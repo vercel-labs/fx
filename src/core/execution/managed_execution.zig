@@ -1584,6 +1584,23 @@ pub const Runtime = struct {
         return self.background_cancel.load(.acquire);
     }
 
+    /// Whether any captured background shell or registered TTY command is
+    /// still starting, running, or stopping on this runtime.
+    pub fn hasRunningExecution(self: *Runtime) bool {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        if (self.pending_admissions > 0) return true;
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            entry.mutex.lockUncancelable(zio);
+            const running = !entry.isTerminal();
+            entry.mutex.unlock(zio);
+            if (running) return true;
+        }
+        return false;
+    }
+
     fn stopAllAndJoin(self: *Runtime, mode: StopMode) void {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
@@ -3596,6 +3613,93 @@ test "terminal output keeps its head and tail through restore, refresh, and deli
     try std.testing.expectEqualStrings("gh", next.snapshot.output_delta);
     try std.testing.expect(!next.snapshot.output_truncated);
     try runtime.commitDelivery(next.snapshot.execution_id, next.reservation_id);
+}
+
+test "caller defer releases reserved TTY admission once and concurrent reservation stays valid on failure" {
+    const alloc = std.testing.allocator;
+    {
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+
+        try runtime.reserveTtyCapacity();
+        var capacity_reserved = true;
+        defer if (capacity_reserved) runtime.releaseTtyCapacity();
+        try std.testing.expectEqual(@as(usize, 1), runtime.pending_admissions);
+        try std.testing.expect(runtime.hasRunningExecution());
+
+        if (runtime.registerTty(alloc, .{
+            .execution_id = "tty-reserved-init-fail",
+            .command = "interactive",
+            .state = .running,
+            .max_output_bytes = 64,
+            .published_running = true,
+            .capacity_reserved = true,
+            .next_cursor = .{ .segment = 0, .offset = 0 },
+        })) |prepared_value| {
+            var prepared = prepared_value;
+            prepared.deinit(alloc);
+            capacity_reserved = false;
+            return error.TestExpectedEqual;
+        } else |err| {
+            try std.testing.expectEqual(error.InvalidTtyCursor, err);
+        }
+
+        // Caller's defer (as in src/tools/shell/shell.zig) must release the
+        // reservation once, leaving pending_admissions at 0 and idle false.
+        if (capacity_reserved) {
+            runtime.releaseTtyCapacity();
+            capacity_reserved = false;
+        }
+        try std.testing.expectEqual(@as(usize, 0), runtime.pending_admissions);
+        try std.testing.expect(!runtime.hasRunningExecution());
+    }
+
+    {
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+
+        try runtime.reserveTtyCapacity();
+        var first_reserved = true;
+        defer if (first_reserved) runtime.releaseTtyCapacity();
+
+        try runtime.reserveTtyCapacity();
+        var second_reserved = true;
+        defer if (second_reserved) runtime.releaseTtyCapacity();
+        try std.testing.expectEqual(@as(usize, 2), runtime.pending_admissions);
+
+        // First caller fails in registerTty and releases its own reservation once.
+        try std.testing.expectError(
+            error.InvalidTtyCursor,
+            runtime.registerTty(alloc, .{
+                .execution_id = "tty-first-fail",
+                .command = "interactive",
+                .state = .running,
+                .max_output_bytes = 64,
+                .published_running = true,
+                .capacity_reserved = true,
+                .next_cursor = .{ .segment = 0, .offset = 0 },
+            }),
+        );
+        if (first_reserved) {
+            runtime.releaseTtyCapacity();
+            first_reserved = false;
+        }
+        try std.testing.expectEqual(@as(usize, 1), runtime.pending_admissions);
+
+        // Second concurrent start must still hold its reservation and register.
+        var second = try runtime.registerTty(alloc, .{
+            .execution_id = "tty-second-ok",
+            .command = "interactive",
+            .state = .running,
+            .max_output_bytes = 64,
+            .published_running = true,
+            .capacity_reserved = true,
+        });
+        second_reserved = false;
+        defer second.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), runtime.pending_admissions);
+        try std.testing.expect(runtime.hasRunningExecution());
+    }
 }
 
 test "a managed rebuild keeps a placed command's placement, profile, and launch" {

@@ -65,6 +65,7 @@ const auto_classifier_context = @import("../permissions/auto_classifier_context.
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
+const recovery_policy = @import("../recovery/recovery.zig");
 const session_runtime = @import("../session/session.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -779,6 +780,7 @@ const AskContext = struct {
     /// kind or attempt changes, not on every one-second refresh.
     last_recovery_notice_kind: ?types.RouteRecoveryStatus.Kind = null,
     last_recovery_notice_attempt: usize = 0,
+    retry_budget_exhausted: bool = false,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -2128,6 +2130,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .max_tool_result_bytes = startup.max_tool_result_bytes,
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
+        .recovery_retry_budget_ms = recovery_policy.retryBudgetFromValue(io_mod.getenv("FX_TEST_RECOVERY_RETRY_BUDGET_MS")),
+        .recovery_retry_budget_exhausted = &ctx.retry_budget_exhausted,
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,
         .effort = ctx.effort,
@@ -2156,7 +2160,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job, false)) |early| return early;
     // The ask ends once its whole tree is quiet: mail that waits when a turn
     // ends runs as the ask's next turn, as one wakes an idle main.
+    // When fx ask's own turn ended because its retry budget ran out, stop
+    // waiting and let `ctx.deinit()` cancel and join any running subagents.
     while (ctx.subagent_host) |tree| {
+        if (ctx.retry_budget_exhausted) {
+            tree.closeTree();
+            break;
+        }
         switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag(), true)) {
             .quiet, .stopped => break,
             .mail => {},
@@ -2228,6 +2238,7 @@ fn runAskTurn(
     // (`tests/tla/subagent/MainMail.tla` JoinsOpenTurn).
     const processing = marked or (ctx.subagent_host != null and ctx.worker.beginDirectProcessing(job.turn_id));
     defer if (processing) ctx.worker.finishProcessing();
+    ctx.retry_budget_exhausted = false;
     const processed = options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job);
     // The next turn starts the agent's usage over, so this one's is taken
     // now, whether the turn ended well or not.
@@ -2313,13 +2324,16 @@ fn maybeStartAskTitleTask(
     return task;
 }
 
-/// Gives the title task a short grace after the turn, then installs the
-/// generated title unless the session already carries a user-set title. A
-/// title still pending after the grace is dropped, and the session keeps the
-/// title derived from its first prompt.
+/// `fx ask` exits as soon as its turn ends without waiting for title generation.
+const title_exit_grace_ms: u32 = 0;
+
+/// Installs a generated title if the task finished before the turn ended, and
+/// otherwise cancels it immediately with no exit wait. A pending title is
+/// dropped and traced, and the session keeps the title derived from its first
+/// prompt.
 fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) void {
     defer task.destroy();
-    task.joinOrCancel(ctx.cancelFlag(), session_title_generation.after_turn_grace_ms);
+    task.joinOrCancel(ctx.cancelFlag(), title_exit_grace_ms);
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -3540,7 +3554,7 @@ fn reachWorkspace(raw_ctx: *anyopaque, dir: []const u8, tool_name: []const u8) v
     ctx.turn_capture.reach(context, dir, tool_name, &ctx.session_write_mutex);
 }
 
-fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8, _: u64) !void {}
 
 fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
@@ -5598,6 +5612,37 @@ test "fx ask's report sink queues a report as its subagent's message" {
     try std.testing.expect(std.mem.find(u8, queued.prompt, "looks good") != null);
     // No turn is running, so it waits for the ask's next turn.
     try std.testing.expect(queued.delivery == .continuation);
+}
+
+test "completeAskTitleTask drops a pending title at exit without waiting" {
+    const alloc = std.testing.allocator;
+    const Wait = struct {
+        fn stream(_: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) anyerror!agent_stream_provider.Result {
+            try request.admission.admit();
+            while (!request.cancel_flag.load(.seq_cst)) io_mod.sleep(5 * std.time.ns_per_ms);
+            return error.Cancelled;
+        }
+    };
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
+    defer ctx.deinit();
+
+    const task = try session_title_generation.Task.create(.{
+        .session_id = "ask-exit-no-wait",
+        .model = "test/title",
+        .prompt_excerpt = "fix the renderer",
+        .api_key = "key",
+        .stream_provider = .{ .stream_fn = Wait.stream },
+    });
+    errdefer task.destroy();
+    try task.spawn();
+
+    const started = io_mod.milliTimestamp();
+    completeAskTitleTask(&ctx, task);
+    try std.testing.expect(io_mod.milliTimestamp() - started < 1_000);
 }
 
 test "fx ask deps validate malformed registered calls" {

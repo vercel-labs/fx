@@ -259,6 +259,9 @@ const version_usage = "usage: fx --version\n";
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
+    /// The build's number on main, or 0 when unknown
+    /// (`update_target.CurrentBuild.build`).
+    build_number: u32 = 0,
     build_channel: update_target.Channel = .stable,
     auth_mode: credentials.AuthMode = .local,
     command_catalog: CommandCatalog,
@@ -2526,6 +2529,7 @@ fn runNonInteractiveWithDeps(
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
+                .build = cfg.build_number,
             }, channel, switch (opts.format) {
                 .text => .text,
                 .json => .json,

@@ -2625,6 +2625,54 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "/trace says a prompt went on when Enter retried its sign-in after the issuer recovered",
+    async () => {
+      let failing = true;
+      const issuer = startFakeIssuer({
+        refresh: (count) => failing ? new Response("unavailable", { status: 500 }) : `issued-token-${count}`,
+      });
+      const traceDir = mkdtempSync(join(tmpdir(), "fx-sign-in-trace-"));
+      try {
+        await withFx((body) => text("main", latestUserText(body).includes("RETRIED") ? "SWITCH_RETRY_DONE" : "SWITCH_MAIN_DONE"), async (session, { home }) => {
+          await session.sendText("SWITCH_USER first");
+          await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+          await session.waitForComposer(15_000);
+
+          writeFxLogin(home, issuer.issuerUrl, "seeded-token", { expiresAtMs: Date.now() - 120_000 });
+          const mark = traceText().length;
+          await session.sendText("SWITCH_USER RETRIED after the failure");
+          await until("the prompt waits", () => traceText().slice(mark).includes("pending_prompt_awaiting_auth"), 30_000);
+          await session.waitForText("credential refresh failed", 15_000);
+
+          // The issuer answers again; Enter on the empty composer retries.
+          failing = false;
+          await session.sendKeys("Enter");
+          await session.waitForText("SWITCH_RETRY_DONE", 30_000);
+          await session.waitForComposer(15_000);
+
+          const before = new Set(traceReportNames(traceDir));
+          await session.sendText("/trace");
+          const report = await waitForNewTraceReport(traceDir, before);
+          const details = report.all("sign_in_event").map((record) => `${String(record.event)} ${String(record.detail ?? "")}`);
+          expect(details.some((d) => d.startsWith("prompt ") && d.includes("outcome=waits_for_sign_in screen=main"))).toBe(true);
+          expect(details.some((d) => d.startsWith("prompt ") && d.includes("outcome=resumed screen=main") && d.includes("trigger=retry"))).toBe(true);
+          expect(details.some((d) => d.startsWith("refresh ") && d.includes("outcome=rotated"))).toBe(true);
+          expect(report.text).not.toContain("seeded-token");
+        }, (home) => writeFxLogin(home, issuer.issuerUrl, "seeded-token"), false, {
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          AI_GATEWAY_API_KEY: undefined as unknown as string,
+          TMPDIR: traceDir,
+        });
+      } finally {
+        issuer.stop();
+        rmSync(traceDir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "/trace says fx deleted the saved login after the issuer refused its refresh token",
     async () => {
       const issuer = startFakeIssuer({ refresh: () => Response.json({ error: "invalid_grant" }, { status: 400 }) });
@@ -6125,6 +6173,60 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
         writeSpikeWriter,
         false,
         { FX_TEST_APPROVAL_SCREEN_FAIL: "1" },
+        {},
+        "",
+        true,
+      );
+    },
+    TIMEOUT,
+  );
+
+  // The hook is a test switch like any other: only an on value fails a screen.
+  // `0` leaves it off, so the request opens its screen and a key answers it.
+  test(
+    "a zero approval screen fail value leaves the approval screen open for the key",
+    async () => {
+      const arrived = held();
+      let childCalls = 0;
+      await withFx(
+        (body) => {
+          if (!SPIKE_MAIN(body)) {
+            childCalls += 1;
+            // The write waits for the person to be on the subagent's own
+            // screen, so the request opens its screen there.
+            if (childCalls === 1) {
+              return arrived.promise.then(() =>
+                toolCall("child_e8_write", "write_file", { path: "spike-e8.txt", content: "SPIKE_WROTE\n" })
+              );
+            }
+            return text("child_e8_done", "SPIKE_E8_WROTE");
+          }
+          if (!body.includes('"main_e8_start"')) {
+            return toolCall("main_e8_start", "subagent", {
+              request: { action: "message", agent: "writer", message: "SPIKE_E8_TASK", profile: "writer" },
+            });
+          }
+          return text("main_e8_tail", "SPIKE_E8_MAIN_DONE");
+        },
+        async (session, { workspace, stderrPath }) => {
+          await session.sendText("SPIKE_USER_e8");
+          await session.waitForText("SPIKE_E8_MAIN_DONE", 30_000);
+          await showAgent(session, "writer");
+          arrived.release();
+          // The screen opens as usual, and its key answers the request.
+          await session.waitForText("Apply this change?", 30_000);
+          expect(await session.capturePane()).toContain("spike-e8.txt");
+          await session.sendKeys("1");
+          await until("the write", () => existsSync(join(workspace, "spike-e8.txt")));
+          expect(readFileSync(join(workspace, "spike-e8.txt"), "utf8")).toBe("SPIKE_WROTE\n");
+          await session.waitForText("SPIKE_E8_WROTE", 30_000);
+          expect(await session.capturePane()).not.toContain("could not open");
+          expect(stderrPath).toBeDefined();
+          expect(readFileSync(stderrPath!, "utf8")).toBe("");
+        },
+        writeSpikeWriter,
+        false,
+        { FX_TEST_APPROVAL_SCREEN_FAIL: "0" },
         {},
         "",
         true,

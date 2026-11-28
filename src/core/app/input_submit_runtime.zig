@@ -74,9 +74,9 @@ fn buildPendingPromptDraft(
 }
 
 /// What a prompt sent in the moment after the held turns were let go for an
-/// upgrade's restart gets: they stopped for the relaunch, which comes once the
+/// update's restart gets: they stopped for the relaunch, which comes once the
 /// composer is empty (`app_upgrade_runtime.zig` `finishWaitingRestart`).
-const restart_held_submit_notice = "fx restarts for the upgrade once the prompt is empty; clear it, or send it after the restart";
+const restart_held_submit_notice = "fx restarts for the update once the prompt is empty; clear it, or send it after the restart";
 
 pub fn SubmitRuntime(comptime App: type) type {
     return struct {
@@ -659,7 +659,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (!submitsQuit(app) and !submitsNothing(app) and !app_upgrade_runtime.Runtime(App).restartWhenIdleForPrompt(app)) {
                     debug_trace.logf("input", "submit held reason=upgrade_restart_releasing input_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
                     try app.writeDomainNotice(.{
-                        .topic = "upgrade",
+                        .topic = "update",
                         .tone = .neutral,
                         .body = restart_held_submit_notice,
                     }, true);
@@ -685,10 +685,11 @@ pub fn SubmitRuntime(comptime App: type) type {
                     {
                         if (comptime @hasDecl(App, "retryPendingPromptCredential")) {
                             switch (try App.retryPendingPromptCredential(app, agents.screenAgentOf(app))) {
+                                // The prompt waits for a new refresh again, and
+                                // its `/trace` record says it went on.
                                 .pending => {
-                                    agents.screenAgentOf(app).submission.retry_after_auth = false;
-                                    agents.screenAgentOf(app).submission.pending.?.phase = .adopted;
-                                    app.shell.render_requests.request(.footer);
+                                    const resumed = resumePendingPromptAfterAuth(app, agents.screenAgentOf(app), "retry");
+                                    std.debug.assert(resumed);
                                 },
                                 .current => {
                                     const resumed = resumePendingPromptAfterAuth(app, agents.screenAgentOf(app), "submit");

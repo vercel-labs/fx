@@ -2,12 +2,17 @@ const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
+const app_render_runtime = @import("app_render_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const io_mod = @import("../shared/io.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
-const editor_state = @import("../input/editor_state.zig");
+const composer_stash = @import("../input/composer_stash.zig");
+const core_input_runtime = @import("../input/runtime.zig");
+const ui_input_runtime = @import("../../ui/input/runtime.zig");
 const paste_framing = @import("../input/paste_framing.zig");
+const workspace_trust = @import("../workspace_trust/workspace_trust.zig");
 
 pub const ApplyOutcome = enum {
     not_ready,
@@ -33,9 +38,24 @@ pub const Deps = struct {
 /// A turn stops at its next step and goes on after the restart, unless it
 /// cannot stop there, such as a turn on a provider other than the gateway,
 /// which runs to its end (`orchestrator.zig` `canStopForRestart`).
-const restart_waits_notice = "upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip";
-const restart_cancelled_notice = "restart cancelled; Ctrl+G restarts for the upgrade later";
-const restart_releasing_notice = "fx is restarting for the upgrade now";
+const restart_waits_notice = "update ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip";
+const restart_cancelled_notice = "restart cancelled; Ctrl+G restarts for the update later";
+const restart_releasing_notice = "fx is restarting for the update now";
+
+/// Quiet time after the last key press before an idle automatic update restart
+/// starts (`collectUpgradeFacts`).
+pub const idle_restart_quiet_ms: i64 = 2000;
+const idle_quiet_env_name = "FX_TEST_UPGRADE_IDLE_QUIET_MS";
+
+fn idleRestartQuietMs() i64 {
+    return parseIdleRestartQuietMs(io_mod.getenv(idle_quiet_env_name));
+}
+
+fn parseIdleRestartQuietMs(text: ?[]const u8) i64 {
+    const value = text orelse return idle_restart_quiet_ms;
+    const ms = std.fmt.parseInt(u32, value, 10) catch return idle_restart_quiet_ms;
+    return if (ms > 0) @intCast(ms) else idle_restart_quiet_ms;
+}
 
 /// Whether `App` can stop running turns between steps for the restart.
 /// Without it, Ctrl+G still refuses while a response streams.
@@ -62,6 +82,36 @@ pub fn Runtime(comptime App: type) type {
                 if (comptime @hasDecl(@TypeOf(app.upgrader), "takeRenderDirty")) {
                     if (app.upgrader.takeRenderDirty()) requestFooterRender(app);
                 }
+            }
+            const now_ms = currentTimestampMs(app);
+            syncReadySince(app, now_ms);
+            _ = tryIdleAutoUpgrade(
+                app,
+                agents.screenAgentOf(app),
+                now_ms,
+                idleRestartQuietMs(),
+                .{},
+            );
+        }
+
+        fn syncReadySince(app: *App, now_ms: i64) void {
+            if (comptime !(@hasField(App, "upgrader") and
+                @hasField(@FieldType(App, "upgrader"), "ready_since_ms")))
+            {
+                return;
+            }
+            if (app.upgrader.getState() == auto_upgrade.State.ready) {
+                if (app.upgrader.ready_since_ms == null) app.upgrader.ready_since_ms = now_ms;
+            } else {
+                app.upgrader.ready_since_ms = null;
+            }
+        }
+
+        pub fn noteUserInput(app: *App, now_ms: i64) void {
+            if (comptime @hasField(App, "upgrader") and
+                @hasField(@FieldType(App, "upgrader"), "last_user_input_ms"))
+            {
+                app.upgrader.last_user_input_ms = now_ms;
             }
         }
 
@@ -131,10 +181,20 @@ pub fn Runtime(comptime App: type) type {
             return state.readable;
         }
 
-        /// Whether a restart put off by a prompt can run now: nothing Ctrl+G
-        /// refuses for is there, so it loses nothing and asks for no answer.
+        /// Whether a restart put off by a prompt can run now: it loses no
+        /// draft or queued work, closes no menu, and asks for no answer, the
+        /// same rule as the automatic restart (`isIdleForAutoRestart`).
         fn idleForRestart(app: *App) bool {
-            if (upgradeUnavailableNotice(app, agents.screenAgentOf(app)) != null) return false;
+            return nothingWaitsOnPerson(app, agents.screenAgentOf(app));
+        }
+
+        /// What both idle restarts wait for: nothing Ctrl+G refuses for, no
+        /// draft anywhere, no open menu, no agent waiting for an answer, and
+        /// no queued work elsewhere.
+        fn nothingWaitsOnPerson(app: *App, agent: *AppAgent) bool {
+            if (upgradeUnavailableNotice(app, agent) != null) return false;
+            if (anyDraftNonEmpty(app, agent)) return false;
+            if (menuOrPickerActive(app, agent)) return false;
             var name_buf: [32]u8 = undefined;
             if (comptime @hasDecl(App, "needsUserElsewhere")) {
                 if (app.needsUserElsewhere(&name_buf) != null) return false;
@@ -158,7 +218,7 @@ pub fn Runtime(comptime App: type) type {
                 app.upgrader.cancelRestart();
                 debug_trace.logf("upgrade", "event=restart_cancelled reason=handoff_unavailable err={s}", .{@errorName(err)});
                 const notice = app.alloc.print(
-                    "restart for the upgrade cancelled because this conversation is not safely resumable: {s}; press Ctrl+G to try again",
+                    "restart for the update cancelled because this conversation is not safely resumable: {s}; press Ctrl+G to try again",
                     .{@errorName(err)},
                 ) catch return false;
                 defer app.alloc.free(notice);
@@ -185,10 +245,12 @@ pub fn Runtime(comptime App: type) type {
         /// Whether `agent` holds the handoff an upgrade asked for
         /// (`requestResumeHandoffForUpgrade`). The test app keeps it as a flag.
         fn holdsUpgradeHandoff(agent: *const AppAgent) bool {
-            if (comptime @hasField(AppAgent, "session_persistence")) {
+            if (comptime @hasField(AppAgent, "upgrade_handoff")) return agent.upgrade_handoff;
+            if (comptime @hasField(AppAgent, "session_persistence") and
+                @hasField(@FieldType(AppAgent, "session_persistence"), "resume_handoff_intent"))
+            {
                 return agent.session_persistence.resume_handoff_intent == .upgrade_requested;
             }
-            if (comptime @hasField(AppAgent, "upgrade_handoff")) return agent.upgrade_handoff;
             return false;
         }
 
@@ -199,15 +261,15 @@ pub fn Runtime(comptime App: type) type {
         /// while one is there (`draftPending`).
         fn draftNotice(app: *App, agent: *AppAgent) ?[]const u8 {
             if (comptime @hasField(App, "input_runtime")) {
-                if (app.input_runtime.paste.active()) return "finish the paste before upgrading";
-                if (app.input_runtime.edit_state.input.items.len > 0) return "submit or clear the current prompt before upgrading";
+                if (app.input_runtime.paste.active()) return "finish the paste before updating";
+                if (app.input_runtime.edit_state.input.items.len > 0) return "submit or clear the current prompt before updating";
             }
             if (comptime agents.hasAgentField(App, "pending_images")) {
-                if (agent.pending_images.items.len > 0) return "submit or clear pending images before upgrading";
+                if (agent.pending_images.items.len > 0) return "submit or clear pending images before updating";
             }
             // The worker holds its queue while it yields, so a sent prompt
             // that has not started would wait there until fx exits.
-            if (submissionPending(app)) return "upgrade is unavailable while a sent prompt waits to go out";
+            if (submissionPending(app)) return "update is unavailable while a sent prompt waits to go out";
             return null;
         }
 
@@ -223,7 +285,7 @@ pub fn Runtime(comptime App: type) type {
         /// (`submission.pending`, every phase): it waits for a frame, for
         /// sign-in, or for the worker to take it, and lives only in memory
         /// until then.
-        fn submissionPending(app: *App) bool {
+        fn submissionPending(app: *const App) bool {
             if (comptime !agents.hasAgentField(App, "submission")) return false;
             if (app.main_agent.submission.pending != null) return true;
             if (comptime @hasField(App, "child_agents")) {
@@ -272,7 +334,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "needsUserElsewhere")) {
                 var name_buf: [32]u8 = undefined;
                 if (app.needsUserElsewhere(&name_buf)) |busy| {
-                    const notice = try app.alloc.print("upgrade is unavailable while {s} {s}", .{ busy.name, busyPhrase(busy.doing) });
+                    const notice = try app.alloc.print("update is unavailable while {s} {s}", .{ busy.name, busyPhrase(busy.doing) });
                     defer app.alloc.free(notice);
                     try writeUpgradeNotice(app, .neutral, notice);
                     return .unavailable;
@@ -285,7 +347,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "queuedWorkElsewhere")) {
                 var queue_name_buf: [32]u8 = undefined;
                 if (app.queuedWorkElsewhere(&queue_name_buf)) |name| {
-                    const notice = try app.alloc.print("upgrade unavailable · {s} has queued prompts", .{name});
+                    const notice = try app.alloc.print("update unavailable · {s} has queued prompts", .{name});
                     defer app.alloc.free(notice);
                     try writeUpgradeNotice(app, .neutral, notice);
                     return .unavailable;
@@ -299,14 +361,14 @@ pub fn Runtime(comptime App: type) type {
 
             if (comptime @hasField(App, "upgrader")) {
                 if (app.upgrader.getState() != auto_upgrade.State.ready) {
-                    try writeUpgradeNotice(app, .neutral, "no installed upgrade is ready");
+                    try writeUpgradeNotice(app, .neutral, "no installed update is ready");
                     return .not_ready;
                 }
             }
 
             app.prepareResumeHandoffForUpgrade(agent) catch |err| {
                 const notice = try app.alloc.print(
-                    "upgrade paused because this conversation is not safely resumable: {s}; run `fx doctor` for recovery guidance",
+                    "update paused because this conversation is not safely resumable: {s}; run `fx doctor` for recovery guidance",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(notice);
@@ -320,7 +382,7 @@ pub fn Runtime(comptime App: type) type {
                 &executable_buf,
             ) catch |err| {
                 const notice = try app.alloc.print(
-                    "upgrade installed, but the executable path could not be resolved: {s}; restart fx manually",
+                    "update installed, but the executable path could not be resolved: {s}; restart fx manually",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(notice);
@@ -330,7 +392,7 @@ pub fn Runtime(comptime App: type) type {
 
             app.requestUpgradeRelaunch(executable_path) catch |err| {
                 const notice = try app.alloc.print(
-                    "upgrade installed, but relaunch could not be prepared: {s}; restart fx manually",
+                    "update installed, but relaunch could not be prepared: {s}; restart fx manually",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(notice);
@@ -391,38 +453,38 @@ pub fn Runtime(comptime App: type) type {
         fn upgradeUnavailableNotice(app: *App, agent: *AppAgent) ?[]const u8 {
             // A host that stops turns between steps waits for them instead.
             if (comptime agents.hasAgentField(App, "stream") and !supportsYield(App)) {
-                if (agent.stream.active) return "upgrade is unavailable until the response finishes";
+                if (agent.stream.active) return "update is unavailable until the response finishes";
             }
             if (comptime agents.hasAgentField(App, "worker")) {
                 if (comptime @hasDecl(@TypeOf(agent.worker), "queuedPromptCount")) {
                     if (agent.worker.queuedPromptCount() > 0) {
-                        return "upgrade is unavailable while prompts are queued";
+                        return "update is unavailable while prompts are queued";
                     }
                 }
             }
             if (comptime agents.hasAgentField(App, "question_prompt")) {
-                if (agent.question_prompt.isActive()) return "upgrade is unavailable while a question is open";
+                if (agent.question_prompt.isActive()) return "update is unavailable while a question is open";
             }
             if (comptime agents.hasAgentField(App, "approval_prompt")) {
-                if (agent.approval_prompt.isActive()) return "upgrade is unavailable while an approval is open";
+                if (agent.approval_prompt.isActive()) return "update is unavailable while an approval is open";
             }
             if (comptime @hasField(App, "auth") and
                 @hasDecl(@TypeOf(app.auth), "apiKeyEntryActive"))
             {
-                if (app.auth.apiKeyEntryActive()) return "upgrade is unavailable during API key entry";
+                if (app.auth.apiKeyEntryActive()) return "update is unavailable during API key entry";
             }
             if (comptime @hasField(App, "subagents")) {
-                if (app.subagents.isViewActive()) return "close the subagent view before upgrading";
+                if (app.subagents.isViewActive()) return "close the subagent view before updating";
             }
             if (comptime agents.hasAgentField(App, "session_persistence")) {
-                if (agent.session_persistence.session_picker.active) return "close the session picker before upgrading";
+                if (agent.session_persistence.session_picker.active) return "close the session picker before updating";
             }
             if (comptime @hasField(App, "terminal")) {
-                if (app.terminal.fullTranscriptScreenActive()) return "close the transcript view before upgrading";
+                if (app.terminal.fullTranscriptScreenActive()) return "close the transcript view before updating";
             }
             if (draftNotice(app, agent)) |notice| return notice;
             if (comptime @hasField(App, "terminal_input_runtime")) {
-                if (app.terminal_input_runtime.hasPendingTerminalAction()) return "finish the key sequence before upgrading";
+                if (app.terminal_input_runtime.hasPendingTerminalAction()) return "finish the key sequence before updating";
             }
             return null;
         }
@@ -436,7 +498,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn writeUpgradeNotice(app: *App, tone: types.NoticeTone, body: []const u8) !void {
             try app.writeDomainNotice(.{
-                .topic = "upgrade",
+                .topic = "update",
                 .tone = tone,
                 .body = body,
             }, true);
@@ -445,6 +507,142 @@ pub fn Runtime(comptime App: type) type {
 
         fn requestFooterRender(app: *App) void {
             if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
+        }
+
+        fn currentTimestampMs(app: *const App) i64 {
+            if (comptime @hasField(App, "test_now_ms")) {
+                if (app.test_now_ms) |now_ms| return now_ms;
+            }
+            return io_mod.milliTimestamp();
+        }
+
+        fn hasRunningShellOrTtySession(app: *App) bool {
+            if (comptime agents.hasAgentField(App, "managed_executions")) {
+                if (app.main_agent.managed_executions.hasRunningExecution()) return true;
+                if (comptime @hasField(App, "child_agents")) {
+                    for (app.child_agents.items) |child| {
+                        if (child.agent.managed_executions.hasRunningExecution()) return true;
+                    }
+                }
+            }
+            if (comptime @hasField(App, "terminal_client") and
+                @hasDecl(@FieldType(App, "terminal_client"), "hasRunningSession"))
+            {
+                if (app.terminal_client.hasRunningSession()) return true;
+            }
+            return false;
+        }
+
+        fn idleRestartQuietElapsed(app: *const App, now_ms: i64, quiet_ms: i64) bool {
+            if (comptime @hasField(App, "upgrader") and
+                @hasField(@FieldType(App, "upgrader"), "ready_since_ms"))
+            {
+                const ready_ms = app.upgrader.ready_since_ms orelse return false;
+                if (now_ms - ready_ms < quiet_ms) return false;
+            }
+            if (comptime @hasField(App, "upgrader") and
+                @hasField(@FieldType(App, "upgrader"), "last_user_input_ms"))
+            {
+                if (app.upgrader.last_user_input_ms) |last_ms| {
+                    if (now_ms - last_ms < quiet_ms) return false;
+                }
+            }
+            return true;
+        }
+
+        pub fn anyDraftNonEmpty(app: *const App, agent: *const AppAgent) bool {
+            if (comptime @hasField(App, "input_runtime")) {
+                if (app.input_runtime.paste.active()) return true;
+                if (app.input_runtime.edit_state.input.items.len > 0) return true;
+                if (comptime @hasDecl(@FieldType(App, "input_runtime"), "hasStashedDraft")) {
+                    if (app.input_runtime.hasStashedDraft()) return true;
+                }
+            }
+            if (comptime @hasField(App, "terminal_input_runtime") and
+                @hasDecl(@FieldType(App, "terminal_input_runtime"), "hasDeferredSessionInput"))
+            {
+                if (app.terminal_input_runtime.hasDeferredSessionInput()) return true;
+            }
+            if (comptime agents.hasAgentField(App, "pending_images")) {
+                if (agent.pending_images.items.len > 0) return true;
+            }
+            if (submissionPending(app)) return true;
+            return app_agents_runtime.Runtime(App).anyStashedDraft(app);
+        }
+
+        fn menuOrPickerActive(app: *const App, agent: *const AppAgent) bool {
+            if (comptime @hasDecl(App, "anyMenuOrPickerActive")) {
+                return app.anyMenuOrPickerActive(agent);
+            }
+            return app_render_runtime.Runtime(App).anyMenuOrPickerActive(app, agent);
+        }
+
+        fn isIdleForAutoRestart(
+            app: *App,
+            agent: *AppAgent,
+            now_ms: i64,
+            quiet_ms: i64,
+        ) bool {
+            if (comptime !runtime_profile.allows(App, .auto_upgrade)) return false;
+            if (!autoUpgradeEnabled(app)) return false;
+            if (comptime @hasField(App, "should_exit")) {
+                if (app.should_exit) return false;
+            }
+            if (comptime @hasField(App, "upgrader")) {
+                if (app.upgrader.getState() != auto_upgrade.State.ready) return false;
+                if (comptime @hasField(@FieldType(App, "upgrader"), "restart")) {
+                    if (app.upgrader.restart != .none) return false;
+                }
+                if (comptime @hasField(@FieldType(App, "upgrader"), "auto_restart_failed")) {
+                    if (app.upgrader.auto_restart_failed) return false;
+                }
+            }
+            if (comptime @hasDecl(App, "anyTurnRunning")) {
+                if (app.anyTurnRunning()) return false;
+            }
+            if (comptime agents.hasAgentField(App, "stream")) {
+                if (agent.stream.active) return false;
+            }
+            if (!nothingWaitsOnPerson(app, agent)) return false;
+            if (hasRunningShellOrTtySession(app)) return false;
+            return idleRestartQuietElapsed(app, now_ms, quiet_ms);
+        }
+
+        fn tryIdleAutoUpgrade(
+            app: *App,
+            agent: *AppAgent,
+            now_ms: i64,
+            quiet_ms: i64,
+            deps: Deps,
+        ) bool {
+            if (!isIdleForAutoRestart(app, agent, now_ms, quiet_ms)) return false;
+            const outcome = applyReadyUpgradeWithDeps(app, agent, deps) catch |err| {
+                debug_trace.logf("upgrade", "event=idle_auto_restart_failed err={s}", .{@errorName(err)});
+                var msg_buf: [192]u8 = undefined;
+                const msg = std.mem.print(
+                    &msg_buf,
+                    "automatic restart failed ({s}); press ctrl+g or restart fx manually",
+                    .{@errorName(err)},
+                ) catch "automatic restart failed; press ctrl+g or restart fx manually";
+                // Best-effort notice on an already-failing restart path; auto_restart_failed suppresses retries.
+                writeUpgradeNotice(app, .@"error", msg) catch {};
+                if (comptime @hasField(App, "upgrader") and
+                    @hasField(@FieldType(App, "upgrader"), "auto_restart_failed"))
+                {
+                    app.upgrader.auto_restart_failed = true;
+                }
+                return false;
+            };
+            if (outcome != .relaunch_requested) {
+                if (comptime @hasField(App, "upgrader") and
+                    @hasField(@FieldType(App, "upgrader"), "auto_restart_failed"))
+                {
+                    app.upgrader.auto_restart_failed = true;
+                }
+                return false;
+            }
+            debug_trace.logf("upgrade", "event=idle_auto_restart_started", .{});
+            return true;
         }
     };
 }
@@ -462,6 +660,9 @@ const TestUpgrader = struct {
     render_dirty: bool = false,
     restart: auto_upgrade.RestartWait = .none,
     cancel_count: usize = 0,
+    last_user_input_ms: ?i64 = null,
+    ready_since_ms: ?i64 = null,
+    auto_restart_failed: bool = false,
 
     fn getState(self: *TestUpgrader) auto_upgrade.State {
         return self.state;
@@ -496,14 +697,14 @@ const TestWorker = struct {
     }
 };
 
-const TestInputRuntime = struct {
-    edit_state: editor_state.State = .{},
-    paste: paste_framing.State = .{},
-};
-
 const TestTerminalInputRuntime = struct {
     terminal_action_pending: bool = false,
     input_pending: bool = false,
+    inner: ui_input_runtime.Runtime = .{},
+
+    fn deinit(self: *TestTerminalInputRuntime, alloc: std.mem.Allocator) void {
+        self.inner.deinit(alloc);
+    }
 
     fn hasPendingTerminalAction(self: *const TestTerminalInputRuntime) bool {
         return self.terminal_action_pending;
@@ -512,17 +713,9 @@ const TestTerminalInputRuntime = struct {
     fn hasPendingTerminalInput(self: *const TestTerminalInputRuntime) bool {
         return self.input_pending;
     }
-};
 
-const TestTerminal = struct {
-    readable: bool = false,
-
-    fn pollInput(self: TestTerminal, _: i32) !struct { readable: bool } {
-        return .{ .readable = self.readable };
-    }
-
-    fn fullTranscriptScreenActive(_: TestTerminal) bool {
-        return false;
+    pub fn hasDeferredSessionInput(self: *const TestTerminalInputRuntime) bool {
+        return self.inner.hasDeferredSessionInput();
     }
 };
 
@@ -538,17 +731,95 @@ const TestShell = struct {
     render_requests: TestRenderRequests = .{},
 };
 
+const TestToggle = struct {
+    active: bool = false,
+
+    pub fn isActive(self: *const TestToggle) bool {
+        return self.active;
+    }
+};
+
+const TestSessionPersistence = struct {
+    session_picker: struct { active: bool = false } = .{},
+    fork_menu: struct {
+        active_flag: bool = false,
+        pub fn active(self: *const @This()) bool {
+            return self.active_flag;
+        }
+    } = .{},
+};
+
+const TestManagedExecutions = struct {
+    running: bool = false,
+
+    pub fn hasRunningExecution(self: *const TestManagedExecutions) bool {
+        return self.running;
+    }
+};
+
+const TestAuth = struct {
+    api_key_entry: bool = false,
+    picker_active: bool = false,
+
+    pub fn apiKeyEntryActive(self: *const TestAuth) bool {
+        return self.api_key_entry;
+    }
+
+    pub fn pickerView(self: *const TestAuth) struct { active: bool = false } {
+        return .{ .active = self.picker_active };
+    }
+};
+
+const TestSubagents = struct {
+    view_active: bool = false,
+
+    pub fn isViewActive(self: *const TestSubagents) bool {
+        return self.view_active;
+    }
+};
+
+const TestTerminal = struct {
+    full_transcript_active: bool = false,
+    readable: bool = false,
+
+    pub fn fullTranscriptScreenActive(self: *const TestTerminal) bool {
+        return self.full_transcript_active;
+    }
+
+    fn pollInput(self: TestTerminal, _: i32) !struct { readable: bool } {
+        return .{ .readable = self.readable };
+    }
+};
+
+const TestTerminalClient = struct {
+    running: bool = false,
+
+    pub fn hasRunningSession(self: *const TestTerminalClient) bool {
+        return self.running;
+    }
+};
+
 const TestAgent = struct {
     worker: TestWorker = .{},
     stream: struct { active: bool = false } = .{},
     submission: struct { pending: ?u8 = null } = .{},
+    pending_images: std.ArrayList(u8) = .empty,
+    question_prompt: TestToggle = .{},
+    approval_prompt: TestToggle = .{},
+    session_persistence: TestSessionPersistence = .{},
+    managed_executions: TestManagedExecutions = .{},
     role: enum { instance, subagent } = .instance,
     /// Whether this agent holds the resume handoff an upgrade asked for.
     upgrade_handoff: bool = false,
 };
 
+const TestScreenSlot = struct {
+    draft: composer_stash.State = .{},
+};
+
 const TestChild = struct {
     agent: TestAgent = .{},
+    screen: TestScreenSlot = .{},
 };
 
 const TestApp = struct {
@@ -557,13 +828,37 @@ const TestApp = struct {
     upgrader: TestUpgrader = .{},
     main_agent: TestAgent = .{},
     child_agents: std.ArrayList(*TestChild) = .empty,
-    input_runtime: TestInputRuntime = .{},
+    main_screen: TestScreenSlot = .{},
+    instances: struct {
+        agents_menu: struct {
+            open: bool = false,
+            draft: ?composer_stash.State = null,
+        } = .{},
+    } = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
     terminal_input_runtime: TestTerminalInputRuntime = .{},
+    trust: struct { prompt: ?workspace_trust.prompt.Prompt = null } = .{},
+    model_cache: struct { menu: struct { active: bool = false } = .{} } = .{},
+    skills: struct {
+        active: bool = false,
+        pub fn menuVisible(self: *const @This()) bool {
+            return self.active;
+        }
+    } = .{},
+    mcp: struct { host_menu: struct { active: bool = false } = .{} } = .{},
+    auth: TestAuth = .{},
+    subagents: TestSubagents = .{},
     terminal: TestTerminal = .{},
+    terminal_client: TestTerminalClient = .{},
     shell: TestShell = .{},
     should_exit: bool = false,
     session_id: ?[]const u8 = "session-123",
+    test_now_ms: ?i64 = null,
     notices: std.ArrayList(u8) = .empty,
+    notice_count: usize = 0,
+    last_notice_tone: ?types.NoticeTone = null,
+    notice_fail_once: bool = false,
+    notice_fail_always: bool = false,
     prepare_count: usize = 0,
     request_handoff_count: usize = 0,
     relaunch_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
@@ -581,7 +876,15 @@ const TestApp = struct {
     cancel_handoff_count: usize = 0,
 
     fn deinit(self: *TestApp) void {
-        self.input_runtime.edit_state.deinit(self.alloc);
+        self.input_runtime.deinit(self.alloc);
+        self.terminal_input_runtime.deinit(self.alloc);
+        self.main_screen.draft.deinit(self.alloc);
+        if (self.instances.agents_menu.draft) |*draft| draft.deinit(self.alloc);
+        self.main_agent.pending_images.deinit(self.alloc);
+        for (self.child_agents.items) |child| {
+            child.agent.pending_images.deinit(self.alloc);
+            child.screen.draft.deinit(self.alloc);
+        }
         self.notices.deinit(self.alloc);
         self.child_agents.deinit(self.alloc);
     }
@@ -642,6 +945,13 @@ const TestApp = struct {
     }
 
     fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
+        if (self.notice_fail_always) return error.WriteNoticeFailed;
+        if (self.notice_fail_once) {
+            self.notice_fail_once = false;
+            return error.WriteNoticeFailed;
+        }
+        self.notice_count += 1;
+        self.last_notice_tone = notice.tone;
         try self.notices.appendSlice(self.alloc, notice.body);
     }
 
@@ -706,7 +1016,7 @@ test "app_upgrade_runtime refuses while another agent needs the user, and names 
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
 
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
-    try std.testing.expectEqualStrings("upgrade is unavailable while reviewer needs approval", app.notices.items);
+    try std.testing.expectEqualStrings("update is unavailable while reviewer needs approval", app.notices.items);
     try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
     try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
     try std.testing.expect(!app.should_exit);
@@ -723,7 +1033,7 @@ test "app_upgrade_runtime refuses while another instance has queued prompts, and
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
 
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
-    try std.testing.expectEqualStrings("upgrade unavailable · fx 2 has queued prompts", app.notices.items);
+    try std.testing.expectEqualStrings("update unavailable · fx 2 has queued prompts", app.notices.items);
     try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
     try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
     try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
@@ -857,7 +1167,7 @@ test "app_upgrade_runtime rejects ctrl+g while upgrade is not ready" {
 
     try std.testing.expectEqual(ApplyOutcome.not_ready, outcome);
     try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
-    try std.testing.expect(std.mem.find(u8, app.notices.items, "no installed upgrade is ready") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "no installed update is ready") != null);
 }
 
 test "app_upgrade_runtime requires an active session before reload" {
@@ -1165,7 +1475,7 @@ test "app_upgrade_runtime names the ways out of the restart wait" {
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
     try std.testing.expectEqual(ApplyOutcome.waiting, outcome);
     try std.testing.expectEqualStrings(
-        "upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip",
+        "update ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip",
         app.notices.items,
     );
 }
@@ -1192,6 +1502,745 @@ test "app_upgrade_runtime rejects mid key sequence before reload" {
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
     try std.testing.expectEqual(@as(usize, 0), deps.path_count);
     try std.testing.expect(std.mem.find(u8, app.notices.items, "finish the key sequence") != null);
+}
+
+fn expectAutoRestartHeldUntilCleared(app: *TestApp, clear: *const fn (*TestApp) void) !void {
+    if (app.upgrader.state == .ready and app.upgrader.ready_since_ms == null) {
+        app.upgrader.ready_since_ms = 10_000;
+    }
+    if (app.test_now_ms == null) {
+        app.test_now_ms = 12_000;
+    }
+    Runtime(TestApp).collectUpgradeFacts(app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 0), app.relaunch_path_len);
+
+    clear(app);
+    Runtime(TestApp).collectUpgradeFacts(app);
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expect(app.relaunch_path_len > 0);
+}
+
+test "app_upgrade_runtime auto-restarts when idle and auto_upgrade is on" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.upgrader.ready_since_ms = 10_000;
+    app.test_now_ms = 12_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 1), app.request_handoff_count);
+    try std.testing.expect(app.relaunch_path_len > 0);
+}
+
+test "app_upgrade_runtime auto-restart stays off when auto_upgrade is disabled" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.auto_upgrade_enabled = false;
+    app.upgrader.state = .ready;
+    app.upgrader.ready_since_ms = 10_000;
+    app.test_now_ms = 12_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 0), app.relaunch_path_len);
+}
+
+test "app_upgrade_runtime auto-restart waits until update state is ready" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .downloading;
+    app.test_now_ms = 10_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expect(app.upgrader.ready_since_ms == null);
+
+    app.upgrader.state = .ready;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(?i64, 10_000), app.upgrader.ready_since_ms);
+
+    app.test_now_ms = 12_000;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+}
+
+test "app_upgrade_runtime waits quiet time after .ready even when idle for a long time" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .downloading;
+    app.upgrader.last_user_input_ms = 1_000;
+    app.test_now_ms = 100_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+
+    // .ready lands after a long idle period: must draw notice first and wait
+    // the full quiet window after .ready before restarting.
+    app.upgrader.state = .ready;
+    app.upgrader.render_dirty = true;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.render_requests.footer_count);
+    try std.testing.expectEqual(@as(?i64, 100_000), app.upgrader.ready_since_ms);
+
+    app.test_now_ms = 101_999;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+
+    app.test_now_ms = 102_000;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+}
+
+test "app_upgrade_runtime auto-restart holds while a turn is running" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.turn_running = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a subagent has a pending prompt" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    var subagent = TestChild{ .agent = .{ .role = .subagent } };
+    try app.child_agents.append(app.alloc, &subagent);
+    subagent.agent.submission.pending = 1;
+    app.upgrader.state = .ready;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.child_agents.items[0].agent.submission.pending = null;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a restart already waits" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    app.upgrader.restart = .waiting;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.waiting, app.upgrader.restart);
+}
+
+test "app_upgrade_runtime auto-restart holds while prompts are queued" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.worker.queued_count = 1;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.worker.queued_count = 0;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while composer has draft text" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    try app.input_runtime.edit_state.input.appendSlice(app.alloc, "draft");
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.input_runtime.edit_state.input.clearRetainingCapacity();
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a paste is active" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.input_runtime.paste.begin(.composer, 1024);
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.input_runtime.paste.finishHandled();
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while pending images exist" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    try app.main_agent.pending_images.append(app.alloc, 1);
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.pending_images.clearRetainingCapacity();
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a sent prompt waits to go out" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.submission.pending = 1;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.submission.pending = null;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a question is open" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.question_prompt.active = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.question_prompt.active = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while an approval is open" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.approval_prompt.active = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.approval_prompt.active = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds during API key entry" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.auth.api_key_entry = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.auth.api_key_entry = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while subagent view is open" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.subagents.view_active = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.subagents.view_active = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while session picker is open" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.session_persistence.session_picker.active = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.session_persistence.session_picker.active = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while full transcript screen is open" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.terminal.full_transcript_active = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.terminal.full_transcript_active = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a terminal key sequence is pending" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.terminal_input_runtime.terminal_action_pending = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.terminal_input_runtime.terminal_action_pending = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while deferred session input is waiting" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    try std.testing.expect(try app.terminal_input_runtime.inner.deferSessionInputByte(app.alloc, 'x', 64));
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            _ = target.terminal_input_runtime.inner.discardDeferredSessionInput();
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while another agent needs the user" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.needs_user_elsewhere = .{ .name = "reviewer", .doing = .needs_approval };
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.needs_user_elsewhere = null;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while another instance has queued prompts" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.queued_elsewhere = "fx 2";
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.queued_elsewhere = null;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a background shell session runs" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.managed_executions.running = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.managed_executions.running = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a child background shell session runs" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    var child = TestChild{};
+    child.agent.managed_executions.running = true;
+    try app.child_agents.append(app.alloc, &child);
+    app.upgrader.state = .ready;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.child_agents.items[0].agent.managed_executions.running = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a tty session runs" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.terminal_client.running = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.terminal_client.running = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds during the quiet time after a key press" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.upgrader.ready_since_ms = 1_000;
+    app.upgrader.last_user_input_ms = 10_000;
+    app.test_now_ms = 11_999;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.test_now_ms = 12_000;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime parses idle quiet time override" {
+    try std.testing.expectEqual(@as(i64, 2000), idle_restart_quiet_ms);
+    try std.testing.expectEqual(idle_restart_quiet_ms, parseIdleRestartQuietMs(null));
+    try std.testing.expectEqual(idle_restart_quiet_ms, parseIdleRestartQuietMs("0"));
+    try std.testing.expectEqual(idle_restart_quiet_ms, parseIdleRestartQuietMs("-5"));
+    try std.testing.expectEqual(idle_restart_quiet_ms, parseIdleRestartQuietMs("fast"));
+    try std.testing.expectEqual(@as(i64, 150), parseIdleRestartQuietMs("150"));
+    try std.testing.expectEqual(@as(i64, 3_600_000), parseIdleRestartQuietMs("3600000"));
+}
+
+test "app_upgrade_runtime idle auto-restart does not repeat failed relaunch notices" {
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .session_id = null,
+    };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.upgrader.ready_since_ms = 10_000;
+    app.test_now_ms = 12_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expect(app.upgrader.auto_restart_failed);
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+}
+
+test "app_upgrade_runtime idle auto-restart reports catch-arm failure once and suppresses retries" {
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .session_id = null,
+        .notice_fail_once = true,
+    };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.upgrader.ready_since_ms = 10_000;
+    app.test_now_ms = 12_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expect(app.upgrader.auto_restart_failed);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqual(@as(?types.NoticeTone, .@"error"), app.last_notice_tone);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "WriteNoticeFailed") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "ctrl+g") != null);
+
+    // Next tick must not repeat the notice or retry.
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+
+    // If writing the catch-arm notice itself also fails, it is swallowed without retrying.
+    var failing = TestApp{
+        .alloc = std.testing.allocator,
+        .session_id = null,
+        .notice_fail_always = true,
+    };
+    defer failing.deinit();
+    failing.upgrader.state = .ready;
+    failing.upgrader.ready_since_ms = 10_000;
+    failing.test_now_ms = 12_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&failing);
+    try std.testing.expect(failing.upgrader.auto_restart_failed);
+    try std.testing.expectEqual(@as(usize, 0), failing.notice_count);
+}
+
+test "app_upgrade_runtime auto-restart holds while an instance turn runs" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.turn_running = false;
+        }
+    }.clear);
+}
+
+fn captureStashText(alloc: std.mem.Allocator, text: []const u8) !composer_stash.State {
+    var temp = core_input_runtime.Runtime{};
+    defer temp.deinit(alloc);
+    try temp.edit_state.input.appendSlice(alloc, text);
+    return composer_stash.State.capture(temp.composerStashView());
+}
+
+test "app_upgrade_runtime auto-restart holds while any menu, picker, or catalog is active" {
+    const cases = [_]struct {
+        open: *const fn (*TestApp) void,
+        close: *const fn (*TestApp) void,
+    }{
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.help_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.help_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.settings_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.settings_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.statusline_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.statusline_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.info_panel.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.info_panel.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.effort_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.effort_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.usage_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.usage_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.workspace_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.workspace_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.model_cache.menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.model_cache.menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.skills.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.skills.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.main_agent.session_persistence.session_picker.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.main_agent.session_persistence.session_picker.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.main_agent.session_persistence.fork_menu.active_flag = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.main_agent.session_persistence.fork_menu.active_flag = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.instances.agents_menu.open = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.instances.agents_menu.open = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.mcp.host_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.mcp.host_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.auth.picker_active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.auth.picker_active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.trust.prompt = .{ .folder = "/tmp/workspace", .cover = .this_folder };
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.trust.prompt = null;
+                }
+            }.f,
+        },
+    };
+    for (cases) |case| {
+        var app = TestApp{ .alloc = std.testing.allocator };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        case.open(&app);
+        try expectAutoRestartHeldUntilCleared(&app, case.close);
+    }
+}
+
+test "app_upgrade_runtime auto-restart holds while any stashed or off-screen draft is non-empty" {
+    const alloc = std.testing.allocator;
+    {
+        var app = TestApp{ .alloc = alloc };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        app.input_runtime.model_picker_draft = try captureStashText(alloc, "ctrl+p draft");
+        try expectAutoRestartHeldUntilCleared(&app, struct {
+            fn clear(a: *TestApp) void {
+                if (a.input_runtime.model_picker_draft) |*d| d.deinit(a.alloc);
+                a.input_runtime.model_picker_draft = null;
+            }
+        }.clear);
+    }
+    {
+        var app = TestApp{ .alloc = alloc };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        app.input_runtime.card_model_picker_draft = try captureStashText(alloc, "card picker draft");
+        try expectAutoRestartHeldUntilCleared(&app, struct {
+            fn clear(a: *TestApp) void {
+                if (a.input_runtime.card_model_picker_draft) |*d| d.deinit(a.alloc);
+                a.input_runtime.card_model_picker_draft = null;
+            }
+        }.clear);
+    }
+    {
+        var app = TestApp{ .alloc = alloc };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        app.instances.agents_menu.draft = try captureStashText(alloc, "agents menu draft");
+        try expectAutoRestartHeldUntilCleared(&app, struct {
+            fn clear(a: *TestApp) void {
+                if (a.instances.agents_menu.draft) |*d| d.deinit(a.alloc);
+                a.instances.agents_menu.draft = null;
+            }
+        }.clear);
+    }
+    {
+        var app = TestApp{ .alloc = alloc };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        app.main_screen.draft = try captureStashText(alloc, "main off-screen draft");
+        try expectAutoRestartHeldUntilCleared(&app, struct {
+            fn clear(a: *TestApp) void {
+                a.main_screen.draft.deinit(a.alloc);
+            }
+        }.clear);
+    }
+    {
+        var app = TestApp{ .alloc = alloc };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        var child = TestChild{};
+        child.screen.draft = try captureStashText(alloc, "child off-screen draft");
+        try app.child_agents.append(alloc, &child);
+        try expectAutoRestartHeldUntilCleared(&app, struct {
+            fn clear(a: *TestApp) void {
+                a.child_agents.items[0].screen.draft.deinit(a.alloc);
+            }
+        }.clear);
+    }
 }
 
 test "app_upgrade_runtime lets a prompt sent while the restart waits go on, and restarts at the next idle moment" {
@@ -1299,7 +2348,7 @@ test "app_upgrade_runtime cancels a restart put off until idle when the session 
     try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
     try std.testing.expectEqual(@as(usize, 1), app.upgrader.cancel_count);
     try std.testing.expect(!app.agent().upgrade_handoff);
-    try std.testing.expect(std.mem.find(u8, app.notices.items, "restart for the upgrade cancelled because this conversation is not safely resumable") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "restart for the update cancelled because this conversation is not safely resumable") != null);
 }
 
 test "app_upgrade_runtime cancels a restart put off until idle on Ctrl+G, and keeps a prompt only once the held turns were let go" {

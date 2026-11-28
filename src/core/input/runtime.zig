@@ -2,6 +2,8 @@ const std = @import("std");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
 const effort_menu = @import("effort_menu.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
+const types = @import("../shared/types.zig");
 const info_panel = @import("info_panel.zig");
 const usage_menu = @import("../session/usage_menu.zig");
 const workspace_menu = @import("../workspace/workspace_menu.zig");
@@ -14,6 +16,8 @@ const composer_selection = @import("composer_selection.zig");
 const composer_skill_binding = @import("composer_skill_binding.zig");
 const composer_text_replacement = @import("composer_text_replacement.zig");
 const composer_undo = @import("composer_undo.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const pasted_blocks = @import("pasted_blocks.zig");
 const composer_history = @import("composer_history.zig");
 const composer_stash = @import("composer_stash.zig");
 const edit_history = @import("edit_history.zig");
@@ -61,6 +65,10 @@ pub const Runtime = struct {
     /// subagent, which borrows the composer as its query box. Holds the
     /// person's draft until the pick or the picker's close gives it back.
     card_model_picker_draft: ?composer_stash.State = null,
+    /// The draft the composer held when the `/effort` menu opened. The menu
+    /// borrows the composer as its query box and gives the draft back when
+    /// it closes, as the model picker shortcut does.
+    effort_menu_draft: ?composer_stash.State = null,
 
     pub fn initInto(self: *Runtime) void {
         const runtime_info = @typeInfo(Runtime).@"struct";
@@ -85,6 +93,46 @@ pub const Runtime = struct {
         self.edit_history.deinit(alloc);
         if (self.model_picker_draft) |*draft| draft.deinit(alloc);
         if (self.card_model_picker_draft) |*draft| draft.deinit(alloc);
+        if (self.effort_menu_draft) |*draft| draft.deinit(alloc);
+    }
+
+    /// Opens the `/effort` menu and sets the composer's draft aside, so the
+    /// menu's query starts empty and the draft comes back when it closes.
+    /// Leaves everything as it was when the menu cannot open.
+    pub fn openEffortMenu(
+        self: *Runtime,
+        alloc: Allocator,
+        model: []const u8,
+        capabilities: model_capabilities.Capabilities,
+        current: types.ReasoningEffort,
+    ) Allocator.Error!void {
+        try self.effort_menu.open(alloc, model, capabilities, current);
+        if (self.effort_menu_draft == null) self.effort_menu_draft = composer_stash.State.capture(self.composerStashView());
+    }
+
+    /// Closes the `/effort` menu, clears its query from the composer, and
+    /// gives back the draft `openEffortMenu` set aside. Every surface that
+    /// takes the footer from the menu calls it first, so Enter never reaches
+    /// a menu that is not on screen and the query is never kept as a draft.
+    /// False when the menu was not open.
+    pub fn cancelEffortMenu(self: *Runtime, alloc: Allocator, reason: []const u8) bool {
+        if (!self.effort_menu.active) return false;
+        debug_trace.logf("input", "effort menu closed and its query cleared reason={s} query_bytes={d} pasted_blocks={d} image_tokens={d} skill_tokens={d} draft_restored={}", .{
+            reason,
+            self.edit_state.input.items.len,
+            self.entities.pasted_blocks.items.len,
+            self.entities.image_tokens.items.len,
+            self.entities.skill_tokens.items.len,
+            self.effort_menu_draft != null,
+        });
+        self.effort_menu.close(alloc);
+        self.inputResetState().clearCurrent(alloc);
+        pasted_blocks.clearBlocks(alloc, &self.entities.pasted_blocks);
+        if (self.effort_menu_draft) |*draft| {
+            draft.restore(alloc, self.composerStashView());
+            self.effort_menu_draft = null;
+        }
+        return true;
     }
 
     /// Sets the person's draft aside so the model picker a card's "Change
@@ -102,6 +150,26 @@ pub const Runtime = struct {
         self.card_model_picker_draft = null;
         draft.restore(alloc, self.composerStashView());
         return true;
+    }
+
+    pub fn hasActiveMenu(self: *const Runtime) bool {
+        return self.help_menu.active or
+            self.settings_menu.active or
+            self.statusline_menu.active or
+            self.info_panel.active or
+            self.effort_menu.active or
+            self.usage_menu.active or
+            self.workspace_menu.active;
+    }
+
+    pub fn hasStashedDraft(self: *const Runtime) bool {
+        if (self.model_picker_draft) |*draft| {
+            if (draft.hasDraft()) return true;
+        }
+        if (self.card_model_picker_draft) |*draft| {
+            if (draft.hasDraft()) return true;
+        }
+        return false;
     }
 
     pub fn composerStashView(self: *Runtime) composer_stash.State.ComposerView {

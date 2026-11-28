@@ -13,6 +13,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const env_settings = @import("../config/env_settings.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -427,13 +428,14 @@ const approval_screen_failure_notice = "The approval screen could not open, so f
 
 /// `FX_TEST_APPROVAL_SCREEN_FAIL` makes the next approval screen fail, so a
 /// test can prove the deny reaches the request's owner
-/// (`tests/e2e/tui-host-switch.test.ts`).
+/// (`tests/e2e/tui-host-switch.test.ts`). Like every test switch, only an on
+/// value such as `1` turns it on, so `0` opens the screen as usual.
 const approval_screen_fail_env = "FX_TEST_APPROVAL_SCREEN_FAIL";
 var approval_screen_fail_used = false;
 
-fn approvalScreenFailureForced() bool {
+fn approvalScreenFailureForced(raw: ?[]const u8) bool {
     if (approval_screen_fail_used) return false;
-    if (io_mod.getenv(approval_screen_fail_env) == null) return false;
+    if (!env_settings.testSwitchOn(raw)) return false;
     approval_screen_fail_used = true;
     return true;
 }
@@ -835,6 +837,7 @@ pub fn Runtime(comptime App: type) type {
                     .tools = app.mcp.host_menu_tools,
                     .notes = app.mcp.host_menu_notes,
                     .sign_in_url = app.mcp.hostMenuSignInUrl(),
+                    .marker_phase = shimmer_pos,
                 } else .{},
                 .help_menu = render_input.helpMenuProjection(
                     &app.input_runtime.help_menu,
@@ -1514,7 +1517,8 @@ pub fn Runtime(comptime App: type) type {
                     .attempt_invalidations = attempt_invalidations,
                     .pending_tail_rows = if (pending_card) |card| card.row_count else 0,
                 };
-                const fixed_point = try render_engine.frame_fixed_point.solve(
+                const fixed_point = try presentation_shell.solveFrameWithFooterCloseReset(
+                    &app.metrics,
                     FixedPointTranscriptContext(App),
                     &fixed_point_ctx,
                     .{
@@ -1529,6 +1533,8 @@ pub fn Runtime(comptime App: type) type {
                     },
                     FixedPointTranscriptContext(App).prepareCandidate,
                     FixedPointTranscriptContext(App).resolveCandidate,
+                    skillsMenuRefreshPending(app),
+                    &prepared_transcript,
                 );
                 const solved = fixed_point.layout;
                 solved_layout = solved;
@@ -1919,6 +1925,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 presentation_shell.shimmer_active = frame_ctx.activity_result.painted;
                 presentation_shell.shimmer_is_overlay = frame_ctx.activity_result.overlay;
+                presentation_shell.loading_marker_active = footer_frame.composed.loading_marker_visible;
                 if (scroll_plan.remaining_inline_advance_rows > 0) {
                     presentation_shell.markTranscriptDirty();
                 } else if (!render_requests.hasReason(.transcript)) {
@@ -1930,7 +1937,7 @@ pub fn Runtime(comptime App: type) type {
             }
             return .{
                 .shadow_state = result.state(),
-                .animation_visible = frame_ctx.activity_result.painted,
+                .animation_visible = frame_ctx.activity_result.painted or footer_frame.composed.loading_marker_visible,
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
                 // The committed pending UI permits adoption even when its preview
@@ -1948,7 +1955,7 @@ pub fn Runtime(comptime App: type) type {
         fn renderApprovalScreen(app: *App, agent: *AppAgent) !FrameAttemptResult {
             const approval = agent.approval_prompt.projection() orelse return error.MissingApprovalRequest;
             const request = approval.request;
-            if (approvalScreenFailureForced()) {
+            if (approvalScreenFailureForced(io_mod.getenv(approval_screen_fail_env))) {
                 return failApprovalScreen(app, agent, request.id, error.ForcedApprovalScreenFailure);
             }
             const clear_display = approvalScreenNeedsClear(
@@ -2139,6 +2146,17 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
+        /// `/skills` and `/skills <name>` open the skills menu when the catalog
+        /// refresh they queued lands, so the frame before that shows the plain composer.
+        fn skillsMenuRefreshPending(app: *const App) bool {
+            if (comptime !@hasField(App, "skills")) return false;
+            const pending = app.skills.pending_refresh_action orelse return false;
+            return switch (pending.action) {
+                .list, .show => true,
+                .notice, .startup_notice => false,
+            };
+        }
+
         fn modelMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "model_cache")) return app.model_cache.menu.active;
             return false;
@@ -2205,6 +2223,34 @@ pub fn Runtime(comptime App: type) type {
 
         fn catalogMenuActive(app: *const App) bool {
             return modelMenuActive(app) and !settingsMenuActive(app);
+        }
+
+        pub fn anyMenuOrPickerActive(app: *const App, agent: *const AppAgent) bool {
+            if (shownTrustPrompt(app) != null) return true;
+            if (comptime @hasField(App, "input_runtime")) {
+                if (comptime @hasDecl(@FieldType(App, "input_runtime"), "hasActiveMenu")) {
+                    if (app.input_runtime.hasActiveMenu()) return true;
+                } else {
+                    if (helpMenuActive(app) or effortMenuActive(app) or settingsMenuActive(app)) return true;
+                }
+            }
+            if (modelMenuActive(app) or
+                skillsMenuActive(app) or
+                sessionMenuActive(app, agent) or
+                forkMenuActive(app, agent) or
+                agentsMenuActive(app))
+            {
+                return true;
+            }
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.host_menu.active) return true;
+            }
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@FieldType(App, "auth"), "pickerView")) {
+                    if (app.auth.pickerView().active) return true;
+                }
+            }
+            return false;
         }
 
         fn activityProjection(app: *const App) activity_runtime.ActivityProjection {
@@ -4238,6 +4284,18 @@ const ApprovalScreenFailureTestApp = struct {
         return self.notice_buf[0..self.notice_len];
     }
 };
+
+test "only an on value fails the next approval screen" {
+    approval_screen_fail_used = false;
+    defer approval_screen_fail_used = false;
+    try std.testing.expect(!approvalScreenFailureForced(null));
+    try std.testing.expect(!approvalScreenFailureForced("0"));
+    try std.testing.expect(!approvalScreenFailureForced(""));
+    try std.testing.expect(!approvalScreenFailureForced("false"));
+    try std.testing.expect(approvalScreenFailureForced("1"));
+    // One shot: an on value fails one screen, not every later one.
+    try std.testing.expect(!approvalScreenFailureForced("1"));
+}
 
 test "a failed approval screen denies the request on the worker that owns it" {
     const alloc = std.testing.allocator;

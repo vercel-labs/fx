@@ -2287,9 +2287,30 @@ pub fn Runtime(comptime App: type) type {
                 std.mem.print(buf, "{s} finished", .{name}) catch "";
         }
 
-        pub fn menuActive(app: *App) bool {
+        pub fn menuActive(app: *const App) bool {
             if (comptime !@hasField(App, "instances")) return false;
             return app.instances.agents_menu.open;
+        }
+
+        pub fn anyStashedDraft(app: *const App) bool {
+            if (comptime @hasField(App, "instances")) {
+                if (app.instances.agents_menu.draft) |*draft| {
+                    if (draft.hasDraft()) return true;
+                }
+            }
+            if (comptime @hasField(App, "main_screen")) {
+                if (app.main_screen.draft.hasDraft()) return true;
+            }
+            if (comptime @hasField(App, "child_agents")) {
+                for (app.child_agents.items) |child| {
+                    if (comptime @hasField(@TypeOf(child.*), "screen")) {
+                        if (child.screen.draft.hasDraft()) return true;
+                    }
+                    if (child.agent.pending_images.items.len > 0) return true;
+                    if (child.agent.submission.pending != null) return true;
+                }
+            }
+            return false;
         }
 
         /// Opens the agent list on the agent on screen, which Esc and Ctrl+X
@@ -3460,7 +3481,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(App, "writeDomainNotice")) return;
             const body = try app.alloc.print("a message from {s} came while fx waits to restart, so fx restarts without it", .{sender});
             defer app.alloc.free(body);
-            try app.writeDomainNotice(.{ .topic = "upgrade", .tone = .neutral, .body = body }, true);
+            try app.writeDomainNotice(.{ .topic = "update", .tone = .neutral, .body = body }, true);
         }
 
         /// Takes every waiting hand-off. Runs on the main loop each pass,
@@ -3688,12 +3709,20 @@ pub fn Runtime(comptime App: type) type {
             return child;
         }
 
+        /// The next agent's `screen_id`, never one an earlier agent had.
+        fn takeScreenId(app: *App) u64 {
+            if (comptime !@hasField(App, "next_screen_id")) return 0;
+            const id = app.next_screen_id;
+            app.next_screen_id += 1;
+            return id;
+        }
+
         /// Adds the agent for child session `id` to the end of the list,
         /// with no worker yet.
         fn addChild(app: *App, id: []const u8) !*ChildAgent {
             const child = try app.alloc.create(ChildAgent);
             errdefer app.alloc.destroy(child);
-            child.* = .{ .id = try app.alloc.dupe(u8, id), .agent = .{ .app = @ptrCast(app), .role = .subagent } };
+            child.* = .{ .id = try app.alloc.dupe(u8, id), .agent = .{ .app = @ptrCast(app), .role = .subagent, .screen_id = takeScreenId(app) } };
             errdefer app.alloc.free(child.id);
             {
                 // Resolvers on other threads read the list.
@@ -3715,7 +3744,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn addInstance(app: *App) !*ChildAgent {
             const child = try app.alloc.create(ChildAgent);
             errdefer app.alloc.destroy(child);
-            child.* = .{ .id = try app.alloc.dupe(u8, "instance"), .agent = .{ .app = @ptrCast(app), .role = .instance } };
+            child.* = .{ .id = try app.alloc.dupe(u8, "instance"), .agent = .{ .app = @ptrCast(app), .role = .instance, .screen_id = takeScreenId(app) } };
             errdefer app.alloc.free(child.id);
             app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
             defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
