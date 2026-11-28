@@ -102,6 +102,8 @@ pub const Options = struct {
     /// Listen for tool list changes once a 2026 server is ready, so the
     /// catalog hears of them. fx turns it on.
     listen_tools: bool = false,
+    /// The host's reading of each listed tool (`tools.Store.judge`).
+    judge: ?tools.Judge = null,
     subscription: subscription.Config = .{},
     timeouts: request.Timeouts = .{},
     /// 2025: how long a new session's requests wait for its listening
@@ -330,7 +332,7 @@ pub const Server = struct {
     table_slots: [64]request.Slot = undefined,
     detector: era.Detector,
     catalog: catalog.Catalog,
-    /// Its `check_headers` is set for each page from the session's era.
+    /// Its `check_headers` is set for each page from the session's era, and its `judge` from `Options.judge`.
     store: tools.Store = .{},
     logicals: [32]Logical = undefined,
     next_handle: Handle = 1,
@@ -423,6 +425,7 @@ pub const Server = struct {
             .client = undefined,
             .proc = undefined,
             .stdio = options.link == .stdio,
+            .store = .{ .judge = options.judge },
             .table = undefined,
             .detector = .init(options.era),
             .catalog = .init(options.catalog),

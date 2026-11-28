@@ -48,6 +48,21 @@ pub const script =
     \\
 ;
 
+/// The same server, but its one list has a tool named `echo` with an `inputSchema` of `{}`, which the engine keeps and the
+/// host's reading refuses, and then a good tool of that name, whose description is "Echoes". It answers no call.
+pub const meaningless_first_script =
+    \\#!/bin/sh
+    \\while IFS= read -r line; do
+    \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    \\  case "$line" in
+    \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+    \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"meaningless","inputSchema":{}},{"name":"echo","description":"Echoes","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    \\  esac
+    \\done
+    \\
+;
+
 pub const Fixture = struct {
     tmp: testing.TmpDir,
     home: []u8,

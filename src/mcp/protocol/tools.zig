@@ -124,11 +124,13 @@ pub const Added = struct {
     /// Tools without a plain, non-empty `name`, or whose `inputSchema` isn't an object. Such a tool takes no name, so
     /// a later tool of the same name is kept.
     invalid: u32 = 0,
+    /// Tools the host's reading (`Store.judge`) left out, by the reason it gave. Such a tool takes no name either.
+    refused: Dropped = .{},
     /// Tools with a field written twice, `name` included: no copy of it is trusted over the other.
     repeated_field: u32 = 0,
     /// Tools that are no JSON object, or that fx could not read for another reason.
     unreadable: u32 = 0,
-    /// Tools named like one listed earlier (the first wins).
+    /// Tools named like one kept earlier: the first tool that passes the structure check and the host's reading wins.
     duplicate: u32 = 0,
     /// Over HTTP, tools with an invalid `x-mcp-header`; the first
     /// one is named, for the warning the spec asks for.
@@ -147,6 +149,7 @@ pub const Added = struct {
         d.add(.unusable, a.unreadable);
         d.add(.repeated_name, a.duplicate);
         d.add(.bad_header, a.bad_headers -| a.header_limit);
+        d.merge(a.refused);
         return d;
     }
 };
@@ -160,7 +163,8 @@ pub const Drop = enum {
     unnamed,
     /// A field of the tool written twice, `name` included (`Store.addPage`).
     repeated_field,
-    /// A name already listed by an earlier tool: the first one wins (`Store.addPage`).
+    /// A name an earlier tool already has: the first one that the engine's structure check and the host's reading both
+    /// keep wins (`Store.addPage`).
     repeated_name,
     /// An `x-mcp-header` annotation that is not valid (`Store.addPage`).
     bad_header,
@@ -285,6 +289,14 @@ pub fn refusalOf(err: wire.DecodeError) Refusal {
     };
 }
 
+/// The host's reading of a tool that passed the structure check, so that a name is taken only by a tool the host keeps.
+/// `refuses` gives the reason to leave the tool object `raw` out, or null to keep it; the host decides, and the
+/// engine only asks. It is called from the thread that steps the server.
+pub const Judge = struct {
+    context: *const anyopaque,
+    refuses: *const fn (context: *const anyopaque, raw: []const u8) std.mem.Allocator.Error!?Drop,
+};
+
 /// The tool list of one server: the current list, the one being gathered by
 /// a running listing, and the cursor for its next page. The effects of
 /// `core/catalog.zig` say which method to call.
@@ -296,6 +308,8 @@ pub const Store = struct {
     /// Streamable HTTP: drop tools whose `x-mcp-header` annotations are
     /// invalid. Other transports may ignore them.
     check_headers: bool = false,
+    /// The host's reading of each tool the structure check keeps. With none, every such tool is kept.
+    judge: ?Judge = null,
 
     pub fn deinit(store: *Store, gpa: std.mem.Allocator) void {
         store.current.deinit(gpa);
@@ -305,7 +319,8 @@ pub const Store = struct {
 
     /// Adds a page's tools to the list being gathered and keeps its cursor.
     /// Each malformed tool is skipped and counted, so one bad definition
-    /// doesn't hide the others. On error, the caller fails the listing,
+    /// doesn't hide the others. A tool takes its name only after the structure check and the host's reading keep it, so
+    /// a later tool of that name is kept when an earlier one was left out. On error, the caller fails the listing,
     /// which discards the partial list.
     pub fn addPage(store: *Store, gpa: std.mem.Allocator, page: Page) AddError!Added {
         var added: Added = .{};
@@ -326,6 +341,10 @@ pub const Store = struct {
                 added.invalid += 1;
                 continue;
             }
+            if (store.judge) |judge| if (try judge.refuses(judge.context, raw)) |why| {
+                added.refused.add(why, 1);
+                continue;
+            };
             if (store.gathering.find(name) != null) {
                 added.duplicate += 1;
                 continue;
@@ -740,4 +759,104 @@ test "a tool nested past what the header check handles is over a limit, not wron
     try testing.expectEqual(@as(u32, 1), added.header_limit);
     try testing.expectEqual(@as(u32, 1), added.dropped().counts[@backingInt(Drop.over_limit)]);
     try testing.expectEqual(@as(u32, 0), added.dropped().counts[@backingInt(Drop.bad_header)]);
+}
+
+/// A host that leaves out a tool whose object holds "nope" (unusable) or "huge" (over a limit), and runs out of memory on
+/// one that holds "oom".
+const test_judge: Judge = .{ .context = &test_judge_context, .refuses = refusesNope };
+const test_judge_context: u8 = 0;
+
+fn refusesNope(_: *const anyopaque, raw: []const u8) std.mem.Allocator.Error!?Drop {
+    if (std.mem.find(u8, raw, "oom") != null) return error.OutOfMemory;
+    if (std.mem.find(u8, raw, "nope") != null) return .unusable;
+    if (std.mem.find(u8, raw, "huge") != null) return .over_limit;
+    return null;
+}
+
+const nope_a = "{\"name\":\"a\",\"description\":\"nope\",\"inputSchema\":{}}";
+const good_a = "{\"name\":\"a\",\"description\":\"first\",\"inputSchema\":{\"type\":\"object\"}}";
+const other_a = "{\"name\":\"a\",\"description\":\"second\",\"inputSchema\":{\"type\":\"object\"}}";
+
+fn gatherJudged(store: *Store, tools_text: []const u8) !Added {
+    const gpa = testing.allocator;
+    const wrapped = try gpa.print("{{\"tools\":[{s}]}}", .{tools_text});
+    defer gpa.free(wrapped);
+    return store.addPage(gpa, try parsePage(wrapped));
+}
+
+fn expectKept(store: *const Store, description: []const u8, count: usize) !void {
+    try testing.expectEqual(count, store.gathering.len());
+    try testing.expect(std.mem.find(u8, store.gathering.find("a").?.raw, description) != null);
+}
+
+test "a tool the host's reading leaves out takes no name: the first tool that both checks keep is kept, whatever the order" {
+    const orders = [_]struct { tools: []const u8, refused: u32, duplicate: u32 }{
+        .{ .tools = nope_a ++ "," ++ good_a, .refused = 1, .duplicate = 0 },
+        .{ .tools = good_a ++ "," ++ nope_a, .refused = 1, .duplicate = 0 },
+        .{ .tools = nope_a ++ "," ++ good_a ++ "," ++ other_a, .refused = 1, .duplicate = 1 },
+        .{ .tools = good_a ++ "," ++ nope_a ++ "," ++ other_a, .refused = 1, .duplicate = 1 },
+        .{ .tools = good_a ++ "," ++ other_a ++ "," ++ nope_a, .refused = 1, .duplicate = 1 },
+        .{ .tools = nope_a ++ "," ++ nope_a ++ "," ++ good_a, .refused = 2, .duplicate = 0 },
+    };
+    for (orders) |order| {
+        var store: Store = .{ .judge = test_judge };
+        defer store.deinit(testing.allocator);
+        const added = try gatherJudged(&store, order.tools);
+        try testing.expectEqual(@as(u32, 1), added.added);
+        try testing.expectEqual(@as(u32, order.duplicate), added.duplicate);
+        try testing.expectEqual(@as(u32, order.refused), added.refused.counts[@backingInt(Drop.unusable)]);
+        try expectKept(&store, "first", 1);
+        // What the page left out is counted by each tool's own reason: a tool the reading leaves out is never a repeated name.
+        const left = added.dropped();
+        try testing.expectEqual(@as(u32, order.refused), left.counts[@backingInt(Drop.unusable)]);
+        try testing.expectEqual(@as(u32, order.duplicate), left.counts[@backingInt(Drop.repeated_name)]);
+        try testing.expectEqual(@as(u32, order.refused + order.duplicate), left.total());
+    }
+}
+
+test "tools the host's reading leaves out on one page leave the name to a good tool of a later page" {
+    var store: Store = .{ .judge = test_judge };
+    defer store.deinit(testing.allocator);
+    const first = try gatherJudged(&store, nope_a);
+    try testing.expectEqual(@as(u32, 0), first.added);
+    try testing.expectEqual(@as(usize, 0), store.gathering.len());
+    const second = try gatherJudged(&store, good_a ++ "," ++ other_a);
+    try testing.expectEqual(@as(u32, 1), second.added);
+    try testing.expectEqual(@as(u32, 1), second.duplicate);
+    try expectKept(&store, "first", 1);
+}
+
+test "a store with no judge keeps the first tool of a name that passes the structure check, as before" {
+    var store: Store = .{};
+    defer store.deinit(testing.allocator);
+    const added = try gatherJudged(&store, nope_a ++ "," ++ good_a);
+    try testing.expectEqual(@as(u32, 1), added.added);
+    try testing.expectEqual(@as(u32, 1), added.duplicate);
+    try testing.expectEqual(@as(u32, 0), added.refused.total());
+    try expectKept(&store, "nope", 1);
+}
+
+test "a tool that fails the structure check keeps its structure reason: the reading is not asked" {
+    var store: Store = .{ .judge = test_judge };
+    defer store.deinit(testing.allocator);
+    const added = try gatherJudged(&store, "{\"name\":\"a\",\"description\":\"nope\"}," ++ "{\"name\":\"a\",\"description\":\"huge\",\"inputSchema\":[]}");
+    try testing.expectEqual(@as(u32, 2), added.invalid);
+    try testing.expectEqual(@as(u32, 0), added.refused.total());
+    try testing.expectEqual(@as(u32, 2), added.dropped().counts[@backingInt(Drop.unnamed)]);
+}
+
+test "a reason the host gives is the reason a tool is counted by, over any limit too" {
+    var store: Store = .{ .judge = test_judge };
+    defer store.deinit(testing.allocator);
+    const huge = "{\"name\":\"b\",\"description\":\"huge\",\"inputSchema\":{}}";
+    const added = try gatherJudged(&store, huge ++ "," ++ nope_a);
+    try testing.expectEqual(@as(u32, 0), added.added);
+    try testing.expectEqual(@as(u32, 1), added.dropped().counts[@backingInt(Drop.over_limit)]);
+    try testing.expectEqual(@as(u32, 1), added.dropped().counts[@backingInt(Drop.unusable)]);
+}
+
+test "a reading that runs out of memory fails the page, as any allocation of the store does" {
+    var store: Store = .{ .judge = test_judge };
+    defer store.deinit(testing.allocator);
+    try testing.expectError(error.OutOfMemory, gatherJudged(&store, good_a ++ ",{\"name\":\"b\",\"description\":\"oom\",\"inputSchema\":{}}"));
 }
