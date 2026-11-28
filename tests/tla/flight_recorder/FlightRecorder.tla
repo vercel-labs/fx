@@ -13,10 +13,12 @@
 (*              (atomic slot add, zero bytes), WriteHeader (magic + length *)
 (*              + header CRC), Copy (payload), Commit (CRC word).          *)
 (*              When a segment is full, producers enter switching and run  *)
-(*              SwitchSegment (CAS on current segment index; loser retries *)
-(*              in the new segment). Prealloc allocates the next segment   *)
-(*              ahead; if none is ready, producers increment a             *)
-(*              mapped-header dropped counter without waiting. Reopen      *)
+(*              SwitchCurrent (CAS current) then ClearNext (CAS next to 0; *)
+(*              loser retries in the new segment). Prealloc allocates the  *)
+(*              next segment when next is null or equals current; if none  *)
+(*              is ready, producers increment a mapped-header dropped      *)
+(*              counter without waiting. CleanExit discards next only if   *)
+(*              nothing was reserved in it, otherwise seals it. Reopen     *)
 (*              scans forward past holes and torn frames via the length    *)
 (*              header, cuts them, reports gaps, and marks missing exits.  *)
 (*              When segments exceed MaxSegs, Evict writes a durable gap   *)
@@ -29,7 +31,7 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS
     Design,       \* "current" | "queue" | "mmap"
-    Mutant,       \* "none" | "no_length_header" | "no_resync" | "switch_without_cas" | "counter_in_memory" | "wait_for_prealloc" | "no_exit_mark" | "evict_without_gap" | "delete_before_gap" | "evict_open"
+    Mutant,       \* "none" | "no_length_header" | "no_resync" | "switch_without_cas" | "stop_discards_next" | "counter_in_memory" | "wait_for_prealloc" | "no_exit_mark" | "evict_without_gap" | "delete_before_gap" | "evict_open"
     AllowFaults,  \* BOOLEAN: FALSE for ideal simulation, TRUE otherwise
     AllowReset,   \* BOOLEAN: TRUE to enable SessionReset in "current"
     MaxEvents,    \* max events emitted per thread across the run
@@ -42,8 +44,8 @@ CONSTANTS
 ASSUME Design \in {"current", "queue", "mmap"}
 ASSUME Mutant \in {
     "none", "no_length_header", "no_resync", "switch_without_cas",
-    "counter_in_memory", "wait_for_prealloc", "no_exit_mark",
-    "evict_without_gap", "delete_before_gap", "evict_open"
+    "stop_discards_next", "counter_in_memory", "wait_for_prealloc",
+    "no_exit_mark", "evict_without_gap", "delete_before_gap", "evict_open"
 }
 ASSUME AllowFaults \in BOOLEAN
 ASSUME AllowReset \in BOOLEAN
@@ -65,17 +67,17 @@ VARIABLES
     nextSegId,           \* next unique segment ID
     lastCrash,           \* "none" | "process" | "power" | "clean"
     justReopened,        \* "none" | "process" | "power" | "clean"
-    tPhase,              \* [Threads -> "idle" | "offset_reserved" | "header_written" | "copied" | "switching" | "waiting_prealloc"]
+    tPhase,              \* [Threads -> "idle" | "offset_reserved" | "header_written" | "copied" | "switching" | "clearing_next" | "waiting_prealloc"]
     tSeq,                \* [Threads -> 0..MaxEvents]
     tFrame,              \* [Threads -> in-flight frame locator (by seg ID) or NoFrame]
     tSwitchSeg,          \* [Threads -> Nat]: segment ID seen full when entering "switching"
+    tClearSeg,           \* [Threads -> Nat]: target segment ID for ClearNext CAS
     switchViolation,     \* TRUE if a segment had more than one successor opened
     ring,                \* "current": bounded in-memory ring of events
     queue,               \* "queue": unbounded in-memory queue of events
     segs,                \* page cache segments: Seq([id: Nat, sealed: BOOLEAN, frames: Seq(Frame)])
     durableSegs,         \* stable storage segments (synced on Tick / Reopen)
-    nextSegReady,        \* TRUE when Prealloc has prepared the next segment
-    durableNextSegReady, \* stable storage copy of nextSegReady
+    nextSeg,             \* segment ID in Writer.next (0 when null, may equal CurSegId in gap)
     mappedDropped,       \* dropped-events counter in mapped segment header
     durableDropped,      \* stable storage copy of mappedDropped
     memDropped,          \* mutant_counter_in_memory: volatile dropped counter
@@ -110,8 +112,8 @@ VARIABLES
 
 vars == <<
     status, deleted, instance, nextSeq, nextSegId, lastCrash, justReopened,
-    tPhase, tSeq, tFrame, tSwitchSeg, switchViolation, ring, queue, segs, durableSegs,
-    nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+    tPhase, tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, ring, queue, segs, durableSegs,
+    nextSeg, mappedDropped, durableDropped,
     memDropped, persistedGap, durableGap, evictState, pendingEvictSegId,
     pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
     recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -249,10 +251,14 @@ MissingExitMarks(existing, upToInst) ==
     { [inst |-> i, kind |-> "ended_without_exit_record"] :
         i \in { k \in 1..upToInst : ~\E r \in existing : r.inst = k } }
 
+CurSegId == IF Len(segs) > 0 THEN segs[Len(segs)].id ELSE 0
+nextSegReady == nextSeg # 0 /\ nextSeg # CurSegId
+
 IdleThreads ==
     /\ tPhase' = [t \in Threads |-> "idle"]
     /\ tFrame' = [t \in Threads |-> NoFrame]
     /\ tSwitchSeg' = [t \in Threads |-> 0]
+    /\ tClearSeg' = [t \in Threads |-> 0]
 
 (* ------------------------------- Init ----------------------------------- *)
 
@@ -268,13 +274,13 @@ Init ==
     /\ tSeq = [t \in Threads |-> 0]
     /\ tFrame = [t \in Threads |-> NoFrame]
     /\ tSwitchSeg = [t \in Threads |-> 0]
+    /\ tClearSeg = [t \in Threads |-> 0]
     /\ switchViolation = FALSE
     /\ ring = <<>>
     /\ queue = <<>>
     /\ segs = IF Design = "current" THEN <<>> ELSE <<EmptySeg(1)>>
     /\ durableSegs = IF Design = "current" THEN <<>> ELSE <<EmptySeg(1)>>
-    /\ nextSegReady = FALSE
-    /\ durableNextSegReady = FALSE
+    /\ nextSeg = 0
     /\ mappedDropped = 0
     /\ durableDropped = 0
     /\ memDropped = 0
@@ -319,8 +325,8 @@ ConvAccept ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, nextSegId, lastCrash,
-        tPhase, tSeq, tFrame, tSwitchSeg, switchViolation, ring, queue, segs, durableSegs,
-        nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+        tPhase, tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, ring, queue, segs, durableSegs,
+        nextSeg, mappedDropped, durableDropped,
         memDropped, persistedGap, durableGap, evictState, pendingEvictSegId,
         pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -348,8 +354,8 @@ EmitCurrent(t) ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSegId, lastCrash, tPhase, tFrame,
-        tSwitchSeg, switchViolation, queue, segs, durableSegs, nextSegReady,
-        durableNextSegReady, mappedDropped, durableDropped, memDropped,
+        tSwitchSeg, tClearSeg, switchViolation, queue, segs, durableSegs, nextSeg,
+        mappedDropped, durableDropped, memDropped,
         persistedGap, durableGap, evictState, pendingEvictSegId,
         pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -370,8 +376,8 @@ SessionReset ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, nextSegId, lastCrash,
-        tPhase, tSeq, tFrame, tSwitchSeg, switchViolation, queue, segs, durableSegs,
-        nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+        tPhase, tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, queue, segs, durableSegs,
+        nextSeg, mappedDropped, durableDropped,
         memDropped, persistedGap, durableGap, evictState, pendingEvictSegId,
         pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -396,8 +402,8 @@ EmitQueue(t) ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSegId, lastCrash, tPhase, tFrame,
-        tSwitchSeg, switchViolation, ring, segs, durableSegs, nextSegReady,
-        durableNextSegReady, mappedDropped, durableDropped, memDropped,
+        tSwitchSeg, tClearSeg, switchViolation, ring, segs, durableSegs, nextSeg,
+        mappedDropped, durableDropped, memDropped,
         persistedGap, durableGap, evictState, pendingEvictSegId,
         pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -433,8 +439,8 @@ RecorderStep ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, lastCrash,
-        tPhase, tSeq, tFrame, tSwitchSeg, switchViolation, ring, durableSegs,
-        nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+        tPhase, tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, ring, durableSegs,
+        nextSeg, mappedDropped, durableDropped,
         memDropped, persistedGap, durableGap, evictState, pendingEvictSegId,
         pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -466,17 +472,18 @@ ReserveOffset(t) ==
              /\ nextSeq' = nextSeq + 1
              /\ emitted' = emitted \cup {ev}
              /\ justReopened' = "none"
-             /\ UNCHANGED <<tSwitchSeg, mappedDropped, memDropped, mappedDroppedSet>>
+             /\ UNCHANGED <<tSwitchSeg, tClearSeg, mappedDropped, memDropped, mappedDroppedSet>>
           ELSE IF nextSegReady THEN
              /\ tPhase' = [tPhase EXCEPT ![t] = "switching"]
              /\ tSwitchSeg' = [tSwitchSeg EXCEPT ![t] = IF curIdx > 0 THEN segs[curIdx].id ELSE 0]
+             /\ tClearSeg' = [tClearSeg EXCEPT ![t] = nextSeg]
              /\ justReopened' = "none"
              /\ UNCHANGED <<segs, tFrame, tSeq, nextSeq, emitted,
                             mappedDropped, memDropped, mappedDroppedSet>>
           ELSE IF Mutant = "wait_for_prealloc" THEN
              /\ tPhase[t] = "idle"
              /\ tPhase' = [tPhase EXCEPT ![t] = "waiting_prealloc"]
-             /\ UNCHANGED <<segs, tFrame, tSwitchSeg, tSeq, nextSeq, emitted,
+             /\ UNCHANGED <<segs, tFrame, tSwitchSeg, tClearSeg, tSeq, nextSeq, emitted,
                             justReopened, mappedDropped, memDropped, mappedDroppedSet>>
           ELSE
              (* Non-blocking drop: no next segment ready, record drop in counter. *)
@@ -490,10 +497,10 @@ ReserveOffset(t) ==
                 ELSE /\ mappedDropped' = mappedDropped + 1
                      /\ mappedDroppedSet' = mappedDroppedSet \cup {ev}
                      /\ UNCHANGED memDropped
-             /\ UNCHANGED <<segs, tPhase, tFrame, tSwitchSeg>>
+             /\ UNCHANGED <<segs, tPhase, tFrame, tSwitchSeg, tClearSeg>>
     /\ UNCHANGED <<
         status, deleted, instance, nextSegId, lastCrash, switchViolation,
-        ring, queue, durableSegs, nextSegReady, durableNextSegReady,
+        ring, queue, durableSegs, nextSeg,
         durableDropped, persistedGap, durableGap, evictState,
         pendingEvictSegId, pendingEvictEvents, evictedOpenSeg, exitRecords,
         durableExitRecords, recoveredEvents, recoveredSeq, recoveredGap,
@@ -503,8 +510,9 @@ ReserveOffset(t) ==
         powerLostPrev, syncedInFlight, expectedInFlight
        >>
 
-(* "mmap" producer segment switch: CAS on current segment index; loser retries. *)
-SwitchSegment(t) ==
+(* "mmap" producer segment switch step 1: CAS on current segment index. *)
+(* Winner leaves next = current until ClearNext(t); loser retries. *)
+SwitchCurrent(t) ==
     /\ Design = "mmap"
     /\ status = "open"
     /\ ~deleted
@@ -512,34 +520,34 @@ SwitchSegment(t) ==
     /\ LET curIdx == Len(segs)
            curId == IF curIdx > 0 THEN segs[curIdx].id ELSE 0
        IN IF curId = tSwitchSeg[t] THEN
-             /\ nextSegReady
              /\ segs' = IF curIdx > 0
-                        THEN Append([segs EXCEPT ![curIdx].sealed = TRUE], EmptySeg(nextSegId))
-                        ELSE <<EmptySeg(nextSegId)>>
+                        THEN Append([segs EXCEPT ![curIdx].sealed = TRUE], EmptySeg(tClearSeg[t]))
+                        ELSE <<EmptySeg(tClearSeg[t])>>
              /\ nextSegId' = nextSegId + 1
-             /\ nextSegReady' = FALSE
-             /\ tPhase' = [tPhase EXCEPT ![t] = "idle"]
+             /\ tPhase' = [tPhase EXCEPT ![t] = "clearing_next"]
              /\ tSwitchSeg' = [tSwitchSeg EXCEPT ![t] = 0]
-             /\ UNCHANGED switchViolation
+             /\ UNCHANGED <<nextSeg, tClearSeg, switchViolation>>
           ELSE IF Mutant = "switch_without_cas" THEN
              /\ segs' = IF curIdx > 0
                         THEN Append([segs EXCEPT ![curIdx].sealed = TRUE], EmptySeg(nextSegId))
                         ELSE <<EmptySeg(nextSegId)>>
              /\ nextSegId' = nextSegId + 1
-             /\ nextSegReady' = FALSE
+             /\ nextSeg' = 0
              /\ switchViolation' = TRUE
              /\ tPhase' = [tPhase EXCEPT ![t] = "idle"]
              /\ tSwitchSeg' = [tSwitchSeg EXCEPT ![t] = 0]
+             /\ tClearSeg' = [tClearSeg EXCEPT ![t] = 0]
           ELSE
              (* CAS lost: another thread already switched; retry reservation in new segment. *)
              /\ tPhase' = [tPhase EXCEPT ![t] = "idle"]
              /\ tSwitchSeg' = [tSwitchSeg EXCEPT ![t] = 0]
-             /\ UNCHANGED <<segs, nextSegId, nextSegReady, switchViolation>>
+             /\ tClearSeg' = [tClearSeg EXCEPT ![t] = 0]
+             /\ UNCHANGED <<segs, nextSegId, nextSeg, switchViolation>>
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, lastCrash,
         tSeq, tFrame, ring, queue, durableSegs,
-        durableNextSegReady, mappedDropped, durableDropped,
+        mappedDropped, durableDropped,
         memDropped, persistedGap, durableGap, evictState, pendingEvictSegId,
         pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -547,6 +555,29 @@ SwitchSegment(t) ==
         committedBeforeTick, mappedDroppedSet, durableDroppedSet,
         persistedGapSet, durableGapSet, evictedDurableSet, powerLost,
         powerLostPrev, syncedInFlight, expectedInFlight
+       >>
+
+(* "mmap" producer segment switch step 2: CAS next from old value to null. *)
+ClearNext(t) ==
+    /\ Design = "mmap"
+    /\ status = "open"
+    /\ ~deleted
+    /\ tPhase[t] = "clearing_next"
+    /\ nextSeg' = IF nextSeg = tClearSeg[t] THEN 0 ELSE nextSeg
+    /\ tPhase' = [tPhase EXCEPT ![t] = "idle"]
+    /\ tClearSeg' = [tClearSeg EXCEPT ![t] = 0]
+    /\ justReopened' = "none"
+    /\ UNCHANGED <<
+        status, deleted, instance, nextSeq, nextSegId, lastCrash,
+        tSeq, tFrame, tSwitchSeg, switchViolation, ring, queue, segs, durableSegs,
+        mappedDropped, durableDropped, memDropped, persistedGap, durableGap,
+        evictState, pendingEvictSegId, pendingEvictEvents, evictedOpenSeg,
+        exitRecords, durableExitRecords, recoveredEvents, recoveredSeq,
+        recoveredGap, tornFound, diskFull, convLog, convExpected, emitted,
+        emittedBeforeTick, completedEvents, committedBeforeTick,
+        mappedDroppedSet, durableDroppedSet, persistedGapSet, durableGapSet,
+        evictedDurableSet, powerLost, powerLostPrev, syncedInFlight,
+        expectedInFlight
        >>
 
 (* "mmap" producer step 1b: write frame header (magic, length, header CRC). *)
@@ -563,8 +594,8 @@ WriteHeader(t) ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, nextSegId, lastCrash,
-        tSeq, tFrame, tSwitchSeg, switchViolation, ring, queue, durableSegs,
-        nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+        tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, ring, queue, durableSegs,
+        nextSeg, mappedDropped, durableDropped,
         memDropped, persistedGap, durableGap, evictState, pendingEvictSegId,
         pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -588,8 +619,8 @@ Copy(t) ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, nextSegId, lastCrash,
-        tSeq, tFrame, tSwitchSeg, switchViolation, ring, queue, durableSegs,
-        nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+        tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, ring, queue, durableSegs,
+        nextSeg, mappedDropped, durableDropped,
         memDropped, persistedGap, durableGap, evictState, pendingEvictSegId,
         pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -616,8 +647,8 @@ Commit(t) ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, nextSegId, lastCrash,
-        tSeq, tSwitchSeg, switchViolation, ring, queue, durableSegs,
-        nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+        tSeq, tSwitchSeg, tClearSeg, switchViolation, ring, queue, durableSegs,
+        nextSeg, mappedDropped, durableDropped,
         memDropped, persistedGap, durableGap, evictState, pendingEvictSegId,
         pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -628,18 +659,19 @@ Commit(t) ==
        >>
 
 (* "mmap" recorder thread pre-allocates the next segment ahead of producers. *)
+(* May run when next is null (0) or equals current (CurSegId), installing via CAS. *)
 Prealloc ==
     /\ Design = "mmap"
     /\ status = "open"
     /\ ~deleted
-    /\ ~nextSegReady
     /\ ~diskFull
-    /\ nextSegReady' = TRUE
+    /\ nextSeg \in {0, CurSegId}
+    /\ nextSeg' = nextSegId
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, nextSegId, lastCrash,
-        tPhase, tSeq, tFrame, tSwitchSeg, switchViolation, ring, queue, segs, durableSegs,
-        durableNextSegReady, mappedDropped, durableDropped,
+        tPhase, tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, ring, queue, segs, durableSegs,
+        mappedDropped, durableDropped,
         memDropped, persistedGap, durableGap, evictState, pendingEvictSegId,
         pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -694,8 +726,8 @@ EvictWriteGap ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, nextSegId, lastCrash,
-        tPhase, tSeq, tFrame, tSwitchSeg, switchViolation, ring, queue, durableSegs,
-        nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+        tPhase, tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, ring, queue, durableSegs,
+        nextSeg, mappedDropped, durableDropped,
         memDropped, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
         convLog, convExpected, emitted, emittedBeforeTick, completedEvents,
@@ -719,8 +751,8 @@ EvictDeleteSeg ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, nextSegId, lastCrash,
-        tPhase, tSeq, tFrame, tSwitchSeg, switchViolation, ring, queue, durableSegs,
-        nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+        tPhase, tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, ring, queue, durableSegs,
+        nextSeg, mappedDropped, durableDropped,
         memDropped, persistedGap, durableGap, pendingEvictEvents,
         exitRecords, durableExitRecords, recoveredEvents, recoveredSeq,
         recoveredGap, tornFound, diskFull, convLog, convExpected, emitted,
@@ -751,8 +783,8 @@ EvictFinishGap ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, nextSegId, lastCrash,
-        tPhase, tSeq, tFrame, tSwitchSeg, switchViolation, ring, queue, segs, durableSegs,
-        nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+        tPhase, tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, ring, queue, segs, durableSegs,
+        nextSeg, mappedDropped, durableDropped,
         memDropped, pendingEvictSegId, evictedOpenSeg, exitRecords,
         durableExitRecords, recoveredEvents, recoveredSeq, recoveredGap,
         tornFound, diskFull, convLog, convExpected, emitted,
@@ -771,7 +803,6 @@ Tick ==
     /\ status = "open"
     /\ ~deleted
     /\ \/ durableSegs # segs
-       \/ durableNextSegReady # nextSegReady
        \/ durableDropped # mappedDropped
        \/ durableGap # persistedGap
        \/ durableExitRecords # exitRecords
@@ -779,7 +810,6 @@ Tick ==
        \/ committedBeforeTick # completedEvents
        \/ syncedInFlight # InFlightEvents
     /\ durableSegs' = segs
-    /\ durableNextSegReady' = nextSegReady
     /\ durableDropped' = mappedDropped
     /\ durableDroppedSet' = mappedDroppedSet
     /\ durableGap' = persistedGap
@@ -791,7 +821,7 @@ Tick ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, nextSegId, lastCrash,
-        tPhase, tSeq, tFrame, tSwitchSeg, switchViolation, ring, queue, segs, nextSegReady,
+        tPhase, tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, ring, queue, segs, nextSeg,
         mappedDropped, memDropped, persistedGap, evictState,
         pendingEvictSegId, pendingEvictEvents, evictedOpenSeg, exitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound, diskFull,
@@ -800,34 +830,41 @@ Tick ==
         powerLostPrev, expectedInFlight
        >>
 
-(* Clean process exit: writes an exit record into the store when threads are idle. *)
+(* Clean process exit: writes an exit record and handles Writer.next. *)
+(* Mutant stop_discards_next discards next even if frames were written in it. *)
 CleanExit ==
     /\ status = "open"
     /\ ~deleted
-    /\ \A t \in Threads : tPhase[t] = "idle"
+    /\ \A t \in Threads : tPhase[t] \in {"idle", "clearing_next"}
     /\ status' = "exited"
     /\ lastCrash' = "clean"
     /\ justReopened' = "none"
+    /\ IdleThreads
     /\ evictState' = "idle"
     /\ pendingEvictSegId' = 0
     /\ pendingEvictEvents' = {}
     /\ queue' = <<>>
     /\ IF Design = "current"
        THEN /\ ring' = <<>>
-            /\ UNCHANGED exitRecords
+            /\ UNCHANGED <<segs, nextSeg, exitRecords>>
        ELSE /\ exitRecords' = exitRecords \cup {[inst |-> instance, kind |-> "clean"]}
+            /\ nextSeg' = 0
             /\ UNCHANGED ring
+            /\ IF Design = "mmap" /\ nextSeg # 0 /\ SegIdxById(segs, nextSeg) > 0
+               THEN LET idx == SegIdxById(segs, nextSeg)
+                    IN IF Mutant = "stop_discards_next" \/ Len(segs[idx].frames) = 0
+                       THEN segs' = RemoveSegAt(segs, idx)
+                       ELSE segs' = [segs EXCEPT ![idx].sealed = TRUE]
+               ELSE UNCHANGED segs
     /\ UNCHANGED <<
-        deleted, instance, nextSeq, nextSegId, tPhase, tSeq, tFrame,
-        tSwitchSeg, switchViolation, segs,
-        durableSegs, nextSegReady, durableNextSegReady, mappedDropped,
-        durableDropped, memDropped, persistedGap, durableGap, evictedOpenSeg,
-        durableExitRecords, recoveredEvents, recoveredSeq, recoveredGap,
-        tornFound, diskFull, convLog, convExpected, emitted,
-        emittedBeforeTick, completedEvents, committedBeforeTick,
-        mappedDroppedSet, durableDroppedSet, persistedGapSet, durableGapSet,
-        evictedDurableSet, powerLost, powerLostPrev, syncedInFlight,
-        expectedInFlight
+        deleted, instance, nextSeq, nextSegId, tSeq, switchViolation,
+        durableSegs, mappedDropped, durableDropped, memDropped, persistedGap,
+        durableGap, evictedOpenSeg, durableExitRecords, recoveredEvents,
+        recoveredSeq, recoveredGap, tornFound, diskFull, convLog,
+        convExpected, emitted, emittedBeforeTick, completedEvents,
+        committedBeforeTick, mappedDroppedSet, durableDroppedSet,
+        persistedGapSet, durableGapSet, evictedDurableSet, powerLost,
+        powerLostPrev, syncedInFlight, expectedInFlight
        >>
 
 (* ProcessCrash (kill -9): volatile memory is lost; page cache survives. *)
@@ -840,6 +877,7 @@ ProcessCrash ==
     /\ justReopened' = "none"
     /\ expectedInFlight' = InFlightEvents
     /\ IdleThreads
+    /\ nextSeg' = 0
     /\ evictState' = "idle"
     /\ pendingEvictSegId' = 0
     /\ pendingEvictEvents' = {}
@@ -848,7 +886,7 @@ ProcessCrash ==
     /\ memDropped' = 0
     /\ UNCHANGED <<
         deleted, instance, nextSeq, nextSegId, switchViolation, segs, durableSegs, tSeq,
-        nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+        mappedDropped, durableDropped,
         persistedGap, durableGap, evictedOpenSeg, exitRecords,
         durableExitRecords, recoveredEvents, recoveredSeq, recoveredGap,
         tornFound, diskFull, convLog, convExpected, emitted,
@@ -874,7 +912,7 @@ PowerLoss ==
     /\ queue' = <<>>
     /\ memDropped' = 0
     /\ segs' = durableSegs
-    /\ nextSegReady' = durableNextSegReady
+    /\ nextSeg' = 0
     /\ mappedDropped' = durableDropped
     /\ mappedDroppedSet' = durableDroppedSet
     /\ persistedGap' = durableGap
@@ -892,7 +930,7 @@ PowerLoss ==
           /\ completedEvents' = completedEvents \cap survivingDone
     /\ UNCHANGED <<
         deleted, instance, nextSeq, nextSegId, switchViolation, tSeq, durableSegs,
-        durableNextSegReady, durableDropped, durableGap, evictedOpenSeg,
+        durableDropped, durableGap, evictedOpenSeg,
         durableExitRecords, recoveredEvents, recoveredSeq, recoveredGap,
         tornFound, diskFull, convLog, convExpected, emitted,
         emittedBeforeTick, committedBeforeTick, durableDroppedSet,
@@ -918,7 +956,7 @@ Reopen ==
           /\ recoveredSeq' = <<>>
           /\ recoveredGap' = 0
           /\ tornFound' = {}
-          /\ UNCHANGED <<segs, durableSegs, nextSegReady, durableNextSegReady,
+          /\ UNCHANGED <<segs, durableSegs, nextSeg,
                          mappedDropped, durableDropped, mappedDroppedSet,
                          durableDroppedSet, persistedGap, durableGap,
                          persistedGapSet, durableGapSet, exitRecords,
@@ -939,8 +977,7 @@ Reopen ==
              /\ recoveredGap' = newGap
              /\ segs' = repaired
              /\ durableSegs' = repaired
-             /\ UNCHANGED nextSegReady
-             /\ durableNextSegReady' = nextSegReady
+             /\ nextSeg' = 0
              /\ mappedDropped' = 0
              /\ durableDropped' = 0
              /\ mappedDroppedSet' = {}
@@ -967,8 +1004,8 @@ DiskFull ==
     /\ justReopened' = "none"
     /\ UNCHANGED <<
         status, deleted, instance, nextSeq, nextSegId, lastCrash,
-        tPhase, tSeq, tFrame, tSwitchSeg, switchViolation, ring, queue, segs, durableSegs,
-        nextSegReady, durableNextSegReady, mappedDropped, durableDropped,
+        tPhase, tSeq, tFrame, tSwitchSeg, tClearSeg, switchViolation, ring, queue, segs, durableSegs,
+        nextSeg, mappedDropped, durableDropped,
         memDropped, persistedGap, durableGap, evictState, pendingEvictSegId,
         pendingEvictEvents, evictedOpenSeg, exitRecords, durableExitRecords,
         recoveredEvents, recoveredSeq, recoveredGap, tornFound,
@@ -990,8 +1027,7 @@ SessionDelete ==
     /\ queue' = <<>>
     /\ segs' = <<>>
     /\ durableSegs' = <<>>
-    /\ nextSegReady' = FALSE
-    /\ durableNextSegReady' = FALSE
+    /\ nextSeg' = 0
     /\ mappedDropped' = 0
     /\ durableDropped' = 0
     /\ memDropped' = 0
@@ -1026,7 +1062,8 @@ Next ==
     \/ \E t \in Threads : EmitQueue(t)
     \/ RecorderStep
     \/ \E t \in Threads : ReserveOffset(t)
-    \/ \E t \in Threads : SwitchSegment(t)
+    \/ \E t \in Threads : SwitchCurrent(t)
+    \/ \E t \in Threads : ClearNext(t)
     \/ \E t \in Threads : WriteHeader(t)
     \/ \E t \in Threads : Copy(t)
     \/ \E t \in Threads : Commit(t)
@@ -1051,9 +1088,10 @@ TypeOK ==
     /\ instance \in 1..MaxInstances
     /\ nextSeq \in Nat
     /\ nextSegId \in Nat
+    /\ nextSeg \in Nat
     /\ lastCrash \in {"none", "process", "power", "clean"}
     /\ justReopened \in {"none", "process", "power", "clean"}
-    /\ tPhase \in [Threads -> {"idle", "offset_reserved", "header_written", "copied", "switching", "waiting_prealloc"}]
+    /\ tPhase \in [Threads -> {"idle", "offset_reserved", "header_written", "copied", "switching", "clearing_next", "waiting_prealloc"}]
     /\ tSeq \in [Threads -> 0..MaxEvents]
     /\ switchViolation \in BOOLEAN
     /\ evictState \in {"idle", "gap_written", "deleted_awaiting_gap"}
@@ -1063,10 +1101,10 @@ TypeOK ==
     /\ convLog.status \in {"ok", "failed"}
     /\ convExpected \in 0..MaxConv
 
-\* R1 NoSilentLoss: after Reopen following a ProcessCrash, every emitted event
-\* is either in the recovered store or counted by a gap record.
+\* R1 NoSilentLoss: after Reopen following a ProcessCrash or CleanExit, every
+\* emitted event is either in the recovered store or counted by a gap record.
 NoSilentLoss ==
-    (~deleted /\ status = "open" /\ justReopened = "process") =>
+    (~deleted /\ status = "open" /\ justReopened \in {"process", "clean"}) =>
         /\ recoveredEvents \subseteq emitted
         /\ Cardinality((emitted \ powerLost) \ recoveredEvents) <= recoveredGap
 
@@ -1118,6 +1156,7 @@ DeleteRemovesAll ==
     deleted =>
         /\ segs = <<>>
         /\ durableSegs = <<>>
+        /\ nextSeg = 0
         /\ queue = <<>>
         /\ ring = <<>>
         /\ mappedDropped = 0

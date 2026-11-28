@@ -78,7 +78,9 @@ Precursor(o) ==
              /\ ReserveOffset(o.thread)
              /\ tPhase'[o.thread] # "idle"
           \/ /\ tPhase[o.thread] = "switching"
-             /\ SwitchSegment(o.thread)
+             /\ SwitchCurrent(o.thread)
+          \/ /\ tPhase[o.thread] = "clearing_next"
+             /\ ClearNext(o.thread)
           \/ /\ tPhase[o.thread] = "offset_reserved"
              /\ WriteHeader(o.thread)
           \/ /\ tPhase[o.thread] = "header_written"
@@ -100,7 +102,8 @@ Precursor(o) ==
              /\ Cardinality(emitted) < o.emittedMax
              /\ ReserveOffset("worker")
           \/ \E t \in Threads :
-                \/ SwitchSegment(t)
+                \/ SwitchCurrent(t)
+                \/ ClearNext(t)
                 \/ WriteHeader(t)
                 \/ Copy(t)
                 \/ Commit(t)

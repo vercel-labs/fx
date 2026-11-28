@@ -21,6 +21,12 @@ pub const startup_buffer_bytes: usize = 256 * 1024;
 
 pub const GapHook = *const fn (ctx: ?*anyopaque, gap_name: []const u8, seg_name: []const u8) void;
 
+/// Called by a switch winner after it sets `current` and before it clears `next`.
+pub const SwitchGapHook = *const fn (ctx: ?*anyopaque) void;
+
+/// Called by the recorder thread in `sealReadySegments` between its two loads of `current` and `next`.
+pub const SealScanHook = *const fn (ctx: ?*anyopaque) void;
+
 /// Recorder-thread steps that a test can make fail once.
 pub const FaultSite = enum { sync, evict, seal };
 
@@ -35,6 +41,8 @@ pub const Options = struct {
     fail_seal_for_test: bool = false,
     fault_once_for_test: ?FaultSite = null,
     on_gap_written_for_test: ?GapHook = null,
+    on_switch_gap_for_test: ?SwitchGapHook = null,
+    on_seal_scan_for_test: ?SealScanHook = null,
     test_ctx: ?*anyopaque = null,
 };
 
@@ -75,6 +83,8 @@ pub const Writer = struct {
     fail_seal_for_test: bool,
     fault_once_for_test: ?FaultSite,
     on_gap_written_for_test: ?GapHook,
+    on_switch_gap_for_test: ?SwitchGapHook,
+    on_seal_scan_for_test: ?SealScanHook,
     test_ctx: ?*anyopaque,
 
     current: std.atomic.Value(?*segment.Segment),
@@ -127,6 +137,8 @@ pub const Writer = struct {
             .fail_seal_for_test = options.fail_seal_for_test,
             .fault_once_for_test = options.fault_once_for_test,
             .on_gap_written_for_test = options.on_gap_written_for_test,
+            .on_switch_gap_for_test = options.on_switch_gap_for_test,
+            .on_seal_scan_for_test = options.on_seal_scan_for_test,
             .test_ctx = options.test_ctx,
             .current = .init(null),
             .next = .init(null),
@@ -217,6 +229,7 @@ pub const Writer = struct {
                 }
                 const next_seg = maybe_next.?;
                 if (self.current.cmpxchgStrong(seg, next_seg, .seq_cst, .acquire) == null) {
+                    if (self.on_switch_gap_for_test) |hook| hook(self.test_ctx);
                     _ = self.next.cmpxchgStrong(next_seg, null, .release, .monotonic);
                     self.wake();
                 }
@@ -386,7 +399,7 @@ pub const Writer = struct {
         if (self.current.load(.acquire) == null) {
             self.initFirstSegment();
         }
-        if (self.current.load(.acquire) != null and self.next.load(.acquire) == null and !self.stopping.load(.acquire) and !self.over_cap.load(.acquire)) {
+        if (self.current.load(.acquire) != null and !self.stopping.load(.acquire) and !self.over_cap.load(.acquire)) {
             self.prepareNextSegment();
         }
         self.sealReadySegments();
@@ -478,9 +491,28 @@ pub const Writer = struct {
         if (stale_buf) |buf| self.gpa.free(buf);
     }
 
+    /// `next` is ready when it is set and is not `current`. A switch winner sets `current` first and
+    /// clears `next` later, so `next == current` means that switch has not finished yet.
     fn prepareNextSegment(self: *Writer) void {
-        const seg = self.createNextSegment() orelse return;
-        self.next.store(seg, .release);
+        while (true) {
+            const observed = self.next.load(.acquire);
+            if (observed) |ready_or_stale| {
+                if (ready_or_stale != self.current.load(.acquire)) return;
+            }
+            const seg = self.createNextSegment() orelse return;
+            if (self.next.cmpxchgStrong(observed, seg, .release, .acquire) == null) return;
+            // The winner cleared `next` between the load and the install, so install again.
+            self.discardCreatedSegment(seg);
+        }
+    }
+
+    /// Removes a segment that `createNextSegment` just made but could not install. Its index is free again.
+    fn discardCreatedSegment(self: *Writer, seg: *segment.Segment) void {
+        const last = self.open_segments.items.len - 1;
+        std.debug.assert(self.open_segments.items[last] == seg);
+        _ = self.open_segments.orderedRemove(last);
+        self.next_index -= 1;
+        seg.discardUnsealed(self.gpa);
     }
 
     fn drainPinEpoch(self: *Writer) bool {
@@ -491,8 +523,13 @@ pub const Writer = struct {
     }
 
     fn sealReadySegments(self: *Writer) void {
-        const cur = self.current.load(.acquire);
-        const nxt = self.next.load(.acquire);
+        // `next` is loaded before `current`. Only this thread installs `next`, and it did so earlier in this tick,
+        // so a segment that becomes `current` after the `current` load was already `next` at the `next` load and is
+        // skipped as `nxt`. A segment that is neither can never be acquired again; the drain covers producers that
+        // acquired it earlier.
+        const nxt = self.next.load(.seq_cst);
+        if (self.on_seal_scan_for_test) |hook| hook(self.test_ctx);
+        const cur = self.current.load(.seq_cst);
         if (!self.drainPinEpoch()) return;
 
         var idx: usize = 0;
@@ -528,12 +565,13 @@ pub const Writer = struct {
         }
 
         for (self.open_segments.items) |seg| {
-            if (next_seg != null and seg == next_seg.?) {
-                seg.discardUnsealed(self.gpa);
-                continue;
-            }
             while (!seg.canSeal()) {
                 std.atomic.spinLoopHint();
+            }
+            // A switch that stopped between its two stores leaves the current segment as `next`, so only an empty one is discarded.
+            if (next_seg != null and seg == next_seg.? and reservedCount(seg) == 0) {
+                seg.discardUnsealed(self.gpa);
+                continue;
             }
             // A failed seal keeps the .open file, which readers treat as unfinished, and its frames stay readable.
             self.sealOne(seg) catch {
@@ -668,6 +706,11 @@ pub const Writer = struct {
         return .{ .events = events, .frames = res.frames.items.len };
     }
 };
+
+/// Frames reserved in a segment, overflowed reservations included. Zero means nothing was written to it.
+fn reservedCount(seg: *segment.Segment) u32 {
+    return format.unpackCursor(seg.cursorPtr().load(.acquire)).count;
+}
 
 fn nowMonoNs(io: std.Io) u64 {
     return std.math.cast(u64, std.Io.Clock.boot.now(io).toNanoseconds()) orelse 0;

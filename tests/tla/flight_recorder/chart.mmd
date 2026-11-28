@@ -1,8 +1,9 @@
 %% Always-on mmap flight recorder lifecycle (FlightRecorder.tla, design-mmap).
-%% design-mmap passes all invariants (R1-R8, EvictOnlySealed, OneSwitchPerSegment) across 28,265,893 distinct states.
+%% design-mmap passes all invariants (R1-R8, EvictOnlySealed, OneSwitchPerSegment) across 16,608,533 distinct states.
 stateDiagram-v2
     state "Session open, producers idle" as Open
-    state "Switching full segment (CAS pending)" as Switching
+    state "Switching full segment (current CAS pending)" as Switching
+    state "Switched current, clearing next pointer" as ClearingNext
     state "Slot offset reserved (zero hole)" as OffsetReserved
     state "Frame header written" as HeaderWritten
     state "Payload copied to page cache" as Copied
@@ -12,18 +13,22 @@ stateDiagram-v2
     state "Session deleted" as Deleted
 
     [*] --> Open : start fx session
-    Open --> Switching : segment full and next segment ready
-    Switching --> Open : CAS wins (seal and open next) or loses (retry in new segment)
+    Open --> Switching : segment full and distinct next segment ready
+    Switching --> ClearingNext : CAS wins on current (next equals current)
+    Switching --> Open : CAS loses on current (retry in new segment)
+    ClearingNext --> Open : CAS clears next to null (or leaves newer prealloc)
     Open --> OffsetReserved : producer reserves offset by atomic add
     OffsetReserved --> HeaderWritten : producer writes magic, length, and header CRC
     HeaderWritten --> Copied : producer copies event bytes
     Copied --> Open : producer writes commit word
-    Open --> Open : segment full without next ready (drop counted), prealloc, msync, or chat turn
+    Open --> Open : drop without next ready, prealloc (next null or current), msync, or chat turn
     Open --> Evicting : segments above cap (write durable gap record first)
     Evicting --> Open : delete oldest sealed segment (no reserved frame inside)
-    Open --> Exited : fx exits cleanly (writes exit record)
+    Open --> Exited : fx exits cleanly (seals non-empty next, discards empty next)
+    ClearingNext --> Exited : fx exits cleanly (seals if another thread wrote frames)
     Open --> Down : kill -9 or power loss
     Switching --> Down : kill -9 or power loss before slot reserved
+    ClearingNext --> Down : kill -9 or power loss before next cleared
     OffsetReserved --> Down : kill -9 or power loss (leaves zero hole)
     HeaderWritten --> Down : kill -9 or power loss mid-write
     Copied --> Down : kill -9 or power loss mid-write
@@ -42,7 +47,8 @@ stateDiagram-v2
 %% - current-reset breaks NoSilentLoss (R1): Open -> emit to ring -> kill -9 -> reopen (4 states).
 %% - mutant-no-length-header breaks TornOnlyInFlight (R3): Open -> ReserveOffset -> WriteHeader (no length) -> ReserveOffset/WriteHeader/Copy/Commit (other thread) -> kill -9 -> reopen.
 %% - mutant-no-resync breaks NoSilentLoss (R1): Open -> ReserveOffset (t1) -> ReserveOffset (t2) -> kill -9 -> reopen stops at first hole (5 states).
-%% - mutant-switch-without-cas breaks OneSwitchPerSegment: Open -> ReserveOffset -> Prealloc -> kill -9 -> reopen -> ReserveOffset (t1) -> ReserveOffset (t2) -> SwitchSegment (t2) -> SwitchSegment (t1) opens second successor (9 states).
+%% - mutant-switch-without-cas breaks OneSwitchPerSegment: Open -> ReserveOffset -> kill -9 -> reopen -> Prealloc -> ReserveOffset (t1) -> ReserveOffset (t2) -> SwitchCurrent (t2) -> SwitchCurrent (t1) opens second successor (9 states).
+%% - mutant-stop-discards-next breaks NoSilentLoss (R1): fill seg 1 -> Prealloc -> SwitchCurrent (t1, next=seg2) -> ReserveOffset/WriteHeader/Copy/Commit (t2 in seg2) -> CleanExit discards next -> reopen (19 states).
 %% - mutant-counter-in-memory breaks NoSilentLoss (R1): Open -> fill segment -> drop in memory -> kill -9 -> reopen.
 %% - mutant-wait-for-prealloc breaks UiNeverWaitsOnDisk (R7): Open -> ReserveOffset -> kill -9 -> reopen -> UI waits on prealloc.
 %% - mutant-no-exit-mark breaks InstanceEndKnown (R5): Open -> kill -9 -> reopen (3 states).

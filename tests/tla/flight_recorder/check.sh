@@ -1,7 +1,7 @@
 #!/bin/sh
 # Model-check FlightRecorder.tla across the three designs ("current", "queue",
-# "mmap"), nine planted mmap mutants (including reservation hole resync, segment
-# switch CAS, and size-cap eviction), and ideal/non-ideal simulations.
+# "mmap"), ten planted mmap mutants (including reservation hole resync, segment
+# switch CAS, stop-discards-next, and size-cap eviction), and ideal/non-ideal simulations.
 #
 # design-mmap must pass every invariant (R1-R8, EvictOnlySealed, and OneSwitchPerSegment).
 # design-queue, current-ring, current-reset, and each mutant-* config must fail
@@ -24,6 +24,7 @@ FlightRecorder current-reset NoSilentLoss
 FlightRecorder mutant-no-length-header TornOnlyInFlight
 FlightRecorder mutant-no-resync NoSilentLoss
 FlightRecorder mutant-switch-without-cas OneSwitchPerSegment
+FlightRecorder mutant-stop-discards-next NoSilentLoss
 FlightRecorder mutant-counter-in-memory NoSilentLoss
 FlightRecorder mutant-wait-for-prealloc UiNeverWaitsOnDisk
 FlightRecorder mutant-no-exit-mark InstanceEndKnown

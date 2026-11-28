@@ -22,6 +22,8 @@ pub const Options = struct {
     fail_seal_for_test: bool = false,
     fault_once_for_test: ?writer.FaultSite = null,
     on_gap_written_for_test: ?writer.GapHook = null,
+    on_switch_gap_for_test: ?writer.SwitchGapHook = null,
+    on_seal_scan_for_test: ?writer.SealScanHook = null,
     test_ctx: ?*anyopaque = null,
 };
 
@@ -53,6 +55,8 @@ pub const Recorder = struct {
             .fail_seal_for_test = options.fail_seal_for_test,
             .fault_once_for_test = options.fault_once_for_test,
             .on_gap_written_for_test = options.on_gap_written_for_test,
+            .on_switch_gap_for_test = options.on_switch_gap_for_test,
+            .on_seal_scan_for_test = options.on_seal_scan_for_test,
             .test_ctx = options.test_ctx,
         });
         return self;
@@ -162,12 +166,18 @@ fn minSealedSegments(events: usize, payload_len: usize, segment_bytes: usize) us
 
 const max_next_segment_yields: usize = 10_000_000;
 
+/// `next` is ready when it is set and is not `current`: during a switch, `next == current` until the winner clears it.
+fn nextSegmentReady(rec: *Recorder) bool {
+    const next = rec.inner.next.load(.acquire) orelse return false;
+    return next != rec.inner.current.load(.acquire);
+}
+
 /// Called by a producer before each emit. It yields while the recorder has no next segment ready,
 /// so no producer fills a segment before the recorder can switch to the next one. The yield count
 /// is bounded: a recorder that never prepares one lets the test return and fail on its drop count.
 fn yieldUntilNextSegmentReady(rec: *Recorder) void {
     var yields: usize = 0;
-    while (rec.inner.next.load(.acquire) == null and yields < max_next_segment_yields) : (yields += 1) {
+    while (!nextSegmentReady(rec) and yields < max_next_segment_yields) : (yields += 1) {
         // A failed yield only skips a scheduling hint, so the producer does not depend on it.
         std.Thread.yield() catch {};
     }
@@ -703,6 +713,195 @@ test "a session cap below three segments is refused at start" {
         .max_session_bytes = 3 * 4096,
     });
     rec.stop();
+}
+
+const switch_pause_segment_bytes: usize = 4096;
+/// Frames of a 32-byte payload that fit in a 4096-byte segment: (4096 - 64) / 88 rounded down.
+const switch_pause_frames_per_segment: usize = 45;
+const switch_pause_events: usize = 60;
+const switch_pause_main_events: usize = 5;
+
+/// Holds the first switch winner between its two stores until the test releases it.
+const SwitchPause = struct {
+    consumed: std.atomic.Value(bool) = .init(false),
+    paused: std.atomic.Value(bool) = .init(false),
+    released: std.atomic.Value(bool) = .init(false),
+
+    fn holdFirstSwitch(ctx: ?*anyopaque) void {
+        const self: *SwitchPause = @ptrCast(@alignCast(ctx.?));
+        if (self.consumed.swap(true, .acq_rel)) return;
+        self.paused.store(true, .release);
+        while (!self.released.load(.acquire)) {
+            // A failed yield only skips a scheduling hint, so the pause does not depend on it.
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+const EmitWorker = struct {
+    fn run(rec: *Recorder, count: usize) void {
+        for (0..count) |_| rec.emit(1, 1, "0123456789abcdef0123456789abcdef");
+    }
+};
+
+fn stopWriter(w: *writer.Writer) void {
+    w.stop();
+}
+
+fn waitForFlag(flag: *const std.atomic.Value(bool)) !void {
+    while (!flag.load(.acquire)) try std.Thread.yield();
+}
+
+test "a switch paused before its next store still lets the recorder prepare the successor" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var pause: SwitchPause = .{};
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x510B,
+        .segment_bytes = switch_pause_segment_bytes,
+        .sync_interval_ms = 5000,
+        .on_switch_gap_for_test = SwitchPause.holdFirstSwitch,
+        .test_ctx = &pause,
+    });
+    while (rec.inner.next.load(.acquire) == null) try std.Thread.yield();
+    // The first tick may still be finishing its seal and sync steps, so wait for it to end before the paused tick.
+    try waitForTicks(rec, 1);
+
+    const worker = try std.Thread.spawn(.{}, EmitWorker.run, .{ rec, switch_pause_events });
+    errdefer {
+        pause.released.store(true, .release);
+        worker.join();
+        rec.stop();
+    }
+    try waitForFlag(&pause.paused);
+    try tickAndWait(rec);
+
+    const current = rec.inner.current.load(.acquire) orelse return error.NoCurrentSegment;
+    const next = rec.inner.next.load(.acquire) orelse return error.NoNextSegment;
+    try testing.expect(next != current);
+
+    pause.released.store(true, .release);
+    worker.join();
+    const stats = rec.stats();
+    rec.stop();
+
+    const totals = try totalSegments(tmp.dir);
+    try testing.expectEqual(@as(u64, switch_pause_events), totals.frames + totals.dropped + stats.startup_dropped);
+}
+
+test "stopping while a switch is paused before its next store keeps the current segment's frames" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var pause: SwitchPause = .{};
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x510C,
+        .segment_bytes = switch_pause_segment_bytes,
+        .sync_interval_ms = 5000,
+        .on_switch_gap_for_test = SwitchPause.holdFirstSwitch,
+        .test_ctx = &pause,
+    });
+    while (rec.inner.next.load(.acquire) == null) try std.Thread.yield();
+
+    const worker = try std.Thread.spawn(.{}, EmitWorker.run, .{ rec, switch_pause_events });
+    try waitForFlag(&pause.paused);
+    for (0..switch_pause_main_events) |_| {
+        rec.emit(1, 2, "0123456789abcdef0123456789abcdef");
+    }
+
+    // The stop takes `next` out, then waits for the paused switch to finish with its segment.
+    const stopper = try std.Thread.spawn(.{}, stopWriter, .{&rec.inner});
+    while (rec.inner.next.load(.acquire) != null) try std.Thread.yield();
+    pause.released.store(true, .release);
+    worker.join();
+    stopper.join();
+
+    const stats = rec.stats();
+    testing.allocator.destroy(rec);
+
+    const totals = try totalSegments(tmp.dir);
+    try testing.expectEqual(
+        @as(u64, switch_pause_events + switch_pause_main_events),
+        totals.frames + totals.dropped + stats.startup_dropped,
+    );
+}
+
+/// Holds the recorder inside `sealReadySegments`, between its two loads, once the test arms it.
+const ScanPause = struct {
+    armed: std.atomic.Value(bool) = .init(false),
+    paused: std.atomic.Value(bool) = .init(false),
+    released: std.atomic.Value(bool) = .init(false),
+
+    fn holdArmedScan(ctx: ?*anyopaque) void {
+        const self: *ScanPause = @ptrCast(@alignCast(ctx.?));
+        if (!self.armed.load(.acquire)) return;
+        if (self.paused.swap(true, .acq_rel)) return;
+        while (!self.released.load(.acquire)) {
+            // A failed yield only skips a scheduling hint, so the pause does not depend on it.
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+fn fileExists(dir: std.Io.Dir, name: []const u8) bool {
+    _ = dir.statFile(testing.io, name, .{}) catch return false;
+    return true;
+}
+
+test "a seal scan never seals the segment a switch made current between its two loads" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const instance: u64 = 0x510D;
+    var pause: ScanPause = .{};
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = instance,
+        .segment_bytes = switch_pause_segment_bytes,
+        .sync_interval_ms = 5000,
+        .on_seal_scan_for_test = ScanPause.holdArmedScan,
+        .test_ctx = &pause,
+    });
+    while (rec.inner.next.load(.acquire) == null) try std.Thread.yield();
+    try waitForTicks(rec, 1);
+
+    const ticks_before_scan = rec.inner.tick_count.load(.acquire);
+    pause.armed.store(true, .release);
+    rec.inner.wake();
+    try waitForFlag(&pause.paused);
+
+    // This thread's emits fill segment 0 and switch to the prepared segment 1 while the recorder is held.
+    for (0..switch_pause_frames_per_segment + 1) |_| {
+        rec.emit(1, 1, "0123456789abcdef0123456789abcdef");
+    }
+    pause.released.store(true, .release);
+    try waitForTicks(rec, ticks_before_scan + 1);
+
+    var open_name_buf: [segment.name_buf_bytes]u8 = undefined;
+    const current_open_name = segment.openFileName(&open_name_buf, instance, 1);
+    if (!fileExists(tmp.dir, current_open_name)) {
+        // Stop before any emit: the segment is already sealed and unmapped, so writing to it would crash.
+        rec.stop();
+        return error.CurrentSegmentSealed;
+    }
+
+    for (0..switch_pause_main_events) |_| {
+        rec.emit(1, 2, "0123456789abcdef0123456789abcdef");
+    }
+    const stats = rec.stats();
+    rec.stop();
+
+    const totals = try totalSegments(tmp.dir);
+    try testing.expectEqual(
+        @as(u64, switch_pause_frames_per_segment + 1 + switch_pause_main_events),
+        totals.frames + totals.dropped + stats.startup_dropped,
+    );
 }
 
 test "a recorder whose io cannot run concurrent tasks fails to start and frees its buffers" {
