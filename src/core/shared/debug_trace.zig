@@ -424,6 +424,10 @@ fn writeLine(line: []const u8) void {
 }
 
 fn appendLineToFile(zio: std.Io, path: []const u8, line: []const u8) void {
+    // The open and the write are cancelation points that drop the line on `error.Canceled` and use up the cancel
+    // meant for the calling task; blocked, the cancel waits for the task's next cancelation point.
+    const before = zio.swapCancelProtection(.blocked);
+    defer _ = zio.swapCancelProtection(before);
     var file = io_mod.openRegularFileForAppendAbsolute(path, .follow) catch return;
     defer file.close(zio);
     file.lock(zio, .exclusive) catch return;
@@ -881,4 +885,119 @@ test "trace append refuses a FIFO that replaces the log after startup" {
     // Returns at once; a blocking open here would stall every thread that logs.
     logf("test", "lost", .{});
     try std.testing.expect(isEnabled());
+}
+
+var cancel_gate_ready: std.atomic.Value(bool) = .init(false);
+var cancel_gate_open: std.atomic.Value(bool) = .init(false);
+
+/// Waits, without any Io call, until the test has asked this task to cancel,
+/// then writes a trace line and checks for the cancel.
+fn logWhileCancelRequested(io: std.Io) error{Canceled}!void {
+    cancel_gate_ready.store(true, .release);
+    // A failed yield only makes this spin tighter; the loop still ends when the gate opens.
+    while (!cancel_gate_open.load(.acquire)) std.Thread.yield() catch {};
+    logf("test", "written while a cancel is pending", .{});
+    try io.checkCancel();
+}
+
+fn openCancelGateSoon(io: std.Io) void {
+    // Nothing cancels this task, and a sleep that failed would only open the gate sooner, which the test then reports.
+    io.sleep(.fromMilliseconds(100), .awake) catch {};
+    cancel_gate_open.store(true, .release);
+}
+
+test "a trace line is written and does not take the cancel that its task is waiting for" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const path = try tmpPath(alloc, root, "cancel-trace.log");
+    defer alloc.free(path);
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTest(alloc, path);
+
+    cancel_gate_ready.store(false, .release);
+    cancel_gate_open.store(false, .release);
+    var task = try io.concurrent(logWhileCancelRequested, .{io});
+    while (!cancel_gate_ready.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    // The timer starts once the task is waiting: a task that took more than its 100 ms to start would find the gate
+    // open before the cancel was asked for, and end without one.
+    var opener = try io.concurrent(openCancelGateSoon, .{io});
+    // The cancel is requested while the task is between Io calls, so it is delivered at the first Io call after
+    // the gate opens: the trace write on an unprotected logger, the task's own check on a protected one.
+    const result = task.cancel(io);
+    opener.await(io);
+    try std.testing.expectError(error.Canceled, result);
+
+    const trace = try readFileForTest(alloc, path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "[test] written while a cancel is pending") != null);
+}
+
+/// The cancel protection that the task has after a trace line, when it had `before` ahead of it.
+fn protectionAfterLog(io: std.Io, before: std.Io.CancelProtection) std.Io.CancelProtection {
+    const original = io.swapCancelProtection(before);
+    defer _ = io.swapCancelProtection(original);
+    logf("test", "protection is {s}", .{@tagName(before)});
+    return io.swapCancelProtection(before);
+}
+
+test "a trace line leaves the task's cancel protection as it found it" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const path = try tmpPath(alloc, root, "protection-trace.log");
+    defer alloc.free(path);
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTest(alloc, path);
+
+    inline for (.{ std.Io.CancelProtection.unblocked, std.Io.CancelProtection.blocked }) |before| {
+        var task = try io.concurrent(protectionAfterLog, .{ io, before });
+        try std.testing.expectEqual(before, task.await(io));
+    }
+}
+
+const cancel_wait_limit_ms: i64 = 3000;
+const cancel_after_ms: i64 = 20;
+// A cancel that lands just as a trace write ends is still found by the task's next check, so a single round passes
+// on an unprotected logger now and then; five rounds make that pass negligible.
+const cancel_rounds = 5;
+
+fn logUntilCanceled(io: std.Io) error{ Canceled, NeverCanceled }!void {
+    const started_ms = io_mod.milliTimestamp();
+    while (io_mod.milliTimestamp() - started_ms < cancel_wait_limit_ms) {
+        logf("test", "still running", .{});
+        try io.checkCancel();
+    }
+    return error.NeverCanceled;
+}
+
+test "a cancel that arrives while a task writes trace lines reaches the task" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const path = try tmpPath(alloc, root, "loop-trace.log");
+    defer alloc.free(path);
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTest(alloc, path);
+
+    for (0..cancel_rounds) |_| {
+        var task = try io.concurrent(logUntilCanceled, .{io});
+        try io.sleep(.fromMilliseconds(cancel_after_ms), .awake);
+        try std.testing.expectError(error.Canceled, task.cancel(io));
+    }
 }
