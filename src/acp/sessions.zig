@@ -421,13 +421,13 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         defer alloc.free(message);
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = message });
     }
-    if (!state.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
+    if (!state.cfg.allowsAcpMcp() and mcp_configs.items.items.len > 0) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "MCP servers are unavailable in this runtime",
         });
     }
-    if (state.cfg.allow_acp_mcp) {
+    if (state.cfg.allowsAcpMcp()) {
         try appendMcpConfigs(state, alloc, msg.params_raw, workspace_root, &mcp_configs);
     }
     var mcp_preparation = try mcp_servers.prepare(
@@ -808,7 +808,7 @@ fn handleRestoreSession(
         defer alloc.free(message);
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = message });
     }
-    if (!state.cfg.allow_acp_mcp) {
+    if (!state.cfg.allowsAcpMcp()) {
         if (mcp_configs.items.items.len > 0) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,

@@ -12,6 +12,11 @@
 // libfx agents never run (builtin_tools in build.zig). Their code would add
 // about 0.8 MB to an addon, less than a budget's headroom.
 //
+// It also checks that fx-core.wasm and each addon leave out text that only
+// the full ACP kernel, which `fx acp` runs, uses. libfx builds its kernel
+// switches as constants (libfx_kernel in build.zig), so the branches that
+// hold that text are not compiled in.
+//
 //   node sdk/tests/test-package-size.mjs <libfx.tgz> --native-dir <dir> [--print]
 //
 // --print prints the measured sizes as budgets JSON instead of checking them.
@@ -27,6 +32,18 @@ const tarball = resolve(process.argv[2] ?? "");
 const nativeDir = nativeDirArgument();
 assert.ok(nativeDir, "usage: test-package-size.mjs <libfx.tgz> --native-dir <dir> [--print]");
 const budgets = JSON.parse(await readFile(new URL("./package-size-budgets.json", import.meta.url), "utf8"));
+// Each text must still be in its source file, so the check can't pass only
+// because a message was reworded.
+const fullKernelOnly = [
+  { text: "Blocked by the content filter. Change your request and send it again.", source: "src/acp/prompt.zig" },
+  { text: "Steering prompt text exceeds the 64 KiB limit", source: "src/acp/server.zig" },
+  { text: "cwd must name an existing directory", source: "src/acp/workspace_binding.zig" },
+];
+for (const { text, source } of fullKernelOnly) {
+  const code = await readFile(new URL(`../../${source}`, import.meta.url), "utf8");
+  assert.ok(code.includes(text), `${source} no longer contains "${text}"; use other text that only the full kernel uses`);
+}
+const withFullKernel = [];
 
 async function unpackedBytes(dir) {
   let total = 0;
@@ -54,6 +71,8 @@ try {
   for (const file of ["engine.js", "wasm-runtime.js", "fx-sdk.js"]) {
     measured[file] = { gzip: gzipSync(await readFile(join(libfx.dir, file)), { level: 9 }).length };
   }
+  const coreWasm = await readFile(join(libfx.dir, "fx-core.wasm"));
+  for (const { text } of fullKernelOnly) if (coreWasm.includes(text)) withFullKernel.push(`fx-core.wasm: "${text}"`);
 } finally {
   await rm(libfx.dir, { recursive: true, force: true });
 }
@@ -94,12 +113,14 @@ for (const [name, path] of Object.entries(nativeTarballs(nativeDir))) {
   const frames = frameRecordSetups(addon, name);
   if (frames < 1000) miscompiled.push(`${name}: only ${frames} functions set up a frame record`);
   for (const text of toolDescriptions) if (addon.includes(text)) withTools.push(`${name}: "${text}"`);
+  for (const { text } of fullKernelOnly) if (addon.includes(text)) withFullKernel.push(`${name}: "${text}"`);
   if (addon.includes("FX_TRACE_SCOPES")) withTrace.push(name);
   await rm(platform.dir, { recursive: true, force: true });
 }
 assert.deepEqual(miscompiled, [], `a native addon was built with the wrong code generation settings; see addNapiArtifact in build.zig:\n${miscompiled.join("\n")}`);
 assert.deepEqual(withTrace, [], `a native addon contains the trace log's environment settings; build it with trace_log false:\n${withTrace.join("\n")}`);
 assert.deepEqual(withTools, [], `a native addon contains fx's built-in tools; build it with builtin_tools false:\n${withTools.join("\n")}`);
+assert.deepEqual(withFullKernel, [], `libfx holds code that only the full ACP kernel runs; build it with libfx_kernel true:\n${withFullKernel.join("\n")}`);
 
 if (process.argv.includes("--print")) {
   console.log(JSON.stringify(measured, null, 2));

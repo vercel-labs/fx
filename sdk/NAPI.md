@@ -143,7 +143,7 @@ These cases have dedicated tests. Any lifecycle change must preserve all four.
 
 ## Capability profile
 
-The native core is intentionally more restricted than the native `fx` CLI. Its ACP server configuration sets:
+The native core is intentionally more restricted than the native `fx` CLI. It runs libfx's ACP kernel, built with these settings as constants (`libfx_kernel` in `build.zig`), so the code they turn off is not compiled in:
 
 - `allow_native_tools = false`;
 - `allow_acp_mcp = false`;

@@ -591,7 +591,7 @@ const AcpContext = struct {
         if (card != .awaiting_provider_terminal) return;
         const status = providerTerminalStatus(outcome.kind) orelse return;
 
-        const detail = if (self.state.cfg.minimal_kernel) result else null;
+        const detail = if (self.state.cfg.minimalKernel()) result else null;
         switch (status) {
             .completed => try self.sendToolCallCompletedWithCommandResult(tool_call_id, detail orelse "Web search completed", null),
             .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, detail orelse "Web search failed", null),
@@ -1711,7 +1711,7 @@ pub fn handlePromptWithInputId(
             commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input) catch |commit_err| {
                 debug_trace.logf("session", "event=libfx_journal_interrupted_commit_failed err={s}", .{@errorName(commit_err)});
             };
-        } else if (refusesAfterContentFilter(err, ctx.content_filter_blocked, state.cfg.minimal_kernel)) {
+        } else if (refusesAfterContentFilter(err, ctx.content_filter_blocked, state.cfg.minimalKernel())) {
             // The turn ends as a failed one does, but the client gets a
             // refusal it can show instead of an error.
             ctx.refuseAfterContentFilter();
@@ -1738,7 +1738,7 @@ pub fn handlePromptWithInputId(
     try sessions.sendActiveSessionUsageUpdate(state, alloc);
 
     // A steer's interrupt the turn finished before reaching is not a cancel.
-    if (state.cfg.minimal_kernel) server.releaseSteeringInterrupt(state);
+    if (state.cfg.minimalKernel()) server.releaseSteeringInterrupt(state);
     if (session.cancel_flag.load(.seq_cst)) {
         ctx.stop_reason = .cancelled;
     }
@@ -2015,7 +2015,7 @@ fn buildAgentConfig(
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
-        .enforce_response_language = !state.cfg.minimal_kernel,
+        .enforce_response_language = !state.cfg.minimalKernel(),
         .context_limits = state.context_limits,
     };
 }
@@ -2493,7 +2493,7 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
 /// its sessions' lifetimes, so its kernel sends no requests of its own.
 fn acpCacheWarmer(state: *server.ServerState, session: *server.ActiveSessionState) ?*@import("../core/agent/runtime/cache_warmer.zig").Warmer {
     if (comptime @import("builtin").is_test or host_target.is_wasm) return null;
-    if (state.cfg.minimal_kernel or !state.cache_warming) return null;
+    if (state.cfg.minimalKernel() or !state.cache_warming) return null;
     return session.session_rt.cacheWarmer();
 }
 
@@ -2629,7 +2629,7 @@ fn takeSteeringBoundary(
         }
         return if (kind == .cancelled) .interrupt else .none;
     }
-    const kernel = ctx.state.cfg.minimal_kernel;
+    const kernel = ctx.state.cfg.minimalKernel();
     if (kind == .cancelled and !kernel) return .interrupt;
     if (kind == .cancelled) {
         // A user cancel ends the turn, and so does a handoff's interrupt.
@@ -3760,7 +3760,7 @@ fn runReportTurns(
                 ctx.stop_reason = .refused;
                 return null;
             }
-            if (refusesAfterContentFilter(err, ctx.content_filter_blocked, state.cfg.minimal_kernel)) {
+            if (refusesAfterContentFilter(err, ctx.content_filter_blocked, state.cfg.minimalKernel())) {
                 ctx.refuseAfterContentFilter();
                 return null;
             }
@@ -4035,7 +4035,7 @@ fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
         .clear_route_recovery_status => try ctx.clearModelRecoveryStatus(),
         // A libfx steer cuts a streaming reply short, as in the fx CLI, but
         // waits once the model streams a tool call's arguments.
-        .turn_phase_update => |update| if (ctx.state.cfg.minimal_kernel) {
+        .turn_phase_update => |update| if (ctx.state.cfg.minimalKernel()) {
             server.noteSteeringPhase(ctx.state, update.step_id, switch (update.phase) {
                 .thinking, .generating => .reply,
                 .running, .waiting_for_subagent => .tools,
@@ -4084,7 +4084,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
     switch (event) {
         .provisional => |provisional| {
             // A tool call the model announced is no reply a steer cuts short.
-            if (ctx.state.cfg.minimal_kernel) server.noteSteeringToolsPhase(ctx.state);
+            if (ctx.state.cfg.minimalKernel()) server.noteSteeringToolsPhase(ctx.state);
             const tool_name = provisional.tool_name orelse return;
             if (!tool_presentation.isProviderSearchAlias(tool_name)) return;
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
@@ -4097,7 +4097,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             });
         },
         .authoritative_started => |started| {
-            if (ctx.state.cfg.minimal_kernel) server.noteSteeringTool(ctx.state, started.id.call_id, true);
+            if (ctx.state.cfg.minimalKernel()) server.noteSteeringTool(ctx.state, started.id.call_id, true);
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena_state.deinit();
             _ = try ctx.sendToolCallPending(arena_state.allocator(), .{
@@ -4108,7 +4108,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             });
         },
         .terminal => |terminal| {
-            if (ctx.state.cfg.minimal_kernel) server.noteSteeringTool(ctx.state, terminal.id.call_id, false);
+            if (ctx.state.cfg.minimalKernel()) server.noteSteeringTool(ctx.state, terminal.id.call_id, false);
             try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome, terminal.result);
         },
         .progress, .turn_finished => {},

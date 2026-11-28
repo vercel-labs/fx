@@ -1,10 +1,10 @@
 {
   "libfx": {
-    "packed": 4079000,
-    "unpacked": 11647000
+    "packed": 4063350,
+    "unpacked": 11605200
   },
   "fx-core.wasm": {
-    "bytes": 2513000
+    "bytes": 2471200
   },
   "fx-term.wasm": {
     "bytes": 4446000
@@ -19,19 +19,19 @@
     "gzip": 490
   },
   "@libfx/libfx-darwin-arm64": {
-    "packed": 3992000,
-    "unpacked": 8520000
+    "packed": 3893186,
+    "unpacked": 8273648
   },
   "@libfx/libfx-darwin-x64": {
-    "packed": 4359000,
-    "unpacked": 9821000
+    "packed": 4257061,
+    "unpacked": 9533904
   },
   "@libfx/libfx-linux-arm64-gnu": {
-    "packed": 4065000,
-    "unpacked": 8456000
+    "packed": 3964047,
+    "unpacked": 8197880
   },
   "@libfx/libfx-linux-x64-gnu": {
-    "packed": 4302000,
-    "unpacked": 9942000
+    "packed": 4198221,
+    "unpacked": 9652488
   }
 }

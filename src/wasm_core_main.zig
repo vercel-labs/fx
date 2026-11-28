@@ -29,6 +29,9 @@ comptime {
     if (build_options.wasm_surface != .core) {
         @compileError("fx-core requires -Dwasm-surface=core");
     }
+    if (!build_options.libfx_kernel) {
+        @compileError("fx-core runs libfx's kernel; build it with libfx_kernel true");
+    }
 }
 
 pub const panic = @import("core/hosts/wasm_panic.zig").panic;
@@ -77,9 +80,6 @@ pub fn main(init: std.process.Init) !void {
         .fast_override = fastOverrideFromEnv(io_mod.getenv("FX_FAST")),
         .ultrafast_override = fastOverrideFromEnv(io_mod.getenv("FX_ULTRAFAST")),
         .workspace_root_override = "/",
-        .allow_acp_mcp = false,
-        .allow_native_tools = false,
-        .minimal_kernel = true,
         .host_attachments = js_host_attachments.store,
     });
 }

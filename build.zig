@@ -39,6 +39,11 @@ pub fn build(b: *std.Build) void {
         "napi-surface",
         "Build a Node-API addon surface (core)",
     ) orelse .none;
+    const libfx_symbols = b.option(
+        bool,
+        "libfx-symbols",
+        "Keep function names in the WebAssembly surfaces and the Node-API addon, for size reports",
+    ) orelse false;
 
     const sanitize_thread = b.option(
         bool,
@@ -62,6 +67,12 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "libfx", false);
     build_options.addOption(bool, "trace_log", true);
     build_options.addOption(bool, "builtin_tools", true);
+    // Whether this build runs libfx's ACP kernel (fx-core.wasm and the
+    // Node addon). Its switches are then constants, so the branches it
+    // never takes are not compiled in. `fx acp` and fx-term.wasm run the
+    // full kernel; unit tests set the switches per config
+    // (src/core/cli/acp_runner.zig).
+    build_options.addOption(bool, "libfx_kernel", false);
 
     const fuzz_corpora = readFuzzCorpora(b);
     const fuzz_corpus = addFuzzCorpusModule(b, fuzz_corpora);
@@ -192,10 +203,10 @@ pub fn build(b: *std.Build) void {
     });
 
     if (wasm_surface != .none) {
-        addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
+        addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel, libfx_symbols);
     }
     if (napi_surface != .none) {
-        addNapiArtifact(b, napi_surface, target, git_commit, app_version, update_channel);
+        addNapiArtifact(b, napi_surface, target, git_commit, app_version, update_channel, libfx_symbols);
     }
 
     // --- file_index search benchmark ---
@@ -394,6 +405,7 @@ fn addWasmArtifact(
     git_commit: []const u8,
     app_version: []const u8,
     update_channel: UpdateChannel,
+    keep_symbols: bool,
 ) void {
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -421,6 +433,7 @@ fn addWasmArtifact(
     // turn tracing on there through `env:`.
     wasm_options.addOption(bool, "trace_log", surface == .term);
     wasm_options.addOption(bool, "builtin_tools", true);
+    wasm_options.addOption(bool, "libfx_kernel", surface == .core);
 
     const wasm_root = switch (surface) {
         .core => "src/wasm_core_main.zig",
@@ -440,7 +453,7 @@ fn addWasmArtifact(
             .omit_frame_pointer = true,
             .unwind_tables = .none,
             .error_tracing = false,
-            .strip = true,
+            .strip = !keep_symbols,
         }),
     });
     if (surface == .core) wasm_exe.stack_size = 1024 * 1024;
@@ -460,6 +473,7 @@ fn addNapiArtifact(
     git_commit: []const u8,
     app_version: []const u8,
     update_channel: UpdateChannel,
+    keep_symbols: bool,
 ) void {
     const napi_options = b.addOptions();
     napi_options.addOption([]const u8, "git_commit", git_commit);
@@ -474,6 +488,7 @@ fn addNapiArtifact(
     napi_options.addOption(bool, "trace_log", false);
     // libfx agents run only the host's tools, so the addon leaves fx's out.
     napi_options.addOption(bool, "builtin_tools", false);
+    napi_options.addOption(bool, "libfx_kernel", true);
 
     const root = switch (surface) {
         .core => "src/napi_core_main.zig",
@@ -498,7 +513,7 @@ fn addNapiArtifact(
             .omit_frame_pointer = false,
             .unwind_tables = .none,
             .error_tracing = false,
-            .strip = true,
+            .strip = !keep_symbols,
         }),
     });
     lib.root_module.addImport("build_options", napi_options.createModule());
