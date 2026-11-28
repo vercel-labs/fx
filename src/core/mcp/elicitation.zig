@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const server_json_depth = @import("server_json_depth.zig");
 const json_number = @import("json_number.zig");
 const json_schema_pattern = @import("json_schema_pattern.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -320,119 +321,6 @@ pub const Request = struct {
     }
 };
 
-pub const legacy_url_required_error_code: i64 = -32042;
-
-const UrlRequired = struct {
-    requests: []Request,
-
-    pub fn deinit(self: *UrlRequired, alloc: Allocator) void {
-        for (self.requests) |*request| request.deinit(alloc);
-        alloc.free(self.requests);
-        self.* = undefined;
-    }
-};
-
-pub const LegacyUrlConsent = enum {
-    accepted,
-    declined,
-    cancelled,
-};
-
-pub fn renderLegacyUrlRequiredRequests(
-    alloc: Allocator,
-    required: UrlRequired,
-    limits: Limits,
-) Error![]u8 {
-    return renderLegacyUrlRequiredRequestsFallible(alloc, required, limits) catch |err| switch (err) {
-        error.WriteFailed => error.OutOfMemory,
-        else => |other| other,
-    };
-}
-
-fn renderLegacyUrlRequiredRequestsFallible(
-    alloc: Allocator,
-    required: UrlRequired,
-    limits: Limits,
-) (Error || std.Io.Writer.Error)![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeByte('{');
-    for (required.requests, 0..) |request, index| {
-        if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(request.elicitation_id.?, .{}, &out.writer);
-        try out.writer.writeAll(":{\"method\":\"elicitation/create\",\"params\":");
-        try out.writer.writeAll(request.raw_params_json);
-        try out.writer.writeByte('}');
-        if (out.writer.buffered().len > limits.max_response_bytes) return error.LimitExceeded;
-    }
-    try out.writer.writeByte('}');
-    return out.toOwnedSlice();
-}
-
-/// Parses the `2025-11-25` URL-required error data. Older legacy revisions do
-/// not define this error or URL mode and are rejected before any interaction.
-pub fn parseLegacyUrlRequired(
-    alloc: Allocator,
-    wire: Wire,
-    data_json: []const u8,
-    limits: Limits,
-) Error!UrlRequired {
-    if (wire != .legacy_mcp_2025_11) return error.UnsupportedMode;
-    if (data_json.len > limits.max_response_bytes) return error.LimitExceeded;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, data_json, .{
-        .parse_numbers = false,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidRequest,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidRequest;
-    const elicitations = parsed.value.object.get("elicitations") orelse
-        return error.InvalidRequest;
-    if (elicitations != .array or elicitations.array.items.len == 0 or
-        elicitations.array.items.len > limits.max_options)
-    {
-        return error.InvalidRequest;
-    }
-
-    const requests = try alloc.alloc(Request, elicitations.array.items.len);
-    var ids: std.StringHashMapUnmanaged(void) = .empty;
-    defer ids.deinit(alloc);
-    var count: usize = 0;
-    errdefer {
-        for (requests[0..count]) |*request| request.deinit(alloc);
-        alloc.free(requests);
-    }
-    for (elicitations.array.items) |value| {
-        if (value != .object) return error.InvalidRequest;
-        const params_json = try stringifyBounded(alloc, value, limits.max_request_bytes);
-        defer alloc.free(params_json);
-        requests[count] = try parseRequest(
-            alloc,
-            .legacy_mcp_2025_11,
-            params_json,
-            limits,
-        );
-        var current_owned = true;
-        errdefer if (current_owned) requests[count].deinit(alloc);
-        if (requests[count].mode != .url) {
-            requests[count].deinit(alloc);
-            current_owned = false;
-            return error.InvalidRequest;
-        }
-        const id = requests[count].elicitation_id.?;
-        if (ids.contains(id)) {
-            requests[count].deinit(alloc);
-            current_owned = false;
-            return error.InvalidRequest;
-        }
-        try ids.put(alloc, id, {});
-        count += 1;
-        current_owned = false;
-    }
-    return .{ .requests = requests };
-}
-
 const AcpProjectionScope = union(enum) {
     session: struct {
         session_id: []const u8,
@@ -564,7 +452,8 @@ fn writeAcpSchemaValue(
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "$schema") or
-                    std.mem.eql(u8, entry.key_ptr.*, "enumNames")) continue;
+                    std.mem.eql(u8, entry.key_ptr.*, "enumNames") or
+                    std.mem.eql(u8, entry.key_ptr.*, shown_when_key)) continue;
                 if (wrote) try writer.writeByte(',');
                 wrote = true;
                 try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
@@ -754,6 +643,15 @@ pub const Choice = struct {
     }
 };
 
+/// The fx-only `x-fx-shown-when` key: a host form asks its field only while the field
+/// named `field` holds the string `value`. An MCP server's form ignores it.
+pub const ShownWhen = struct {
+    field: []u8,
+    value: []u8,
+};
+
+pub const shown_when_key = "x-fx-shown-when";
+
 pub const Field = struct {
     name: []u8,
     title: ?[]u8 = null,
@@ -761,6 +659,7 @@ pub const Field = struct {
     kind: FieldKind,
     required: bool,
     default_json: ?[]u8 = null,
+    shown_when: ?ShownWhen = null,
     min_length: ?usize = null,
     max_length: ?usize = null,
     minimum: ?json_number.Number = null,
@@ -778,6 +677,10 @@ pub const Field = struct {
         if (self.title) |value| alloc.free(value);
         if (self.description) |value| alloc.free(value);
         if (self.default_json) |value| alloc.free(value);
+        if (self.shown_when) |shown| {
+            alloc.free(shown.field);
+            alloc.free(shown.value);
+        }
         if (self.format_name) |value| alloc.free(value);
         if (self.pattern) |value| alloc.free(value);
         if (self.minimum) |*value| value.deinit(alloc);
@@ -961,7 +864,40 @@ fn parseFieldInto(
         field.default_json = try stringifyBounded(alloc, default_value, limits.max_string_bytes);
         try validateFieldValue(alloc, field, default_value, limits);
     }
+    field.shown_when = try parseShownWhen(alloc, schema, limits);
     out.* = field;
+}
+
+/// The one entry of a well-formed `x-fx-shown-when` value, borrowed from the schema.
+const ShownWhenView = struct {
+    field: []const u8,
+    value: []const u8,
+};
+
+/// Reads the fx-only `x-fx-shown-when` key. A malformed value is server data, so the key is
+/// ignored and the field has no condition: the form still parses and the field is asked as
+/// it is without the key. The trace names the key and the outcome, never its content.
+fn parseShownWhen(alloc: Allocator, schema: std.json.Value, limits: Limits) Error!?ShownWhen {
+    const value = schema.object.get(shown_when_key) orelse return null;
+    const view = shownWhenView(value, limits) orelse {
+        debug_trace.logf("mcp", "x-fx-shown-when is malformed, so fx ignores it and asks the field as it is", .{});
+        return null;
+    };
+    const field = try alloc.dupe(u8, view.field);
+    errdefer alloc.free(field);
+    const text = try alloc.dupe(u8, view.value);
+    return .{ .field = field, .value = text };
+}
+
+/// The entry of a well-formed `x-fx-shown-when` value: one entry, whose name is a field and
+/// whose value is a string. Null when the value is malformed.
+fn shownWhenView(value: std.json.Value, limits: Limits) ?ShownWhenView {
+    if (value != .object or value.object.count() != 1) return null;
+    var entries = value.object.iterator();
+    const entry = entries.next() orelse return null;
+    if (entry.key_ptr.len == 0 or entry.key_ptr.len > limits.max_name_bytes) return null;
+    if (entry.value_ptr.* != .string or entry.value_ptr.string.len > limits.max_string_bytes) return null;
+    return .{ .field = entry.key_ptr.*, .value = entry.value_ptr.string };
 }
 
 fn parseStringConstraints(
@@ -1620,6 +1556,60 @@ test "form schemas parse every supported field kind and validate content" {
     try std.testing.expectError(error.InvalidResponse, validateFormContent(alloc, form, invalid.value, .{}));
 }
 
+test "x-fx-shown-when names one field and one string value, and a malformed value is ignored" {
+    const alloc = std.testing.allocator;
+    var form = try parseFormSchema(
+        alloc,
+        .acp,
+        "{\"type\":\"object\",\"properties\":{\"other\":{\"type\":\"string\",\"x-fx-shown-when\":{\"project\":\"__other__\"}}}}",
+        .{},
+    );
+    defer form.deinit(alloc);
+    const shown = form.fields[0].shown_when orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("project", shown.field);
+    try std.testing.expectEqualStrings("__other__", shown.value);
+
+    const malformed = [_][]const u8{
+        "\"project\"",
+        "{}",
+        "{\"project\":\"a\",\"role\":\"b\"}",
+        "{\"project\":1}",
+        "{\"\":\"a\"}",
+    };
+    // A malformed value is ignored: the form parses, the field has no condition, and each
+    // ignored key leaves one trace line that names the key and no content.
+    var capture = try depth_testing.TraceCapture.start(alloc);
+    defer capture.stop();
+    for (malformed) |value| {
+        const schema = try alloc.print(
+            "{{\"type\":\"object\",\"properties\":{{\"other\":{{\"type\":\"string\",\"x-fx-shown-when\":{s}}}}}}}",
+            .{value},
+        );
+        defer alloc.free(schema);
+        for ([_]Wire{ .acp, .modern_mcp }) |wire| {
+            var ignored = try parseFormSchema(alloc, wire, schema, .{});
+            defer ignored.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), ignored.fields.len);
+            try std.testing.expectEqualStrings("other", ignored.fields[0].name);
+            try std.testing.expect(ignored.fields[0].shown_when == null);
+        }
+    }
+    var lines = try capture.lines("x-fx-shown-when");
+    defer {
+        for (lines.items) |line| alloc.free(line);
+        lines.deinit(alloc);
+    }
+    try std.testing.expectEqual(malformed.len * 2, lines.items.len);
+    try std.testing.expectEqualStrings(
+        "x-fx-shown-when is malformed, so fx ignores it and asks the field as it is",
+        lines.items[0],
+    );
+    const trace = try capture.read();
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "project") == null);
+    try std.testing.expect(std.mem.find(u8, trace, "__other__") == null);
+}
+
 test "secret fields are rejected before a form is published" {
     const schemas = [_][]const u8{
         "{\"type\":\"object\",\"properties\":{\"api_key\":{\"type\":\"string\"}}}",
@@ -1782,44 +1772,6 @@ test "exact numeric constraints retain large integer and fractional lexemes" {
     );
     defer not_multiple.deinit();
     try std.testing.expectError(error.InvalidResponse, validateFormContent(alloc, form, not_multiple.value, .{}));
-}
-
-test "2025-11 URL-required errors parse only on their negotiated wire" {
-    const alloc = std.testing.allocator;
-    const data =
-        "{\"elicitations\":[{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"url-1\"}]}";
-    var required = try parseLegacyUrlRequired(alloc, .legacy_mcp_2025_11, data, .{});
-    defer required.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), required.requests.len);
-    try std.testing.expectEqualStrings("url-1", required.requests[0].elicitation_id.?);
-    const rendered = try renderLegacyUrlRequiredRequests(alloc, required, .{});
-    defer alloc.free(rendered);
-    try std.testing.expectEqualStrings(
-        "{\"url-1\":{\"method\":\"elicitation/create\",\"params\":{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"url-1\"}}}",
-        rendered,
-    );
-    try std.testing.expectError(
-        error.UnsupportedMode,
-        parseLegacyUrlRequired(alloc, .legacy_mcp_2025_06, data, .{}),
-    );
-    try std.testing.expectError(
-        error.InvalidRequest,
-        parseLegacyUrlRequired(
-            alloc,
-            .legacy_mcp_2025_11,
-            "{\"elicitations\":[{\"mode\":\"form\",\"message\":\"No\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}]}",
-            .{},
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidRequest,
-        parseLegacyUrlRequired(
-            alloc,
-            .legacy_mcp_2025_11,
-            "{\"elicitations\":[{\"mode\":\"url\",\"message\":\"One\",\"url\":\"https://example.test/one\",\"elicitationId\":\"same\"},{\"mode\":\"url\",\"message\":\"Two\",\"url\":\"https://example.test/two\",\"elicitationId\":\"same\"}]}",
-            .{},
-        ),
-    );
 }
 
 test "ambiguous schemas are rejected before interaction" {
@@ -2058,6 +2010,28 @@ test "ACP projection keeps the wire distinctions from modern and legacy MCP" {
     try std.testing.expect(std.mem.find(u8, projected_enum_names, "\"enum\":[\"a\"]") != null);
 }
 
+test "ACP projection leaves the fx-only shown-when key out of the schema" {
+    const alloc = std.testing.allocator;
+    var request = try parseRequest(
+        alloc,
+        .modern_mcp,
+        "{\"message\":\"Project\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"oneOf\":[{\"const\":\"__other__\",\"title\":\"Another\"}]},\"other\":{\"type\":\"string\",\"x-fx-shown-when\":{\"project\":\"__other__\"}}}}}",
+        .{},
+    );
+    defer request.deinit(alloc);
+    const projected = try projectToAcpCreateParams(
+        alloc,
+        request,
+        .{ .session = .{ .session_id = "session" } },
+        null,
+        null,
+        .{},
+    );
+    defer alloc.free(projected);
+    try std.testing.expect(std.mem.find(u8, projected, "x-fx-shown-when") == null);
+    try std.testing.expect(std.mem.find(u8, projected, "\"other\":{\"type\":\"string\"}") != null);
+}
+
 test "canonical responses discard ignored content and unknown fields" {
     const alloc = std.testing.allocator;
     var request = try parseRequest(
@@ -2103,16 +2077,6 @@ fn checkAllocationFailures(alloc: Allocator) !void {
         .{},
     );
     alloc.free(projected);
-
-    var url_required = try parseLegacyUrlRequired(
-        alloc,
-        .legacy_mcp_2025_11,
-        "{\"elicitations\":[{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"id\"}]}",
-        .{},
-    );
-    defer url_required.deinit(alloc);
-    const url_requests = try renderLegacyUrlRequiredRequests(alloc, url_required, .{});
-    alloc.free(url_requests);
 }
 
 fn fuzzElicitationJson(_: void, smith: *std.testing.Smith) !void {

@@ -16,6 +16,7 @@ const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 pub const tool_placement = @import("tool_placement.zig");
+const shortcut_rules = @import("../shortcuts/shortcuts.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -55,6 +56,12 @@ pub const Settings = struct {
     context_limits: context_limits.Overrides = .{},
     /// Where built-in tools are offered, by tool. Profile-only.
     tool_placement: tool_placement.Overrides = .{},
+    /// Personal key shortcuts, heap-owned and freed in deinit. Profile-only;
+    /// null when the profile sets none, so an unset profile costs one pointer.
+    shortcuts: ?*shortcut_rules.Map = null,
+    /// The `shortcuts` entry that failed to parse, such as `shortcuts.ctrl+2.model`,
+    /// owned. The rest of the profile still loads; the detailed loader reports it.
+    shortcut_problem: ?[]u8 = null,
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
@@ -69,7 +76,6 @@ pub const Settings = struct {
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
     theme: ?[]const u8 = null,
-    startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     effort: ?types.ReasoningEffort = null,
     /// Optional review-model override for automatic permission review. Owned by
@@ -86,13 +92,24 @@ pub const Settings = struct {
     notification_max: ?bool = null,
     /// `experimental.workspace_capture`, profile-only.
     experimental_workspace_capture: ?bool = null,
+    /// `experimental.sandbox_execution`, profile-only.
+    experimental_sandbox_execution: ?bool = null,
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
     /// Owned absolute directories whose contents symlinked skills may resolve
     /// into. Profile-only; a later layer replaces the whole list. Freed in deinit.
     skill_symlink_authorities: ?[][]u8 = null,
 
+    /// Hands a parse problem to the caller, who then owns its key.
+    fn takeShortcutProblem(self: *Settings) ?[]u8 {
+        const key = self.shortcut_problem;
+        self.shortcut_problem = null;
+        return key;
+    }
+
     pub fn deinit(self: *Settings, alloc: Allocator) void {
+        if (self.shortcuts) |map| alloc.destroy(map);
+        if (self.shortcut_problem) |key| alloc.free(key);
         if (self.skill_symlink_authorities) |paths| freeStringSlice(alloc, paths);
         self.models.deinit(alloc);
         if (self.providers) |*providers| providers.deinit(alloc);
@@ -155,7 +172,6 @@ pub const ConfigSources = struct {
     fast_mode_model_bound: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     collapse_tool_calls: ConfigSource = .compiled_default,
-    startup_scrollback: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
     statusline_session: ConfigSource = .compiled_default,
@@ -224,6 +240,7 @@ pub const ConfigDiagnosticCause = enum {
     retired_skill_match_fuzzy,
     invalid_context_limits,
     invalid_tool_placement,
+    invalid_shortcuts,
     invalid_additional_directories,
     invalid_skill_symlink_authorities,
     invalid_ultrafast_mode_override,
@@ -266,6 +283,9 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
     }
     if (diagnostic.cause == .invalid_tool_placement) {
         try writer.writeAll("; tool_placement keys must be built-in tools that can move (" ++ tool_placement.movable_list ++ ") with the value \"toolbox\" or \"direct\"");
+    }
+    if (diagnostic.cause == .invalid_shortcuts) {
+        try writer.print("; the shortcuts map is ignored; other settings still load; bind each key to a command or a model preset (see fx config schema); at most {d} shortcuts", .{shortcut_rules.max_entries});
     }
     if (diagnostic.cause == .invalid_additional_directories) {
         try writer.print(
@@ -545,6 +565,33 @@ pub fn loadProjectMcpChoicesFromHome(
         &result.diagnostics,
     ) catch return error.InvalidSettingsFormat;
     return result;
+}
+
+/// Reads whether the profile trusts the folder; the caller passes its real path.
+pub fn loadWorkspaceTrustFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+) !bool {
+    var store = try settings_store.Store.initFromHome(alloc, home, .read_only);
+    defer store.deinit(alloc);
+    var primary = try store.loadPrimary(alloc);
+    defer primary.deinit(alloc);
+    const bytes = switch (primary) {
+        .absent => return false,
+        .valid => |value| value,
+        .invalid => return error.InvalidSettingsFormat,
+        .oversized => return error.SettingsPrimaryTooLarge,
+    };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSettingsFormat;
+    const workspaces = parsed.value.object.get("workspaces") orelse return false;
+    if (workspaces != .object) return error.InvalidSettingsFormat;
+    const workspace = workspaces.object.get(normalizeWorkspaceRoot(workspace_root)) orelse return false;
+    if (workspace != .object) return false;
+    const trusted = workspace.object.get(settings_keys.workspace_trusted_key) orelse return false;
+    return trusted == .bool and trusted.bool;
 }
 
 pub fn loadMergedSettingsFromHome(alloc: Allocator, home_dir: []const u8, workspace_root: []const u8) !Settings {
@@ -915,7 +962,6 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "fast_mode_model_bound",
             "slash_menu_categories",
             "collapse_tool_calls",
-            "startup_scrollback",
         }) |key| {
             if (workspace.contains(key)) return true;
         }
@@ -1006,7 +1052,6 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
     if (settings.session_titles != null) sources.session_titles = source;
     if (settings.cache_warming != null) sources.cache_warming = source;
-    if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
     if (settings.statusline_session != null) sources.statusline_session = source;
@@ -1068,6 +1113,14 @@ fn mergeDetailedSettingsLayer(
                     state.permission_sources.user_shadowed_by_local = true;
                 },
             }
+        }
+        if (incoming.takeShortcutProblem()) |key| {
+            errdefer alloc.free(key);
+            try state.diagnostics.append(alloc, .{
+                .layer = diagnostic_layer,
+                .cause = .invalid_shortcuts,
+                .setting_key = key,
+            });
         }
         try mergeSettings(state.settings, &incoming, alloc);
     } else |err| {
@@ -1232,6 +1285,25 @@ pub fn attemptProjectMcpMutation(
     const outcome = store.applyProjectMcpMutation(alloc, .{
         .workspace_root = workspace_root,
         .action = action,
+    }) catch |err| return .{ .failure = .{
+        .err = err,
+        .cleanup = store.takeFailureCleanup(),
+    } };
+    return .{ .outcome = outcome };
+}
+
+/// Saves that the profile trusts the folder; the caller passes its real path.
+pub fn attemptWorkspaceTrustInHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+) CommitAttempt {
+    var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
+        return .{ .failure = .{ .err = err } };
+    };
+    defer store.deinit(alloc);
+    const outcome = store.applyWorkspaceTrustMutation(alloc, .{
+        .workspace_root = workspace_root,
     }) catch |err| return .{ .failure = .{
         .err = err,
         .cleanup = store.takeFailureCleanup(),
@@ -1773,6 +1845,7 @@ fn parseSettingsValueForLayer(
 
     if (layer == .profile) {
         if (root.object.get("providers")) |value| settings.providers = try configured_provider.Registry.parse(alloc, value);
+        if (root.object.get("shortcuts")) |value| try parseShortcutsSetting(alloc, &settings, value);
     }
     if (layer != .project) try parseProfileOnlyFields(
         &settings,
@@ -1942,12 +2015,6 @@ fn parseProfileOnlyFields(
         if (value.string.len > 0) settings.theme = try alloc.dupe(u8, value.string);
     }
 
-    if (root.object.get("startup_scrollback")) |startup_scrollback_value| {
-        const value = startup_scrollback_value;
-        if (value != .bool) return error.InvalidStartupScrollbackType;
-        settings.startup_scrollback = value.bool;
-    }
-
     if (root.object.get("skill_symlink_authorities")) |value| {
         const paths = try parseSkillSymlinkAuthorities(alloc, value);
         if (settings.skill_symlink_authorities) |old| freeStringSlice(alloc, old);
@@ -2016,9 +2083,15 @@ fn parseProfileOnlyFields(
     if (root.object.get("experimental")) |experimental_value| {
         if (experimental_value != .object) {
             debug_trace.logf("config", "ignoring experimental: not an object", .{});
-        } else if (experimental_value.object.get("workspace_capture")) |value| {
-            if (value != .bool) return error.InvalidExperimentalWorkspaceCaptureType;
-            settings.experimental_workspace_capture = value.bool;
+        } else {
+            if (experimental_value.object.get("workspace_capture")) |value| {
+                if (value != .bool) return error.InvalidExperimentalWorkspaceCaptureType;
+                settings.experimental_workspace_capture = value.bool;
+            }
+            if (experimental_value.object.get("sandbox_execution")) |value| {
+                if (value != .bool) return error.InvalidExperimentalSandboxExecutionType;
+                settings.experimental_sandbox_execution = value.bool;
+            }
         }
     }
 
@@ -2064,6 +2137,48 @@ fn pathHasDotDotComponent(path: []const u8) bool {
         if (std.mem.eql(u8, component.name, "..")) return true;
     }
     return false;
+}
+
+const max_shortcut_problem_bytes = 48;
+/// Longest reserved explanation in a diagnostic: a chord name and the chord module's reason.
+const max_reserved_reason_bytes = 256;
+
+/// Parses the profile's `shortcuts`. A bad entry leaves the map unset and
+/// records the field that failed; the rest of the profile still loads.
+fn parseShortcutsSetting(alloc: Allocator, settings: *Settings, value: std.json.Value) !void {
+    var problem: shortcut_rules.Problem = .{};
+    const map = shortcut_rules.parseJsonObjectChecked(value, &problem) catch {
+        settings.shortcut_problem = try shortcutProblemKey(alloc, problem);
+        return;
+    };
+    const stored = try alloc.create(shortcut_rules.Map);
+    errdefer alloc.destroy(stored);
+    stored.* = map;
+    settings.shortcuts = stored;
+}
+
+/// `shortcuts`, `shortcuts.<chord>`, or `shortcuts.<chord>.<field>`, with the
+/// user's text bounded and made printable so it can't write control bytes. A
+/// reserved chord adds the chord module's reason after `; `.
+fn shortcutProblemKey(alloc: Allocator, problem: shortcut_rules.Problem) ![]u8 {
+    var chord_buffer: [max_shortcut_problem_bytes]u8 = undefined;
+    var field_buffer: [max_shortcut_problem_bytes]u8 = undefined;
+    const chord = printableInto(&chord_buffer, problem.chord);
+    const field = printableInto(&field_buffer, problem.field);
+    if (chord.len == 0) return alloc.dupe(u8, "shortcuts");
+    if (problem.reserved) |reserved| {
+        var reason_buffer: [max_reserved_reason_bytes]u8 = undefined;
+        const reason = reserved.chord.reservedMessage(&reason_buffer) orelse "that key is reserved for fx";
+        return alloc.print("shortcuts.{s}; {s}", .{ chord, reason });
+    }
+    if (field.len == 0) return alloc.print("shortcuts.{s}", .{chord});
+    return alloc.print("shortcuts.{s}.{s}", .{ chord, field });
+}
+
+fn printableInto(buffer: []u8, text: []const u8) []u8 {
+    const len = @min(buffer.len, text.len);
+    for (text[0..len], buffer[0..len]) |byte, *out| out.* = if (std.ascii.isPrint(byte)) byte else '?';
+    return buffer[0..len];
 }
 
 fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.Value) !void {
@@ -2139,6 +2254,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
     target.context_limits.merge(incoming.context_limits);
     target.tool_placement.merge(incoming.tool_placement);
+    if (incoming.shortcuts) |value| {
+        if (target.shortcuts) |old| alloc.destroy(old);
+        target.shortcuts = value;
+        incoming.shortcuts = null;
+    }
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
@@ -2164,7 +2284,6 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
         target.theme = value;
         incoming.theme = null;
     }
-    if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
     if (incoming.skill_symlink_authorities) |value| {
         if (target.skill_symlink_authorities) |old| freeStringSlice(alloc, old);
         target.skill_symlink_authorities = value;
@@ -2185,6 +2304,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.notification_attention_required) |value| target.notification_attention_required = value;
     if (incoming.notification_max) |value| target.notification_max = value;
     if (incoming.experimental_workspace_capture) |value| target.experimental_workspace_capture = value;
+    if (incoming.experimental_sandbox_execution) |value| target.experimental_sandbox_execution = value;
 
     if (incoming.has_permission_rules) {
         target.permission_rules.deinit(alloc);
@@ -2770,7 +2890,7 @@ test "loadStartupStatusSettings merges project defaults before profile layers" {
     try std.testing.expectEqual(@as(usize, 8), settings.max_agent_steps.?);
 }
 
-test "loadMergedSettings applies startup scrollback precedence with normalized workspace root" {
+test "loadMergedSettings matches a workspace override when the workspace root has a trailing slash" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2783,7 +2903,7 @@ test "loadMergedSettings applies startup scrollback precedence with normalized w
     defer std.testing.allocator.free(workspace_root);
 
     const user_settings = try std.testing.allocator.print(
-        "{{\"startup_scrollback\":false,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}",
+        "{{\"fast_mode\":true,\"workspaces\":{{\"{s}\":{{\"fast_mode\":false}}}}}}",
         .{workspace_root},
     );
     defer std.testing.allocator.free(user_settings);
@@ -2792,12 +2912,12 @@ test "loadMergedSettings applies startup scrollback precedence with normalized w
     defer std.testing.allocator.free(workspace_with_slash);
 
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
-    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"startup_scrollback\":true}");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"fast_mode\":true}");
 
     var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_with_slash);
     defer settings.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(false, settings.startup_scrollback.?);
+    try std.testing.expectEqual(false, settings.fast_mode.?);
 }
 
 test "max_agent_steps absence and explicit values resolve distinctly" {
@@ -2890,33 +3010,13 @@ test "skill_match_fuzzy returns a migration-specific parse error" {
 test "retired presentation settings are ignored regardless of type" {
     var settings = try parseSettingsJson(
         std.testing.allocator,
-        "{\"model\":\"openai/gpt-5.4\",\"input_appearance\":false,\"maxxing_mode\":7}",
+        "{\"model\":\"openai/gpt-5.4\",\"input_appearance\":false,\"maxxing_mode\":7,\"startup_scrollback\":true}",
     );
     defer settings.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("openai/gpt-5.4", settings.models.get(.gateway).?);
-}
 
-test "startup_scrollback parses merges rejects invalid type and round trips" {
-    var absent = try parseSettingsJson(std.testing.allocator, "{}");
-    defer absent.deinit(std.testing.allocator);
-    try std.testing.expect(absent.startup_scrollback == null);
-
-    var first = try parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":true}");
-    defer first.deinit(std.testing.allocator);
-    try std.testing.expectEqual(true, first.startup_scrollback.?);
-
-    var second = try parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":false}");
-    defer second.deinit(std.testing.allocator);
-    try mergeSettings(&first, &second, std.testing.allocator);
-    try std.testing.expectEqual(false, first.startup_scrollback.?);
-
-    try std.testing.expectError(error.InvalidStartupScrollbackType, parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":\"off\"}"));
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"startup_scrollback\":false}", .{});
-    defer parsed.deinit();
-    const json = try serializeJsonObject(std.testing.allocator, parsed.value);
-    defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"startup_scrollback\":false") != null);
+    var retired_off = try parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":\"off\"}");
+    defer retired_off.deinit(std.testing.allocator);
 }
 
 test "skill_symlink_authorities parses replaces on merge and rejects invalid entries" {
@@ -3814,6 +3914,44 @@ test "user effort preference preserves unrelated workspace override keys" {
     try std.testing.expect((try workspaceOverrideObject(&parsed.value, workspace_root)).get("effort") == null);
 }
 
+test "workspace trust counts only a true boolean for the exact folder" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "empty-home");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"workspaces\":{\"/r\":{\"trusted\":true},\"/s\":{\"trusted\":\"yes\"},\"/t\":{}}}",
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const empty_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "empty-home");
+    defer alloc.free(empty_home);
+
+    try std.testing.expect(try loadWorkspaceTrustFromHome(alloc, home, "/r"));
+    try std.testing.expect(try loadWorkspaceTrustFromHome(alloc, home, "/r/"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, home, "/s"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, home, "/t"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, home, "/u"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, empty_home, "/r"));
+}
+
+test "a saved workspace trust grant is read back" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var attempt = attemptWorkspaceTrustInHome(alloc, home, "/r");
+    defer attempt.deinit(alloc);
+    try std.testing.expect(attempt == .outcome);
+    try std.testing.expect(try loadWorkspaceTrustFromHome(alloc, home, "/r"));
+}
+
 test "user fast mode preference writes bool and preserves unrelated keys" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3855,47 +3993,6 @@ test "user fast mode preference writes bool and preserves unrelated keys" {
     try std.testing.expect((try workspaceOverrideObject(&parsed.value, workspace_root)).get("fast_mode") == null);
 }
 
-test "user startup scrollback preference writes bool and preserves unrelated keys" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    const fixture = try std.testing.allocator.print(
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"my-model\",\"permission_mode\":\"auto\"}}}}}}",
-        .{workspace_root},
-    );
-    defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
-
-    const home = try TestHome.install(std.testing.allocator, home_root);
-    defer home.deinit();
-
-    var outcome = try setUserPreferences(
-        std.testing.allocator,
-        .{ .startup_scrollback = false },
-    );
-    defer outcome.deinit(std.testing.allocator);
-
-    var settings = try loadMergedSettings(std.testing.allocator, workspace_root);
-    defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("my-model", settings.models.get(.gateway).?);
-    try std.testing.expectEqual(types.PermissionMode.auto, settings.permission_mode.?);
-    try std.testing.expectEqual(false, settings.startup_scrollback.?);
-
-    const bytes = try readSettingsBytesForTest(std.testing.allocator, home_root);
-    defer std.testing.allocator.free(bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(false, parsed.value.object.get("startup_scrollback").?.bool);
-    try std.testing.expect((try workspaceOverrideObject(&parsed.value, workspace_root)).get("startup_scrollback") == null);
-}
-
 test "project profile-only settings are ignored and diagnosed by key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3904,12 +4001,12 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try writeFixtureFile(
         tmp.dir,
         "home/.fx/settings.json",
-        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"status_line\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
+        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"status_line\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\"}\n",
     );
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"status_line\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
+        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"status_line\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"max_agent_steps\":17}\n",
     );
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -3932,11 +4029,10 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(false, result.settings.fast_mode.?);
     try std.testing.expectEqual(false, result.settings.slash_menu_categories.?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), result.settings.effort.?);
-    try std.testing.expectEqual(false, result.settings.startup_scrollback.?);
     try std.testing.expectEqual(@as(usize, 1), result.settings.permission_rules.rules.len);
     try expectPermissionRule(result.settings.permission_rules.rules[0], "bash", "profile *", .allow);
 
-    try std.testing.expectEqual(@as(usize, 14), result.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 13), result.diagnostics.len);
     inline for (&.{
         "model",
         "permission_mode",
@@ -3951,7 +4047,6 @@ test "project profile-only settings are ignored and diagnosed by key" {
         "fast_mode",
         "slash_menu_categories",
         "effort",
-        "startup_scrollback",
     }) |key| {
         try expectIgnoredProjectKey(result.diagnostics, key);
     }
@@ -4121,25 +4216,25 @@ test "ordinary and detailed loads agree on workspace overrides with legacy statu
     defer std.testing.allocator.free(workspace_root);
 
     const user_settings = try std.testing.allocator.print(
-        "{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"status_line\":7,\"startup_scrollback\":false}}}}}}\n",
+        "{{\"fast_mode\":true,\"workspaces\":{{\"{s}\":{{\"status_line\":7,\"fast_mode\":false}}}}}}\n",
         .{workspace_root},
     );
     defer std.testing.allocator.free(user_settings);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
-    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"startup_scrollback\":true,\"max_agent_steps\":42}\n");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"fast_mode\":true,\"max_agent_steps\":42}\n");
 
     var ordinary = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
     defer ordinary.deinit(std.testing.allocator);
-    try std.testing.expectEqual(false, ordinary.startup_scrollback.?);
+    try std.testing.expectEqual(false, ordinary.fast_mode.?);
     try std.testing.expectEqual(@as(usize, 42), ordinary.max_agent_steps.?);
 
     var detailed = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer detailed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(false, detailed.settings.startup_scrollback.?);
+    try std.testing.expectEqual(false, detailed.settings.fast_mode.?);
     try std.testing.expectEqual(@as(usize, 42), detailed.settings.max_agent_steps.?);
-    try std.testing.expectEqual(ConfigSource.user_workspace, detailed.sources.startup_scrollback);
+    try std.testing.expectEqual(ConfigSource.user_workspace, detailed.sources.fast_mode);
     try std.testing.expectEqual(@as(usize, 2), detailed.diagnostics.len);
-    try expectIgnoredProjectKey(detailed.diagnostics, "startup_scrollback");
+    try expectIgnoredProjectKey(detailed.diagnostics, "fast_mode");
     try std.testing.expectEqual(
         ConfigDiagnosticCause.legacy_workspace_preferences,
         detailed.diagnostics[1].cause,
@@ -4293,7 +4388,7 @@ test "detailed settings expose target sources and permission views" {
     defer std.testing.allocator.free(workspace_root);
 
     const user_settings = try std.testing.allocator.print(
-        "{{\"model\":\"user/model\",\"permission_mode\":\"ask\",\"fast_mode\":true,\"input_appearance\":\"tint\",\"startup_scrollback\":false," ++
+        "{{\"model\":\"user/model\",\"permission_mode\":\"ask\",\"fast_mode\":true,\"input_appearance\":\"tint\"," ++
             "\"prompt_history\":{{\"enabled\":false}},\"status_line\":{{\"sandbox\":true,\"context\":false,\"session\":true}}," ++
             "\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{" ++
             "\"model\":\"workspace/model\",\"permission_mode\":\"auto\",\"input_appearance\":\"lines\",\"sandbox\":\"none\",\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}" ++
@@ -4315,7 +4410,6 @@ test "detailed settings expose target sources and permission views" {
     try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.permission_mode);
     try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.effort);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.fast_mode);
-    try std.testing.expectEqual(ConfigSource.user_global, result.sources.startup_scrollback);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.prompt_history_enabled);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.statusline_context);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.statusline_session);
@@ -4998,6 +5092,9 @@ test "the settings list gives the types, values, and bounds the settings parser 
         // fx reads these elsewhere or not at all: one workspace's own keys,
         // the workspace map, retired keys, and `$schema`, which editors read.
         if (key.workspace_only or key.kind == .workspaces or key.where == .retired or key.where == .editor) continue;
+        // A bad `shortcuts` value is reported and skipped, not refused: the
+        // shortcut tests check that, so the whole-file refusal below doesn't apply.
+        if (key.kind == .shortcuts) continue;
         const layer: SettingsLayer = if (key.where == .project_safe) .project else .profile;
         const wrong = switch (key.kind) {
             .string, .string_or_null => try alloc.dupe(u8, "5"),
@@ -5085,6 +5182,22 @@ test "the settings list names every value the settings enums accept" {
     try std.testing.expectEqual(std.meta.tags(tool_placement.Placement).len, settings_keys.find("tool_placement").?.values.len);
 }
 
+test "experimental.sandbox_execution is read from the profile only and stays off by default" {
+    const alloc = std.testing.allocator;
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, null), absent.experimental_sandbox_execution);
+    var on = try parseSettingsJson(alloc, "{\"experimental\":{\"sandbox_execution\":true}}");
+    defer on.deinit(alloc);
+    try std.testing.expect(on.experimental_sandbox_execution.?);
+    // A repository's committed .fx.json can never turn it on.
+    var project = try parseSettingsJsonForLayer(alloc, "{\"experimental\":{\"sandbox_execution\":true}}", .project);
+    defer project.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, null), project.experimental_sandbox_execution);
+    // A value of another type is refused, as for every other switch.
+    try std.testing.expectError(error.InvalidExperimentalSandboxExecutionType, parseSettingsJson(alloc, "{\"experimental\":{\"sandbox_execution\":\"yes\"}}"));
+}
+
 test "experimental.workspace_capture is read from the profile only and stays off by default" {
     const alloc = std.testing.allocator;
     var absent = try parseSettingsJson(alloc, "{}");
@@ -5099,4 +5212,70 @@ test "experimental.workspace_capture is read from the profile only and stays off
     try std.testing.expectEqual(@as(?bool, null), project.experimental_workspace_capture);
     // A value of another type is refused, as for every other switch.
     try std.testing.expectError(error.InvalidExperimentalWorkspaceCaptureType, parseSettingsJson(alloc, "{\"experimental\":{\"workspace_capture\":\"yes\"}}"));
+}
+
+test "shortcuts are read from the profile top level only" {
+    const alloc = std.testing.allocator;
+    const valid = "{\"shortcuts\":{\"alt+m\":\"/model\"}}";
+    var profile = try parseSettingsJson(alloc, valid);
+    defer profile.deinit(alloc);
+    try std.testing.expect(profile.shortcuts != null);
+    try std.testing.expect(profile.shortcut_problem == null);
+
+    var project = try parseSettingsJsonForLayer(alloc, valid, .project);
+    defer project.deinit(alloc);
+    try std.testing.expect(project.shortcuts == null);
+
+    var workspace = try parseSettingsJsonForLayer(alloc, valid, .profile_workspace);
+    defer workspace.deinit(alloc);
+    try std.testing.expect(workspace.shortcuts == null);
+}
+
+test "a bad shortcut is named by its field and leaves theme and permission_mode loaded" {
+    const alloc = std.testing.allocator;
+    var settings = try parseSettingsJson(alloc,
+        \\{"theme":"light","permission_mode":"ask","shortcuts":{"ctrl+1":{"provider":"gateway","model":"openai/gpt-5","effort":"high"}}}
+    );
+    defer settings.deinit(alloc);
+    try std.testing.expectEqualStrings("light", settings.theme.?);
+    try std.testing.expect(settings.permission_mode != null);
+    try std.testing.expect(settings.shortcuts == null);
+    try std.testing.expectEqualStrings("shortcuts.ctrl+1.fast_mode", settings.shortcut_problem.?);
+}
+
+test "a shortcuts value that is not an object is named as the whole key" {
+    const alloc = std.testing.allocator;
+    var settings = try parseSettingsJson(alloc, "{\"theme\":\"dark\",\"shortcuts\":[]}");
+    defer settings.deinit(alloc);
+    try std.testing.expectEqualStrings("dark", settings.theme.?);
+    try std.testing.expect(settings.shortcuts == null);
+    try std.testing.expectEqualStrings("shortcuts", settings.shortcut_problem.?);
+}
+
+test "a reserved shortcut names its reason, and only the map is dropped" {
+    const alloc = std.testing.allocator;
+    var settings = try parseSettingsJson(alloc,
+        \\{"theme":"light","shortcuts":{"alt+m":"/model","ctrl+c":"/fast"}}
+    );
+    defer settings.deinit(alloc);
+    try std.testing.expectEqualStrings("light", settings.theme.?);
+    try std.testing.expect(settings.shortcuts == null);
+    try std.testing.expectEqualStrings(
+        "shortcuts.ctrl+c; ctrl+c is reserved for fx: interrupts a running turn and exits",
+        settings.shortcut_problem.?,
+    );
+}
+
+test "a shortcut problem key stays printable and bounded" {
+    const alloc = std.testing.allocator;
+    const escaped = try shortcutProblemKey(alloc, .{ .chord = "ctrl+\x1b[31m", .field = "model" });
+    defer alloc.free(escaped);
+    try std.testing.expectEqualStrings("shortcuts.ctrl+?[31m.model", escaped);
+
+    const long = try alloc.alloc(u8, 100);
+    defer alloc.free(long);
+    @memset(long, 'x');
+    const bounded = try shortcutProblemKey(alloc, .{ .chord = long });
+    defer alloc.free(bounded);
+    try std.testing.expectEqual("shortcuts.".len + max_shortcut_problem_bytes, bounded.len);
 }

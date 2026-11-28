@@ -98,7 +98,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   mkdirSync(workspace);
   writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-    model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
   }));
   // Failure attempts need an older exchange outside the retained suffix, but
   // must leave the next ordinary request below the automatic pressure threshold.
@@ -153,6 +153,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-compaction-key",
     FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_WORKSPACE_TRUST: "1",
     FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -329,7 +330,7 @@ async function foldedReadAfterReopen(trigger: "auto" | "overflow") {
   writeFileSync(join(workspace, "b.txt"), "bravo\n");
   writeFileSync(join(workspace, "c.txt"), "charlie\n");
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-    model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
     ...(trigger === "auto" ? { auto_compact_percent: 10 } : {}),
   }));
   const PROMPT = "Read the three files.";
@@ -372,6 +373,7 @@ async function foldedReadAfterReopen(trigger: "auto" | "overflow") {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-compaction-key",
     FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_WORKSPACE_TRUST: "1",
     FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -839,6 +841,10 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await reopened.sendKeys("C-o");
         await reopened.waitForComposer(5000);
         expect(await reopened.captureFullScrollbackEscapes()).not.toMatch(COMPACTION_OUTPUT);
+        // Typing /quit while the resumed history is still being written grows
+        // the footer, so fx writes the rest at once, and the quit waits until
+        // the terminal takes it. That can outlast close's wait on a slow runner.
+        await f.waitForResumeHandoff();
         await f.close();
         expect(f.counts()).toEqual(cancelledCounts);
         expect(f.savedEvents().startsWith(cancelledEvents)).toBe(true);
@@ -970,7 +976,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
     }));
     for (let n = 1; n <= 30; n++) {
       writeFileSync(join(workspace, `probe-${n}.txt`), `STEER_PROBE_${n}_8d4 context pressure line\n`.repeat(250));
@@ -998,6 +1004,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
       TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
       FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_TEST_SKIP_WORKSPACE_TRUST: "1",
       FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_PERMISSION_MODE: "full-access",
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -1076,7 +1083,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
     }));
     const answers = [
       "CTRLO_OLDER_FIRST_5c1",
@@ -1097,6 +1104,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
       TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
       FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_TEST_SKIP_WORKSPACE_TRUST: "1",
       FX_SOUND: "0", FX_AUTO_UPGRADE: "0", NO_COLOR: "1",
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -1160,7 +1168,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     mkdirSync(workspace);
     writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
     writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
     }));
     const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
     writeFxLogin(home, issuer.issuerUrl, "launch-token");
@@ -1243,11 +1251,16 @@ const NOTICE_PROMPT = "Read the three files.";
 const NOTICE_DONE = "NOTICE_ROWS_DONE_7c1a";
 const NOTICE_REJECTION = "REJECTED_9d2e";
 const NOTICE_HANDOFF = "Facts:\nF1: NOTICE_ROWS_HANDOFF_51aa: the user asked to read three files.";
-// fx estimates the turn's first request at about 5k to 6k tokens and the
-// next one, with a.txt's preview of one-letter words, at about 7k to 8k.
-// Compaction starts at 10% of the usable input: the window less the 8192
-// tokens kept for output, so 6.7k, between the two.
-const NOTICE_AUTO_CONTEXT_WINDOW = 67_000 + 8192;
+// fx measures a request as a whole, tool catalog included, and compacts when
+// that estimate reaches 10% of the usable input: the window less the 8192
+// tokens kept for output. This turn must compact once, after a.txt's preview
+// and before the calls that follow, so the point sits between them. Measured
+// here: about 6.4k for the turn's first request, 8.5k with a.txt's preview of
+// one-letter words, and 6.2k to 6.8k for the requests after the compaction.
+// The point, 7.6k, is about 0.9k from either side, so a tool catalog that
+// grows by less than that still yields one compaction.
+const NOTICE_AUTO_COMPACT_AT_TOKENS = 7_600;
+const NOTICE_AUTO_CONTEXT_WINDOW = NOTICE_AUTO_COMPACT_AT_TOKENS * 10 + 8192;
 const NOTICE_CLOCK = /\((?:\d+h)?(?:\d+m)?\d+s\)/g;
 
 type NoticeMiddle = "overflow" | "auto" | "provider-error" | "effort" | "empty-reply";
@@ -1284,7 +1297,7 @@ async function readAroundNotice(middle: NoticeMiddle) {
   writeFileSync(join(workspace, "b.txt"), "bravo\n");
   writeFileSync(join(workspace, "c.txt"), "charlie\n");
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-    model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
     ...(middle === "auto" ? { auto_compact_percent: 10 } : {}),
   }));
   // The earlier turn gives compaction something to fold. It reports no
@@ -1342,6 +1355,7 @@ async function readAroundNotice(middle: NoticeMiddle) {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-notice-key",
     FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_WORKSPACE_TRUST: "1",
     FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -1379,7 +1393,8 @@ async function readAroundNotice(middle: NoticeMiddle) {
       await live.waitForText("Next turn will use reasoning effort high", 10_000);
       releaseSecondRead();
     }
-    const liveRows = noticeTurnRows((await live.waitForPane(noticeTurnDone, 20_000)).split("\n"));
+    const livePane = await live.waitForPane(noticeTurnDone, 20_000);
+    const liveRows = noticeTurnRows(livePane.split("\n"));
     await live.sendKeys("C-o");
     await live.waitForText("esc close · pgup/pgdn scroll", 5000);
     await live.sendKeys("End");
@@ -1396,7 +1411,7 @@ async function readAroundNotice(middle: NoticeMiddle) {
     expect(await resumed.waitForSessionEnd(10_000)).toBe(true);
     for (const path of stderrPaths) expect(readFileSync(path, "utf8")).toBe("");
     passed = true;
-    return { liveRows, fullRows, resumedRows };
+    return { liveRows, livePane, fullRows, resumedRows };
   } finally {
     if (!passed) {
       if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
@@ -1440,14 +1455,17 @@ describe.skipIf(!tmuxAvailable())("tui: tool rows around a notice in the middle 
   }, 120_000);
 
   test("provider error: the calls after the reason fx showed while it waited draw below it, and share one row after resume", async () => {
-    const { liveRows, fullRows, resumedRows } = await readAroundNotice("provider-error");
+    const { liveRows, livePane, fullRows, resumedRows } = await readAroundNotice("provider-error");
     expect(liveRows).toEqual([
       `┃ ${NOTICE_PROMPT}`,
       "● Read a.txt",
-      `! system: API access denied · HTTP 403 · invalid_request_error: ${NOTICE_REJECTION}`,
+      `⚠ ${NOTICE_REJECTION}`,
       "● Read b.txt, c.txt",
       `  ${NOTICE_DONE}`,
     ]);
+    expect(livePane).not.toContain("system:");
+    expect(livePane).not.toContain("HTTP 403");
+    expect(fullRows.join("\n")).toContain("HTTP 403 · invalid_request_error");
     expectFullTranscriptOrder(fullRows, ["● Read a.txt", NOTICE_REJECTION, "● Read b.txt", "● Read c.txt", NOTICE_DONE]);
     expect(resumedRows).toEqual([`┃ ${NOTICE_PROMPT}`, "● Read a.txt, b.txt, c.txt", `  ${NOTICE_DONE}`]);
   }, 120_000);
@@ -1505,7 +1523,7 @@ describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live
       writeFileSync(join(workspace, `part${part}.txt`), `${body(`part${part}`, 300)}\n`);
     }
     writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-      model: LIVE_MODEL, auto_compact_percent: 10, auto_upgrade: false, startup_scrollback: false,
+      model: LIVE_MODEL, auto_compact_percent: 10, auto_upgrade: false,
     }));
     // A local gateway plays the earlier turn, so only this turn and its
     // compaction reach the live model.

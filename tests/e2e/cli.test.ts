@@ -14,6 +14,7 @@ import {
   rmSync,
   symlinkSync,
   utimesSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import { homedir, platform, tmpdir } from "node:os";
@@ -31,6 +32,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  startDynamicFakeGateway,
   startFakeGateway,
   tokenPassCatalog,
 } from "./tmux-helpers";
@@ -412,7 +414,7 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>
+  fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--stream-events] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>
 
 Options:
   --permission-mode <mode>    Set the permission mode for this request: ask, auto, or full-access
@@ -433,6 +435,7 @@ Options:
   --image PATH                Attach an image file; repeat for multiple images
   --system TEXT               Replace the built-in system prompt for this request
   --json                      Emit machine-readable JSON instead of text
+  --stream-events             Stream JSON Lines lifecycle events on stdout as they happen
   --quiet                     Suppress assistant output
   --prompt-permissions        Prompt for Y/N permission approval when stdin is a TTY
   --timeout <seconds>         Time limit for each shell command the agent runs
@@ -794,6 +797,472 @@ describe("cli: closed output pipe", () => {
       TIMEOUT,
     );
   }
+});
+
+describe("cli: closed terminal", () => {
+  const PTY_HELPER = [
+    "import fcntl, json, os, pty, select, struct, subprocess, sys, termios, time",
+    "ctty = sys.argv[1].endswith('+ctty')",
+    "mode = sys.argv[1].split('+')[0]",
+    "fx_bin = sys.argv[2]",
+    "cwd = sys.argv[3]",
+    "stderr_path = sys.argv[4]",
+    "needle = sys.argv[5].encode('latin1')",
+    "argv = sys.argv[6:]",
+    "master, slave = pty.openpty()",
+    "fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))",
+    "err_master = err_slave = None",
+    "if mode == 'separate_err':",
+    "    err_master, err_slave = pty.openpty()",
+    "def preexec():",
+    "    # New session. Without TIOCSCTTY closing master sends no SIGHUP; with ctty it does, as a closed window does.",
+    "    os.setsid()",
+    "    if ctty: fcntl.ioctl(slave, termios.TIOCSCTTY, 0)",
+    "    os.dup2(slave, 0)",
+    "    os.dup2(slave, 1)",
+    "    if err_slave is not None:",
+    "        os.dup2(err_slave, 2)",
+    "    else:",
+    "        err_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)",
+    "        os.dup2(err_fd, 2)",
+    "        if err_fd > 2: os.close(err_fd)",
+    "    if slave > 2: os.close(slave)",
+    "    if mode != 'immediate': os.close(master)",
+    "    if err_slave is not None and err_slave > 2: os.close(err_slave)",
+    "    if err_master is not None: os.close(err_master)",
+    "if mode == 'immediate':",
+    "    os.close(master)",
+    "proc = subprocess.Popen([fx_bin] + argv, cwd=cwd, preexec_fn=preexec, close_fds=False)",
+    "os.close(slave)",
+    "if err_slave is not None: os.close(err_slave)",
+    "def drain(fd):",
+    "    chunks = []",
+    "    while True:",
+    "        r, _, _ = select.select([fd], [], [], 0.05)",
+    "        if not r: break",
+    "        try:",
+    "            d = os.read(fd, 4096)",
+    "            if not d: break",
+    "            chunks.append(d)",
+    "        except OSError: break",
+    "    return b''.join(chunks)",
+    "if mode == 'immediate':",
+    "    pass",
+    "elif mode == 'open':",
+    "    out = bytearray()",
+    "    while proc.poll() is None:",
+    "        r, _, _ = select.select([master], [], [], 0.05)",
+    "        if r:",
+    "            try: out.extend(os.read(master, 4096))",
+    "            except OSError: break",
+    "    out.extend(drain(master))",
+    "    os.close(master)",
+    "else:",
+    "    watch_fd = err_master if err_master is not None else master",
+    "    buf = bytearray()",
+    "    sent_11 = False",
+    "    sent_6n = False",
+    "    deadline = time.monotonic() + 8.0",
+    "    while time.monotonic() < deadline:",
+    "        r, _, _ = select.select([watch_fd], [], [], 0.1)",
+    "        if r:",
+    "            try: chunk = os.read(watch_fd, 4096)",
+    "            except OSError: break",
+    "            if not chunk: break",
+    "            buf.extend(chunk)",
+    "            if mode == 'ask_stream':",
+    "                if not sent_11 and b'\\x1b]11;?' in buf:",
+    "                    sent_11 = True",
+    "                    os.write(master, b'\\x1b]11;rgb:0000/0000/0000\\x1b\\\\\\x1b[?1;2c')",
+    "                if not sent_6n and b'\\x1b[6n' in buf:",
+    "                    sent_6n = True",
+    "                    os.write(master, b'\\x1b[1;1R')",
+    "            if needle:",
+    "                if needle in buf:",
+    "                    os.close(master)",
+    "                    if mode == 'ask_stream':",
+    "                        sys.stdout.write('PTY_CLOSED\\n')",
+    "                        sys.stdout.flush()",
+    "                    break",
+    "            elif len(buf) > 0:",
+    "                os.close(master)",
+    "                break",
+    "    else:",
+    "        os.close(master)",
+    "try:",
+    "    rc = proc.wait(timeout=2.0)",
+    "except subprocess.TimeoutExpired:",
+    "    proc.kill()",
+    "    rc = proc.wait(timeout=2.0)",
+    "if err_master is not None:",
+    "    stderr_txt = drain(err_master).decode('utf-8', 'replace')",
+    "    os.close(err_master)",
+    "else:",
+    "    stderr_txt = open(stderr_path, encoding='utf-8', errors='replace').read()",
+    "if ctty and rc < 0: rc = 128 - rc  # killed by a signal: the shell's 128 + signal",
+    "print(json.dumps({'status': rc, 'stderr': stderr_txt}))",
+  ].join("\n");
+
+  async function runInPty(opts: {
+    mode: "immediate" | "open" | "ask_stream" | "wait_needle" | "separate_err";
+    argv: string[];
+    cwd: string;
+    env: Record<string, string | undefined>;
+    needle?: string;
+    onPtyClosed?: () => void;
+    controllingTerminal?: boolean;
+  }): Promise<{ status: number; stderr: string }> {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-pty-")));
+    const stderrPath = join(root, "stderr.log");
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries({ ...process.env, ...opts.env })) {
+      if (v !== undefined) env[k] = v;
+    }
+    const proc = Bun.spawn(
+      [
+        "python3",
+        "-c",
+        PTY_HELPER,
+        opts.controllingTerminal ? `${opts.mode}+ctty` : opts.mode,
+        FX_BIN,
+        opts.cwd,
+        stderrPath,
+        opts.needle ?? "",
+        ...opts.argv,
+      ],
+      { cwd: opts.cwd, env, stdout: "pipe", stderr: "pipe" },
+    );
+    const lines: string[] = [];
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (line === "PTY_CLOSED") opts.onPtyClosed?.();
+          else if (line) lines.push(line);
+        }
+      }
+      if (buf.trim()) lines.push(buf.trim());
+      const exitCode = await proc.exited;
+      const helperErr = await new Response(proc.stderr).text();
+      if (exitCode !== 0) throw new Error(`pty helper failed (${exitCode}): ${helperErr}`);
+      return JSON.parse(lines[lines.length - 1]!);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  function writeSampleReplayTape(path: string) {
+    const magic = Buffer.from("FXTP\x01", "latin1");
+    const ver = Buffer.from("0.0.1", "latin1");
+    const line = Buffer.from("HELLO_REPLAY_FRAME_" + "X".repeat(80) + "\r\n", "latin1");
+    const header = Buffer.alloc(13);
+    header.writeUInt16LE(80, 0);
+    header.writeUInt16LE(24, 2);
+    header.writeBigInt64LE(123456789n, 4);
+    header.writeUInt8(ver.length, 12);
+    const frameHeader = Buffer.alloc(9);
+    frameHeader.writeInt32LE(1, 0);
+    frameHeader.writeUInt8(1, 4);
+    frameHeader.writeUInt32LE(line.length, 5);
+    const frames = Buffer.concat(Array.from({ length: 1200 }, () => Buffer.concat([frameHeader, line])));
+    writeFileSync(path, Buffer.concat([magic, header, ver, frames]));
+  }
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx ask in a terminal closing mid-stream exits 129 with empty stderr",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-pty-stream-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const workspaceFile = join(workspace, "note.txt");
+      writeFileSync(workspaceFile, "hello\n");
+      let releaseTurn2!: () => void;
+      const turn2Gate = new Promise<void>((resolve) => {
+        releaseTurn2 = resolve;
+      });
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes("pty_call_1")) {
+          return fakeGatewaySse([
+            { type: "text-delta", id: "answer_1", delta: "First chunk paragraph." },
+            {
+              type: "tool-call",
+              toolCallId: "pty_call_1",
+              toolName: "read_file",
+              input: { path: "note.txt" },
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: { inputTokens: { total: 2 }, outputTokens: { total: 10 } },
+            },
+          ]);
+        }
+        await turn2Gate;
+        return fakeGatewayFinalText("Second chunk after terminal closed.");
+      });
+      try {
+        const result = await runInPty({
+          mode: "ask_stream",
+          argv: ["ask", "--auto", "Read note.txt and reply."],
+          cwd: workspace,
+          needle: "First chunk paragraph.",
+          onPtyClosed: () => releaseTurn2(),
+          env: {
+            HOME: home,
+            TERM: "xterm-256color",
+            AI_GATEWAY_API_KEY: "pty-hangup-key",
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_SOUND: "0",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+      } finally {
+        releaseTurn2();
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx ask in a terminal closing during the startup probe exits 129 with empty stderr",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-pty-startup-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      try {
+        const result = await runInPty({
+          mode: "wait_needle",
+          argv: ["ask", "--auto", "Say hi."],
+          cwd: workspace,
+          needle: "\x1b[6n",
+          env: {
+            HOME: home,
+            TERM: "xterm-256color",
+            AI_GATEWAY_API_KEY: "pty-startup-key",
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_SOUND: "0",
+            FX_TEST_SKIP_ONBOARDING: "1",
+          },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx replay in a terminal closing mid-write exits 129 with empty stderr",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-replay-pty-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tapePath = join(root, "sample.fxtape");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeSampleReplayTape(tapePath);
+      try {
+        const result = await runInPty({
+          mode: "wait_needle",
+          argv: ["replay", tapePath, "--frames"],
+          cwd: workspace,
+          env: { HOME: home, TERM: "xterm-256color", FX_SOUND: "0", FX_AUTO_UPGRADE: "0" },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx status in a terminal closing at once exits 129 with empty stderr",
+    async () => {
+      const home = createIsolatedTestHome();
+      try {
+        const result = await runInPty({
+          mode: "immediate",
+          argv: ["status"],
+          cwd: home,
+          env: { HOME: home, TERM: "xterm-256color", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1" },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx login --api-key with stdin closed exits 129 with empty stderr",
+    async () => {
+      const home = createIsolatedTestHome();
+      try {
+        for (const argv of [["login", "--api-key"]]) {
+          const result = await runInPty({
+            mode: "separate_err",
+            argv,
+            cwd: home,
+            needle: "input hidden",
+            // macOS gives the pty a controlling terminal, as a real window does, so the Keychain prompt stays on it; FXC-451 tracks the hang-up without SIGHUP.
+            controllingTerminal: process.platform === "darwin",
+            env: { HOME: home, TERM: "xterm-256color", FX_SOUND: "0", FX_AUTO_UPGRADE: "0" },
+          });
+          const afterPrompt = result.stderr.split("input hidden): ").slice(1).join("");
+          expect({ status: result.status, afterPrompt }, argv.join(" ")).toEqual({ status: 129, afterPrompt: "" });
+        }
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx login grok with stdin closed exits 129 with empty stderr without hanging",
+    async () => {
+      const home = createIsolatedTestHome();
+      const grokIssuer = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch() {
+          return Response.json({
+            authorization_endpoint: `http://127.0.0.1:${grokIssuer.port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${grokIssuer.port}/token`,
+          });
+        },
+      });
+      try {
+        const result = await runInPty({
+          mode: "wait_needle",
+          argv: ["login", "grok"],
+          cwd: home,
+          needle: "Paste the code",
+          env: {
+            HOME: home,
+            TERM: "xterm-256color",
+            FX_SOUND: "0",
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_NO_OPEN_BROWSER: "1",
+            FX_TEST_GROK_ISSUER_URL: `http://127.0.0.1:${grokIssuer.port}`,
+          },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+      } finally {
+        grokIssuer.stop(true);
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx teams with stdin closed exits 129 with empty stderr and does not pick a team",
+    async () => {
+      const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-teams-pty-hangup-")));
+      const issuer = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch(request) {
+          const url = new URL(request.url);
+          if (url.pathname === "/v2/teams") {
+            return Response.json({
+              teams: [
+                { id: "team_one", slug: "team-one", name: "Team One" },
+                { id: "team_two", slug: "team-two", name: "Team Two" },
+              ],
+            });
+          }
+          return new Response("not found", { status: 404 });
+        },
+      });
+      try {
+        writeSeededFxAuth(home, "team_old", `http://127.0.0.1:${issuer.port}`);
+        const result = await runInPty({
+          mode: "wait_needle",
+          argv: ["teams"],
+          cwd: home,
+          needle: "Select a Vercel team",
+          env: {
+            HOME: home,
+            TERM: "xterm-256color",
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_SOUND: "0",
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: `http://127.0.0.1:${issuer.port}`,
+          },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+        const persisted = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as { team_id?: string };
+        expect(persisted.team_id).toBe("team_old");
+      } finally {
+        issuer.stop(true);
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test("fx replay with a missing tape still reports its file error and exits 1", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-replay-missing-guard-"));
+    try {
+      const r = await runFx(["replay", join(root, "does-not-exist.fxtape")], { cwd: root });
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("cannot open");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx status on an open terminal still exits 0 with empty stderr",
+    async () => {
+      const home = createIsolatedTestHome();
+      try {
+        const result = await runInPty({
+          mode: "open",
+          argv: ["status"],
+          cwd: home,
+          env: { HOME: home, TERM: "xterm-256color", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1" },
+        });
+        expect(result).toEqual({ status: 0, stderr: "" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: status", () => {
@@ -1297,6 +1766,53 @@ describe("cli: status", () => {
     },
     TIMEOUT,
   );
+
+  test("shortcut edits use key identity and preserve unrelated bindings", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fx-shortcut-identity-"));
+    try {
+      const profile = join(home, ".fx");
+      mkdirSync(profile);
+      const file = join(profile, "settings.json");
+      writeFileSync(file, JSON.stringify({ theme: "light", shortcuts: { "Alt+Ctrl+K": "/model", F8: "/model" } }));
+      const config = (...args: string[]) => runFx(["config", ...args], {
+        cwd: home, env: { ...NO_GATEWAY_AUTH, ...NO_SETTING_ENV, HOME: home, FX_HOME: profile },
+      });
+      const original = readFileSync(file, "utf8");
+      const restricted = await config("set", "shortcuts.f9", "/permissions ask");
+      expect(restricted.code).toBe(2);
+      expect(restricted.stderr).toContain("not available from shortcuts");
+      expect(readFileSync(file, "utf8")).toBe(original);
+      const reserved = await config("set", "shortcuts.ctrl+c", "/fast");
+      expect(reserved.code).toBe(2);
+      expect(reserved.stderr).toContain("ctrl+c is reserved for fx: interrupts a running turn and exits");
+      expect(reserved.stderr).not.toContain("use a key chord");
+      expect(readFileSync(file, "utf8")).toBe(original);
+      const key = "shortcuts.ctrl+alt+k";
+      expect((await config("get", key)).code).toBe(0);
+      const alias = await config("get", "shortcuts.CTRL+ALT+k");
+      expect([alias.code, alias.stdout.trim()]).toEqual([0, "/model"]);
+      const before = readFileSync(file, "utf8");
+      const occupied = await config("set", key, "/fast");
+      expect(occupied.code).toBe(1);
+      expect(occupied.stderr).toContain("already has a shortcut");
+      expect(readFileSync(file, "utf8")).toBe(before);
+      expect((await config("unset", key)).code).toBe(0);
+      expect((await config("get", key)).code).toBe(1);
+      expect((await config("set", key, "/fast")).code).toBe(0);
+      expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({
+        theme: "light", shortcuts: { F8: "/model", "ctrl+alt+k": "/fast" },
+      });
+      const preset = JSON.stringify({ provider: "gateway", model: "openai/gpt-5", effort: "high", fast_mode: true });
+      expect((await config("set", "shortcuts.ctrl+1", preset)).code).toBe(0);
+      expect((await config("get", "shortcuts.ctrl+1.model")).stdout.trim()).toBe("openai/gpt-5");
+      expect((await config("unset", "shortcuts.ctrl+1")).code).toBe(0);
+      expect((await config("unset", key)).code).toBe(0);
+      expect((await config("unset", "shortcuts.F8")).code).toBe(0);
+      expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ theme: "light" });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
 
   test(
     "tool placement moves built-in tools through fx config and --tool-placement",
@@ -2094,6 +2610,39 @@ describe("cli: status", () => {
         expect(second.agent_step_limit).toBe(4);
       } finally {
         rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "FX_TRACE_LOG as a FIFO fails closed without blocking startup",
+    async () => {
+      if (platform() === "win32") return;
+      const home = createIsolatedTestHome();
+      const fifoDir = mkdtempSync(join(tmpdir(), "fx-e2e-trace-fifo-"));
+      try {
+        const fxHome = join(home, ".fx");
+        const fifo = join(fifoDir, "trace.fifo");
+        expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+
+        const result = await runFx(["status"], {
+          cwd: fifoDir,
+          env: {
+            ...NO_GATEWAY_AUTH,
+            HOME: home,
+            FX_HOME: fxHome,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TRACE_LOG: fifo,
+          },
+          timeoutMs: 5_000,
+        });
+        expect(result.timedOut, "fx blocked opening the FIFO trace log").toBe(false);
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(fifoDir, { recursive: true, force: true });
       }
     },
     TIMEOUT,
@@ -6729,7 +7278,7 @@ describe("cli: error handling", () => {
             "fx ask: --no-save cannot be used with --resume",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save]",
+            "usage: fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--stream-events] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
@@ -7628,4 +8177,504 @@ describe("fx login Token Pass status", () => {
       rmSync(home, { recursive: true, force: true });
     }
   }, TIMEOUT);
+
+  test(
+    "fx ask --model names the requested model in turn context and keeps the stable prefix unchanged",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace);
+      const modelA = "openai/gpt-5.5";
+      const modelB = "anthropic/claude-opus-4.6";
+      const modelC = "anthropic/claude-sonnet-4.6";
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("ASK_MODEL_A_OK"),
+        fakeGatewayFinalText("ASK_MODEL_B_OK"),
+        fakeGatewayFinalText("ASK_MODEL_C_OK"),
+      ], {
+        models: [
+          { id: modelA, type: "language", tags: ["tool-use"] },
+          { id: modelB, type: "language", tags: ["tool-use"] },
+          { id: modelC, type: "language", tags: ["tool-use"] },
+        ],
+      });
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-ask-model-id-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const askA = await runFx(["ask", "--json", "--no-save", "--model", modelA, "Which model are you?"], {
+          cwd: workspace,
+          env,
+          timeoutMs: TIMEOUT,
+        });
+        expect(askA.code, askA.stderr).toBe(0);
+        const askB = await runFx(["ask", "--json", "--no-save", "--model", modelB, "Which model are you?"], {
+          cwd: workspace,
+          env,
+          timeoutMs: TIMEOUT,
+        });
+        expect(askB.code, askB.stderr).toBe(0);
+        const askC = await runFx(["ask", "--json", "--no-save", "--model", modelC, "Which model are you?"], {
+          cwd: workspace,
+          env,
+          timeoutMs: TIMEOUT,
+        });
+        expect(askC.code, askC.stderr).toBe(0);
+        expect(gateway.requests).toHaveLength(3);
+
+        const reqA = JSON.parse(gateway.requests[0]!.body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+        const reqB = JSON.parse(gateway.requests[1]!.body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+        const reqC = JSON.parse(gateway.requests[2]!.body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+        const sysText = (content: unknown) => typeof content === "string" ? content : JSON.stringify(content);
+        const turnIdxA = reqA.prompt.findIndex((m) => m.role === "system" && sysText(m.content).includes("<fx-turn-context>"));
+        const turnIdxB = reqB.prompt.findIndex((m) => m.role === "system" && sysText(m.content).includes("<fx-turn-context>"));
+        const turnIdxC = reqC.prompt.findIndex((m) => m.role === "system" && sysText(m.content).includes("<fx-turn-context>"));
+        expect(turnIdxA).toBeGreaterThan(0);
+        expect(turnIdxB).toBe(turnIdxA);
+        expect(turnIdxC).toBe(turnIdxA);
+
+        const turnA = sysText(reqA.prompt[turnIdxA]!.content);
+        const turnB = sysText(reqB.prompt[turnIdxB]!.content);
+        const turnC = sysText(reqC.prompt[turnIdxC]!.content);
+        expect(turnA).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelA}\\n`));
+        expect(turnB).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelB}\\n`));
+        expect(turnC).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelC}\\n`));
+        // The stable prefix text before <fx-turn-context> stays identical across model families,
+        // and within the same caching family even the cache breakpoints stay byte-for-byte identical.
+        expect(reqB.prompt.slice(0, turnIdxB).map((m) => m.content)).toEqual(reqA.prompt.slice(0, turnIdxA).map((m) => m.content));
+        expect(JSON.stringify(reqC.prompt.slice(0, turnIdxC))).toBe(JSON.stringify(reqB.prompt.slice(0, turnIdxB)));
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+describe("cli: ask stream events", () => {
+  test(
+    "fx ask --stream-events emits turn_start, tool_start, tool_end, result in order and leaves --json byte-identical",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(workspace, "hello.txt"), "hello from disk\n", "utf8");
+
+      let step = 0;
+      const gateway = startDynamicFakeGateway(async () => {
+        step += 1;
+        if (step % 2 === 1) {
+          return fakeGatewaySse([
+            {
+              type: "tool-call",
+              toolCallId: `call_read_${step}`,
+              toolName: "read_file",
+              input: { path: "hello.txt" },
+            },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+        }
+        return fakeGatewayFinalText("DONE_STREAM_EVENTS");
+      });
+
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-ask-stream-events-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+
+        const streamed = await runFx(
+          ["ask", "--stream-events", "--full-access", "--model", FAKE_GATEWAY_MODEL, "Read hello.txt"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(streamed.code, streamed.stderr).toBe(0);
+        const rawLines = streamed.stdout.trimEnd().split("\n");
+        expect(rawLines).toHaveLength(4);
+        const events = rawLines.map((line) => JSON.parse(line));
+
+        expect(events[0].type).toBe("turn_start");
+        expect(typeof events[0].session_id).toBe("string");
+        expect(events[0].session_id.length).toBeGreaterThan(0);
+        expect(events[0].model).toBe(FAKE_GATEWAY_MODEL);
+        expect(events[0].provider).toBe("gateway");
+
+        expect(events[1]).toEqual({
+          type: "tool_start",
+          call_id: "call_read_1",
+          name: "read_file",
+          target: "hello.txt",
+        });
+
+        expect(events[2]).toEqual({
+          type: "tool_end",
+          call_id: "call_read_1",
+          name: "read_file",
+          status: "completed",
+        });
+
+        expect(events[3].type).toBe("result");
+        expect(events[3].exit_code).toBe(0);
+        expect(events[3].final_output).toBe("DONE_STREAM_EVENTS");
+        expect(events[3].session_id).toBe(events[0].session_id);
+        expect(events[3].tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+
+        // --json output with --no-save must remain byte-identical across runs.
+        step = 0;
+        const jsonRunA = await runFx(
+          ["ask", "--json", "--no-save", "--full-access", "--model", FAKE_GATEWAY_MODEL, "Read hello.txt"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(jsonRunA.code, jsonRunA.stderr).toBe(0);
+        const parsedJsonA = JSON.parse(jsonRunA.stdout);
+        const { type: resultType, ...resultWithoutType } = events[3];
+        expect(resultType).toBe("result");
+        expect({ ...resultWithoutType, session_id: "" }).toEqual(parsedJsonA);
+        // Exact canonical shape check for --json stdout.
+        expect(jsonRunA.stdout).toBe(
+          JSON.stringify({
+            output: "DONE_STREAM_EVENTS",
+            final_output: "DONE_STREAM_EVENTS",
+            exit_code: 0,
+            model: FAKE_GATEWAY_MODEL,
+            resolved_provider: null,
+            session_id: "",
+            steps: 1,
+            tool_calls: [{ name: "read_file", status: "success" }],
+            usage: { input_tokens: 3, output_tokens: 5 },
+          }) + "\n",
+        );
+
+        // Last flag wins between --json and --stream-events; --quiet preserves stream stdout.
+        step = 1;
+        const streamWins = await runFx(
+          ["ask", "--json", "--stream-events", "--no-save", "--full-access", "--model", FAKE_GATEWAY_MODEL, "hi"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(streamWins.code, streamWins.stderr).toBe(0);
+        const streamWinsLines = streamWins.stdout.trimEnd().split("\n").map((l) => JSON.parse(l));
+        expect(streamWinsLines.map((l) => l.type)).toEqual(["turn_start", "result"]);
+        expect(streamWinsLines[1].final_output).toBe("DONE_STREAM_EVENTS");
+
+        step = 1;
+        const jsonWins = await runFx(
+          ["ask", "--stream-events", "--json", "--no-save", "--full-access", "--model", FAKE_GATEWAY_MODEL, "hi"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(jsonWins.code, jsonWins.stderr).toBe(0);
+        const jsonWinsParsed = JSON.parse(jsonWins.stdout);
+        expect("type" in jsonWinsParsed).toBe(false);
+        expect(jsonWinsParsed.final_output).toBe("DONE_STREAM_EVENTS");
+
+        step = 1;
+        const streamQuiet = await runFx(
+          ["ask", "--stream-events", "--quiet", "--no-save", "--full-access", "--model", FAKE_GATEWAY_MODEL, "hi"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(streamQuiet.code, streamQuiet.stderr).toBe(0);
+        const streamQuietLines = streamQuiet.stdout.trimEnd().split("\n").map((l) => JSON.parse(l));
+        expect(streamQuietLines.map((l) => l.type)).toEqual(["turn_start", "result"]);
+        expect(streamQuietLines[1].final_output).toBe("DONE_STREAM_EVENTS");
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --stream-events keeps turn_start and tool_start on stdout and exits 143 on SIGTERM during a slow tool",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      const tracePath = join(home, "sigterm-trace.log");
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          {
+            type: "tool-call",
+            toolCallId: "call_slow_shell",
+            toolName: "shell",
+            input: { action: "run", command: "sleep 10", yield_time_ms: 10000 },
+          },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]),
+      ]);
+      const proc = Bun.spawn(
+        [FX_BIN, "ask", "--stream-events", "--full-access", "--model", FAKE_GATEWAY_MODEL, "Run sleep 10"],
+        {
+          cwd: workspace,
+          env: fxChildEnv({
+            AI_GATEWAY_API_KEY: "fake-ask-sigterm-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            HOME: home,
+            FX_MODEL: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TRACE_LOG: tracePath,
+          }),
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+
+      try {
+        const reader = proc.stdout.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        const lines: string[] = [];
+        const deadline = AbortSignal.timeout(TIMEOUT);
+        while (lines.length < 2) {
+          if (deadline.aborted) throw new Error(`Timed out waiting for turn_start and tool_start; got: ${buffer}`);
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let nl = buffer.indexOf("\n");
+          while (nl !== -1) {
+            const line = buffer.slice(0, nl);
+            if (line.length > 0) lines.push(line);
+            buffer = buffer.slice(nl + 1);
+            nl = buffer.indexOf("\n");
+          }
+        }
+        expect(lines.length).toBeGreaterThanOrEqual(2);
+        const turnStart = JSON.parse(lines[0]!);
+        const toolStart = JSON.parse(lines[1]!);
+        expect(turnStart.type).toBe("turn_start");
+        expect(turnStart.session_id.length).toBeGreaterThan(0);
+        expect(toolStart).toEqual({
+          type: "tool_start",
+          call_id: "call_slow_shell",
+          name: "shell",
+          target: "sleep 10",
+        });
+
+        proc.kill("SIGTERM");
+        const exitCode = await proc.exited;
+        expect(exitCode).toBe(143);
+        expect(proc.signalCode).toBe("SIGTERM");
+        expect(readFileSync(tracePath, "utf8")).toContain("stream result dropped reason=interrupted exit=143");
+      } finally {
+        proc.kill("SIGKILL");
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --stream-events emits result line on error exits with diagnostics on stderr",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+        };
+
+        // Usage error (--unknown-flag) exits 2 with stderr diagnostic and stream result line.
+        const unknownFlag = await runFx(["ask", "--stream-events", "--unknown-flag", "hi"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(unknownFlag.code).toBe(2);
+        expect(unknownFlag.stderr).toContain("--unknown-flag");
+        const unknownLines = unknownFlag.stdout.trim().split("\n").map((l) => JSON.parse(l));
+        expect(unknownLines).toHaveLength(1);
+        expect(unknownLines[0]).toMatchObject({ type: "result", exit_code: 2, error: "InvalidAskArgs" });
+
+        // Missing prompt exits 2 with stderr diagnostic and stream result line.
+        const missingPrompt = await runFx(["ask", "--stream-events"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(missingPrompt.code).toBe(2);
+        expect(missingPrompt.stderr).toContain("missing prompt");
+        const missingLines = missingPrompt.stdout.trim().split("\n").map((l) => JSON.parse(l));
+        expect(missingLines).toHaveLength(1);
+        expect(missingLines[0]).toMatchObject({ type: "result", exit_code: 2, error: "MissingPrompt" });
+
+        // Missing prompt with --stream-events --quiet also writes the stream result line.
+        const missingQuiet = await runFx(["ask", "--stream-events", "--quiet"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(missingQuiet.code).toBe(2);
+        expect(missingQuiet.stderr).toContain("missing prompt");
+        const missingQuietLines = missingQuiet.stdout.trim().split("\n").map((l) => JSON.parse(l));
+        expect(missingQuietLines).toHaveLength(1);
+        expect(missingQuietLines[0]).toMatchObject({ type: "result", exit_code: 2, error: "MissingPrompt" });
+
+        // Runtime failure (MissingCredentials) exits 1 with stderr diagnostic and stream result matching --json fields.
+        const noAuthStream = await runFx(
+          ["ask", "--stream-events", "--no-save", "--model", FAKE_GATEWAY_MODEL, "hello"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(noAuthStream.code).toBe(1);
+        expect(noAuthStream.stderr.length).toBeGreaterThan(0);
+        const noAuthLines = noAuthStream.stdout.trim().split("\n").map((l) => JSON.parse(l));
+        expect(noAuthLines).toHaveLength(1);
+        expect(noAuthLines[0]).toMatchObject({ type: "result", exit_code: 1, error: "MissingCredentials" });
+
+        const noAuthJson = await runFx(
+          ["ask", "--json", "--no-save", "--model", FAKE_GATEWAY_MODEL, "hello"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(noAuthJson.code).toBe(1);
+        const { type: t, ...streamRest } = noAuthLines[0];
+        expect(t).toBe("result");
+        expect(streamRest).toEqual(JSON.parse(noAuthJson.stdout));
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --stream-events traces dropped results on closed stdout pipe and full stdout",
+    async () => {
+      // Case 1: `| head -n 1` closes stdout after turn_start, so final result fails with OutputReaderGone.
+      {
+        const home = createIsolatedTestHome();
+        const workspace = join(home, "workspace");
+        mkdirSync(workspace, { recursive: true });
+        const tracePath = join(home, "pipe-trace.log");
+        const headOutPath = join(home, "head.out");
+        const headDonePath = join(home, "head.done");
+        const errPath = join(home, "fx.err");
+        const statusPath = join(home, "fx.status");
+        const gateway = startDynamicFakeGateway(async () => {
+          if (!existsSync(headDonePath)) {
+            await new Promise<void>((resolve, reject) => {
+              const signal = AbortSignal.timeout(5000);
+              const watcher = watch(home, () => {
+                if (existsSync(headDonePath)) {
+                  watcher.close();
+                  resolve();
+                }
+              });
+              signal.addEventListener("abort", () => {
+                watcher.close();
+                reject(new Error("Timed out waiting for head.done"));
+              }, { once: true });
+              if (existsSync(headDonePath)) {
+                watcher.close();
+                resolve();
+              }
+            });
+          }
+          return fakeGatewayFinalText("DONE_AFTER_HEAD");
+        });
+        try {
+          const env = {
+            ...fxChildEnv({
+              HOME: home,
+              AI_GATEWAY_API_KEY: "fake-head-key",
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_TRACE_LOG: tracePath,
+              FX_ERR_PATH: errPath,
+              FX_STATUS_PATH: statusPath,
+              FX_HEAD_OUT: headOutPath,
+              FX_HEAD_DONE: headDonePath,
+            }),
+          };
+          const proc = Bun.spawn(
+            [
+              "sh",
+              "-c",
+              '("$0" "$@" 2>"$FX_ERR_PATH"; echo $? > "$FX_STATUS_PATH") | (head -n 1 > "$FX_HEAD_OUT"; touch "$FX_HEAD_DONE")',
+              FX_BIN,
+              "ask",
+              "--stream-events",
+              "--no-save",
+              "--full-access",
+              "--model",
+              FAKE_GATEWAY_MODEL,
+              "hello",
+            ],
+            { cwd: workspace, env, stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+          );
+          await proc.exited;
+          expect(Number(readFileSync(statusPath, "utf8").trim())).toBe(141);
+          const headLine = JSON.parse(readFileSync(headOutPath, "utf8").trim());
+          expect(headLine.type).toBe("turn_start");
+          const trace = readFileSync(tracePath, "utf8");
+          expect(trace).toContain("stream result dropped reason=OutputReaderGone");
+        } finally {
+          gateway.stop();
+          cleanupIsolatedTestHome(home);
+        }
+      }
+
+      // Case 2: `> /dev/full` fails turn_start with OutputWriteFailed and logs one drop line.
+      if (existsSync("/dev/full")) {
+        const home = createIsolatedTestHome();
+        const workspace = join(home, "workspace");
+        mkdirSync(workspace, { recursive: true });
+        const tracePath = join(home, "full-trace.log");
+        const errPath = join(home, "full.err");
+        const statusPath = join(home, "full.status");
+        const gateway = startFakeGateway([fakeGatewayFinalText("UNREACHABLE")]);
+        try {
+          const env = {
+            ...fxChildEnv({
+              HOME: home,
+              AI_GATEWAY_API_KEY: "fake-full-key",
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_TRACE_LOG: tracePath,
+              FX_ERR_PATH: errPath,
+              FX_STATUS_PATH: statusPath,
+            }),
+          };
+          const proc = Bun.spawn(
+            [
+              "sh",
+              "-c",
+              '"$0" "$@" >/dev/full 2>"$FX_ERR_PATH"; echo $? > "$FX_STATUS_PATH"',
+              FX_BIN,
+              "ask",
+              "--stream-events",
+              "--no-save",
+              "--full-access",
+              "--model",
+              FAKE_GATEWAY_MODEL,
+              "hello",
+            ],
+            { cwd: workspace, env, stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+          );
+          await proc.exited;
+          expect(Number(readFileSync(statusPath, "utf8").trim())).toBe(1);
+          const stderr = readFileSync(errPath, "utf8");
+          expect(stderr).not.toContain("OutputWriteFailed");
+          expect(stderr).toContain("couldn't write the output");
+          const trace = readFileSync(tracePath, "utf8");
+          expect(trace.match(/stream result dropped reason=OutputWriteFailed/g)?.length).toBe(1);
+        } finally {
+          gateway.stop();
+          cleanupIsolatedTestHome(home);
+        }
+      }
+    },
+    TIMEOUT,
+  );
 });

@@ -58,10 +58,6 @@ pub const Request = struct {
     message: []const u8,
     /// URL mode: the URL, written without escapes.
     url: []const u8 = "",
-    /// Its host, for the host to highlight.
-    host: []const u8 = "",
-    /// The host has a Punycode label or non-ASCII bytes: warn.
-    suspicious: bool = false,
     /// 2025 URL mode: a raw JSON string token.
     elicitation_id: ?[]const u8 = null,
 };
@@ -91,10 +87,9 @@ pub fn parse(params: []const u8, form: *Form) Error!Request {
         return .{ .mode = .form, .message = message };
     }
     const url = wire.plainString(f[3] orelse return error.Unreadable) orelse return error.Unreadable;
-    const u = discovery.parseUrl(url) orelse return error.Unreadable;
-    if (!discovery.secureOrLoopback(url)) return error.Unreadable;
+    if (discovery.parseUrl(url) == null or !discovery.secureOrLoopback(url)) return error.Unreadable;
     if (f[4]) |id| if (id[0] != '"') return error.Unreadable;
-    return .{ .mode = .url, .message = message, .url = url, .host = u.host, .suspicious = suspicious(u.host), .elicitation_id = f[4] };
+    return .{ .mode = .url, .message = message, .url = url, .elicitation_id = f[4] };
 }
 
 /// The modes `capabilities` (the client's, a JSON object) declares, read as
@@ -202,16 +197,6 @@ fn bound(raw: ?[]const u8, count: bool) Error!?f64 {
     const x = std.fmt.parseFloat(f64, value) catch return error.Unreadable;
     if (!std.math.isFinite(x) or (count and (x < 0 or @trunc(x) != x))) return error.Unreadable;
     return x;
-}
-
-/// A Punycode label or any non-ASCII byte.
-fn suspicious(host: []const u8) bool {
-    var labels = std.mem.splitScalar(u8, host, '.');
-    while (labels.next()) |label| {
-        if (label.len >= 4 and std.ascii.eqlIgnoreCase(label[0..4], "xn--")) return true;
-    }
-    for (host) |byte| if (byte >= 0x80) return true;
-    return false;
 }
 
 pub const Option = struct {
@@ -435,9 +420,8 @@ test "reads the spec's form and URL examples" {
         \\{"mode":"url","url":"https://mcp.example.com/ui/set_api_key","message":"Please provide your API key to continue.","elicitationId":"550e8400"}
     , &form);
     try testing.expectEqual(Mode.url, url.mode);
-    try testing.expectEqualStrings("mcp.example.com", url.host);
+    try testing.expectEqualStrings("https://mcp.example.com/ui/set_api_key", url.url);
     try testing.expectEqualStrings("\"550e8400\"", url.elicitation_id.?);
-    try testing.expect(!url.suspicious);
 }
 
 test "reads every field kind the spec allows" {
@@ -494,12 +478,13 @@ test "refuses what the client can't show" {
     , &form);
 }
 
-test "flags a Punycode or non-ASCII host" {
+test "a Punycode or non-ASCII host is read like any other: the host warns about it" {
+    // `classifyHost` in src/core/mcp/elicitation.zig and the consent question that uses it do the warning.
     var form: Form = .{};
-    try testing.expect((try parse(
+    _ = try parse(
         \\{"mode":"url","message":"m","url":"https://www.xn--pple-43d.com/login"}
-    , &form)).suspicious);
-    try testing.expect((try parse("{\"mode\":\"url\",\"message\":\"m\",\"url\":\"https://\xc3\xa9x.com/\"}", &form)).suspicious);
+    , &form);
+    _ = try parse("{\"mode\":\"url\",\"message\":\"m\",\"url\":\"https://\xc3\xa9x.com/\"}", &form);
 }
 
 test "writes the defaults the suite's SEP-1034 scenario asks for" {

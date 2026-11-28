@@ -230,10 +230,11 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
             .finish_reason = case.finish_reason,
             .omit_finish = case.omit_finish,
         };
-        // A cut-off reply with nothing usable is resent once with fx's limit;
-        // the resend's own cut-off reply ends the turn.
-        const completions = [_]FakeCompletion{ reply, reply };
-        const requests: usize = if (case.expected == .length_limited) 2 else 1;
+        // A cut-off reply with nothing usable gets a note twice, and the
+        // third cut reply in a row ends the turn
+        // (`tests/tla/agent_runtime/OutputLimit.tla` EndsAfterThird).
+        const completions = [_]FakeCompletion{ reply, reply, reply };
+        const requests: usize = if (case.expected == .length_limited) 3 else 1;
         var gateway = FakeGateway.init(alloc, completions[0..requests]);
         defer gateway.deinit();
         var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -777,13 +778,16 @@ test "processQueuedPrompt step limit writes active debug trace" {
     try std.testing.expect(std.mem.find(u8, trace, "{\"path\":\"a\"}") == null);
 }
 
-test "common Stop natural completion allows and preserves disposition" {
+test "common Stop sees a cut answer joined with the reply that finished it" {
     const alloc = std.testing.allocator;
+    // A reply cut at its output limit never reaches Stop: fx asks the model
+    // to go on, and Stop sees the whole answer.
     var gateway = FakeGateway.init(alloc, &.{
         .{
             .content = "candidate",
             .finish_reason = .length,
         },
+        .{ .content = " and the rest" },
     });
     defer gateway.deinit();
     var deps = FakeAgentRuntimeDeps.init(alloc);
@@ -806,22 +810,21 @@ test "common Stop natural completion allows and preserves disposition" {
         testLifecycleContext(view, alloc, fixture.workspace_root),
     );
 
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), handler.calls);
-    try std.testing.expectEqualStrings("candidate", handler.seen_text.?);
-    try std.testing.expectEqual(@as(usize, 1), handler.seen_step_index);
+    try std.testing.expectEqualStrings("candidate and the rest", handler.seen_text.?);
+    try std.testing.expectEqual(@as(usize, 2), handler.seen_step_index);
     try std.testing.expect(handler.seen_can_continue);
     try std.testing.expectEqual(
-        types.ProviderCompletionDisposition.length_limited,
+        types.ProviderCompletionDisposition.completed,
         handler.seen_disposition.?,
     );
     try std.testing.expectEqualStrings(
-        "candidate",
+        "candidate and the rest",
         deps.history_turns.items[0].assistant.execution.tool_steps[0].assistant.?,
     );
-    try std.testing.expectEqual(
-        types.ProviderCompletionDisposition.length_limited,
-        deps.finalized_disposition.?,
-    );
+    // A finished turn carries no provider disposition to finalization.
+    try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, null), deps.finalized_disposition);
 }
 
 test "common Stop cancellation and failure preserve original replay" {
@@ -1355,8 +1358,10 @@ test "common Stop step limit retains candidate and current-turn execution" {
 
 test "common Stop length-limited tool failure retains candidate" {
     const alloc = std.testing.allocator;
+    // The call is cut off mid-arguments and no step is left, so the cut
+    // reply ends the turn.
     const calls = [_]ToolCall{
-        toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
+        toolCall("call_read", "read_file", "{\"path\":\"READ"),
     };
     var gateway = FakeGateway.init(alloc, &.{
         .{ .content = "candidate" },
@@ -1379,10 +1384,12 @@ test "common Stop length-limited tool failure retains candidate" {
     defer handler.deinit();
     const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
 
+    var config = fixture.config();
+    config.agent_step_limit = 2;
     try runFakePromptWithLifecycle(
         &gateway,
         &deps,
-        fixture.config(),
+        config,
         fixture.job(),
         testLifecycleContext(view, alloc, fixture.workspace_root),
     );

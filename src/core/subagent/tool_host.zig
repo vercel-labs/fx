@@ -25,6 +25,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
 const io_mod = @import("../shared/io.zig");
+const host_target = @import("../hosts/target.zig");
 const testing_event = @import("../shared/testing_event.zig");
 const profiles = @import("../profiles/profiles.zig");
 const started_with_mod = @import("../profiles/started_with.zig");
@@ -295,6 +296,9 @@ pub const ChildRunner = struct {
         domain.AdmissionSnapshot,
         *std.atomic.Value(bool),
     ) execution.ServiceError!execution.RunOutcome = unavailableChildRun,
+    /// Whether the child agent's worker is asked to stop for an upgrade's
+    /// restart. The app knows the worker of every child, idle ones too.
+    restarting_fn: ?*const fn (?*anyopaque, []const u8) bool = null,
 };
 
 fn unavailableChildRun(
@@ -402,6 +406,29 @@ pub const ModelOverrideResolver = struct {
     }
 };
 
+/// Checks a subagent's waiting call as if the parent made it, under the
+/// parent's own permission mode, rules, grants, reviewer and prompter.
+/// Null means allowed; otherwise the reason it was refused, owned by `arena`.
+pub const ApprovalCheck = struct {
+    context: *anyopaque,
+    check_fn: *const fn (*anyopaque, Allocator, types.ToolCall) anyerror!?[]const u8,
+};
+
+/// What a child reads when main's own check could not be made (R4.2).
+const unchecked_approval_feedback = "fx could not check this request against your parent's permissions, so it was refused.";
+
+/// What a subagent reads when its parent stopped it before answering.
+const stopped_approval_feedback = "Your parent stopped you before answering this request. Do not retry it.";
+
+/// What a subagent reads when its parent closed it before answering.
+const parent_closed_approval_feedback = "Your parent closed you before answering this request. Do not retry it.";
+
+/// What a subagent reads when the person closed it before its request was answered.
+const user_closed_approval_feedback = "The person closed you before this request was answered. Do not retry it.";
+
+/// What a child reads when fx ask refuses a request main left unanswered.
+const unanswered_approval_feedback = "Your parent ended its turn without answering, so this request was refused.";
+
 pub const ExecuteOptions = struct {
     observer: ?*execution_observation.Observer = null,
     caller_id: []const u8,
@@ -420,6 +447,8 @@ pub const ExecuteOptions = struct {
     /// The caller's turn so far, oldest first, ending with the reply that
     /// made this call. `wait` reads it for a user message with no answer.
     turn_messages: []const types.ChatMessage = &.{},
+    /// Checks a subagent's waiting call as the caller's own, for `approve`.
+    approval_check: ?ApprovalCheck = null,
     progress: ?ProgressSink = null,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?ModelOverrideResolver = null,
@@ -484,6 +513,11 @@ pub const Runtime = struct {
     closed_unseen: std.ArrayList([]u8) = .empty,
     /// Whether `closed_unseen` holds a child, read without the lock.
     closed_waiting: std.atomic.Value(bool) = .init(false),
+    /// Continuations `continueYieldedWorks` saved whose slots have not
+    /// started yet, until `startHeldContinues`. Guarded by `admission_mutex`.
+    held_continues: std.ArrayList(HeldContinue) = .empty,
+    /// Whether `held_continues` holds one, read without the lock.
+    continues_held: std.atomic.Value(bool) = .init(false),
     /// Messages waiting for a starting work's turn to begin. A close of
     /// their child marks them, so the message is refused instead of
     /// outliving the close. Guarded by `admission_mutex`.
@@ -577,6 +611,13 @@ pub const Runtime = struct {
         self.closing.deinit(self.alloc);
         for (self.closed_unseen.items) |id| self.alloc.free(id);
         self.closed_unseen.deinit(self.alloc);
+        // Its work stays open in the log: the next open ends it interrupted
+        // (D1) and continues the yielded turn again.
+        for (self.held_continues.items) |*held| {
+            debug_trace.eventf("mailbox", "continue_dropped", .{}, "child={s} work_id={s} reason=host_closed", .{ held.child_id, held.work_id });
+            held.deinit(self.alloc);
+        }
+        self.held_continues.deinit(self.alloc);
         self.start_waits.deinit(self.alloc);
         if (self.held_wait_id) |id| self.alloc.free(id);
         self.usage_ledger.deinit(self.alloc);
@@ -652,6 +693,7 @@ pub const Runtime = struct {
         self.managed.on_end = .{ .context = self, .end_fn = workEnded };
         self.managed.authority_resolver = &self.authority_resolver;
         self.managed.approvals = &self.approvals;
+        self.managed.approval_note = .{ .context = self, .note_fn = noteApprovalHook };
     }
 
     /// Opens child `child_id`'s session for its own agent to hold, as main
@@ -895,6 +937,14 @@ pub const Runtime = struct {
                 if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
                 return self.closeNamed(alloc, request.close.agent);
             },
+            .approve => {
+                if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
+                return self.answerApproval(alloc, request.approve.agent, .once, null, options.approval_check);
+            },
+            .deny => {
+                if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
+                return self.answerApproval(alloc, request.deny.agent, .deny, request.deny.message, null);
+            },
             .message => {},
         }
         if (request.toParent()) return self.messageParent(alloc, request.message.message, options, from_root);
@@ -1012,6 +1062,7 @@ pub const Runtime = struct {
                                     var buf: [sent_result_bytes]u8 = undefined;
                                     return self.encodeManaged(alloc, .{ .ok = false, .error_code = "feedback_capacity", .result = capacityResult(&buf, agent) });
                                 },
+                                .restarting => return self.refuse(alloc, .child_restarting),
                                 .unavailable => return self.refuse(alloc, .state_unavailable),
                                 .cancelled => return self.refuse(alloc, .child_cancelled),
                                 .conflict => return self.refuse(alloc, .operation_conflict),
@@ -1171,7 +1222,7 @@ pub const Runtime = struct {
             if (std.mem.eql(u8, item.child_id, child_id)) waiting += 1;
         }
         if (waiting >= max_pending_per_child) return error.QueueFull;
-        try self.ensureManagedChildSession(child_id, operation_id, effectiveDefaults(options.defaults, request.override(), resolved_model));
+        try self.ensureManagedChildSeed(child_id, effectiveDefaults(options.defaults, request.override(), resolved_model), true);
         var work = try makeManagedWork(self.alloc, operation_id, fingerprint, request, options);
         errdefer work.deinit(self.alloc);
         const owned_child = try self.alloc.dupe(u8, child_id);
@@ -1233,6 +1284,14 @@ pub const Runtime = struct {
         return !self.anyWorking();
     }
 
+    /// Whether a message from the parent waits for `child_id` to start its
+    /// next work.
+    pub fn hasWaitingMessage(self: *Runtime, child_id: []const u8) bool {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        return self.hasPendingLocked(child_id);
+    }
+
     /// Whether mail for this host's owner is still in its runtime's hands,
     /// not yet on the owner's worker (`ReportSink.mail_waiting_fn`).
     fn mailOnTheWay(self: *Runtime) bool {
@@ -1264,11 +1323,12 @@ pub const Runtime = struct {
             if (worker.waitForPostOrNudgeTimeout(recheck)) |wake| return wake;
         }
         if (self.nothingCanArrive(worker)) return null;
+        end_test_controls.noteWaitBlocking();
         return worker.waitForPostOrNudge();
     }
 
-    pub const TreeWake = enum { mail, quiet, stopped };
-    const cancel_poll: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+    pub const TreeWake = enum { mail, quiet, stopped, approvals_unanswered };
+    pub const cancel_poll: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
 
     /// For a runtime that finishes only once its tree is quiet, as `fx ask`
     /// does: blocks until mail is queued for `worker`, nothing in this host
@@ -1277,14 +1337,30 @@ pub const Runtime = struct {
     /// behind.
     /// A set `cancel` stops it too. It is rechecked every `cancel_poll`, so
     /// a signal handler may set it without waking anything.
-    pub fn awaitMailOrQuiet(self: *Runtime, worker: *worker_runtime.WorkerRuntime, cancel: ?*const std.atomic.Value(bool)) TreeWake {
+    /// `refuse_unanswered` is fx ask's: when the only work left is approval
+    /// requests main had in its turn and left unanswered, it returns
+    /// `.approvals_unanswered` so the caller can refuse them
+    /// (`tests/tla/subagent/ParentApproval.tla` `Fallback`). ACP passes false,
+    /// since a person can still answer there.
+    pub fn awaitMailOrQuiet(
+        self: *Runtime,
+        worker: *worker_runtime.WorkerRuntime,
+        cancel: ?*const std.atomic.Value(bool),
+        refuse_unanswered: bool,
+    ) TreeWake {
         self.setWaiter(worker);
         defer self.setWaiter(null);
         while (true) {
             if (cancel) |flag| if (flag.load(.seq_cst)) return .stopped;
             if (worker.queuedPromptCount() > 0) return .mail;
             if (!self.anyWorking()) return .quiet;
-            const wake = if (cancel != null)
+            // The registry check is cheap and the phase read loads the state
+            // store, so the cheap one decides first.
+            if (refuse_unanswered and self.approvals.allPendingNoted(self.root_id) and self.onlyApprovalWaits()) return .approvals_unanswered;
+            // With the fallback on, the timed wait is the wake: the mark after
+            // `PostNote` wakes nobody, and each re-check finds it
+            // (`ParentApproval.tla` `Wake`).
+            const wake = if (cancel != null or refuse_unanswered)
                 worker.waitForPostOrNudgeTimeout(cancel_poll) orelse continue
             else
                 worker.waitForPostOrNudge();
@@ -1294,6 +1370,37 @@ pub const Runtime = struct {
                 .stopped => return .stopped,
             }
         }
+    }
+
+    /// Whether every child that still works waits on an approval the registry
+    /// holds: its turn does not run, and no message waits for it. Refusing
+    /// those requests then leaves nothing here running.
+    fn onlyApprovalWaits(self: *Runtime) bool {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        if (self.pending.items.len > 0 or self.busy.items.len == 0) return false;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = self.managed.state_store.load(arena.allocator()) catch |err| {
+            debug_trace.logf("mailbox", "approval wait check failed err={s}", .{@errorName(err)});
+            return false;
+        };
+        for (self.busy.items) |id| {
+            const child = registry.findById(id) orelse return false;
+            if (child.phase != .awaiting_approval) return false;
+        }
+        return true;
+    }
+
+    /// fx ask's fallback: refuses every approval request main's turn left
+    /// unanswered, with the reason the subagents read, and returns how many.
+    /// Logged so none is dropped silently (RULES.md R3.8).
+    pub fn refuseUnansweredApprovals(self: *Runtime) usize {
+        const counts = self.approvals.refuseNoted(self.root_id, unanswered_approval_feedback);
+        debug_trace.eventf("mailbox", "approvals_refused_unanswered", .{}, "owner={s} refused={d} gone={d}", .{ self.ownerName(), counts.accepted, counts.gone });
+        return counts.accepted + counts.gone;
     }
 
     /// How trace lines name this host's owner: `main` for a root host, as the
@@ -1674,6 +1781,149 @@ pub const Runtime = struct {
         const dropped = self.takeUserDropped(child_id);
         if (dropped.count == 0) return false;
         return self.postDropNotice(child_id, dropped);
+    }
+
+    /// Continues each open persistent child whose last work ended `cancelled`
+    /// or `interrupted` while its turn was yielded, saving a continuation work
+    /// that replaces the stopped one. Its slot waits for `startHeldContinues`.
+    /// Call right after `Runtime.create` and before `resumeReports`.
+    pub fn continueYieldedWorks(self: *Runtime) void {
+        if (comptime host_target.is_wasm) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+
+        var initial = blk: {
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            break :blk self.managed.state_store.load(a) catch |err| {
+                debug_trace.eventf("mailbox", "continue_yielded_skipped", .{}, "reason=state_load err={s}", .{@errorName(err)});
+                return;
+            };
+        };
+        defer initial.deinit(a);
+
+        for (initial.children) |child| {
+            const candidate = yieldedContinuationCandidate(child, self.closingIndexLocked(child.id) != null);
+            if (candidate == .skip) continue;
+            const yielded = self.children.parent.store.childTurnYielded(a, child.id) catch |err| {
+                debug_trace.eventf("mailbox", "continue_yielded_skipped", .{}, "child={s} work_id={s} reason=log_read err={s}", .{ child.id, child.last_work_id.?, @errorName(err) });
+                continue;
+            };
+            if (!yielded) continue;
+            if (candidate == .no_saved_admission) {
+                debug_trace.eventf("mailbox", "continue_yielded_skipped", .{}, "child={s} work_id={s} reason=no_saved_admission", .{ child.id, child.last_work_id.? });
+                continue;
+            }
+            self.continueOneYieldedChildLocked(a, child);
+        }
+    }
+
+    fn continueOneYieldedChildLocked(self: *Runtime, a: Allocator, child: child_state.Child) void {
+        const old_work_id = child.last_work_id orelse return;
+        const admission = child.last_admission orelse return;
+        const agent = child.agentName() orelse return;
+
+        const seed = session_store.generateSessionId(a) catch |err| {
+            debug_trace.eventf("mailbox", "continue_yielded_skipped", .{}, "child={s} work_id={s} reason=work_id err={s}", .{ child.id, old_work_id, @errorName(err) });
+            return;
+        };
+        const new_work_id = operationIdAlloc(a, seed, self.issueOperationIdentity(seed)) catch |err| {
+            debug_trace.eventf("mailbox", "continue_yielded_skipped", .{}, "child={s} work_id={s} reason=work_id err={s}", .{ child.id, old_work_id, @errorName(err) });
+            return;
+        };
+        const active: child_state.ActiveWork = .{
+            .id = new_work_id,
+            .request_fingerprint = child.last_request_fingerprint orelse @splat(0),
+            .message = @constCast(""),
+            .root_user_intent_context = admission.root_user_intent_context,
+            .root_user_messages = admission.root_user_messages,
+            .root_user_evidence_complete = admission.root_user_evidence_complete,
+            .permission_mode = admission.permission_mode,
+            .created_at_ms = io_mod.milliTimestamp(),
+            .started_by = admission.started_by,
+            .replaces = old_work_id,
+        };
+
+        {
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            var registry = self.managed.state_store.load(self.alloc) catch |err| {
+                debug_trace.eventf("mailbox", "continue_yielded_skipped", .{}, "child={s} work_id={s} reason=state_load err={s}", .{ child.id, old_work_id, @errorName(err) });
+                return;
+            };
+            defer registry.deinit(self.alloc);
+            const current = registry.findById(child.id) orelse return;
+            if (yieldedContinuationCandidate(current.*, self.closingIndexLocked(child.id) != null) != .ready) return;
+            _ = registry.startPersistentWork(self.alloc, agent, null, active) catch |err| {
+                debug_trace.eventf("mailbox", "continue_yielded_skipped", .{}, "child={s} work_id={s} reason=start_work err={s}", .{ child.id, old_work_id, @errorName(err) });
+                return;
+            };
+            self.managed.state_store.save(self.alloc, registry) catch |err| {
+                debug_trace.eventf("mailbox", "continue_yielded_skipped", .{}, "child={s} work_id={s} reason=state_save err={s}", .{ child.id, old_work_id, @errorName(err) });
+                return;
+            };
+        }
+
+        self.holdContinueLocked(child.id, old_work_id, new_work_id) catch |err| {
+            self.endUnstartedContinue(child.id, new_work_id, err);
+            return;
+        };
+        debug_trace.eventf("mailbox", "continue_held", .{}, "child={s} old_work_id={s} work_id={s}", .{ child.id, old_work_id, new_work_id });
+    }
+
+    /// Keeps a saved continuation for `startHeldContinues`. Its child is busy
+    /// from now on, so a message sent before the slot starts waits for it.
+    fn holdContinueLocked(self: *Runtime, child_id: []const u8, old_work_id: []const u8, work_id: []const u8) !void {
+        const child_copy = try self.alloc.dupe(u8, child_id);
+        errdefer self.alloc.free(child_copy);
+        const old_copy = try self.alloc.dupe(u8, old_work_id);
+        errdefer self.alloc.free(old_copy);
+        const work_copy = try self.alloc.dupe(u8, work_id);
+        errdefer self.alloc.free(work_copy);
+        try self.held_continues.ensureUnusedCapacity(self.alloc, 1);
+        self.markBusyLocked(child_id) catch |err| {
+            debug_trace.eventf("mailbox", "start_blocked", .{}, "child={s} work_id={s} error={s} stage=busy", .{ child_id, work_id, @errorName(err) });
+            return err;
+        };
+        self.held_continues.appendAssumeCapacity(.{ .child_id = child_copy, .old_work_id = old_copy, .work_id = work_copy });
+        self.continues_held.store(true, .release);
+    }
+
+    /// Starts the slots of the continuations `continueYieldedWorks` saved, in
+    /// continue mode. The app calls it from its main loop, because a slot
+    /// reaches the app through `child_runner.context`: `App.init` opens the
+    /// host on a local that it then copies (`rebindHost`), and a slot started
+    /// before the copy would hand its turn to the local, which no loop reads.
+    pub fn startHeldContinues(self: *Runtime) void {
+        if (!self.continues_held.load(.acquire)) return;
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        for (self.held_continues.items) |*held| {
+            defer held.deinit(self.alloc);
+            _ = self.managed.startContinue(held.child_id) catch |err| {
+                debug_trace.eventf("mailbox", "start_blocked", .{}, "child={s} work_id={s} error={s} stage=spawn", .{ held.child_id, held.work_id, @errorName(err) });
+                self.clearBusyLocked(held.child_id);
+                self.endUnstartedContinue(held.child_id, held.work_id, err);
+                continue;
+            };
+            debug_trace.eventf("mailbox", "continue_yielded", .{}, "child={s} old_work_id={s} work_id={s} reason=continue_yielded", .{ held.child_id, held.old_work_id, held.work_id });
+        }
+        self.held_continues.clearRetainingCapacity();
+        self.continues_held.store(false, .release);
+    }
+
+    /// Ends a continuation whose slot did not start, as any unstarted work
+    /// ends: it owes its report.
+    fn endUnstartedContinue(self: *Runtime, child_id: []const u8, work_id: []const u8, err: anyerror) void {
+        const ended = if (self.managed.endUnstarted(child_id, work_id, err, true)) |end| done: {
+            end.deinit(self.alloc);
+            break :done true;
+        } else false;
+        debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} work_id={s} error={s} ended={}", .{ child_id, work_id, @errorName(err), ended });
     }
 
     /// Posts the reports `session`'s log still owes its owner, oldest first,
@@ -2634,6 +2884,13 @@ pub const Runtime = struct {
             const child = registry.findPersistent(agent) orelse break :blk null;
             break :blk try a.dupe(u8, child.id);
         } orelse return self.refuseNotOpen(alloc, agent);
+        // Refuse the request the child waits on before the stop takes
+        // admission: the stopper holds admission and the owner's mutex while it
+        // waits for the child's worker, and `refuseChild` takes neither (it
+        // releases the registry mutex before it answers the worker), so the
+        // note path's worker -> registry order and this registry -> owner ->
+        // worker order cannot cycle (the E1 rule).
+        _ = self.approvals.refuseChild(child_id, stopped_approval_feedback);
         const dropped, const stopped = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -2659,6 +2916,130 @@ pub const Runtime = struct {
             try a.print("Stopped {s}: its turn ended{s}{s}.", .{ agent, if (dropped > 0) ", and " else "", dropped_text })
         else
             try a.print("{s} was not working{s}{s}.", .{ agent, if (dropped > 0) "; " else "", dropped_text });
+        return self.encodeManaged(alloc, .{ .ok = true, .result = text });
+    }
+
+    /// `approve` and `deny`: answers the one approval request `agent` waits
+    /// on. `approve` carries the parent's own authority (RULES.md R4.1,
+    /// R4.3): the subagent's exact call is checked as if the parent made it,
+    /// and a check that refuses, fails, or cannot be made refuses the request
+    /// (R4.2). `deny` only refuses, so it needs no check. The request is
+    /// allowed once, or refused with the reason the child reads.
+    fn answerApproval(
+        self: *Runtime,
+        alloc: Allocator,
+        agent: []const u8,
+        decision: types.ToolPermissionDecision,
+        feedback: ?[]const u8,
+        approval_check: ?ApprovalCheck,
+    ) !ManagedExecutionResult {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const child_id = blk: {
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            var registry = try self.managed.state_store.load(a);
+            const child = registry.findPersistent(agent) orelse break :blk null;
+            break :blk try a.dupe(u8, child.id);
+        } orelse return self.refuseNotOpen(alloc, agent);
+        var pending = (try self.approvals.firstPendingForChild(a, child_id)) orelse
+            return self.encodeManaged(alloc, .{
+                .ok = true,
+                .result = try a.print("{s} has no approval request waiting.", .{agent}),
+            });
+        defer pending.deinit(a);
+        const label = pending.request.view().label;
+        // No lock is held here: the check can wait for the user or the
+        // reviewer. The request can end meanwhile, which `resolve` reports.
+        var unchecked = approval_check == null;
+        var denial: ?[]const u8 = null;
+        if (decision != .deny) {
+            if (approval_check) |check| {
+                denial = check.check_fn(check.context, a, pending.call) catch |err| blk: {
+                    debug_trace.logf("subagent", "approval check failed agent={s} err={s}", .{ agent, @errorName(err) });
+                    unchecked = true;
+                    break :blk null;
+                };
+            }
+        }
+        if (decision != .deny and (unchecked or denial != null)) {
+            const reason = denial orelse unchecked_approval_feedback;
+            const resolution = self.approvals.resolve(
+                pending.request_id,
+                pending.child_id,
+                .deny,
+                reason,
+                io_mod.milliTimestamp(),
+            ) catch |err| switch (err) {
+                // The request ended while the check ran: its worker is gone, so
+                // the answer has nowhere to go, and the parent must not read
+                // otherwise.
+                error.RequestNotFound => {
+                    debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=request_ended", .{agent});
+                    return self.encodeManaged(alloc, .{
+                        .ok = true,
+                        .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
+                    });
+                },
+                else => |other| {
+                    debug_trace.logf("subagent", "approval answer failed agent={s} err={s}", .{ agent, @errorName(other) });
+                    return self.encodeManaged(alloc, .{
+                        .ok = false,
+                        .error_code = "approval_not_answered",
+                        .result = try a.print("fx could not answer {s}'s approval request: {s}. Call status, then try again.", .{ agent, @errorName(other) }),
+                    });
+                },
+            };
+            if (resolution == .rejected) {
+                debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=worker_gone", .{agent});
+                return self.encodeManaged(alloc, .{
+                    .ok = true,
+                    .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
+                });
+            }
+            const text = if (denial) |why|
+                try a.print("Refused {s}'s request: {s}. Your permissions did not allow it: {s}", .{ agent, label, why })
+            else
+                try a.print("Refused {s}'s request: {s}. fx cannot check it against your permissions here.", .{ agent, label });
+            return self.encodeManaged(alloc, .{ .ok = true, .result = text });
+        }
+        const resolution = self.approvals.resolve(
+            pending.request_id,
+            pending.child_id,
+            decision,
+            feedback,
+            io_mod.milliTimestamp(),
+        ) catch |err| switch (err) {
+            // The request ended before this answer: the child already stopped
+            // waiting, and the parent must not read otherwise.
+            error.RequestNotFound => {
+                debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=request_ended", .{agent});
+                return self.encodeManaged(alloc, .{
+                    .ok = true,
+                    .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
+                });
+            },
+            else => |other| {
+                debug_trace.logf("subagent", "approval answer failed agent={s} err={s}", .{ agent, @errorName(other) });
+                return self.encodeManaged(alloc, .{
+                    .ok = false,
+                    .error_code = "approval_not_answered",
+                    .result = try a.print("fx could not answer {s}'s approval request: {s}. Call status, then try again.", .{ agent, @errorName(other) }),
+                });
+            },
+        };
+        if (resolution == .rejected) {
+            debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=worker_gone", .{agent});
+            return self.encodeManaged(alloc, .{
+                .ok = true,
+                .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
+            });
+        }
+        const text = if (decision == .deny)
+            try a.print("Refused {s}'s request: {s}.", .{ agent, label })
+        else
+            try a.print("Allowed {s}'s request: {s}.", .{ agent, label });
         return self.encodeManaged(alloc, .{ .ok = true, .result = text });
     }
 
@@ -2699,6 +3080,10 @@ pub const Runtime = struct {
             @memcpy(name_buf[0..value.len], value);
             break :blk name_buf[0..value.len];
         };
+        // As a stop does, refuse the request this child waits on before the
+        // close takes admission, so the call is refused with the reason and
+        // nothing runs. `refuseChild` holds no lock across its wait (see it).
+        _ = self.approvals.refuseChild(child_id, if (by == .user) user_closed_approval_feedback else parent_closed_approval_feedback);
         const result: Closed, const settle_now = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -2980,12 +3365,60 @@ pub const Runtime = struct {
         const sink = self.report_sink orelse return debug_trace.logf("mailbox", "waiting note dropped child={s} reason=no_parent", .{child_id});
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        const text = (if (resend)
-            arena.allocator().print("fx: my last request failed and waits for a follow-up ({s}). A message from you sends it again.", .{reason})
-        else
-            arena.allocator().print("fx: my last request failed and waits for the user ({s}). Only the user can continue it, on my screen, so tell them.", .{reason})) catch return;
-        sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = text } }) catch |err|
-            debug_trace.logf("mailbox", "waiting note lost child={s} err={s}", .{ child_id, @errorName(err) });
+        const text = waitingNoteText(arena.allocator(), reason, resend) catch |err|
+            return debug_trace.logf("mailbox", "waiting note lost child={s} err={s}", .{ child_id, @errorName(err) });
+        postNote(self, sink, child_id, name, text, "waiting");
+    }
+
+    /// Tells the owner that child `child_id` needs the person for `reason`,
+    /// such as an MCP server asking for input. `reason` is a fixed sentence
+    /// for the kind, never an item's text, a field value or a URL (R4.8).
+    pub fn noteChildNeedsUser(self: *Runtime, child_id: []const u8, name: []const u8, reason: []const u8) void {
+        const sink = self.report_sink orelse return debug_trace.logf("mailbox", "needs_user note dropped child={s} reason=no_parent", .{child_id});
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const text = needsUserNoteText(arena.allocator(), reason) catch |err|
+            return debug_trace.logf("mailbox", "needs_user note lost child={s} err={s}", .{ child_id, @errorName(err) });
+        postNote(self, sink, child_id, name, text, "needs_user");
+    }
+
+    /// The person answered `child_id`'s request on its own screen, so its
+    /// registry binding goes with it: main's later answer finds nothing and
+    /// reads that the request is no longer waiting
+    /// (`tests/tla/subagent/TuiParentApproval.tla` AnswerOnce).
+    pub fn withdrawAnsweredApproval(self: *Runtime, child_id: []const u8) usize {
+        return self.approvals.withdrawChild(child_id);
+    }
+
+    /// Tells the owner, as child `child_id`'s own message, that it waits on
+    /// the owner's approval for `label`, so a parent that would otherwise
+    /// wait hears of it. A note for a child that is closing or gone, or one
+    /// the parent's queue refuses, is dropped with a trace line.
+    /// Returns whether the note was posted: false means the parent was not
+    /// told, and the request is refused at once by its observer.
+    pub fn noteChildApproval(self: *Runtime, child_id: []const u8, name: []const u8, label: []const u8) bool {
+        if (!self.childListed(child_id)) {
+            debug_trace.eventf("mailbox", "approval_note_dropped", .{}, "child={s} reason=closed", .{child_id});
+            return false;
+        }
+        const sink = self.report_sink orelse {
+            debug_trace.eventf("mailbox", "approval_note_dropped", .{}, "child={s} reason=no_parent", .{child_id});
+            return false;
+        };
+        var stored: [live_metrics.max_label_bytes]u8 = undefined;
+        const action = stored[0..live_metrics.storeLabel(&stored, label)];
+        var buffer: [live_metrics.max_label_bytes + 384]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        writer.print("fx: I wait for your approval to run: {s}. Answer with the subagent tool, action \"approve\" or \"deny\" and agent \"{s}\"; deny's message tells me why. Ask the user first only when the action is risky or you cannot judge it.", .{ action, name }) catch {
+            debug_trace.eventf("mailbox", "approval_note_dropped", .{}, "child={s} reason=too_long", .{child_id});
+            return false;
+        };
+        sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = writer.buffered() } }) catch |err| {
+            debug_trace.eventf("mailbox", "approval_note_dropped", .{}, "child={s} reason={s}", .{ child_id, @errorName(err) });
+            return false;
+        };
+        debug_trace.eventf("mailbox", "approval_note_posted", .{}, "child={s}", .{child_id});
+        return true;
     }
 
     /// Tells the owner, as child `child_id`'s own message, that a shell
@@ -3008,6 +3441,26 @@ pub const Runtime = struct {
         sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = writer.buffered() } }) catch |err|
             return debug_trace.eventf("mailbox", "quiet_note_dropped", .{}, "child={s} reason={s} quiet_ms={d}", .{ child_id, @errorName(err), crossing.quiet_ms });
         debug_trace.eventf("mailbox", "quiet_note_posted", .{}, "child={s} quiet_ms={d}", .{ child_id, crossing.quiet_ms });
+    }
+
+    /// Whether `child_id` is still one of this host's children, read from the
+    /// state store alone. A note is posted under the child's worker mutex,
+    /// which a parent's stop or close waits for while it holds
+    /// `admission_mutex`, so the note cannot use `childOpen`: taking that
+    /// mutex there would deadlock the two (E1 lock map). A child that is
+    /// closing but still listed lets its one note through, as a child's own
+    /// message does; the slot's end settles it.
+    fn childListed(self: *Runtime, child_id: []const u8) bool {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        const registry = self.managed.state_store.load(arena.allocator()) catch |err| {
+            debug_trace.logf("mailbox", "approval note check failed child={s} err={s}", .{ child_id, @errorName(err) });
+            return false;
+        };
+        for (registry.children) |child| if (std.mem.eql(u8, child.id, child_id)) return true;
+        return false;
     }
 
     /// Whether `child_id` is one of this host's children and not closing.
@@ -3142,6 +3595,7 @@ pub const Runtime = struct {
             },
             .authority_resolver = &self.authority_resolver,
             .approvals = &self.approvals,
+            .approval_note = .{ .context = self, .note_fn = noteApprovalHook },
         };
     }
 
@@ -3242,6 +3696,13 @@ pub const Runtime = struct {
         return admitted;
     }
 
+    /// Whether the child's worker is asked to stop for an upgrade's restart,
+    /// so it takes no message. A wasm host never restarts itself.
+    fn childRestarting(self: *const Runtime, child_id: []const u8) bool {
+        const ask = self.child_runner.restarting_fn orelse return false;
+        return ask(self.child_runner.context, child_id);
+    }
+
     fn admitManagedWork(
         self: *Runtime,
         alloc: Allocator,
@@ -3288,11 +3749,7 @@ pub const Runtime = struct {
                     .operation_conflict,
                 );
             }
-            try self.ensureManagedChildSession(
-                existing.id,
-                operation_id,
-                defaults,
-            );
+            try self.ensureManagedChildSeed(existing.id, defaults, true);
             if (existing.last_work_id) |work_id| {
                 if (std.mem.eql(u8, work_id, operation_id)) return .{ .completed = .{
                     .child_id = try alloc.dupe(u8, existing.id),
@@ -3315,12 +3772,13 @@ pub const Runtime = struct {
         );
         defer active.deinit(alloc);
         switch (request) {
-            .wait, .status, .stop, .close => unreachable,
+            .wait, .status, .stop, .close, .approve, .deny => unreachable,
             .message => |message| {
                 if (registry.findPersistent(message.agent)) |child| {
                     // Closing, it takes nothing; once gone, the name starts a new one.
                     if (self.closingIndexLocked(child.id) != null) return managedAdmissionRejected(alloc, child.id, .child_closing);
-                    if (request.override().present()) {
+                    const override = request.override();
+                    if (override.present() and !try self.overrideMatchesChild(child.*, override, resolved_model)) {
                         debug_trace.logf(
                             "subagent",
                             "admission rejected operation={s} child_id={s} agent={s} code=override_after_create",
@@ -3331,6 +3789,17 @@ pub const Runtime = struct {
                             child.id,
                             .override_after_create,
                         );
+                    }
+                    // A child whose worker stops for the restart takes no
+                    // message: a waiting one or a new work would not start
+                    // before fx exits, and nothing carries it across.
+                    if (self.childRestarting(child.id)) {
+                        debug_trace.logf(
+                            "subagent",
+                            "admission rejected operation={s} child_id={s} code=child_restarting reason=upgrade_restart",
+                            .{ operation_id, child.id },
+                        );
+                        return managedAdmissionRejected(alloc, child.id, .child_restarting);
                     }
                     // A child whose slot still runs works between turns too:
                     // the message joins or waits, never starts a second run.
@@ -3363,7 +3832,7 @@ pub const Runtime = struct {
                     // slot is a child marked running that takes no message.
                     // A child lost before its first turn has no log to
                     // resume, so its next work starts it fresh (D33).
-                    try self.ensureManagedChildSession(started.id, active.id, defaults);
+                    try self.ensureManagedChildSeed(started.id, defaults, true);
                     var ready = try managedAdmissionReady(alloc, started.id, false);
                     errdefer ready.deinit(alloc);
                     try self.managed.state_store.save(alloc, registry);
@@ -3395,7 +3864,12 @@ pub const Runtime = struct {
                 }
                 if (message.report) |rule| try registry.setReportRule(child_id, rule);
                 // The save is the last step that can fail (see above).
-                try self.ensureManagedChildSession(child_id, active.id, defaults);
+                try self.ensureManagedChildSeed(child_id, defaults, false);
+                debug_trace.logf(
+                    "subagent",
+                    "child session reserved child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
+                    .{ child_id, active.id, @tagName(defaults.provider), defaults.model, defaults.effort.label(), defaults.fast_mode, defaults.ultrafast_mode },
+                );
                 var ready = try managedAdmissionReady(
                     alloc,
                     registry.children[registry.children.len - 1].id,
@@ -3422,15 +3896,15 @@ pub const Runtime = struct {
         try registry.setStartedWith(alloc, child_id, started);
     }
 
-    fn ensureManagedChildSession(
+    fn ensureManagedChildSeed(
         self: *Runtime,
         child_id: []const u8,
-        work_id: []const u8,
         defaults: Defaults,
+        keep_existing: bool,
     ) !void {
         // A child reaches the disk with its first turn, under the id its
         // spawn line names (D34); until then only its settings wait here.
-        try self.children.rememberSeed(child_id, .{
+        try self.children.setSeed(child_id, .{
             .preferences = .{
                 .provider = defaults.provider,
                 .model = @constCast(defaults.model),
@@ -3439,12 +3913,7 @@ pub const Runtime = struct {
                 .ultrafast_mode = defaults.ultrafast_mode,
             },
             .language = defaults.conversation_language,
-        });
-        debug_trace.logf(
-            "subagent",
-            "child session reserved child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
-            .{ child_id, work_id, @tagName(defaults.provider), defaults.model, defaults.effort.label(), defaults.fast_mode, defaults.ultrafast_mode },
-        );
+        }, keep_existing);
     }
 
     fn managedResultText(
@@ -3459,9 +3928,29 @@ pub const Runtime = struct {
         return @as(?[]u8, try alloc.dupe(u8, text));
     }
 
-    /// A child's saved preferences, read without opening it. Caller owns.
-    fn childPreferences(self: *Runtime, alloc: Allocator, child_id: []const u8) !session_codec.DurableSessionPreferences {
-        return self.children.parent.store.childPreferences(alloc, child_id);
+    /// True when every override field set on `override` matches the existing
+    /// child's current profile, model, and effort.
+    fn overrideMatchesChild(
+        self: *Runtime,
+        child: child_state.Child,
+        override: model_contract.Override,
+        resolved_model: ?[]const u8,
+    ) !bool {
+        if (override.profile) |requested_profile| {
+            const current_profile = child.profile orelse profiles.main_name;
+            if (!std.mem.eql(u8, requested_profile, current_profile)) return false;
+        }
+        if (override.model == null and override.effort == null) return true;
+        var current = try managed_owner.readChildPreferences(&self.managed, child.id);
+        defer current.deinit(self.managed.alloc);
+        if (override.model) |requested_model| {
+            const effective_model = resolved_model orelse requested_model;
+            if (!std.mem.eql(u8, effective_model, current.model)) return false;
+        }
+        if (override.effort) |requested_effort| {
+            if (!requested_effort.eql(current.effort)) return false;
+        }
+        return true;
     }
 
     fn encodeManaged(
@@ -3565,6 +4054,9 @@ const MailboxFixture = struct {
     /// The worker of the child agent that runs each turn, as the app's does:
     /// set, the runs are hosted (`bind`), and a hosted run saves nothing.
     hosted: ?*worker_runtime.WorkerRuntime = null,
+    /// The worker `restarting` reads for every child, as the app's child
+    /// worker is: its restart request keeps messages out.
+    restart_worker: ?*worker_runtime.WorkerRuntime = null,
     /// While set, a hosted run fails to bind to its agent (`bind`), so its work
     /// ends before its worker attaches.
     bind_fails: std.atomic.Value(bool) = .init(false),
@@ -3582,6 +4074,8 @@ const MailboxFixture = struct {
     mutex: std.Io.Mutex = .init,
     /// The text each run's turn began on, in order. Owned.
     began_contents: std.ArrayList([]u8) = .empty,
+    /// Whether each run's turn began in continue mode (`continues_yielded`).
+    began_continues_yielded: std.ArrayList(bool) = .empty,
     /// "agent work_id outcome output" per report, in arrival order. Owned.
     reports: std.ArrayList([]u8) = .empty,
     /// Each report's facts, in the same order.
@@ -3594,6 +4088,7 @@ const MailboxFixture = struct {
     fn deinit(self: *MailboxFixture) void {
         for (self.began_contents.items) |content| std.testing.allocator.free(content);
         self.began_contents.deinit(std.testing.allocator);
+        self.began_continues_yielded.deinit(std.testing.allocator);
         for (self.reports.items) |line| std.testing.allocator.free(line);
         self.reports.deinit(std.testing.allocator);
         self.ends.deinit(std.testing.allocator);
@@ -3602,6 +4097,12 @@ const MailboxFixture = struct {
 
     fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
         return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
+    }
+
+    fn restarting(raw: ?*anyopaque, _: []const u8) bool {
+        const self: *MailboxFixture = @ptrCast(@alignCast(raw.?));
+        const worker = self.restart_worker orelse return false;
+        return worker.yield_requested.load(.seq_cst);
     }
 
     fn bind(raw: ?*anyopaque, turn: *execution.TurnContext, cancel: *std.atomic.Value(bool)) execution.ServiceError!void {
@@ -3651,7 +4152,7 @@ const MailboxFixture = struct {
         defer if (processing) worker.finishProcessing();
         if (processing) {
             _ = self.begun.fetchAdd(1, .seq_cst);
-            self.noteBegan(message.content);
+            self.noteBegan(message.content, message.continues_yielded);
         }
         if (processing and !self.steerable) {
             var boundary = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3676,17 +4177,22 @@ const MailboxFixture = struct {
             std.testing.allocator.print("DONE {s}", .{message.content}) catch return error.ProviderFailed;
         defer std.testing.allocator.free(reply);
         turn.commit(turn.active_work_id.?, .{ .assistant = .{
-            .user = .{ .text = message.content },
+            .user = .{ .text = if (message.continues_yielded) @constCast("work") else message.content },
             .assistant = reply,
         } }) catch return error.ProviderFailed;
         return .completed;
     }
 
-    fn noteBegan(self: *MailboxFixture, content: []const u8) void {
+    fn noteBegan(self: *MailboxFixture, content: []const u8, continues_yielded: bool) void {
         const copy = std.testing.allocator.dupe(u8, content) catch return;
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        self.began_contents.append(std.testing.allocator, copy) catch std.testing.allocator.free(copy);
+        self.began_contents.append(std.testing.allocator, copy) catch {
+            std.testing.allocator.free(copy);
+            return;
+        };
+        // The two lists must stay the same length for the test's checks.
+        self.began_continues_yielded.append(std.testing.allocator, continues_yielded) catch @panic("test fixture out of memory");
     }
 
     fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
@@ -3734,7 +4240,7 @@ fn hostedMailboxRuntime(alloc: Allocator, fixture: *MailboxFixture, parent: *chi
 }
 
 fn mailboxRuntime(alloc: Allocator, fixture: *MailboxFixture, parent: *child_state.TestParent) !*Runtime {
-    const runtime = try Runtime.create(alloc, &parent.children, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = fixture, .run_fn = MailboxFixture.run });
+    const runtime = try Runtime.create(alloc, &parent.children, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = fixture, .run_fn = MailboxFixture.run, .restarting_fn = MailboxFixture.restarting });
     runtime.report_sink = .{ .context = fixture, .post_fn = MailboxFixture.post };
     return runtime;
 }
@@ -3758,28 +4264,34 @@ fn callToolResult(runtime: *Runtime, arena: Allocator, input: model_contract.Req
 }
 
 /// What a `wait` that a nudge ended returns: a subagent's turn ended without
-/// a report, or fx asked the caller's turn to stop for an upgrade's restart
-/// while its subagents keep working (`WorkerRuntime.requestYield`).
+/// a report, or fx asked the caller's turn to stop for an upgrade's restart,
+/// which the subagents pause for too (`WorkerRuntime.requestYield`).
 fn nudgedWaitResult(restarting: bool) []const u8 {
     return if (restarting)
-        "fx may restart for an upgrade, so this wait ends here. The subagents keep working, and their reports still arrive."
+        "fx is restarting for an upgrade. This wait ends now. Subagents pause and resume after the restart; their reports still arrive."
     else
         "A subagent's turn ended without a report. Call status to see where things stand, or wait again.";
 }
 
 test "a wait that the upgrade's restart ends says the reports still arrive" {
-    try std.testing.expect(std.mem.find(u8, nudgedWaitResult(true), "their reports still arrive") != null);
+    try std.testing.expectEqualStrings(
+        "fx is restarting for an upgrade. This wait ends now. Subagents pause and resume after the restart; their reports still arrive.",
+        nudgedWaitResult(true),
+    );
     try std.testing.expectEqualStrings(
         "A subagent's turn ended without a report. Call status to see where things stand, or wait again.",
         nudgedWaitResult(false),
     );
 }
 
+/// Release test builds turn error tracing off (`build.zig`), so without these
+/// prints a failed test says only "failed without output".
 fn waitForRuns(fixture: *MailboxFixture, count: usize) !void {
     for (0..5000) |_| {
         if (fixture.runs.load(.seq_cst) >= count) return;
         io_mod.sleep(std.time.ns_per_ms);
     }
+    std.debug.print("waitForRuns: {d} runs did not start in time\n", .{count});
     return error.Timeout;
 }
 
@@ -4065,6 +4577,382 @@ test "the roster names the open subagents, and the working ones while they work"
     const open = (try runtime.rosterNames(alloc, false)).?;
     defer alloc.free(open);
     try std.testing.expectEqualStrings("reviewer, builder", open);
+}
+
+test "a message waiting for a busy subagent is reported until the subagent starts it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-0", null);
+    try waitForRuns(&fixture, 1);
+    runtime.admission_mutex.lockUncancelable(io_mod.getIo());
+    const child_id = try alloc.dupe(u8, runtime.busy.items[0]);
+    runtime.admission_mutex.unlock(io_mod.getIo());
+    defer alloc.free(child_id);
+    try std.testing.expect(!runtime.hasWaitingMessage(child_id));
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "more" } }, "call-1", null);
+    try std.testing.expect(runtime.hasWaitingMessage(child_id));
+
+    _ = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-stop", null);
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    try std.testing.expect(!runtime.hasWaitingMessage(child_id));
+}
+
+test "a message to a child whose restart was asked is refused with its text and queues nothing" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .restart_worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-0", null);
+    try waitForRuns(&fixture, 1);
+    runtime.admission_mutex.lockUncancelable(io_mod.getIo());
+    const child_id = try alloc.dupe(u8, runtime.busy.items[0]);
+    runtime.admission_mutex.unlock(io_mod.getIo());
+    defer alloc.free(child_id);
+
+    worker.requestYield();
+    const refused = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "more" } }, "call-1", null);
+    try std.testing.expect(std.mem.find(u8, refused, "\"error_code\":\"child_restarting\"") != null);
+    try std.testing.expect(std.mem.find(u8, refused, "This subagent is pausing for an upgrade restart. Send again after the restart.") != null);
+    try std.testing.expect(!runtime.hasWaitingMessage(child_id));
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+
+    // Once the restart is cancelled, the same message is admitted and waits.
+    worker.cancelYield();
+    const admitted = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "more" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, admitted, "child_restarting") == null);
+    try std.testing.expect(runtime.hasWaitingMessage(child_id));
+
+    _ = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-stop", null);
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+}
+
+fn markChildTurnYielded(alloc: Allocator, parent: *child_state.TestParent, child_id: []const u8) !void {
+    const child = try session_adapter.Session.openChild(alloc, &parent.store, parent.parent.id(), child_id, parent.home, parent.seed(""));
+    defer child.close();
+    try child.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try std.testing.expectEqual(true, try child.markYielded());
+}
+
+/// A reviewer whose working turn yielded and whose work a quit then
+/// cancelled, with its admission saved: what a Ctrl+G restart leaves for the
+/// next open. Returns the child's id and the cancelled work's id, in `arena`.
+fn yieldedReviewer(alloc: Allocator, arena: Allocator, parent: *child_state.TestParent) !struct { []const u8, []const u8 } {
+    const child_id, const work_id = blk: {
+        var fixture = MailboxFixture{ .hold = true };
+        defer fixture.deinit();
+        const runtime = try mailboxRuntime(alloc, &fixture, parent);
+        defer runtime.deinit();
+
+        var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "working" } });
+        defer request.deinit(alloc);
+        const root_messages = [_][]const u8{"fix the bug"};
+        _ = try runtime.executeManaged(arena, &request, .{
+            .caller_id = runtime.root_id,
+            .invocation_id = "call-0",
+            .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+            .max_result_bytes = 4096,
+            .timestamp_ms = 1,
+            .parent_permission_mode = .ask,
+            .root_user_intent_context = "ship it",
+            .root_user_messages = &root_messages,
+            .root_user_evidence_complete = true,
+        });
+        try waitForRuns(&fixture, 1);
+        const cid = try reviewerId(runtime, arena);
+        var reg = try runtime.managed.state_store.load(arena);
+        const wid = try arena.dupe(u8, reg.findById(cid).?.active.?.id);
+        runtime.noteQuitting();
+        try runtime.managed.cancel(cid);
+        try waitUntilQuiet(runtime);
+        break :blk .{ cid, wid };
+    };
+    try markChildTurnYielded(alloc, parent, child_id);
+    return .{ child_id, work_id };
+}
+
+test "continueYieldedWorks continues a cancelled child with yielded turn and saved admission, and suppresses old report" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const child_id, const old_work_id = try yieldedReviewer(alloc, arena, &parent);
+
+    var children2 = child_state.V2Children.init(alloc, parent.parent, parent.home);
+    defer children2.deinit();
+    var fixture2 = MailboxFixture{ .hold = true };
+    defer fixture2.deinit();
+    const runtime2 = try Runtime.create(alloc, &children2, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = &fixture2, .run_fn = MailboxFixture.run, .restarting_fn = MailboxFixture.restarting });
+    defer runtime2.deinit();
+    runtime2.report_sink = .{ .context = &fixture2, .post_fn = MailboxFixture.post };
+
+    runtime2.continueYieldedWorks();
+    runtime2.startHeldContinues();
+    try waitForRuns(&fixture2, 1);
+
+    // A second call while the continuation runs saves nothing more.
+    runtime2.continueYieldedWorks();
+
+    {
+        var reg = try runtime2.managed.state_store.load(alloc);
+        defer reg.deinit(alloc);
+        const child = reg.findById(child_id).?;
+        const active = child.active.?;
+        try std.testing.expectEqualStrings(old_work_id, active.replaces.?);
+        try std.testing.expectEqualStrings("", active.message);
+        try std.testing.expectEqual(types.PermissionMode.ask, active.permission_mode);
+        try std.testing.expectEqualStrings("ship it", active.root_user_intent_context);
+        try std.testing.expectEqual(@as(usize, 1), active.root_user_messages.len);
+        try std.testing.expectEqualStrings("fix the bug", active.root_user_messages[0]);
+        try std.testing.expect(active.root_user_evidence_complete);
+    }
+
+    // The fold skips the replaced work's owed report, so resumeReports posts nothing.
+    const lines = try parent.parent.reportLines(arena);
+    try std.testing.expectEqual(@as(usize, 0), (try reports.pendingReports(arena, lines)).len);
+    runtime2.resumeReports(parent.parent);
+    try std.testing.expectEqual(@as(usize, 0), fixture2.reportCount());
+
+    fixture2.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime2);
+    // Calling continueYieldedWorks again after completion saves nothing more.
+    runtime2.continueYieldedWorks();
+
+    try std.testing.expectEqual(@as(usize, 1), fixture2.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), fixture2.begun.load(.seq_cst));
+    try std.testing.expectEqualStrings("", fixture2.began_contents.items[0]);
+    try std.testing.expectEqual(true, fixture2.began_continues_yielded.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), fixture2.reportCount());
+    try std.testing.expect(std.mem.find(u8, fixture2.reports.items[0], " completed ") != null);
+}
+
+test "a continuation's slot starts only from startHeldContinues, so it runs through the host's moved context" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const child_id, const old_work_id = try yieldedReviewer(alloc, arena, &parent);
+
+    // As `App.init` does: the host opens on a context that then moves.
+    var children2 = child_state.V2Children.init(alloc, parent.parent, parent.home);
+    defer children2.deinit();
+    var before = MailboxFixture{ .hold = true };
+    defer before.deinit();
+    var after = MailboxFixture{ .hold = true };
+    defer after.deinit();
+    const runtime2 = try Runtime.create(alloc, &children2, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = &before, .run_fn = MailboxFixture.run, .restarting_fn = MailboxFixture.restarting });
+    defer runtime2.deinit();
+    runtime2.report_sink = .{ .context = &before, .post_fn = MailboxFixture.post };
+
+    runtime2.continueYieldedWorks();
+    // The open saved the continuation and started no slot, which would run
+    // through the context that is about to move.
+    try std.testing.expect(!runtime2.managed.hasRunningChild(child_id));
+    {
+        var reg = try runtime2.managed.state_store.load(arena);
+        try std.testing.expectEqualStrings(old_work_id, reg.findById(child_id).?.active.?.replaces.?);
+    }
+
+    runtime2.rebindHost(&after, .{ .resolve_fn = MailboxFixture.resolve });
+    runtime2.startHeldContinues();
+    try std.testing.expect(runtime2.managed.hasRunningChild(child_id));
+    // A second call has nothing left to start.
+    runtime2.startHeldContinues();
+    try waitForRuns(&after, 1);
+
+    after.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime2);
+    try std.testing.expectEqual(@as(usize, 0), before.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), after.runs.load(.seq_cst));
+    try std.testing.expectEqual(true, after.began_continues_yielded.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), before.reportCount());
+    try std.testing.expectEqual(@as(usize, 1), after.reportCount());
+}
+
+test "a host closed before it starts its held continuations runs none and leaves the work open for the next open" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const child_id, _ = try yieldedReviewer(alloc, arena, &parent);
+
+    var children2 = child_state.V2Children.init(alloc, parent.parent, parent.home);
+    defer children2.deinit();
+    var fixture2 = MailboxFixture{ .hold = true };
+    defer fixture2.deinit();
+    const continuation_id = blk: {
+        const runtime2 = try Runtime.create(alloc, &children2, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = &fixture2, .run_fn = MailboxFixture.run, .restarting_fn = MailboxFixture.restarting });
+        defer runtime2.deinit();
+        runtime2.report_sink = .{ .context = &fixture2, .post_fn = MailboxFixture.post };
+        runtime2.continueYieldedWorks();
+        var reg = try runtime2.managed.state_store.load(arena);
+        break :blk try arena.dupe(u8, reg.findById(child_id).?.active.?.id);
+    };
+    try std.testing.expectEqual(@as(usize, 0), fixture2.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), fixture2.reportCount());
+
+    // The saved continuation is still the child's open work.
+    const store: child_state.Store = .{ .children = &children2, .parent_id = parent.parent.id() };
+    var reg = try store.load(arena);
+    try std.testing.expectEqualStrings(continuation_id, reg.findById(child_id).?.active.?.id);
+}
+
+test "continueYieldedWorks skips a cancelled child whose log does not end in a yielded turn" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+
+    const child_id, const old_work_id = blk: {
+        var fixture = MailboxFixture{ .hold = true };
+        defer fixture.deinit();
+        const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+        defer runtime.deinit();
+
+        _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-0", null);
+        try waitForRuns(&fixture, 1);
+        const cid = try reviewerId(runtime, arena);
+        var reg = try runtime.managed.state_store.load(arena);
+        const wid = try arena.dupe(u8, reg.findById(cid).?.active.?.id);
+        runtime.noteQuitting();
+        try runtime.managed.cancel(cid);
+        try waitUntilQuiet(runtime);
+        break :blk .{ cid, wid };
+    };
+
+    var children2 = child_state.V2Children.init(alloc, parent.parent, parent.home);
+    defer children2.deinit();
+    var fixture2 = MailboxFixture{};
+    defer fixture2.deinit();
+    const runtime2 = try Runtime.create(alloc, &children2, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = &fixture2, .run_fn = MailboxFixture.run, .restarting_fn = MailboxFixture.restarting });
+    defer runtime2.deinit();
+    runtime2.report_sink = .{ .context = &fixture2, .post_fn = MailboxFixture.post };
+
+    runtime2.continueYieldedWorks();
+    try waitUntilQuiet(runtime2);
+    try std.testing.expectEqual(@as(usize, 0), fixture2.runs.load(.seq_cst));
+    var reg = try runtime2.managed.state_store.load(alloc);
+    defer reg.deinit(alloc);
+    try std.testing.expect(reg.findById(child_id).?.active == null);
+    const lines = try parent.parent.reportLines(arena);
+    const pending = try reports.pendingReports(arena, lines);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqualStrings(old_work_id, pending[0].work_id);
+}
+
+test "continueYieldedWorks skips a yielded child with no saved admission and leaves report pending" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+
+    const child_id = try session_store.generateSessionId(arena);
+    const old_work_id = "work-no-admission";
+    const fp: [64]u8 = @splat('a');
+    const spawn_data = try arena.print("{{\"agent\":\"reviewer\",\"fingerprint\":\"{s}\",\"profile\":\"main\",\"report\":\"final\"}}", .{fp});
+    try parent.parent.appendChildLines(&.{
+        .{ .spawned = .{ .child = child_id, .work_id = old_work_id, .data = spawn_data } },
+        .{ .finished = .{ .child = child_id, .work_id = old_work_id, .outcome = .cancelled, .data = "{\"report\":true,\"cause\":\"fx_quit\"}" } },
+    });
+    try markChildTurnYielded(alloc, &parent, child_id);
+
+    var children2 = child_state.V2Children.init(alloc, parent.parent, parent.home);
+    defer children2.deinit();
+    var fixture2 = MailboxFixture{};
+    defer fixture2.deinit();
+    const runtime2 = try Runtime.create(alloc, &children2, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = &fixture2, .run_fn = MailboxFixture.run, .restarting_fn = MailboxFixture.restarting });
+    defer runtime2.deinit();
+    runtime2.report_sink = .{ .context = &fixture2, .post_fn = MailboxFixture.post };
+
+    runtime2.continueYieldedWorks();
+    try waitUntilQuiet(runtime2);
+    try std.testing.expectEqual(@as(usize, 0), fixture2.runs.load(.seq_cst));
+    var reg = try runtime2.managed.state_store.load(alloc);
+    defer reg.deinit(alloc);
+    try std.testing.expect(reg.findById(child_id).?.active == null);
+    const lines = try parent.parent.reportLines(arena);
+    const pending = try reports.pendingReports(arena, lines);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqualStrings(old_work_id, pending[0].work_id);
+}
+
+test "continueYieldedWorks skips a closed child" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+
+    const child_id = blk: {
+        var fixture = MailboxFixture{ .hold = true };
+        defer fixture.deinit();
+        const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+        defer runtime.deinit();
+
+        _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-0", null);
+        try waitForRuns(&fixture, 1);
+        const cid = try reviewerId(runtime, arena);
+        runtime.noteQuitting();
+        try runtime.managed.cancel(cid);
+        try waitUntilQuiet(runtime);
+        break :blk cid;
+    };
+    try markChildTurnYielded(alloc, &parent, child_id);
+    try parent.stateStore().close(child_id, "close-1");
+
+    var children2 = child_state.V2Children.init(alloc, parent.parent, parent.home);
+    defer children2.deinit();
+    var fixture2 = MailboxFixture{};
+    defer fixture2.deinit();
+    const runtime2 = try Runtime.create(alloc, &children2, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = &fixture2, .run_fn = MailboxFixture.run, .restarting_fn = MailboxFixture.restarting });
+    defer runtime2.deinit();
+    runtime2.report_sink = .{ .context = &fixture2, .post_fn = MailboxFixture.post };
+
+    runtime2.continueYieldedWorks();
+    try waitUntilQuiet(runtime2);
+    try std.testing.expectEqual(@as(usize, 0), fixture2.runs.load(.seq_cst));
+    var reg = try runtime2.managed.state_store.load(alloc);
+    defer reg.deinit(alloc);
+    try std.testing.expect(reg.findById(child_id) == null);
 }
 
 test "a message past a busy subagent's full queue is refused to its sender" {
@@ -7325,8 +8213,8 @@ const SettleGap = struct {
     }
 };
 
-/// A trace file for the `mailbox` scope, which a test reads to see that a
-/// `wait` has looked and is about to block (`wait_begin`).
+/// A trace file for the `mailbox` scope, which the host's trace lines go to in
+/// these tests.
 const GapTrace = struct {
     tmp: std.testing.TmpDir,
     path: []u8,
@@ -7348,14 +8236,6 @@ const GapTrace = struct {
         self.tmp.cleanup();
     }
 
-    fn waitFor(self: *const GapTrace, needle: []const u8) !void {
-        for (0..5000) |_| {
-            if (self.has(needle)) return;
-            io_mod.sleep(std.time.ns_per_ms);
-        }
-        return error.Timeout;
-    }
-
     /// Reads the first 64 KiB, which holds every line a test of this scope
     /// writes. The host appends to the file while a test polls it, so this
     /// reads from offset 0 into a fixed buffer. `readFileToEnd` sizes the file
@@ -7371,15 +8251,14 @@ const GapTrace = struct {
 };
 
 /// What every gap test builds: a parent log, main's worker, a fixture that
-/// runs the children, the host, and a trace for the `mailbox` scope. Its parts
-/// point at each other, so it stays where `init` built it.
+/// runs the children, and the host. Its parts point at each other, so it stays
+/// where `init` built it.
 const GapFixture = struct {
     arena_state: std.heap.ArenaAllocator,
     parent: child_state.TestParent,
     worker: worker_runtime.WorkerRuntime,
     fixture: MailboxFixture,
     runtime: *Runtime,
-    trace: GapTrace,
     armed: bool,
 
     const Options = struct {
@@ -7404,21 +8283,17 @@ const GapFixture = struct {
         errdefer self.fixture.deinit();
         self.runtime = try mailboxRuntime(alloc, &self.fixture, &self.parent);
         errdefer self.runtime.deinit();
-        try self.trace.init(alloc);
-        errdefer self.trace.deinit(alloc);
         self.armed = false;
         if (options.armed) self.arm();
     }
 
-    /// Releases a held host first, so the runtime can join it, and keeps the
-    /// trace until the runtime's threads are gone.
+    /// Releases a held host first, so the runtime can join it.
     fn deinit(self: *GapFixture) void {
         const alloc = std.testing.allocator;
         SettleGap.go.set(io_mod.getIo());
         if (self.armed) SettleGap.disarm();
         self.runtime.deinit();
         self.fixture.deinit();
-        self.trace.deinit(alloc);
         self.worker.deinit(alloc);
         self.parent.deinit();
         self.arena_state.deinit();
@@ -7462,6 +8337,25 @@ const GapFixture = struct {
     }
 };
 
+/// Set once a `wait` has found that something can still arrive and is about
+/// to block (`end_test_controls.noteWaitBlocking`).
+const WaitBlocking = struct {
+    var blocked: std.Io.Event = .unset;
+
+    fn arm() void {
+        blocked = .unset;
+        end_test_controls.test_wait_blocking = note;
+    }
+
+    fn disarm() void {
+        end_test_controls.test_wait_blocking = null;
+    }
+
+    fn note() void {
+        blocked.set(io_mod.getIo());
+    }
+};
+
 /// One `wait` call on its own thread, as main's worker makes it.
 const GapWait = struct {
     runtime: *Runtime,
@@ -7488,15 +8382,23 @@ const GapWait = struct {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    /// Starts the wait, then waits for its trace line, which it writes once it
-    /// has read that a child works and before it blocks.
-    fn startBlocked(self: *GapWait, trace: *const GapTrace) !void {
+    /// Starts the wait, and returns once it is about to block: the host has
+    /// found that something can still arrive and sends `noteWaitBlocking`
+    /// right before it blocks. On failure the wait's thread is joined first,
+    /// then the hook is disarmed, because that thread may still read the hook
+    /// until it has returned.
+    fn startBlocked(self: *GapWait) !void {
+        WaitBlocking.arm();
+        errdefer WaitBlocking.disarm();
         try self.start();
-        trace.waitFor("wait_begin") catch {
+        WaitBlocking.blocked.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
             self.worker.requestCancel();
             self.thread.join();
-            return error.WaitNeverBegan;
+            WaitBlocking.disarm();
+            std.debug.print("wait never blocked\n", .{});
+            return error.WaitNeverBlocked;
         };
+        WaitBlocking.disarm();
     }
 
     /// Joins the wait's thread and returns what it said, which the caller
@@ -7507,6 +8409,7 @@ const GapWait = struct {
         self.done.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
             self.worker.requestCancel();
             self.thread.join();
+            std.debug.print("wait stayed blocked after the end settled\n", .{});
             return error.WaitBlockedWhileNothingWorks;
         };
         self.thread.join();
@@ -7531,11 +8434,22 @@ const gap_wait_limit: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5),
 /// (`tests/tla/subagent/WaitNudge.tla`: `wait` always returns).
 fn waitInSettleGap(gap: *GapFixture) ![]u8 {
     defer SettleGap.go.set(io_mod.getIo());
-    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
+        std.debug.print("host never reached the gap\n", .{});
+        return error.HostNeverReachedTheGap;
+    };
     var waiting = GapWait{ .runtime = gap.runtime, .worker = &gap.worker };
-    try waiting.startBlocked(&gap.trace);
+    try waiting.startBlocked();
     SettleGap.go.set(io_mod.getIo());
     return waiting.finish();
+}
+
+/// Checks that `wait` said the end left no report, and prints what it said
+/// when it did not.
+fn expectEndedWithoutReport(said: []const u8) !void {
+    if (std.mem.find(u8, said, "ended without a report") != null) return;
+    std.debug.print("wait said: {s}\n", .{said});
+    return error.TestUnexpectedResult;
 }
 
 /// One `wait` call with nothing held, returning what it said, which the
@@ -7555,7 +8469,7 @@ test "a wait that starts as a subagent's work ends with nothing to report still 
     _ = try gap.call(.{ .message = .{ .agent = "quiet", .message = "go", .report = "never" } }, "call-1");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7571,7 +8485,7 @@ test "a wait that starts as the parent's stop ends a subagent's turn still retur
     _ = try gap.call(.{ .stop = .{ .agent = "reviewer" } }, "call-2");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7585,7 +8499,7 @@ test "a wait that starts as a report its owner's sink refuses is held still retu
     _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "go" } }, "call-1");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
     try std.testing.expectEqual(@as(usize, 0), gap.worker.queuedPromptCount());
@@ -7601,7 +8515,7 @@ test "a wait that starts as the parent's close ends a subagent's turn still retu
     _ = try gap.call(.{ .close = .{ .agent = "reviewer" } }, "call-2");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7622,7 +8536,7 @@ test "a wait that starts as the user's turn on a subagent ends with nothing to r
     ender.join();
     const text = try said;
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "ended without a report") != null);
+    try expectEndedWithoutReport(text);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 1), gap.fixture.reportCount());
 }
@@ -7641,7 +8555,7 @@ test "a wait that starts before and after the user's turn on a closing subagent 
     defer std.testing.allocator.free(work_id);
     // The user's turn keeps the subagent working, so this wait blocks.
     var waiting = GapWait{ .runtime = gap.runtime, .worker = &gap.worker, .child_id = child_id };
-    try waiting.startBlocked(&gap.trace);
+    try waiting.startBlocked();
     // The parent closes the subagent meanwhile, and the turn then ends.
     const closed = (try gap.runtime.closeChild(child_id, .parent)).?;
     try std.testing.expect(closed.stopped);
@@ -8263,6 +9177,7 @@ fn waitUntilQuiet(runtime: *Runtime) !void {
         if (runtime.quiet()) return;
         io_mod.sleep(std.time.ns_per_ms);
     }
+    std.debug.print("runtime did not go quiet in time\n", .{});
     return error.Timeout;
 }
 
@@ -8739,6 +9654,7 @@ const OverrideResolverFixture = struct {
         self.runs += 1;
         var preferences = turn.child.?.currentPreferences(std.testing.allocator) catch return error.ProviderFailed;
         defer preferences.deinit(std.testing.allocator);
+        if (self.observed_model) |prev| std.testing.allocator.free(prev);
         self.observed_model = std.testing.allocator.dupe(u8, preferences.model) catch return error.ProviderFailed;
         if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
         turn.commit(turn.active_work_id.?, .{ .assistant = .{
@@ -8875,6 +9791,197 @@ test "model override passes through for non-gateway providers" {
     try std.testing.expectEqualStrings("unknown-model", fixture.observed_model.?);
 }
 
+test "a subagent message that repeats its model and effort is accepted, while a different effort is refused" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const first = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first", .model = "openai/gpt-5", .effort = "low" } }, "call-1", null);
+    try std.testing.expect(std.mem.find(u8, first, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+
+    const repeated = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second", .model = "openai/gpt-5", .effort = "low" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, repeated, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+
+    const different_effort = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "third", .model = "openai/gpt-5", .effort = "high" } }, "call-3", null);
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"result\":\"model, effort and profile are fixed when a subagent is created, so this one keeps its own: send the message again without them. To change them, close it and start a new one, which loses its conversation.\",\"error_code\":\"override_after_create\"}",
+        different_effort,
+    );
+
+    // An effort equal to the child's default (.auto) is also accepted.
+    const auto_first = try callTool(runtime, arena, .{ .message = .{ .agent = "default-kid", .message = "first", .model = "openai/gpt-5" } }, "call-4", null);
+    try std.testing.expect(std.mem.find(u8, auto_first, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+    const auto_repeated = try callTool(runtime, arena, .{ .message = .{ .agent = "default-kid", .message = "second", .model = "openai/gpt-5", .effort = "default" } }, "call-5", null);
+    try std.testing.expect(std.mem.find(u8, auto_repeated, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+}
+
+test "a subagent message that repeats its profile is accepted, while a different profile is refused" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    try parent.tmp.dir.createDirPath(io, ".fx/agents/session-reviewer");
+    var settings = try parent.tmp.dir.createFile(io, ".fx/agents/session-reviewer/profile.json", .{});
+    defer settings.close(io);
+    try settings.writeStreamingAll(io, "{\"description\": \"Reads the session workspace\", \"tools\": [\"read_file\"]}");
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const first = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "look", .profile = "session-reviewer" } }, "call-1", null);
+    try std.testing.expect(std.mem.find(u8, first, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+
+    const repeated = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again", .profile = "session-reviewer" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, repeated, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+
+    const different = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "switch", .profile = "main" } }, "call-3", null);
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"result\":\"model, effort and profile are fixed when a subagent is created, so this one keeps its own: send the message again without them. To change them, close it and start a new one, which loses its conversation.\",\"error_code\":\"override_after_create\"}",
+        different,
+    );
+}
+
+test "a subagent message whose model query resolves to the child's model is accepted" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = OverrideResolverFixture{};
+    defer if (fixture.observed_model) |model| alloc.free(model);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const options = ExecuteOptions{
+        .caller_id = parent.parent.id(),
+        .invocation_id = "override-repeat-1",
+        .defaults = .{ .provider = .gateway, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .model_override_resolver = .{ .context = &fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
+    };
+
+    var first_req = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "first", .model = "openai/gpt-5.6-terra-fast" } });
+    defer first_req.deinit(alloc);
+    const first = try runtime.executeManaged(arena, &first_req, options);
+    try std.testing.expect(first.success);
+    try waitUntilQuiet(runtime);
+
+    var second_req = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "second", .model = "terra-fast" } });
+    defer second_req.deinit(alloc);
+    var second_opts = options;
+    second_opts.invocation_id = "override-repeat-2";
+    const second = try runtime.executeManaged(arena, &second_req, second_opts);
+    try std.testing.expect(second.success);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs);
+
+    var third_req = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "third", .model = "astra" } });
+    defer third_req.deinit(alloc);
+    var third_opts = options;
+    third_opts.invocation_id = "override-repeat-3";
+    const third = try runtime.executeManaged(arena, &third_req, third_opts);
+    try std.testing.expect(!third.success);
+    try std.testing.expect(std.mem.find(u8, third.body, "\"error_code\":\"override_after_create\"") != null);
+}
+
+test "queuing a message after the parent changes model keeps the child's startup seed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    var req1 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "first", .model = "model-a" } });
+    defer req1.deinit(alloc);
+    const first = try runtime.executeManaged(arena, &req1, .{
+        .caller_id = parent.parent.id(),
+        .invocation_id = "seed-keep-1",
+        .defaults = .{ .provider = .gateway, .model = "model-a", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+    });
+    try std.testing.expect(first.success);
+    const child_id = try reviewerId(runtime, arena);
+    try waitForRuns(&fixture, 1);
+
+    // Change the parent's model to model-b before queuing a follow-up while the
+    // child still has no log on disk.
+    var model_b = "model-b".*;
+    try parent.parent.setPreferences(.{ .provider = .gateway, .model = &model_b, .effort = .auto, .fast_mode = false });
+    const parent_b_options = ExecuteOptions{
+        .caller_id = parent.parent.id(),
+        .invocation_id = "seed-keep-2",
+        .defaults = .{ .provider = .gateway, .model = "model-b", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 2,
+    };
+    var req2 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "second" } });
+    defer req2.deinit(alloc);
+    const queued = try runtime.executeManaged(arena, &req2, parent_b_options);
+    try std.testing.expect(queued.success);
+    try std.testing.expect(std.mem.find(u8, queued.body, "is busy") != null);
+
+    var seed = (try runtime.children.seedFor(alloc, child_id)).?;
+    defer seed.preferences.deinit(alloc);
+    try std.testing.expectEqualStrings("model-a", seed.preferences.model);
+
+    var prefs = try managed_owner.readChildPreferences(&runtime.managed, child_id);
+    defer prefs.deinit(runtime.managed.alloc);
+    try std.testing.expectEqualStrings("model-a", prefs.model);
+
+    var req3 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "third", .model = "model-a" } });
+    defer req3.deinit(alloc);
+    var repeat_opts = parent_b_options;
+    repeat_opts.invocation_id = "seed-keep-3";
+    const repeat = try runtime.executeManaged(arena, &req3, repeat_opts);
+    try std.testing.expect(repeat.success);
+    try std.testing.expect(std.mem.find(u8, repeat.body, "is busy") != null);
+
+    var req4 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "fourth", .model = "model-b" } });
+    defer req4.deinit(alloc);
+    var changed_opts = parent_b_options;
+    changed_opts.invocation_id = "seed-keep-4";
+    const changed = try runtime.executeManaged(arena, &req4, changed_opts);
+    try std.testing.expect(!changed.success);
+    try std.testing.expect(std.mem.find(u8, changed.body, "\"error_code\":\"override_after_create\"") != null);
+
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+    try std.testing.expect(std.mem.find(u8, fixture.began_contents.items[1], "second") != null);
+    try std.testing.expect(std.mem.find(u8, fixture.began_contents.items[1], "third") != null);
+}
+
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {
     const reason = failure orelse "failure reason unavailable";
     const text = partial orelse "";
@@ -8938,6 +10045,20 @@ fn terminalResult(
 
 /// How often a message that waits for a starting work's turn asks again.
 const start_wait_poll_ns = 5 * std.time.ns_per_ms;
+
+/// A continuation work saved at the open whose slot has not started
+/// (`Runtime.held_continues`). Owns its ids.
+const HeldContinue = struct {
+    child_id: []u8,
+    old_work_id: []u8,
+    work_id: []u8,
+
+    fn deinit(self: *HeldContinue, alloc: Allocator) void {
+        alloc.free(self.child_id);
+        alloc.free(self.old_work_id);
+        alloc.free(self.work_id);
+    }
+};
 
 /// One message waiting for its child's starting turn (`Runtime.start_waits`).
 /// A child being closed for good (`Runtime.closing`).
@@ -9451,6 +10572,12 @@ fn admissionFrom(
     };
 }
 
+/// Relays a child's approval request to its parent, for the owner's hook.
+fn noteApprovalHook(raw: *anyopaque, child_id: []const u8, name: []const u8, label: []const u8) bool {
+    const self: *Runtime = @ptrCast(@alignCast(raw));
+    return self.noteChildApproval(child_id, name, label);
+}
+
 fn bindChild(
     raw: ?*anyopaque,
     turn: *execution.TurnContext,
@@ -9476,6 +10603,74 @@ fn runChild(
         admission,
         cancel,
     );
+}
+
+const YieldedCandidate = enum {
+    skip,
+    no_saved_admission,
+    ready,
+};
+
+fn yieldedContinuationCandidate(child: child_state.Child, closing: bool) YieldedCandidate {
+    if (closing) return .skip;
+    if (child.kind != .persistent) return .skip;
+    switch (child.phase) {
+        .idle, .interrupted => {},
+        .running, .awaiting_approval, .finished => return .skip,
+    }
+    if (child.active != null) return .skip;
+    const outcome = child.last_outcome orelse return .skip;
+    if (outcome != .cancelled and outcome != .interrupted) return .skip;
+    if (child.last_work_id == null) return .skip;
+    if (child.last_admission == null) return .no_saved_admission;
+    return .ready;
+}
+
+test "yieldedContinuationCandidate accepts open persistent cancelled or interrupted child with saved admission" {
+    const admission: child_state.Admission = .{ .permission_mode = .ask };
+    var persistent_idle: child_state.Child = .{
+        .id = @constCast("child-1"),
+        .kind = .{ .persistent = .{ .agent = @constCast("reviewer"), .instructions = &.{} } },
+        .phase = .idle,
+        .last_work_id = @constCast("work-1"),
+        .last_outcome = .cancelled,
+        .last_admission = admission,
+    };
+    try std.testing.expectEqual(YieldedCandidate.ready, yieldedContinuationCandidate(persistent_idle, false));
+
+    persistent_idle.phase = .interrupted;
+    persistent_idle.last_outcome = .interrupted;
+    try std.testing.expectEqual(YieldedCandidate.ready, yieldedContinuationCandidate(persistent_idle, false));
+
+    var no_admission = persistent_idle;
+    no_admission.last_admission = null;
+    try std.testing.expectEqual(YieldedCandidate.no_saved_admission, yieldedContinuationCandidate(no_admission, false));
+
+    try std.testing.expectEqual(YieldedCandidate.skip, yieldedContinuationCandidate(persistent_idle, true));
+
+    var finished = persistent_idle;
+    finished.phase = .finished;
+    try std.testing.expectEqual(YieldedCandidate.skip, yieldedContinuationCandidate(finished, false));
+
+    var running = persistent_idle;
+    running.phase = .running;
+    try std.testing.expectEqual(YieldedCandidate.skip, yieldedContinuationCandidate(running, false));
+
+    var with_active = persistent_idle;
+    with_active.active = .{ .id = @constCast("work-2"), .message = @constCast(""), .created_at_ms = 1 };
+    try std.testing.expectEqual(YieldedCandidate.skip, yieldedContinuationCandidate(with_active, false));
+
+    var completed = persistent_idle;
+    completed.last_outcome = .completed;
+    try std.testing.expectEqual(YieldedCandidate.skip, yieldedContinuationCandidate(completed, false));
+
+    var no_work = persistent_idle;
+    no_work.last_work_id = null;
+    try std.testing.expectEqual(YieldedCandidate.skip, yieldedContinuationCandidate(no_work, false));
+
+    var one_off = persistent_idle;
+    one_off.kind = .one_off;
+    try std.testing.expectEqual(YieldedCandidate.skip, yieldedContinuationCandidate(one_off, false));
 }
 
 fn cloneStrings(
@@ -11622,4 +12817,558 @@ test "every message main sends has one account in every window of a subagent's s
     }
     if (broken > 0) std.debug.print("\nTABLE {d} of {d} cells break the rule or could not be driven\n", .{ broken, cells });
     try std.testing.expectEqual(@as(usize, 0), broken);
+}
+
+/// The worker route of a subagent waiting on an approval. It records the
+/// answer it accepts, as the child's worker would deliver it.
+const ApprovalWorker = struct {
+    decision: ?types.ToolPermissionDecision = null,
+    feedback_buf: [256]u8 = undefined,
+    feedback_len: usize = 0,
+    released: usize = 0,
+
+    fn route(self: *ApprovalWorker) approval_registry.WorkerRoute {
+        return .{
+            .context = self,
+            .submit_fn = submit,
+            .cancel_fn = cancel,
+            .pin_fn = pin,
+            .release_fn = release,
+        };
+    }
+
+    fn submit(
+        raw: *anyopaque,
+        _: u64,
+        response: permission_request.OwnedPermissionResponse,
+        _: ?worker_runtime.WorkerRuntime.PermissionCommit,
+    ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+        const self: *ApprovalWorker = @ptrCast(@alignCast(raw));
+        var owned = response;
+        defer owned.deinit();
+        self.decision = owned.decision;
+        self.feedback_len = 0;
+        if (owned.feedback) |feedback| {
+            const length = @min(feedback.len, self.feedback_buf.len);
+            @memcpy(self.feedback_buf[0..length], feedback[0..length]);
+            self.feedback_len = length;
+        }
+        return .accepted;
+    }
+
+    fn cancel(_: *anyopaque) void {}
+
+    fn pin(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn release(raw: *anyopaque) void {
+        const self: *ApprovalWorker = @ptrCast(@alignCast(raw));
+        self.released += 1;
+    }
+
+    fn feedbackText(self: *const ApprovalWorker) []const u8 {
+        return self.feedback_buf[0..self.feedback_len];
+    }
+};
+
+/// A host whose store holds an open, idle subagent named reviewer, so an
+/// approval can be registered against it as its turn would.
+const ApprovalFixture = struct {
+    arena_state: std.heap.ArenaAllocator,
+    parent: child_state.TestParent,
+    mailbox: MailboxFixture,
+    worker: ApprovalWorker,
+    runtime: *Runtime,
+
+    fn init(self: *ApprovalFixture) !void {
+        const alloc = std.testing.allocator;
+        self.mailbox = .{};
+        self.worker = .{};
+        self.arena_state = std.heap.ArenaAllocator.init(alloc);
+        errdefer self.arena_state.deinit();
+        try self.parent.init(alloc);
+        errdefer self.parent.deinit();
+        var registry = try child_state.Registry.init(alloc, self.parent.parent.id());
+        defer registry.deinit(alloc);
+        try registry.appendPersistent(alloc, "child-1", "reviewer", "", .{ .id = @constCast("work-1"), .message = @constCast("old task"), .created_at_ms = 1 });
+        try registry.finish(alloc, "child-1", "work-1", .completed, null);
+        try self.parent.stateStore().save(alloc, registry);
+        self.runtime = try mailboxRuntime(alloc, &self.mailbox, &self.parent);
+    }
+
+    fn deinit(self: *ApprovalFixture) void {
+        self.runtime.deinit();
+        self.mailbox.deinit();
+        self.parent.deinit();
+        self.arena_state.deinit();
+    }
+
+    fn arena(self: *ApprovalFixture) Allocator {
+        return self.arena_state.allocator();
+    }
+
+    /// Registers the request reviewer waits on, as its turn does when a tool
+    /// call needs approval.
+    fn register(self: *ApprovalFixture, label: []const u8) !void {
+        try self.runtime.approvals.registerTool(
+            "approval-1",
+            "child-1",
+            self.runtime.root_id,
+            "work-1",
+            .{ .id = 7, .label = label },
+            .{ .id = "call-1", .name = "write_file", .arguments_json = "{\"path\":\"parent-approved.txt\"}" },
+            &.{},
+            self.worker.route(),
+            7,
+        );
+    }
+};
+
+test "approve allows the request a subagent waits on, once" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+    var check = FakeApprovalCheck{ .expected_name = "write_file", .expected_arguments = "{\"path\":\"parent-approved.txt\"}" };
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try expectAnswerHas(result.body, "Allowed reviewer's request: run touch marker.");
+    try std.testing.expect(check.saw_call);
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .once), t.worker.decision);
+    try std.testing.expectEqualStrings("", t.worker.feedbackText());
+    try std.testing.expectEqual(@as(usize, 1), t.worker.released);
+
+    // The answer was the one request it had; a second call finds none.
+    const again = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try expectAnswerHas(again.body, "reviewer has no approval request waiting.");
+}
+
+test "deny refuses the request a subagent waits on and passes its reason" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .deny, "not now", null);
+    try expectAnswerHas(result.body, "Refused reviewer's request: run touch marker.");
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+    try std.testing.expectEqualStrings("not now", t.worker.feedbackText());
+    try std.testing.expectEqual(@as(usize, 1), t.worker.released);
+}
+
+test "a subagent with nothing waiting is told so, and an unknown one is refused" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, null);
+    try expectAnswerHas(result.body, "reviewer has no approval request waiting.");
+    try std.testing.expect(t.worker.decision == null);
+
+    const unknown = try t.runtime.answerApproval(t.arena(), "ghost", .once, null, null);
+    try std.testing.expect(!unknown.success);
+    try std.testing.expect(std.mem.find(u8, unknown.body, "child_unavailable") != null);
+}
+
+test "approve runs the parent's own check, and its allow lets the request run" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+    var check = FakeApprovalCheck{ .expected_name = "write_file", .expected_arguments = "{\"path\":\"parent-approved.txt\"}" };
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try expectAnswerHas(result.body, "Allowed reviewer's request: run touch marker.");
+    // The check saw the exact call the subagent registered, not the label.
+    try std.testing.expect(check.saw_call);
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .once), t.worker.decision);
+    try std.testing.expectEqualStrings("", t.worker.feedbackText());
+}
+
+test "approve refuses the request when the parent's own check refuses it" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+    var check = FakeApprovalCheck{
+        .expected_name = "write_file",
+        .expected_arguments = "{\"path\":\"parent-approved.txt\"}",
+        .verdict = "the safety review held it",
+    };
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try std.testing.expect(check.saw_call);
+    try expectAnswerHas(result.body, "Your permissions did not allow it");
+    try expectAnswerHas(result.body, "the safety review held it");
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+    try std.testing.expectEqualStrings("the safety review held it", t.worker.feedbackText());
+}
+
+test "approve with no way to check refuses the request" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, null);
+    try expectAnswerHas(result.body, "fx cannot check it against your permissions here");
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+    try expectAnswerHas(t.worker.feedbackText(), "could not check this request against your parent's permissions");
+}
+
+test "a failing check refuses the request" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+    var check = FakeApprovalCheck{
+        .expected_name = "write_file",
+        .expected_arguments = "{\"path\":\"parent-approved.txt\"}",
+        .fail = true,
+    };
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try std.testing.expect(check.saw_call);
+    try expectAnswerHas(result.body, "fx cannot check it against your permissions here");
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+    try expectAnswerHas(t.worker.feedbackText(), "could not check this request against your parent's permissions");
+}
+
+/// A stand-in for main's own permission check: it records whether it was
+/// given the registered call, then allows, refuses with a reason, or fails.
+const FakeApprovalCheck = struct {
+    expected_name: []const u8,
+    expected_arguments: []const u8,
+    verdict: ?[]const u8 = null,
+    fail: bool = false,
+    saw_call: bool = false,
+
+    fn check(raw: *anyopaque, _: Allocator, call: types.ToolCall) anyerror!?[]const u8 {
+        const self: *FakeApprovalCheck = @ptrCast(@alignCast(raw));
+        self.saw_call = std.mem.eql(u8, call.name, self.expected_name) and
+            std.mem.eql(u8, call.arguments_json, self.expected_arguments);
+        if (self.fail) return error.ReviewUnavailable;
+        return self.verdict;
+    }
+
+    fn hook(self: *FakeApprovalCheck) ApprovalCheck {
+        return .{ .context = self, .check_fn = check };
+    }
+};
+
+test "a note tells the parent that a subagent waits on its approval" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    const Capture = struct {
+        posts: usize = 0,
+        text: ?[]u8 = null,
+
+        fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (delivery) {
+                .report => return,
+                .message => |message| {
+                    self.posts += 1;
+                    if (self.text) |old| std.testing.allocator.free(old);
+                    self.text = try std.testing.allocator.dupe(u8, message.text);
+                },
+            }
+        }
+
+        fn deinit(self: *@This()) void {
+            if (self.text) |text| std.testing.allocator.free(text);
+        }
+    };
+    var capture: Capture = .{};
+    defer capture.deinit();
+    t.runtime.report_sink = .{ .context = &capture, .post_fn = Capture.post };
+
+    // A child this host does not have posts nothing.
+    try std.testing.expect(!t.runtime.noteChildApproval("no-such-child", "ghost", "run touch marker"));
+    try std.testing.expectEqual(@as(usize, 0), capture.posts);
+
+    try std.testing.expect(t.runtime.noteChildApproval("child-1", "reviewer", "run touch marker"));
+    try std.testing.expectEqual(@as(usize, 1), capture.posts);
+    try expectAnswerHas(capture.text.?, "I wait for your approval to run: run touch marker");
+    try expectAnswerHas(capture.text.?, "agent \"reviewer\"");
+}
+
+test "a note with no parent to post to reports false" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    t.runtime.report_sink = null;
+
+    // The observer refuses the request at once on false, so this must not be
+    // mistaken for a note nobody had to receive.
+    try std.testing.expect(!t.runtime.noteChildApproval("child-1", "reviewer", "run touch marker"));
+}
+
+test "the waiting loop answers the fallback after a request is marked noted" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    try t.register("run touch marker");
+    // The child waits on the approval, and the host sees it working.
+    try t.runtime.busy.append(alloc, try alloc.dupe(u8, "child-1"));
+    var children = try t.runtime.managed.state_store.load(t.arena());
+    const child = children.findById("child-1") orelse return error.TestUnexpectedResult;
+    child.phase = .awaiting_approval;
+    try t.runtime.managed.state_store.save(t.arena(), children);
+    // A registered request whose note has not gone out is not the fallback's.
+    try std.testing.expect(!t.runtime.approvals.allPendingNoted(t.runtime.root_id));
+
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var cancel = std.atomic.Value(bool).init(false);
+    var result: ?Runtime.TreeWake = null;
+    var done: std.Io.Event = .unset;
+    const Runner = struct {
+        fn run(rt: *Runtime, w: *worker_runtime.WorkerRuntime, c: *std.atomic.Value(bool), out: *?Runtime.TreeWake, event: *std.Io.Event) void {
+            out.* = rt.awaitMailOrQuiet(w, c, true);
+            event.set(io_mod.getIo());
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ t.runtime, &worker, &cancel, &result, &done });
+    defer {
+        cancel.store(true, .seq_cst);
+        thread.join();
+    }
+    // The note is marked while the loop waits. Its `cancel_poll` re-check is
+    // the wake (`awaitMailOrQuiet`), so no nudge is needed.
+    t.runtime.approvals.markNoted("approval-1");
+    done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch return error.Timeout;
+    try std.testing.expectEqual(@as(?Runtime.TreeWake, .approvals_unanswered), result);
+}
+
+/// Holds a parent's stop inside its admission section, so a test can prove the
+/// approval note never waits for that mutex.
+const AdmissionHold = struct {
+    var held: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+
+    fn inStop(_: []const u8) void {
+        held.set(io_mod.getIo());
+        go.waitUncancelable(io_mod.getIo());
+    }
+
+    fn arm() void {
+        held = .unset;
+        go = .unset;
+        end_test_controls.test_hold_stop = inStop;
+    }
+
+    fn clear() void {
+        end_test_controls.test_hold_stop = null;
+    }
+
+    fn release() void {
+        go.set(io_mod.getIo());
+    }
+
+    fn waitHeld() !void {
+        held.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } }) catch return error.Timeout;
+    }
+};
+
+test "an approval note posts while a stop holds admission, and never waits for it" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    const Notes = struct {
+        posts: usize = 0,
+
+        fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (delivery) {
+                .report => return,
+                .message => self.posts += 1,
+            }
+        }
+    };
+    var notes: Notes = .{};
+    t.runtime.report_sink = .{ .context = &notes, .post_fn = Notes.post };
+
+    AdmissionHold.arm();
+    defer AdmissionHold.clear();
+    // The stop takes `admission_mutex` and keeps it until `release`.
+    const Stop = struct {
+        fn run(rt: *Runtime, arena: Allocator, done: *std.Io.Event) void {
+            // The stop's own answer is not what this test reads: it holds
+            // admission while the note is posted.
+            _ = rt.stopChild(arena, "reviewer") catch {};
+            done.set(io_mod.getIo());
+        }
+    };
+    var stop_done: std.Io.Event = .unset;
+    const stop_thread = try std.Thread.spawn(.{}, Stop.run, .{ t.runtime, t.arena(), &stop_done });
+    AdmissionHold.waitHeld() catch {
+        AdmissionHold.release();
+        stop_thread.join();
+        return error.TestUnexpectedResult;
+    };
+
+    // The note runs on its own thread, as it does inside a child's observation,
+    // which holds that child's worker mutex.
+    const Note = struct {
+        fn run(rt: *Runtime, out: *?bool, done: *std.Io.Event) void {
+            out.* = rt.noteChildApproval("child-1", "reviewer", "run touch marker");
+            done.set(io_mod.getIo());
+        }
+    };
+    var noted: ?bool = null;
+    var note_done: std.Io.Event = .unset;
+    const note_thread = try std.Thread.spawn(.{}, Note.run, .{ t.runtime, &noted, &note_done });
+    note_done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch {
+        // The note waited for the stop's admission mutex: the stop would now
+        // wait for the worker the note runs under.
+        AdmissionHold.release();
+        stop_thread.join();
+        note_thread.join();
+        return error.TestUnexpectedResult;
+    };
+    AdmissionHold.release();
+    stop_thread.join();
+    note_thread.join();
+    try std.testing.expectEqual(true, noted.?);
+    try std.testing.expectEqual(@as(usize, 1), notes.posts);
+}
+
+test "an answer whose request ends during the check says it is no longer waiting" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+    // The request ends while main's check runs, as a stop of that child ends it.
+    const Check = struct {
+        approvals: *approval_registry.Registry,
+
+        fn check(raw: *anyopaque, _: Allocator, _: types.ToolCall) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.approvals.withdraw("approval-1");
+            return null;
+        }
+
+        fn hook(self: *@This()) ApprovalCheck {
+            return .{ .context = self, .check_fn = check };
+        }
+    };
+    var check = Check{ .approvals = &t.runtime.approvals };
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try expectAnswerHas(result.body, "reviewer's request: run touch marker is no longer waiting.");
+    // Nothing reached the worker: the request had already ended.
+    try std.testing.expect(t.worker.decision == null);
+}
+
+test "a stop refuses the child's waiting request once, with the reason" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+
+    const stopped = try t.runtime.stopChild(t.arena(), "reviewer");
+    // The fixture's work already ended, so the stop answers that it was not
+    // working; the refusal is what this test reads.
+    try expectAnswerHas(stopped.body, "reviewer");
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+    try expectAnswerHas(t.worker.feedbackText(), "Your parent stopped you before answering this request");
+    try std.testing.expect((try t.runtime.approvals.firstPendingForChild(t.arena(), "child-1")) == null);
+
+    // A second stop finds nothing to refuse.
+    t.worker = .{};
+    _ = try t.runtime.stopChild(t.arena(), "reviewer");
+    try std.testing.expect(t.worker.decision == null);
+    try std.testing.expectEqualStrings("", t.worker.feedbackText());
+}
+
+test "a close refuses the child's waiting request with the reason of who closed it" {
+    for ([_]Runtime.CloseBy{ .parent, .user }) |by| {
+        var t: ApprovalFixture = undefined;
+        try t.init();
+        defer t.deinit();
+        try t.register("run touch marker");
+
+        // The close's own result is not what this test reads: the refusal comes first.
+        _ = t.runtime.closeChild("child-1", by) catch |err| switch (err) {
+            error.CloseNotSaved => null,
+            else => return err,
+        };
+        try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+        if (by == .user) {
+            try expectAnswerHas(t.worker.feedbackText(), "The person closed you before this request was answered");
+        } else {
+            try expectAnswerHas(t.worker.feedbackText(), "Your parent closed you before answering this request");
+        }
+        try std.testing.expect((try t.runtime.approvals.firstPendingForChild(t.arena(), "child-1")) == null);
+    }
+}
+
+test "a stop or close with nothing waiting refuses nothing" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+
+    _ = try t.runtime.stopChild(t.arena(), "reviewer");
+    try std.testing.expect(t.worker.decision == null);
+    // The close's own result is not what this test reads.
+    _ = try t.runtime.closeChild("child-1", .parent);
+    try std.testing.expect(t.worker.decision == null);
+}
+
+/// Posts a note to the owner as child `child_id`'s own message, and traces one
+/// the sink lost, naming the kind of note and the error (`R3.8`).
+fn postNote(runtime: *Runtime, sink: ReportSink, child_id: []const u8, name: []const u8, text: []const u8, kind: []const u8) void {
+    sink.post(runtime, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = text } }) catch |err|
+        debug_trace.logf("mailbox", "note lost child={s} kind={s} err={s}", .{ child_id, kind, @errorName(err) });
+}
+
+/// The sentence both notes to the owner end with: the person's view is where
+/// the item is continued, so the parent tells them rather than answering.
+const needs_user_tail = "Only the user can continue it from their view, so tell them.";
+
+/// The note that tells a parent its subagent waits for the person, for the
+/// fixed `reason` of the kind. It carries no question, field value or URL.
+pub fn waitingNoteText(alloc: Allocator, reason: []const u8, resend: bool) ![]u8 {
+    if (resend) {
+        return alloc.print("fx: my last request failed and waits for a follow-up ({s}). A message from you sends it again.", .{reason});
+    }
+    return alloc.print("fx: my last request failed and waits for the user ({s}). {s}", .{ reason, needs_user_tail });
+}
+
+/// The note for an item that needs the person without a failed request, such
+/// as an MCP server's question. `reason` names the kind only.
+pub fn needsUserNoteText(alloc: Allocator, reason: []const u8) ![]u8 {
+    return alloc.print("fx: I wait for you ({s}). {s}", .{ reason, needs_user_tail });
+}
+
+test "wait card: the note to main names the reason and nothing else" {
+    const alloc = std.testing.allocator;
+    const notes = [_][]const u8{ "Out of credits", "an MCP server asks for input", "an MCP server asks to sign in" };
+    for (notes) |reason| {
+        const user = try waitingNoteText(alloc, reason, false);
+        defer alloc.free(user);
+        const expected = try alloc.print("fx: my last request failed and waits for the user ({s}). Only the user can continue it from their view, so tell them.", .{reason});
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, user);
+        // The view wording replaced "on my screen": the person may be anywhere.
+        try std.testing.expect(std.mem.find(u8, user, "on my screen") == null);
+        const needs = try needsUserNoteText(alloc, reason);
+        defer alloc.free(needs);
+        const expected_needs = try alloc.print("fx: I wait for you ({s}). Only the user can continue it from their view, so tell them.", .{reason});
+        defer alloc.free(expected_needs);
+        try std.testing.expectEqualStrings(expected_needs, needs);
+        // A fixed reason carries no URL, no field name and no value.
+        for ([_][]const u8{ user, needs }) |note| {
+            for ([_][]const u8{ "http", "://", "=", "{\"", "API key" }) |carried| {
+                try std.testing.expect(std.mem.find(u8, note, carried) == null);
+            }
+        }
+    }
+    const resend = try waitingNoteText(alloc, "Out of credits", true);
+    defer alloc.free(resend);
+    try std.testing.expectEqualStrings("fx: my last request failed and waits for a follow-up (Out of credits). A message from you sends it again.", resend);
 }

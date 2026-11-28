@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import re
+from collections.abc import Sequence
 
 from scripts.pgso import linux
 from scripts.pgso.model import PgsoError
@@ -22,9 +23,10 @@ from scripts.pgso.pipeline import (
     PROFILE_PREPARATION_PASSES,
     ArtifactSpec,
     PipelinePaths,
-    _outline_without_folded_constants,
+    _outline_and_check,
     _require_bitcode_header,
     _require_nonempty_file,
+    _rewrite_outliner_input,
     build_control,
     candidate_object_argv,
     cleanup_outlined_ir_argv,
@@ -36,6 +38,9 @@ from scripts.pgso.toolchain import Toolchain
 
 SELECTOR = "unit_tests"
 TARGETS = (linux.ARM64.TARGET, linux.X86_64.TARGET)
+# One IR outliner run over the whole unit test module needs more memory than
+# a 16 GB Linux runner has. Each of four parts needs under 5 GB.
+OUTLINE_PARTS = 4
 
 # The fx candidate's profile-use passes without the profile, after every
 # function is marked `minsize`.
@@ -84,6 +89,73 @@ def object_argv(toolchain: Toolchain, paths: PipelinePaths) -> tuple[str, ...]:
 
 def link_argv(toolchain: Toolchain, paths: PipelinePaths) -> list[str]:
     return linux.relink_argv(toolchain, paths, paths.profile_use_object, paths.candidate_binary)
+
+
+def split_ir_argv(
+    toolchain: Toolchain,
+    source: pathlib.Path,
+    prefix: pathlib.Path,
+) -> tuple[str, ...]:
+    return (
+        str(toolchain.llvm_split),
+        "-j",
+        str(OUTLINE_PARTS),
+        "-o",
+        str(prefix),
+        str(source),
+    )
+
+
+def link_parts_argv(
+    toolchain: Toolchain,
+    parts: Sequence[pathlib.Path],
+    output: pathlib.Path,
+) -> tuple[str, ...]:
+    return (
+        str(toolchain.llvm_link),
+        *map(str, parts),
+        "-o",
+        str(output),
+    )
+
+
+def outline_in_parts(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+    source: pathlib.Path,
+    output: pathlib.Path,
+    name: str,
+) -> None:
+    widened = _rewrite_outliner_input(toolchain, paths, source, name)
+    prefix = source.with_name(f"{paths.binary_name}.split.")
+    run_checked(
+        split_ir_argv(toolchain, widened, prefix),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / f"split-{name}.json",
+        require_empty_stderr=True,
+    )
+    parts = tuple(
+        source.with_name(f"{paths.binary_name}.split.{index}")
+        for index in range(OUTLINE_PARTS)
+    )
+    outlined_parts = tuple(
+        source.with_name(f"{paths.binary_name}.outlined.{index}.bc")
+        for index in range(OUTLINE_PARTS)
+    )
+    for index, (part, outlined_part) in enumerate(zip(parts, outlined_parts)):
+        _require_nonempty_file(part, f"unit test IR partition {index}")
+        _outline_and_check(toolchain, paths, part, outlined_part, f"{name}-part-{index}")
+    run_checked(
+        link_parts_argv(toolchain, outlined_parts, output),
+        cwd=paths.root,
+        env=os.environ.copy(),
+        timeout_s=300,
+        log_path=paths.logs / f"link-outlined-{name}.json",
+        require_empty_stderr=True,
+    )
+    _require_bitcode_header(output)
 
 
 def parse_test_summary(output: str) -> dict[str, int]:
@@ -149,7 +221,7 @@ def build_transformed(toolchain: Toolchain, paths: PipelinePaths) -> dict[str, o
         require_empty_stderr=True,
     )
     _require_bitcode_header(paths.profile_use_base_bitcode)
-    _outline_without_folded_constants(
+    outline_in_parts(
         toolchain, paths, paths.profile_use_base_bitcode, paths.outlined_bitcode, "unit-tests"
     )
     run_checked(
