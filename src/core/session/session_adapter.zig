@@ -61,6 +61,7 @@ const session_display_metadata = @import("session_display_metadata.zig");
 const session_store = @import("session_store.zig");
 const session_summary_codec = @import("session_summary_codec.zig");
 const v1_conversion = @import("v1_conversion.zig");
+const session_catalog_cache = @import("session_catalog_cache.zig");
 const child_state = @import("../subagent/child_state.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const artifact_digest = @import("artifact_digest.zig");
@@ -97,6 +98,9 @@ fn openHome(home: []const u8) !io_mod.VerifiedDir {
 
 /// Pieces larger than this go to a blob; the line keeps a reference.
 const max_inline_piece_bytes: usize = 256 * 1024;
+/// The most bytes of a child line's data the session keeps; a spawn line
+/// that is longer is refused (`sm.max_child_data_bytes`).
+pub const max_child_data_bytes = sm.max_child_data_bytes;
 /// A workspace capture always fits inline: one held for a turn not on disk
 /// yet could not go to a blob, which needs the turn on disk (D44, D98).
 const max_workspace_capture_bytes = max_inline_piece_bytes;
@@ -452,6 +456,33 @@ pub const Store = struct {
         return history.toOwnedSlice(alloc);
     }
 
+    /// Whether a child's newest turn ends in the yield marker, with nothing
+    /// after it, read without its lock. False for a child with no log.
+    pub fn childTurnYielded(store: *Store, alloc: Allocator, child_id: []const u8) !bool {
+        var scan: YieldScan = .{};
+        var from: sm.From = .end;
+        while (true) {
+            var page = store.manager.read(alloc, child_id, from, .backward, replay_page_lines) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .turn_started => return scan.yielded(),
+                    .item => |piece| {
+                        scan.item(piece.type);
+                        if (scan.done()) return scan.yielded();
+                    },
+                    else => {},
+                }
+            }
+            from = .{ .at = page.next orelse break };
+        }
+        return scan.yielded();
+    }
+
     /// A child's newest preferences, read without its lock. Caller owns.
     pub fn childPreferences(store: *Store, alloc: Allocator, child_id: []const u8) !session_codec.DurableSessionPreferences {
         var from: sm.From = .end;
@@ -616,6 +647,37 @@ pub fn listPage(
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
 ) !session_store.SessionListPage {
+    var v1_roots = try readV1Roots(store, alloc);
+    defer v1_roots.deinit(alloc);
+    return listPageWithV1Roots(store, alloc, &v1_roots, workspace, continuation, limit);
+}
+
+/// v1's roots not converted yet (D59), newest first. One read serves every
+/// page of a listing. Free with `deinit`.
+pub const V1Roots = struct {
+    catalog: session_catalog_cache.ActionableSessionCatalog,
+
+    pub fn deinit(roots: *V1Roots, alloc: Allocator) void {
+        roots.catalog.deinit(alloc);
+    }
+};
+
+/// Reads v1's roots, sorted newest first. Caller owns the result.
+pub fn readV1Roots(store: *Store, alloc: Allocator) !V1Roots {
+    const catalog = try v1_conversion.listRoots(alloc, store.home, null);
+    session_summary_codec.sortSummariesNewestFirst(catalog.summaries.items);
+    return .{ .catalog = catalog };
+}
+
+/// `listPage` on roots read before, so the pages of one listing share one read of v1's folder.
+pub fn listPageWithV1Roots(
+    store: *Store,
+    alloc: Allocator,
+    v1_roots: *const V1Roots,
+    workspace: ?[]const u8,
+    continuation: ?session_store.ResumableSessionContinuation,
+    limit: usize,
+) !session_store.SessionListPage {
     if (limit == 0 or limit > session_store.session_list_max_limit) return error.InvalidSessionListLimit;
     var candidates: std.ArrayList(session_store.SessionSummary) = .empty;
     defer {
@@ -626,11 +688,8 @@ pub fn listPage(
     session_summary_codec.sortSummariesNewestFirst(candidates.items);
     const v2_count = candidates.items.len;
 
-    var v1_roots = try v1_conversion.listRoots(alloc, store.home, null);
-    defer v1_roots.deinit(alloc);
-    session_summary_codec.sortSummariesNewestFirst(v1_roots.summaries.items);
     var added: usize = 0;
-    for (v1_roots.summaries.items) |summary| {
+    for (v1_roots.catalog.summaries.items) |summary| {
         if (workspace) |root| if (!std.mem.eql(u8, summary.workspace_root orelse continue, root)) continue;
         if (continuation) |position| if (!session_summary_codec.summaryFollowsContinuation(summary, position)) continue;
         // After `limit` newer ones, this one and every later one is off the page.
@@ -646,7 +705,7 @@ pub fn listPage(
     // workspace is unknown, and counts them as v1 did; the profile-wide
     // listing shows them instead (D61).
     if (workspace != null and continuation == null) {
-        for (v1_roots.summaries.items) |summary| {
+        for (v1_roots.catalog.summaries.items) |summary| {
             if (summary.workspace_root == null) page.skipped_invalid += 1;
         }
     }
@@ -2006,6 +2065,14 @@ pub const Session = struct {
     /// so a write that supersedes it gives its fresh copy the marker too
     /// (`supersedeOpenTurn`, RULES R1.8).
     open_continued: bool = false,
+    /// The open log turn is a copy written after a supersede, once a
+    /// compaction inside the turn cut steps, so it holds fx's view after the
+    /// cut; every later write of the turn keeps to that view (`TurnView`).
+    open_cut_copy: bool = false,
+    /// How many open turns this session closed as superseded. A write
+    /// compares it before and after its checks to tell that it starts its
+    /// turn afresh.
+    supersedes: u64 = 0,
     /// The v2 turn behind each of fx's history turns, in order; null for a
     /// compacted summary.
     turn_numbers: std.ArrayList(?u64) = .empty,
@@ -2444,7 +2511,25 @@ pub const Session = struct {
     /// Stores the turn's tool results and images as blobs and gives them
     /// handles, as v1 does at commit. A result whose blob the stream already
     /// wrote (`withResultFiles`) keeps it, unwritten a second time.
+    /// A turn with a whole execution, which only the log saves, has it
+    /// prepared too (`types.savedHistoryTurn`).
     pub fn prepareTurn(self: *Session, turn: *types.HistoryTurn) !void {
+        try self.prepareTurnExecution(turn);
+        var saved_turn = types.savedHistoryTurn(turn.*);
+        switch (turn.*) {
+            .assistant => |*entry| if (entry.saved_execution) |*whole| {
+                try self.prepareTurnExecution(&saved_turn);
+                whole.* = saved_turn.assistant.execution;
+            },
+            .interrupted => |*entry| if (entry.saved_execution) |*whole| {
+                try self.prepareTurnExecution(&saved_turn);
+                whole.* = saved_turn.interrupted.execution;
+            },
+            .compacted_summary => {},
+        }
+    }
+
+    fn prepareTurnExecution(self: *Session, turn: *types.HistoryTurn) !void {
         try self.reuseStreamedFiles(turn);
         {
             self.mutex.lockUncancelable(io_mod.getIo());
@@ -2485,7 +2570,8 @@ pub const Session = struct {
     }
 
     /// Appends a finished turn: the pieces not streamed yet, then its end,
-    /// in one durable batch. `turn` must already be prepared. Writes no
+    /// in one durable batch, from its whole execution when it has one
+    /// (`types.savedHistoryTurn`). `turn` must already be prepared. Writes no
     /// workspace capture and leaves the current capture turn as it is, so a
     /// commit of an earlier turn, such as ACP's interrupted one, never takes
     /// the next turn's captures: an open turn that holds another capture
@@ -2528,19 +2614,23 @@ pub const Session = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        var events: std.ArrayList(Event) = .empty;
-        try session_event.appendHistoryTurnConversationEvents(a, &events, turn);
-        if (events.items.len < 2) return error.InvalidConversationFrame;
-        const pieces = events.items[0 .. events.items.len - 1];
-        const end = events.items[events.items.len - 1];
-
+        const whole = savedExecutionOf(turn);
+        const view: TurnView = .{ .cut = whole != null, .copy = self.open_cut_copy, .supersedes = self.supersedes };
         // The end piece joins the others; its line ends the turn.
-        const all = events.items;
-        const encoded = try a.alloc([]u8, all.len);
-        for (all, encoded) |piece, *bytes| bytes.* = try self.encodeEvent(a, piece);
+        const whole_pieces = try self.turnPieces(a, types.savedHistoryTurn(turn));
+        const cut_pieces = if (view.cut) try self.turnPieces(a, turn) else whole_pieces;
+        var all = if (view.keepsCut()) cut_pieces else whole_pieces;
+        const end = all.events[all.events.len - 1];
         if (self.othersOpenTurn(owner)) try self.supersedeOpenTurn("other_turn");
-        const skip = try self.continuedSkip(all);
-        const start = try self.streamedPrefix(encoded[0..pieces.len], .commit, countResults(pieces));
+        var skip = try self.continuedSkip(all.events);
+        const piece_count = all.events.len - 1;
+        var start = try self.streamedPrefix(all.encoded[0..piece_count], .commit, countResults(all.events[0..piece_count]));
+        if (view.copiesCut(self)) {
+            self.traceCutCopy("commit", whole.?, executionOf(turn));
+            all = cut_pieces;
+            skip = try self.continuedSkip(all.events);
+            start = 0;
+        }
 
         var tail: std.ArrayList(sm.Event) = .empty;
         if (owner != 0) {
@@ -2583,7 +2673,7 @@ pub const Session = struct {
         const owned_language = if (language_changed) try self.alloc.dupe(u8, language_tag) else null;
         errdefer if (owned_language) |owned| self.alloc.free(owned);
 
-        const written = try withoutSkipped(a, all, encoded, skip);
+        const written = try withoutSkipped(a, all.events, all.encoded, skip);
         try self.writePieces(a, written.events[start..], written.encoded[start..], tail.items, openingAuthor(turn), owner);
         // An `extends` continuation numbers its turn as its chain's first turn
         // (RULES R1.8). The copy format numbers it as its own log turn.
@@ -2594,6 +2684,7 @@ pub const Session = struct {
         self.turn_open = false;
         self.open_extends = false;
         self.open_continued = false;
+        self.open_cut_copy = false;
         self.turn_token = 0;
         self.clearStreamed();
         if (owned_language) |owned| {
@@ -2736,15 +2827,19 @@ pub const Session = struct {
         execution: types.ExecutionMemory,
         running: Running,
     ) !void {
-        return self.appendProgressWithRecord(user, execution, running, .keep);
+        return self.appendProgressWithRecord(user, execution, null, running, .keep);
     }
 
-    /// `appendProgress`, with the recovery module's record for the send this
-    /// write goes before (`recovery_type`).
+    /// `appendProgress`, with the whole turn as `saved_execution` once a
+    /// compaction inside it cut steps out of `execution`, fx's view (D87),
+    /// and the recovery module's record for the send this write goes before
+    /// (`recovery_type`). The log streams `saved_execution`, except into a
+    /// copy written after a supersede (`TurnView`).
     pub fn appendProgressWithRecord(
         self: *Session,
         user: types.UserTurn,
         execution: types.ExecutionMemory,
+        saved_execution: ?types.ExecutionMemory,
         running: Running,
         record: types.RecoveryRecordWrite,
     ) !void {
@@ -2753,36 +2848,107 @@ pub const Session = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        var events: std.ArrayList(Event) = .empty;
-        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id, .input_id = user.input_id } });
-        // A result's blob needs the turn on disk first (D44).
-        if (storesBodies(execution)) try self.openTurnLocked(self.capture_turn);
-        // On a missing handle the list keeps the pieces before it.
-        session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, execution)) catch |err| switch (err) {
-            error.ConversationArtifactRequired => {},
-            else => return err,
-        };
-        const encoded = try a.alloc([]u8, events.items.len);
-        for (events.items, encoded) |event, *bytes| bytes.* = try self.encodeEvent(a, event);
-        const skip = try self.continuedSkip(events.items);
-        const start = try self.streamedPrefix(encoded, .stream, countResults(events.items));
+        const whole = saved_execution orelse execution;
+        const view: TurnView = .{ .cut = saved_execution != null, .copy = self.open_cut_copy, .supersedes = self.supersedes };
+        // A result's blob needs the turn on disk first (D44). Both views
+        // get their files now, while the turn is open: a cut view's results
+        // are the whole turn's, so the second pass writes none.
+        if (storesBodies(whole)) try self.openTurnLocked(self.capture_turn);
+        const whole_pieces = try self.progressPieces(a, user, whole);
+        const cut_pieces = if (view.cut) try self.progressPieces(a, user, execution) else whole_pieces;
+        var pieces = if (view.keepsCut()) cut_pieces else whole_pieces;
+        var skip = try self.continuedSkip(pieces.events);
+        var start = try self.streamedPrefix(pieces.encoded, .stream, countResults(pieces.events));
+        const copies_cut = view.copiesCut(self);
+        if (copies_cut) {
+            self.traceCutCopy("stream", whole, execution);
+            pieces = cut_pieces;
+            skip = try self.continuedSkip(pieces.events);
+            start = 0;
+        }
         // The record goes out in the same write as the pieces before its
         // send, so a turn's first write already carries it
         // (`tests/tla/recovery/Resume.tla` CrashLoopAsks).
         var tail: std.ArrayList(sm.Event) = .empty;
         if (try self.recoveryItem(a, record)) |piece| try tail.append(a, .{ .item = piece });
-        if (!self.turn_open or start < encoded.len) {
+        if (!self.turn_open or start < pieces.encoded.len) {
             // A skip happens only before the first write, so `start` is 0 then.
-            const written = try withoutSkipped(a, events.items, encoded, skip);
+            const written = try withoutSkipped(a, pieces.events, pieces.encoded, skip);
             try self.writePieces(a, written.events[start..], written.encoded[start..], tail.items, user.author, self.capture_turn);
             self.clearContinuedBase();
             // The skipped pieces are streamed too, so a later rebuild still matches the log.
-            try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
-            for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
+            try self.streamed.ensureUnusedCapacity(self.alloc, pieces.encoded.len - start);
+            for (pieces.encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
         } else if (tail.items.len > 0) {
             _ = try self.write(tail.items);
         }
+        if (copies_cut) self.open_cut_copy = true;
         try self.saveRunning(a, running);
+    }
+
+    /// A turn's pieces as the log writes them, and their bytes.
+    const EncodedPieces = struct { events: []Event, encoded: [][]u8 };
+
+    /// The turn so far as pieces: `user`, then `execution`'s, each result
+    /// with the side file the commit would give it (`withResultFiles`).
+    fn progressPieces(self: *Session, a: Allocator, user: types.UserTurn, execution: types.ExecutionMemory) !EncodedPieces {
+        var events: std.ArrayList(Event) = .empty;
+        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id, .input_id = user.input_id } });
+        // On a missing handle the list keeps the pieces before it.
+        session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, execution)) catch |err| switch (err) {
+            error.ConversationArtifactRequired => {},
+            else => return err,
+        };
+        return self.encodePieces(a, events.items);
+    }
+
+    /// A finished turn's pieces, its end last, as a commit writes them.
+    fn turnPieces(self: *Session, a: Allocator, turn: types.HistoryTurn) !EncodedPieces {
+        var events: std.ArrayList(Event) = .empty;
+        try session_event.appendHistoryTurnConversationEvents(a, &events, turn);
+        if (events.items.len < 2) return error.InvalidConversationFrame;
+        return self.encodePieces(a, events.items);
+    }
+
+    fn encodePieces(self: *Session, a: Allocator, events: []Event) !EncodedPieces {
+        const encoded = try a.alloc([]u8, events.len);
+        for (events, encoded) |event, *bytes| bytes.* = try self.encodeEvent(a, event);
+        return .{ .events = events, .encoded = encoded };
+    }
+
+    /// Which view of a turn a write puts in the log. The log saves the
+    /// whole turn, and resume leaves out what a compaction inside it cut
+    /// (D87). It finds that turn by its number, and a copy written after a
+    /// supersede has a new one, so resume cannot trim the copy: a copy of a
+    /// turn with a cut holds fx's view after the cut, and every later write
+    /// of the turn keeps to it. The model never gets the summarized steps
+    /// back; the transcript loses them, which `traceCutCopy` logs.
+    const TurnView = struct {
+        /// A compaction inside the turn cut steps, so the views differ.
+        cut: bool,
+        /// The open turn is such a copy already (`open_cut_copy`).
+        copy: bool,
+        /// `Session.supersedes` before the write's checks.
+        supersedes: u64,
+
+        fn keepsCut(self: TurnView) bool {
+            return self.cut and self.copy;
+        }
+
+        /// Whether the write's checks just closed the open turn, so the write
+        /// starts a copy that must hold the cut view.
+        fn copiesCut(self: TurnView, session: *const Session) bool {
+            return self.cut and session.supersedes != self.supersedes;
+        }
+    };
+
+    fn traceCutCopy(self: *Session, phase: []const u8, whole: types.ExecutionMemory, kept: types.ExecutionMemory) void {
+        debug_trace.logf("session", "event=sessions_v2_cut_copy session={s} phase={s} path=superseded_after_cut kept=view_after_cut dropped=summarized_steps tool_steps={d} steering={d}", .{
+            self.id(),
+            phase,
+            whole.tool_steps.len -| kept.tool_steps.len,
+            whole.steering.len -| kept.steering.len,
+        });
     }
 
     /// Saves or clears the record in the open turn. A turn not written yet
@@ -3425,7 +3591,7 @@ pub const Session = struct {
         var found: InterruptedRequest = .{ .record = null, .saved_ms = 0 };
         var record_seen = false;
         var has_prompt = false;
-        var newest_item = true;
+        var yield_scan: YieldScan = .{};
         var from: sm.From = .end;
         scan: while (true) {
             var page = try self.source().readTo(self.alloc, from, .backward, replay_page_lines);
@@ -3435,12 +3601,7 @@ pub const Session = struct {
                 switch (body) {
                     .turn_started => |started| if (started.turn == ended.turn) break :scan,
                     .item => |piece| {
-                        // A request's recovery status says nothing of how the
-                        // turn ended, so a yield marker before one still counts.
-                        if (newest_item and !std.mem.eql(u8, piece.type, model_recovery_type)) {
-                            newest_item = false;
-                            found.yielded = std.mem.eql(u8, piece.type, yielded_type);
-                        }
+                        yield_scan.item(piece.type);
                         if (found.saved_ms == 0) found.saved_ms = entry.ts_ms;
                         if (std.mem.eql(u8, piece.type, itemType(.turn_completed).?)) return null;
                         if (std.mem.eql(u8, piece.type, itemType(.user).?)) has_prompt = true;
@@ -3454,6 +3615,7 @@ pub const Session = struct {
             }
             from = .{ .at = page.next orelse break };
         }
+        found.yielded = yield_scan.yielded();
         return if (has_prompt) found else null;
     }
 
@@ -3504,17 +3666,21 @@ pub const Session = struct {
         return false;
     }
 
-    /// A copy of `execution` in which each tool result without a result file
-    /// has the one the commit gives it (`session_log.externalizeConversationTurnResults`):
-    /// the same handle, size and preview, so its streamed piece is the
-    /// committed one. A result backed only by its command replay has no file
-    /// before then. Each file is written once a turn.
+    /// A copy of `execution` in which each tool result has what the commit
+    /// gives it (`session_log.externalizeConversationTurnResults`): the same
+    /// preview, and, without a result file, the same handle and size, so its
+    /// streamed piece is the committed one. A result backed only by its
+    /// command replay has no file before then. Each file is written once a
+    /// turn.
     fn withResultFiles(self: *Session, a: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
         var copy = execution;
         copy.tool_steps = try a.dupe(types.ToolExecutionStep, execution.tool_steps);
         for (copy.tool_steps) |*step| {
             step.tool_results = try a.dupe(types.PersistedToolResult, step.tool_results);
             for (step.tool_results) |*result| {
+                // A result its tool already stored, such as a clipped
+                // read_tool_result page, still gets the commit's preview.
+                if (result.preview == null) result.preview = try result_store.previewText(a, result.output, result_store.preview_bytes);
                 if (result.output_handle != null) continue;
                 const handle = self.stored_results.get(result.tool_call_id) orelse blk: {
                     const stored = try result_store.storeLargeResultManaged(self.alloc, try self.capabilityLocked(), result.tool_call_id, result.tool_name, result.output);
@@ -3527,7 +3693,6 @@ pub const Session = struct {
                 // Copied: a superseded turn frees the cache before its pieces are written.
                 result.output_handle = try a.dupe(u8, handle);
                 result.stored_output_bytes = result.output.len;
-                if (result.preview == null) result.preview = try result_store.previewText(a, result.output, result_store.preview_bytes);
             }
         }
         return copy;
@@ -3603,6 +3768,7 @@ pub const Session = struct {
         // The marker was written with this turn when it continues a yielded one.
         self.open_extends = self.continues_yielded and self.continued_extends;
         self.open_continued = self.continues_yielded;
+        self.open_cut_copy = false;
         self.continues_yielded = false;
         if (opener != 0) self.markStartsWritten(opener);
     }
@@ -3738,6 +3904,7 @@ pub const Session = struct {
         self.turn_open = false;
         self.open_extends = false;
         self.open_continued = false;
+        self.open_cut_copy = false;
         self.turn_token = 0;
     }
 
@@ -3781,10 +3948,12 @@ pub const Session = struct {
             .{ .item = .{ .type = superseded_type, .data = "{}" } },
             .{ .turn_interrupted = .failed },
         });
+        self.supersedes += 1;
         self.turn_open = false;
         self.turn_stale = false;
         self.open_extends = false;
         self.open_continued = false;
+        self.open_cut_copy = false;
         self.turn_token = 0;
         self.clearStreamed();
         for (self.captures.items) |*capture| capture.written = false;
@@ -6139,10 +6308,10 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
     var sink: RestoreSink = .{ .alloc = alloc, .history = &history, .numbers = numbers };
     try replay(src, alloc, sa, from, skip_offset, ReplaySink.init(&sink));
     if (numbers) |n| n.trim.* = .{};
-    // The cut covers steps of the turn the compaction names. When fx wrote
-    // that turn again afresh, superseding it, the copy holds only fx's view
-    // after the cut, and trimming it would drop steps the compaction never
-    // covered.
+    // The cut covers steps of the turn the compaction names. A turn
+    // superseded after the cut and written again afresh, as fx wrote one
+    // before it saved such turns whole, holds only fx's view after the cut,
+    // and trimming it would drop steps the compaction never covered.
     const cut_turn_kept = sink.first_turn == null or sink.first_turn.? == keep_from_turn;
     if ((covered.tool_steps != 0 or covered.steering != 0) and !cut_turn_kept) {
         debug_trace.logf("session", "event=sessions_v2_compaction_cut_superseded session={s} cut_turn={?d} first_kept_turn={?d} tool_steps={d} steering={d}", .{ src.id, keep_from_turn, sink.first_turn, covered.tool_steps, covered.steering });
@@ -6458,6 +6627,13 @@ fn mergeContinued(alloc: Allocator, earlier: types.HistoryTurn, later: types.His
     if (tail.runtime_context) |texts| {
         if (runtime_context == null) runtime_context = texts else types.freeRuntimeContext(alloc, texts);
     }
+    // So does the toolbox menu of the turn that kept it, and the newer note
+    // wins (D103).
+    var toolbox_menu = head.execution.toolbox_menu;
+    if (tail.toolbox_menu) |menu| {
+        if (toolbox_menu == null) toolbox_menu = menu else alloc.free(menu.text);
+    }
+    const toolbox_noted = tail.toolbox_noted orelse head.execution.toolbox_noted;
     const turn_summary = tail.turn_summary orelse head.execution.turn_summary;
     const execution: types.ExecutionMemory = .{
         .tool_steps = tool_steps,
@@ -6465,12 +6641,25 @@ fn mergeContinued(alloc: Allocator, earlier: types.HistoryTurn, later: types.His
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        .toolbox_menu = toolbox_menu,
+        .toolbox_noted = toolbox_noted,
         .turn_summary = turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,
     };
 
-    const user = head.user;
+    var user = head.user;
+    const later_user: *types.UserTurn = switch (second) {
+        .assistant => |*value| &value.user,
+        .interrupted => |*value| &value.user,
+        .compacted_summary => unreachable,
+    };
+    // A continued child work carries a new work id that replaces the yielded one.
+    if (later_user.work_id) |work_id| {
+        if (user.work_id) |old| alloc.free(old);
+        user.work_id = work_id;
+        later_user.work_id = null;
+    }
     if (head.assistant) |text| alloc.free(text);
     if (head.tool_call) |call| types.freeToolCall(alloc, call);
     types.freeCompletedToolNames(alloc, head.completed_tool_names);
@@ -6692,6 +6881,8 @@ noinline fn replay(
                         .steering => |value| try builder.appendSteering(value.text),
                         .context_note => |value| try builder.appendContextNote(value.text, value.sources),
                         .runtime_context => |value| try builder.setRuntimeContext(value.messages),
+                        .toolbox_menu => |value| try builder.setToolboxMenu(value.text, value.entries_hash),
+                        .toolbox_noted => |value| try builder.setToolboxNoted(value),
                         .turn_completed => |value| {
                             const finished = try presentStoredResults(src, alloc, try builder.finishAssistant(value));
                             // Numbered as its chain's first turn when it continues one (RULES R1.8).
@@ -7062,6 +7253,26 @@ const yielded_type = "turn_yielded";
 const continued_type = "turn_continued";
 const continued_extends_data = "{\"extends\":true}";
 
+/// Whether a turn ends in the yield marker. Feed its log entries newest
+/// first: the newest item decides, except a model-recovery status, which says
+/// nothing of how the turn ended. A turn with no such item did not yield.
+const YieldScan = struct {
+    verdict: ?bool = null,
+
+    fn item(self: *YieldScan, item_type: []const u8) void {
+        if (self.verdict != null or std.mem.eql(u8, item_type, model_recovery_type)) return;
+        self.verdict = std.mem.eql(u8, item_type, yielded_type);
+    }
+
+    fn done(self: YieldScan) bool {
+        return self.verdict != null;
+    }
+
+    fn yielded(self: YieldScan) bool {
+        return self.verdict orelse false;
+    }
+};
+
 /// `execution` without its display-only records: the model and bridge calls, which a continuation's rebuild never carries and the yielded turn keeps in its own log turn.
 fn withoutDisplayRecords(execution: types.ExecutionMemory) types.ExecutionMemory {
     var copy = execution;
@@ -7167,6 +7378,26 @@ fn openingAuthor(turn: types.HistoryTurn) types.MessageAuthor {
         .assistant => |entry| entry.user.author,
         .interrupted => |entry| entry.user.author,
         .compacted_summary => .user,
+    };
+}
+
+/// fx's view of `turn`: after a compaction inside it, only the part after
+/// the cut.
+fn executionOf(turn: types.HistoryTurn) types.ExecutionMemory {
+    return switch (turn) {
+        .assistant => |entry| entry.execution,
+        .interrupted => |entry| entry.execution,
+        .compacted_summary => .{},
+    };
+}
+
+/// The whole turn the log saves, when a compaction inside `turn` cut
+/// steps out of fx's view (`types.savedHistoryTurn`); null otherwise.
+fn savedExecutionOf(turn: types.HistoryTurn) ?types.ExecutionMemory {
+    return switch (turn) {
+        .assistant => |entry| entry.saved_execution,
+        .interrupted => |entry| entry.saved_execution,
+        .compacted_summary => null,
     };
 }
 
@@ -7570,9 +7801,12 @@ fn itemType(kind: PieceKind) ?[]const u8 {
         .turn_completed => "turn_end",
         .interrupted => "interruption",
         .context_checkpoint => null,
-        // An older fx leaves out an item type it does not know (D17, D93, D94).
+        // An older fx leaves out an item type it does not know (D17, D93, D94,
+        // D103).
         .context_note => "context_note",
         .runtime_context => "runtime_context",
+        .toolbox_menu => "toolbox_menu",
+        .toolbox_noted => "toolbox_noted",
         .model_call => "model_call",
     };
 }
@@ -8534,7 +8768,7 @@ test "a send's record rides with the turn's first write, and a reopen finds the 
     const user: types.UserTurn = .{ .text = @constCast("go") };
     // Nothing is written until the turn's first pieces are.
     try testing.expect(!try s.saveRecovery(.{ .save = @splat(0x11) }));
-    try s.appendProgressWithRecord(user, .{}, .{}, .{ .save = @splat(0x22) });
+    try s.appendProgressWithRecord(user, .{}, null, .{}, .{ .save = @splat(0x22) });
     try testing.expect(try s.saveRecovery(.{ .save = @splat(0x33) }));
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
@@ -8587,7 +8821,7 @@ test "a cleared record leaves the turn resumable without one" {
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
     const user: types.UserTurn = .{ .text = @constCast("run it") };
-    try s.appendProgressWithRecord(user, .{}, .{}, .{ .save = @splat(0x44) });
+    try s.appendProgressWithRecord(user, .{}, null, .{}, .{ .save = @splat(0x44) });
     // The response arrived: its tool call runs with no request in flight.
     try testing.expect(try s.saveRecovery(.clear));
     const call: types.ToolCall = .{ .id = "call_1", .name = "bash", .arguments_json = "{}" };
@@ -8640,7 +8874,7 @@ test "a yielded turn is found as yielded, and a later piece clears it" {
     const user: types.UserTurn = .{ .text = @constCast("work") };
     // Nothing is open yet, so nothing is marked.
     try testing.expect(!try s.markYielded());
-    try s.appendProgressWithRecord(user, .{}, .{}, .{ .save = @splat(0x55) });
+    try s.appendProgressWithRecord(user, .{}, null, .{}, .{ .save = @splat(0x55) });
     try testing.expect(try s.saveRecovery(.{ .save = @splat(0x66) }));
     try testing.expect(try s.markYielded());
     const id = try testing.allocator.dupe(u8, s.id());
@@ -8664,6 +8898,94 @@ test "a yielded turn is found as yielded, and a later piece clears it" {
     const r2 = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id2 }, "/w", .app);
     defer r2.close();
     try testing.expect(!(try r2.interruptedRequest()).?.yielded);
+}
+
+/// Closes `s` and returns its id, which the caller frees.
+fn closeForId(s: *Session) ![]u8 {
+    const id = try testing.allocator.dupe(u8, s.id());
+    s.close();
+    return id;
+}
+
+test "a child whose newest turn ends in the yield marker reads as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try testing.expect(try s.markYielded());
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+    try testing.expect(try t.store.childTurnYielded(testing.allocator, id));
+}
+
+test "a child's yield marker followed by a model recovery status still reads as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try testing.expect(try s.markYielded());
+    try s.saveModelRecovery(.{ .kind = .recovered, .attempt = 2, .failure = .rate_limited });
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+    try testing.expect(try t.store.childTurnYielded(testing.allocator, id));
+}
+
+test "a child's yield marker followed by a tool call does not read as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    try s.appendProgress(user, .{}, .{});
+    try testing.expect(try s.markYielded());
+    const call: types.ToolCall = .{ .id = "call_1", .name = "bash", .arguments_json = "{}" };
+    try s.appendProgress(user, .{}, .{ .calls = &.{call} });
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+    try testing.expect(!try t.store.childTurnYielded(testing.allocator, id));
+}
+
+test "a child's yield marker followed by a turn end does not read as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    try s.appendProgress(user, .{}, .{});
+    try testing.expect(try s.markYielded());
+    try s.commitTurn(assistantTurn("work", "done"), types.ConversationLanguage.default());
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+    try testing.expect(!try t.store.childTurnYielded(testing.allocator, id));
+}
+
+test "a child's turn that began after a yielded one does not read as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    try s.appendProgress(user, .{}, .{});
+    try testing.expect(try s.markYielded());
+    try s.commitTurn(assistantTurn("work", "done"), types.ConversationLanguage.default());
+    try s.appendProgress(.{ .text = @constCast("next") }, .{}, .{});
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+    try testing.expect(!try t.store.childTurnYielded(testing.allocator, id));
+}
+
+test "a child with no log does not read as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    try testing.expect(!try t.store.childTurnYielded(testing.allocator, "1786460757753-none"));
 }
 
 test "a continuing turn starts with its marker, once" {
@@ -9139,6 +9461,38 @@ fn restoredJson(t: *TestHome, a: Allocator, id: []const u8) ![]u8 {
     return historyJson(a, restored.history);
 }
 
+test "a continued turn keeps the continuation work id when merged with its yielded turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const old_user: types.UserTurn = .{ .text = @constCast("work"), .work_id = @constCast("work-old") };
+    try s.appendProgress(old_user, .{ .tool_steps = try stepsUpTo(a, 1) }, .{});
+    try testing.expect(try s.markYielded());
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+
+    const c = try resumeContinuing(&t, id);
+    defer c.close();
+    const new_user: types.UserTurn = .{ .text = @constCast("work"), .work_id = @constCast("work-new") };
+    try c.commitTurn(.{ .assistant = .{
+        .user = new_user,
+        .assistant = @constCast("SOLO_DONE"),
+        .execution = .{ .tool_steps = try stepsUpTo(a, 2) },
+    } }, types.ConversationLanguage.default());
+    try expectExtendsMarker(&t, id);
+
+    const history = try t.store.childHistory(testing.allocator, id);
+    defer types.freeHistoryTurnSlice(testing.allocator, history);
+    try testing.expectEqual(@as(usize, 1), history.len);
+    try testing.expectEqualStrings("work-new", history[0].assistant.user.work_id.?);
+    try testing.expectEqualStrings("SOLO_DONE", history[0].assistant.assistant);
+}
+
 /// Asserts that the newest continuation in session `id` is in the `extends` format.
 fn expectExtendsMarker(t: *TestHome, id: []const u8) !void {
     const marker = try lastItemData(t.store.manager, id, continued_type);
@@ -9457,6 +9811,84 @@ test "a continuation superseded after a compaction commits its fresh copy" {
     const reference_id = try writeSupersededReference(&t, a, user);
     defer testing.allocator.free(reference_id);
     try testing.expectEqualStrings(try restoredJson(&t, a, reference_id), try restoredJson(&t, a, id));
+}
+
+/// Turn 2 streams step 1, then a compaction cuts it out of fx's view. The
+/// whole turn fx gives next no longer matches the stream, as after a bug:
+/// step 1's call has other arguments. With `at_stream`, the next stream
+/// shows the mismatch while fx's view is still empty, and one more stream
+/// adds step 2; otherwise the commit shows it. The turn ends with steps 1
+/// to 3 whole and 2 and 3 in fx's view. Returns its session id, owned by
+/// the caller.
+fn writeCutCopy(t: *TestHome, a: Allocator, user: types.UserTurn, at_stream: bool) ![]u8 {
+    var model = "m".*;
+    var summary = "summary".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    errdefer s.close();
+    try commitPlainTurn(s, "first");
+    const steps = try stepsUpTo(a, 3);
+    try s.appendProgress(user, .{ .tool_steps = steps[0..1] }, .{});
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, true, .{ .turns = 1, .tool_steps = 1 });
+    const drifted = try a.dupe(types.ToolExecutionStep, steps);
+    drifted[0].tool_calls = try a.dupe(types.ToolCall, &.{.{ .id = steps[0].tool_calls[0].id, .name = "read_file", .arguments_json = "{\"path\":\"other\"}" }});
+    if (at_stream) {
+        try s.appendProgressWithRecord(user, .{}, .{ .tool_steps = drifted[0..1] }, .{}, .keep);
+        try s.appendProgressWithRecord(user, .{ .tool_steps = steps[1..2] }, .{ .tool_steps = drifted[0..2] }, .{}, .keep);
+    }
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = steps[1..3] },
+        .saved_execution = .{ .tool_steps = drifted },
+    } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    s.close();
+    return id;
+}
+
+test "a turn whose commit no longer matches its stream after a cut saves fx's view in its fresh copy" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    const id = try writeCutCopy(&t, a, user, false);
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, superseded_type));
+
+    // The copy has a new number, so resume cannot trim it; it holds only
+    // what fx kept after the cut, as a copy main wrote does.
+    const reference_id = try writeSupersededReference(&t, a, user);
+    defer testing.allocator.free(reference_id);
+    const got = try restoredKept(&t, a, id);
+    const want = try restoredKept(&t, a, reference_id);
+    try testing.expectEqual(@as(usize, 2), got.turns);
+    try testing.expectEqualStrings(want.steps, got.steps);
+}
+
+test "a turn whose stream no longer matches after a cut keeps fx's view in its fresh copy to the commit" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    // The cut takes the one streamed step, so the copy starts with the user
+    // piece only, a prefix of the whole turn too; the later writes still
+    // keep to the view, and the commit supersedes nothing more.
+    const id = try writeCutCopy(&t, a, user, true);
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, superseded_type));
+
+    const reference_id = try writeSupersededReference(&t, a, user);
+    defer testing.allocator.free(reference_id);
+    const got = try restoredKept(&t, a, id);
+    const want = try restoredKept(&t, a, reference_id);
+    try testing.expectEqual(@as(usize, 2), got.turns);
+    try testing.expectEqualStrings(want.steps, got.steps);
 }
 
 fn expectLines(expected: []const []const u8, actual: []const []const u8) !void {
@@ -10531,7 +10963,7 @@ test "workspace capture: a recovery record is not saved into a failed turn left 
     try leaveStaleTurn(s, &failing);
     // The host takes the record with the fresh turn's first write instead.
     try testing.expect(!try s.saveRecovery(.{ .save = @splat(7) }));
-    try s.appendProgressWithRecord(.{ .text = @constCast("two") }, .{}, .{}, .{ .save = @splat(7) });
+    try s.appendProgressWithRecord(.{ .text = @constCast("two") }, .{}, null, .{}, .{ .save = @splat(7) });
     try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), superseded_type));
     try testing.expect(s.turn_open and !s.turn_stale);
 }
@@ -11696,6 +12128,34 @@ test "a turn whose result keeps its stamp commits as streamed, with that stamp" 
     try testing.expectEqual(@as(i64, 100), try restoredStamp(&t, id));
 }
 
+test "a result its tool already stored streams with the preview its commit gives it, so the commit supersedes nothing" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("read the saved page") };
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "read_tool_result", .arguments_json = "{}" }};
+    // A clipped page read_tool_result stored itself: a handle and no
+    // preview, and too long for its piece to show it whole instead.
+    const page: [session_event.max_conversation_preview_bytes + 1]u8 = @splat('p');
+    var results = [_]types.PersistedToolResult{readResult("call-1", &page, 100)};
+    results[0].tool_name = @constCast("read_tool_result");
+    results[0].output_handle = @constCast("result-page.txt");
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    try s.appendProgress(user, execution, .{});
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
+    try s.prepareTurn(&turn);
+    defer if (results[0].preview) |preview| testing.allocator.free(preview);
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, id, superseded_type));
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, "tool_result"));
+}
+
 test "a result rebuilt with other content supersedes its stream and is written as rebuilt" {
     var t: TestHome = undefined;
     try t.init();
@@ -11918,6 +12378,69 @@ test "a compaction inside a turn leaves the steps it covers out of that turn on 
     try testing.expectEqual(@as(usize, 0), kept.execution.steering.len);
 }
 
+test "a turn an older fx wrote again after a compaction inside it resumes as that fx left it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var calls = [_]types.ToolCall{
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "call-2", .name = "shell", .arguments_json = "{}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("call-1"), .tool_name = @constCast("shell"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .output_handle = @constCast("result-shell-1.txt"), .stored_output_bytes = 2 },
+        .{ .tool_call_id = @constCast("call-2"), .tool_name = @constCast("shell"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .output_handle = @constCast("result-shell-2.txt"), .stored_output_bytes = 2 },
+    };
+    var steps = [_]types.ToolExecutionStep{
+        .{ .tool_calls = calls[0..1], .tool_results = results[0..1] },
+        .{ .tool_calls = calls[1..2], .tool_results = results[1..2] },
+    };
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    // That fx streamed the turn's first step, compacted it, then saved only
+    // the step after the cut, so the turn was superseded and written afresh.
+    try s.appendProgress(user, .{ .tool_steps = steps[0..1] }, .{});
+    var summary = "the first step".*;
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 0, .compaction_count = 1 }, true, .{ .tool_steps = 1 });
+    try s.appendProgress(user, .{ .tool_steps = steps[1..2] }, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = steps[1..2] } } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, superseded_type));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    // The model gets the turn from the cut, not cut a second time.
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("the first step", restored.history[0].compacted_summary.summary);
+    const kept = restored.history[1].assistant;
+    try testing.expectEqual(@as(usize, 1), kept.execution.tool_steps.len);
+    try testing.expectEqualStrings("call-2", kept.execution.tool_steps[0].tool_calls[0].id);
+    // The transcript shows the turn as written afresh.
+    const Steps = struct {
+        turns: usize = 0,
+        first_call: ?[]u8 = null,
+        steps: usize = 0,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            self.turns += 1;
+            const execution = turn.assistant.execution;
+            self.steps = execution.tool_steps.len;
+            if (self.first_call) |old| testing.allocator.free(old);
+            self.first_call = try testing.allocator.dupe(u8, execution.tool_steps[0].tool_calls[0].id);
+        }
+    };
+    var shown: Steps = .{};
+    defer if (shown.first_call) |value| testing.allocator.free(value);
+    try r.visitHistory(testing.allocator, &shown);
+    try testing.expectEqual(@as(usize, 1), shown.turns);
+    try testing.expectEqual(@as(usize, 1), shown.steps);
+    try testing.expectEqualStrings("call-2", shown.first_call.?);
+}
+
 /// Two shell steps whose results name their stored bodies.
 const NoteTestSteps = struct {
     calls: [3]types.ToolCall = .{
@@ -12051,6 +12574,81 @@ test "a turn's runtime context comes back on resume, saved once right after its 
     for (captured, execution.runtime_context.?) |want, got| try testing.expectEqualStrings(want, got);
     // A later turn that used the saved copy saves none.
     try testing.expect(restored.history[1].assistant.execution.runtime_context == null);
+}
+
+test "a turn's toolbox menu and noted hash come back on resume and in a fork, saved right after its user message (D103)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var captured = [_][]u8{@constCast("Runtime context: permission mode is ask.")};
+    const menu: types.SavedToolboxMenu = .{ .text = @constCast("TOOLBOX_MENU_BYTES"), .entries_hash = std.math.maxInt(u64) };
+    const noted: types.ToolboxNoted = .{ .entries_hash = 9, .compaction_count = 1 };
+    const lang = types.ConversationLanguage.default();
+    const user: types.UserTurn = .{ .text = @constCast("first turn") };
+    // The menu is kept before the first step, and every save of the turn
+    // carries it, so the streamed pieces stay a prefix of the committed turn.
+    try s.appendProgress(user, .{ .toolbox_menu = menu }, .{});
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..1], .runtime_context = &captured, .toolbox_menu = menu }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .runtime_context = &captured, .toolbox_menu = menu },
+    } }, lang);
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("noted turn") },
+        .assistant = @constCast("noted"),
+        .execution = .{ .toolbox_noted = noted },
+    } }, lang);
+    try s.commitTurn(assistantTurn("plain", "turn"), lang);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "TOOLBOX_MENU_BYTES"));
+    const user_at = std.mem.find(u8, bytes, "first turn").?;
+    const menu_at = std.mem.find(u8, bytes, "\"type\":\"toolbox_menu\"").?;
+    const runtime_at = std.mem.find(u8, bytes, "\"type\":\"runtime_context\"").?;
+    try testing.expect(user_at < menu_at and menu_at < runtime_at);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes[user_at..menu_at], "\n"));
+    try testing.expect(std.mem.find(u8, bytes, "\"type\":\"toolbox_noted\",\"data\":{\"entries_hash\":9,\"compaction_count\":1}") != null);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    {
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 3), restored.history.len);
+        const first = restored.history[0].assistant.execution;
+        try testing.expectEqual(@as(usize, 2), first.tool_steps.len);
+        try testing.expectEqualStrings(menu.text, first.toolbox_menu.?.text);
+        try testing.expectEqual(menu.entries_hash, first.toolbox_menu.?.entries_hash);
+        try testing.expect(first.toolbox_noted == null);
+        try testing.expect(restored.history[1].assistant.execution.toolbox_menu == null);
+        try testing.expectEqual(@as(?types.ToolboxNoted, noted), restored.history[1].assistant.execution.toolbox_noted);
+        try testing.expect(restored.history[2].assistant.execution.toolbox_menu == null);
+        try testing.expect(restored.history[2].assistant.execution.toolbox_noted == null);
+    }
+
+    // A fork copies the turns before its point with their items.
+    const points = try r.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, points);
+    const copy = try r.fork(testing.allocator, .{ .before_turn = points[2].turn, .workspace = "/w", .host = .app });
+    defer copy.close();
+    var forked = try copy.restore(testing.allocator);
+    defer forked.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), forked.history.len);
+    try testing.expectEqualStrings(menu.text, forked.history[0].assistant.execution.toolbox_menu.?.text);
+    try testing.expectEqual(@as(?types.ToolboxNoted, noted), forked.history[1].assistant.execution.toolbox_noted);
 }
 
 test "a turn's model call records come back on resume at their steps, each saved once" {

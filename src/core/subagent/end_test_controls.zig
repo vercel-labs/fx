@@ -7,8 +7,8 @@
 //! work still counts as running, so a test can send a message in that gap
 //! every time (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a message right
 //! after a stop starts the subagent's next turn";
-//! `tests/tla/drivers/subagent/stop-message.test.ts`). Only those tests set
-//! the controls, so the libfx artifacts leave them out.
+//! `tests/tla/drivers/subagent/stop-message.test.ts`). Only tests set the
+//! controls, so the libfx artifacts leave them out.
 //!
 //! Every hold reads two paths from the environment and uses them only when
 //! both are absolute (`holdFiles`): the file calls take no other kind, and a
@@ -32,12 +32,15 @@
 //! A fourth hold sits in the host, after it has finished a turn that ended
 //! before its work opened, with the lock released, and before it settles the
 //! child again (`holdInSettle`). Test builds only: no file control sets it.
+//!
+//! A note, not a hold, reaches a test from the host's `wait` once it has found
+//! that something can still arrive and is about to block (`noteWaitBlocking`).
+//! Test builds only: no file control sets it.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
-
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const hold_marker = @import("../shared/hold_marker.zig");
 
 /// The longest any hold waits for its release file. Every seam in this folder
 /// reads it from here.
@@ -148,6 +151,20 @@ pub fn holdBeforeCloseSettle(child_id: []const u8) void {
     }
 }
 
+/// Test builds only: an inline test sets it to learn when a `wait` has found
+/// that something can still arrive and is about to block. No file control
+/// sets it.
+pub var test_wait_blocking: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
+
+/// Called by the host when a `wait` has found that something can still
+/// arrive, right before it blocks.
+pub fn noteWaitBlocking() void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_wait_blocking) |note| note();
+    }
+}
+
 /// Test builds only: an inline test sets it to hold the host after it has
 /// finished a turn that ended before its work opened, with the lock released
 /// and before it settles the child again, so a close or a turn can land in
@@ -198,23 +215,11 @@ fn holdOnFiles(counter: *std.atomic.Value(u32), files: HoldFiles, comptime fmt: 
     const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ files.release, n }) catch return;
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, fmt, args) catch return;
-    writeMarker(marker, contents) catch return;
+    hold_marker.write(marker, contents) catch return;
     const deadline = io_mod.milliTimestamp() + max_hold_ms;
     while (!pathExists(files.release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);
     }
-}
-
-/// Writes a hold's marker file with owner-only permissions and syncs it. Every
-/// seam in this folder writes its marker here.
-pub fn writeMarker(path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
-        .truncate = true,
-        .permissions = private_file_permissions,
-    });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), contents);
-    try file.sync(io_mod.getIo());
 }
 
 /// Whether a hold's release file exists. Every seam in this folder checks it
@@ -266,4 +271,22 @@ test "a test build holds the end of a user's turn before it settles a close only
     // Without a hook the host's call returns at once.
     try std.testing.expect(test_hold_close_settle == null);
     holdBeforeCloseSettle("child");
+}
+
+test "a test build notes a blocking wait only through its hook" {
+    // Without a hook the host's call returns at once.
+    try std.testing.expect(test_wait_blocking == null);
+    noteWaitBlocking();
+
+    const Notes = struct {
+        var count: usize = 0;
+        fn note() void {
+            count += 1;
+        }
+    };
+    Notes.count = 0;
+    test_wait_blocking = Notes.note;
+    defer test_wait_blocking = null;
+    noteWaitBlocking();
+    try std.testing.expectEqual(@as(usize, 1), Notes.count);
 }

@@ -1,6 +1,8 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
+const wait_card = @import("../agent/wait_card.zig");
+const workspace_trust = @import("../workspace_trust/workspace_trust.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
@@ -21,6 +23,7 @@ const diff_mod = @import("../output/diff.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const permission_request = @import("../permissions/permission_request.zig");
+const subagent_execution = @import("../subagent/execution.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
 const file_index = @import("../workspace/file_index.zig");
@@ -416,6 +419,23 @@ noinline fn approvalScreenNeedsClear(
     return prior.request_id != request.id or
         prior.rows != layout.rows or
         prior.cols != layout.cols;
+}
+
+/// What the person reads when the approval screen fails and fx denies the
+/// request instead.
+const approval_screen_failure_notice = "The approval screen could not open, so fx denied this request.";
+
+/// `FX_TEST_APPROVAL_SCREEN_FAIL` makes the next approval screen fail, so a
+/// test can prove the deny reaches the request's owner
+/// (`tests/e2e/tui-host-switch.test.ts`).
+const approval_screen_fail_env = "FX_TEST_APPROVAL_SCREEN_FAIL";
+var approval_screen_fail_used = false;
+
+fn approvalScreenFailureForced() bool {
+    if (approval_screen_fail_used) return false;
+    if (io_mod.getenv(approval_screen_fail_env) == null) return false;
+    approval_screen_fail_used = true;
+    return true;
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -892,7 +912,9 @@ pub fn Runtime(comptime App: type) type {
                     "",
                 .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed(),
                 .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
+                .trust_prompt = shownTrustPrompt(app),
                 .question = shownQuestion(app, agent),
+                .wait_card = shownWaitCard(app, agent),
                 .statusline = statusline,
                 .activity = activityProjection(app),
                 .input = &app.input_runtime,
@@ -1926,6 +1948,9 @@ pub fn Runtime(comptime App: type) type {
         fn renderApprovalScreen(app: *App, agent: *AppAgent) !FrameAttemptResult {
             const approval = agent.approval_prompt.projection() orelse return error.MissingApprovalRequest;
             const request = approval.request;
+            if (approvalScreenFailureForced()) {
+                return failApprovalScreen(app, agent, request.id, error.ForcedApprovalScreenFailure);
+            }
             const clear_display = approvalScreenNeedsClear(
                 app.terminal.fileApprovalScreenActive(),
                 request,
@@ -2038,13 +2063,60 @@ pub fn Runtime(comptime App: type) type {
                     .{@errorName(leave_err)},
                 );
             };
-            switch (agent.worker.submitPermissionResponse(
+            // The screen can show a request a subagent lent it, and that
+            // request waits on the subagent's worker, so the deny goes to the
+            // worker that owns it (R1.8, `tests/tla/subagent/TuiParentApproval.tla`
+            // NoAnswerToNonOwner).
+            const worker = if (comptime @hasDecl(App, "approvalWorker"))
+                app.approvalWorker(agent)
+            else
+                &agent.worker;
+            const reason: ?[]u8 = app.alloc.dupe(u8, subagent_execution.unshown_approval_feedback) catch blk: {
+                // The deny still lands without its reason, so a copy that
+                // fails here is traced instead of ending the frame.
+                debug_trace.logf(
+                    "permission",
+                    "approval_screen_deny_reason_lost request_id={d}",
+                    .{request_id},
+                );
+                break :blk null;
+            };
+            const result = worker.submitPermissionResponse(
                 request_id,
-                permission_request.OwnedPermissionResponse.init(app.alloc, .deny, null),
-            )) {
+                permission_request.OwnedPermissionResponse.init(app.alloc, .deny, reason),
+            );
+            debug_trace.logf(
+                "permission",
+                "approval_screen_denied result={s} request_id={d}",
+                .{ @tagName(result), request_id },
+            );
+            switch (result) {
                 .accepted => {
                     agent.approval_prompt.clearWithReason(app.alloc, "screen_failure");
                     app.approval_screen.clear();
+                    // The answered request's registry binding goes with it, as
+                    // the key path's does (R1.8), so main's later answer reads
+                    // that it no longer waits instead of answering a binding
+                    // whose worker is gone (`tests/tla/subagent/TuiParentApproval.tla`
+                    // AnswerOnce).
+                    if (comptime @hasDecl(App, "withdrawAnsweredApproval")) {
+                        app.withdrawAnsweredApproval(agent);
+                    }
+                    // An accepted answer clears the prompt, so no frame retries
+                    // this screen and the notice shows once.
+                    if (comptime @hasDecl(App, "writeDomainNotice")) {
+                        app.writeDomainNotice(.{
+                            .topic = "permissions",
+                            .tone = .warning,
+                            .body = approval_screen_failure_notice,
+                        }, true) catch |notice_err| {
+                            debug_trace.logf(
+                                "permission",
+                                "approval_screen_failure_notice_failed request_id={d} err={s}",
+                                .{ request_id, @errorName(notice_err) },
+                            );
+                        };
+                    }
                 },
                 .stale, .no_pending => {},
             }
@@ -2094,6 +2166,21 @@ pub fn Runtime(comptime App: type) type {
         fn shownQuestion(app: *const App, agent: *AppAgent) ?question_prompt.Projection {
             if (agentsMenuActive(app)) return null;
             return agent.question_prompt.projection();
+        }
+
+        /// The wait card the agent on screen holds. The open agent list takes
+        /// the footer, and `waitCardFor` holds it under the alternate screen,
+        /// so the card returns when either closes. The Folder access screen
+        /// takes the footer ahead of it and the card returns when it closes.
+        fn shownWaitCard(app: *const App, agent: *const AppAgent) ?*const wait_card.WaitCardPrompt {
+            if (agentsMenuActive(app)) return null;
+            return @import("app_agents_runtime.zig").Runtime(App).waitCardFor(app, agent);
+        }
+
+        fn shownTrustPrompt(app: *const App) ?*const workspace_trust.prompt.Prompt {
+            if (comptime !@hasField(App, "trust")) return null;
+            if (app.trust.prompt) |*prompt| return prompt;
+            return null;
         }
 
         fn forkMenuActive(_: *const App, agent: *const AppAgent) bool {
@@ -4058,6 +4145,231 @@ const CoordinatorTestApp = struct {
     }
 };
 
+// A worker that takes only the request it waits on, as `WorkerRuntime` does:
+// an answer for any other id is `.stale`, and one with nothing waiting is
+// `.no_pending` (`permissionSubmissionBlockedLocked` in
+// `src/core/agent/worker_runtime.zig`).
+const approval_screen_failure_feedback_capacity_bytes: usize = 128;
+
+const ApprovalScreenFailureWorker = struct {
+    waiting_id: ?u64 = null,
+    accepted: usize = 0,
+    request_id: ?u64 = null,
+    decision: ?types.ToolPermissionDecision = null,
+    feedback_buf: [approval_screen_failure_feedback_capacity_bytes]u8 = undefined,
+    feedback_len: usize = 0,
+
+    pub fn submitPermissionResponse(
+        self: *ApprovalScreenFailureWorker,
+        request_id: u64,
+        response: permission_request.OwnedPermissionResponse,
+    ) worker_runtime.PermissionSubmissionResult {
+        var owned = response;
+        defer owned.deinit();
+        const waiting = self.waiting_id orelse return .no_pending;
+        if (waiting != request_id) return .stale;
+        self.accepted += 1;
+        self.request_id = request_id;
+        self.decision = owned.decision;
+        if (owned.feedback) |text| {
+            self.feedback_len = @min(text.len, self.feedback_buf.len);
+            @memcpy(self.feedback_buf[0..self.feedback_len], text[0..self.feedback_len]);
+        }
+        return .accepted;
+    }
+
+    fn feedbackText(self: *const ApprovalScreenFailureWorker) []const u8 {
+        return self.feedback_buf[0..self.feedback_len];
+    }
+};
+
+const ApprovalScreenFailureAgent = struct {
+    approval_prompt: approval_prompt.ApprovalPrompt = .{},
+    worker: ApprovalScreenFailureWorker = .{},
+};
+
+// An app whose screen shows the approval `lender` holds a copy of, as
+// `lentApproval` reports for main's screen.
+const ApprovalScreenFailureTestApp = struct {
+    alloc: std.mem.Allocator,
+    metrics: types.Metrics = .{},
+    terminal: shell_runtime.TerminalState = .{},
+    shell: transcript_runtime.TranscriptRuntime = .{},
+    approval_screen: interaction_state.ApprovalScreenState = .{},
+    main_agent: ApprovalScreenFailureAgent = .{},
+    lender: ?*ApprovalScreenFailureAgent = null,
+    /// The hosted child this app answers for, as `child_agents` holds it:
+    /// production withdraws a binding only for an agent that is one, and main
+    /// is not.
+    hosted_child: ?*ApprovalScreenFailureAgent = null,
+    notice_count: usize = 0,
+    notice_buf: [128]u8 = undefined,
+    notice_len: usize = 0,
+    withdrawn: usize = 0,
+
+    pub fn approvalWorker(
+        self: *ApprovalScreenFailureTestApp,
+        agent: *ApprovalScreenFailureAgent,
+    ) *ApprovalScreenFailureWorker {
+        const lender = self.lender orelse return &agent.worker;
+        return &lender.worker;
+    }
+
+    pub fn withdrawAnsweredApproval(
+        self: *ApprovalScreenFailureTestApp,
+        agent: *ApprovalScreenFailureAgent,
+    ) void {
+        const child = self.hosted_child orelse return;
+        if (agent != child) return;
+        self.withdrawn += 1;
+    }
+
+    pub fn writeDomainNotice(
+        self: *ApprovalScreenFailureTestApp,
+        notice: types.SemanticNotice,
+        _: bool,
+    ) !void {
+        self.notice_count += 1;
+        self.notice_len = @min(notice.body.len, self.notice_buf.len);
+        @memcpy(self.notice_buf[0..self.notice_len], notice.body[0..self.notice_len]);
+    }
+
+    fn noticeBody(self: *const ApprovalScreenFailureTestApp) []const u8 {
+        return self.notice_buf[0..self.notice_len];
+    }
+};
+
+test "a failed approval screen denies the request on the worker that owns it" {
+    const alloc = std.testing.allocator;
+    var app: ApprovalScreenFailureTestApp = .{ .alloc = alloc };
+    defer app.main_agent.approval_prompt.deinit(alloc);
+    var child: ApprovalScreenFailureAgent = .{};
+    defer child.approval_prompt.deinit(alloc);
+    child.worker.waiting_id = 7;
+    app.lender = &child;
+    // Main's screen holds the copy of the subagent's request, as
+    // `lendApproval` leaves it.
+    _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{
+        .id = 7,
+        .label = "write_file note.txt",
+        .origin = .{ .subagent = "writer" },
+    });
+
+    _ = try Runtime(ApprovalScreenFailureTestApp).failApprovalScreen(
+        &app,
+        &app.main_agent,
+        7,
+        error.OutOfMemory,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), child.worker.accepted);
+    try std.testing.expectEqual(@as(?u64, 7), child.worker.request_id);
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), child.worker.decision);
+    try std.testing.expectEqualStrings(
+        subagent_execution.unshown_approval_feedback,
+        child.worker.feedbackText(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.accepted);
+    try std.testing.expect(!app.main_agent.approval_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqualStrings(approval_screen_failure_notice, app.noticeBody());
+    // The screen agent is main, which is not a hosted child, so production
+    // withdraws nothing: the key path passes main here too and the binding, if
+    // the request has one, is the subagent's own.
+    try std.testing.expectEqual(@as(usize, 0), app.withdrawn);
+}
+
+test "a failed approval screen never answers the screen's own request with the same id" {
+    const alloc = std.testing.allocator;
+    var app: ApprovalScreenFailureTestApp = .{ .alloc = alloc };
+    defer app.main_agent.approval_prompt.deinit(alloc);
+    var child: ApprovalScreenFailureAgent = .{};
+    defer child.approval_prompt.deinit(alloc);
+    // Every worker numbers its requests from 1, so main's own request can have
+    // the lent request's id (`allocatePermissionRequestIdLocked` in
+    // `src/core/agent/worker_runtime.zig`).
+    app.main_agent.worker.waiting_id = 7;
+    child.worker.waiting_id = 7;
+    app.lender = &child;
+    _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{
+        .id = 7,
+        .label = "shell ls",
+        .origin = .{ .subagent = "writer" },
+    });
+
+    _ = try Runtime(ApprovalScreenFailureTestApp).failApprovalScreen(
+        &app,
+        &app.main_agent,
+        7,
+        error.OutOfMemory,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.accepted);
+    try std.testing.expectEqual(@as(usize, 1), child.worker.accepted);
+    // Main's own screen answers through the subagent's worker and withdraws
+    // nothing for main.
+    try std.testing.expectEqual(@as(usize, 0), app.withdrawn);
+}
+
+test "a failed screen on the subagent's own screen withdraws its answered request" {
+    const alloc = std.testing.allocator;
+    var app: ApprovalScreenFailureTestApp = .{ .alloc = alloc };
+    var child: ApprovalScreenFailureAgent = .{};
+    defer child.approval_prompt.deinit(alloc);
+    child.worker.waiting_id = 7;
+    app.hosted_child = &child;
+    // The subagent's own screen shows its request, so the answer goes to its
+    // worker, and its binding goes with the answer
+    // (`withdrawAnsweredApproval` for a hosted child).
+    _ = try child.approval_prompt.syncRequest(alloc, .{
+        .id = 7,
+        .label = "write_file note.txt",
+        .origin = .{ .subagent = "writer" },
+    });
+
+    _ = try Runtime(ApprovalScreenFailureTestApp).failApprovalScreen(
+        &app,
+        &child,
+        7,
+        error.OutOfMemory,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), child.worker.accepted);
+    try std.testing.expect(!child.approval_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqual(@as(usize, 1), app.withdrawn);
+}
+
+test "a failed approval screen that no worker takes withdraws nothing" {
+    const alloc = std.testing.allocator;
+    var app: ApprovalScreenFailureTestApp = .{ .alloc = alloc };
+    var child: ApprovalScreenFailureAgent = .{};
+    defer child.approval_prompt.deinit(alloc);
+    // The request ended before the deny arrived: its own worker waits on
+    // nothing.
+    child.worker.waiting_id = null;
+    app.hosted_child = &child;
+    _ = try child.approval_prompt.syncRequest(alloc, .{
+        .id = 7,
+        .label = "write_file note.txt",
+        .origin = .{ .subagent = "writer" },
+    });
+
+    _ = try Runtime(ApprovalScreenFailureTestApp).failApprovalScreen(
+        &app,
+        &child,
+        7,
+        error.OutOfMemory,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), child.worker.accepted);
+    try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.accepted);
+    // A deny nobody took answers nothing, so no binding goes with it and no
+    // notice claims a request was denied.
+    try std.testing.expectEqual(@as(usize, 0), app.withdrawn);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+}
+
 fn initCoordinatorProjectionTestApp(
     alloc: std.mem.Allocator,
     file: std.Io.File,
@@ -5398,6 +5710,188 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
     }
 }
 
+const resumed_history_rows = 300;
+const resumed_history_prompt = "SENT_WHILE_PUBLISHING";
+const resumed_history_composer = "COMPOSER_LINE_ONE\nCOMPOSER_LINE_TWO\nCOMPOSER_LINE_THREE";
+const resumed_history_notice: types.SemanticNotice = .{
+    .topic = "session",
+    .tone = .information,
+    .body = "RESTORED_NOTICE a notice long enough to wrap over several rows of the eighty column " ++
+        "terminal, as a restored prompt's notice can, so the transcript grows by more than one row " ++
+        "in the frame right after the resumed history is handed off.",
+};
+
+/// What grows during a resume, or right after it.
+const ResumeGrowth = enum {
+    none,
+    /// A prompt sent as Enter sends it, after the first frame: its card
+    /// shows above the composer.
+    prompt_card,
+    /// A composer of several lines after the first frame, with nothing sent.
+    taller_composer,
+    /// A notice in the transcript right after the frame that hands the
+    /// resumed history off, as a restored prompt's notice lands.
+    notice_after_handoff,
+};
+
+/// Resumes `resumed_history_rows` numbered rows into the 12-row coordinator
+/// terminal and paints frames until the resumed flow is released, with
+/// `growth` applied. Appends the history rows each frame wrote into
+/// scrollback to `frame_rows`, and checks that every row reached the
+/// terminal once, in order, above what grew.
+fn publishResumedHistory(
+    alloc: std.mem.Allocator,
+    growth: ResumeGrowth,
+    frame_rows: *std.ArrayList(u32),
+) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "resume-publication.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = try initCoordinatorProjectionTestApp(alloc, file);
+    defer app.deinit();
+    app.terminal_client.source_running = false;
+    try app.shell.initViewport(&app.metrics, 1);
+
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &app.shell, 0, 1);
+    defer projection.deinit();
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+    for (0..resumed_history_rows) |i| {
+        var buf: [32]u8 = undefined;
+        try flow.appendSlice(alloc, try std.mem.print(
+            &buf,
+            "{s}HISTORY_ROW_{d:0>3}",
+            .{ if (i == 0) "" else "\n", i },
+        ));
+    }
+    _ = try projection.appendRawClassified(flow.items, .unknown_raw);
+    try projection.finalize();
+    projection.install(&app.shell);
+
+    var physical = try vt_emulator.Grid.init(alloc, 80, 12);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var scrollback: std.ArrayList(u8) = .empty;
+    defer scrollback.deinit(alloc);
+    var offset: u64 = 0;
+    app.shell.render_requests.request(.first_frame);
+    var settle_frames: usize = 0;
+    var notice_added = false;
+    while (settle_frames < 3) {
+        if (frame_rows.items.len == 40) return error.TestResumePublicationNeverFinished;
+        if (growth == .notice_after_handoff and !notice_added and
+            frame_rows.items.len > 0 and app.shell.notebook.pending_resume_source == null)
+        {
+            _ = try app.shell.appendSemanticNotice(alloc, resumed_history_notice);
+            notice_added = true;
+        }
+        if (frame_rows.items.len == 1) switch (growth) {
+            .none, .notice_after_handoff => {},
+            .prompt_card => app.agent().submission.pending = .{ .draft = .{
+                .turn_id = 1,
+                .prompt = try alloc.dupe(u8, resumed_history_prompt),
+                .images = &.{},
+                .skill_display_spans = &.{},
+            } },
+            .taller_composer => {
+                try app.input_runtime.edit_state.setText(alloc, resumed_history_composer);
+                app.shell.render_requests.request(.footer);
+            },
+        };
+        const rows_before = std.mem.count(u8, scrollback.items, "\n");
+        app.shell.render_requests.request(.transcript);
+        app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+        try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
+        const bytes = try readCoordinatorFrameBytes(alloc, file, &offset);
+        defer alloc.free(bytes);
+        try feedRewritePublicationFrame(alloc, &physical, &scrollback, bytes);
+        try frame_rows.append(alloc, @intCast(std.mem.count(u8, scrollback.items, "\n") - rows_before));
+        if (app.shell.notebook.pending_resume_source == null) settle_frames += 1;
+    }
+    try std.testing.expectEqual(.stable, app.shell.transcriptCommitDiagnostic().state);
+
+    const text = try rewritePublicationText(alloc, &physical, scrollback.items);
+    defer alloc.free(text);
+    var next_row: usize = 0;
+    var last_row_end: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const label = "HISTORY_ROW_";
+        if (!std.mem.startsWith(u8, line, label)) continue;
+        // A gap or a repeat shows as the expected and the found row number.
+        try std.testing.expectEqual(next_row, try std.fmt.parseInt(usize, line[label.len..], 10));
+        next_row += 1;
+        last_row_end = lines.index orelse text.len;
+    }
+    try std.testing.expectEqual(@as(usize, resumed_history_rows), next_row);
+    const grown = switch (growth) {
+        .none => return,
+        .prompt_card => resumed_history_prompt,
+        .taller_composer => "COMPOSER_LINE_THREE",
+        .notice_after_handoff => "RESTORED_NOTICE",
+    };
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, grown));
+    try std.testing.expect(std.mem.find(u8, text, grown).? > last_row_end);
+}
+
+/// The first frame writes one batch, the frame after the footer grew writes
+/// the rest, and later frames write nothing more.
+fn expectRestAfterGrowth(frame_rows: []const u32) !void {
+    try std.testing.expectEqual(@as(u32, 64), frame_rows[0]);
+    try std.testing.expect(frame_rows[1] > 64);
+    for (frame_rows[2..]) |rows| try std.testing.expectEqual(@as(u32, 0), rows);
+}
+
+test "core.app_render_runtime a prompt sent while resumed history publishes writes the rest in its next frame" {
+    const alloc = std.testing.allocator;
+    var frame_rows: std.ArrayList(u32) = .empty;
+    defer frame_rows.deinit(alloc);
+    errdefer std.debug.print("rows per frame: {any}\n", .{frame_rows.items});
+    try publishResumedHistory(alloc, .prompt_card, &frame_rows);
+
+    // Without this, the taller footer leaves the rest of the history waiting
+    // until the turn ends, and the prompt's card waits with it.
+    try expectRestAfterGrowth(frame_rows.items);
+}
+
+test "core.app_render_runtime a composer of several lines while resumed history publishes writes the rest in its next frame" {
+    const alloc = std.testing.allocator;
+    var frame_rows: std.ArrayList(u32) = .empty;
+    defer frame_rows.deinit(alloc);
+    errdefer std.debug.print("rows per frame: {any}\n", .{frame_rows.items});
+    try publishResumedHistory(alloc, .taller_composer, &frame_rows);
+
+    // No prompt was sent; the footer grew all the same.
+    try expectRestAfterGrowth(frame_rows.items);
+}
+
+test "core.app_render_runtime a notice right after resumed history is handed off leaves every history row in scrollback" {
+    const alloc = std.testing.allocator;
+    var frame_rows: std.ArrayList(u32) = .empty;
+    defer frame_rows.deinit(alloc);
+    errdefer std.debug.print("rows per frame: {any}\n", .{frame_rows.items});
+    // Without this, the frame after the handoff moves the screen top down by
+    // the notice's rows without scrolling, and paints over the last history
+    // rows before they reach scrollback.
+    try publishResumedHistory(alloc, .notice_after_handoff, &frame_rows);
+}
+
+test "core.app_render_runtime resumed history with no prompt publishes in paced batches" {
+    const alloc = std.testing.allocator;
+    var frame_rows: std.ArrayList(u32) = .empty;
+    defer frame_rows.deinit(alloc);
+    errdefer std.debug.print("rows per frame: {any}\n", .{frame_rows.items});
+    try publishResumedHistory(alloc, .none, &frame_rows);
+
+    var batches: usize = 0;
+    for (frame_rows.items) |rows| {
+        try std.testing.expect(rows <= 64);
+        if (rows > 0) batches += 1;
+    }
+    try std.testing.expect(batches >= 4);
+}
+
 test "core.app_render_runtime first requested startup frame commits through the ordinary coordinator" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6104,7 +6598,7 @@ test "core.app_render_runtime file approval returns to the preserved inline skil
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6197,7 +6691,7 @@ test "core.app_render_runtime file approvals commit the alternate screen for eac
         alloc,
         request_a,
     ));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     app.shell.render_requests.request(.first_frame);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6233,7 +6727,7 @@ test "core.app_render_runtime file approvals commit the alternate screen for eac
         alloc,
         request_b,
     ));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     app.shell.render_requests.request(.modal);
     try std.testing.expect(!approval_screen.fileApprovalAffirmativeReady(
         &app.shell,
@@ -6325,7 +6819,7 @@ test "core.app_render_runtime restores file review before rendering a generic ap
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, file_request));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     app.shell.render_requests.request(.first_frame);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6543,7 +7037,7 @@ test "core.app_render_runtime file approval takes over the full transcript alter
     try app.shell.writeTranscript(alloc, &app.metrics, "prior transcript\n", true);
     try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6667,7 +7161,7 @@ test "core.app_render_runtime lifecycle rewrite recovers normal buffer after fil
     var review = try diff_mod.FileReview.init(alloc, "", "pending\n");
     defer review.deinit(alloc);
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(app.terminal.fileApprovalScreenActive());

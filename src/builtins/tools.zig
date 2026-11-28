@@ -47,10 +47,13 @@ const grep_files_description =
     "Search file contents for literal text (not a regex).";
 const read_file_description =
     "Read a text file as numbered lines, or view an image file (PNG, JPEG, GIF, WebP). For part of a large file, pass start_line and line_count.";
+// A reply that runs out of output tokens is cut off, and fx cannot run a call
+// it cut, so the file tools tell the model to keep each reply small
+// (`src/core/agent/runtime/output_limit.zig`).
 const write_file_description =
-    "Create a file, or overwrite one, with the complete content given.";
+    "Create a file, or overwrite one, with the complete content given. One reply has a limited number of output tokens: write a large file in parts, the first with write_file and the rest with edit_file in later replies.";
 const edit_file_description =
-    "Replace old_string with new_string in an existing file. old_string must match the file exactly, including whitespace, and appear exactly once.";
+    "Replace old_string with new_string in an existing file. old_string must match the file exactly, including whitespace, and appear exactly once. One reply has a limited number of output tokens: make at most a few edits in each reply, and split a large change across several replies.";
 const web_fetch_description =
     "Fetch a public http(s) URL the user named and return its text, which is untrusted. Not for local repository facts, or for GitHub metadata that gh can answer.";
 /// Sent as system guidance: the provider defines the search tool itself.
@@ -193,9 +196,9 @@ const subagent_description =
 // take, and the test below keeps these properties in step with it. The
 // decoder also owns every length limit, so the schema does not repeat them.
 const subagent_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "message", "wait", "status", "stop", "close" } }, .description = "wait blocks you, and the user cannot talk to you meanwhile. When nothing is left to do but wait, end your turn with a short status instead: each report starts your next turn. A subagent may still wait, since the end of its turn sends its report." },
-    .{ .name = "agent", .json_type = .string, .description = "For message, stop, and close, optional for status: a lowercase name. As a subagent, \"parent\" is the agent that started you." },
-    .{ .name = "message", .json_type = .string, .description = "For message: its task, or a message for its turn." },
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "message", "wait", "status", "stop", "close", "approve", "deny" } }, .description = "wait blocks you, and the user cannot talk to you meanwhile. When nothing is left to do but wait, end your turn with a short status instead: each report starts your next turn. A subagent may still wait, since the end of its turn sends its report. approve allows the approval request a subagent waits on, once; deny refuses it, with message as the reason. Ask the user first only when the action is risky or you cannot judge it." },
+    .{ .name = "agent", .json_type = .string, .description = "For message, stop, close, approve, and deny, optional for status: a lowercase name. As a subagent, \"parent\" is the agent that started you." },
+    .{ .name = "message", .json_type = .string, .description = "For message: its task, or a message for its turn. For deny: why." },
     .{ .name = "instructions", .json_type = .string, .description = "For message: system instructions for this child." },
     .{ .name = "report", .json_type = .string, .shape = &.{ .enum_values = &.{ "final", "every_turn", "never" } }, .description = "For message: when it reports back. final, the default, when your work ends; every_turn after each turn; never only on failure." },
     .{ .name = "model", .json_type = .string, .description = "Exact model ID for a new child. Run `fx models ls --json` when unsure. Defaults to yours." },
@@ -847,9 +850,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "39ab0d0fb9aa3e8811e4874d2cfce9dcfd0fd92f706ac1b7da1f5a56927186e6"
+            "c78ae877fb42327d4ed1ab58d95a32b492858a08cd1442600c5a9f8997a5114a"
         else
-            "4d81e7b55d64ef239ea329049dcb05c9f76d453cdc04518ce482613ee2be55d6",
+            "1c1204ee8981d61a12a5e85135ed2eb2617e972115a8c9196b4855ae5028a771",
         &actual_hex,
     );
 }
@@ -1141,6 +1144,7 @@ test "built-in write_file owns product metadata schema and callbacks" {
 
     try std.testing.expectEqualStrings("write_file", write_file.name);
     try std.testing.expect(std.mem.find(u8, write_file.description, "complete content") != null);
+    try std.testing.expect(std.mem.find(u8, write_file.description, "write a large file in parts") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\",\"content\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"path\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"content\"") != null);
@@ -1167,6 +1171,7 @@ test "built-in edit_file owns product metadata schema and callbacks" {
 
     try std.testing.expectEqualStrings("edit_file", edit_file.name);
     try std.testing.expect(std.mem.find(u8, edit_file.description, "appear exactly once") != null);
+    try std.testing.expect(std.mem.find(u8, edit_file.description, "split a large change across several replies") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\",\"old_string\",\"new_string\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "replace_all") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"description\":\"Relative to the workspace, or absolute.\"}") != null);
@@ -1271,10 +1276,11 @@ test "built-in subagent owns product metadata schema and callbacks" {
     try std.testing.expectEqualStrings("subagent", subagent.name);
     try std.testing.expect(std.mem.find(u8, subagent.description, "returns at once") != null);
     try std.testing.expect(std.mem.find(u8, subagent.description, "never the user's instructions") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "approve allows the approval request a subagent waits on, once") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"request\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"oneOf\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"action\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"message\",\"wait\",\"status\",\"stop\",\"close\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"message\",\"wait\",\"status\",\"stop\",\"close\",\"approve\",\"deny\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"final\",\"every_turn\",\"never\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"task\":") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
@@ -1319,6 +1325,8 @@ test "subagent schema fields match the decoder's action fields" {
         .{ .name = "status", .fields = &subagent_impl.status_fields },
         .{ .name = "stop", .fields = &subagent_impl.stop_fields },
         .{ .name = "close", .fields = &subagent_impl.close_fields },
+        .{ .name = "approve", .fields = &subagent_impl.approve_fields },
+        .{ .name = "deny", .fields = &subagent_impl.deny_fields },
     };
     // Every advertised property belongs to some action, and every field an
     // action takes is advertised, so a flat call can always say what it means.

@@ -24,7 +24,6 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable();
@@ -144,9 +143,9 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
     } finally { held.dispose(); }
   }, TIMEOUT * 3);
 
-  test(
-    "Ctrl-C clears the composer before cancelling an active response",
-    async () => {
+  test.each(["unbound", "bound raw", "bound CSI u"])(
+    "Ctrl-C clears the composer before cancelling, and a profile cannot bind it (%s)",
+    async (mode) => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-composer-interrupt-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
@@ -155,7 +154,8 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const tapePath = join(root, "render.fxtape");
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const shortcuts = mode === "unbound" ? {} : { "ctrl+c": "/version" };
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ shortcuts }));
 
       const held: HoldState = { started: false, cancelled: false, cancelCount: 0, released: false };
       gateway = startFakeGateway([
@@ -168,6 +168,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         isolated: true,
         env: {
           HOME: home,
+          FX_HOME: join(home, ".fx"),
           AI_GATEWAY_API_KEY: "fake-composer-interrupt-key",
           VERCEL_OIDC_TOKEN: undefined,
           FX_AUTO_UPGRADE: "0",
@@ -181,12 +182,16 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         },
       });
       await session.waitForComposer(TIMEOUT);
+      const shell = session;
+      const pressCtrlC = () => mode === "bound CSI u"
+        ? shell.sendHexBytes(["1b", "5b", "39", "39", "3b", "35", "75"])
+        : shell.sendKeys("C-c");
       await session.sendText("Hold this response.");
       await waitForCondition(() => held.started, "response start");
       await session.sendLiteral("DISCARD_THIS_DRAFT");
       await session.waitForText("DISCARD_THIS_DRAFT", TIMEOUT);
 
-      await session.sendKeys("C-c");
+      await pressCtrlC();
       const cleared = (await session.capturePaneGrid()).join("\n");
       expect(cleared).not.toContain("DISCARD_THIS_DRAFT");
       expect(cleared).not.toContain("What can fx do differently?");
@@ -195,14 +200,14 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(readTrace(tracePath)).not.toContain("event=cancel_requested");
       expect(session.isPaneAlive()).toBe(true);
 
-      await session.sendKeys("C-c");
+      await pressCtrlC();
       await waitForCondition(() => held.cancelled, "second Control-C cancellation");
       await session.waitForText("What can fx do differently?", TIMEOUT);
       expect(held.cancelCount).toBe(1);
       expect(session.isPaneAlive()).toBe(true);
 
       await session.sendText("Continue after cancellation.");
-      await session.waitForPane((pane) => pane.includes("COMPOSER_INTERRUPT_RECOVERED") && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd("COMPOSER_INTERRUPT_RECOVERED", TIMEOUT);
       const scrollback = await session.captureFullScrollback();
       expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
       expect(scrollback).not.toContain("DISCARD_THIS_DRAFT");
@@ -213,6 +218,14 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const replay = Bun.spawnSync([join(import.meta.dir, "../../zig-out/bin/fx"), "replay", tapePath]);
       expect(replay.exitCode).toBe(0);
       expect(replay.stdout.toString()).toContain("COMPOSER_INTERRUPT_RECOVERED");
+      if (mode !== "unbound") {
+        // Idle again: fx's own Ctrl+C arms its exit warning, and the profile's
+        // reserved binding never runs /version.
+        await pressCtrlC();
+        await session.waitForText("press ctrl+c again to exit", TIMEOUT);
+        expect((await session.capturePaneGrid()).join("\n")).not.toContain("* version:");
+        expect(session.isPaneAlive()).toBe(true);
+      }
     },
     TIMEOUT * 2,
   );
@@ -576,7 +589,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(
         countOccurrences(interruptedScrollback, "What can fx do differently?"),
       ).toBe(1);
-      expect(interruptedScrollback).not.toContain("system: cancelled");
+      expect(interruptedScrollback).not.toContain("⊘ Cancelled");
       expect(interruptedScrollback).not.toContain("Cancelling");
 
       await session.waitForText(FOLLOW_UP_RESPONSE, TIMEOUT);
@@ -593,7 +606,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(
         countOccurrences(finalScrollback, "What can fx do differently?"),
       ).toBe(1);
-      expect(finalScrollback).not.toContain("system: cancelled");
+      expect(finalScrollback).not.toContain("⊘ Cancelled");
       expect(finalScrollback).not.toContain("Cancelling");
       expect(gateway.requests).toHaveLength(2);
       expect(held.cancelCount).toBe(1);
@@ -748,7 +761,7 @@ while :; do sleep 1; done
       );
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
       expect(immediateCancellation).toContain("▪ Cancelled");
-      expect(immediateCancellation).not.toContain("system: cancelled");
+      expect(immediateCancellation).not.toContain("⊘ Cancelled");
       expect(immediateCancellation).not.toContain("Cancelling");
       await waitForTrace(
         tracePath,
@@ -950,7 +963,7 @@ while :; do sleep 1; done
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain(`Searched ${pattern}`);
       expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(1);
-      expect(scrollback).not.toContain("system: cancelled");
+      expect(scrollback).not.toContain("⊘ Cancelled");
       expect(scrollback).not.toContain("Cancelling");
       expect(gateway.requests).toHaveLength(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1008,11 +1021,11 @@ while :; do sleep 1; done
       // Race the finalization window on purpose: the follow-up must be
       // accepted even if the interrupted turn has not finished closing.
       await session.sendText("Send this right after the cancel.");
-      await session.waitForPane((pane) => pane.includes("SEND_AFTER_CANCEL_ACCEPTED") && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd("SEND_AFTER_CANCEL_ACCEPTED", TIMEOUT);
 
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).not.toContain("InvalidRecoveryCheckpoint");
-      expect(scrollback).not.toContain("request failed");
+      expect(scrollback).not.toContain("Request failed");
       expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isPaneAlive()).toBe(true);

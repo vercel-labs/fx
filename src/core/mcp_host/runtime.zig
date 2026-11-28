@@ -24,10 +24,13 @@ const kept_sign_outs = @import("kept_sign_outs.zig");
 const login_words = @import("login_words.zig");
 const loopback = @import("login.zig");
 const elicitation = @import("../mcp/elicitation.zig");
+const core_mrtr = @import("../mcp/mrtr.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const json_depth = @import("../shared/json_depth.zig");
 const shared_servers = @import("shared_servers.zig");
+const dropped_tools = @import("dropped_tools.zig");
 const owner_core = @import("owner_core.zig");
 const share_key = @import("share_key.zig");
 
@@ -113,6 +116,13 @@ pub const Status = struct {
     /// the words, so `publish` copies them into the snapshot and `statusesNow` copies them into each caller's
     /// allocator, like the other strings.
     tools_error: ?[]const u8 = null,
+    /// The HTTP status behind `tools_error` when its words say the server is temporarily unavailable (429, 503), else
+    /// 0: `fx mcp show` and the `/mcp` screen say "unavailable (HTTP n)" for it. A number, so every copy carries it.
+    tools_unavailable: u16 = 0,
+    /// How many tools of the list fx left out of what the model gets, by reason, for a server that is `ready`: the ones
+    /// the engine skipped (`mcp.tools.Store.addPage`) and the ones the host's reading refuses (`dropped_tools`). Plain
+    /// counts, so every copy of a `Status` carries them as it is.
+    dropped: mcp.tools.Dropped = .{},
     needs_login: bool = false,
     signed_in: bool = false,
     /// A login is under way: from `/mcp login` until it signs in, fails,
@@ -178,8 +188,11 @@ pub const CallResult = union(enum) {
 pub const Question = struct {
     server: []const u8,
     /// MCP's `inputRequests` object: each key with its `elicitation/create`
-    /// request.
+    /// request. Empty for a 2026 round, which gives `requests`.
     input_requests_json: []const u8,
+    /// A 2026 round's requests as the engine read them, in order: slices of the
+    /// server's own bytes, valid while the question is asked.
+    requests: []const core_mrtr.RawRequest = &.{},
     /// The version the server speaks, which decides how a form's schema reads.
     version: ?[]const u8,
     /// Set while the user waits for a 2025 server to complete the URLs they
@@ -383,8 +396,9 @@ const Pending = struct {
     json: []u8,
     version: ?[]u8,
     reply: union(enum) {
-        /// 2026: the call's input requests, answered in this key order.
-        input: struct { call: engine.Handle, keys: [][]u8 },
+        /// 2026: the call's input requests, answered in this order. The slices
+        /// point into `bytes`, a copy of what the engine read.
+        input: struct { call: engine.Handle, requests: []core_mrtr.RawRequest, bytes: []u8 },
         /// 2025: the server's elicitation, by slot and number, so an answer
         /// to one it withdrew never reaches the next in that slot.
         elicit: mcp.core.elicitation.Id,
@@ -399,8 +413,8 @@ const Pending = struct {
         if (p.version) |v| gpa.free(v);
         switch (p.reply) {
             .input => |input| {
-                for (input.keys) |k| gpa.free(k);
-                gpa.free(input.keys);
+                gpa.free(input.requests);
+                gpa.free(input.bytes);
             },
             .elicit, .url_consent, .url_wait => {},
         }
@@ -547,6 +561,10 @@ pub const Runtime = struct {
         /// next is the one it had before, not a sign-in. Only the moments after the refusal count:
         /// see `refusalRecent`.
         refused_new_ms: ?i64 = null,
+        /// What `dropped_tools` made of the list whose `fingerprint` is `dropped_key`, so a list is read once and
+        /// not at every status snapshot.
+        read_here: dropped_tools.Reading = .{},
+        dropped_key: ?u64 = null,
     };
 
     /// A refresh the engine said was due: waiting for its login's refresh lock,
@@ -949,6 +967,10 @@ pub const Runtime = struct {
         const answer = asker.ask(asker.context, scratch.allocator(), .{
             .server = pending.name,
             .input_requests_json = pending.json,
+            .requests = switch (pending.reply) {
+                .input => |input| input.requests,
+                else => &.{},
+            },
             .version = pending.version,
             .url_wait = if (pending.reply == .url_wait) &req.url_signal else null,
         }) catch |err| answer: {
@@ -1176,7 +1198,7 @@ pub const Runtime = struct {
                 defer scratch.deinit();
                 switch (a.pending.reply) {
                     .input => |input| {
-                        const values = if (a.json) |json| inputValues(scratch.allocator(), json, input.keys) else null;
+                        const values = if (a.json) |json| inputValuesOf(scratch.allocator(), json, input.requests) else null;
                         if (values) |v| r.respondCall(input.call, v) catch |err| {
                             debug_trace.logf("mcp", "MCP answer not sent server={s} err={s}", .{ name, @errorName(err) });
                         } else {
@@ -1560,7 +1582,7 @@ pub const Runtime = struct {
         switch (event.kind) {
             // A failed attempt ends the waits for tools with its reason; the
             // engine keeps trying, so a later request may still get them.
-            .phase => |phase| if (phase == .backoff or phase == .failed) {
+            .phase => |phase| if (explainsFailure(phase)) {
                 r.endToolWaiters(i, .failed);
                 // The request that checks a new login failed to get an answer. Not a refusal,
                 // unless the server's 401 stands (`checkFailed`).
@@ -1631,7 +1653,7 @@ pub const Runtime = struct {
                     "its reply was larger than fx reads in one message, so fx dropped it";
             }
             if (result == .ended and result.ended.outcome == .transport_failed) {
-                const down = if (r.enginePhase(index)) |p| p == .backoff or p == .failed else false;
+                const down = if (r.enginePhase(index)) |p| explainsFailure(p) else false;
                 if (down) result.ended.why = r.failureText(req.alloc, index) catch null;
             }
             // The server sent something fx could not read: a 2xx body that is no JSON-RPC message,
@@ -2420,10 +2442,7 @@ pub const Runtime = struct {
             o.tools = st.tools;
             // The engine keeps its last failure; it explains a server that is
             // down, not one that is back or stopped to wait for a sign-in.
-            o.last_error = switch (o.state) {
-                .failed, .retrying => try r.failureText(a, i),
-                else => null,
-            };
+            o.last_error = if (explainsFailure(st.phase)) try r.failureText(a, i) else null;
             // A shared server runs in the owner, which keeps no sign-in state
             // for this session: a login there belongs to no session.
             const on_owner = if (r.shared) |*sh| sh.has(s.name) else false;
@@ -2443,7 +2462,18 @@ pub const Runtime = struct {
                 }
             }
             // The engine lends the words until its next refusal.
-            if (o.state == .ready and !o.needs_login) o.tools_error = if (st.list_refusal) |words| try a.dupe(u8, words) else null;
+            if (o.state == .ready and !o.needs_login) {
+                o.tools_error = if (st.list_refusal) |words| try a.dupe(u8, words) else null;
+                o.tools_unavailable = if (o.tools_error != null) st.list_unavailable else 0;
+            }
+            if (o.state == .ready) {
+                o.dropped = st.dropped;
+                // The tools it counts are the ones it lists and the model gets: the host's reading keeps them.
+                if (r.hostReading(i, s.name)) |read| {
+                    o.dropped.merge(read.dropped);
+                    o.tools = read.kept;
+                }
+            }
             if (r.instructionsOf(s.name)) |t| o.instructions = try a.dupe(u8, t);
         }
         r.mutex.lockUncancelable(r.io);
@@ -2513,26 +2543,12 @@ pub const Runtime = struct {
         return null;
     }
 
+    /// Keeps the round's requests for the question UI and the answer, as copies of the slices the engine read.
     fn inputQuestion(r: *Runtime, i: usize, call_handle: engine.Handle, requests: []const mcp.mrtr.Request) Allocator.Error!Pending {
-        const keys = try r.gpa.alloc([]u8, requests.len);
-        var made: usize = 0;
-        errdefer {
-            for (keys[0..made]) |k| r.gpa.free(k);
-            r.gpa.free(keys);
-        }
-        var out: std.Io.Writer.Allocating = .init(r.gpa);
-        defer out.deinit();
-        // An allocating writer fails only when allocation does.
-        out.writer.writeByte('{') catch return error.OutOfMemory;
-        for (requests, keys, 0..) |request, *key, n| {
-            key.* = try r.gpa.dupe(u8, request.key);
-            made += 1;
-            if (n > 0) out.writer.writeByte(',') catch return error.OutOfMemory;
-            out.writer.print("{s}:{s}", .{ request.key, request.raw }) catch return error.OutOfMemory;
-        }
-        out.writer.writeByte('}') catch return error.OutOfMemory;
-        const json = try out.toOwnedSlice();
-        return .{ .name = r.resolved.servers[i].name, .server = r.ids[i], .json = json, .version = r.versionCopy(i), .reply = .{ .input = .{ .call = call_handle, .keys = keys } } };
+        const kept = try keepRequests(r.gpa, requests);
+        errdefer kept.free(r.gpa);
+        const json = try r.gpa.alloc(u8, 0);
+        return .{ .name = r.resolved.servers[i].name, .server = r.ids[i], .json = json, .version = r.versionCopy(i), .reply = .{ .input = .{ .call = call_handle, .requests = kept.requests, .bytes = kept.bytes } } };
     }
 
     fn versionCopy(r: *Runtime, i: usize) ?[]u8 {
@@ -2571,6 +2587,23 @@ pub const Runtime = struct {
             return;
         };
         return r.engine.needTools(name);
+    }
+
+    /// What the host's reading makes of server `name`'s list now, read again only when the list changed: the tools it
+    /// keeps and the ones it leaves out. Null when the list can't be read now, or the count ran out of memory, which
+    /// the next snapshot tries again.
+    fn hostReading(r: *Runtime, i: usize, name: []const u8) ?dropped_tools.Reading {
+        const list = r.toolListOf(name) catch return null;
+        const key = list.fingerprint();
+        const flags = &r.flags[i];
+        if (flags.dropped_key == key) return flags.read_here;
+        flags.read_here = dropped_tools.reading(r.gpa, list) catch |err| {
+            debug_trace.logf("mcp", "MCP left-out tools not counted server={s} err={s}", .{ name, @errorName(err) });
+            flags.dropped_key = null;
+            return null;
+        };
+        flags.dropped_key = key;
+        return flags.read_here;
     }
 
     fn toolListOf(r: *Runtime, name: []const u8) engine.Error!*const mcp.tools.List {
@@ -2692,7 +2725,20 @@ pub const Runtime = struct {
 
     fn lastError(r: *Runtime, alloc: Allocator, i: usize) Allocator.Error![]u8 {
         if (try r.unreadText(alloc, i)) |why| return why;
-        return (try r.failureText(alloc, i)) orelse try alloc.dupe(u8, "the server is unavailable");
+        if (r.statusOf(i)) |st| switch (saysWhy(st.phase, st.last_error != null, st.list_refusal != null)) {
+            .failure => if (try r.failureText(alloc, i)) |why| return why,
+            .refusal => if (try r.refusalText(alloc, i)) |why| return why,
+            .none => {},
+        };
+        return try alloc.dupe(u8, "the server is unavailable");
+    }
+
+    /// Why fx refused server `i`'s last tool list, in `alloc`: the words `Status.tools_error` has, so a screen, a
+    /// status and what the model is told all give one reason. Null when it refused none.
+    fn refusalText(r: *Runtime, alloc: Allocator, i: usize) Allocator.Error!?[]u8 {
+        const st = r.statusOf(i) orelse return null;
+        // The engine lends the words until its next refusal.
+        return if (st.list_refusal) |words| try alloc.dupe(u8, words) else null;
     }
 
     /// Why server `i` has no login, in `alloc`, when that's because the
@@ -2740,14 +2786,26 @@ pub const Runtime = struct {
         };
     }
 
+    /// The tools of server `name`'s list that the host keeps (`dropped_tools.read`), each copied into `alloc`. One it
+    /// leaves out is traced here and is in no list.
     fn copyTools(r: *Runtime, alloc: Allocator, name: []const u8) Allocator.Error![]Tool {
         const list = r.toolListOf(name) catch return &.{};
-        const out = try alloc.alloc(Tool, list.len());
-        for (out, 0..) |*t, k| {
+        var out: std.ArrayList(Tool) = .empty;
+        var scratch: std.heap.ArenaAllocator = .init(r.gpa);
+        defer scratch.deinit();
+        for (0..list.len()) |k| {
             const tool = list.get(k);
-            t.* = .{ .name = try alloc.dupe(u8, tool.name), .raw = try alloc.dupe(u8, tool.raw) };
+            _ = scratch.reset(.retain_capacity);
+            switch (try dropped_tools.read(scratch.allocator(), tool.raw)) {
+                .tool => {},
+                .left_out => |left_out| {
+                    debug_trace.logf("mcp", "MCP tool left out server={s} tool={s} err={s}", .{ name, tool.name, @errorName(left_out.err) });
+                    continue;
+                },
+            }
+            try out.append(alloc, .{ .name = try alloc.dupe(u8, tool.name), .raw = try alloc.dupe(u8, tool.raw) });
         }
-        return out;
+        return out.items;
     }
 
     /// A login saved since by another fx, taken in place of asking for one;
@@ -3047,6 +3105,24 @@ test "a failed sign-in says why in words, with the server's own" {
     try std.testing.expect(said.len < 340);
 }
 
+/// Whether the engine's last failure explains a server in `phase`: it is down (retrying or failed), not back and not
+/// stopped to wait for a sign-in. The engine keeps the failure after the server is ready again, so the status and
+/// what the model is told both ask this before they say it.
+fn explainsFailure(phase: engine.Phase) bool {
+    return switch (phase) {
+        .backoff, .failed => true,
+        .idle, .connecting, .ready => false,
+    };
+}
+
+/// What says why a server has no tools: its failure while it is down, else the refusal of its list, else nothing.
+const WhySaid = enum { failure, refusal, none };
+
+fn saysWhy(phase: engine.Phase, has_failure: bool, has_refusal: bool) WhySaid {
+    if (has_failure and explainsFailure(phase)) return .failure;
+    return if (has_refusal) .refusal else .none;
+}
+
 fn writeFailure(w: *std.Io.Writer, why: []const u8, exit: ?mcp.stdio.Exit, stray: ?[]const u8, tail: ?[]const u8) std.Io.Writer.Error!void {
     try w.writeAll(describeFailure(why));
     // "its process exited" says how; another failure adds it.
@@ -3087,18 +3163,76 @@ fn describeFailure(why: []const u8) []const u8 {
     return why;
 }
 
-/// The answers to a call's input requests, in the order of `keys` (JSON
-/// string tokens); null when one is missing or the answers aren't an object.
+/// The answers to a call's input requests, in the order of `requests`.
+fn inputValuesOf(a: Allocator, json: []const u8, requests: []const core_mrtr.RawRequest) ?[]const []const u8 {
+    const keys = a.alloc([]const u8, requests.len) catch return null;
+    for (requests, keys) |request, *key| key.* = request.key;
+    return inputValues(a, json, keys);
+}
+
+/// The answers to a call's input requests, in the order of `keys` (JSON string tokens as the server wrote them), as
+/// the slices of `json` that hold them: each is given back as it was written, and the engine writes it under its own
+/// key. A key matches whichever way its name is spelled. Null when one is missing or the answers aren't an object.
 fn inputValues(a: Allocator, json: []const u8, keys: []const []const u8) ?[]const []const u8 {
-    const answers = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }) catch return null;
-    if (answers != .object) return null;
     const values = a.alloc([]const u8, keys.len) catch return null;
-    for (keys, values) |token, *value| {
-        const key = json_decode.parseFromSliceLeaky([]const u8, a, token, .{}) catch return null;
-        const answer = answers.object.get(key) orelse return null;
-        value.* = std.json.Stringify.valueAlloc(a, answer, .{}) catch return null;
+    const found = a.alloc(bool, keys.len) catch return null;
+    @memset(found, false);
+    var fields: mcp.wire.Fields = undefined;
+    fields.init(json) catch return null;
+    while (fields.next() catch return null) |field| {
+        for (keys, values, found) |token, *value, *seen| {
+            if (seen.* or !mcp.wire.sameString(token, field.key)) continue;
+            value.* = field.value;
+            seen.* = true;
+            break;
+        }
     }
+    for (found) |seen| if (!seen) return null;
     return values;
+}
+
+/// A round's requests copied out of the call's memory, which the engine frees with the call: the engine's bytes, kept
+/// as they are. The slices of `requests` point into `bytes`.
+const KeptRequests = struct {
+    requests: []core_mrtr.RawRequest,
+    bytes: []u8,
+
+    fn free(kept: KeptRequests, gpa: Allocator) void {
+        gpa.free(kept.requests);
+        gpa.free(kept.bytes);
+    }
+};
+
+fn keepRequests(gpa: Allocator, requests: []const mcp.mrtr.Request) Allocator.Error!KeptRequests {
+    var total: usize = 0;
+    for (requests) |request| {
+        const params: []const u8 = request.params orelse "";
+        total += request.key.len + request.raw.len + params.len;
+    }
+    const bytes = try gpa.alloc(u8, total);
+    errdefer gpa.free(bytes);
+    const kept = try gpa.alloc(core_mrtr.RawRequest, requests.len);
+    var at: usize = 0;
+    for (requests, kept) |request, *out| {
+        out.* = .{
+            .key = copyInto(bytes, &at, request.key),
+            .kind = switch (request.kind) {
+                .elicitation => .elicitation,
+                .sampling => .sampling,
+                .roots => .roots,
+            },
+            .raw = copyInto(bytes, &at, request.raw),
+            .params = if (request.params) |params| copyInto(bytes, &at, params) else null,
+        };
+    }
+    return .{ .requests = kept, .bytes = bytes };
+}
+
+fn copyInto(bytes: []u8, at: *usize, from: []const u8) []const u8 {
+    const out = bytes[at.*..][0..from.len];
+    @memcpy(out, from);
+    at.* += from.len;
+    return out;
 }
 
 /// A held call that ended with its -32042 answer because fx failed at `step`.
@@ -3391,6 +3525,20 @@ const refusing_server_script =
     \\
 ;
 
+/// A 2025 server in sh whose every tool list is no list (`tools` is a number).
+const always_refusing_server_script =
+    \\#!/bin/sh
+    \\while IFS= read -r line; do
+    \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    \\  case "$line" in
+    \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+    \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":7}}\n' "$id" ;;
+    \\  esac
+    \\done
+    \\
+;
+
 /// Asks for server `fake`'s tools until its status says `want`, for up to thirty seconds: the snapshot follows the engine a moment later,
 /// and a loaded machine can take longer. It stops as soon as the status is right.
 fn statusAfterListing(r: *Runtime, arena: Allocator, want_refused: bool) !Status {
@@ -3403,6 +3551,65 @@ fn statusAfterListing(r: *Runtime, arena: Allocator, want_refused: bool) !Status
         std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
     }
     return status;
+}
+
+/// A 2025 server in sh whose first tool list keeps one tool and has two the host leaves out: a second tool named
+/// `echo`, which the engine skips, and one whose `description` is not text, which the host's reading refuses. It then
+/// says its tools changed, and every later list keeps all its tools.
+const leaving_out_server_script =
+    \\#!/bin/sh
+    \\n=0
+    \\while IFS= read -r line; do
+    \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    \\  case "$line" in
+    \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+    \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\    *'"method":"tools/list"'*)
+    \\      n=$((n + 1))
+    \\      if [ "$n" = 1 ]; then
+    \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes","inputSchema":{"type":"object"}},{"name":"echo","inputSchema":{"type":"object"}},{"name":"odd","description":7,"inputSchema":{"type":"object"}}]}}\n' "$id"
+    \\        printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+    \\      else
+    \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes","inputSchema":{"type":"object"}}]}}\n' "$id"
+    \\      fi ;;
+    \\  esac
+    \\done
+    \\
+;
+
+test "tools fx leaves out of a list show in the status by reason, and a later list that keeps them all clears it" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = leaving_out_server_script, .flags = .{ .permissions = .executable_file } });
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The engine skipped the second `echo`, and the host's reading refuses `odd`: two tools are left out, for two reasons,
+    // and the list and the count have the one tool that is kept.
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "fake", null)).tools.len);
+    var status = (try r.statuses(a))[0];
+    try testing.expectEqual(State.ready, status.state);
+    try testing.expectEqual(@as(usize, 1), status.tools);
+    try testing.expectEqual(@as(u32, 2), status.dropped.total());
+    try testing.expectEqual(@as(u32, 1), status.dropped.counts[@backingInt(mcp.tools.Drop.repeated_name)]);
+    try testing.expectEqual(@as(u32, 1), status.dropped.counts[@backingInt(mcp.tools.Drop.unusable)]);
+
+    // The server says its tools changed: the next list keeps every tool, and the status says nothing is left out.
+    for (0..600) |_| {
+        _ = try r.tools(a, "fake", null);
+        status = (try r.statuses(a))[0];
+        if (status.dropped.total() == 0) break;
+        // A sleep that ends early only polls sooner, and the loop is bounded.
+        std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
+    }
+    try testing.expectEqual(@as(u32, 0), status.dropped.total());
+    try testing.expectEqual(@as(usize, 1), status.tools);
 }
 
 test "a refused tool list shows in the status beside the older list still served, and a good list clears it" {
@@ -3448,6 +3655,144 @@ test "a refused tool list shows in the status beside the older list still served
     status = try statusAfterListing(&r, a, false);
     try testing.expect(status.tools_error == null);
     try testing.expectEqual(@as(usize, 1), status.tools);
+}
+
+test "a server whose tool list is refused fails the request for its tools with the refusal's words, as its status says them" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = always_refusing_server_script, .flags = .{ .permissions = .executable_file } });
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The `/mcp` screen, the catalog and `toolbox` all read the words of this failure, so they say what the status says
+    // and not that the server is unavailable.
+    const why = switch (try r.tools(a, "fake", null)) {
+        .failed => |text| text,
+        else => return error.TestExpectedFailure,
+    };
+    try testing.expectEqualStrings("\"tools\" is not a list", why);
+    const status = try statusAfterListing(&r, a, true);
+    try testing.expectEqualStrings(why, status.tools_error orelse return error.TestExpectedRefusal);
+    try testing.expectEqual(@as(usize, 0), status.tools);
+    try testing.expectEqual(@as(u16, 0), status.tools_unavailable);
+}
+
+test "a server's failure is said while it is down, and its list's refusal when it is back, whatever the engine still keeps" {
+    const phases = [_]engine.Phase{ .idle, .connecting, .ready, .backoff, .failed };
+    for (phases) |phase| {
+        const down = phase == .backoff or phase == .failed;
+        // A failure and a refusal: the failure of a server that is down, the refusal of one that is not.
+        try testing.expectEqual(if (down) WhySaid.failure else WhySaid.refusal, saysWhy(phase, true, true));
+        // A failure the engine kept, and no refusal: said only while the server is down.
+        try testing.expectEqual(if (down) WhySaid.failure else WhySaid.none, saysWhy(phase, true, false));
+        // A refusal alone is said in every phase, and neither says nothing.
+        try testing.expectEqual(WhySaid.refusal, saysWhy(phase, false, true));
+        try testing.expectEqual(WhySaid.none, saysWhy(phase, false, false));
+    }
+}
+
+// The server's first start dies; the next one is ready and refuses its list, as `always_refusing_server_script` does.
+const crashes_once_then_refuses_script =
+    \\#!/bin/sh
+    \\marker="$0.started"
+    \\if [ ! -e "$marker" ]; then : > "$marker"; echo "first start crashes" >&2; exit 3; fi
+    \\while IFS= read -r line; do
+    \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    \\  case "$line" in
+    \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+    \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":7}}\n' "$id" ;;
+    \\  esac
+    \\done
+    \\
+;
+
+test "a server that crashed once and is ready again tells the model its list's refusal, not its old crash" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = crashes_once_then_refuses_script, .flags = .{ .permissions = .executable_file } });
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // While the first process is down, the failure is said: that is the server's reason.
+    var saw_crash = false;
+    var why: []const u8 = "";
+    for (0..600) |_| {
+        why = switch (try r.tools(a, "fake", null)) {
+            .failed => |text| text,
+            else => return error.TestExpectedFailure,
+        };
+        if (std.mem.find(u8, why, "its process exited") != null) saw_crash = true else break;
+        // A sleep that ends early only polls sooner, and the loop is bounded.
+        std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
+    }
+    try testing.expect(saw_crash);
+    // The second process is ready and refuses its list. The engine still keeps the crash, and the words are the refusal's.
+    try testing.expectEqualStrings("\"tools\" is not a list", why);
+    const status = (try r.statuses(a))[0];
+    try testing.expectEqual(State.ready, status.state);
+    try testing.expectEqualStrings(why, status.tools_error orelse return error.TestExpectedRefusal);
+    try testing.expect(status.last_error == null);
+}
+
+// The server's first process refuses its list and dies; every later one dies as it starts.
+const refuses_then_crashes_script =
+    \\#!/bin/sh
+    \\marker="$0.started"
+    \\if [ -e "$marker" ]; then echo "later start crashes" >&2; exit 3; fi
+    \\: > "$marker"
+    \\while IFS= read -r line; do
+    \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    \\  case "$line" in
+    \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+    \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":7}}\n' "$id"; exit 4 ;;
+    \\  esac
+    \\done
+    \\
+;
+
+test "a server that refused its list and then went down tells the model its failure, not the refusal" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = refuses_then_crashes_script, .flags = .{ .permissions = .executable_file } });
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The first process refuses the list, and then it dies.
+    var why: []const u8 = "";
+    for (0..600) |_| {
+        why = switch (try r.tools(a, "fake", null)) {
+            .failed => |text| text,
+            else => return error.TestExpectedFailure,
+        };
+        if (std.mem.find(u8, why, "its process exited") != null) break;
+        // A sleep that ends early only polls sooner, and the loop is bounded.
+        std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
+    }
+    // The engine still holds the refusal while the server is down; what the model is told is the failure.
+    const st = r.statusOf(0) orelse return error.TestExpectedStatus;
+    try testing.expect(st.list_refusal != null);
+    try testing.expect(explainsFailure(st.phase));
+    try testing.expect(std.mem.startsWith(u8, why, "its process exited"));
 }
 
 test "a cancelled call ends, and stopping ends a call that never answers" {
@@ -4103,6 +4448,127 @@ test "answers go back under the server's keys, and an answer that can't be read 
     try testing.expectEqualStrings("{}", declaredCapabilities(.{}));
     try testing.expectEqualStrings("{\"elicitation\":{\"form\":{}}}", declaredCapabilities(.{ .form = true }));
     try testing.expectEqualStrings("{\"elicitation\":{\"form\":{},\"url\":{}}}", declaredCapabilities(.{ .form = true, .url = true }));
+}
+
+test "a round's answers are found by each key however its name is spelled, and given back as written" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The round's keys as the server wrote them: an escape, a non-ASCII character with an astral pair, a quote, a
+    // backslash and a slash.
+    const keys = [_][]const u8{ "\"\\u0061b\"", "\"caf\\u00e9 \\ud83d\\ude00 é\"", "\"q\\\"u\\\\o\\/te\"" };
+    // The answer spells each name another way, in another order. Its values keep their own bytes, spaces included.
+    const json =
+        \\{ "q\"u\\o/te" : {"action":"cancel"} , "café 😀 é":{ "action":"accept","content":{"n": 1.50}},"ab":{"action":"decline"}}
+    ;
+    const values = inputValues(a, json, &keys).?;
+    try testing.expectEqualStrings("{\"action\":\"decline\"}", values[0]);
+    try testing.expectEqualStrings("{ \"action\":\"accept\",\"content\":{\"n\": 1.50}}", values[1]);
+    try testing.expectEqualStrings("{\"action\":\"cancel\"}", values[2]);
+
+    // A name that only starts like a key, a key left out, a repeat standing for another key, and text after the
+    // answers are each an answer that can't be read.
+    try testing.expect(inputValues(a, "{\"abc\":{},\"x\":{}}", &.{ "\"ab\"", "\"x\"" }) == null);
+    try testing.expect(inputValues(a, "{\"ab\":{}}", &.{ "\"ab\"", "\"x\"" }) == null);
+    try testing.expect(inputValues(a, "{\"ab\":{},\"a\\u0062\":{}}", &.{ "\"ab\"", "\"x\"" }) == null);
+    try testing.expect(inputValues(a, "{\"ab\":{}} {}", &.{"\"ab\""}) == null);
+    try testing.expect(inputValues(a, "{\"ab\":", &.{"\"ab\""}) == null);
+}
+
+/// What `inputValues` did before it read the answers' slices: every key decoded through std.json and the answers
+/// parsed into a tree and written out again. It is the oracle of the test below.
+fn inputValuesByDecoding(a: Allocator, json: []const u8, keys: []const []const u8) ?[]const []const u8 {
+    const answers = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }) catch return null;
+    if (answers != .object) return null;
+    const values = a.alloc([]const u8, keys.len) catch return null;
+    for (keys, values) |token, *value| {
+        const key = json_decode.parseFromSliceLeaky([]const u8, a, token, .{}) catch return null;
+        const answer = answers.object.get(key) orelse return null;
+        value.* = std.json.Stringify.valueAlloc(a, answer, .{}) catch return null;
+    }
+    return values;
+}
+
+test "a round's answers are the ones std.json finds by each decoded key, on hostile keys and answers" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const key_sets = [_][]const []const u8{
+        &.{"\"k\""},
+        &.{ "\"\\u0061b\"", "\"ab2\"" },
+        &.{ "\"caf\\u00e9 \\ud83d\\ude00\"", "\"\\u00e9\"", "\"e\"" },
+        &.{ "\"q\\\"u\\\\o\\/te\"", "\"a\\u0000b\"" },
+        &.{ "\"\\u0131\"", "\"i\"" },
+        &.{"\"\\ud800\""},
+        &.{"\"\""},
+    };
+    const answer_texts = [_][]const u8{
+        "{\"k\":{\"action\":\"accept\"}}",
+        "{ \"k\" : { \"action\" : \"decline\" } }",
+        "{\"ab\":{\"action\":\"accept\",\"content\":{\"n\":1.50}},\"ab2\":{\"action\":\"cancel\"}}",
+        "{\"a\\u0062\":{\"action\":\"accept\"},\"ab2\":{}}",
+        "{\"café 😀\":{\"action\":\"accept\"},\"é\":{\"action\":\"decline\"},\"e\":{\"action\":\"cancel\"}}",
+        "{\"caf\\u00e9 \\ud83d\\ude00\":{},\"\\u00e9\":{},\"e\":{}}",
+        "{\"q\\\"u\\\\o/te\":{\"action\":\"accept\"},\"a\\u0000b\":{\"action\":\"accept\"}}",
+        "{\"\\u0131\":{\"action\":\"accept\"},\"i\":{\"action\":\"decline\"}}",
+        "{\"\":{\"action\":\"accept\"}}",
+        "{\"k\":{\"action\":\"accept\"},\"extra\":[1,2,{\"x\":null}]}",
+        "{\"k\":1e400}",
+        "{\"k\":",
+        "{\"k\":{}} tail",
+        "[]",
+        "\"k\"",
+        "",
+    };
+    for (key_sets) |keys| for (answer_texts) |text| {
+        const raw = inputValues(a, text, keys);
+        const decoded = inputValuesByDecoding(a, text, keys);
+        try testing.expectEqual(decoded == null, raw == null);
+        const found = raw orelse continue;
+        for (found, decoded.?) |slice, canonical| {
+            // The slice is the answer as written; read as JSON it is the value the decoding path wrote out.
+            const tree = try std.json.parseFromSliceLeaky(std.json.Value, a, slice, .{ .parse_numbers = false });
+            try testing.expectEqualStrings(canonical, try std.json.Stringify.valueAlloc(a, tree, .{}));
+        }
+    };
+}
+
+test "a round's requests are kept as the engine read them, and freed with the question" {
+    const engine_requests = [_]mcp.mrtr.Request{
+        .{ .key = "\"\\u0061b\"", .kind = .elicitation, .raw = "{\"method\":\"elicitation/create\",\"params\":{ \"message\":\"m\" }}", .params = "{ \"message\":\"m\" }" },
+        .{ .key = "\"caf\\u00e9 😀\"", .kind = .roots, .raw = "{\"method\":\"roots/list\"}", .params = null },
+        .{ .key = "\"s\"", .kind = .sampling, .raw = "{\"method\":\"sampling/createMessage\",\"params\":{}}", .params = "{}" },
+    };
+    const kept = try keepRequests(testing.allocator, &engine_requests);
+    defer kept.free(testing.allocator);
+    try testing.expectEqual(engine_requests.len, kept.requests.len);
+    for (engine_requests, kept.requests) |engine_request, request| {
+        try testing.expectEqualStrings(engine_request.key, request.key);
+        try testing.expectEqualStrings(engine_request.raw, request.raw);
+        try testing.expect(request.key.ptr != engine_request.key.ptr);
+        try testing.expectEqual(engine_request.params == null, request.params == null);
+        if (engine_request.params) |params| try testing.expectEqualStrings(params, request.params.?);
+    }
+    try testing.expectEqual(core_mrtr.RawRequest.Kind.elicitation, kept.requests[0].kind);
+    try testing.expectEqual(core_mrtr.RawRequest.Kind.roots, kept.requests[1].kind);
+    try testing.expectEqual(core_mrtr.RawRequest.Kind.sampling, kept.requests[2].kind);
+    const none = try keepRequests(testing.allocator, &.{});
+    none.free(testing.allocator);
+}
+
+test "keeping a round's requests releases memory when an allocation fails" {
+    try testing.checkAllAllocationFailures(testing_allocator.no_resize, keepAllocationFailures, .{});
+}
+
+fn keepAllocationFailures(gpa: Allocator) !void {
+    const requests = [_]mcp.mrtr.Request{
+        .{ .key = "\"k\"", .kind = .elicitation, .raw = "{\"method\":\"elicitation/create\",\"params\":{}}", .params = "{}" },
+        .{ .key = "\"r\"", .kind = .roots, .raw = "{\"method\":\"roots/list\"}", .params = null },
+    };
+    const kept = try keepRequests(gpa, &requests);
+    kept.free(gpa);
 }
 
 /// What the engine gives the host when a call ends with a protocol error.

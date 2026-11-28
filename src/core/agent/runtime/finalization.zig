@@ -33,6 +33,7 @@ pub const TurnFinalizationGuard = struct {
         open,
         emitted,
         fatal,
+        yielded,
     };
 
     deps: *const AgentRuntimeDeps,
@@ -45,12 +46,17 @@ pub const TurnFinalizationGuard = struct {
     /// Every save of the turn carries it, so a streamed turn keeps one prefix
     /// (D94). Borrowed from the turn's arena.
     captured_runtime_context: ?[][]u8 = null,
+    /// The toolbox menu this turn sent first for the conversation, and what
+    /// its change note told it, if it did. Every save of the turn carries
+    /// them (D103). Borrowed from the turn's arena.
+    saved_toolbox_menu: ?types.SavedToolboxMenu = null,
+    toolbox_noted: ?types.ToolboxNoted = null,
     lease_allocator: Allocator = std.heap.c_allocator,
     agent_terminal_leases: std.ArrayList([]u8) = .empty,
     /// The turn's settled model calls, in the order they settled, for
     /// Ctrl+O. The first `stamped_model_calls` know their step; a newer one
     /// takes the step count the next save sees and keeps it, so every later
-    /// save writes it the same way (`persistedExecution`). Owned with
+    /// save writes it the same way (`withTurnRecords`). Owned with
     /// `lease_allocator`.
     model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
     stamped_model_calls: usize = 0,
@@ -68,22 +74,38 @@ pub const TurnFinalizationGuard = struct {
         };
     }
 
-    /// The execution memory a save of this turn records: the part after any
-    /// in-turn compaction cut, with the runtime context the turn captured
-    /// and the model calls it made. `execution` holds the whole turn; a call
-    /// settled since the last save is placed after the steps it holds.
-    /// Borrows `execution`, the captured texts and the call records.
+    /// The execution memory fx's history and the recovery checkpoint keep of
+    /// this turn: the part after any in-turn compaction cut, with the runtime
+    /// context the turn captured and the model calls it made. `execution`
+    /// holds the whole turn; a call settled since the last save is placed
+    /// after the steps it holds. Borrows `execution`, the captured texts and
+    /// the call records.
     pub fn persistedExecution(self: *TurnFinalizationGuard, arena: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
+        return self.compacted_execution.project(arena, self.withTurnRecords(execution));
+    }
+
+    /// The whole turn, with the same records, once a compaction inside it
+    /// cut steps out of `persistedExecution`; null when none did. The session
+    /// log saves it, and resume leaves the cut steps out again (D87). Borrows
+    /// as `persistedExecution` does.
+    pub fn savedExecution(self: *TurnFinalizationGuard, execution: types.ExecutionMemory) ?types.ExecutionMemory {
+        const cut = self.compacted_execution;
+        if (cut.tool_steps == 0 and cut.steering == 0) return null;
+        return self.withTurnRecords(execution);
+    }
+
+    fn withTurnRecords(self: *TurnFinalizationGuard, execution: types.ExecutionMemory) types.ExecutionMemory {
         for (self.model_calls.items[self.stamped_model_calls..]) |*record| {
             record.after_tool_step_count = execution.tool_steps.len;
             record.after_steering_count = execution.steering.len;
         }
         self.stamped_model_calls = self.model_calls.items.len;
-        var with_calls = execution;
-        with_calls.model_calls = self.model_calls.items;
-        var projected = try self.compacted_execution.project(arena, with_calls);
-        projected.runtime_context = self.captured_runtime_context;
-        return projected;
+        var with_records = execution;
+        with_records.model_calls = self.model_calls.items;
+        with_records.runtime_context = self.captured_runtime_context;
+        with_records.toolbox_menu = self.saved_toolbox_menu;
+        with_records.toolbox_noted = self.toolbox_noted;
+        return with_records;
     }
 
     /// Keeps a settled call's record for every later save of the turn. One
@@ -166,6 +188,15 @@ pub const TurnFinalizationGuard = struct {
                 .{ self.turn_id, @errorName(err) },
             );
         };
+    }
+
+    /// Leaves a turn that yielded open: its host resumes the same turn, and
+    /// that run reports how it ends (`tests/tla/recovery/Resume.tla`
+    /// Relaunch). The terminal leases this run took are still released.
+    pub fn leaveOpenForResume(self: *TurnFinalizationGuard) void {
+        if (self.state != .open) return;
+        self.cleanup_agent_terminal_leases();
+        self.state = .yielded;
     }
 
     pub fn finish(
@@ -263,6 +294,7 @@ pub fn finishAssistantTerminalWithExecution(
         .assistant = @constCast(assistant_text),
         .provider_replay = replay,
         .execution = context_execution,
+        .saved_execution = finalization.savedExecution(execution),
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     const finished = try types.dupeFinishedPrompt(

@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv } from "../evals/eval-helpers";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
 import {
   assertPaneContains,
@@ -172,11 +172,10 @@ describe("tui: render record/replay", () => {
       expect(replay.stdout_bytes).toBeGreaterThan(0);
 
       execFileSync(FX_BIN, ["replay", tapePath, "--golden", goldenPath], {
-        env: {
-          ...process.env,
+        env: fxChildEnv({
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: TRACE_SCOPES,
-        },
+        }),
       });
       const trace = readTrace(tracePath);
       expect(trace).not.toContain("viewport_validation_clamped");
@@ -300,11 +299,10 @@ describe("tui: render record/replay", () => {
       expect(replay.stdout_bytes).toBeGreaterThan(0);
 
       execFileSync(FX_BIN, ["replay", tapePath, "--golden", goldenPath], {
-        env: {
-          ...process.env,
+        env: fxChildEnv({
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: TRACE_SCOPES,
-        },
+        }),
       });
       const trace = readTrace(tracePath);
       expect(trace).not.toContain("InvalidActivityPlacement");

@@ -14,7 +14,14 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../../evals/eval-helpers";
-import { fakeGatewayTitleDefault, isVolatileTokenStatusRow, TITLE_GENERATION_MARKER } from "../tmux-helpers";
+import {
+  DEFAULT_UNSET_ENV_KEYS,
+  fakeGatewayTitleDefault,
+  fxChildEnv,
+  isVolatileTokenStatusRow,
+  TITLE_GENERATION_MARKER,
+  TMUX_NO_CONFIG,
+} from "../tmux-helpers";
 import {
   ACTIVE_TOOL_MARKER,
   analyzeRun,
@@ -22,6 +29,7 @@ import {
   findFooters,
   readQuiescence,
   TERMINAL_TOOL_MARKER,
+  PROMPT_TEXT,
   traceCountersFromTrace,
 } from "./analyzer";
 import type {
@@ -119,8 +127,7 @@ function permissionDecisionResponse(): Response {
 
 const SCENARIO = "same-shell-relaunch";
 const BUFFER_SYSTEM_FRAME_BENCH = "buffer-system-frame-bench";
-const STARTUP_SCROLLBACK_DISABLED_OVERFLOW = "startup-scrollback-disabled-overflow";
-const STARTUP_SCROLLBACK_ENABLED_OVERFLOW = "startup-scrollback-enabled-overflow";
+const STARTUP_OVERFLOW = "startup-overflow";
 const ACTIVE_TOOL_PLACEMENT = "active-tool-placement";
 const USER_CARD_RESIZE_REPLAY_SCROLLBACK = "user-card-resize-replay-scrollback";
 const TUI_OBSERVABILITY_GAUNTLET = "tui-observability-gauntlet";
@@ -140,7 +147,6 @@ const DEFAULT_BENCH_SIZES: RenderLabTerminalSize[] = [
 ];
 const BENCHMARK_COMBINED_P95_LIMIT_MS = 8;
 const BENCHMARK_P95_MIN_RUNS = 20;
-const PROMPT_TEXT = "FX_RENDER_LAB%";
 const TRACE_SCOPES =
   "render,paint,resize,scroll,footer.clean,input,permission,frame_layout,frame_plan,frame_diff,frame_commit,frame_owner_violation,frame_schedule,ui_activity";
 const QUIESCENCE_INTERVAL_MS = 300;
@@ -185,17 +191,8 @@ export async function runRenderLab(rawOptions: Partial<Options> = {}): Promise<R
       results.push(await runUserCardResizeReplayScrollback(options.out, i + 1));
     } else if (options.scenario === TUI_OBSERVABILITY_GAUNTLET) {
       results.push(await runTuiObservabilityGauntlet(options.out, i + 1));
-    } else if (
-      options.scenario === STARTUP_SCROLLBACK_DISABLED_OVERFLOW ||
-      options.scenario === STARTUP_SCROLLBACK_ENABLED_OVERFLOW
-    ) {
-      results.push(
-        await runStartupScrollbackOverflow(
-          options.out,
-          i + 1,
-          options.scenario === STARTUP_SCROLLBACK_ENABLED_OVERFLOW,
-        ),
-      );
+    } else if (options.scenario === STARTUP_OVERFLOW) {
+      results.push(await runStartupOverflow(options.out, i + 1));
     } else if (isNativeScenario(options.scenario)) {
       results.push(await runNativeRenderLab(options.scenario, options.out, i + 1));
     } else {
@@ -206,8 +203,7 @@ export async function runRenderLab(rawOptions: Partial<Options> = {}): Promise<R
           ACTIVE_TOOL_PLACEMENT,
           USER_CARD_RESIZE_REPLAY_SCROLLBACK,
           TUI_OBSERVABILITY_GAUNTLET,
-          STARTUP_SCROLLBACK_DISABLED_OVERFLOW,
-          STARTUP_SCROLLBACK_ENABLED_OVERFLOW,
+          STARTUP_OVERFLOW,
           ...nativeScenarioNames(),
         ].join(", ")}`,
       );
@@ -1028,16 +1024,10 @@ function activeToolPlacement(
   return markerRows[0] === footer.topDivider - 1 ? "transient" : "transcript";
 }
 
-async function runStartupScrollbackOverflow(
-  outRoot: string,
-  runNumber: number,
-  startupScrollback: boolean,
-): Promise<RenderLabManifest> {
+async function runStartupOverflow(outRoot: string, runNumber: number): Promise<RenderLabManifest> {
   preflight();
 
-  const scenario = startupScrollback
-    ? STARTUP_SCROLLBACK_ENABLED_OVERFLOW
-    : STARTUP_SCROLLBACK_DISABLED_OVERFLOW;
+  const scenario = STARTUP_OVERFLOW;
   const startedAt = new Date();
   const markerSuffix = randomBytes(4).toString("hex");
   const runId = `${scenario}-${timestampForPath(startedAt)}-${runNumber}-${markerSuffix}`;
@@ -1085,7 +1075,7 @@ async function runStartupScrollbackOverflow(
   mkdirSync(join(fixture.home, ".fx"), { recursive: true });
   writeFileSync(
     join(fixture.home, ".fx", "settings.json"),
-    `${JSON.stringify({ startup_scrollback: startupScrollback })}\n`,
+    `${JSON.stringify({})}\n`,
   );
   const gateway = startLocalGatewayFixture(promptTail);
   let session: RenderLabTmux | null = null;
@@ -2088,6 +2078,28 @@ async function writeReplaySummary(manifest: RenderLabManifest): Promise<void> {
   }
 }
 
+/// The command that starts `shell` in a render-lab pane. A pane inherits the
+/// tmux server's environment, so `env` first drops every name TmuxSession
+/// drops, then sets `assignments`, which therefore keep their values.
+export function renderLabPaneCommand(shell: string, assignments: Record<string, string>): string {
+  return [
+    "env",
+    ...DEFAULT_UNSET_ENV_KEYS.flatMap((key) => ["-u", key]),
+    ...Object.entries(assignments).map(([key, value]) => `${key}=${shQuote(value)}`),
+    shQuote(shell),
+    // The fixture owns ZDOTDIR, so runner-global startup files must not run.
+    "-d",
+    "-i",
+  ].join(" ");
+}
+
+/// The tmux arguments that start a render-lab session running `command`. A
+/// server they start loads no config, so a developer's tmux.conf cannot
+/// change what render-lab records.
+export function renderLabSessionArgs(name: string, width: number, height: number, cwd: string, command: string): string[] {
+  return [...TMUX_NO_CONFIG, "new-session", "-d", "-s", name, "-x", String(width), "-y", String(height), "-c", cwd, command];
+}
+
 class RenderLabTmux {
   readonly name: string;
   readonly fixture: Fixture;
@@ -2106,45 +2118,22 @@ class RenderLabTmux {
   }): Promise<RenderLabTmux> {
     const name = `fx-render-lab-${process.pid}-${randomBytes(4).toString("hex")}`;
     const env = testEnv(opts.fixture, opts.manifest);
-    const command = [
-      "env",
-      "-u",
-      "AI_GATEWAY_API_KEY",
-      "-u",
-      "VERCEL_OIDC_TOKEN",
-      "FX_DISABLE_KEYCHAIN=1",
-      "FX_TEST_SKIP_ONBOARDING=1",
-      `HOME=${shQuote(opts.fixture.home)}`,
-      `ZDOTDIR=${shQuote(opts.fixture.zdotdir)}`,
-      `HISTFILE=${shQuote(opts.fixture.histfile)}`,
-      `SHELL=${shQuote(zshPath())}`,
-      `FX_TRACE_LOG=${shQuote(opts.manifest.traceLogPath)}`,
-      `FX_TRACE_SCOPES=${shQuote(TRACE_SCOPES)}`,
-      `SHELL_A_BEFORE_FIRST=${shQuote(opts.manifest.markers.shell[0] ?? "")}`,
-      `SHELL_A_BETWEEN_LAUNCHES=${shQuote(opts.manifest.markers.shell[1] ?? "")}`,
-      `SHELL_A_BEFORE_THIRD=${shQuote(opts.manifest.markers.shell[2] ?? "")}`,
-      shQuote(zshPath()),
-      // The fixture owns ZDOTDIR, so runner-global startup files must not run.
-      "-d",
-      "-i",
-    ].join(" ");
+    const command = renderLabPaneCommand(zshPath(), {
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_WORKSPACE_TRUST: "1",
+      HOME: opts.fixture.home,
+      ZDOTDIR: opts.fixture.zdotdir,
+      HISTFILE: opts.fixture.histfile,
+      SHELL: zshPath(),
+      FX_TRACE_LOG: opts.manifest.traceLogPath,
+      FX_TRACE_SCOPES: TRACE_SCOPES,
+      SHELL_A_BEFORE_FIRST: opts.manifest.markers.shell[0] ?? "",
+      SHELL_A_BETWEEN_LAUNCHES: opts.manifest.markers.shell[1] ?? "",
+      SHELL_A_BEFORE_THIRD: opts.manifest.markers.shell[2] ?? "",
+    });
 
-    tmux(
-      [
-        "new-session",
-        "-d",
-        "-s",
-        name,
-        "-x",
-        String(opts.width),
-        "-y",
-        String(opts.height),
-        "-c",
-        opts.fixture.work,
-        command,
-      ],
-      env,
-    );
+    tmux(renderLabSessionArgs(name, opts.width, opts.height, opts.fixture.work, command), env);
     const session = new RenderLabTmux(name, opts.fixture);
     await sleep(800);
     await session.waitForPane((pane) => pane.includes(PROMPT_TEXT), 10_000);
@@ -2316,11 +2305,10 @@ function preflightBinaryOnly(): void {
 }
 
 function testEnv(fixture: Fixture, manifest: RenderLabManifest): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  delete env.AI_GATEWAY_API_KEY;
-  delete env.VERCEL_OIDC_TOKEN;
+  const env: NodeJS.ProcessEnv = fxChildEnv();
   env.FX_DISABLE_KEYCHAIN = "1";
   env.FX_TEST_SKIP_ONBOARDING = "1";
+  env.FX_TEST_SKIP_WORKSPACE_TRUST = "1";
   env.HOME = fixture.home;
   env.ZDOTDIR = fixture.zdotdir;
   env.HISTFILE = fixture.histfile;
@@ -2491,9 +2479,8 @@ function printHelp(): void {
       "benchmark scenarios:",
       `  ${BUFFER_SYSTEM_FRAME_BENCH}`,
       "",
-      "startup scrollback scenarios:",
-      `  ${STARTUP_SCROLLBACK_DISABLED_OVERFLOW}`,
-      `  ${STARTUP_SCROLLBACK_ENABLED_OVERFLOW}`,
+      "startup scenarios:",
+      `  ${STARTUP_OVERFLOW}`,
       "",
       "activity scenarios:",
       `  ${ACTIVE_TOOL_PLACEMENT}`,
@@ -2518,9 +2505,8 @@ function printScenarioList(): void {
       "benchmark scenarios:",
       `  ${BUFFER_SYSTEM_FRAME_BENCH}`,
       "",
-      "startup scrollback scenarios:",
-      `  ${STARTUP_SCROLLBACK_DISABLED_OVERFLOW}`,
-      `  ${STARTUP_SCROLLBACK_ENABLED_OVERFLOW}`,
+      "startup scenarios:",
+      `  ${STARTUP_OVERFLOW}`,
       "",
       "activity scenarios:",
       `  ${ACTIVE_TOOL_PLACEMENT}`,
@@ -2623,7 +2609,7 @@ function tmux(args: string[], env?: NodeJS.ProcessEnv): string {
   return execFileSync("tmux", args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    env: env ? { ...process.env, ...env } : process.env,
+    env: env ?? process.env,
   });
 }
 

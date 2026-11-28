@@ -156,6 +156,8 @@ export async function steering(agent: FxEngine): Promise<void> {
   const { id } = await steer;
   const withdrawn = await turn.withdraw(id);
   assertType<Equal<typeof withdrawn, "withdrawn" | "already_placed">>();
+  const yielded: Promise<void> = turn.yield();
+  void yielded;
   // @ts-expect-error steering accepts only text blocks
   turn.steer([{ type: "image", data: "aGk=", mimeType: "image/png" }]);
   turn.cancel();

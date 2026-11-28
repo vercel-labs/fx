@@ -8,7 +8,7 @@
 //! can send a stop or a close into that gap every time
 //! (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a stop right after a
 //! subagent's turn ended finds it not working" and "a close right after a
-//! subagent's turn ended closes it as an idle one"). Only those tests set the
+//! subagent's turn ended closes it as an idle one"). Only tests set the
 //! controls, so the libfx artifacts leave them out. A build that sets neither
 //! control reads one environment variable per end and does nothing more.
 //!
@@ -19,6 +19,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 const end_test_controls = @import("end_test_controls.zig");
+const hold_marker = @import("../shared/hold_marker.zig");
 
 var holds = std.atomic.Value(u32).init(0);
 
@@ -42,7 +43,7 @@ pub fn holdPublish(child_id: []const u8) void {
     const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ release, n }) catch return;
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, "publish child={s}", .{child_id}) catch return;
-    end_test_controls.writeMarker(marker, contents) catch return;
+    hold_marker.write(marker, contents) catch return;
     const deadline = io_mod.milliTimestamp() + end_test_controls.max_hold_ms;
     while (!end_test_controls.pathExists(release) and !end_test_controls.pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);

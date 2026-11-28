@@ -1235,12 +1235,12 @@ test "a resumed transcript keeps the rows it painted until a frame repaints them
     try runtime.transcriptWindowResumed(alloc, true);
 
     // The first frame paints the resumed flow and hands it to the anchor,
-    // which stays invalid until the next frame.
+    // whose rows come from that flow, not the entries, until the next frame.
     var handoff = try transcriptFrame(alloc, &runtime, runtime.notebook.pending_resume_source.?.bytes, .none);
     defer handoff.deinit(alloc);
     runtime.consumeTranscriptTransition(alloc, &handoff, committedFrameResult());
     try std.testing.expectEqual(@as(usize, 0), runtime.pendingResumeFlow().len);
-    try std.testing.expect(runtime.transcript_commit_state == .invalid);
+    try std.testing.expect(runtime.transcript_commit_state == .stable);
     // A turn that ends before the next frame lets the closed cycle go, and
     // what is on screen stays.
     try runTurn(alloc, &runtime, &metrics, "AFTER_RESUME", "REPLY\n");

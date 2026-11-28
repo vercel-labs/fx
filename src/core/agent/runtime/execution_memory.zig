@@ -1083,33 +1083,29 @@ pub fn prepareCapturedToolModelOutput(
         candidate.policy() == .required
     else
         false;
-    if (!required_command_replay and
-        (config.session_child_capability != null or config.tool_result_dir != null))
-    {
-        const sanitized_output = try tool_result_limits.prepareSanitizedOutput(
-            arena,
-            raw_output,
-        );
-        if (config.session_child_capability != null) {
+    if (!required_command_replay) {
+        if (config.session_child_capability) |capability| {
             return result_store.prepareManaged(
                 arena,
-                config.session_child_capability,
+                capability,
                 tool_call.id,
                 tool_call.name,
                 raw_output.len,
-                sanitized_output,
+                try tool_result_limits.prepareSanitizedOutput(arena, raw_output),
                 config.max_tool_result_bytes,
             );
         }
-        return result_store.prepare(
-            arena,
-            config.tool_result_dir,
-            tool_call.id,
-            tool_call.name,
-            raw_output.len,
-            sanitized_output,
-            config.max_tool_result_bytes,
-        );
+        if (config.tool_result_dir) |dir| {
+            return result_store.prepare(
+                arena,
+                dir,
+                tool_call.id,
+                tool_call.name,
+                raw_output.len,
+                try tool_result_limits.prepareSanitizedOutput(arena, raw_output),
+                config.max_tool_result_bytes,
+            );
+        }
     }
     const model_output_budget = if (required_command_replay)
         config.max_tool_result_bytes -| command_replay_store.model_handle_notice_reserve_bytes

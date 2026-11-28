@@ -104,7 +104,7 @@ fn collectScoredMatches(
     return out.toOwnedSlice(alloc);
 }
 
-pub const Action = enum { message, wait, status, stop, close };
+pub const Action = enum { message, wait, status, stop, close, approve, deny };
 
 /// The name a subagent gives its own parent in `message{agent}`. No child
 /// can be named it.
@@ -125,6 +125,8 @@ pub const RequestInput = union(Action) {
     status: struct { agent: ?[]const u8 = null },
     stop: struct { agent: []const u8 },
     close: struct { agent: []const u8 },
+    approve: struct { agent: []const u8 },
+    deny: struct { agent: []const u8, message: ?[]const u8 = null },
 };
 
 /// Creation-time overrides carried by a request. Model and effort default to
@@ -162,6 +164,10 @@ pub const Request = union(Action) {
     stop: struct { agent: []u8 },
     /// Stops a subagent and removes it for good, with its conversation.
     close: struct { agent: []u8 },
+    /// Allows the approval request the subagent waits on, once.
+    approve: struct { agent: []u8 },
+    /// Refuses the approval request the subagent waits on; `message` tells it why.
+    deny: struct { agent: []u8, message: ?[]u8 = null },
 
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
@@ -176,6 +182,11 @@ pub const Request = union(Action) {
             .status => |value| if (value.agent) |agent| alloc.free(agent),
             .stop => |value| alloc.free(value.agent),
             .close => |value| alloc.free(value.agent),
+            .approve => |value| alloc.free(value.agent),
+            .deny => |value| {
+                alloc.free(value.agent);
+                if (value.message) |message| alloc.free(message);
+            },
         }
         self.* = undefined;
     }
@@ -191,6 +202,8 @@ pub const Request = union(Action) {
             .status => |value| value.agent,
             .stop => |value| value.agent,
             .close => |value| value.agent,
+            .approve => |value| value.agent,
+            .deny => |value| value.agent,
         };
     }
 
@@ -203,7 +216,7 @@ pub const Request = union(Action) {
     pub fn override(self: Request) Override {
         return switch (self) {
             .message => |value| .{ .model = value.model, .effort = value.effort, .profile = value.profile },
-            .wait, .status, .stop, .close => .{},
+            .wait, .status, .stop, .close, .approve, .deny => .{},
         };
     }
 };
@@ -211,7 +224,7 @@ pub const Request = union(Action) {
 pub const ValidationError = error{
     OutOfMemory,
     InvalidAgent,
-    /// `stop` or `close` named "parent", which is no subagent of the caller's.
+    /// `stop`, `close`, `approve` or `deny` named "parent", which is no subagent of the caller's.
     InvalidParentTarget,
     InvalidInstructions,
     InvalidMessage,
@@ -284,6 +297,22 @@ pub fn validateRequest(
             if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
             if (std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidParentTarget;
             break :blk .{ .close = .{ .agent = try alloc.dupe(u8, value.agent) } };
+        },
+        .approve => |value| blk: {
+            if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
+            if (std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidParentTarget;
+            break :blk .{ .approve = .{ .agent = try alloc.dupe(u8, value.agent) } };
+        },
+        .deny => |value| blk: {
+            if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
+            if (std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidParentTarget;
+            if (value.message) |message| try validateText(message, domain.max_message_bytes, error.InvalidMessage);
+            const agent = try alloc.dupe(u8, value.agent);
+            errdefer alloc.free(agent);
+            break :blk .{ .deny = .{
+                .agent = agent,
+                .message = try dupeOptional(alloc, value.message),
+            } };
         },
     };
 }
@@ -368,7 +397,7 @@ pub fn requestFingerprint(request: Request) [32]u8 {
     hash.update(@tagName(request.action()));
     hash.update("\x00");
     switch (request) {
-        .wait, .status, .stop, .close => return hash.finalResult(),
+        .wait, .status, .stop, .close, .approve, .deny => return hash.finalResult(),
         .message => |value| {
             hash.update(value.agent);
             hash.update("\x00");
@@ -479,7 +508,7 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
 
 test "minimal request validation owns each action's intent" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 5), @typeInfo(Action).@"enum".field_names.len);
+    try std.testing.expectEqual(@as(usize, 7), @typeInfo(Action).@"enum".field_names.len);
     var wait = try validateRequest(alloc, .wait);
     defer wait.deinit(alloc);
     try std.testing.expectEqual(Action.wait, wait.action());

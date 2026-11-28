@@ -10,7 +10,7 @@
 //! end the agent's step in that gap every time
 //! (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a report that waits in the
 //! main loop's hand-off as an empty reply ends takes the nudge's place").
-//! Only that test sets the controls, so the libfx artifacts leave them out.
+//! Only tests set the controls, so the libfx artifacts leave them out.
 //! Unlike the other holds, this one never blocks: the main loop keeps running
 //! while it defers.
 //!
@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 const end_test_controls = @import("end_test_controls.zig");
+const hold_marker = @import("../shared/hold_marker.zig");
 
 /// The hold that now defers the delivery. Only the main loop calls
 /// `deferred`, so neither it nor `holds` needs a lock.
@@ -69,7 +70,7 @@ fn writeHeldMarker(files: end_test_controls.HoldFiles, n: u32, child_id: []const
     const marker = try std.mem.print(&marker_buf, "{s}.{d}", .{ files.held, n });
     var contents_buf: [256]u8 = undefined;
     const contents = try std.mem.print(&contents_buf, "report_delivery child={s}", .{child_id});
-    try end_test_controls.writeMarker(marker, contents);
+    try hold_marker.write(marker, contents);
 }
 
 fn deferEveryReport(_: []const u8) bool {
@@ -132,7 +133,7 @@ test "a delivery hold with a marker it can write holds until its release file ex
     try std.testing.expectEqual(@as(u32, 1), holds);
 
     // The release file ends it.
-    try end_test_controls.writeMarker(release, "");
+    try hold_marker.write(release, "");
     try std.testing.expect(!deferOnFiles(files, "child-1"));
     try std.testing.expect(active == null);
 }

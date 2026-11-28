@@ -6,11 +6,11 @@
 // owners.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const io_mod = @import("../../core/shared/io.zig");
 const record_tape = @import("../../core/workspace/record_tape.zig");
 const types = @import("../../core/shared/types.zig");
 const terminal_diff = @import("../render_engine/terminal_diff.zig");
+const ui_terminal = @import("../terminal/terminal.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
@@ -40,8 +40,8 @@ pub fn disableShadowVt(shell: anytype) void {
 }
 
 /// Writes `bytes` to the terminal. A write that fails because the terminal
-/// hung up reports `error.TerminalHungUp` (`terminalHungUp`), so the frame
-/// commit can close fx as a hang-up; every other failure reports its own
+/// hung up reports `error.TerminalHungUp` (`ui_terminal.terminalGone`), so the
+/// frame commit can close fx as a hang-up; every other failure reports its own
 /// error.
 pub fn writeFrameBytes(shell: anytype, metrics: *Metrics, bytes: []const u8) terminal_diff.FrameSinkWriteResult {
     var accepted_bytes: usize = 0;
@@ -54,29 +54,12 @@ pub fn writeFrameBytes(shell: anytype, metrics: *Metrics, bytes: []const u8) ter
         ) catch |err| return recordPartialFrame(
             metrics,
             bytes[0..accepted_bytes],
-            if (terminalHungUp(shell.stdout_file, err)) error.TerminalHungUp else err,
+            if (ui_terminal.terminalGone(shell.stdout_file.handle, err)) error.TerminalHungUp else err,
         );
         if (written == 0) return recordPartialFrame(metrics, bytes[0..accepted_bytes], error.NoProgress);
         accepted_bytes += written;
     }
     return recordCompleteFrame(metrics, bytes);
-}
-
-/// Whether a write to `file` failed with `err` because the terminal hung up,
-/// as when its window closed: the write failed with EIO, and the descriptor
-/// polls as hung up. Linux and macOS both report a pty whose other end closed
-/// with POLLHUP. Once the hang-up ends the terminal's session, macOS revokes
-/// the terminal, and the descriptor then polls POLLNVAL instead.
-fn terminalHungUp(file: std.Io.File, err: anyerror) bool {
-    if (comptime builtin.target.os.tag == .wasi) return false;
-    if (err != error.InputOutput) return false;
-    var fds = [_]std.posix.pollfd{.{
-        .fd = file.handle,
-        .events = std.posix.POLL.OUT,
-        .revents = 0,
-    }};
-    _ = std.posix.poll(&fds, 0) catch return false;
-    return (fds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0;
 }
 
 fn recordPartialFrame(metrics: *Metrics, accepted: []const u8, err: anyerror) terminal_diff.FrameSinkWriteResult {

@@ -8,8 +8,9 @@ import {
   analyzeRun,
   readQuiescence,
 } from "./render-lab/analyzer";
+import { renderLabPaneCommand, renderLabSessionArgs } from "./render-lab/index";
 import type { RenderLabFrame, RenderLabManifest } from "./render-lab/types";
-import { tmuxAvailable } from "./tmux-helpers";
+import { DEFAULT_UNSET_ENV_KEYS, tmuxAvailable } from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 120_000;
@@ -29,8 +30,7 @@ test("render-lab lists gated Plan B native scenarios", () => {
 
   expect(output).toContain("same-shell-relaunch");
   expect(output).toContain("buffer-system-frame-bench");
-  expect(output).toContain("startup-scrollback-disabled-overflow");
-  expect(output).toContain("startup-scrollback-enabled-overflow");
+  expect(output).toContain("startup-overflow");
   expect(output).toContain("active-tool-placement");
   expect(output).toContain("user-card-resize-replay-scrollback");
   expect(output).toContain("tui-observability-gauntlet");
@@ -137,6 +137,55 @@ test("native render-lab scenarios require explicit opt-in", () => {
 
   expect(result.status).not.toBe(0);
   expect(result.stderr).toContain("FX_RENDER_LAB_NATIVE=1");
+});
+
+test.skipIf(SKIP)("a render-lab tmux server ignores the developer's tmux config", () => {
+  outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-tmux-config-test-"));
+  // render-lab reads the whole scrollback, so a short history would cut it.
+  const hostileConfig = "set -g history-limit 1\nset -g remain-on-exit-format 'HOSTILE'\n";
+  writeFileSync(join(outDir, ".tmux.conf"), hostileConfig);
+  mkdirSync(join(outDir, ".config", "tmux"), { recursive: true });
+  writeFileSync(join(outDir, ".config", "tmux", "tmux.conf"), hostileConfig);
+  const socket = `fx-render-lab-config-${process.pid}-${Date.now().toString(36)}`;
+  const referenceSocket = `${socket}-ref`;
+  const state = (socketName: string) => execFileSync(
+    "tmux",
+    ["-L", socketName, "display-message", "-p", "-t", "render-lab", "#{history-limit}|#{remain-on-exit-format}"],
+    { encoding: "utf8" },
+  ).trim();
+  try {
+    execFileSync("tmux", ["-L", socket, ...renderLabSessionArgs("render-lab", 80, 24, outDir, "sleep 30")], {
+      env: { ...process.env, HOME: outDir, XDG_CONFIG_HOME: join(outDir, ".config") },
+    });
+    // tmux's defaults, from a server that loads no config at all.
+    execFileSync("tmux", ["-L", referenceSocket, "-f", "/dev/null", "new-session", "-d", "-s", "render-lab", "sleep 30"]);
+    expect(state(socket)).toBe(state(referenceSocket));
+  } finally {
+    for (const socketName of [socket, referenceSocket]) {
+      try {
+        execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" });
+      } catch {}
+    }
+  }
+});
+
+test("a render-lab pane starts without the names TmuxSession clears and keeps its own values", () => {
+  outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-pane-env-test-"));
+  // The probe takes the shell's place and prints the environment it gets.
+  const probe = join(outDir, "probe");
+  writeFileSync(probe, "#!/bin/sh\nenv\n", { mode: 0o755 });
+  const inherited = Object.fromEntries(DEFAULT_UNSET_ENV_KEYS.map((key) => [key, `stale-${key.toLowerCase()}`]));
+  const command = renderLabPaneCommand(probe, { FX_PERMISSION_MODE: "render-lab-own", HOME: outDir });
+
+  const paneEnv = execFileSync("/bin/sh", ["-c", command], {
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...inherited },
+    encoding: "utf8",
+  }).split("\n");
+
+  expect(DEFAULT_UNSET_ENV_KEYS).toContain("FX_TEST_GREP_RELEASE");
+  expect(paneEnv.filter((row) => row.includes("=stale-"))).toEqual([]);
+  expect(paneEnv).toContain("FX_PERMISSION_MODE=render-lab-own");
+  expect(paneEnv).toContain(`HOME=${outDir}`);
 });
 
 test("render-lab analyzer flags excess gap before transient activity", () => {
@@ -723,31 +772,11 @@ describe.skipIf(SKIP)("tui: render lab", () => {
   );
 
   test(
-    "startup scrollback disabled overflow artifacts pass tape oracle",
+    "startup overflow artifacts pass tape oracle",
     () => {
-      const artifacts = runScenarioArtifacts("startup-scrollback-disabled-overflow");
+      const artifacts = runScenarioArtifacts("startup-overflow");
       expect(artifacts.manifest.failures).toEqual([]);
       expect(artifacts.trace).toMatch(/\[scroll\] preserved_row_release .*accepted=[1-9]\d* .*owned_top=1(?:\s|$)/);
-      expect(artifacts.manifest.frames.some((frame) => frame.event === "overflow-long-prompt-editor-tail-visible")).toBe(true);
-      expect(artifacts.manifest.frames.some((frame) => frame.event === "overflow-submitted-prompt-tail-visible")).toBe(true);
-      expect(artifacts.finalFrame.grid.some((row) => row.includes(artifacts.manifest.markers.submitted[0]!))).toBe(true);
-      expect(artifacts.manifest.markers.history?.every((marker) => artifacts.finalFrame.scrollback.includes(marker))).toBe(true);
-      expect(artifacts.finalFrame.grid.some((row) => /^┃\s*$/.test(row))).toBe(true);
-      expect(artifacts.finalFrame.grid.some((row) => row.includes("HTTP 401"))).toBe(false);
-      expect(artifacts.finalFrame.grid.some((row) => row.includes("RENDER_LAB_LOCAL_GATEWAY_OK"))).toBe(false);
-      expect(artifacts.gatewayRequests).toEqual(["GET /coding-agent/v1/models", "POST /v4/ai/language-model"]);
-      expect(artifacts.stderr).toBe("");
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "startup scrollback enabled overflow starts eagerly without progressive release",
-    () => {
-      const artifacts = runScenarioArtifacts("startup-scrollback-enabled-overflow");
-      expect(artifacts.manifest.failures).toEqual([]);
-      expect(artifacts.trace).toMatch(/\[frame_layout\] fixed_point .*prior_owned_top=1 post_scroll_owned_top=1/);
-      expect(artifacts.trace).not.toMatch(/\[scroll\] preserved_row_release .*accepted=[1-9]\d*/);
       expect(artifacts.manifest.frames.some((frame) => frame.event === "overflow-long-prompt-editor-tail-visible")).toBe(true);
       expect(artifacts.manifest.frames.some((frame) => frame.event === "overflow-submitted-prompt-tail-visible")).toBe(true);
       expect(artifacts.finalFrame.grid.some((row) => row.includes(artifacts.manifest.markers.submitted[0]!))).toBe(true);

@@ -1127,6 +1127,7 @@ fn broadcastMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, k
                 // The engine lends the words until its next refusal; the frame
                 // copies them, as it copies the list.
                 .list_refusal = refusalMessage(owner, engine_value, a, key),
+                .dropped = droppedMessage(owner, engine_value, key),
                 .tools = toolsJson(owner, engine_value, a, key),
             },
         },
@@ -1174,6 +1175,12 @@ fn refusalMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key
     const index = liveSlotOf(owner, engine_value, key) orelse return null;
     const words = engine_value.status(index).list_refusal orelse return null;
     return a.dupe(u8, words) catch null;
+}
+
+/// How many tools of this server's list its engine left out, by reason, for the frame that carries the list.
+fn droppedMessage(owner: *Owner, engine_value: *engine.Engine, key: core.Key) mcp.tools.Dropped {
+    const index = liveSlotOf(owner, engine_value, key) orelse return .{};
+    return engine_value.status(index).dropped;
 }
 
 fn toolsJson(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: core.Key) []const u8 {

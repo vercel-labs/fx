@@ -5,6 +5,7 @@ const types = @import("../shared/types.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const context_limits = @import("../config/context_limits.zig");
 const elicitation = @import("../mcp/elicitation.zig");
+const mrtr = @import("../mcp/mrtr.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const access_policy = @import("../mcp/access_policy.zig");
 
@@ -13,6 +14,9 @@ const Allocator = std.mem.Allocator;
 pub const HasToolFn = *const fn (*anyopaque, []const u8, Access) bool;
 /// Whether `access` is a subagent's view of servers that have changed since it was given, which allows nothing now.
 pub const AccessChangedFn = *const fn (*anyopaque, Access) bool;
+/// What a search of MCP says when there is no MCP to search.
+pub const unavailable_search_output = "{\"tools\":[],\"count\":0,\"state\":\"unavailable\"}";
+
 /// Why a subagent's lookup of an MCP tool, server or search finds nothing after
 /// the session's servers changed under it, in the words every such answer ends with.
 pub const servers_changed_reason = "the session's MCP servers changed after it began. Work that starts later sees the current servers.";
@@ -24,28 +28,6 @@ pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.Per
 
 pub const Progress = mcp_contract.Progress;
 pub const ProgressSink = mcp_contract.ProgressSink;
-
-pub const ResolvedLiveView = struct {
-    /// Generation of the MCP-specific immutable view.
-    authority_generation: u64,
-    view: access_policy.View,
-    /// Full child authority generation for final action precommit.
-    action_authority_generation: u64 = 0,
-
-    pub fn deinit(self: *ResolvedLiveView, alloc: Allocator) void {
-        self.view.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-const LiveViewProvider = struct {
-    context: *anyopaque,
-    resolve_fn: *const fn (*anyopaque, Allocator) anyerror!ResolvedLiveView,
-
-    pub fn resolve(self: LiveViewProvider, alloc: Allocator) !ResolvedLiveView {
-        return self.resolve_fn(self.context, alloc);
-    }
-};
 
 /// The MCP servers an agent may use, by name: an instance's profile.
 pub const ServerFilter = struct {
@@ -63,21 +45,10 @@ pub const Access = union(enum) {
     /// Every tool of a server the filter allows. The host, which knows each
     /// tool's server, decides.
     servers: ServerFilter,
+    /// A subagent's view of the servers: the tools and servers its parent had when it was made.
     scoped: struct {
         captured: *const access_policy.View,
-        admission_authority_generation: u64,
-        live: LiveViewProvider,
-        action_authority_generation: u64 = 0,
     },
-
-    pub fn allowsTool(self: Access, runtime_generation: u64, name: []const u8) bool {
-        return switch (self) {
-            .unrestricted, .servers => true,
-            .disabled => false,
-            .scoped => |scope| scope.captured.runtime_generation == runtime_generation and
-                scope.captured.tool(name) != null,
-        };
-    }
 };
 
 pub const DefinitionSnapshot = union(enum) {
@@ -104,6 +75,10 @@ pub const CallOptions = struct {
 };
 
 pub const InputRequired = struct {
+    /// A 2026 round as the engine read it: the question's requests, in order, as slices of the server's own bytes
+    /// that stay valid while the question is asked. Empty for a 2025 question and a test, which give the text form.
+    requests: []const mrtr.RawRequest = &.{},
+    /// `{key: request, ...}` as text, read when `requests` is empty.
     input_requests_json: []const u8,
     request_state_json: ?[]const u8 = null,
     legacy_retry_without_responses: bool = false,
@@ -251,13 +226,11 @@ pub const CallStatus = enum {
     success,
     tool_failure,
     protocol_failure,
-    input_required,
 
     pub fn observed(self: CallStatus) observation.McpStatus {
         return switch (self) {
             .success => .success,
             .tool_failure, .protocol_failure => .failure,
-            .input_required => .input_required,
         };
     }
 };
@@ -266,19 +239,16 @@ test "MCP hook statuses normalize tool and protocol failures" {
     try std.testing.expectEqual(observation.McpStatus.success, CallStatus.success.observed());
     try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.tool_failure.observed());
     try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.protocol_failure.observed());
-    try std.testing.expectEqual(observation.McpStatus.input_required, CallStatus.input_required.observed());
 }
 
 pub const CallResult = struct {
     model_output: []const u8,
     images: []types.ToolImage = &.{},
     status: CallStatus = .success,
-    input_required: ?InputRequired = null,
 
     pub fn deinit(self: *CallResult, alloc: Allocator) void {
         alloc.free(self.model_output);
         types.freeToolImages(alloc, self.images);
-        self.deinitInputRequired(alloc);
         self.* = undefined;
     }
 
@@ -291,16 +261,8 @@ pub const CallResult = struct {
     pub fn takeModelOutput(self: *CallResult, alloc: Allocator) []const u8 {
         const model_output = self.model_output;
         types.freeToolImages(alloc, self.images);
-        self.deinitInputRequired(alloc);
         self.* = undefined;
         return model_output;
-    }
-
-    fn deinitInputRequired(self: *CallResult, alloc: Allocator) void {
-        if (self.input_required) |required| {
-            alloc.free(required.input_requests_json);
-            if (required.request_state_json) |state| alloc.free(state);
-        }
     }
 };
 
@@ -387,12 +349,6 @@ const AvailabilityInput = struct {
     runtime: RuntimeCapabilities,
 };
 
-const CallInput = struct {
-    advertised_dynamic_tool_names: []const []const u8,
-    runtime: RuntimeCapabilities,
-    max_tool_result_bytes: usize,
-    options: CallOptions = .{},
-};
 pub fn isAdvertisedDynamicToolName(
     advertised_dynamic_tool_names: []const []const u8,
     name: []const u8,
@@ -411,24 +367,6 @@ pub fn isAvailableDynamicTool(input: AvailabilityInput, name: []const u8) bool {
     return has_tool(context, name, input.runtime.access);
 }
 
-fn callAdvertisedDynamicTool(
-    input: CallInput,
-    arena: Allocator,
-    name: []const u8,
-    arguments_json: []const u8,
-) !?CallResult {
-    if (!isAdvertisedDynamicToolName(input.advertised_dynamic_tool_names, name)) return null;
-    const context = input.runtime.context orelse return null;
-    const call_tool = input.runtime.call_tool orelse return null;
-    return try call_tool(
-        context,
-        arena,
-        name,
-        arguments_json,
-        input.max_tool_result_bytes,
-        input.options,
-    );
-}
 /// The result of a direct call of an MCP tool the request didn't send. The
 /// name is the model's, so it is written as visible text.
 pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
@@ -446,45 +384,3 @@ test "a direct call of a tool the request didn't send names it as visible text" 
     try std.testing.expect(std.mem.find(u8, text, "mcp_x&#x00;y is not one of the tools") != null);
     for (text) |byte| try std.testing.expect(byte >= 0x20);
 }
-test "MCP advertised dynamic tool executes only through its supplied capability" {
-    var fixture = Fixture.CountingContext{};
-    const advertised = [_][]const u8{"mcp_fs_read"};
-    const input = CallInput{
-        .advertised_dynamic_tool_names = &advertised,
-        .runtime = .{
-            .context = @ptrCast(&fixture),
-            .call_tool = Fixture.callCounting,
-        },
-        .max_tool_result_bytes = 1024,
-    };
-
-    const result = (try callAdvertisedDynamicTool(
-        input,
-        std.testing.allocator,
-        "mcp_fs_read",
-        "{}",
-    )).?;
-    defer std.testing.allocator.free(result.model_output);
-
-    try std.testing.expectEqualStrings("mcp ok", result.model_output);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect((try callAdvertisedDynamicTool(
-        input,
-        std.testing.allocator,
-        "mcp_other",
-        "{}",
-    )) == null);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-}
-
-const Fixture = struct {
-    const CountingContext = struct {
-        calls: usize = 0,
-    };
-
-    fn callCounting(raw_context: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, _: CallOptions) anyerror!?CallResult {
-        const context: *CountingContext = @ptrCast(@alignCast(raw_context));
-        context.calls += 1;
-        return .{ .model_output = try arena.dupe(u8, "mcp ok") };
-    }
-};

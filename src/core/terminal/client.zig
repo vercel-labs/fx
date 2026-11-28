@@ -415,6 +415,18 @@ pub const Runtime = struct {
         return self.projection.clear(alloc);
     }
 
+    /// Ends the in-flight mark that a start with `retain_in_flight` left on
+    /// `session_id`, once its caller has indexed the terminal or given up.
+    /// The backend mutex is held only to read the backend, which `deinit`
+    /// alone frees, so no lock is held while the store takes its own.
+    pub fn endStart(self: *Runtime, session_id: []const u8) void {
+        const zio = io_mod.getIo();
+        self.backend_mutex.lockUncancelable(zio);
+        const backend = self.backend;
+        self.backend_mutex.unlock(zio);
+        if (backend) |value| value.store.end_start(session_id);
+    }
+
     /// Ends every terminal this runtime started, with no prompt, and refuses
     /// later requests. Running requests are cancelled. For process-exit paths
     /// that skip `deinit`; idempotent, and bounded by the registry's exit
@@ -656,27 +668,19 @@ pub const Runtime = struct {
 
 fn ignoreLiveWork(_: ?*anyopaque, _: bool) void {}
 
+/// Test builds only: runs with the lock free, after a worker registers a request and before its thread starts. Set by "a cancel that lands right after the worker takes a request is not lost".
+var test_after_take: if (builtin.is_test) ?*const fn (runtime: *Runtime, correlation_id: contracts.CorrelationId) void else void = if (builtin.is_test) null else {};
+
 fn workerMain(runtime: *Runtime) void {
     const alloc = runtime.alloc.?;
     while (true) {
-        const intent = takeIntent(runtime) orelse return;
-        const worker = alloc.create(RequestWorker) catch {
-            finishUnstarted(runtime, alloc, intent);
-            continue;
+        const spare = alloc.create(RequestWorker) catch null;
+        const worker = switch (takeAndRegister(runtime, spare)) {
+            .stopped => return,
+            .unstarted => continue,
+            .started => |started| started,
         };
-        worker.* = .{ .runtime = runtime, .intent = intent };
-
-        const zio = io_mod.getIo();
-        runtime.mutex.lockUncancelable(zio);
-        const slot = runtime.registerWorkerLocked(worker);
-        if (slot) |index| worker.slot = index;
-        runtime.mutex.unlock(zio);
-        if (slot == null) {
-            const unstarted = worker.intent;
-            alloc.destroy(worker);
-            finishUnstarted(runtime, alloc, unstarted);
-            continue;
-        }
+        if (builtin.is_test) if (test_after_take) |hook| hook(runtime, worker.intent.correlation_id);
         // Tickets are issued here, in admission order, before any worker of
         // a later request can run.
         if (operation.requiresOrderedMutation(worker.intent.request.value)) {
@@ -793,6 +797,8 @@ fn closeCancelledStart(
         },
         .failure => return,
     };
+    // The caller only learns `.cancelled`, so nobody else ends the mark.
+    defer if (start.retain_in_flight) backend.store.end_start(session_id);
     var close_request: contracts.ActionRequest = .{ .close = .{
         .session_id = session_id,
         .policy = .force,
@@ -843,32 +849,55 @@ fn persistCancellation(backend: *Backend, request: contracts.ActionRequest) void
     };
 }
 
-fn finishUnstarted(
-    runtime: *Runtime,
-    alloc: Allocator,
-    intent_value: Intent,
-) void {
-    var intent = intent_value;
-    const correlation_id = intent.correlation_id;
-    intent.deinit(alloc);
-    const zio = io_mod.getIo();
-    runtime.mutex.lockUncancelable(zio);
-    defer runtime.mutex.unlock(zio);
-    runtime.completions.push(.{
-        .kind = .disconnected,
-        .correlation_id = correlation_id,
-    });
-}
+const Taken = union(enum) {
+    stopped,
+    unstarted,
+    started: *RequestWorker,
+};
 
-fn takeIntent(runtime: *Runtime) ?Intent {
+/// Waits for work, then takes the next request and registers its worker in
+/// one hold of `runtime.mutex`. `cancel` therefore finds the request in the
+/// queue or the active table at every moment the lock is free. `spare` is the
+/// worker allocated before the hold, or null if that allocation failed. It
+/// is freed when it is not registered.
+fn takeAndRegister(runtime: *Runtime, spare: ?*RequestWorker) Taken {
+    const alloc = runtime.alloc.?;
     const zio = io_mod.getIo();
     runtime.mutex.lockUncancelable(zio);
     defer runtime.mutex.unlock(zio);
     while (runtime.queue.len == 0 and !runtime.stopping) {
         runtime.wake.waitUncancelable(zio, &runtime.mutex);
     }
-    if (runtime.stopping) return null;
-    return runtime.queue.take();
+    const intent = (if (runtime.stopping) null else runtime.queue.take()) orelse {
+        if (spare) |worker| alloc.destroy(worker);
+        return .stopped;
+    };
+    const worker = spare orelse return finishUnstartedLocked(runtime, intent, "allocation failed");
+    worker.* = .{ .runtime = runtime, .intent = intent };
+    if (runtime.registerWorkerLocked(worker)) |index| {
+        worker.slot = index;
+        return .{ .started = worker };
+    }
+    alloc.destroy(worker);
+    return finishUnstartedLocked(runtime, intent, "no free worker slot");
+}
+
+/// Ends a request that got no worker. It runs under `runtime.mutex`, so the
+/// request never leaves the queue without a completion while the lock is free.
+fn finishUnstartedLocked(runtime: *Runtime, intent_value: Intent, reason: []const u8) Taken {
+    var intent = intent_value;
+    const correlation_id = intent.correlation_id;
+    debug_trace.logf(
+        "terminal_client",
+        "request dropped unstarted correlation={d} reason={s}",
+        .{ correlation_id.value, reason },
+    );
+    intent.deinit(runtime.alloc.?);
+    runtime.completions.push(.{
+        .kind = .disconnected,
+        .correlation_id = correlation_id,
+    });
+    return .unstarted;
 }
 
 var file_descriptor_budget_checked: std.atomic.Value(bool) = .init(false);
@@ -1036,14 +1065,10 @@ test "runtime correlation stays reserved until its completion is taken" {
     // Finishing frees the worker and its intent; the testing allocator
     // reports a leak or a double free if it doesn't free them exactly once.
     const worker = try std.testing.allocator.create(RequestWorker);
-    worker.* = .{
-        .runtime = &runtime,
-        .intent = takeIntent(&runtime).?,
-    };
-    const zio = io_mod.getIo();
-    runtime.mutex.lockUncancelable(zio);
-    worker.slot = runtime.registerWorkerLocked(worker).?;
-    runtime.mutex.unlock(zio);
+    try std.testing.expectEqual(
+        Taken{ .started = worker },
+        takeAndRegister(&runtime, worker),
+    );
     try std.testing.expectError(
         error.DuplicateCorrelation,
         admitTestIntent(&runtime, 23),
@@ -1601,6 +1626,236 @@ test "cancelling a start after its terminal launched closes that terminal" {
         contracts.Lifecycle.closed,
         try fixture.recordedLifecycle(session_id),
     );
+}
+
+test "a cancel that lands right after the worker takes a request is not lost" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    const CancelOnTake = struct {
+        var cancel_returned = false;
+
+        fn cancelOnTake(runtime: *Runtime, correlation_id: contracts.CorrelationId) void {
+            cancel_returned = runtime.cancel(correlation_id);
+        }
+    };
+    test_after_take = &CancelOnTake.cancelOnTake;
+    defer test_after_take = null;
+
+    // A screen read starts no terminal, so the test depends only on the cancel
+    // and the completion.
+    const correlation_id = fixture.runtime.nextCorrelationId();
+    try fixture.runtime.admit(std.testing.allocator, correlation_id, .{ .screen = .{
+        .session_id = "terminal-1",
+    } });
+    var completion = try fixture.awaitCompletion(correlation_id, 15_000);
+    defer completion.deinit();
+
+    try std.testing.expectEqual(true, CancelOnTake.cancel_returned);
+    try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
+}
+
+fn configureTraceInTmp(alloc: Allocator, tmp: std.testing.TmpDir, name: []const u8) !void {
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, name });
+    defer alloc.free(path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, path);
+}
+
+fn expectTraceHas(alloc: Allocator, tmp: std.testing.TmpDir, name: []const u8, line: []const u8) !void {
+    debug_trace.shutdown();
+    const trace = try tmp.dir.readFileAlloc(std.testing.io, name, alloc, .limited(1024 * 1024));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, line) != null);
+}
+
+fn finishAndTakeCancelled(runtime: *Runtime, worker: *RequestWorker) !void {
+    const correlation_id = worker.intent.correlation_id;
+    runtime.finishActive(worker, .{ .kind = .cancelled, .correlation_id = correlation_id });
+    var completion = runtime.takeCompletion().?;
+    defer completion.deinit();
+    try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
+}
+
+/// Ends every request still running, so `runtime.deinit` does not wait on a
+/// test that failed early.
+fn finishEveryActive(runtime: *Runtime) void {
+    for (runtime.active) |entry| {
+        const worker = entry orelse continue;
+        runtime.finishActive(worker, .{ .kind = .cancelled, .correlation_id = worker.intent.correlation_id });
+    }
+    while (runtime.takeCompletion()) |completion| {
+        var done = completion;
+        done.deinit();
+    }
+}
+
+test "a request whose worker allocation fails ends disconnected, and the next request runs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try configureTraceInTmp(alloc, tmp, "drop-trace.log");
+    defer debug_trace.resetForTest();
+
+    var runtime: Runtime = .{ .alloc = alloc };
+    defer runtime.deinit();
+    defer finishEveryActive(&runtime);
+    try admitTestIntent(&runtime, 31);
+
+    // workerMain passes null when its spare allocation fails.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const spare = failing.allocator().create(RequestWorker) catch null;
+    try std.testing.expectEqual(Taken{ .unstarted = {} }, takeAndRegister(&runtime, spare));
+
+    var dropped = runtime.takeCompletion().?;
+    defer dropped.deinit();
+    try std.testing.expectEqual(CompletionKind.disconnected, dropped.kind);
+    try std.testing.expectEqual(@as(u64, 31), dropped.correlation_id.?.value);
+    try expectTraceHas(alloc, tmp, "drop-trace.log", "request dropped unstarted correlation=31 reason=allocation failed");
+
+    try admitTestIntent(&runtime, 32);
+    const worker = try alloc.create(RequestWorker);
+    try std.testing.expectEqual(Taken{ .started = worker }, takeAndRegister(&runtime, worker));
+    try finishAndTakeCancelled(&runtime, worker);
+}
+
+test "a full worker table refuses one more request, and the next request runs once a slot frees" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{ .alloc = alloc };
+    defer runtime.deinit();
+    defer finishEveryActive(&runtime);
+
+    // Every running request holds a correlation until its completion is taken,
+    // and the correlation table has as many entries as there are worker slots.
+    // So a request that would need a free slot is refused at admission first.
+    var running: [max_active_requests]*RequestWorker = undefined;
+    for (&running, 0..) |*worker, index| {
+        const correlation_id: u64 = 100 + index;
+        try admitTestIntent(&runtime, correlation_id);
+        worker.* = try alloc.create(RequestWorker);
+        try std.testing.expectEqual(Taken{ .started = worker.* }, takeAndRegister(&runtime, worker.*));
+    }
+
+    try std.testing.expectError(error.QueueFull, admitTestIntent(&runtime, 200));
+
+    try finishAndTakeCancelled(&runtime, running[0]);
+    try admitTestIntent(&runtime, 201);
+    const next = try alloc.create(RequestWorker);
+    try std.testing.expectEqual(Taken{ .started = next }, takeAndRegister(&runtime, next));
+    try finishAndTakeCancelled(&runtime, next);
+    for (running[1..]) |worker| try finishAndTakeCancelled(&runtime, worker);
+}
+
+/// The command of a terminal that stays idle until the fixture ends it. It
+/// writes its byte to the launch signal once it runs, and `exec` leaves no
+/// child behind.
+const idle_signalling_command = "printf x > ./" ++ LaunchSignal.name ++ "; exec sleep 30";
+
+/// A start request for a terminal that stays idle until the fixture ends it.
+/// A test that ends with the fixture waits for the launch signal first: an
+/// exit close that comes while the shell is still starting can leave the
+/// launcher alive (see "What this does not fix" in the PR).
+fn idleStart(fixture: *LiveTerminalFixture, retain_in_flight: bool) contracts.ActionRequest {
+    return .{ .start = .{
+        .cwd = fixture.home,
+        .command = idle_signalling_command,
+        .shell = .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
+        .backend = .native,
+        .return_when = .started,
+        .wait_ceiling_ms = 15_000,
+        .persistence = fixture.persistence.?.view(),
+        .retain_in_flight = retain_in_flight,
+    } };
+}
+
+test "start in flight: a start keeps its mark for a caller that asks, until the caller ends it" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    var launched: LaunchSignal = undefined;
+    try launched.init(fixture.home);
+    defer launched.deinit();
+    for ([_]bool{ false, true }) |retain| {
+        try fixture.preparePersistence();
+        var started = try fixture.run(idleStart(&fixture, retain));
+        defer started.deinit(alloc);
+        try launched.wait(15_000);
+        const session_id = switch (started.view()) {
+            .success => |success| switch (success) {
+                .start => |value| value.session.session_id,
+                else => return error.TestUnexpectedResult,
+            },
+            .failure => return error.TestTerminalStartFailed,
+        };
+        const store = &fixture.runtime.backend.?.store;
+        // A caller that did not ask finds the id already visible.
+        try std.testing.expectEqual(retain, store.is_starting(session_id));
+        fixture.runtime.endStart(session_id);
+        try std.testing.expect(!store.is_starting(session_id));
+    }
+}
+
+test "start in flight: a cancelled start ends the mark it kept" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    var launched: LaunchSignal = undefined;
+    try launched.init(fixture.home);
+    defer launched.deinit();
+
+    try fixture.preparePersistence();
+    const correlation_id = fixture.runtime.nextCorrelationId();
+    try fixture.runtime.admit(alloc, correlation_id, .{ .start = .{
+        .cwd = fixture.home,
+        .command = idle_signalling_command,
+        .shell = .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
+        .backend = .native,
+        .return_when = .exit,
+        .wait_ceiling_ms = 15_000,
+        .persistence = fixture.persistence.?.view(),
+        .retain_in_flight = true,
+    } });
+    try launched.wait(15_000);
+    const session_id = try fixture.waitForOnlyRecordedSession(15_000);
+    defer alloc.free(session_id);
+    const store = &fixture.runtime.backend.?.store;
+    try std.testing.expect(store.is_starting(session_id));
+
+    try std.testing.expect(fixture.runtime.cancel(correlation_id));
+    var completion = try fixture.awaitCompletion(correlation_id, 15_000);
+    defer completion.deinit();
+    try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
+    // The caller only learned `.cancelled`, so nobody else can end the mark.
+    try std.testing.expect(!store.is_starting(session_id));
+}
+
+test "start in flight: a start result the executor cannot copy ends the mark it kept" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    var launched: LaunchSignal = undefined;
+    try launched.init(fixture.home);
+    defer launched.deinit();
+    try fixture.preparePersistence();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, LiveTerminalFixture.action_executor.execute(.{
+        .alloc = failing.allocator(),
+        .lifecycle_allocator = alloc,
+        .runtime = &fixture.runtime,
+    }, idleStart(&fixture, true)));
+    try launched.wait(15_000);
+    const session_id = try fixture.waitForOnlyRecordedSession(15_000);
+    defer alloc.free(session_id);
+    try std.testing.expect(!fixture.runtime.backend.?.store.is_starting(session_id));
 }
 
 test "zsh terminal commands keep words that start with = literal" {

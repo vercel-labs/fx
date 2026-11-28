@@ -43,6 +43,57 @@ else
 pub const ResizeApprovalInterlock = resize_runtime.ResizeApprovalInterlock;
 pub const RedrawMode = resize_runtime.RedrawMode;
 
+var resize_wake_write_fd: if (supports_resize_signal) std.atomic.Value(std.posix.fd_t) else void =
+    if (supports_resize_signal) .init(-1) else {};
+
+/// Called from the SIGWINCH handler, so it only loads an atomic and writes one
+/// byte, and it keeps the interrupted code's errno.
+pub fn notifyResizeWakePipe() void {
+    if (!supports_resize_signal) return;
+    const fd = resize_wake_write_fd.load(.acquire);
+    if (fd < 0) return;
+    const saved_errno = std.c._errno().*;
+    defer std.c._errno().* = saved_errno;
+    const byte = [_]u8{1};
+    while (true) {
+        const rc = std.c.write(fd, &byte, 1);
+        if (rc >= 0) return;
+        switch (std.posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return,
+            else => return,
+        }
+    }
+}
+
+fn closeWakePipe(pipe: *[2]std.posix.fd_t) void {
+    for (pipe) |*fd| {
+        if (fd.* >= 0) {
+            _ = std.c.close(fd.*);
+            fd.* = -1;
+        }
+    }
+}
+
+fn drainNonblockingPipe(fd: std.posix.fd_t) void {
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const rc = std.c.read(fd, &buf, buf.len);
+        if (rc > 0) continue;
+        if (rc < 0 and std.posix.errno(rc) == .INTR) continue;
+        return;
+    }
+}
+
+fn pollResultFromRevents(revents: i16) PollResult {
+    return .{
+        .readable = (revents & std.posix.POLL.IN) != 0,
+        .hung_up = (revents & std.posix.POLL.HUP) != 0,
+        // macOS sets POLLNVAL when session teardown revokes the tty (`tests/tla/terminal_hangup/TerminalHangup.tla` `NoSpin`).
+        .has_error = (revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0,
+    };
+}
+
 pub const PollResult = struct {
     readable: bool = false,
     hung_up: bool = false,
@@ -71,6 +122,7 @@ pub const TerminalState = struct {
     alternate_mouse_tracking_active: bool = false,
     signal_handler_installed: bool = false,
     old_winch_action: ?std.posix.Sigaction = null,
+    resize_wake_pipe: [2]std.posix.fd_t = .{ -1, -1 },
 
     pub fn fileApprovalScreenActive(self: TerminalState) bool {
         return self.alternate_screen_owner == .file_approval;
@@ -143,6 +195,16 @@ pub const TerminalState = struct {
     pub fn installResizeSignal(self: *TerminalState, handler: ResizeHandler) void {
         if (!supports_resize_signal) return;
 
+        if (self.resize_wake_pipe[0] < 0) {
+            self.resize_wake_pipe = std.Io.Threaded.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true }) catch |err| blk: {
+                debug_trace.logf("resize", "resize_wake_pipe_failed err={s} fallback=poll_timeout", .{@errorName(err)});
+                break :blk .{ -1, -1 };
+            };
+        }
+        if (self.resize_wake_pipe[1] >= 0) {
+            resize_wake_write_fd.store(self.resize_wake_pipe[1], .release);
+        }
+
         const act: std.posix.Sigaction = .{
             .handler = .{ .handler = handler },
             .mask = std.posix.sigemptyset(),
@@ -156,11 +218,18 @@ pub const TerminalState = struct {
     }
 
     pub fn uninstallResizeSignal(self: *TerminalState) void {
-        if (!supports_resize_signal or !self.signal_handler_installed) return;
-        if (self.old_winch_action) |old| {
-            std.posix.sigaction(std.posix.SIG.WINCH, &old, null);
+        if (!supports_resize_signal) return;
+        if (self.signal_handler_installed) {
+            if (self.old_winch_action) |old| {
+                std.posix.sigaction(std.posix.SIG.WINCH, &old, null);
+            }
+            self.signal_handler_installed = false;
         }
-        self.signal_handler_installed = false;
+        resize_wake_write_fd.store(-1, .release);
+        // The wake pipe stays open: a handler already running on another
+        // thread may have loaded its fd, and closing it here would let that
+        // write land in a reused descriptor. The next install reuses it, and
+        // it closes when the process exits.
     }
 
     pub fn queryLayout(self: TerminalState, footer_rows: u16) !Layout {
@@ -178,10 +247,12 @@ pub const TerminalState = struct {
         }
         var stdout_file = std.Io.File.stdout();
         try stdout_file.writeStreamingAll(io_mod.getIo(), "\x1b[6n");
+        return self.readCursorPositionUntilDeadline(io_mod.milliTimestamp() + 100);
+    }
 
+    fn readCursorPositionUntilDeadline(self: TerminalState, deadline_ms: i64) !CursorPosition {
         var buf: [64]u8 = undefined;
         var len: usize = 0;
-        const deadline_ms = io_mod.milliTimestamp() + 100;
 
         while (len < buf.len) {
             const now_ms = io_mod.milliTimestamp();
@@ -189,7 +260,8 @@ pub const TerminalState = struct {
 
             const remaining_ms: i32 = @intCast(deadline_ms - now_ms);
             const poll = try self.pollInput(remaining_ms);
-            if (poll.closed() or !poll.readable) break;
+            if (poll.closed()) break;
+            if (!poll.readable) continue;
 
             const n = try self.read(buf[len .. len + 1]);
             if (n == 0) break;
@@ -251,7 +323,10 @@ pub const TerminalState = struct {
         if (comptime builtin.target.os.tag == .wasi) {
             return std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{out});
         }
-        return std.posix.read(self.stdin_fd, out);
+        return std.posix.read(self.stdin_fd, out) catch |err| {
+            if (ui_terminal.terminalGone(self.stdin_fd, err)) return 0;
+            return err;
+        };
     }
 
     pub fn pollInput(self: TerminalState, timeout_ms: i32) !PollResult {
@@ -262,19 +337,35 @@ pub const TerminalState = struct {
                 else => .{},
             };
         }
-        var fds = [_]std.posix.pollfd{.{
-            .fd = self.stdin_fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
+        const wake_fd = self.resize_wake_pipe[0];
+        if (wake_fd < 0) {
+            var fds = [_]std.posix.pollfd{.{
+                .fd = self.stdin_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            _ = try std.posix.poll(&fds, timeout_ms);
+            return pollResultFromRevents(fds[0].revents);
+        }
 
-        _ = try std.posix.poll(&fds, timeout_ms);
-        const revents = fds[0].revents;
-        return .{
-            .readable = (revents & std.posix.POLL.IN) != 0,
-            .hung_up = (revents & std.posix.POLL.HUP) != 0,
-            .has_error = (revents & std.posix.POLL.ERR) != 0,
+        var fds = [_]std.posix.pollfd{
+            .{
+                .fd = self.stdin_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = wake_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
         };
+        _ = try std.posix.poll(&fds, timeout_ms);
+        if ((fds[1].revents & std.posix.POLL.IN) != 0) {
+            drainNonblockingPipe(wake_fd);
+        }
+        // Hangup and error state must come only from stdin (`TerminalHangup.tla` `NoSpin`).
+        return pollResultFromRevents(fds[0].revents);
     }
 };
 
@@ -540,6 +631,14 @@ pub fn applyResizeWithLayout(
     return resize_runtime.applyResizeWithLayout(shell, metrics, new_layout, settled);
 }
 
+pub fn normalizeStartCursor(layout: Layout, position: CursorPosition) CursorPosition {
+    if (layout.rows == 0) return .{ .row = 1, .col = 1 };
+    var row = @min(@max(position.row, 1), layout.rows);
+    const col = if (layout.cols == 0) 1 else @min(@max(position.col, 1), layout.cols);
+    if (col > 1 and row < layout.rows) row += 1;
+    return .{ .row = row, .col = 1 };
+}
+
 fn syncUpdatesEnabledForValues(override: ?[]const u8, term: ?[]const u8) bool {
     if (override) |value| {
         if (std.ascii.eqlIgnoreCase(value, "0") or
@@ -720,8 +819,227 @@ test "enableRawMode preserves carriage return input" {
     try std.testing.expectEqual(@as(u8, '\r'), buf[0]);
 }
 
+test "pollInput reports a revoked or closed descriptor as closed" {
+    if (comptime builtin.target.os.tag == .wasi) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "closed-poll", .{});
+    defer file.close(std.testing.io);
+
+    const floor: c_int = @intCast(@min((try std.posix.getrlimit(.NOFILE)).cur -| 1, 900));
+    var closed = std.c.fcntl(file.handle, std.posix.F.DUPFD, floor);
+    if (closed < 0) closed = std.c.dup(file.handle);
+    try std.testing.expect(closed >= 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.close(closed));
+
+    const terminal = TerminalState{ .stdin_fd = closed };
+    const poll_result = try terminal.pollInput(0);
+    try std.testing.expect(poll_result.closed());
+}
+
+fn testSigWinchWake(_: std.posix.SIG) callconv(.c) void {
+    notifyResizeWakePipe();
+}
+
+test "pollInput wakes promptly on SIGWINCH during a long timeout" {
+    if (comptime !supports_resize_signal) return error.SkipZigTest;
+
+    const stdin_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer closeTestFd(stdin_pipe[0]);
+    defer closeTestFd(stdin_pipe[1]);
+
+    var terminal = TerminalState{ .stdin_fd = stdin_pipe[0] };
+    terminal.installResizeSignal(testSigWinchWake);
+    defer terminal.uninstallResizeSignal();
+
+    const Sender = struct {
+        fn run(pid: std.c.pid_t) void {
+            // Makes the signal likely to land during `poll`; a signal before it leaves a byte in the pipe, so either order passes.
+            io_mod.sleep(5 * std.time.ns_per_ms);
+            _ = std.c.kill(pid, std.posix.SIG.WINCH);
+        }
+    };
+    const pid = std.c.getpid();
+    var thread = try std.Thread.spawn(.{}, Sender.run, .{pid});
+    defer thread.join();
+
+    const started_ms = io_mod.milliTimestamp();
+    const poll_result = try terminal.pollInput(500);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+
+    try std.testing.expect(!poll_result.readable);
+    try std.testing.expect(!poll_result.closed());
+    try std.testing.expect(elapsed_ms < 50);
+
+    // Uninstall disarms the signal's write target and keeps the pipe open.
+    terminal.uninstallResizeSignal();
+    try std.testing.expectEqual(@as(std.posix.fd_t, -1), resize_wake_write_fd.load(.acquire));
+    try std.testing.expect(terminal.resize_wake_pipe[0] >= 0 and terminal.resize_wake_pipe[1] >= 0);
+    notifyResizeWakePipe();
+    closeWakePipe(&terminal.resize_wake_pipe);
+}
+
+test "queryCursorPosition keeps waiting across SIGWINCH until reply arrives" {
+    if (comptime !supports_resize_signal) return error.SkipZigTest;
+
+    const stdin_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer closeTestFd(stdin_pipe[0]);
+    defer closeTestFd(stdin_pipe[1]);
+
+    var terminal = TerminalState{ .stdin_fd = stdin_pipe[0] };
+    terminal.installResizeSignal(testSigWinchWake);
+    defer {
+        terminal.uninstallResizeSignal();
+        closeWakePipe(&terminal.resize_wake_pipe);
+    }
+
+    const Peer = struct {
+        fn run(pid: std.c.pid_t, write_fd: std.posix.fd_t) void {
+            io_mod.sleep(5 * std.time.ns_per_ms);
+            _ = std.c.kill(pid, std.posix.SIG.WINCH);
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            const reply = "\x1b[12;34R";
+            _ = std.c.write(write_fd, reply.ptr, reply.len);
+        }
+    };
+    const pid = std.c.getpid();
+    var thread = try std.Thread.spawn(.{}, Peer.run, .{ pid, stdin_pipe[1] });
+    defer thread.join();
+
+    // A deadline well past the peer's 25 ms keeps a loaded CI machine from ending the wait first; the old code still fails, because it stopped at the wake.
+    const pos = try terminal.readCursorPositionUntilDeadline(io_mod.milliTimestamp() + 2_000);
+    try std.testing.expectEqual(@as(u16, 12), pos.row);
+    try std.testing.expectEqual(@as(u16, 34), pos.col);
+}
+
+test "TerminalState.read returns 0 when the terminal hangs up" {
+    if (!supports_test_pty) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+
+    const ioctl_sctty: c_int = switch (builtin.target.os.tag) {
+        .macos => 0x20007461,
+        .linux => @intCast(std.os.linux.T.IOCSCTTY),
+        else => unreachable,
+    };
+    const pty = try TestPty.open();
+    defer pty.close();
+
+    const res_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        _ = std.c.close(res_pipe[0]);
+        _ = std.c.close(res_pipe[1]);
+    }
+    const done_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        _ = std.c.close(done_pipe[0]);
+        _ = std.c.close(done_pipe[1]);
+    }
+
+    const p1 = std.c.fork();
+    if (p1 < 0) return error.Unexpected;
+    if (p1 == 0) {
+        _ = std.c.close(pty.master);
+        _ = std.c.close(res_pipe[0]);
+        _ = std.c.close(done_pipe[1]);
+        _ = std.c.setsid();
+        _ = std.c.ioctl(pty.slave, ioctl_sctty, @as(c_int, 0));
+
+        const orphan_pipe = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch std.c._exit(2);
+        const p2 = std.c.fork();
+        if (p2 < 0) std.c._exit(2);
+        if (p2 == 0) {
+            const p3 = std.c.fork();
+            if (p3 < 0) std.c._exit(2);
+            if (p3 == 0) {
+                _ = std.c.close(orphan_pipe[1]);
+                _ = std.c.setpgid(0, 0);
+                var wait_byte: [1]u8 = undefined;
+                while (true) {
+                    const r = std.c.read(orphan_pipe[0], &wait_byte, 1);
+                    if (r == 0) break;
+                    if (r < 0 and std.posix.errno(r) == .INTR) continue;
+                    break;
+                }
+                _ = std.c.close(orphan_pipe[0]);
+
+                const terminal = TerminalState{ .stdin_fd = pty.slave };
+                var buf: [16]u8 = undefined;
+                const msg: []const u8 = if (terminal.read(&buf)) |n|
+                    if (n == 0) "OK" else "NONZERO"
+                else |err|
+                    @errorName(err);
+                _ = std.c.write(res_pipe[1], msg.ptr, msg.len);
+                std.c._exit(0);
+            }
+            std.c._exit(0);
+        }
+        _ = std.c.close(orphan_pipe[0]);
+        _ = std.c.close(orphan_pipe[1]);
+        _ = std.c.close(res_pipe[1]);
+        var st: c_int = 0;
+        _ = std.c.waitpid(p2, &st, 0);
+        var wait_done: [1]u8 = undefined;
+        while (true) {
+            const r = std.c.read(done_pipe[0], &wait_done, 1);
+            if (r == 0) break;
+            if (r < 0 and std.posix.errno(r) == .INTR) continue;
+            break;
+        }
+        _ = std.c.close(done_pipe[0]);
+        std.c._exit(0);
+    }
+
+    _ = std.c.close(res_pipe[1]);
+    _ = std.c.close(done_pipe[0]);
+
+    var msg_buf: [64]u8 = undefined;
+    var msg_len: usize = 0;
+    while (msg_len < msg_buf.len) {
+        const n = std.c.read(res_pipe[0], msg_buf[msg_len..].ptr, msg_buf.len - msg_len);
+        if (n == 0) break;
+        if (n < 0) {
+            if (std.posix.errno(n) == .INTR) continue;
+            break;
+        }
+        msg_len += @intCast(n);
+    }
+    _ = std.c.close(res_pipe[0]);
+    _ = std.c.close(done_pipe[1]);
+    var st: c_int = 0;
+    _ = std.c.waitpid(p1, &st, 0);
+
+    try std.testing.expectEqualStrings("OK", msg_buf[0..msg_len]);
+}
+
 test "reconstructive paint re-emits a full transcript in order" {
     try @import("resize_tests.zig").testReconstructiveFullTranscriptReplay();
+}
+
+test "normalizeStartCursor bounds out-of-range terminal replies" {
+    const layout = Layout{
+        .rows = 49,
+        .cols = 146,
+        .content_bottom = 45,
+        .divider_top_row = 46,
+        .input_row = 47,
+        .divider_bottom_row = 48,
+        .hint_row = 49,
+    };
+    try std.testing.expectEqual(CursorPosition{ .row = 1, .col = 1 }, normalizeStartCursor(layout, .{ .row = 0, .col = 1 }));
+    try std.testing.expectEqual(CursorPosition{ .row = 1, .col = 1 }, normalizeStartCursor(layout, .{ .row = 1, .col = 1 }));
+    try std.testing.expectEqual(CursorPosition{ .row = 11, .col = 1 }, normalizeStartCursor(layout, .{ .row = 10, .col = 5 }));
+    try std.testing.expectEqual(CursorPosition{ .row = 49, .col = 1 }, normalizeStartCursor(layout, .{ .row = 49, .col = 5 }));
+    try std.testing.expectEqual(CursorPosition{ .row = 49, .col = 1 }, normalizeStartCursor(layout, .{ .row = 60000, .col = 1 }));
+    try std.testing.expectEqual(CursorPosition{ .row = 49, .col = 1 }, normalizeStartCursor(layout, .{ .row = 60000, .col = 8 }));
+
+    var one_col = layout;
+    one_col.cols = 1;
+    try std.testing.expectEqual(CursorPosition{ .row = 10, .col = 1 }, normalizeStartCursor(one_col, .{ .row = 10, .col = 5 }));
+
+    var zero_rows = layout;
+    zero_rows.rows = 0;
+    try std.testing.expectEqual(CursorPosition{ .row = 1, .col = 1 }, normalizeStartCursor(zero_rows, .{ .row = 60000, .col = 1 }));
 }
 
 test {

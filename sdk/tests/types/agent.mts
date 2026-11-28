@@ -47,6 +47,10 @@ export async function readmeAgent(): Promise<void> {
 
   const result = await turn.result;
   console.log(result.messageId, result.stopReason, result.usage);
+  const handedOff: Promise<void> = agent.handOff({ within: 250 });
+  void agent.handOff();
+  // @ts-expect-error within is milliseconds
+  void agent.handOff({ within: "250" });
   await agent.close();
 }
 
@@ -325,6 +329,10 @@ export function options(): void {
   createFxAgent({ sessionId: "support-42" });
   // @ts-expect-error unknown backend
   createFxAgent({ backend: "gpu" });
+  createFxAgent({ handOffOnSigterm: false });
+  createFxAgent({ handOffOnSigterm: { within: 25_000 } });
+  // @ts-expect-error handOffOnSigterm takes a boolean or { within }
+  createFxAgent({ handOffOnSigterm: "yes" });
 }
 
 // `onEvent` receives the engines' diagnostics and the sessions'.
@@ -337,6 +345,8 @@ export function events(): void {
       if (event.type === "session.error") console.log(event.sessionId, event.error.message);
       if (event.type === "session.deadline" || event.type === "session.fenced") assertType<Equal<typeof event.epoch, number>>();
       if (event.type === "session.deadline") assertType<Equal<typeof event.cutoffs, number>>();
+      if (event.type === "session.handoff") assertType<Equal<typeof event.epoch, number>>();
+      if (event.type === "session.handoff") assertType<Equal<typeof event.cutoffs, number>>();
       if (event.type === "session.forwarded") assertType<Equal<typeof event.agent, string>>();
       if (event.type === "checkpoint.mismatch") console.log(event.changed.includes("model"), event.current.toolSchemaHash);
       if (event.type === "transport.activity") console.log(event.attempt, event.chunkBytes, event.totalBytes);

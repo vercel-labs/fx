@@ -10,7 +10,7 @@ const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const versions = @import("../core/gateway/provider_versions.zig");
-const version_lookup = @import("provider_versions.zig");
+const catalog_fetch_failure = @import("catalog_fetch_failure.zig");
 
 const max_catalog_models: usize = 128;
 pub const title_model = "grok-4.5";
@@ -89,13 +89,7 @@ fn fetchCatalogForProvider(
         .clock = .awake,
         .raw = .fromMilliseconds(fetch_timeout_ms),
     });
-    const version = if (request_auth.include_subscription_headers)
-        version_lookup.resolve(alloc, .grok, cancel_flag, deadline) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return .{ .failure = catalogFetchFailure(err) };
-        }
-    else
-        null;
+    const version: ?[]const u8 = if (request_auth.include_subscription_headers) versions.grok_client_version else null;
     var response = fetchCatalogResponse(
         alloc,
         request_url,
@@ -174,76 +168,8 @@ fn catalogRequestAuth(access: credentials.CatalogAccess) ?CatalogRequestAuth {
 }
 
 fn catalogFetchFailure(err: anyerror) model_catalog.Failure {
-    if (err == error.Cancelled) return .{ .category = .cancellation };
-    if (isCutOffCatalogAnswer(err)) return .{ .category = .malformed_response, .retryable = true };
-    if (isBrokenCatalogAnswer(err)) return .{ .category = .malformed_response };
-    return .{ .category = .transport, .retryable = true };
-}
-
-/// Errors from an answer that arrived but cannot be read, other than the std
-/// decoder errors that `isBrokenCatalogAnswer` finds. Repeating the request gets
-/// the same answer, so these are not retryable. `ReadFailed` is not here: the
-/// same name is returned for a read that failed before the answer's head.
-const broken_answer_errors = [_]anyerror{
-    error.GrokModelCatalogTooLarge,
-    error.HttpHeadersInvalid,
-    error.HttpHeadersOversize,
-    error.HttpContentEncodingUnsupported,
-    error.UnsupportedCompressionMethod,
-    error.HttpChunkInvalid,
-};
-
-/// The error sets of the std gzip, deflate, and zstd decoders.
-const decoder_error_sets = .{
-    std.compress.flate.Decompress.Error,
-    std.compress.zstd.Decompress.Error,
-};
-
-/// Whether a std decoder returns `err`. `ReadFailed` is excluded: a decoder
-/// reports a failed input read with it, and `decompressError` maps it to null.
-fn isDecoderError(err: anyerror) bool {
-    inline for (decoder_error_sets) |Set| {
-        inline for (@typeInfo(Set).error_set.error_names.?) |name| {
-            if (!std.mem.eql(u8, name, "ReadFailed") and err == @field(Set, name)) return true;
-        }
-    }
-    return false;
-}
-
-/// An answer cut off before its end. A retry can get the whole answer.
-const cut_off_answer_errors = [_]anyerror{
-    error.HttpChunkTruncated,
-    error.EndOfStream,
-    error.HttpBodyCutOff,
-};
-
-/// fx's own zstd buffer sizes, not the answer, so these stay transport.
-const fx_buffer_errors = [_]anyerror{
-    error.OutputBufferUndersize,
-    error.InputBufferUndersize,
-};
-
-fn isCutOffCatalogAnswer(err: anyerror) bool {
-    for (cut_off_answer_errors) |cut_off| {
-        if (err == cut_off) return true;
-    }
-    return false;
-}
-
-fn isFxBufferError(err: anyerror) bool {
-    for (fx_buffer_errors) |buffer_error| {
-        if (err == buffer_error) return true;
-    }
-    return false;
-}
-
-fn isBrokenCatalogAnswer(err: anyerror) bool {
-    if (isCutOffCatalogAnswer(err) or isFxBufferError(err)) return false;
-    if (isDecoderError(err)) return true;
-    for (broken_answer_errors) |broken| {
-        if (err == broken) return true;
-    }
-    return false;
+    if (err == error.GrokModelCatalogTooLarge) return .{ .category = .malformed_response };
+    return catalog_fetch_failure.classify(err);
 }
 
 const FetchResponse = struct {
@@ -262,7 +188,7 @@ const FetchOperation = struct {
     credential: ?[]const u8,
     account_id: ?[]const u8,
     include_subscription_headers: bool,
-    client_version: ?versions.Version = null,
+    client_version: ?[]const u8 = null,
 
     pub fn run(self: *@This()) !FetchResponse {
         var auth_header: ?[]u8 = null;
@@ -290,8 +216,8 @@ const FetchOperation = struct {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-userid", .value = account_id };
             extra_headers_len += 1;
         }
-        if (self.client_version) |*version| {
-            extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-version", .value = version.slice() };
+        if (self.client_version) |version| {
+            extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-version", .value = version };
             extra_headers_len += 1;
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-identifier", .value = "fx" };
             extra_headers_len += 1;
@@ -322,7 +248,7 @@ fn fetchCatalogResponse(
     credential: ?[]const u8,
     account_id: ?[]const u8,
     include_subscription_headers: bool,
-    client_version: ?versions.Version,
+    client_version: ?[]const u8,
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
 ) !FetchResponse {
@@ -735,51 +661,6 @@ test "Grok oversized catalog responses are terminal malformed data" {
     try std.testing.expect(!failure.retryable);
 }
 
-fn expectCatalogFetchFailure(err: anyerror, category: model_catalog.FailureCategory, retryable: bool) !void {
-    const failure = catalogFetchFailure(err);
-    try std.testing.expectEqual(category, failure.category);
-    try std.testing.expectEqual(retryable, failure.retryable);
-}
-
-test "Grok catalog fetch failures split unreadable answers from connection failures" {
-    inline for (decoder_error_sets) |Set| {
-        inline for (@typeInfo(Set).error_set.error_names.?) |name| {
-            const err = @field(Set, name);
-            if (!std.mem.eql(u8, name, "ReadFailed")) {
-                if (isFxBufferError(err)) {
-                    try expectCatalogFetchFailure(err, .transport, true);
-                } else {
-                    try expectCatalogFetchFailure(err, .malformed_response, isCutOffCatalogAnswer(err));
-                }
-            }
-        }
-    }
-    try expectCatalogFetchFailure(error.HttpChunkTruncated, .malformed_response, true);
-    try expectCatalogFetchFailure(error.EndOfStream, .malformed_response, true);
-    try expectCatalogFetchFailure(error.HttpBodyCutOff, .malformed_response, true);
-    const broken = [_]anyerror{
-        error.BadGzipHeader,
-        error.WrongGzipChecksum,
-        error.HttpChunkInvalid,
-        error.HttpHeadersInvalid,
-        error.GrokModelCatalogTooLarge,
-    };
-    for (broken) |err| try expectCatalogFetchFailure(err, .malformed_response, false);
-    for (fx_buffer_errors) |err| try expectCatalogFetchFailure(err, .transport, true);
-    for (broken_answer_errors) |err| try expectCatalogFetchFailure(err, .malformed_response, false);
-
-    const refused = catalogFetchFailure(error.ConnectionRefused);
-    try std.testing.expectEqual(model_catalog.FailureCategory.transport, refused.category);
-    try std.testing.expect(refused.retryable);
-
-    const reset = catalogFetchFailure(error.ReadFailed);
-    try std.testing.expectEqual(model_catalog.FailureCategory.transport, reset.category);
-    try std.testing.expect(reset.retryable);
-
-    const cancelled = catalogFetchFailure(error.Cancelled);
-    try std.testing.expectEqual(model_catalog.FailureCategory.cancellation, cancelled.category);
-}
-
 test "Grok model ids enforce the exact provider-local bound" {
     const exact_json = try buildCatalogJson(std.testing.allocator, 1, max_model_id_bytes, 0);
     defer std.testing.allocator.free(exact_json);
@@ -960,7 +841,6 @@ const CatalogEndpointEnvironment = struct {
         errdefer self.map.deinit();
         try self.map.put(e2e_models_endpoint_env, models_url);
         try self.map.put(e2e_modalities_endpoint_env, modalities_url);
-        try self.map.put("FX_TEST_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }

@@ -283,8 +283,10 @@ const Lab = struct {
                     error.OutOfMemory => return .page_failed,
                     else => return .page_refused,
                 };
-                if (added.invalid + added.duplicate > 0) {
-                    try lab.print("tools", .{ .event = "dropped", .invalid = added.invalid, .duplicate = added.duplicate });
+                // `invalid` is every tool the page's own reading refused, as it was before the engine counted them by reason.
+                const invalid = added.invalid + added.repeated_field + added.unreadable;
+                if (invalid + added.duplicate > 0) {
+                    try lab.print("tools", .{ .event = "dropped", .invalid = invalid, .duplicate = added.duplicate });
                 }
                 return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms, .now_ms = lab.now() } };
             },

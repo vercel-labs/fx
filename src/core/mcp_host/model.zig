@@ -22,6 +22,7 @@ const tool_names = @import("../mcp/tool_names.zig");
 const tool_result = @import("../mcp/tool_result.zig");
 const tool_search = @import("../mcp/tool_search.zig");
 const tools_feature = @import("../mcp/features/tools.zig");
+const dropped_tools = @import("dropped_tools.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 
@@ -160,20 +161,40 @@ pub const Catalog = struct {
     /// The has, validate, and call operations, for checks made outside a
     /// tool context.
     pub fn runtimeCapabilities(c: *Catalog) tool_mcp_runtime.RuntimeCapabilities {
-        return .{ .context = c, .has_tool = hasToolFn, .validate_tool = validateToolFn, .call_tool = callToolFn };
+        const ops = Operations(Catalog);
+        return .{ .context = c, .has_tool = ops.hasTool, .validate_tool = ops.validateTool, .call_tool = ops.callTool };
     }
 
-    /// Points a tool context's MCP operations at this catalog.
+    /// Points a tool context's MCP operations at this catalog. Every surface
+    /// gets its MCP answers through this and `wireVia`, and no other adapter.
     pub fn wire(c: *Catalog, tc: *tool_runtime.Context) void {
-        tc.mcp_ctx = c;
-        tc.mcp_has_tool = hasToolFn;
-        tc.mcp_access_changed = accessChangedFn;
-        tc.mcp_validate_tool = validateToolFn;
-        tc.mcp_call_tool = callToolFn;
-        tc.mcp_search_tools = searchToolsFn;
-        tc.mcp_tool_schema = toolSchemaFn;
-        tc.mcp_snapshot_tool = snapshotToolFn;
+        wireVia(Catalog, c, tc);
     }
+
+    /// `wire` for a source that may replace its host while contexts live, as
+    /// the terminal app does on a reload. Each operation asks `source` for the
+    /// catalog of the host it has when the operation runs, and gives it back
+    /// when the operation ends: `Source` has `pub fn acquireCatalog(*Source) ?*Catalog`
+    /// and `pub fn releaseCatalog(*Source, *Catalog) void`. With no catalog an
+    /// operation answers as a context with no MCP does.
+    pub fn wireVia(comptime Source: type, source: *Source, tc: *tool_runtime.Context) void {
+        const ops = Operations(Source);
+        tc.mcp_ctx = source;
+        tc.mcp_has_tool = ops.hasTool;
+        tc.mcp_access_changed = ops.accessChanged;
+        tc.mcp_validate_tool = ops.validateTool;
+        tc.mcp_call_tool = ops.callTool;
+        tc.mcp_search_tools = ops.searchTools;
+        tc.mcp_tool_schema = ops.toolSchema;
+        tc.mcp_snapshot_tool = ops.snapshotTool;
+    }
+
+    /// A catalog is its own source: it is always there, and nothing to give back.
+    fn acquireCatalog(c: *Catalog) ?*Catalog {
+        return c;
+    }
+
+    fn releaseCatalog(_: *Catalog, _: *Catalog) void {}
 
     pub fn hasTool(c: *Catalog, name: []const u8, access: Access) bool {
         if (!c.mayAllow(access)) return false;
@@ -742,10 +763,10 @@ pub const Catalog = struct {
     fn build(c: *Catalog, a: Allocator, server_name: []const u8, listed: []const runtime_mod.Tool) Allocator.Error![]McpTool {
         var out: std.ArrayList(McpTool) = .empty;
         for (listed) |item| {
-            const parsed = tools_feature.parseToolJson(a, item.raw, .{}) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    debug_trace.logf("mcp", "MCP tool left out server={s} tool={s} err={s}", .{ server_name, item.name, @errorName(err) });
+            const parsed = switch (try dropped_tools.read(a, item.raw)) {
+                .tool => |tool| tool,
+                .left_out => |left_out| {
+                    debug_trace.logf("mcp", "MCP tool left out server={s} tool={s} err={s}", .{ server_name, item.name, @errorName(left_out.err) });
                     continue;
                 },
             };
@@ -882,7 +903,7 @@ const Asking = struct {
         };
         self.origin = origin;
         const signal = question.url_wait orelse {
-            const answer = try self.respond(alloc, origin, .{ .input_requests_json = question.input_requests_json }, question.server);
+            const answer = try self.respond(alloc, origin, .{ .input_requests_json = question.input_requests_json, .requests = question.requests }, question.server);
             return @constCast(answer);
         };
         // A surface with no Retry control (ACP) waits for the server alone.
@@ -1029,36 +1050,62 @@ fn signInStep(alloc: Allocator, server: []const u8, how: SignIn) ![]u8 {
     };
 }
 
-fn catalog(raw: *anyopaque) *Catalog {
-    return @ptrCast(@alignCast(raw));
-}
+/// The operations `wire` installs, for contexts whose `mcp_ctx` is a `Source`.
+fn Operations(comptime Source: type) type {
+    return struct {
+        fn hasTool(raw: *anyopaque, name: []const u8, access: Access) bool {
+            const source = sourceOf(raw);
+            const c = source.acquireCatalog() orelse return false;
+            defer source.releaseCatalog(c);
+            return c.hasTool(name, access);
+        }
 
-fn hasToolFn(raw: *anyopaque, name: []const u8, access: Access) bool {
-    return catalog(raw).hasTool(name, access);
-}
+        fn accessChanged(raw: *anyopaque, access: Access) bool {
+            const source = sourceOf(raw);
+            const c = source.acquireCatalog() orelse return false;
+            defer source.releaseCatalog(c);
+            return c.accessChanged(access);
+        }
 
-fn accessChangedFn(raw: *anyopaque, access: Access) bool {
-    return catalog(raw).accessChanged(access);
-}
+        fn validateTool(raw: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: Access) anyerror!tool_mcp_runtime.ValidationResult {
+            const source = sourceOf(raw);
+            const c = source.acquireCatalog() orelse return .not_available;
+            defer source.releaseCatalog(c);
+            return c.validateTool(arena, name, arguments_json, access);
+        }
 
-fn validateToolFn(raw: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: Access) anyerror!tool_mcp_runtime.ValidationResult {
-    return catalog(raw).validateTool(arena, name, arguments_json, access);
-}
+        fn callTool(raw: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
+            const source = sourceOf(raw);
+            const c = source.acquireCatalog() orelse return null;
+            defer source.releaseCatalog(c);
+            return c.callTool(arena, name, arguments_json, max_bytes, options);
+        }
 
-fn callToolFn(raw: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-    return catalog(raw).callTool(arena, name, arguments_json, max_bytes, options);
-}
+        fn searchTools(raw: *anyopaque, alloc: Allocator, request: tool_mcp_runtime.SearchRequest, rules: types.PermissionRuleSet, limits: context_limits.Values, access: Access, cancel: Cancel) anyerror!tool_mcp_runtime.SearchResult {
+            const source = sourceOf(raw);
+            const c = source.acquireCatalog() orelse return .{ .model_output = try alloc.dupe(u8, tool_mcp_runtime.unavailable_search_output) };
+            defer source.releaseCatalog(c);
+            return c.searchTools(alloc, request, rules, limits, access, cancel);
+        }
 
-fn searchToolsFn(raw: *anyopaque, alloc: Allocator, request: tool_mcp_runtime.SearchRequest, rules: types.PermissionRuleSet, limits: context_limits.Values, access: Access, cancel: Cancel) anyerror!tool_mcp_runtime.SearchResult {
-    return catalog(raw).searchTools(alloc, request, rules, limits, access, cancel);
-}
+        fn toolSchema(raw: *anyopaque, alloc: Allocator, name: []const u8, rules: types.PermissionRuleSet, limits: context_limits.Values, access: Access, cancel: Cancel) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+            const source = sourceOf(raw);
+            const c = source.acquireCatalog() orelse return null;
+            defer source.releaseCatalog(c);
+            return c.toolSchema(alloc, name, rules, limits, access, cancel);
+        }
 
-fn toolSchemaFn(raw: *anyopaque, alloc: Allocator, name: []const u8, rules: types.PermissionRuleSet, limits: context_limits.Values, access: Access, cancel: Cancel) anyerror!?tool_mcp_runtime.ToolSchemaResult {
-    return catalog(raw).toolSchema(alloc, name, rules, limits, access, cancel);
-}
+        fn snapshotTool(raw: *anyopaque, alloc: Allocator, name: []const u8, known_binding: Binding, rules: types.PermissionRuleSet, limits: context_limits.Values, access: Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
+            const source = sourceOf(raw);
+            const c = source.acquireCatalog() orelse return .unavailable;
+            defer source.releaseCatalog(c);
+            return c.snapshotToolDefinition(alloc, name, known_binding, rules, limits, access);
+        }
 
-fn snapshotToolFn(raw: *anyopaque, alloc: Allocator, name: []const u8, known_binding: Binding, rules: types.PermissionRuleSet, limits: context_limits.Values, access: Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
-    return catalog(raw).snapshotToolDefinition(alloc, name, known_binding, rules, limits, access);
+        fn sourceOf(raw: *anyopaque) *Source {
+            return @ptrCast(@alignCast(raw));
+        }
+    };
 }
 
 const testing = std.testing;
@@ -1092,7 +1139,7 @@ test "a subagent made before its parent's server starts may use the server's too
     try testing.expectEqual(@as(usize, 1), view.servers.len);
     try testing.expectEqualStrings("fake", view.servers[0].name);
     try testing.expectEqual(@as(usize, 0), view.tools.len);
-    const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
+    const child: Access = .{ .scoped = .{ .captured = &view } };
     try testing.expect(c.hasTool("mcp_fake_echo", child));
     try testing.expectEqual(c.currentGeneration(), (try c.validateTool(a, "mcp_fake_echo", "{}", child)).valid);
     const result = (try c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = child })).?;
@@ -1102,7 +1149,7 @@ test "a subagent made before its parent's server starts may use the server's too
     var other = try view.clone(testing.allocator);
     defer other.deinit(testing.allocator);
     other.runtime_generation +%= 1;
-    const stale: Access = .{ .scoped = .{ .captured = &other, .admission_authority_generation = 0, .live = undefined } };
+    const stale: Access = .{ .scoped = .{ .captured = &other } };
     try testing.expect(!c.hasTool("mcp_fake_echo", stale));
     try testing.expectError(error.McpAccessDenied, c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = stale }));
 }
@@ -1201,7 +1248,7 @@ test "an MCP server's tools reach the model under fx's names" {
     var view = try c.snapshotAccessView(testing.allocator, "child", "parent");
     defer view.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), view.tools.len);
-    try testing.expect(Access.allowsTool(.{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } }, c.currentGeneration(), "mcp_fake_echo"));
+    try testing.expect(c.hasTool("mcp_fake_echo", .{ .scoped = .{ .captured = &view } }));
     const names = try c.serverNames(testing.allocator);
     defer {
         for (names) |name| testing.allocator.free(name);
@@ -1288,7 +1335,7 @@ test "a reload beside a call that is out and a reader of the access view ends on
     // A subagent's admission: the view it was given.
     var view = try c.snapshotAccessView(testing.allocator, "child", "parent");
     defer view.deinit(testing.allocator);
-    const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
+    const child: Access = .{ .scoped = .{ .captured = &view } };
 
     // Its calls, one on each server, which never answer.
     const Caller = struct {
@@ -1823,6 +1870,110 @@ test "a name no list holds refreshes each server whose name could own it, and a 
         try testing.expect(c.known("mcp_linear_dev_echo"));
         try testing.expect(c.lists[0].state != .loaded);
         try testing.expect(c.lists[1].state == .loaded);
+    }
+}
+
+test "a name the registry bound to a server a reload dropped belongs to no server: nothing is loaded or blamed for it" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    {
+        // `linear` loads, and its name prefixes `mcp_linear_dev_echo`, which the registry binds to `linear_dev`. A reload
+        // drops `linear_dev`, so the name is no tool of any server now. Looking for it must not load `linear`'s list.
+        const linear: mcp_contract.McpServerConfig = .{ .name = "linear", .command = f.server };
+        const linear_dev: mcp_contract.McpServerConfig = .{ .name = "linear_dev", .command = f.server };
+        var r: Runtime = undefined;
+        try r.start(testing.allocator, testing.io, &.{ linear, linear_dev }, &f.inherited, f.options());
+        defer r.deinit();
+        var c: Catalog = undefined;
+        try c.init(testing.allocator, testing.io, &r, .{});
+        defer c.deinit();
+        _ = try c.names.name(a, .{}, "linear_dev", "echo");
+        try c.reload(try r.reload(&.{linear}, &f.inherited));
+        try testing.expect(c.lists[0].state != .loaded);
+        try testing.expect((try c.toolSchema(a, "mcp_linear_dev_echo", .{}, .{}, .unrestricted, null)) == null);
+        try testing.expect(c.lists[0].state != .loaded);
+        try testing.expect(!c.known("mcp_linear_dev_echo"));
+    }
+    {
+        // The same with `linear` held for a variable that is not set: it has a reason, and the name is not blamed on it.
+        const unset = @constCast("FX_MCP_HOST_TEST_UNSET");
+        const linear: mcp_contract.McpServerConfig = .{ .name = "linear", .transport = .http, .url = "https://example.invalid/mcp", .bearer_token_env = unset };
+        const linear_dev: mcp_contract.McpServerConfig = .{ .name = "linear_dev", .command = f.server };
+        var r: Runtime = undefined;
+        try r.start(testing.allocator, testing.io, &.{ linear, linear_dev }, &f.inherited, f.options());
+        defer r.deinit();
+        var c: Catalog = undefined;
+        try c.init(testing.allocator, testing.io, &r, .{});
+        defer c.deinit();
+        _ = try c.names.name(a, .{}, "linear_dev", "echo");
+        try c.reload(try r.reload(&.{linear}, &f.inherited));
+        try testing.expect((try c.toolSchema(a, "mcp_linear_dev_echo", .{}, .{}, .unrestricted, null)) == null);
+        // A name only `linear` could own still hears why it is held.
+        const held = (try c.toolSchema(a, "mcp_linear_list", .{}, .{}, .unrestricted, null)).?;
+        try testing.expectEqualStrings("MCP server 'linear' needs FX_MCP_HOST_TEST_UNSET set before fx starts.", held.rejected.model_output);
+    }
+}
+
+test "what the catalog leaves out of a server's tools is what the count says was left out, from one decision" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wide_schema = try dropped_tools.wide(gpa, 5000);
+    defer gpa.free(wide_schema);
+    const too_big = try gpa.print("{{\"name\":\"big\",\"inputSchema\":{s}}}", .{wide_schema});
+    defer gpa.free(too_big);
+    var list = try dropped_tools.listOf(gpa, &.{
+        "{\"name\":\"good\",\"inputSchema\":{\"type\":\"object\"}}",
+        too_big,
+        "{\"name\":\"odd\",\"description\":7,\"inputSchema\":{\"type\":\"object\"}}",
+        "{\"name\":\"fine\",\"description\":\"Says it\",\"inputSchema\":{\"type\":\"object\"}}",
+    });
+    defer list.deinit(gpa);
+    var listed: [4]runtime_mod.Tool = undefined;
+    for (&listed, 0..) |*item, k| item.* = .{ .name = list.get(k).name, .raw = list.get(k).raw };
+    var c: Catalog = undefined;
+    c.names = .init(gpa);
+    defer c.names.deinit();
+    c.builtins = .{};
+    const built = try c.build(a, "srv", &listed);
+    const counted = try dropped_tools.reading(gpa, &list);
+    // Every listed tool is in the catalog or in the count, and no tool is in both.
+    try testing.expectEqual(listed.len, built.len + counted.dropped.total());
+    try testing.expectEqual(@as(usize, 2), built.len);
+    try testing.expectEqual(@as(usize, counted.kept), built.len);
+    try testing.expectEqualStrings("good", built[0].original_name);
+    try testing.expectEqualStrings("fine", built[1].original_name);
+    try testing.expectEqual(@as(u32, 2), counted.dropped.total());
+}
+
+test "a tool the engine skips for its inputSchema takes no name: the model gets a later good tool of the name" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const skipped = [_][]const u8{ "{\"name\":\"a\"}", "{\"name\":\"a\",\"inputSchema\":null}", "{\"name\":\"a\",\"inputSchema\":[]}" };
+    for (skipped) |bad| {
+        var list = try dropped_tools.listOf(gpa, &.{
+            bad,
+            "{\"name\":\"a\",\"description\":\"the good one\",\"inputSchema\":{\"type\":\"object\"}}",
+        });
+        defer list.deinit(gpa);
+        var listed: [1]runtime_mod.Tool = undefined;
+        try testing.expectEqual(listed.len, list.len());
+        listed[0] = .{ .name = list.get(0).name, .raw = list.get(0).raw };
+        var c: Catalog = undefined;
+        c.names = .init(gpa);
+        defer c.names.deinit();
+        c.builtins = .{};
+        const built = try c.build(a, "srv", &listed);
+        try testing.expectEqual(@as(usize, 1), built.len);
+        try testing.expectEqualStrings("a", built[0].original_name);
+        try testing.expectEqualStrings("the good one", built[0].description);
     }
 }
 

@@ -29,8 +29,8 @@ const mutants: Mutant[] = [
   {
     name: "wait-never-crosses",
     file: "src/core/execution/managed_execution.zig",
-    from: "prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;",
-    to: "prepared.snapshot.quiet_crossed = false;",
+    from: "        var prepared = try self.prepareSnapshotForEntry(alloc, entry);\n        // A command that ended as the wait finished is no crossing.\n        if (quiet_crossed) prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;",
+    to: "        var prepared = try self.prepareSnapshotForEntry(alloc, entry);\n        prepared.snapshot.quiet_crossed = false;",
   },
   {
     name: "memory-drops-crossing",
@@ -95,7 +95,7 @@ const unitFilters = [
   "a call ends only itself",
   "the quiet note names",
   "a quiet note for a child",
-  "only a running result that ended",
+  "only a result whose wait ended past the limit after seeing it under",
   "working subagent's row",
   "dupeToolResultMemory",
   "command sidebands merge",

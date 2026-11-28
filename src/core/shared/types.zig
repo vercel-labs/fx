@@ -3,6 +3,7 @@ const testing_allocator = @import("testing_allocator.zig");
 const text_utils = @import("text_utils.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const recovery = @import("../recovery/recovery.zig");
+const json_decode = @import("json_decode.zig");
 
 pub const Layout = struct {
     rows: u16,
@@ -45,17 +46,17 @@ pub const SemanticNotice = struct {
     /// An optional dim line under the body, indented like a wrapped body row
     /// and without its own glyph.
     detail: []const u8 = "",
+    /// Where the detail row shows; `.full_only` keeps it to the full transcript.
+    detail_visibility: NoticeVisibility = .compact_and_full,
 };
 
-/// Status glyph leading every semantic notice, keyed by tone. Tool activity
-/// owns "●"; notices deliberately use distinct git-style status glyphs so the
-/// two channels never read as the same raw marker. The neutral marker "*"
-/// avoids the middot, which the footer already uses as a separator.
+/// Status glyph leading every semantic notice, keyed by tone. Tool activity owns "●",
+/// so notices use other marks; "⚠" matches the status line's warning sign, and "*" avoids the footer's middot.
 pub fn noticeGlyph(tone: NoticeTone) []const u8 {
     return switch (tone) {
         .information => "i",
         .success => "✓",
-        .warning => "!",
+        .warning => "⚠",
         .@"error" => "✗",
         .cancelled => "⊘",
         .neutral => "*",
@@ -75,6 +76,7 @@ pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.
         .body = body,
         .visibility = notice.visibility,
         .detail = try alloc.dupe(u8, notice.detail),
+        .detail_visibility = notice.detail_visibility,
     };
 }
 
@@ -214,7 +216,35 @@ pub const TurnPresentationOutcome = enum {
 pub const TurnFinished = struct {
     turn_id: u64,
     outcome: TurnPresentationOutcome,
+    /// How the turn's last model reply ended, when one did. A subagent's
+    /// parent reads it to say why a failed turn failed.
+    disposition: ?ProviderCompletionDisposition = null,
 };
+
+/// Why a turn failed when its reply was cut off at the output limit, in the
+/// failure a subagent's parent sees in place of `agent_turn_failed`.
+const output_limit_failure = "output_limit: the reply was cut off at its output-token limit";
+
+/// The failure a turn that ended this way reports, when its own reason says
+/// more than that it failed.
+pub fn turnFailureFor(finished: TurnFinished) ?ModelFailureDiagnostic {
+    if (finished.outcome != .failed) return null;
+    const disposition = finished.disposition orelse return null;
+    return switch (disposition) {
+        .length_limited => ModelFailureDiagnostic.init(output_limit_failure),
+        else => null,
+    };
+}
+
+test "a turn that a cut reply failed reports the output limit" {
+    try std.testing.expectEqualStrings(
+        "output_limit: the reply was cut off at its output-token limit",
+        turnFailureFor(.{ .turn_id = 1, .outcome = .failed, .disposition = .length_limited }).?.view(),
+    );
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .completed, .disposition = .length_limited }) == null);
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .failed }) == null);
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .failed, .disposition = .completed }) == null);
+}
 
 pub const ToolLifecycleId = struct {
     turn_id: u64,
@@ -1452,9 +1482,9 @@ pub const ToolResultMemory = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
-    /// Set on a running shell result whose wait ended when its command
-    /// crossed the quiet limit (`src/core/execution/quiet_notice.zig`), for
-    /// the note fx relays to a subagent's parent. Only the tool's end event
+    /// Set on a running shell result whose wait ended past the quiet limit
+    /// after seeing the command under it (`src/core/execution/quiet_notice.zig`),
+    /// for the note fx relays to a subagent's parent. Only the tool's end event
     /// reads it; the session never saves it.
     quiet_crossing: ?QuietCrossing = null,
     /// A `subagent` message that made a new subagent, so its row reads
@@ -1691,6 +1721,23 @@ pub const FileEvidence = struct {
     stale: bool = false,
 };
 
+/// The toolbox menu a conversation sends on every request (D103).
+pub const SavedToolboxMenu = struct {
+    /// The lead and the menu, as the requests send them.
+    text: []u8,
+    /// `toolbox.entriesHash` of what the menu lists.
+    entries_hash: u64,
+};
+
+/// What a toolbox change note told the conversation the toolbox holds (D103).
+pub const ToolboxNoted = struct {
+    /// `toolbox.entriesHash` of what the toolbox held.
+    entries_hash: u64,
+    /// How many compactions the conversation had when the note was added. A
+    /// later compaction's summary replaces the note.
+    compaction_count: usize,
+};
+
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
@@ -1704,6 +1751,11 @@ pub const ExecutionMemory = struct {
     /// that captured it saves it; later turns send the newest saved copy
     /// unchanged (D94).
     runtime_context: ?[][]u8 = null,
+    /// The toolbox menu this turn sent first for the conversation. Later
+    /// turns, resumed ones included, send these bytes unchanged (D103).
+    toolbox_menu: ?SavedToolboxMenu = null,
+    /// What this turn's toolbox change note told the conversation (D103).
+    toolbox_noted: ?ToolboxNoted = null,
     turn_summary: ?TurnSummary = null,
     /// The turn's settled model calls, in order, for Ctrl+O. Display data:
     /// never part of what the model is sent.
@@ -2053,7 +2105,110 @@ pub const ChatMessage = struct {
     /// provider's compaction block stands for, which only the model that
     /// wrote it can read (`tests/tla/compaction/ProviderCompaction.tla` Wire).
     replay_fallback: ?[]const u8 = null,
+    /// The user's own answer to a question fx asked, which the security
+    /// review and compaction take as the user's words. Set from the call
+    /// that ran and its result (`isUserAnswer`), where the result is made and
+    /// where a saved turn is rebuilt, so a question asked through toolbox
+    /// counts too and fx's note for a cancelled question never does. Never
+    /// saved or sent to a provider.
+    user_answer: bool = false,
+    /// A question's result that fx stored outside the session behind a
+    /// preview (`ToolResultMemory.output_handle`), so its answers are not in
+    /// `content`. The security review reads them by handle before it takes
+    /// them as the user's words (`isStoredUserAnswer`). Never saved or sent
+    /// to a provider.
+    stored_user_answer: bool = false,
 };
+
+/// The tool that asks the user questions.
+pub const user_question_tool_name = "ask_user_question";
+
+/// The answered questions in a question tool's result, in its order. Null for
+/// any other text, such as fx's note that the user cancelled the question or
+/// that no one could answer it. Only the answers must be there; a missing
+/// question reads as empty. The strings borrow `output` or `arena`.
+pub fn answeredQuestions(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const QuestionAnswer {
+    return json_decode.parseFromSliceLeaky([]const QuestionAnswer, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+}
+
+/// The user's answers in a question tool's result (`answeredQuestions`). The
+/// answers borrow `output` or `arena`.
+pub fn questionAnswers(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const []const u8 {
+    const pairs = try answeredQuestions(arena, output) orelse return null;
+    const answers = try arena.alloc([]const u8, pairs.len);
+    for (answers, pairs) |*answer, pair| answer.* = pair.answer;
+    return answers;
+}
+
+/// Whether a result with `status` and `output` is the user's own answer to a
+/// question fx asked: one that lists the user's answers (`questionAnswers`).
+/// `ran_tool` is the tool that ran: for a toolbox run, the one it carries,
+/// not `toolbox`, the name its result goes back under.
+pub fn isUserAnswer(alloc: std.mem.Allocator, ran_tool: []const u8, status: ?PersistedToolStatus, output: []const u8) std.mem.Allocator.Error!bool {
+    if (!std.mem.eql(u8, ran_tool, user_question_tool_name) or status == .failure) return false;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    return try answeredQuestions(scratch.allocator(), output) != null;
+}
+
+/// Whether a result is a question's answers that fx stored behind a preview:
+/// the question tool ran (`ran_tool`, as for `isUserAnswer`), it did not
+/// fail, the model saw only a preview (`truncated`), and the whole output has
+/// a stored handle. fx saves a short result under a handle too, but the model
+/// sees all of it, so that result is not one.
+pub fn isStoredUserAnswer(ran_tool: []const u8, status: ?PersistedToolStatus, memory: ?ToolResultMemory) bool {
+    if (!std.mem.eql(u8, ran_tool, user_question_tool_name) or status == .failure) return false;
+    const stored = memory orelse return false;
+    return stored.truncated and stored.output_handle != null;
+}
+
+test "only a question's listed answers are the user's answer" {
+    const alloc = std.testing.allocator;
+    const answered = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    try std.testing.expect(try isUserAnswer(alloc, "ask_user_question", .success, answered));
+    try std.testing.expect(try isUserAnswer(alloc, "ask_user_question", null, answered));
+    try std.testing.expect(!try isUserAnswer(alloc, "ask_user_question", .failure, answered));
+    try std.testing.expect(!try isUserAnswer(alloc, "toolbox", .success, answered));
+    try std.testing.expect(!try isUserAnswer(alloc, "shell", .success, answered));
+    // fx's own notes, which the question tool returns as a success.
+    for ([_][]const u8{
+        "(user cancelled the question)",
+        "(ask_user_question is only available in the interactive shell; ask the user freeform instead)",
+        "(ask_user_question: invalid arguments; provide {questions})",
+        "[{\"question\":\"Choose next step?\"}]",
+    }) |note| try std.testing.expect(!try isUserAnswer(alloc, "ask_user_question", .success, note));
+}
+
+test "a question's result gives each question with its answer, in order" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pairs = (try answeredQuestions(arena, "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"},{\"question\":\"When may I push?\",\"answer\":\"only after CI is green\"}]")).?;
+    try std.testing.expectEqual(@as(usize, 2), pairs.len);
+    try std.testing.expectEqualStrings("Choose next step?", pairs[0].question);
+    try std.testing.expectEqualStrings("Run tests", pairs[0].answer);
+    try std.testing.expectEqualStrings("When may I push?", pairs[1].question);
+    try std.testing.expectEqualStrings("only after CI is green", pairs[1].answer);
+    const unasked = (try answeredQuestions(arena, "[{\"answer\":\"Run tests\"}]")).?;
+    try std.testing.expectEqualStrings("", unasked[0].question);
+    try std.testing.expect(try answeredQuestions(arena, "(user cancelled the question)") == null);
+    // A question that is not a string makes the text no answer list.
+    try std.testing.expect(try answeredQuestions(arena, "[{\"question\":5,\"answer\":\"Run tests\"}]") == null);
+    // An empty list is a list of no answers.
+    try std.testing.expectEqual(@as(usize, 0), (try answeredQuestions(arena, "[]")).?.len);
+    // A full batch of 20 reads whole, in order.
+    var full: std.Io.Writer.Allocating = .init(arena);
+    try full.writer.writeByte('[');
+    for (0..20) |n| try full.writer.print("{s}{{\"question\":\"Q{d}?\",\"answer\":\"A{d}\"}}", .{ if (n == 0) "" else ",", n, n });
+    try full.writer.writeByte(']');
+    const batch = (try answeredQuestions(arena, full.written())).?;
+    try std.testing.expectEqual(@as(usize, 20), batch.len);
+    try std.testing.expectEqualStrings("Q19?", batch[19].question);
+    try std.testing.expectEqualStrings("A19", batch[19].answer);
+}
 
 /// Returns a caller-owned shallow projection only when incompatible replay exists.
 pub fn projectProviderReplay(
@@ -2834,6 +2989,10 @@ pub const AssistantHistoryTurn = struct {
     assistant: []u8,
     execution: ExecutionMemory = .{},
     provider_replay: ?ProviderReplay = null,
+    /// The whole turn, when a compaction inside it cut steps out of
+    /// `execution`: the session log saves it, and resume leaves the cut steps
+    /// out again (D87). fx's history never keeps it (`dropSavedExecution`).
+    saved_execution: ?ExecutionMemory = null,
 };
 
 /// What a turn write does with the recovery module's record for the model
@@ -2885,6 +3044,8 @@ pub const InterruptedHistoryTurn = struct {
     /// (`turn_yielded`), and a later turn goes on from it. Only a session's
     /// replay sets it, and nothing saves it.
     yielded: bool = false,
+    /// As `AssistantHistoryTurn.saved_execution`.
+    saved_execution: ?ExecutionMemory = null,
 };
 
 pub const CompactedSummaryHistoryTurn = struct {
@@ -2911,8 +3072,14 @@ pub const HistoryTurn = union(enum) {
 
 pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
     switch (turn.*) {
-        .assistant => |*entry| entry.execution.turn_summary = summary,
-        .interrupted => |*entry| entry.execution.turn_summary = summary,
+        .assistant => |*entry| {
+            entry.execution.turn_summary = summary;
+            if (entry.saved_execution) |*whole| whole.turn_summary = summary;
+        },
+        .interrupted => |*entry| {
+            entry.execution.turn_summary = summary;
+            if (entry.saved_execution) |*whole| whole.turn_summary = summary;
+        },
         .compacted_summary => {},
     }
 }
@@ -3198,7 +3365,9 @@ pub const QuestionBatchEntry = struct {
 /// One persisted answer from an interactive question batch. The strings are
 /// borrowed from the short-lived arena that decodes the completed tool result.
 pub const QuestionAnswer = struct {
-    question: []const u8,
+    /// Empty when a saved answer list leaves the question out
+    /// (`answeredQuestions`).
+    question: []const u8 = "",
     answer: []const u8,
 };
 
@@ -3219,6 +3388,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             alloc.free(entry.assistant);
             if (entry.provider_replay) |replay| freeProviderReplay(alloc, replay);
             freeExecutionMemory(alloc, entry.execution);
+            if (entry.saved_execution) |saved| freeExecutionMemory(alloc, saved);
         },
         .interrupted => |entry| {
             freeUserTurn(alloc, entry.user);
@@ -3226,12 +3396,44 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             if (entry.tool_call) |tool_call| freeToolCall(alloc, tool_call);
             freeCompletedToolNames(alloc, entry.completed_tool_names);
             freeExecutionMemory(alloc, entry.execution);
+            if (entry.saved_execution) |saved| freeExecutionMemory(alloc, saved);
             if (entry.cancelled_command) |presentation| {
                 freeCancelledCommandPresentation(alloc, presentation);
             }
             if (entry.cancelled_wait) |presentation| freeCancelledWaitPresentation(alloc, presentation);
         },
     }
+}
+
+/// `turn` as the session log saves it: its whole execution in place of the
+/// part fx's history keeps, when a compaction inside it cut steps (D87).
+/// Borrows `turn`.
+pub fn savedHistoryTurn(turn: HistoryTurn) HistoryTurn {
+    var saved = turn;
+    switch (saved) {
+        .assistant => |*entry| if (entry.saved_execution) |whole| {
+            entry.execution = whole;
+            entry.saved_execution = null;
+        },
+        .interrupted => |*entry| if (entry.saved_execution) |whole| {
+            entry.execution = whole;
+            entry.saved_execution = null;
+        },
+        .compacted_summary => {},
+    }
+    return saved;
+}
+
+/// Frees `turn`'s whole execution, which only the session log saves, so fx's
+/// history keeps what the model is sent and nothing more.
+pub fn dropSavedExecution(alloc: std.mem.Allocator, turn: *HistoryTurn) void {
+    const saved = switch (turn.*) {
+        .assistant => |*entry| &entry.saved_execution,
+        .interrupted => |*entry| &entry.saved_execution,
+        .compacted_summary => return,
+    };
+    if (saved.*) |whole| freeExecutionMemory(alloc, whole);
+    saved.* = null;
 }
 
 pub fn freeHistoryTurnSlice(alloc: std.mem.Allocator, turns: []HistoryTurn) void {
@@ -3280,12 +3482,15 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
             errdefer freeExecutionMemory(alloc, execution);
+            const saved_execution = if (entry.saved_execution) |saved| try dupeExecutionMemory(alloc, saved) else null;
+            errdefer if (saved_execution) |saved| freeExecutionMemory(alloc, saved);
             const replay = if (entry.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
             break :blk .{ .assistant = .{
                 .user = user,
                 .assistant = assistant,
                 .execution = execution,
                 .provider_replay = replay,
+                .saved_execution = saved_execution,
             } };
         },
         .interrupted => |entry| blk: {
@@ -3316,6 +3521,8 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
             errdefer if (cancelled_wait) |presentation| freeCancelledWaitPresentation(alloc, presentation);
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
+            errdefer freeExecutionMemory(alloc, execution);
+            const saved_execution = if (entry.saved_execution) |saved| try dupeExecutionMemory(alloc, saved) else null;
 
             break :blk .{ .interrupted = .{
                 .user = user,
@@ -3329,6 +3536,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .cancellation_origin = entry.cancellation_origin,
                 .stopped_by_exit = entry.stopped_by_exit,
                 .yielded = entry.yielded,
+                .saved_execution = saved_execution,
             } };
         },
     };
@@ -3427,6 +3635,11 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     errdefer freePersistedContextNotes(alloc, context_notes);
     const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
     errdefer if (runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    const toolbox_menu: ?SavedToolboxMenu = if (memory.toolbox_menu) |menu|
+        .{ .text = try alloc.dupe(u8, menu.text), .entries_hash = menu.entries_hash }
+    else
+        null;
+    errdefer if (toolbox_menu) |menu| alloc.free(menu.text);
     const model_calls = try dupeModelCallRecords(alloc, memory.model_calls);
     errdefer freeModelCallRecords(alloc, model_calls);
     const bridge_calls = try dupeBridgeCallRecords(alloc, memory.bridge_calls);
@@ -3436,6 +3649,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        .toolbox_menu = toolbox_menu,
+        .toolbox_noted = memory.toolbox_noted,
         .turn_summary = memory.turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,
@@ -3450,6 +3665,7 @@ pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) vo
     freePersistedSteering(alloc, memory.steering);
     freePersistedContextNotes(alloc, memory.context_notes);
     if (memory.runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    if (memory.toolbox_menu) |menu| alloc.free(menu.text);
 }
 
 /// Caller owns the result; free it with `freeRuntimeContext`.

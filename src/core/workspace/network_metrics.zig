@@ -9,6 +9,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 
 pub const max_model_len: usize = 64;
 pub const max_error_len: usize = 48;
@@ -17,6 +18,12 @@ pub const max_gateway_schema_diagnostic_len: usize = 160;
 pub const max_gateway_request_shape_len: usize = 512;
 /// The gateway's own words for a failed call, so a trace says why it failed.
 pub const max_gateway_error_message_len: usize = 200;
+/// The gateway's generation ID and the provider that served the call, cut to
+/// the same limit a model call record uses.
+pub const max_generation_id_len: usize = types.model_call_text_max_bytes;
+pub const max_served_by_len: usize = types.model_call_text_max_bytes;
+/// The reasoning effort the request sent, cut to the name limit.
+pub const max_effort_len: usize = types.ReasoningEffort.max_name_bytes;
 pub const ring_capacity: usize = 32;
 /// Failed calls kept apart from the window, so later successful calls never
 /// push them out.
@@ -57,6 +64,12 @@ pub const NetworkCall = struct {
     gateway_request_shape_len: u16 = 0,
     gateway_error_message_buf: [max_gateway_error_message_len]u8 = @splat(0),
     gateway_error_message_len: u16 = 0,
+    generation_id_buf: [max_generation_id_len]u8 = @splat(0),
+    generation_id_len: u16 = 0,
+    served_by_buf: [max_served_by_len]u8 = @splat(0),
+    served_by_len: u16 = 0,
+    effort_buf: [max_effort_len]u8 = @splat(0),
+    effort_len: u8 = 0,
 
     pub fn model(self: *const NetworkCall) []const u8 {
         return self.model_buf[0..self.model_len];
@@ -86,6 +99,18 @@ pub const NetworkCall = struct {
         return self.gateway_error_message_buf[0..self.gateway_error_message_len];
     }
 
+    pub fn generationId(self: *const NetworkCall) []const u8 {
+        return self.generation_id_buf[0..self.generation_id_len];
+    }
+
+    pub fn servedBy(self: *const NetworkCall) []const u8 {
+        return self.served_by_buf[0..self.served_by_len];
+    }
+
+    pub fn effort(self: *const NetworkCall) []const u8 {
+        return self.effort_buf[0..self.effort_len];
+    }
+
     pub fn setModel(self: *NetworkCall, name: []const u8) void {
         self.model_len = @intCast(keepPrefix(&self.model_buf, name));
     }
@@ -108,6 +133,18 @@ pub const NetworkCall = struct {
 
     pub fn setGatewayRequestShape(self: *NetworkCall, shape: []const u8) void {
         self.gateway_request_shape_len = @intCast(keepPrefix(&self.gateway_request_shape_buf, shape));
+    }
+
+    pub fn setGenerationId(self: *NetworkCall, id: []const u8) void {
+        self.generation_id_len = @intCast(keepPrefix(&self.generation_id_buf, id));
+    }
+
+    pub fn setServedBy(self: *NetworkCall, provider: []const u8) void {
+        self.served_by_len = @intCast(keepPrefix(&self.served_by_buf, provider));
+    }
+
+    pub fn setEffort(self: *NetworkCall, name: []const u8) void {
+        self.effort_len = @intCast(keepPrefix(&self.effort_buf, name));
     }
 
     /// Keeps `message` as one line the trace can quote: control bytes and
@@ -501,6 +538,9 @@ const text_fields = [_]TextField{
     .{ .set = NetworkCall.setProviderStopReason, .get = NetworkCall.providerStopReason, .limit = max_stop_reason_len },
     .{ .set = NetworkCall.setGatewaySchemaDiagnostic, .get = NetworkCall.gatewaySchemaDiagnostic, .limit = max_gateway_schema_diagnostic_len },
     .{ .set = NetworkCall.setGatewayRequestShape, .get = NetworkCall.gatewayRequestShape, .limit = max_gateway_request_shape_len },
+    .{ .set = NetworkCall.setGenerationId, .get = NetworkCall.generationId, .limit = max_generation_id_len },
+    .{ .set = NetworkCall.setServedBy, .get = NetworkCall.servedBy, .limit = max_served_by_len },
+    .{ .set = NetworkCall.setEffort, .get = NetworkCall.effort, .limit = max_effort_len },
 };
 
 test "network call text cuts end on a UTF-8 boundary" {
@@ -543,6 +583,17 @@ fn fuzzNetworkCallText(_: void, smith: *std.testing.Smith) !void {
             try std.testing.expect(kept.len + 3 >= @min(value.len, field.limit));
         }
     }
+}
+
+test "generation id and served-by keep 256 bytes, and effort keeps its 64-byte name" {
+    var call: NetworkCall = .{};
+    const long: [300]u8 = @splat('g');
+    call.setGenerationId(&long);
+    call.setServedBy(&long);
+    call.setEffort(&long);
+    try std.testing.expectEqual(@as(usize, 256), call.generationId().len);
+    try std.testing.expectEqual(@as(usize, 256), call.servedBy().len);
+    try std.testing.expectEqual(@as(usize, 64), call.effort().len);
 }
 
 test "fuzzed network call text stays a bounded prefix that keeps UTF-8 whole" {

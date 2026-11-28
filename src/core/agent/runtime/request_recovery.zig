@@ -28,7 +28,8 @@
 //! instances, and each can have a request in flight.
 //!
 //! The module retries every transient failure for as long as it lasts, and fx
-//! adds no limit of its own: only Esc ends a request whose failures keep
+//! adds no limit of its own, except for unreadable replies and OS errors that
+//! Zig has no name for: only Esc ends a request whose other failures keep
 //! coming.
 
 const std = @import("std");
@@ -78,6 +79,12 @@ pub fn failureKind(cause: types.ModelRecoveryCause) ?Failure.Kind {
 /// that sends one every time is broken, not having a bad moment.
 const max_unreadable_replies = 3;
 
+/// The OS errors that Zig has no name for one request takes before its turn
+/// ends. Their cause is not known, so one that comes back every time is taken
+/// as a defect, not a bad moment on the network. Other network failures in
+/// between do not count.
+const max_unnamed_os_errors = 3;
+
 /// Whether the store now holds a login the waiting request can send, other
 /// than the one the provider refused, as another fx process that signs in
 /// saves.
@@ -105,6 +112,9 @@ pub const RequestRecovery = struct {
     /// Replies this request could not read. Touched only by the request's
     /// own thread.
     unreadable_replies: u8 = 0,
+    /// Sends that failed with an OS error Zig has no name for. Touched only
+    /// by the request's own thread.
+    unnamed_os_errors: u8 = 0,
     /// Links the request into `registry` while it is registered. Guarded by
     /// `registry_mutex`, not `mutex`.
     registry_node: std.DoublyLinkedList.Node = .{},
@@ -142,6 +152,9 @@ pub const RequestRecovery = struct {
     /// `closeActive` saved the record marked clean: fx is exiting, and
     /// nothing after that may replace it.
     closed: bool = false,
+    /// What `closeForYield` replaced, so a cancelled restart can put the
+    /// request back (`reopenAfterYield`).
+    before_yield: ?BeforeYield = null,
     next_beat_ms: u64 = 0,
     /// Tests run on this virtual boot clock, so a 30-second wait takes no
     /// real time.
@@ -169,6 +182,8 @@ pub const RequestRecovery = struct {
 
     pub const Resume = types.RecoveryResume;
 
+    const BeforeYield = struct { state: recovery.State, record: ?recovery.Record };
+
     /// A new request, or one resumed. `fast` is the request's Fast
     /// selection, which makes "retrying without Fast" a real option.
     /// Returns the first send, or null when the module asks the user first;
@@ -176,6 +191,15 @@ pub const RequestRecovery = struct {
     pub fn start(self: *RequestRecovery, fast: bool, resumed: ?Resume) !?Send {
         if (self.deps.begin_route_recovery_request) |begin| begin(self.deps.ctx);
         if (self.deps.save_recovery_record != null) register(self);
+        // A continue or a closed sign-in from before this request answers none
+        // of its questions. Both are cleared before the step, which may ask,
+        // to keep a quick answer.
+        if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
+            debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event=user_continue origin=start reason=nothing_waits_for_it", .{});
+        };
+        if (self.sign_in_closed_flag) |flag| if (flag.swap(false, .seq_cst)) {
+            debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event=sign_in_closed origin=start reason=nothing_waits_for_it", .{});
+        };
         const from = resumed orelse Resume{};
         return self.event(.{ .start = .{ .fast = fast, .resume_from = from.record, .stale = from.stale, .continues = from.continues } });
     }
@@ -261,8 +285,9 @@ pub const RequestRecovery = struct {
     /// The turn stops before this request's send, between steps, for an
     /// upgrade's restart: saves the clean record `closing` returns, as
     /// SIGTERM does, so the next launch continues the request without
-    /// counting a death (`tests/tla/recovery/Resume.tla` Relaunch,
-    /// NoFalseCrashQuestion). Nothing replaces that record afterwards.
+    /// counting a death (`tests/tla/recovery/Resume.tla` Hold,
+    /// NoFalseCrashQuestion). Only a cancelled restart replaces that record
+    /// afterwards (`reopenAfterYield`).
     /// When the clean record does not land, the request stays as it was,
     /// open and with its send's record, so the turn goes on and its next
     /// boundary asks again (`Resume.tla` YieldSaveFails). Returns whether
@@ -290,9 +315,38 @@ pub const RequestRecovery = struct {
             debug_trace.eventf("recovery", "yield_close_failed", self.trace_ctx, "reason=clean_record_not_saved", .{});
             return false;
         }
+        self.before_yield = .{ .state = state_before, .record = record_before };
         self.closed = true;
         debug_trace.eventf("recovery", "closed", self.trace_ctx, "record_written=true", .{});
         return true;
+    }
+
+    pub const ReopenError = error{ NotYielded, RecordNotSaved };
+
+    /// The restart this request's turn stopped for was cancelled: the request
+    /// goes back to how it was before `closeForYield`, and its send's record
+    /// is saved again before the send, so a death during that send counts
+    /// (`tests/tla/recovery/Resume.tla` CancelRestart, CrashLoopAsks). When
+    /// the record does not land, the request stays closed with its clean
+    /// record and this fails, so no send goes out without its record.
+    /// Called on the request's own thread.
+    pub fn reopenAfterYield(self: *RequestRecovery) ReopenError!void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const before = self.before_yield orelse return error.NotYielded;
+        self.before_yield = null;
+        self.state = before.state;
+        self.record = before.record;
+        self.record_written = false;
+        self.closed = false;
+        self.writeRecordLocked();
+        if (!self.record_written) {
+            self.closed = true;
+            debug_trace.eventf("recovery", "yield_reopen_failed", self.trace_ctx, "reason=send_record_not_saved", .{});
+            return error.RecordNotSaved;
+        }
+        debug_trace.eventf("recovery", "reopened", self.trace_ctx, "reason=restart_cancelled", .{});
     }
 
     /// Whether this request's record is in the session log, so a turn
@@ -479,6 +533,14 @@ pub const RequestRecovery = struct {
     pub fn unreadableReplyEndsRequest(self: *RequestRecovery) bool {
         self.unreadable_replies +|= 1;
         return self.unreadable_replies >= max_unreadable_replies;
+    }
+
+    /// Counts a send that failed with an OS error Zig has no name for, and
+    /// says whether it is the last one: at `max_unnamed_os_errors` the turn
+    /// ends with the error instead of another resend.
+    pub fn unnamedOsErrorEndsRequest(self: *RequestRecovery) bool {
+        self.unnamed_os_errors +|= 1;
+        return self.unnamed_os_errors >= max_unnamed_os_errors;
     }
 
     pub fn attempt(self: *RequestRecovery) u16 {
@@ -1443,6 +1505,61 @@ test "a yield whose clean record does not land leaves the request open with its 
     try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
 }
 
+test "a cancelled restart reopens the request and saves its send's record again" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = (try request.start(false, null)).?;
+    const send_write = request.sendRecord();
+    try std.testing.expect(send_write == .save);
+    const sent = send_write.save;
+    fake.recovery_record = sent;
+    try std.testing.expect(request.closeForYield());
+    const clean = fake.recovery_record.?;
+
+    try request.reopenAfterYield();
+    try std.testing.expect(!std.mem.eql(u8, &clean, &fake.recovery_record.?));
+    try std.testing.expectEqual(sent, fake.recovery_record.?);
+    try std.testing.expect(request.recordSaved());
+}
+
+test "a reopen whose send record does not land fails and keeps the request closed" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = (try request.start(false, null)).?;
+    const send_write = request.sendRecord();
+    try std.testing.expect(send_write == .save);
+    fake.recovery_record = send_write.save;
+    try std.testing.expect(request.closeForYield());
+    const clean = fake.recovery_record.?;
+
+    fake.recovery_record_save_failures = 1;
+    try std.testing.expectError(error.RecordNotSaved, request.reopenAfterYield());
+    try std.testing.expect(!request.recordSaved());
+    try std.testing.expectEqual(clean, fake.recovery_record.?);
+}
+
+test "a request that never yielded cannot be reopened" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = (try request.start(false, null)).?;
+    try std.testing.expectError(error.NotYielded, request.reopenAfterYield());
+}
+
 test "closing saves a clean record for every request in flight" {
     var main_fake = recordingFake();
     defer main_fake.deinit();
@@ -1507,6 +1624,94 @@ test "a resumed start that must ask first sends nothing" {
         defer request.deinit();
         try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
     }
+}
+
+test "a continue from before a request does not answer the question it starts with" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    defer request.deinit();
+
+    // An Enter that reached no waiting request, such as one typed just
+    // after the out-of-credits picker's retry.
+    continue_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
+    try std.testing.expect(!continue_flag.load(.seq_cst));
+    try std.testing.expect(recovery.usesAnswer(&request.state, .user_continue));
+    try std.testing.expectEqual(@as(u16, 0), request.attempt());
+    // The user's own Enter answers it.
+    continue_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 1), request.attempt());
+}
+
+test "an Enter as soon as a request's first question shows answers it" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var continue_flag = std.atomic.Value(bool).init(false);
+    fake.continue_on_need_user = &continue_flag;
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    defer request.deinit();
+
+    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
+    try std.testing.expect(continue_flag.load(.seq_cst));
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 1), request.attempt());
+}
+
+/// The record a request saves while it waits for a sign-in.
+fn signInWaitRecord() recovery.Record {
+    var probe: recovery.State = .{};
+    _ = recovery.step(&probe, .{ .start = .{} }, 0);
+    return recovery.step(&probe, .{ .failed = .{ .kind = .sign_in } }, 0).save.?;
+}
+
+test "a sign-in closed before a request does not end the sign-in wait it resumes" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var closed_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.sign_in_closed_flag = &closed_flag;
+    defer request.deinit();
+
+    // The sign-in of an earlier request closed while that request's resend
+    // was on the wire, and the resend went through.
+    closed_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .record = signInWaitRecord() }));
+    try std.testing.expect(!closed_flag.load(.seq_cst));
+    try std.testing.expect(recovery.usesAnswer(&request.state, .sign_in_closed));
+    try std.testing.expectEqual(@as(u16, 0), request.attempt());
+    // The sign-in fx opens for this wait closes, and the request tries its
+    // saved login.
+    closed_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 1), request.attempt());
+}
+
+test "a sign-in that closes as soon as a resumed sign-in wait shows ends that wait" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var closed_flag = std.atomic.Value(bool).init(false);
+    fake.sign_in_closed_on_sign_in_wait = &closed_flag;
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.sign_in_closed_flag = &closed_flag;
+    defer request.deinit();
+
+    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .record = signInWaitRecord() }));
+    try std.testing.expect(closed_flag.load(.seq_cst));
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 1), request.attempt());
 }
 
 test "a resend leaves within one wait tick of its jittered deadline" {

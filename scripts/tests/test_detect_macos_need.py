@@ -213,6 +213,31 @@ class DetectMacosNeedTests(unittest.TestCase):
         self.assertEqual({}, outputs)
         self.assertIn("not a JSON array", text)
 
+    def test_non_ascii_zig_path_needs_macos(self) -> None:
+        self.write("src/café_mac.zig", "if (builtin.os.tag == .macos) {}\n")
+        self.commit("non-ascii path")
+
+        self.assertIn("src/café_mac.zig", self.assert_needed())
+
+    def test_quoted_zig_path_needs_macos(self) -> None:
+        self.write('src/a "quoted" mac.zig', "if (builtin.os.tag == .macos) {}\n")
+        self.commit("quoted path")
+
+        self.assertIn('src/a "quoted" mac.zig', self.assert_needed())
+
+    def test_git_diff_failure_exits_nonzero(self) -> None:
+        tree_sha = self.git("rev-parse", "HEAD^{tree}")
+        obj_path = self.root / ".git" / "objects" / tree_sha[:2] / tree_sha[2:]
+        obj_path.chmod(0o644)
+        obj_path.unlink()
+
+        code, outputs, text = self.detect()
+
+        self.assertNotEqual(0, code, text)
+        self.assertEqual({}, outputs)
+        self.assertIn("git diff", text)
+        self.assertIn("failed", text)
+
 
 class MacosWorkflowConcurrencyTests(unittest.TestCase):
     def test_only_a_label_run_waits_for_the_run_in_progress(self) -> None:

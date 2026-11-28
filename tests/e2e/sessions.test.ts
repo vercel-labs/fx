@@ -23,7 +23,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -221,7 +221,7 @@ async function waitForSettledChild(fixture: Fixture, id: string, children: numbe
 function spawnAsk(fixture: Fixture, gateway: any, args: string[], cwd = fixture.workspace) {
   const child = spawn(FX_BIN, ["ask", "--json", "--auto", ...args], {
     cwd,
-    env: { ...process.env, ...env(fixture, gateway) } as Record<string, string>,
+    env: fxChildEnv({ ...env(fixture, gateway), FX_SOUND: "0" }) as Record<string, string>,
     stdio: "ignore",
   });
   const exited = new Promise((resolve) => child.on("exit", resolve));
@@ -251,7 +251,7 @@ function askWithSizeLimit(fixture: Fixture, gateway: any, blocks: number, args: 
     const child = spawn(
       "/bin/sh",
       ["-c", `trap '' XFSZ; ulimit -f ${blocks}; exec "$0" "$@"`, FX_BIN, "ask", "--json", "--auto", ...args],
-      { cwd: fixture.workspace, env: { ...process.env, ...env(fixture, gateway) } as Record<string, string> },
+      { cwd: fixture.workspace, env: fxChildEnv(env(fixture, gateway)) as Record<string, string> },
     );
     let stdout = "";
     let stderr = "";
@@ -302,10 +302,10 @@ function command(fixture: Fixture, gateway: any, args: string[], cwd = fixture.w
   return runFx(args, { cwd, env: env(fixture, gateway), timeoutMs: TIMEOUT });
 }
 
-async function ask(fixture: Fixture, gateway: any, args: string[]) {
+async function ask(fixture: Fixture, gateway: any, args: string[], extraEnv: Record<string, string | undefined> = {}) {
   const result = await runFx(["ask", "--json", "--auto", ...args], {
     cwd: fixture.workspace,
-    env: env(fixture, gateway),
+    env: { ...env(fixture, gateway), ...extraEnv },
     timeoutMs: TIMEOUT,
   });
   return result;
@@ -570,6 +570,47 @@ test("fx ask sends the turn's request while its start capture runs, and saves th
   }
 }, TIMEOUT);
 
+test("fx started by runFx or spawnAsk ignores a start capture hold left in the developer's environment, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-inherited-hold-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const held = join(fixture.root, "inherited-held");
+  const release = join(fixture.root, "inherited-release");
+  // The release comes with the first request, so an fx that takes the hold
+  // still finishes and leaves its marker behind.
+  const gateway = startDynamicFakeGateway(() => {
+    writeFileSync(release, "");
+    return fakeGatewayFinalText("DONE");
+  });
+  const before = {
+    held: process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD,
+    release: process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE,
+  };
+  process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD = held;
+  process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE = release;
+  try {
+    const run = await runFx(["ask", "--json", "--auto", "First."], { cwd: fixture.workspace, env: env(fixture, gateway), timeoutMs: TIMEOUT });
+    const runHeld = existsSync(held);
+    rmSync(held, { force: true });
+    const { exited } = spawnAsk(fixture, gateway, ["Second."]);
+    const spawnedCode = await exited;
+    expect({
+      runFx: { code: run.code, held: runHeld },
+      spawnAsk: { code: spawnedCode, held: existsSync(held) },
+    }).toEqual({
+      runFx: { code: 0, held: false },
+      spawnAsk: { code: 0, held: false },
+    });
+  } finally {
+    if (before.held === undefined) delete process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD;
+    else process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD = before.held;
+    if (before.release === undefined) delete process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE;
+    else process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE = before.release;
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
 test("fx ask killed while its start capture is held keeps the prompt, and the resumed turn records its own captures, with experimental.workspace_capture", async () => {
   const fixture = createFixture("fx-v2-capture-kill-");
   makeCaptureRepository(fixture);
@@ -589,7 +630,7 @@ test("fx ask killed while its start capture is held keeps the prompt, and the re
   try {
     const child = spawn(FX_BIN, ["ask", "--json", "--auto", "Before the kill."], {
       cwd: fixture.workspace,
-      env: { ...process.env, ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release } as Record<string, string>,
+      env: fxChildEnv({ ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release }) as Record<string, string>,
       stdio: "ignore",
     });
     const exited = new Promise((resolve) => child.on("exit", resolve));
@@ -614,6 +655,34 @@ test("fx ask killed while its start capture is held keeps the prompt, and the re
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT);
+
+test("fx ask finishes and leaves a FIFO alone when one sits at its start capture's hold marker, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-fifo-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // Nothing ever reads this FIFO, so opening it to write the marker would
+  // block fx for good.
+  const held = join(fixture.root, "start-capture-held");
+  const release = join(fixture.root, "start-capture-release");
+  const mkfifo = Bun.spawnSync(["mkfifo", held]);
+  expect(mkfifo.exitCode).toBe(0);
+  const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FIFO_LEFT_ALONE"));
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Say done."], {
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release },
+      timeoutMs: TIMEOUT,
+    });
+    expect({ code: result.code, timedOut: result.timedOut }).toEqual({ code: 0, timedOut: false });
+    expect(JSON.parse(result.stdout).output).toContain("FIFO_LEFT_ALONE");
+    expect(statSync(held).isFIFO()).toBe(true);
+    // The start capture skipped its hold and still ran.
+    expect(workspaceCaptures(fixture, JSON.parse(result.stdout).session_id).map((record) => record.phase)).toEqual(["start", "end"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
 
 test("fx ask never captures a repository at the home folder that a tool writes in, with experimental.workspace_capture", async () => {
   const fixture = createFixture("fx-v2-capture-home-");
@@ -827,13 +896,15 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
     expect(first.output).toBe("V2_FIRST_ANSWER");
     const id: string = first.session_id;
     expect(id.length).toBeGreaterThan(0);
-    // The first turn saves the runtime context it captured right after its
-    // user message (D94), checkpoints recovery before the model call and
-    // clears it after the call completes, alongside the model call (D96).
+    // The first turn saves the toolbox menu it sent (D103) and the runtime
+    // context it captured (D94) right after its user message, checkpoints
+    // recovery before the model call and clears it after the call
+    // completes, alongside the model call (D96).
     expect(shape(logLines(fixture.home, id))).toEqual([
       "session_created",
       "turn_started",
       "item:user",
+      "item:toolbox_menu",
       "item:runtime_context",
       "item:recovery",
       "item:model_call",
@@ -862,9 +933,76 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
 
     const kinds = logLines(fixture.home, id).map((line) => line.kind);
     expect(kinds.filter((kind) => kind === "turn_committed").length).toBe(3);
-    // The resumed turns send the saved copy and save none of their own.
+    // The resumed turns send the saved copies and save none of their own.
     expect(shape(logLines(fixture.home, id)).filter((kind) => kind === "item:runtime_context").length).toBe(1);
+    expect(shape(logLines(fixture.home, id)).filter((kind) => kind === "item:toolbox_menu").length).toBe(1);
     expectNoV1Sessions(fixture);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("a v2 session saved before model identity existed emits one <fx-context-update> with the model on first resume and none on the next", async () => {
+  const fixture = createFixture("fx-v2-pre-model-resume-");
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("PRE_MODEL_SEED"),
+    fakeGatewayFinalText("PRE_MODEL_RESUME_1"),
+    fakeGatewayFinalText("PRE_MODEL_RESUME_2"),
+  ]);
+  try {
+    const seeded = await ask(fixture, gateway, ["Seed pre-model session."]);
+    expect(seeded.code, seeded.stderr).toBe(0);
+    const id = JSON.parse(seeded.stdout).session_id;
+
+    // Strip any `model: ...` line from the saved `item:runtime_context` so the
+    // log matches a v2 session saved before fx named the model in turn context.
+    const logPath = join(storeRoot(fixture.home), id, "log.jsonl");
+    let stripped = false;
+    const rewritten = readFileSync(logPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        if (line.includes('"type":"runtime_context"') && line.includes(`\\nmodel: ${FAKE_GATEWAY_MODEL}\\n`)) {
+          const crcIdx = line.lastIndexOf(',"crc":"');
+          expect(crcIdx).toBeGreaterThan(0);
+          const prefix = line.slice(0, crcIdx).replace(`\\nmodel: ${FAKE_GATEWAY_MODEL}\\n`, "\\n");
+          const crc = crc32c(Buffer.from(prefix)).toString(16).padStart(8, "0");
+          stripped = true;
+          return `${prefix},"crc":"${crc}"}`;
+        }
+        return line;
+      })
+      .join("\n") + "\n";
+    expect(stripped).toBe(true);
+    writeFileSync(logPath, rewritten, { mode: 0o600 });
+    expectWholeLog(fixture, id);
+
+    const resumed1 = await ask(fixture, gateway, ["--resume", id, "First resumed question."]);
+    expect(resumed1.code, resumed1.stderr).toBe(0);
+    const resumed2 = await ask(fixture, gateway, ["--resume", id, "Second resumed question."]);
+    expect(resumed2.code, resumed2.stderr).toBe(0);
+
+    expect(gateway.requests).toHaveLength(3);
+    const contentText = (content: unknown): string => {
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) return content.map(contentText).join("");
+      if (content && typeof content === "object") {
+        const value = content as Record<string, unknown>;
+        return [contentText(value.text), contentText(value.value), contentText(value.content)].join("");
+      }
+      return "";
+    };
+    const userMsg = (body: string) => {
+      const prompt = JSON.parse(body).prompt as Array<{ role: string; content: unknown }>;
+      return contentText(prompt.filter((m) => m.role === "user").at(-1)?.content);
+    };
+    const req1User = userMsg(gateway.requests[1]!.body);
+    expect(req1User).toContain("<fx-context-update>");
+    expect(req1User).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${FAKE_GATEWAY_MODEL}\\n`));
+
+    const req2User = userMsg(gateway.requests[2]!.body);
+    expect(req2User).not.toContain("<fx-context-update>");
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -1160,7 +1298,7 @@ test("fx ask killed in the middle of a turn resumes with that turn interrupted",
 
     const child = spawn(FX_BIN, ["ask", "--json", "--auto", "--resume", id, "This turn is killed."], {
       cwd: fixture.workspace,
-      env: { ...process.env, ...env(fixture, gateway) } as Record<string, string>,
+      env: fxChildEnv(env(fixture, gateway)) as Record<string, string>,
       stdio: "ignore",
     });
     await reachedStall;
@@ -1671,7 +1809,7 @@ test.skipIf(!tmuxAvailable())("the interactive app saves to v2 and resumes with 
   try {
     const first = await startApp(fixture, gateway, []);
     await first.session.sendText("First interactive question.");
-    await first.session.waitForPane((pane) => pane.includes("APP_V2_FIRST") && turnSettled(pane), TIMEOUT);
+    await first.session.waitForReplyAndTurnEnd("APP_V2_FIRST", TIMEOUT);
     await quitApp(first);
     const id = onlySessionId(fixture.home);
     expectNoV1Sessions(fixture);
@@ -1844,7 +1982,7 @@ test.skipIf(!tmuxAvailable())("the picker shows a session open in another fx as 
   try {
     const owner = await startApp(fixture, gateway, []);
     await owner.session.sendText("Hold this session open.");
-    await owner.session.waitForPane((pane) => pane.includes("PICKER_BUSY_SAVED") && turnSettled(pane), TIMEOUT);
+    await owner.session.waitForReplyAndTurnEnd("PICKER_BUSY_SAVED", TIMEOUT);
     const id = onlySessionId(fixture.home);
 
     const contenderStderr = join(fixture.root, "contender-stderr.log");
@@ -1954,7 +2092,7 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     const app = await startApp(fixture, gateway, [], true, wiringTrace(trace));
     for (const [prompt, answer] of [["Fork prompt one.", "FORK_ONE"], ["Fork prompt two.", "FORK_TWO"], ["Fork prompt three.", "FORK_THREE"]]) {
       await app.session.sendText(prompt!);
-      await app.session.waitForPane((pane) => pane.includes(answer!) && turnSettled(pane), TIMEOUT);
+      await app.session.waitForReplyAndTurnEnd(answer!, TIMEOUT);
     }
     await app.session.sendText("/rename Fork source");
     await app.session.waitForText('renamed to "Fork source"', TIMEOUT);
@@ -2039,7 +2177,7 @@ test.skipIf(!tmuxAvailable())(forkBusyChildTest, async () => {
   try {
     app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access", FX_TRACE: "1", FX_TRACE_LOG: trace });
     await app.session.sendText("Fork busy prompt one.");
-    await app.session.waitForPane((pane) => pane.includes("BUSY_ONE") && turnSettled(pane), TIMEOUT);
+    await app.session.waitForReplyAndTurnEnd("BUSY_ONE", TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork busy prompt two.");
     await scrollbackContains(app.session, "BUSY_PARENT_SENT");
@@ -2170,7 +2308,7 @@ test.skipIf(!tmuxAvailable())("/fork stops a subagent waiting on a long shell co
   try {
     app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
     await app.session.sendText("Fork shell prompt one.");
-    await app.session.waitForPane((pane) => pane.includes("SHELL_ONE") && turnSettled(pane), TIMEOUT);
+    await app.session.waitForReplyAndTurnEnd("SHELL_ONE", TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork shell prompt two.");
     await scrollbackContains(app.session, "SHELL_PARENT_SENT");
@@ -2232,7 +2370,7 @@ test.skipIf(!tmuxAvailable())("a fork that stopped a working subagent leaves its
   try {
     app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
     await app.session.sendText("Fork stop prompt one.");
-    await app.session.waitForPane((pane) => pane.includes("STOP_ONE") && turnSettled(pane), TIMEOUT);
+    await app.session.waitForReplyAndTurnEnd("STOP_ONE", TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork stop prompt two.");
     await scrollbackContains(app.session, "STOP_PARENT_SENT");
@@ -2822,10 +2960,10 @@ test.skipIf(!tmuxAvailable())("a fork of a long session ends with its notice and
     const lastLine = lines.at(-1)!;
     longAnswer = ["```text", ...lines, "```"].join("\n");
     await app.session.sendText("Long fork prompt one.");
-    await app.session.waitForPane((pane) => pane.includes(lastLine) && turnSettled(pane), TIMEOUT);
+    await app.session.waitForReplyAndTurnEnd(lastLine, TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Long fork prompt two.");
-    await app.session.waitForPane((pane) => pane.includes("LONG_FORK_TWO") && turnSettled(pane), TIMEOUT);
+    await app.session.waitForReplyAndTurnEnd("LONG_FORK_TWO", TIMEOUT);
     await app.session.waitForStableComposer();
     const source = onlySessionId(fixture.home);
 
@@ -2863,7 +3001,7 @@ class AcpRpc {
       : ["/bin/sh", ["-c", `trap '' XFSZ; ulimit -f ${limitBlocks}; exec "$0" "$@"`, FX_BIN, "acp"]];
     this.proc = spawn(command, args, {
       cwd: fixture.workspace,
-      env: { ...process.env, ...env(fixture, gateway), ...extraEnv } as Record<string, string>,
+      env: fxChildEnv({ ...env(fixture, gateway), ...extraEnv }) as Record<string, string>,
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.exited = new Promise((resolve) => this.proc.on("exit", (code) => resolve(code)));
@@ -3828,6 +3966,208 @@ test("fx ask runs a subagent as a v2 child with its own log, recorded in the par
       expect(direct.code).toBe(1);
       expect(JSON.parse(direct.stdout).code).toBe("SessionNotFound");
     }
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx ask: a subagent's approval request goes to main, and main's approve lets the command run", async () => {
+  const fixture = createFixture("fx-v2-subagent-approval-approve-");
+  // A subagent that asks before it runs a command: fx ask has no screen for
+  // it, so its parent hears and answers with the subagent tool.
+  const profileDir = join(fixture.home, ".fx", "agents", "asker");
+  mkdirSync(profileDir, { recursive: true });
+  writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ description: "Runs one command", tools: ["shell"], permission_mode: "ask" }));
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body) && !body.includes("call_child_shell")) {
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayToolCall("call_child_shell", "shell", { request: { action: "run", command: "touch approved.txt" } });
+    }
+    if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_RAN");
+    if (body.includes("I wait for your approval to run") && !body.includes("call_main_approve")) {
+      return fakeGatewayToolCall("call_main_approve", "subagent", { action: "approve", agent: "asker" });
+    }
+    if (body.includes("call_main_approve") && !isReportTurn(body)) return fakeGatewayFinalText("MAIN_APPROVED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-asker")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-asker", "subagent", { request: { action: "message", agent: "asker", profile: "asker", message: "Touch approved.txt." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await ask(fixture, gateway, ["Delegate the command."]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    const output = JSON.parse(result.stdout);
+    expect(existsSync(join(fixture.workspace, "approved.txt"))).toBe(true);
+    expect(output.output).toContain("PARENT_DONE");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx ask: main's deny refuses a subagent's approval request with its reason", async () => {
+  const fixture = createFixture("fx-v2-subagent-approval-deny-");
+  const profileDir = join(fixture.home, ".fx", "agents", "asker");
+  mkdirSync(profileDir, { recursive: true });
+  writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ description: "Runs one command", tools: ["shell"], permission_mode: "ask" }));
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body) && !body.includes("call_child_shell")) {
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayToolCall("call_child_shell", "shell", { request: { action: "run", command: "touch approved.txt" } });
+    }
+    if (isChildRequest(body)) return fakeGatewayFinalText(body.includes("not in this workspace") ? "CHILD_SAW_DENY" : "CHILD_NO_REASON");
+    if (body.includes("I wait for your approval to run") && !body.includes("call_main_deny")) {
+      return fakeGatewayToolCall("call_main_deny", "subagent", { action: "deny", agent: "asker", message: "not in this workspace" });
+    }
+    if (body.includes("call_main_deny") && !isReportTurn(body)) return fakeGatewayFinalText("MAIN_DENIED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-asker")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-asker", "subagent", { request: { action: "message", agent: "asker", profile: "asker", message: "Touch approved.txt." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await ask(fixture, gateway, ["Delegate the command."]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    const output = JSON.parse(result.stdout);
+    expect(existsSync(join(fixture.workspace, "approved.txt"))).toBe(false);
+    expect(output.output).toContain("PARENT_DONE");
+    // The child read the reason main gave, and never ran the command.
+    const lines = childLines(fixture.home, output.session_id);
+    const childLog = logLines(fixture.home, lines[0].child) as any[];
+    expect(JSON.stringify(childLog)).toContain("CHILD_SAW_DENY");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx ask: main's stop refuses a subagent's approval request, and nothing runs", async () => {
+  const fixture = createFixture("fx-v2-subagent-approval-stop-");
+  const profileDir = join(fixture.home, ".fx", "agents", "asker");
+  mkdirSync(profileDir, { recursive: true });
+  writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ description: "Runs one command", tools: ["shell"], permission_mode: "ask" }));
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body) && !body.includes("call_child_shell")) {
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayToolCall("call_child_shell", "shell", { request: { action: "run", command: "touch stopped.txt" } });
+    }
+    if (isChildRequest(body)) {
+      return fakeGatewayFinalText(body.includes("Your parent stopped you before answering this request") ? "CHILD_SAW_STOP" : "CHILD_NO_REASON");
+    }
+    if (body.includes("I wait for your approval to run") && !body.includes("call_main_stop")) {
+      return fakeGatewayToolCall("call_main_stop", "subagent", { action: "stop", agent: "asker" });
+    }
+    if (body.includes("call_main_stop") && !isReportTurn(body)) return fakeGatewayFinalText("MAIN_STOPPED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-asker")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-asker", "subagent", { request: { action: "message", agent: "asker", profile: "asker", message: "Touch stopped.txt." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const trace = join(fixture.root, "fx-trace.log");
+    const result = await ask(fixture, gateway, ["Delegate the command."], { FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "subagent,mailbox" });
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    const output = JSON.parse(result.stdout);
+    expect(existsSync(join(fixture.workspace, "stopped.txt"))).toBe(false);
+    expect(output.output).toContain("MAIN_STOPPED");
+    // The stop refused the waiting request before it ended the turn: the trace
+    // names the request it refused, and the unit test proves the worker read
+    // the reason. The call never returned a result, so nothing ran.
+    expect(readFileSync(trace, "utf8")).toMatch(/approval requests refused child=\S+ refused=1 gone=0 ids=\S+/);
+    const lines = childLines(fixture.home, output.session_id);
+    const childLog = JSON.stringify(logLines(fixture.home, lines[0].child));
+    expect(childLog).toContain("call_child_shell");
+    expect(childLog).toContain("turn_interrupted");
+    expect(childLog).not.toContain("tool_result");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx ask: main's approve is refused when main's own review holds the action", async () => {
+  const fixture = createFixture("fx-v2-subagent-approval-caution-");
+  // The same subagent as the approve test, but main's own safety review holds
+  // the child's command, so approve must refuse it (RULES.md R4.2, R4.3).
+  const profileDir = join(fixture.home, ".fx", "agents", "asker");
+  mkdirSync(profileDir, { recursive: true });
+  writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ description: "Runs one command", tools: ["shell"], permission_mode: "ask" }));
+  let childAfter: string | null = null;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body) && !body.includes("call_child_shell")) {
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayToolCall("call_child_shell", "shell", { request: { action: "run", command: "touch approved.txt" } });
+    }
+    if (isChildRequest(body)) {
+      childAfter = body;
+      return fakeGatewayFinalText(body.includes("Action held after safety review") ? "CHILD_SAW_REFUSAL" : "CHILD_NO_REASON");
+    }
+    if (body.includes("I wait for your approval to run") && !body.includes("call_main_approve")) {
+      return fakeGatewayToolCall("call_main_approve", "subagent", { action: "approve", agent: "asker" });
+    }
+    if (body.includes("call_main_approve") && !isReportTurn(body)) return fakeGatewayFinalText("MAIN_APPROVED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-asker")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-asker", "subagent", { request: { action: "message", agent: "asker", profile: "asker", message: "Touch approved.txt." } });
+  }, { classifierDecision: "caution" });
+  try {
+    // Main's own delegate call needs no approval, so only the child's command
+    // reaches the review, which holds it.
+    const result = await ask(fixture, gateway, ["Delegate the command."]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    const output = JSON.parse(result.stdout);
+    expect(output.output).toContain("PARENT_DONE");
+    // The held command never ran, and the child read the review's reason.
+    expect(existsSync(join(fixture.workspace, "approved.txt"))).toBe(false);
+    expect(childAfter).not.toBeNull();
+    expect(childAfter!).toContain("Action held after safety review");
+    const lines = childLines(fixture.home, output.session_id);
+    const childLog = logLines(fixture.home, lines[0].child) as any[];
+    expect(JSON.stringify(childLog)).toContain("CHILD_SAW_REFUSAL");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx ask: a subagent's approval request that main leaves unanswered is refused when main's turn ends", async () => {
+  const fixture = createFixture("fx-v2-subagent-approval-unanswered-");
+  const profileDir = join(fixture.home, ".fx", "agents", "asker");
+  mkdirSync(profileDir, { recursive: true });
+  writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ description: "Runs one command", tools: ["shell"], permission_mode: "ask" }));
+  let childAfter: string | null = null;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body) && !body.includes("call_child_shell")) {
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayToolCall("call_child_shell", "shell", { request: { action: "run", command: "touch approved.txt" } });
+    }
+    if (isChildRequest(body)) {
+      childAfter = body;
+      return fakeGatewayFinalText(body.includes("ended its turn without answering") ? "CHILD_SAW_FALLBACK" : "CHILD_NO_REASON");
+    }
+    // Main reads the note and ends its turn without answering it. The report
+    // turn carries the note in its history, so it is not this turn.
+    if (!isReportTurn(body) && body.includes("I wait for your approval to run")) return fakeGatewayFinalText("MAIN_IGNORED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-asker")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-asker", "subagent", { request: { action: "message", agent: "asker", profile: "asker", message: "Touch approved.txt." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await ask(fixture, gateway, ["Delegate the command."]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    const output = JSON.parse(result.stdout);
+    // The fallback refused the request, the child reported, and main answered
+    // the report: the ask ends instead of waiting for ever.
+    expect(output.output).toContain("PARENT_DONE");
+    expect(existsSync(join(fixture.workspace, "approved.txt"))).toBe(false);
+    expect(childAfter).not.toBeNull();
+    expect(childAfter!).toContain("ended its turn without answering");
+    const lines = childLines(fixture.home, output.session_id);
+    const childLog = logLines(fixture.home, lines[0].child) as any[];
+    expect(JSON.stringify(childLog)).toContain("CHILD_SAW_FALLBACK");
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -5656,7 +5996,7 @@ test.skipIf(!tmuxAvailable())("text typed while the app answers steers that turn
     await until(() => hold.started, "the held reply");
     await app.session.sendText(steering);
     await until(() => hold.cancelled, "steering to stop the held reply");
-    await app.session.waitForPane((pane) => pane.includes("STEERED_ANSWER") && turnSettled(pane), TIMEOUT);
+    await app.session.waitForReplyAndTurnEnd("STEERED_ANSWER", TIMEOUT);
     await app.session.waitForComposer(TIMEOUT);
     const steered = gateway.requests[1]!.body;
     expect(steered).toContain("<user_steering>");
@@ -5719,7 +6059,7 @@ test.skipIf(!tmuxAvailable())("a cancelled app reply is saved as cancelled, and 
     await until(() => hold.cancelled, "the cancel to reach the gateway");
     await app.session.waitForComposer(TIMEOUT);
     await app.session.sendText("Confirm the next prompt still works.");
-    await app.session.waitForPane((pane) => pane.includes("AFTER_CANCEL_ANSWER") && turnSettled(pane), TIMEOUT);
+    await app.session.waitForReplyAndTurnEnd("AFTER_CANCEL_ANSWER", TIMEOUT);
     const followUp = gateway.requests[1]!.body;
     expect(countIn(followUp, "<turn_aborted>")).toBe(1);
     expect(followUp).toContain("PARTIAL_BEFORE_CANCEL");
@@ -5866,7 +6206,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     await tui.sendText("STEERING_START");
     await tui.waitForPane(() => childRequests === 1, 10000);
     // The parent's turn ends with the receipt while its child works.
-    await tui.waitForPane((pane) => pane.includes("START_SENT") && turnSettled(pane), 10000);
+    await tui.waitForReplyAndTurnEnd("START_SENT", 10000);
     const parent = rootSessionIds(fixture.home)[0]!;
     await until(() => childWork(fixture.home, parent).spawns === 1, "the child's spawn in the parent's log");
     const original = childWork(fixture.home, parent);
@@ -5880,7 +6220,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     expect(childWork(fixture.home, parent)).toEqual(original);
 
     held.release("HELD_CHILD_RESULT");
-    const reported = await tui.waitForPane((pane) => pane.includes("CHILD_COMPLETE") && turnSettled(pane), 10000);
+    const reported = await tui.waitForReplyAndTurnEnd("CHILD_COMPLETE", 10000);
     // The report shows as a finished subagent row, not as the user's prompt.
     expect(reported).toContain("worker finished");
     expect(reported).not.toContain("Subagent report (untrusted");
@@ -5889,7 +6229,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     await until(() => childWork(fixture.home, parent).outcome === "ok", "the child's work to be recorded done");
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_LATER");
-    await tui.waitForPane((pane) => pane.includes("LATER_OK") && turnSettled(pane), 10000);
+    await tui.waitForReplyAndTurnEnd("LATER_OK", 10000);
     expect(childRequests).toBe(1);
     await tui.sendText("/quit");
     await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
@@ -6182,7 +6522,7 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     const whole = readFileSync(log);
     let app2 = await launch(id, Math.floor(whole.length / SH_LIMIT_BLOCK));
     await app2.sendText("The disk is already full.");
-    await app2.waitForText("request failed: a file-size limit was reached", TIMEOUT);
+    await app2.waitForText("Request failed: a file-size limit was reached", TIMEOUT);
     await app2.waitForComposer(TIMEOUT);
     await quit();
     expect(gateway.requests.length).toBe(asked);
@@ -6688,7 +7028,7 @@ async function makeGridBase(exit: GridExit, by: "ask" | "app") {
         await app.session.waitForStableComposer(TIMEOUT, 300);
         await app.session.sendText("Grid second.");
         if (exit === "committed") {
-          await app.session.waitForPane((pane) => pane.includes("GRID_SECOND_ANSWER") && turnSettled(pane), TIMEOUT);
+          await app.session.waitForReplyAndTurnEnd("GRID_SECOND_ANSWER", TIMEOUT);
           await app.session.waitForComposer(TIMEOUT);
           await quitApp(app);
         } else if (exit === "cancelled") {

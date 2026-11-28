@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
 import { LARGE_TOOL, OTHER_TOOL, SMALL_TOOL, runPaths, seen, type PathName, type PathsRun } from "./mcp-rules-paths";
 import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
@@ -22,9 +22,9 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
+import { RAW_ANSWER, RAW_KEYS, RAW_STATE, arrayOf, escapedString, expectRawRetry, longNumber, longString, nested, objectOf, rawForm, rawLinesAt, rawRequests } from "./mcp-raw-rounds";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -94,6 +94,7 @@ type RootOptions = {
     | "response_missing_payload"
     | "response_ambiguous_payload"
     | "mrtr_input_required"
+    | "mrtr_raw"
     | "mrtr_url_required"
     | "mrtr_full_form"
     | "mrtr_collision_form"
@@ -139,6 +140,10 @@ type RootOptions = {
   expectedElicitation?: "form" | "url" | "both";
   elicitationUrl?: string;
   compactField?: Record<string, unknown>;
+  /** For mode "mrtr_raw": the input_required rounds the server sends, each field as the raw JSON text it writes (see the fixture). */
+  mrtrRaw?: Array<{ requests: string; state?: string }>;
+  /** For mode "mrtr_raw": the first server process exits on its first tools/call; the next one answers the rounds. */
+  mrtrCrashFirstCall?: boolean;
   legacyVersion?: "2025-06-18" | "2025-11-25";
   legacyDiscoveryVersions?: readonly ["2024-11-05", "2025-06-18", "2025-11-25"];
   legacyDiscoveryMethodNotFound?: boolean;
@@ -251,6 +256,9 @@ function createRoot(
             FX_MCP_EXPECT_ELICITATION: options.expectedElicitation,
             FX_MCP_ELICITATION_URL: options.elicitationUrl,
             FX_MCP_COMPACT_FIELD: options.compactField ? JSON.stringify(options.compactField) : undefined,
+            FX_MCP_MRTR_RAW: options.mrtrRaw ? JSON.stringify(options.mrtrRaw) : undefined,
+            FX_MCP_RAW_LINES: join(root, "mcp-raw-lines.txt"),
+            FX_MCP_MRTR_CRASH_FIRST_CALL: options.mrtrCrashFirstCall ? "1" : undefined,
             FX_MCP_RESOURCES_SUBSCRIBE: options.resourcesSubscribe === false
               ? "0"
               : undefined,
@@ -1295,7 +1303,7 @@ describe("modern MCP stdio compatibility", () => {
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Load the fixture echo tool and call it.");
-      await tui.waitForPane((pane) => pane.includes("FIRST_TURN_DONE") && turnSettled(pane), 20_000);
+      await tui.waitForReplyAndTurnEnd("FIRST_TURN_DONE", 20_000);
       await tui.waitForComposer(10_000);
       expect(toolResultText(activeGateway.requests[2]!.body, "first_call")).toContain(`${MODERN_RESULT}:first`);
       await tui.sendText("Call the echo tool again.");
@@ -2816,7 +2824,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP fixture.");
     await options.answer?.(tui);
-    await tui.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), 20_000);
+    await tui.waitForReplyAndTurnEnd(finalText, 20_000);
     const live = compactRows(await tui.captureFullScrollback());
     expect(live).toContain(`└ ${row}`);
     expect(live.filter((line) => line.includes(alias))).toEqual([`├ Opened ${alias}`]);
@@ -2916,7 +2924,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath, env });
         await tui.waitForComposer(15_000);
         await tui.sendText("Call the MCP fixture.");
-        await tui.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), 20_000);
+        await tui.waitForReplyAndTurnEnd(finalText, 20_000);
         await tui.waitForStableComposer(10_000);
         const live = compactRows(await tui.captureFullScrollback());
         expect(live).toContain(`└ Used ${serverName} to echo`);
@@ -3050,7 +3058,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath, env });
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP tool.");
-    await tui.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), 25_000);
+    await tui.waitForReplyAndTurnEnd(finalText, 25_000);
     await tui.waitForStableComposer(10_000);
     const live = compactRows(await tui.captureFullScrollback());
     expect(live).toContain(row);
@@ -3163,7 +3171,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       const cause = "arguments rejected: limit is a string, the schema wants a number";
       // The row names the failed call, and the cause follows it on its line.
       await tui.waitForText(cause, 20_000);
-      await tui.waitForPane((pane) => pane.includes("Rejected arguments complete.") && turnSettled(pane), 20_000);
+      await tui.waitForReplyAndTurnEnd("Rejected arguments complete.", 20_000);
       expect(await tui.captureFullScrollback()).toContain(`Couldn't use ${TOOL_ROW} · ${cause}`);
       // The model still gets the server's own words, which say how to fix the call.
       expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
@@ -3849,6 +3857,317 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     },
     35_000,
   );
+
+  // ---- a 2026 input_required round: what goes back, byte for byte (mcp-raw-rounds.ts) ----
+  const rawLinesOf = (root: FixtureRoot): string[] => rawLinesAt(join(root.root, "mcp-raw-lines.txt"));
+  const startRawRound = async (
+    label: string,
+    surface: "TUI" | "Ask",
+    options: Pick<RootOptions, "mrtrRaw" | "mrtrCrashFirstCall">,
+    finalText: string,
+    calls = 1,
+  ) => {
+    const root = createRoot(label, MODERN_FIXTURE, { mode: "mrtr_raw", expectedElicitation: "both", ...options });
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      ...Array.from({ length: calls }, (_, index) =>
+        fakeGatewayToolCall(index === 0 ? "call_mcp" : `call_mcp${index + 1}`, "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } })),
+      fakeGatewayFinalText(finalText),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    gateway = activeGateway;
+    const stderrPath = join(root.root, "stderr.log");
+    const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+    const session = await TmuxSession.create({
+      isolated: true,
+      ...(surface === "Ask"
+        ? { cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Call the raw round fixture.")}`, remainOnExit: true }
+        : { stderrPath }),
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: fixtureEnv(root, activeGateway),
+    });
+    tui = session;
+    if (surface === "TUI") {
+      await session.waitForComposer(15_000);
+      await session.sendText("Call the raw round fixture.");
+    }
+    return { root, session, activeGateway, stderrPath };
+  };
+  /** Answers the forms `f1`, `f2`, ... of a round in order: every field true, then the review's choice. */
+  const answerRawForms = async (session: TmuxSession, surface: "TUI" | "Ask", steps: Array<"accept" | "decline" | "cancel">) => {
+    const press = (text: string) => (surface === "TUI" ? session.sendKeys(text) : session.sendText(text));
+    for (const [index, step] of steps.entries()) {
+      const field = `f${index + 1}`;
+      await session.waitForText(`requests ${field}`, 20_000);
+      await press("1");
+      await session.waitForText(`- ${field}: true`, 20_000);
+      await press(step === "accept" ? "1" : step === "decline" ? "3" : "4");
+    }
+  };
+
+  for (const surface of ["TUI", "Ask"] as const) {
+    const accept = [RAW_ANSWER.accept("f1"), RAW_ANSWER.accept("f2"), RAW_ANSWER.accept("f3")];
+    for (const [name, steps, answers] of [
+      ["accepts every request", ["accept", "accept", "accept"], accept],
+      ["declines the first and accepts the rest", ["decline", "accept", "accept"], [RAW_ANSWER.decline, accept[1], accept[2]]],
+      ["cancels the second, which cancels the rest", ["accept", "cancel"], [accept[0], RAW_ANSWER.cancel, RAW_ANSWER.cancel]],
+    ] as const) {
+      test.skipIf(!tmuxAvailable())(
+        `${surface} gives a round's keys and requestState back as the server wrote them when the user ${name}`,
+        async () => {
+          const { root, session, activeGateway, stderrPath } = await startRawRound(
+            `${surface.toLowerCase()}-raw-round`,
+            surface,
+            { mrtrRaw: [{ requests: rawRequests(RAW_KEYS), state: RAW_STATE }] },
+            `${surface} raw round complete.`,
+          );
+          await answerRawForms(session, surface, [...steps]);
+          await session.waitForText(`${surface} raw round complete.`, 20_000);
+
+          const lines = rawLinesOf(root);
+          expect(lines).toHaveLength(2);
+          expectRawRetry(lines[1], RAW_KEYS, [...answers], RAW_STATE);
+          expect(activeGateway.requests[2]?.body).toContain("continued after raw rounds");
+          if (surface === "TUI") expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+          await session.kill();
+          tui = null;
+          await expectFixtureProcessesExited(readWire(root.wireLogPath));
+        },
+        60_000,
+      );
+    }
+  }
+
+  test.skipIf(!tmuxAvailable())(
+    "a round without a requestState sends none back, and a key of the longest length goes back as written",
+    async () => {
+      const keys = [`"${"k".repeat(255)}"`];
+      const { root, session } = await startRawRound("tui-raw-long-key", "TUI", { mrtrRaw: [{ requests: rawRequests(keys) }] }, "Long key complete.");
+      await answerRawForms(session, "TUI", ["accept"]);
+      await session.waitForText("Long key complete.", 20_000);
+      expectRawRetry(rawLinesOf(root)[1], keys, [RAW_ANSWER.accept("f1")], undefined);
+    },
+    45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a round with a key longer than fx takes is declined whole, and nothing goes back",
+    async () => {
+      const keys = [`"${"k".repeat(300)}"`];
+      const { root, session, activeGateway } = await startRawRound("tui-raw-key-over-limit", "TUI", { mrtrRaw: [{ requests: rawRequests(keys), state: RAW_STATE }] }, "Over limit complete.");
+      await session.waitForText("Over limit complete.", 30_000);
+      expect(rawLinesOf(root)).toHaveLength(1);
+      expect(activeGateway.requests.map((entry) => entry.body).join("\n")).not.toContain("continued after raw rounds");
+      expect(readFileSync(root.traceLogPath, "utf8")).toContain("MCP question not answered server=fixture");
+    },
+    45_000,
+  );
+
+  // A round is refused whole when a part of a request that fx does not read goes past one of its bounds, or is not
+  // JSON that std reads. Where the value sits decides its depth: the round is level 0, a request 1, its params or one
+  // more member of it 2, and a member's value 3 or 2. A value, empty or not, may sit at level 32 and no deeper; a
+  // string or a number may spell 65536 bytes, a collection may hold 256 members, and a name may be 256 bytes. An
+  // object may not repeat a name, however the name is written, and that answer wins over a bound. The words are the
+  // ones the user hears, and nothing goes back to the server.
+  const LARGER = "MCP server 'fixture' asked for input, and fx declined it: the form is larger than fx can show.";
+  const INVALID =
+    "MCP server 'fixture' asked for input, and fx declined it: fx can't show the form: it is invalid, has a field type fx doesn't support, or asks for a secret.";
+  // Half a surrogate pair never reaches the form check: the reader of the reply refuses the whole reply first.
+  const BAD_REPLY = "MCP protocol error -32600: invalid reply (it isn't valid JSON-RPC)";
+  const limitCases: Array<{ name: string; in: "params" | "request"; value: string; answer: "shown" | typeof LARGER | typeof INVALID | typeof BAD_REPLY }> = [
+    { name: "a value at level 32 in the params", in: "params", value: nested(29), answer: "shown" },
+    { name: "a value at level 33 in the params", in: "params", value: nested(30), answer: LARGER },
+    { name: "a value at level 32 in the request", in: "request", value: nested(30), answer: "shown" },
+    { name: "a value at level 33 in the request", in: "request", value: nested(31), answer: LARGER },
+    { name: "a string of 65536 bytes", in: "params", value: longString(65536), answer: "shown" },
+    { name: "a string of 65537 bytes", in: "params", value: longString(65537), answer: LARGER },
+    { name: "an escaped string of 65536 bytes", in: "params", value: escapedString(65536 - 2000, "\\n", 2000), answer: "shown" },
+    { name: "an escaped string of 65537 bytes", in: "params", value: escapedString(65536 - 2000, "\\n", 2001), answer: LARGER },
+    { name: "a number of 65536 digits", in: "params", value: longNumber(65536), answer: "shown" },
+    { name: "a number of 65537 digits", in: "params", value: longNumber(65537), answer: LARGER },
+    { name: "an array of 256 items", in: "params", value: arrayOf(256), answer: "shown" },
+    { name: "an array of 257 items", in: "params", value: arrayOf(257), answer: LARGER },
+    { name: "an array of 257 items in the request", in: "request", value: arrayOf(257), answer: LARGER },
+    { name: "an object of 256 members", in: "params", value: objectOf(256), answer: "shown" },
+    { name: "an object of 257 members", in: "params", value: objectOf(257), answer: LARGER },
+    { name: "an object of 257 members in the request", in: "request", value: objectOf(257), answer: LARGER },
+    { name: "a name of 256 bytes", in: "params", value: `{"${"k".repeat(256)}":0}`, answer: "shown" },
+    { name: "a name of 257 bytes", in: "params", value: `{"${"k".repeat(257)}":0}`, answer: LARGER },
+    { name: "a name of 257 bytes written as escapes", in: "params", value: `{"${"\\u006b".repeat(257)}":0}`, answer: LARGER },
+    { name: "an object of 300 members with 3 names", in: "params", value: objectOf(300, 3), answer: INVALID },
+    { name: "a repeated name in an object of the params", in: "params", value: '{"a":0,"a":1}', answer: INVALID },
+    { name: "a repeated name in the request", in: "request", value: '1,"x":2', answer: INVALID },
+    { name: "a repeated name, once written as escapes", in: "request", value: '1,"\\u0078":2', answer: INVALID },
+    { name: "a repeated name under a value past the depth bound", in: "params", value: `{"a":${nested(40)},"a":1}`, answer: INVALID },
+    { name: "a string that is half a surrogate pair", in: "params", value: '"\\ud800"', answer: BAD_REPLY },
+    { name: "a string that is half a surrogate pair under a value past the depth bound", in: "params", value: `[${nested(40)},"\\ud800"]`, answer: BAD_REPLY },
+    { name: "the same name in two objects", in: "params", value: '{"a":{"a":0},"b":{"a":0}}', answer: "shown" },
+  ];
+  for (const limit of limitCases) {
+    for (const surface of limit.answer !== "shown" ? (["TUI", "Ask"] as const) : (["TUI"] as const)) {
+      test.skipIf(!tmuxAvailable())(
+        `${surface} ${limit.answer !== "shown" ? "declines a round with" : "shows a round with"} ${limit.name}`,
+        async () => {
+          const { root, session, activeGateway } = await startRawRound(
+            `${surface.toLowerCase()}-raw-limit`,
+            surface,
+            { mrtrRaw: [{ requests: rawRequests([RAW_KEYS[0]], { in: limit.in, value: limit.value }), state: RAW_STATE }] },
+            `${surface} raw limit complete.`,
+          );
+          if (limit.answer === "shown") {
+            await answerRawForms(session, surface, ["accept"]);
+            await session.waitForText(`${surface} raw limit complete.`, 20_000);
+            const lines = rawLinesOf(root);
+            expect(lines).toHaveLength(2);
+            expectRawRetry(lines[1], [RAW_KEYS[0]], [RAW_ANSWER.accept("f1")], RAW_STATE);
+            return;
+          }
+          await session.waitForText(`${surface} raw limit complete.`, 30_000);
+          const screen = await session.captureFullScrollback();
+          // The longer answer wraps on the screen, so the words are compared with the line breaks taken out.
+          expect(screen.replace(/\s+/g, " ").split(limit.answer).length - 1, screen).toBe(1);
+          expect(rawLinesOf(root)).toHaveLength(1);
+          expect(activeGateway.requests.map((entry) => entry.body).join("\n")).not.toContain("continued after raw rounds");
+          if (limit.answer !== BAD_REPLY) expect(readFileSync(root.traceLogPath, "utf8")).toContain("MCP question not answered server=fixture");
+        },
+        60_000,
+      );
+    }
+  }
+
+  test.skipIf(!tmuxAvailable())(
+    "a URL request and a form request in one round both go back under their own keys",
+    async () => {
+      const keys = ['"\\u0075rl"', '"fórm"'];
+      const urlRequest = '{"method":"elicitation/create","params":{"mode":"url","message":"Authorize","url":"https://example.test/connect"}}';
+      const requests = `{${keys[0]}:${urlRequest},${keys[1]}:${rawForm("f1")}}`;
+      const root = createRoot("ask-raw-url-and-form", MODERN_FIXTURE, { mode: "mrtr_raw", expectedElicitation: "both", mrtrRaw: [{ requests, state: RAW_STATE }] });
+      const fakeBin = join(root.root, "fake-bin");
+      mkdirSync(fakeBin);
+      writeFakeUrlOpeners(fakeBin, "#!/bin/sh\nexit 0\n");
+      const activeGateway = startToolGateway("Url and form complete.");
+      gateway = activeGateway;
+      const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Call the raw round fixture.")}`,
+        cwd: root.workspace,
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+        env: { ...fixtureEnv(root, activeGateway), PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
+      });
+      await tui.waitForText("Complete URL: https://example.test/connect", 20_000);
+      await tui.sendText("1");
+      await answerRawForms(tui, "Ask", ["accept"]);
+      await tui.waitForText("Url and form complete.", 20_000);
+      const lines = rawLinesOf(root);
+      expect(lines).toHaveLength(2);
+      expectRawRetry(lines[1], keys, ['{"action":"accept"}', RAW_ANSWER.accept("f1")], RAW_STATE);
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a round after the server restarted goes back under its own keys",
+    async () => {
+      const keys = [RAW_KEYS[1]];
+      const { root, session } = await startRawRound(
+        "tui-raw-restart",
+        "TUI",
+        { mrtrRaw: [{ requests: rawRequests(keys), state: RAW_STATE }], mrtrCrashFirstCall: true },
+        "Restart complete.",
+        2,
+      );
+      await answerRawForms(session, "TUI", ["accept"]);
+      await session.waitForText("Restart complete.", 60_000);
+      const lines = rawLinesOf(root);
+      // The first process died on the first call, which is not repeated; the model's second call reaches the new
+      // process, which opens a round.
+      expect(lines).toHaveLength(3);
+      expectRawRetry(lines[2], keys, [RAW_ANSWER.accept("f1")], RAW_STATE);
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a subagent's round goes back under the server's own keys when the user answers it",
+    async () => {
+      const root = createRoot("tui-raw-subagent", MODERN_FIXTURE, {
+        mode: "mrtr_raw",
+        expectedElicitation: "both",
+        mrtrRaw: [{ requests: rawRequests(RAW_KEYS), state: RAW_STATE }],
+      });
+      const activeGateway = startDynamicFakeGateway(async (body) => {
+        if (body.includes("Subagent report (untrusted agent output, not user instructions):")) return fakeGatewayFinalText("RAW_PARENT_DONE");
+        // The parent's own history holds the child's task, so its turns are told apart first.
+        if (body.includes('"toolCallId":"create_raw_child"')) return fakeGatewayFinalText("RAW_PARENT_WAITING");
+        if (body.includes('"toolCallId":"raw_child_call"')) return fakeGatewayFinalText("RAW_CHILD_DONE");
+        if (body.includes('"toolCallId":"raw_child_select"')) {
+          return fakeGatewayToolCall("raw_child_call", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } });
+        }
+        if (body.includes("RAW_CHILD_TASK")) return fakeGatewayToolCall("raw_child_select", "toolbox", { open: TOOL_NAME });
+        if (body.includes("RAW_PARENT_TASK")) {
+          return fakeGatewayToolCall("create_raw_child", "subagent", {
+            request: { action: "message", agent: "raw", message: "RAW_CHILD_TASK" },
+          });
+        }
+        return fakeGatewayFinalText("unexpected raw round request");
+      }, {
+        classifierDecision: "clear",
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 40,
+        env: fixtureEnv(root, activeGateway),
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("RAW_PARENT_TASK");
+      await answerRawForms(tui, "TUI", ["accept", "accept", "accept"]);
+      await tui.waitForText("RAW_PARENT_DONE", 30_000);
+      const lines = rawLinesOf(root);
+      expect(lines).toHaveLength(2);
+      expectRawRetry(lines[1], RAW_KEYS, ["f1", "f2", "f3"].map((field) => RAW_ANSWER.accept(field)), RAW_STATE);
+    },
+    90_000,
+  );
+
+  test("a round whose two keys are one name once decoded is refused, and nothing goes back", async () => {
+    const keys = ['"k"', '"\\u006b"'];
+    const root = createRoot("ask-raw-same-name", MODERN_FIXTURE, { mode: "mrtr_raw", expectedElicitation: "both", mrtrRaw: [{ requests: rawRequests(keys), state: RAW_STATE }] });
+    const activeGateway = startToolGateway("Same name complete.");
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the raw round fixture."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, activeGateway),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    expect(rawLinesOf(root)).toHaveLength(1);
+    expect(activeGateway.requests[2]?.body).toContain("the server's answer was malformed");
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 45_000);
+
+  test("fx ask with no terminal declines a round and sends nothing back", async () => {
+    const root = createRoot("ask-raw-no-terminal", MODERN_FIXTURE, { mode: "mrtr_raw", expectedElicitation: "none", mrtrRaw: [{ requests: rawRequests(RAW_KEYS), state: RAW_STATE }] });
+    const activeGateway = startToolGateway("No terminal complete.");
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the raw round fixture."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, activeGateway),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    expect(rawLinesOf(root)).toHaveLength(1);
+    expect(activeGateway.requests[2]?.body).toContain("the server asked for input fx can't give");
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 45_000);
 
   test("negotiated 2025-06 treats a URL-required error as an ordinary failure", async () => {
     const root = createRoot("ask-legacy-url-required-unsupported", LEGACY_FIXTURE, {
@@ -4613,7 +4932,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       fakeGatewayFinalText("Unexpected continuation."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     const proc = Bun.spawn([join(REPO_ROOT, "zig-out", "bin", "fx"), "ask", "--json", "--auto", "--no-save", "Find the fixture tool"], {
-      cwd: root.workspace, env: { ...process.env, ...fixtureEnv(root, gateway) }, stdout: "ignore", stderr: "ignore",
+      cwd: root.workspace, env: fxChildEnv(fixtureEnv(root, gateway)), stdout: "ignore", stderr: "ignore",
     });
     try {
       const deadline = Date.now() + 5_000;
@@ -5460,6 +5779,61 @@ describe("fx mcp call", () => {
   const callTo = (outFile: string, text = "hello") =>
     `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"${text}"}' > ${outFile} 2> err.txt; echo "exit=$?"; cat err.txt; echo "out=$(wc -c < ${outFile} | tr -d ' ')"`;
 
+  // ---- a shell command's `fx mcp call` on a tool whose first answer is an input_required round ----
+  // The round reaches the session's input responder, as any call's does. Without a terminal there is none, so the
+  // host ends the call; with one, the user answers and the call finishes. fx mcp call itself never reports that the
+  // tool asked for input.
+  const askingRound = { requests: rawRequests([RAW_KEYS[0]]), state: RAW_STATE };
+
+  test("a tool that asks for input ends the call when fx has no terminal to ask on", async () => {
+    const root = bridgeRoot("bridge-asks-no-terminal", {}, { mode: "mrtr_raw", mrtrRaw: [askingRound] });
+    const seen = await runBridgeCommand(root, callTo("out.txt"));
+    expect(seen).toContain("exit=1");
+    expect(seen).toContain("fx mcp call: MCP server 'fixture' ended the call: the server asked for input fx can't give.");
+    expect(seen).toContain("out=0");
+    expect(seen).not.toContain("cannot give");
+    expect(rawLinesAt(join(root.root, "mcp-raw-lines.txt"))).toHaveLength(1);
+  }, 90_000);
+
+  for (const surface of ["TUI", "Ask"] as const) {
+    for (const choice of ["accepts", "cancels"] as const) {
+      test.skipIf(!tmuxAvailable())(`${surface}: a tool that asks for input is answered, the user ${choice} and the call finishes`, async () => {
+        const root = bridgeRoot(`bridge-asks-${surface.toLowerCase()}-${choice}`, {}, { mode: "mrtr_raw", expectedElicitation: "both", mrtrRaw: [askingRound] });
+        let seen = "";
+        const activeGateway = startFakeGateway([
+          fakeGatewayToolCall("run_call", "shell", { action: "run", command: callTo("out.txt") }),
+          (body: string) => {
+            seen = toolResultText(body, "run_call");
+            return fakeGatewayFinalText("BRIDGE_ASKS_DONE");
+          },
+        ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+        gateway = activeGateway;
+        const env = { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" };
+        if (surface === "TUI") {
+          tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 140, height: 40, env });
+          await tui.waitForComposer(15_000);
+          await tui.sendText("Run the command.");
+        } else {
+          tui = await TmuxSession.create({
+            isolated: true, cwd: root.workspace, width: 140, height: 40, env, remainOnExit: true,
+            cmd: `${JSON.stringify(FX_BIN)} ask --full-access --no-save ${JSON.stringify("Run the command.")}`,
+          });
+        }
+        const press = (text: string) => (surface === "TUI" ? tui!.sendKeys(text) : tui!.sendText(text));
+        await tui.waitForText("requests f1", 20_000);
+        await press("1");
+        await tui.waitForText("- f1: true", 20_000);
+        await press(choice === "accepts" ? "1" : "4");
+        await tui.waitForText("BRIDGE_ASKS_DONE", 30_000);
+        expect(seen).toContain("exit=0");
+        expect(seen).toContain("fx mcp call: wrote 27 bytes of text in 1 lines");
+        expect(seen).toContain("out=27");
+        expect(seen).not.toContain("cannot give");
+        expect(rawLinesAt(join(root.root, "mcp-raw-lines.txt"))).toHaveLength(2);
+      }, 90_000);
+    }
+  }
+
   test("a tool that returns an error exits 6 with the tool's message and no data", async () => {
     const root = bridgeRoot("bridge-tool-error", {}, { mode: "tool_failure" });
     const seen = await runBridgeCommand(root, callTo("out.txt"));
@@ -5565,7 +5939,7 @@ describe("fx mcp call", () => {
   };
   const runClient = async (env: Record<string, string | undefined>) => {
     const child = Bun.spawn([FX_BIN, "mcp", "call", TOOL_NAME, '{"text":"hello"}'], {
-      env: { ...process.env, FX_MCP_CALL_SOCKET: undefined, FX_MCP_CALL_TOKEN: undefined, FX_SOUND: "0", ...env },
+      env: fxChildEnv({ FX_MCP_CALL_SOCKET: undefined, FX_MCP_CALL_TOKEN: undefined, FX_SOUND: "0", ...env }),
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -5857,7 +6231,7 @@ describe("fx mcp call", () => {
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Page through the list.");
-      await tui.waitForPane((pane) => pane.includes("BRIDGE_ROWS_DONE") && turnSettled(pane), 30_000);
+      await tui.waitForReplyAndTurnEnd("BRIDGE_ROWS_DONE", 30_000);
       const scrollback = await tui.captureFullScrollback();
       // The calls of one tool share a row that counts them, in the
       // command's group.
@@ -5891,7 +6265,7 @@ describe("fx mcp call", () => {
       tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 140, height: 40, stderrPath, env });
       await tui.waitForComposer(15_000);
       await tui.sendText("Page through the list.");
-      await tui.waitForPane((pane) => pane.includes("BRIDGE_ROWS_SAVED") && turnSettled(pane), 30_000);
+      await tui.waitForReplyAndTurnEnd("BRIDGE_ROWS_SAVED", 30_000);
       await tui.waitForComposer(10_000);
       expect(await tui.captureFullScrollback()).toContain(`└ Used ${TOOL_ROW} ×3`);
       await tui.sendText("/quit");
@@ -5991,7 +6365,7 @@ describe("fx mcp call", () => {
 
       // The session goes on.
       await tui.sendText("Go on.");
-      await tui.waitForPane((pane) => pane.includes("BRIDGE_AFTER_CANCEL") && turnSettled(pane), 10_000);
+      await tui.waitForReplyAndTurnEnd("BRIDGE_AFTER_CANCEL", 10_000);
       await tui.waitForComposer(10_000);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);

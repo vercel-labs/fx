@@ -10,6 +10,7 @@ const bp = @import("presentation/block_parse.zig");
 const payload = @import("presentation/payload.zig");
 const inline_render = @import("presentation/inline_render.zig");
 pub const builds_previews = inline_render.builds_previews;
+pub const bareUrlEnd = inline_render.bareUrlEnd;
 const block_render = @import("presentation/block_render.zig");
 
 /// Prevents OSC 8 hyperlinks from coalescing across wrapped terminal rows.
@@ -37,6 +38,10 @@ pub const Event = union(enum) {
     /// An answer attempt starts. It waits for earlier text to show, so the
     /// host knows where the attempt's output begins.
     attempt_start,
+    /// The text before it is a line fx wrote between steps, such as the
+    /// empty-reply nudge, not the model's. It waits for that text to show,
+    /// so the host can mark the entry that holds it.
+    operational_text_shown,
     /// The attempt broke off and the answer starts over. The host replaces
     /// what it showed of the attempt when it still can, and otherwise shows
     /// this line after it.
@@ -52,6 +57,7 @@ pub const Event = union(enum) {
             .code_block => |block| .{ .code_block = try block.clone(alloc) },
             .thematic_rule => .thematic_rule,
             .attempt_start => .attempt_start,
+            .operational_text_shown => .operational_text_shown,
             .attempt_restart => |text| .{ .attempt_restart = try alloc.dupe(u8, text) },
             .assistant_tail => |events| .{ .assistant_tail = try cloneEventSlice(alloc, events) },
         };
@@ -60,7 +66,7 @@ pub const Event = union(enum) {
     pub fn requiresTextDrain(self: Event) bool {
         return switch (self) {
             .text, .attempt_restart, .assistant_tail => false,
-            .table, .code_block, .thematic_rule, .attempt_start => true,
+            .table, .code_block, .thematic_rule, .attempt_start, .operational_text_shown => true,
         };
     }
 
@@ -76,7 +82,7 @@ pub const Event = union(enum) {
                 break :blk total;
             },
             .code_block => |block| block.language.len +| block.code.len,
-            .thematic_rule, .attempt_start => 1,
+            .thematic_rule, .attempt_start, .operational_text_shown => 1,
             .attempt_restart => |text| text.len,
             .assistant_tail => |events| blk: {
                 var total: usize = 0;
@@ -91,7 +97,7 @@ pub const Event = union(enum) {
             .text => |text| alloc.free(text),
             .table => |*table| table.deinit(alloc),
             .code_block => |*block| block.deinit(alloc),
-            .thematic_rule, .attempt_start => {},
+            .thematic_rule, .attempt_start, .operational_text_shown => {},
             .attempt_restart => |text| alloc.free(text),
             .assistant_tail => |events| freeEventSlice(alloc, events),
         }
@@ -4649,7 +4655,7 @@ fn appendEventDisplay(alloc: Allocator, event: Event, out: *std.ArrayList(u8)) !
         .table => |table| try renderTablePayload(alloc, table, out),
         .code_block => |block| try renderCodeBlockPayload(alloc, block, out),
         .thematic_rule => try writeHorizontalRule(alloc, out),
-        .attempt_start, .assistant_tail => {},
+        .attempt_start, .operational_text_shown, .assistant_tail => {},
     }
 }
 

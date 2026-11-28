@@ -65,6 +65,8 @@ pub const Slot = struct {
     /// Why the owner refused this server's last tool list, in its words; null
     /// while it refused none. A list it accepted clears them.
     list_refusal: ?[]u8 = null,
+    /// How many tools of the list the owner's engine left out, by reason, as the frame that brought the list said.
+    dropped: tools.Dropped = .{},
     /// How the last process ended, and the stdout line that answered
     /// nothing, as the engine keeps them for a failure's text.
     exit: ?mcp.stdio.Exit = null,
@@ -321,6 +323,7 @@ pub const Shared = struct {
             .tools = slot.tools_store.current.len(),
             .last_error = slot.last_error,
             .list_refusal = slot.list_refusal,
+            .dropped = slot.dropped,
             .exit = slot.exit,
             .stray_line = slot.stray_line,
         };
@@ -486,6 +489,7 @@ pub const Shared = struct {
                     if (parsed) |parsed_page| {
                         if (slot.tools_store.addPage(s.gpa, parsed_page)) |_| {
                             slot.tools_store.publish();
+                            slot.dropped = page.dropped;
                         } else |err| {
                             // Only out of memory fails here; the session keeps
                             // the list it had.

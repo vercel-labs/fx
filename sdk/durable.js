@@ -37,6 +37,9 @@ class FencedError extends Error {
 }
 
 const durabilityTag = Symbol.for("libfx.durability");
+// Set by `local()` through `world()` (sdk/durable/world.mjs): the World lands a
+// call's chunks in any order, so `ui.write` gives it one chunk at a time.
+const writeUiInOrder = Symbol.for("libfx.durability.writeUiInOrder");
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -211,10 +214,15 @@ export function memory({ maxDurationMs, reserveMs } = {}) {
   return { [durabilityTag]: true, name: "memory", create: () => (backend ??= createMemoryBackend({ maxDurationMs, reserveMs })) };
 }
 
+// setTimeout runs a longer delay at once, which would cut off each step as it starts.
+// The other copy is maxTimerDelayMs in sdk/durable/world.mjs; change both together.
+const maxTimerDelayMs = 2 ** 31 - 1;
+
 function checkDurations(name, { maxDurationMs, reserveMs }) {
   for (const [key, value] of Object.entries({ maxDurationMs, reserveMs })) {
     if (value !== undefined && !(Number.isSafeInteger(value) && value >= 0)) throw new TypeError(`${name}() ${key} must be a non-negative integer`);
   }
+  if (maxDurationMs > maxTimerDelayMs) throw new TypeError(`${name}() maxDurationMs must be at most ${maxTimerDelayMs}`);
 }
 
 // A durability is `memory()`, or a World one from `libfx/durable-world` (and
@@ -706,7 +714,20 @@ const uiStreamOf = (runId) => `${runId.replace(/^wrun_/, "strm_")}_user_bGliZngt
 // The stream that holds an image, named as the UI stream is, with the
 // namespace "libfx-image-" and the image's name.
 const imageStreamOf = (runId, name) => `${runId.replace(/^wrun_/, "strm_")}_user_${base64url(`libfx-image-${name}`)}`;
-const queuePrefix = "__libfx_wkf_workflow_";
+// libfx's queue namespace. A World names a namespace's queue
+// `__<namespace>_wkf_workflow_`, and each session's run records the
+// namespace when libfx creates it, so a World that queues its active runs
+// again as it starts sends a session back to libfx's queue, not to the
+// Workflow SDK's, which fails a run whose workflow it lacks
+// (`tests/tla/sdk/QueueRecovery.tla` LibfxRunsNotFailed).
+const queueNamespace = "libfx";
+const queuePrefix = `__${queueNamespace}_wkf_workflow_`;
+// Whether a queue message carries a libfx prompt. A World's recovery queues
+// `{ runId }` alone, which names no agent and runs nothing, so libfx's
+// routes ack it before they look for an agent: a process whose agents all
+// have names would refuse it, and the World would deliver it again and
+// again (`tests/tla/sdk/QueueRecovery.tla` RecoveryAckedFirstTime).
+const carriesPrompt = (message) => message?.input !== null && typeof message?.input === "object";
 // The name of an agent created without one, and of whatever a message or a
 // session from before names belonged to.
 const defaultAgentName = "default";
@@ -966,6 +987,7 @@ function startInTurn(key, start) {
 // app passed in stays the app's.
 function createWorldBackend(world, durability) {
   const { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true } = durability;
+  const oneChunkAtATime = durability[writeUiInOrder] === true;
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -1012,8 +1034,8 @@ function createWorldBackend(world, durability) {
   });
   // `meta` says which queue message this is and which delivery of it.
   const deliverTo = async (handle, message, meta) => {
-    const input = message?.input;
-    if (!input || typeof input !== "object") return undefined;
+    if (!carriesPrompt(message)) return undefined;
+    const input = message.input;
     if (!handle) {
       // A World libfx created closes with its agent. The app's own World
       // outlives it, so its queue keeps the message for the next agent.
@@ -1031,6 +1053,7 @@ function createWorldBackend(world, durability) {
   // message names, on the store it names, whichever agent's route it is. A
   // message from before stores were named is for this World's store.
   const queueHandler = world.createQueueHandler(queuePrefix, async (message, meta) => {
+    if (!carriesPrompt(message)) return undefined;
     const named = agentOf(message?.input);
     const agent = await agentOnStore(named, typeof message?.input?.store === "string" ? message.input.store : store);
     if (!agent) throw noAgentNamed(named);
@@ -1144,7 +1167,7 @@ function createWorldBackend(world, durability) {
           const slot = slotWritten(await world.events.create(runId, {
             eventType: "run_created",
             ...spec,
-            eventData: { deploymentId, workflowName: "libfx/session", input: encoder.encode("{}") },
+            eventData: { deploymentId, workflowName: "libfx/session", input: encoder.encode("{}"), executionContext: { queueNamespace } },
           }));
           made = slot === firstEventSlot;
           passOver(slot);
@@ -1397,7 +1420,10 @@ function createWorldBackend(world, durability) {
           async write(lines) {
             await ensureRun();
             const chunks = lines.map((line) => `${line}\n`);
-            if (typeof world.streams.writeMulti === "function" && chunks.length > 1) await world.streams.writeMulti(runId, uiStreamOf(runId), chunks);
+            // A World that lands a call's chunks in order takes the batch in one
+            // call; one that does not takes it chunk by chunk, so no chunk shows
+            // before the ones before it (`tests/tla/sdk/UiStreamOrder.tla`).
+            if (!oneChunkAtATime && typeof world.streams.writeMulti === "function" && chunks.length > 1) await world.streams.writeMulti(runId, uiStreamOf(runId), chunks);
             else for (const chunk of chunks) await world.streams.write(runId, uiStreamOf(runId), chunk);
           },
           async length() {
@@ -1479,6 +1505,7 @@ function createWorldBackend(world, durability) {
         listeners = new Map();
         listenersOf.set(world, listeners);
         world.registerHandler(queuePrefix, world.createQueueHandler(queuePrefix, async (message, meta) => {
+          if (!carriesPrompt(message)) return undefined;
           const named = agentOf(message?.input);
           const group = listeners.get(named);
           if (group) return deliverTo(group.members[group.turn++ % group.members.length], message, meta);
@@ -1714,6 +1741,24 @@ function gatedLog(log, ready, claimError) {
 const hardStopMs = 2000;
 
 const durableInternals = Symbol.for("libfx.durableInternals");
+
+// The longest bound a hand-off takes: setTimeout runs a longer delay at once.
+const maxHandOffMs = 2 ** 31 - 1;
+
+// Returns `within`, a hand-off's bound, or throws a TypeError that names it
+// as `name`. Undefined means no bound.
+export function checkHandOffBound(within, name) {
+  if (within === undefined || (Number.isFinite(within) && within >= 0 && within <= maxHandOffMs)) return within;
+  throw new TypeError(`${name} must be a number of milliseconds from 0 to ${maxHandOffMs}`);
+}
+
+// Asks a harness turn to stop at its next safe point. A turn without
+// `yield()` is cut off at the hand-off's bound instead.
+const askToYield = (turn) => {
+  if (typeof turn?.yield !== "function") return Promise.resolve();
+  // A turn that ended meanwhile, or whose engine exited, says so in its result.
+  return Promise.resolve().then(() => turn.yield()).catch(() => {});
+};
 
 // The shortest wait before a message that found its session running in this
 // process is delivered again, as a backstop for the running worker.
@@ -2116,19 +2161,42 @@ class SessionWorker {
     // hardStopMs; a reserve of zero never stops a step.
     const stopMargin = deadline === null ? 0 : Math.min(hardStopMs, Math.floor(this.backend.reserveMs / 2));
     this.stopping = false;
-    this.stopNow = () => {
+    this.handingOff = false;
+    this.yielding = null;
+    this.stopNow = (reason = "deadline") => {
       if (this.stopping) return;
       this.stopping = true;
       // Which cut-off in a row of the same step this is.
-      agent.emit("session.deadline", { sessionId: this.sessionId, epoch: lease.epoch, cutoffs: afterCutoff(cut).cutoffs });
+      agent.emit(reason === "handoff" ? "session.handoff" : "session.deadline", { sessionId: this.sessionId, epoch: lease.epoch, cutoffs: afterCutoff(cut).cutoffs });
       turnNow?.cancel({ reason: "handoff" });
     };
     // A turn that started under a claim that then failed stops at once and
     // stores nothing.
     void ready.then((landed) => { if (!landed) turnNow?.cancel({ reason: "handoff" }); });
+    // A World's deadline can lie further off than a timer waits; stopping
+    // sooner is safe, since the next delivery continues the turn.
     const hardStop = stopMargin > 0 && deadline - stopMargin > Date.now()
-      ? setTimeout(this.stopNow, deadline - stopMargin - Date.now())
+      ? setTimeout(this.stopNow, Math.min(maxTimerDelayMs, deadline - stopMargin - Date.now()))
       : null;
+    // A host handing this process off (agent.handOff()) stops the turn at its
+    // next safe point and starts no other; at `cutAt`, in ms since the epoch,
+    // it cuts the turn off as the deadline does (tests/tla/sdk/DurableHandOff.tla
+    // Yield, HDeadline). A null `cutAt` sets no bound, and the earliest
+    // `cutAt` any hand-off asked for holds.
+    let handOffStop = null;
+    let handOffCutAt = null;
+    this.handOff = (cutAt) => {
+      if (!this.handingOff) {
+        this.handingOff = true;
+        this.yielding = askToYield(turnNow);
+      }
+      if (cutAt === null || (handOffCutAt !== null && handOffCutAt <= cutAt)) return;
+      handOffCutAt = cutAt;
+      clearTimeout(handOffStop);
+      handOffStop = setTimeout(() => this.stopNow("handoff"), Math.max(0, cutAt - Date.now()));
+    };
+    const handOffAsked = agent.handOffRequest();
+    if (handOffAsked) this.handOff(handOffAsked.cutAt);
     let harness = null;
     let harnessRun = runOf(null);
     this.settled = () => (harness ? harness.settled() : Promise.resolve());
@@ -2197,7 +2265,7 @@ class SessionWorker {
       const yieldAt = deadline === null ? undefined : Math.max(1, deadline - this.backend.reserveMs);
       for (;;) {
         if (failed) return broken();
-        if (this.stopping) {
+        if (this.stopping || this.handingOff) {
           await harness.close();
           harness = null;
           await release();
@@ -2285,6 +2353,7 @@ class SessionWorker {
         turnNow = turn;
         if (this.stopping || claimFailed) turn.cancel({ reason: "handoff" });
         else if (spent && !(open.calls?.length > 0)) turn.cancel();
+        else if (this.handingOff) this.yielding = askToYield(turn);
         // A new turn takes the steers sent while it waited to start.
         const joining = fresh ? { ...state, steers: state.pending[0]?.joiners ?? [], endOpen: state.pending[0]?.ends === true } : state;
         const outcome = await this.drive(log, harness, turn, messageId, joining, ui);
@@ -2356,7 +2425,9 @@ class SessionWorker {
       return failed ? broken() : "done";
     } finally {
       if (hardStop) clearTimeout(hardStop);
+      if (handOffStop) clearTimeout(handOffStop);
       this.stopNow = null;
+      this.handOff = null;
       this.settled = null;
       if (renew) clearInterval(renew);
       if (harness) await harness.close().catch(() => {});
@@ -2756,6 +2827,8 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * steer that cannot join it; without it, such a steer waits for the turn to
  * end. Either way the steer runs as the next turn. A turn stops before a
  * model request once `yieldAt` has passed, with the stop reason `yielded`.
+ * A turn may have `yield()`, which stops it at its next safe point; the turn
+ * then ends `yielded`.
  *
  * An input the harness refuses only once a turn runs it is a turn that ends
  * with an error.
@@ -2791,6 +2864,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     const agent = {
       name: agentName,
       emit,
+      handOffRequest: () => handOffRequest,
       // Work that outlives the delivery that started it, which close() waits
       // for: an engine that shuts down after its worker let go.
       track(work) {
@@ -2811,6 +2885,8 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     let chosenDurability = null;
     let unlisten = null;
     let closed = false;
+    // Set once agent.handOff() runs: this process then takes no new work.
+    let handOffRequest = null;
     const workers = new Map();
     const active = new Set();
     // Session ids this process minted whose first prompt has not yet tried
@@ -2884,7 +2960,12 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     // `inRequest` from the request that took the prompt.
     const receive = (created, message, delivery, { inRequest = false, handoff = null, backstop = null } = {}) => {
       const worker = hold(created, message.sessionId);
-      let work = worker.consume(message, delivery, handoff, backstop);
+      // A process handing off takes no new work: the queue delivers the message
+      // again, to another process (tests/tla/sdk/DurableHandOff.tla HStart).
+      // The request that took the prompt awaits the backstop and answers its
+      // failure; with no worker to wait on it here, it is only marked handled.
+      if (handOffRequest) void backstop?.catch(() => {});
+      let work = handOffRequest ? Promise.resolve({ timeoutSeconds: runningBackstopSeconds }) : worker.consume(message, delivery, handoff, backstop);
       if (inRequest) {
         // No queue delivered this message, so none delivers it again: a turn
         // that must go on later continues in a fresh message. One whose
@@ -3335,6 +3416,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         stopAtDeadline: (sessionId) => workers.get(sessionId)?.stopNow?.(),
         // Waits for what a session's running turn has written so far.
         settled: async (sessionId) => { await workers.get(sessionId)?.settled?.(); },
+        // Waits until a session's running turn has its hand-off's request to
+        // stop at its next safe point.
+        yielding: async (sessionId) => { await workers.get(sessionId)?.yielding; },
         // Delivers a queue message to this agent as its queue would.
         deliver: async (delivered, delivery) => {
           const created = await backend();
@@ -3396,6 +3480,22 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
           if (typeof created.queueHandler !== "function") return new Response("this durability delivers in process", { status: 404 });
           return created.queueHandler(request);
         };
+      },
+      /**
+       * Stops every turn this process runs at its next safe point, so another
+       * delivery continues it, and sends new deliveries back to the queue. A
+       * turn that reaches no safe point within `within` milliseconds is cut
+       * off as at its deadline. Resolves once this process let its sessions go.
+       */
+      async handOff({ within } = {}) {
+        checkHandOffBound(within, "handOff() within");
+        // The earliest cut-off any call asked for holds, so a later bound,
+        // such as SIGTERM's, still cuts off a turn an earlier call left unbounded.
+        const cutAt = within === undefined ? null : Date.now() + within;
+        handOffRequest ??= { cutAt: null };
+        if (cutAt !== null && (handOffRequest.cutAt === null || cutAt < handOffRequest.cutAt)) handOffRequest.cutAt = cutAt;
+        for (const worker of workers.values()) worker.handOff?.(handOffRequest.cutAt);
+        while (active.size > 0) await Promise.allSettled([...active]);
       },
       /** Waits for the work this process is running, then lets go. */
       async close() {

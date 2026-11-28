@@ -1,4 +1,4 @@
-//! Drives the connection-open hand-off (`src/gateway/open_job.zig`) for the
+//! Drives the connection-open hand-off (`src/core/shared/open_job.zig`) for the
 //! TLA+ driver in this folder. It reads one JSON operation per line from the
 //! file named by its first argument and writes one JSON result per operation
 //! to the file named by its second.

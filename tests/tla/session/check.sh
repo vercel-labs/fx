@@ -33,7 +33,8 @@
 # LiveSessions models `fx sessions --live`: a scan that tries each session's
 # writer lock without waiting while other fx processes open, hold, crash,
 # and close sessions, and that lists each live session's subagents from its
-# log. live-holds.cfg checks one session exhaustively and must pass;
+# log, with openers whose retry sleeps can last longer than they asked.
+# live-holds.cfg checks one session exhaustively and must pass;
 # live-simulate.cfg runs random behaviors with two sessions, three processes,
 # and two subagents. Each live-witness-*.cfg must be violated, and each
 # live-mutant-*.cfg plants one bug that its property must catch.
@@ -99,6 +100,8 @@ TurnStream stream-mutant-bytes-only SupersedeExplained
 TurnStream stream-mutant-loose-compare CommitIsFinal
 TurnStream stream-mutant-mix CommitIsFinal
 TurnStream stream-mutant-prefix-only CommitIsFinal
+TurnStream stream-mutant-cut-view LogKeepsCutResults
+TurnStream stream-mutant-copy-whole CopyHoldsView
 TurnStream stream-mutant-continue-stale StaleTurnNeverContinues
 TurnStream stream-witness-supersede NeverSuperseded
 TurnStream stream-witness-commit NeverCommittedWhole
@@ -106,6 +109,7 @@ TurnStream stream-witness-compaction NeverCommittedAfterCut
 TurnStream stream-witness-recovery NeverCommittedAfterRecovery
 TurnStream stream-witness-missed-path MissedPathsNeverParse
 TurnStream stream-witness-failed-commit NeverCommittedAfterFailure
+TurnStream stream-witness-cut-copy NeverCopiedAfterCut
 TurnStream stream-simulate simulate $sim
 TurnStream stream-simulate-before simulate $sim
 TurnStream stream-continue -
@@ -133,6 +137,7 @@ LiveSessions live-mutant-probe-keeps-lock ScanHoldsOneTry
 LiveSessions live-mutant-closed-child AgentsAsLogged
 LiveSessions live-mutant-parent-state AgentsAsLogged
 LiveSessions live-mutant-recent-is-live ProbeSound
+LiveSessions live-mutant-counts-sleeps WaitEndsAtBudget
 LiveSessions live-simulate simulate -simulate num=${SIM_RUNS:-20000} -depth 60 -seed 1
 AcceptedInput accepted-current-survives AcceptedSurvives
 AcceptedInput accepted-design-a -
