@@ -779,6 +779,7 @@ pub fn composeFooterFrame(
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
         } else if (input.picker_kind == .sessions and ctx.session_menu.active) {
+            frame.loading_marker_visible = input.picker_rows > 0 and ctx.session_menu.showsOpening();
             var menu_row_index: u16 = 0;
             while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
                 var menu_row = try resume_menu_presentation.composeSessionMenuRow(

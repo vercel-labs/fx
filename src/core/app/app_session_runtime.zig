@@ -1717,25 +1717,269 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "child_agents")) @import("app_agents_runtime.zig").Runtime(App).listRestoredSubagents(app);
         }
 
+        /// Enter on the picker's selected session: starts opening it off the
+        /// UI thread (`SessionPickerOpen`), and its row shows it opening
+        /// until `pollSessionPickerOpen` installs it or says why it cannot.
+        /// While an open runs, Enter does nothing. Returns false when no
+        /// session row is selected.
         pub fn resumeSelectedSession(app: *App, agent: *AppAgent) !bool {
-            const selected_id = agent.session_persistence.session_picker.selectedId() orelse return false;
+            const picker = &agent.session_persistence.session_picker;
+            const selected_id = picker.selectedId() orelse return false;
             const v2_store = agent.session_persistence.v2_store orelse return false;
-            // A session open in another fx shows as busy at once (D38).
-            const v2 = session_adapter.Session.resumeSessionWithoutWaiting(app.alloc, v2_store, .{ .id = selected_id }, app.workspace_root, .app) catch |err| {
-                noteConversionProblem(app, v2_store, err);
-                return err;
+            const open = &agent.session_persistence.session_picker_open;
+            if (open.openingId() != null) return true;
+            picker.selection_failure = null;
+            const request = try session_persistence.SessionPickerOpen.Request.init(selected_id, app.workspace_root);
+            _ = try open.enter(v2_store, request);
+            requestPickerFrame(app);
+            return true;
+        }
+
+        /// The session the picker shows as opening, for its row.
+        pub fn openingSessionId(agent: *const AppAgent) ?[]const u8 {
+            return agent.session_persistence.session_picker_open.openingId();
+        }
+
+        /// Esc while a session opens: drops the open, and the picker stays.
+        /// Returns whether one was opening.
+        pub fn cancelSessionPickerOpen(app: *App, agent: *AppAgent) bool {
+            const open = &agent.session_persistence.session_picker_open;
+            if (open.openingId() == null) return false;
+            open.cancel("escape");
+            requestPickerFrame(app);
+            return true;
+        }
+
+        fn requestPickerFrame(app: *App) void {
+            if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
+        }
+
+        /// One loop turn of the picker's open: takes a finished worker
+        /// stage, or replays a slice of the session's newest cycle, and
+        /// installs the session once its transcript is finalized
+        /// (`tests/tla/session_picker/SessionOpen.tla`).
+        pub fn pollSessionPickerOpen(app: *App, agent: *AppAgent) !void {
+            const open = &agent.session_persistence.session_picker_open;
+            if (open.replaying()) |task| {
+                advancePickerReplay(app, agent, task) catch |err| failPickerOpen(app, agent, task, err);
+                return;
+            }
+            const task = open.completed() orelse return;
+            switch (session_persistence.SessionPickerOpen.planDone(task.abandoned, task.stage, task.failure)) {
+                .drop => {
+                    debug_trace.logf("session", "event=picker_open_dropped reason=cancelled stage={s} session={s}", .{ @tagName(task.stage), task.request.session_id });
+                    finishPickerOpen(app, agent);
+                },
+                .fail => failPickerOpen(app, agent, task, task.failure.?),
+                .replay => {
+                    if (comptime !@hasDecl(App, "beginResumeProjection")) {
+                        // A host without a detached transcript replays into
+                        // its live one as it installs.
+                        return installDetached(app, agent, null);
+                    }
+                    _ = open.beginReplay();
+                    const replay = PickerReplay.create(app, agent, task) catch |err| return failPickerOpen(app, agent, task, err);
+                    task.replay = .{ .state = replay, .finalize_fn = PickerReplay.finalize, .deinit_fn = PickerReplay.destroy };
+                    advancePickerReplay(app, agent, task) catch |err| failPickerOpen(app, agent, task, err);
+                },
+                .install => installDetached(app, agent, @ptrCast(@alignCast(task.replay.?.state))),
+            }
+        }
+
+        fn installDetached(app: *App, agent: *AppAgent, replay: ?*PickerReplay) void {
+            const task = agent.session_persistence.session_picker_open.detach();
+            defer task.destroy();
+            installPickedSession(app, agent, task, replay) catch |err| reportPickerOpenFailure(app, agent, task, err);
+            requestPickerFrame(app);
+        }
+
+        /// Frees the finished open and starts the one queued behind it.
+        fn finishPickerOpen(app: *App, agent: *AppAgent) void {
+            agent.session_persistence.session_picker_open.finish() catch |err| {
+                debug_trace.logf("session", "event=picker_open_failed stage=start err={s}", .{@errorName(err)});
+                const picker = &agent.session_persistence.session_picker;
+                if (picker.active) picker.selection_failure = session_catalog.classifyResumeFailure(err);
             };
-            var v2_owned = true;
-            errdefer if (v2_owned) v2.close();
+            requestPickerFrame(app);
+        }
+
+        /// The open failed before its install: its row says why, the picker
+        /// stays, and the open session is as it was.
+        fn failPickerOpen(app: *App, agent: *AppAgent, task: *session_persistence.SessionPickerOpen.Task, err: anyerror) void {
+            reportPickerOpenFailure(app, agent, task, err);
+            finishPickerOpen(app, agent);
+        }
+
+        /// The row says why the open failed, or, once the install closed
+        /// the picker, a notice does.
+        fn reportPickerOpenFailure(app: *App, agent: *AppAgent, task: *const session_persistence.SessionPickerOpen.Task, err: anyerror) void {
+            debug_trace.logf("session", "event=picker_open_failed stage={s} session={s} err={s}", .{ @tagName(task.stage), task.request.session_id, @errorName(err) });
+            noteConversionProblem(app, task.store, err);
+            const picker = &agent.session_persistence.session_picker;
+            if (picker.active) {
+                picker.selection_failure = session_catalog.classifyResumeFailure(err);
+            } else if (comptime @hasDecl(App, "writeDomainNotice")) {
+                app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .@"error",
+                    .body = config_runtime.sessionConnectionNotice(err) orelse "Unable to resume selected session.",
+                }, true) catch |write_err| debug_trace.logf("session", "event=picker_open_notice_dropped err={s}", .{@errorName(write_err)});
+            }
+        }
+
+        /// The picker's replay of the opening session's newest cycle into a
+        /// detached transcript, a few turns per loop turn, which the worker
+        /// then finalizes. Nothing here touches the open session.
+        const PickerReplay = struct {
+            alloc: Allocator,
+            projection: resume_projection.ResumeProjection,
+            labels: HistoricalSessionLabels,
+            display: session_display_metadata.DisplayMetadata,
+            /// The agent's diff id when the replay began: the projection
+            /// numbers its diffs from it.
+            first_diff_id: u32,
+            notice_written: bool = false,
+            has_prior_turns: bool = false,
+            next: usize = 0,
+            replay_ns: i128 = 0,
+            longest_slice_ns: i128 = 0,
+
+            fn create(app: *App, agent: *AppAgent, task: *session_persistence.SessionPickerOpen.Task) !*PickerReplay {
+                const resumed = &task.resumed.?;
+                const self = try app.alloc.create(PickerReplay);
+                errdefer app.alloc.destroy(self);
+                var display: session_display_metadata.DisplayMetadata = if (resumed.title) |title|
+                    .{ .present = true, .title = try app.alloc.dupe(u8, title) }
+                else
+                    try session_display_metadata.deriveFromHistory(app.alloc, resumed.state.history);
+                errdefer display.deinit(app.alloc);
+                var projection = try resume_projection.ResumeProjection.initEmpty(app.alloc, &app.shell, io_mod.milliTimestamp(), agent.next_diff_id);
+                errdefer projection.deinit();
+                // As `syncTranscriptWindowSaveMode` sets it for a saved
+                // session, before the replay copies the window's retention.
+                try projection.runtime.setTranscriptWindowSaved(app.alloc, true);
+                self.* = .{
+                    .alloc = app.alloc,
+                    .projection = projection,
+                    .labels = .{ .workspace_root = app.workspace_root },
+                    .display = display,
+                    .first_diff_id = agent.next_diff_id,
+                };
+                return self;
+            }
+
+            fn finalize(state: *anyopaque) anyerror!void {
+                const self: *PickerReplay = @ptrCast(@alignCast(state));
+                try self.projection.finalize();
+            }
+
+            fn destroy(state: *anyopaque) void {
+                const self: *PickerReplay = @ptrCast(@alignCast(state));
+                self.projection.deinit();
+                self.labels.deinit(self.alloc);
+                self.display.deinit(self.alloc);
+                self.alloc.destroy(self);
+            }
+        };
+
+        /// One loop turn of the picker's replay; after its last turn the
+        /// worker finalizes the transcript.
+        fn advancePickerReplay(app: *App, agent: *AppAgent, task: *session_persistence.SessionPickerOpen.Task) !void {
+            if (comptime !@hasDecl(App, "beginResumeProjection")) return;
+            const replay: *PickerReplay = @ptrCast(@alignCast(task.replay.?.state));
+            var sink = DetachedHistorySink(resume_projection.ResumeProjection){
+                .app = app,
+                .projection = &replay.projection,
+                .labels = &replay.labels,
+                .agent = agent,
+                .session = task.session,
+            };
+            // A saved call's relative path names a file here only when the
+            // session never ran elsewhere.
+            setSavedCallsRoot(app, if (task.ran_only_here) app.workspace_root else null);
+            defer setSavedCallsRoot(app, null);
+            const slice_started_ns = io_mod.nanoTimestamp();
+            if (!replay.notice_written) {
+                try writeResumeNotice(app, &sink, &replay.display, .session);
+                replay.notice_written = true;
+            }
+            const turns = task.cycle.items;
+            while (replay.next < turns.len) {
+                try replayHistoryToSinkIncremental(app, agent, &sink, turns[replay.next..][0..1], &replay.has_prior_turns, &replay.labels);
+                replay.next += 1;
+                if (io_mod.nanoTimestamp() - slice_started_ns >= archive_replay_slice_ns) break;
+            }
+            const slice_ns = io_mod.nanoTimestamp() - slice_started_ns;
+            replay.replay_ns += slice_ns;
+            replay.longest_slice_ns = @max(replay.longest_slice_ns, slice_ns);
+            if (replay.next < turns.len) return;
+            try agent.session_persistence.session_picker_open.startFinalize();
+        }
+
+        /// Makes the opened session the open one, in one step on the UI
+        /// thread: the session the picker replaced closes only here. A host
+        /// without `replay` replays into its live transcript.
+        fn installPickedSession(app: *App, agent: *AppAgent, task: *session_persistence.SessionPickerOpen.Task, replay: ?*PickerReplay) !void {
+            if (comptime @hasDecl(App, "beginResumeProjection")) {
+                // A turn of the open session numbered a diff meanwhile, so
+                // the replay's diff ids would collide with it.
+                if (replay.?.first_diff_id != agent.next_diff_id) return error.SessionPickerOpenStale;
+            }
+            const startup_pick = if (comptime @hasDecl(App, "takeStartupPickerGroupRestore")) app.takeStartupPickerGroupRestore(agent) else false;
             try app.prepareLiveSessionResume(agent);
-            v2_owned = false;
-            try installResumedV2Session(app, agent, v2, .session);
+            var resumed = task.resumed.?;
+            task.resumed = null;
+            defer resumed.deinit(std.heap.c_allocator);
+            const v2 = task.takeSession();
+            closeWritableSession(app, agent);
+            agent.session_persistence.v2 = v2;
+            errdefer closeWritableSession(app, agent);
+            syncTranscriptWindowSaveMode(app, agent);
+            setSavedCallsRoot(app, if (task.ran_only_here) app.workspace_root else null);
+            defer setSavedCallsRoot(app, null);
+            const previous_provider = provider_runtime.providerOf(app, agent);
+            try restoreResumedAgentState(app, agent, resumed.state);
+            if (comptime @hasDecl(App, "beginResumeProjection")) {
+                const held = replay.?;
+                if (held.display.present) try setCachedSessionTitle(app, agent, held.display.title);
+                try app.installResumeProjection(agent, &held.projection, task.holds_previous_cycle);
+                debug_trace.logf("session", "event=picker_open_installed session={s} turns={d} read_us={d} replay_us={d} longest_slice_us={d} finalize_us={d} total_us={d}", .{
+                    v2.id(),
+                    task.cycle.items.len,
+                    @divTrunc(task.read_ns, std.time.ns_per_us),
+                    @divTrunc(held.replay_ns, std.time.ns_per_us),
+                    @divTrunc(held.longest_slice_ns, std.time.ns_per_us),
+                    @divTrunc(task.finalize_ns, std.time.ns_per_us),
+                    @divTrunc(io_mod.nanoTimestamp() - task.started_ns, std.time.ns_per_us),
+                });
+            } else {
+                var display: session_display_metadata.DisplayMetadata = if (resumed.title) |title|
+                    .{ .present = true, .title = try app.alloc.dupe(u8, title) }
+                else
+                    try session_display_metadata.deriveFromHistory(app.alloc, resumed.state.history);
+                defer display.deinit(app.alloc);
+                var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+                defer labels.deinit(app.alloc);
+                var sink = LiveHistorySink(App){ .app = app, .agent = agent };
+                _ = try replayWithResumeNotice(app, agent, &sink, &display, .session, resumed.state.history, &labels);
+            }
+            if (comptime @hasDecl(App, "restoreSessionCredential")) {
+                try app.restoreSessionCredential(previous_provider);
+            }
+            enableSessionStores(app, agent);
+            syncTranscriptArchiveAvailable(app, agent);
+            noteInterruptedRequest(agent, v2);
+            if (comptime runtime_profile.allows(App, .durable_sessions)) {
+                try schedulePendingAcceptedInputsRestore(agent, v2);
+            }
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
             try noteStoppedSubagentTasks(app, agent);
             try noteKeptQueuedPrompts(app, agent);
             startPendingResume(app, agent);
-            return true;
+            if (startup_pick) {
+                if (comptime @hasDecl(App, "restoreStartupPickerGroup")) app.restoreStartupPickerGroup();
+            }
         }
 
         /// Opens `/fork`'s menu of the session's prompts, newest selected,
@@ -2413,15 +2657,9 @@ pub fn Runtime(comptime App: type) type {
             agents.storeTotal(&agent.total_web_search_requests, 0);
         }
 
-        fn hydrateResumedSession(
-            app: *App,
-            agent: *AppAgent,
-            loaded_state: session_codec.DurableSessionState,
-            display: *const session_display_metadata.DisplayMetadata,
-            notice: ResumeNotice,
-        ) !void {
-            const state = loaded_state;
-            const previous_provider = provider_runtime.providerOf(app, agent);
+        /// The agent's conversation, preferences, and totals from a resumed
+        /// session's state; the transcript comes from its replay.
+        fn restoreResumedAgentState(app: *App, agent: *AppAgent, state: session_codec.DurableSessionState) !void {
             if (comptime agents.hasAgentField(App, "next_image_id")) {
                 agent.next_image_id = try nextImageIdForResume(app.alloc, state.history);
             }
@@ -2442,6 +2680,18 @@ pub fn Runtime(comptime App: type) type {
             agents.storeTotal(&agent.total_input_tokens, state.total_input_tokens);
             agents.storeTotal(&agent.total_output_tokens, state.total_output_tokens);
             agents.storeTotal(&agent.total_web_search_requests, 0);
+        }
+
+        fn hydrateResumedSession(
+            app: *App,
+            agent: *AppAgent,
+            loaded_state: session_codec.DurableSessionState,
+            display: *const session_display_metadata.DisplayMetadata,
+            notice: ResumeNotice,
+        ) !void {
+            const state = loaded_state;
+            const previous_provider = provider_runtime.providerOf(app, agent);
+            try restoreResumedAgentState(app, agent, state);
 
             var historical_labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer historical_labels.deinit(app.alloc);
@@ -2605,7 +2855,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn pollSessionPicker(app: *App, agent: *AppAgent) !void {
+            try pollSessionPickerOpen(app, agent);
             const loader = &agent.session_persistence.session_picker_load;
+            if (loader.takeFirstPart()) |running| showFirstListingPart(app, agent, running);
             const task = loader.takeCompleted() orelse return;
             var task_owned = true;
             defer if (task_owned) task.deinit();
@@ -2679,6 +2931,37 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "shell")) {
                 if (picker.active) app.shell.render_requests.request(.footer);
             }
+        }
+
+        /// Shows a running listing's v2 sessions while it reads v1's
+        /// folders; the whole listing replaces them, keeping the selected
+        /// row (`applySessionPickerCatalogPage`).
+        fn showFirstListingPart(app: *App, agent: *AppAgent, task: *SessionPickerLoad.Task) void {
+            const alloc = std.heap.c_allocator;
+            var part = task.first_part orelse return;
+            task.first_part = null;
+            defer part.deinit(alloc);
+            const picker = &agent.session_persistence.session_picker;
+            const source = pickerSource(app, agent) orelse return;
+            const current = !task.abandoned and picker.active and
+                picker.generation == task.request.generation and
+                optionalStringEql(task.request.active_id, pickerActiveId(agent));
+            // A held catalog already shows the rows, v1's too.
+            if (!current or picker.load_state == .ready) return;
+            const cache = &agent.session_persistence.session_picker_cache;
+            cache.installFirstPart(&part, task.request.active_id) catch |err| {
+                debug_trace.logf("core", "session picker first part not shown err={s}", .{@errorName(err)});
+                return;
+            };
+            const limit = if (comptime @hasField(App, "shell"))
+                resumePageLimitForRows(app.shell.layout.rows)
+            else
+                session_store.default_resume_page_limit;
+            applySessionPickerCatalogPage(picker, app.alloc, cache, source.workspace_root, null, limit, false) catch |err| {
+                debug_trace.logf("core", "session picker first part not shown err={s}", .{@errorName(err)});
+                return;
+            };
+            requestPickerFrame(app);
         }
 
         fn writeSessionPickerError(app: *App, err: anyerror) !void {
@@ -2757,6 +3040,7 @@ pub fn Runtime(comptime App: type) type {
             const loader = &agent.session_persistence.session_picker_load;
             if (loader.task) |task| loader.cancelGeneration(task.request.generation);
             if (loader.pending) |pending| loader.cancelGeneration(pending.generation);
+            agent.session_persistence.session_picker_open.cancel("picker_closed");
             picker.deinit(app.alloc);
         }
 
@@ -3793,6 +4077,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn requestPersistenceShutdown(agent: *AppAgent) void {
             agent.session_persistence.session_picker_load.requestStop();
+            agent.session_persistence.session_picker_open.cancel("shutdown");
             agent.session_persistence.title_generation.requestStop();
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
                 agent.session_persistence.pending_input_restore.onSessionClosed();
@@ -4016,6 +4301,9 @@ pub fn Runtime(comptime App: type) type {
                 labels: *const HistoricalSessionLabels,
                 /// Whose history this is, for the names of its MCP calls.
                 agent: ?*AppAgent = null,
+                /// The session the history comes from, when it is not yet
+                /// the agent's open one: the picker's open replays first.
+                session: ?*session_adapter.Session = null,
 
                 const Self = @This();
 
@@ -4970,7 +5258,7 @@ pub fn Runtime(comptime App: type) type {
             var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
-            const name = try recordedMcpToolName(agent, arena, alias) orelse blk: {
+            const name = try recordedMcpToolNameIn(agent, replaySessionOf(agent, sink), arena, alias) orelse blk: {
                 if (comptime !@hasField(App, "mcp")) return;
                 const identity = try app.mcp.toolIdentity(arena, alias) orelse return;
                 break :blk types.McpToolName{ .server = identity.server, .tool = identity.tool };
@@ -4978,9 +5266,24 @@ pub fn Runtime(comptime App: type) type {
             try sink.attachHistoricalMcpToolName(entry_id, name);
         }
 
+        /// The session whose saved calls `sink` replays: one the picker is
+        /// still opening, else the agent's open one.
+        fn replaySessionOf(agent: *AppAgent, sink: anytype) ?*session_adapter.Session {
+            if (comptime @hasField(@TypeOf(sink.*), "session")) {
+                if (sink.session) |session| return session;
+            }
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return null;
+            return agent.session_persistence.v2;
+        }
+
         fn recordedMcpToolName(agent: *AppAgent, arena: std.mem.Allocator, alias: []const u8) !?types.McpToolName {
             if (comptime !agents.hasAgentField(App, "session_persistence")) return null;
-            const session = agent.session_persistence.v2 orelse return null;
+            return recordedMcpToolNameIn(agent, agent.session_persistence.v2, arena, alias);
+        }
+
+        fn recordedMcpToolNameIn(agent: *AppAgent, replayed: ?*session_adapter.Session, arena: std.mem.Allocator, alias: []const u8) !?types.McpToolName {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return null;
+            const session = replayed orelse return null;
             const identity = try agent.session_persistence.tool_identities.lookup(std.heap.c_allocator, arena, session, alias) orelse return null;
             return .{ .server = identity.server, .tool = identity.tool };
         }
@@ -10436,6 +10739,11 @@ test "interactive session resume uses the live transition and shared restore pat
     try waitForSessionPickerLoad(&app);
 
     try std.testing.expect(try Runtime(TestApp).resumeSelectedSession(&app, (&app).agent()));
+    // Enter only starts the open: the session it replaces stays until the
+    // install (`tests/tla/session_picker/SessionOpen.tla` OldKeptUntilInstall).
+    try std.testing.expectEqual(@as(usize, 0), app.live_resume_prepare_count);
+    try std.testing.expectEqualStrings(saved_session_id, Runtime(TestApp).openingSessionId(app.agent()).?);
+    try waitForSessionPickerOpen(&app);
     try std.testing.expectEqual(@as(usize, 1), app.live_resume_prepare_count);
     try std.testing.expectEqual(@as(usize, 1), app.live_resume_finish_count);
     try std.testing.expectEqualStrings(
@@ -10488,17 +10796,70 @@ test "interactive session resume preserves the current writer when the target is
     defer missing_summary.deinit(alloc);
     try picker.appendSummary(alloc, &missing_summary);
 
-    try std.testing.expectError(
-        error.SessionNotFound,
-        Runtime(TestApp).resumeSelectedSession(&app, (&app).agent()),
-    );
+    try std.testing.expect(try Runtime(TestApp).resumeSelectedSession(&app, (&app).agent()));
+    try waitForSessionPickerOpen(&app);
     try std.testing.expectEqualStrings(
         current_id,
         app.agent().session_persistence.v2.?.id(),
     );
     try std.testing.expect(picker.active);
     try std.testing.expectEqualStrings("missing-session", picker.selectedId().?);
+    try std.testing.expectEqual(session_catalog.ResumeFailure.unavailable, picker.selection_failure.?);
+    try std.testing.expect(Runtime(TestApp).openingSessionId(app.agent()) == null);
     try std.testing.expectEqual(@as(usize, 0), app.live_resume_prepare_count);
+}
+
+test "Esc while a picked session opens keeps the open session, frees the pick, and a second Enter opens nothing extra" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("saved prompt") },
+        .assistant = @constCast("saved response"),
+    } }};
+    const saved_session_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(saved_session_id);
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
+    const current_id = try alloc.dupe(u8, app.agent().session_persistence.v2.?.id());
+    defer alloc.free(current_id);
+    try Runtime(TestApp).openSessionPicker(&app, (&app).agent());
+    try waitForSessionPickerLoad(&app);
+    const picker = &app.agent().session_persistence.session_picker;
+
+    try std.testing.expect(try Runtime(TestApp).resumeSelectedSession(&app, (&app).agent()));
+    try std.testing.expect(Runtime(TestApp).cancelSessionPickerOpen(&app, (&app).agent()));
+    try std.testing.expect(Runtime(TestApp).openingSessionId(app.agent()) == null);
+    try waitForSessionPickerOpen(&app);
+    try std.testing.expectEqualStrings(current_id, app.agent().session_persistence.v2.?.id());
+    try std.testing.expect(picker.active);
+    try std.testing.expectEqual(@as(usize, 0), app.live_resume_prepare_count);
+    // Nothing of the dropped open stays: its session's lock is free.
+    const store = app.agent().session_persistence.v2_store.?;
+    const probe = try session_adapter.Session.resumeSessionWithoutWaiting(std.heap.c_allocator, store, .{ .id = saved_session_id }, paths.workspace, .app);
+    probe.close();
+    // With nothing opening, Esc closes the picker as before.
+    try std.testing.expect(!Runtime(TestApp).cancelSessionPickerOpen(&app, (&app).agent()));
+
+    try std.testing.expect(try Runtime(TestApp).resumeSelectedSession(&app, (&app).agent()));
+    try std.testing.expect(try Runtime(TestApp).resumeSelectedSession(&app, (&app).agent()));
+    try waitForSessionPickerOpen(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.live_resume_prepare_count);
+    try std.testing.expectEqualStrings(saved_session_id, app.agent().session_persistence.v2.?.id());
+    try std.testing.expect(!picker.active);
 }
 
 test "resumeRequestedSession replays persisted model Markdown without parsing generated summaries" {
@@ -12675,6 +13036,16 @@ fn waitForSessionPickerLoad(app: *TestApp) !void {
         io_mod.sleep(std.time.ns_per_ms);
     }
     return error.TestExpectedEqual;
+}
+
+fn waitForSessionPickerOpen(app: *TestApp) !void {
+    const deadline_ms = io_mod.milliTimestamp() + 5_000;
+    while (io_mod.milliTimestamp() < deadline_ms) {
+        try Runtime(TestApp).pollSessionPickerOpen(app, app.agent());
+        if (!app.agent().session_persistence.session_picker_open.busy()) return;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.TestSessionOpenTimedOut;
 }
 
 fn waitForSessionPickerPrewarm(app: *TestApp) !void {

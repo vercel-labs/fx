@@ -16,6 +16,7 @@ const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
+const session_open_test_controls = @import("session_open_test_controls.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const tool_call_identities = @import("../mcp/tool_call_identities.zig");
 const turn_capture = @import("../workspace/turn_capture.zig");
@@ -247,6 +248,9 @@ test "the fork menu's question keeps the chosen prompt, and closing frees it (D9
 
 pub const SessionPickerCatalogCache = struct {
     ready: bool = false,
+    /// False while it holds only v2's sessions, which a listing shows
+    /// before v1's folders are read: it is never fresh then.
+    complete: bool = true,
     loaded_at_ns: i128 = 0,
     active_id: ?[]u8 = null,
     catalog: session_catalog_cache.ActionableSessionCatalog = .{},
@@ -267,7 +271,7 @@ pub const SessionPickerCatalogCache = struct {
 
     pub fn isFresh(self: *const SessionPickerCatalogCache) bool {
         const now_ns = io_mod.nanoTimestamp();
-        return self.ready and now_ns >= self.loaded_at_ns and
+        return self.ready and self.complete and now_ns >= self.loaded_at_ns and
             now_ns - self.loaded_at_ns <= 5 * std.time.ns_per_s;
     }
 
@@ -277,6 +281,17 @@ pub const SessionPickerCatalogCache = struct {
         active_id: ?[]const u8,
     ) !void {
         return self.installAt(source, active_id, io_mod.nanoTimestamp());
+    }
+
+    /// Installs a listing's first part, v2's sessions alone, until the
+    /// whole listing replaces it.
+    pub fn installFirstPart(
+        self: *SessionPickerCatalogCache,
+        source: *session_catalog_cache.ActionableSessionCatalog,
+        active_id: ?[]const u8,
+    ) !void {
+        try self.installAt(source, active_id, io_mod.nanoTimestamp());
+        self.complete = false;
     }
 
     fn installAt(
@@ -445,6 +460,13 @@ pub const SessionPickerLoad = struct {
         abandoned: bool = false,
         request: PageRequest,
         catalog: ?session_catalog_cache.ActionableSessionCatalog = null,
+        /// v2's sessions alone, newest first, which the worker sets before
+        /// it reads v1's folders, so the first rows show meanwhile. The
+        /// worker never touches it after `first_part_ready`.
+        first_part: ?session_catalog_cache.ActionableSessionCatalog = null,
+        first_part_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// Main-loop-owned: `takeFirstPart` took it.
+        first_part_taken: bool = false,
         /// Shared with the app, which joins this thread before freeing it.
         store: *session_adapter.Store,
         failure: ?anyerror = null,
@@ -465,6 +487,7 @@ pub const SessionPickerLoad = struct {
             self.requestStop();
             if (self.thread) |thread| thread.join();
             if (self.catalog) |*catalog| catalog.deinit(std.heap.c_allocator);
+            if (self.first_part) |*part| part.deinit(std.heap.c_allocator);
             self.request.deinit();
             std.heap.c_allocator.destroy(self);
         }
@@ -603,6 +626,14 @@ pub const SessionPickerLoad = struct {
         self.task = task;
     }
 
+    /// The running listing's first part, once the worker has it; taken once.
+    pub fn takeFirstPart(self: *SessionPickerLoad) ?*Task {
+        const task = self.task orelse return null;
+        if (task.first_part_taken or !task.first_part_ready.load(.acquire)) return null;
+        task.first_part_taken = true;
+        return task;
+    }
+
     pub fn takeCompleted(self: *SessionPickerLoad) ?*Task {
         const task = self.task orelse return null;
         if (!task.done.load(.acquire)) return null;
@@ -613,11 +644,35 @@ pub const SessionPickerLoad = struct {
     fn threadMain(task: *Task) void {
         defer task.done.store(true, .release);
         const started = io_mod.nanoTimestamp();
-        const summaries = session_adapter.listSummaries(
+        const FirstPart = struct {
+            task: *Task,
+
+            pub fn v2Listed(first: @This(), listed: []const session_store.SessionSummary) void {
+                const alloc = std.heap.c_allocator;
+                var part: session_catalog_cache.ActionableSessionCatalog = .{};
+                part.summaries.ensureTotalCapacity(alloc, listed.len) catch |err| {
+                    // The rows then show with the whole listing.
+                    debug_trace.logf("core", "session picker first part dropped err={s}", .{@errorName(err)});
+                    return;
+                };
+                for (listed) |summary| {
+                    part.summaries.appendAssumeCapacity(session_summary_codec.cloneSessionSummary(alloc, summary) catch |err| {
+                        debug_trace.logf("core", "session picker first part dropped err={s}", .{@errorName(err)});
+                        part.deinit(alloc);
+                        return;
+                    });
+                }
+                first.task.first_part = part;
+                first.task.first_part_ready.store(true, .release);
+                debug_trace.logf("core", "session picker first part listed sessions={d}", .{listed.len});
+            }
+        };
+        const summaries = session_adapter.listSummariesWith(
             task.store,
             std.heap.c_allocator,
             task.request.active_id,
             &task.cancel_requested,
+            FirstPart{ .task = task },
         ) catch |err| {
             debug_trace.logf("core", "session picker catalog stopped err={s}", .{@errorName(err)});
             task.failure = err;
@@ -625,6 +680,339 @@ pub const SessionPickerLoad = struct {
         };
         task.catalog = .{ .summaries = summaries };
         debug_trace.logf("core", "session picker catalog loaded sessions={d} elapsed_us={d}", .{ summaries.items.len, @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_us) });
+    }
+};
+
+/// Opens the session the picker chose without the UI thread waiting on it
+/// (R2.1): a worker opens it, converting a v1 session first, decodes its
+/// state, and reads its newest compaction cycle; the UI thread replays that
+/// cycle into a detached transcript a slice per loop turn; the worker
+/// finalizes the transcript; the UI thread installs it all in one step.
+/// Until that step the open session stays as it was, so Esc drops the open
+/// whole (`tests/tla/session_picker/SessionOpen.tla`).
+pub const SessionPickerOpen = struct {
+    /// Which thread holds the task: the worker during `read` and
+    /// `finalize` until `done`, the UI thread otherwise.
+    pub const Stage = enum { read, replay, finalize };
+
+    /// The session an open is for. Owns its strings.
+    pub const Request = struct {
+        session_id: []u8,
+        workspace_root: []u8,
+
+        pub fn init(session_id: []const u8, workspace_root: []const u8) !Request {
+            const id = try Task.alloc.dupe(u8, session_id);
+            errdefer Task.alloc.free(id);
+            return .{ .session_id = id, .workspace_root = try Task.alloc.dupe(u8, workspace_root) };
+        }
+
+        pub fn deinit(self: *Request) void {
+            Task.alloc.free(self.session_id);
+            Task.alloc.free(self.workspace_root);
+            self.* = undefined;
+        }
+    };
+
+    /// The UI's replay, which the worker finalizes. The app owns its state
+    /// and frees it through `deinit_fn`; it imports the screen, which this
+    /// file does not.
+    pub const Replay = struct {
+        state: *anyopaque,
+        finalize_fn: *const fn (*anyopaque) anyerror!void,
+        deinit_fn: *const fn (*anyopaque) void,
+    };
+
+    pub const Task = struct {
+        future: ?std.Io.Future(void) = null,
+        done: std.atomic.Value(bool) = .init(false),
+        cancel_requested: std.atomic.Value(bool) = .init(false),
+        /// UI thread only: Esc, a picker close, or quit gave the open up.
+        abandoned: bool = false,
+        stage: Stage = .read,
+        request: Request,
+        /// Shared with the app, which awaits this task before freeing it.
+        store: *session_adapter.Store,
+        /// What the read made; the task owns each until the install takes it.
+        session: ?*session_adapter.Session = null,
+        resumed: ?session_adapter.Resumed = null,
+        /// The newest compaction cycle's turns, oldest first, which the
+        /// screen holds after the resume (`Session.visitHistorySinceCompaction`).
+        cycle: std.ArrayList(types.HistoryTurn) = .empty,
+        /// The cycle is the one before the newest compaction, which has no
+        /// turn yet.
+        holds_previous_cycle: bool = false,
+        /// The session never ran in another workspace, so a saved call's
+        /// relative path names a file here.
+        ran_only_here: bool = false,
+        replay: ?Replay = null,
+        failure: ?anyerror = null,
+        started_ns: i128,
+        read_ns: i128 = 0,
+        finalize_ns: i128 = 0,
+
+        const alloc = std.heap.c_allocator;
+
+        fn cancelled(self: *const Task) bool {
+            return self.cancel_requested.load(.acquire);
+        }
+
+        fn run(self: *Task) void {
+            defer self.done.store(true, .release);
+            switch (self.stage) {
+                .read => {
+                    const started = io_mod.nanoTimestamp();
+                    defer self.read_ns = io_mod.nanoTimestamp() - started;
+                    self.read() catch |err| {
+                        self.failure = err;
+                    };
+                },
+                .finalize => {
+                    const started = io_mod.nanoTimestamp();
+                    defer self.finalize_ns = io_mod.nanoTimestamp() - started;
+                    const replay = self.replay orelse {
+                        self.failure = error.SessionPersistenceUnavailable;
+                        return;
+                    };
+                    replay.finalize_fn(replay.state) catch |err| {
+                        self.failure = err;
+                    };
+                },
+                .replay => unreachable,
+            }
+        }
+
+        fn read(self: *Task) !void {
+            if (self.cancelled()) return error.Cancelled;
+            const id = self.request.session_id;
+            const workspace = self.request.workspace_root;
+            // A session open in another fx shows as busy at once (D38).
+            self.session = try session_adapter.Session.resumeSessionWithoutWaiting(alloc, self.store, .{ .id = id }, workspace, .app);
+            const session = self.session.?;
+            self.resumed = try session.durableState(alloc, workspace);
+            self.ran_only_here = try session.ranOnlyIn(workspace);
+            session_open_test_controls.holdOpen(&self.cancel_requested);
+            if (self.cancelled()) return error.Cancelled;
+            const Visitor = struct {
+                task: *Task,
+
+                pub fn append(visitor: *@This(), turn: types.HistoryTurn) !void {
+                    if (visitor.task.cancelled()) return error.Cancelled;
+                    try visitor.task.cycle.ensureUnusedCapacity(alloc, 1);
+                    visitor.task.cycle.appendAssumeCapacity(try types.dupeHistoryTurn(alloc, turn));
+                }
+            };
+            var visitor = Visitor{ .task = self };
+            self.holds_previous_cycle = try session.visitHistorySinceCompaction(alloc, &visitor);
+        }
+
+        /// Takes the session; the caller closes it.
+        pub fn takeSession(self: *Task) *session_adapter.Session {
+            const session = self.session.?;
+            self.session = null;
+            return session;
+        }
+
+        /// Frees the task and all it still owns. Closing the session gives
+        /// its writer lock back (R3.9).
+        pub fn destroy(self: *Task) void {
+            std.debug.assert(self.future == null);
+            if (self.replay) |replay| replay.deinit_fn(replay.state);
+            for (self.cycle.items) |turn| types.freeHistoryTurn(alloc, turn);
+            self.cycle.deinit(alloc);
+            if (self.resumed) |*resumed| resumed.deinit(alloc);
+            if (self.session) |session| session.close();
+            self.request.deinit();
+            alloc.destroy(self);
+        }
+
+        fn await(self: *Task) void {
+            if (self.future) |*future| future.await(io_mod.getIo());
+            self.future = null;
+        }
+
+        /// Runs the current stage on the worker; without threads, here. On
+        /// a failed spawn the task is done, with the failure.
+        fn launch(self: *Task) !void {
+            self.done.store(false, .release);
+            if (comptime builtin.single_threaded or host_target.is_wasm) {
+                self.run();
+                return;
+            }
+            self.future = io_mod.getIo().concurrent(run, .{self}) catch |err| {
+                self.failure = err;
+                self.done.store(true, .release);
+                return err;
+            };
+        }
+    };
+
+    /// What Enter does to the open in flight. Pure, for the planning tests.
+    pub const EnterPlan = enum { start, queue, ignore };
+
+    /// What the UI does with a task its worker finished. Pure.
+    pub const DonePlan = enum { drop, fail, replay, install };
+
+    task: ?*Task = null,
+    /// An open Enter asked for while an abandoned one still ran: it starts
+    /// once that one is freed, so the process never opens a session twice
+    /// at once (R3.6).
+    pending: ?Request = null,
+
+    pub fn planEnter(task_running: bool, task_abandoned: bool, pending: bool) EnterPlan {
+        if (pending) return .ignore;
+        if (!task_running) return .start;
+        return if (task_abandoned) .queue else .ignore;
+    }
+
+    pub fn planDone(abandoned: bool, stage: Stage, failure: ?anyerror) DonePlan {
+        if (abandoned) return .drop;
+        if (failure != null) return .fail;
+        return switch (stage) {
+            .read => .replay,
+            .finalize => .install,
+            .replay => unreachable,
+        };
+    }
+
+    /// The session the picker shows as opening, or null.
+    pub fn openingId(self: *const SessionPickerOpen) ?[]const u8 {
+        if (self.pending) |request| return request.session_id;
+        const task = self.task orelse return null;
+        return if (task.abandoned) null else task.request.session_id;
+    }
+
+    pub fn busy(self: *const SessionPickerOpen) bool {
+        return self.task != null or self.pending != null;
+    }
+
+    /// Starts opening `request`, or queues it behind an abandoned open.
+    /// Returns false, freeing `request`, when an open already runs: a
+    /// second Enter does nothing.
+    pub fn enter(self: *SessionPickerOpen, store: *session_adapter.Store, request: Request) !bool {
+        var owned = request;
+        const plan = planEnter(self.task != null, if (self.task) |task| task.abandoned else false, self.pending != null);
+        switch (plan) {
+            .ignore => {
+                debug_trace.logf("session", "event=picker_open_ignored reason=open_in_flight session={s}", .{owned.session_id});
+                owned.deinit();
+                return false;
+            },
+            .queue => {
+                self.pending = owned;
+                return true;
+            },
+            .start => {
+                try self.startRead(store, owned);
+                return true;
+            },
+        }
+    }
+
+    fn startRead(self: *SessionPickerOpen, store: *session_adapter.Store, request: Request) !void {
+        std.debug.assert(self.task == null);
+        var owned = request;
+        const task = Task.alloc.create(Task) catch |err| {
+            owned.deinit();
+            return err;
+        };
+        task.* = .{ .request = owned, .store = store, .started_ns = io_mod.nanoTimestamp() };
+        self.task = task;
+        try task.launch();
+    }
+
+    /// The UI's replay stage begins: the task stays here, held by the UI
+    /// thread, which keeps its replay state in it (`setReplay`).
+    pub fn beginReplay(self: *SessionPickerOpen) *Task {
+        const task = self.task.?;
+        std.debug.assert(task.stage == .read and task.done.load(.acquire));
+        task.stage = .replay;
+        return task;
+    }
+
+    /// Hands the UI's finished replay to the worker to finalize.
+    pub fn startFinalize(self: *SessionPickerOpen) !void {
+        const task = self.task.?;
+        std.debug.assert(task.stage == .replay and task.replay != null);
+        task.stage = .finalize;
+        try task.launch();
+    }
+
+    /// The task whose worker finished, still owned here; null while it
+    /// runs or while the UI replays.
+    pub fn completed(self: *SessionPickerOpen) ?*Task {
+        const task = self.task orelse return null;
+        if (task.stage == .replay) return null;
+        if (!task.done.load(.acquire)) return null;
+        task.await();
+        return task;
+    }
+
+    /// Takes the finished task out for its install, which switches
+    /// sessions and so cancels the picker's open: the caller owns it then
+    /// and frees it with `Task.destroy`.
+    pub fn detach(self: *SessionPickerOpen) *Task {
+        const task = self.task.?;
+        std.debug.assert(task.future == null and self.pending == null);
+        self.task = null;
+        return task;
+    }
+
+    /// Whether the UI thread has a replay slice to run: the loop then turns
+    /// again without waiting, still reading input first.
+    pub fn replayDue(self: *const SessionPickerOpen) bool {
+        const task = self.task orelse return false;
+        return task.stage == .replay;
+    }
+
+    /// The task the UI replays into, or null.
+    pub fn replaying(self: *SessionPickerOpen) ?*Task {
+        const task = self.task orelse return null;
+        return if (task.stage == .replay) task else null;
+    }
+
+    /// Frees the task `completed` or `replaying` returned, then starts the
+    /// open queued behind it, which then shows as opening.
+    pub fn finish(self: *SessionPickerOpen) !void {
+        const task = self.task orelse return;
+        const store = task.store;
+        self.task = null;
+        task.destroy();
+        const request = self.pending orelse return;
+        self.pending = null;
+        try self.startRead(store, request);
+    }
+
+    /// Esc, a picker close, or quit: gives the open up without waiting on
+    /// its worker. A finished or replaying open is freed now; a running one
+    /// is freed by the poll that finds it done.
+    pub fn cancel(self: *SessionPickerOpen, reason: []const u8) void {
+        if (self.pending) |*request| {
+            debug_trace.logf("session", "event=picker_open_cancelled reason={s} stage=queued session={s}", .{ reason, request.session_id });
+            request.deinit();
+            self.pending = null;
+            return;
+        }
+        const task = self.task orelse return;
+        if (task.abandoned) return;
+        task.abandoned = true;
+        task.cancel_requested.store(true, .release);
+        debug_trace.logf("session", "event=picker_open_cancelled reason={s} stage={s} session={s}", .{ reason, @tagName(task.stage), task.request.session_id });
+        if (task.stage == .replay or task.done.load(.acquire)) {
+            task.await();
+            self.task = null;
+            task.destroy();
+        }
+    }
+
+    /// Teardown: stops the open and waits for its worker, whose last step
+    /// may be one it cannot stop midway, such as a v1 conversion.
+    pub fn deinit(self: *SessionPickerOpen) void {
+        self.cancel("shutdown");
+        if (self.task) |task| {
+            task.await();
+            task.destroy();
+        }
+        self.* = .{};
     }
 };
 
@@ -1342,6 +1730,8 @@ pub const Persistence = struct {
     process_ultrafast_override: ?bool = null,
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
+    /// The picker's open of the session Enter chose, off the UI thread.
+    session_picker_open: SessionPickerOpen = .{},
     session_picker_cache: SessionPickerCatalogCache = .{},
     fork_menu: ForkMenu = .{},
     /// How many subagent tasks the last switch stopped, for its notice in
@@ -1387,7 +1777,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 40) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 41) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1411,6 +1801,7 @@ pub const Persistence = struct {
         storage.process_ultrafast_override = null;
         storage.session_picker = .{};
         storage.session_picker_load = .{};
+        storage.session_picker_open = .{};
         storage.session_picker_cache = .{};
         storage.fork_menu = .{};
         storage.switch_stopped_tasks = 0;
@@ -1498,6 +1889,7 @@ pub const Persistence = struct {
         if (self.process_model_override) |model| alloc.free(model);
         self.session_picker.deinit(alloc);
         self.session_picker_load.deinit();
+        self.session_picker_open.deinit();
         if (catalog == .free) self.session_picker_cache.deinit();
         self.fork_menu.close(alloc);
         self.title_generation.deinit();
@@ -1511,6 +1903,14 @@ pub const Persistence = struct {
             alloc.destroy(store);
         }
         self.* = undefined;
+    }
+
+    /// Whether the picker shows a listing's first part, v2's sessions,
+    /// while the listing still reads v1's: a search with no match yet may
+    /// match once those arrive.
+    pub fn pickerListingRest(self: *const Persistence) bool {
+        const cache = &self.session_picker_cache;
+        return self.session_picker.active and cache.ready and !cache.complete and self.session_picker_load.task != null;
     }
 
     /// Takes `store` and keeps it at a stable address. Sessions point at
@@ -1632,4 +2032,236 @@ test "cancelling a running Ctrl+O archive read stops it, and the next read finis
     try std.testing.expectEqual(@as(usize, 300), task.turns.items.len);
     read.finish();
     try std.testing.expect(!read.busy());
+}
+
+test "Enter starts an open only when none is in flight, and queues one behind an abandoned open" {
+    const Plan = SessionPickerOpen.EnterPlan;
+    try std.testing.expectEqual(Plan.start, SessionPickerOpen.planEnter(false, false, false));
+    // A second Enter does nothing (`SessionOpen.tla` OneOpen).
+    try std.testing.expectEqual(Plan.ignore, SessionPickerOpen.planEnter(true, false, false));
+    try std.testing.expectEqual(Plan.ignore, SessionPickerOpen.planEnter(true, true, true));
+    // Never beside the abandoned open, which may still hold the session's
+    // lock (`SessionOpen.tla` NoUseAfterFree, OneLockPerSession).
+    try std.testing.expectEqual(Plan.queue, SessionPickerOpen.planEnter(true, true, false));
+}
+
+test "a finished open stage is dropped once abandoned, else fails, replays, or installs" {
+    const Plan = SessionPickerOpen.DonePlan;
+    // `SessionOpen.tla` NoHalfOpen: abandoned wins over every outcome.
+    try std.testing.expectEqual(Plan.drop, SessionPickerOpen.planDone(true, .read, null));
+    try std.testing.expectEqual(Plan.drop, SessionPickerOpen.planDone(true, .finalize, null));
+    try std.testing.expectEqual(Plan.drop, SessionPickerOpen.planDone(true, .read, error.SessionBusy));
+    try std.testing.expectEqual(Plan.fail, SessionPickerOpen.planDone(false, .read, error.SessionBusy));
+    try std.testing.expectEqual(Plan.fail, SessionPickerOpen.planDone(false, .finalize, error.OutOfMemory));
+    try std.testing.expectEqual(Plan.replay, SessionPickerOpen.planDone(false, .read, null));
+    try std.testing.expectEqual(Plan.install, SessionPickerOpen.planDone(false, .finalize, null));
+}
+
+/// A saved session with `turns` turns, closed so an open can take it.
+const OpenTestHome = struct {
+    tmp: std.testing.TmpDir,
+    home: []u8,
+    store: session_adapter.Store,
+    id: []u8,
+    model: [1]u8 = "m".*,
+
+    fn init(self: *OpenTestHome, turns: usize) !void {
+        const alloc = std.testing.allocator;
+        self.* = .{ .tmp = std.testing.tmpDir(.{ .iterate = true }), .home = undefined, .store = undefined, .id = undefined };
+        errdefer self.tmp.cleanup();
+        self.home = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, ".");
+        errdefer alloc.free(self.home);
+        self.store = try session_adapter.Store.open(alloc, self.home);
+        errdefer self.store.deinit(alloc);
+        const session = try session_adapter.Session.create(alloc, &self.store, "/w", .app, .{
+            .preferences = .{ .model = &self.model, .effort = .auto, .fast_mode = false },
+            .language = types.ConversationLanguage.default(),
+            .permission_state = .{},
+        });
+        defer session.close();
+        for (0..turns) |_| {
+            try session.commitTurn(.{ .assistant = .{
+                .user = .{ .text = @constCast("question") },
+                .assistant = @constCast("answer"),
+            } }, types.ConversationLanguage.default());
+        }
+        self.id = try alloc.dupe(u8, session.id());
+    }
+
+    fn deinit(self: *OpenTestHome) void {
+        const alloc = std.testing.allocator;
+        alloc.free(self.id);
+        self.store.deinit(alloc);
+        alloc.free(self.home);
+        self.tmp.cleanup();
+    }
+
+    fn request(self: *OpenTestHome) !SessionPickerOpen.Request {
+        return SessionPickerOpen.Request.init(self.id, "/w");
+    }
+
+    /// Whether another open of the session can take its writer lock now.
+    fn lockFree(self: *OpenTestHome) !bool {
+        const session = session_adapter.Session.resumeSessionWithoutWaiting(std.heap.c_allocator, &self.store, .{ .id = self.id }, "/w", .app) catch |err| switch (err) {
+            error.SessionBusy => return false,
+            else => return err,
+        };
+        session.close();
+        return true;
+    }
+};
+
+fn waitForOpenStage(open: *SessionPickerOpen) !*SessionPickerOpen.Task {
+    for (0..5000) |_| {
+        if (open.completed()) |task| return task;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.TestSessionOpenTimedOut;
+}
+
+/// A replay that counts its finalize and its free.
+const CountingReplay = struct {
+    finalized: usize = 0,
+    freed: usize = 0,
+
+    fn finalize(state: *anyopaque) anyerror!void {
+        const self: *CountingReplay = @ptrCast(@alignCast(state));
+        self.finalized += 1;
+    }
+
+    fn free(state: *anyopaque) void {
+        const self: *CountingReplay = @ptrCast(@alignCast(state));
+        self.freed += 1;
+    }
+
+    fn replay(self: *CountingReplay) SessionPickerOpen.Replay {
+        return .{ .state = self, .finalize_fn = finalize, .deinit_fn = free };
+    }
+};
+
+test "an open reads the session off the calling thread, then the replay is finalized there too, and the install takes the session" {
+    var home: OpenTestHome = undefined;
+    try home.init(2);
+    defer home.deinit();
+    var open: SessionPickerOpen = .{};
+    defer open.deinit();
+
+    try std.testing.expect(try open.enter(&home.store, try home.request()));
+    try std.testing.expectEqualStrings(home.id, open.openingId().?);
+    // A second Enter while it runs opens nothing extra.
+    try std.testing.expect(!try open.enter(&home.store, try home.request()));
+
+    const read = try waitForOpenStage(&open);
+    try std.testing.expectEqual(SessionPickerOpen.DonePlan.replay, SessionPickerOpen.planDone(read.abandoned, read.stage, read.failure));
+    try std.testing.expectEqual(@as(usize, 2), read.cycle.items.len);
+    try std.testing.expect(read.resumed != null and read.ran_only_here);
+    // The read holds the session open: no other open can take it.
+    try std.testing.expect(!try home.lockFree());
+
+    var counting: CountingReplay = .{};
+    const replaying = open.beginReplay();
+    replaying.replay = counting.replay();
+    try std.testing.expect(open.completed() == null);
+    try open.startFinalize();
+    const finalized = try waitForOpenStage(&open);
+    try std.testing.expectEqual(SessionPickerOpen.DonePlan.install, SessionPickerOpen.planDone(finalized.abandoned, finalized.stage, finalized.failure));
+    try std.testing.expectEqual(@as(usize, 1), counting.finalized);
+
+    const session = finalized.takeSession();
+    try open.finish();
+    try std.testing.expectEqual(@as(usize, 1), counting.freed);
+    try std.testing.expect(open.openingId() == null and !open.busy());
+    session.close();
+    try std.testing.expect(try home.lockFree());
+}
+
+test "Esc during the replay frees the open at once and gives the session's lock back" {
+    var home: OpenTestHome = undefined;
+    try home.init(1);
+    defer home.deinit();
+    var open: SessionPickerOpen = .{};
+    defer open.deinit();
+
+    try std.testing.expect(try open.enter(&home.store, try home.request()));
+    _ = try waitForOpenStage(&open);
+    var counting: CountingReplay = .{};
+    open.beginReplay().replay = counting.replay();
+    open.cancel("test");
+    try std.testing.expect(!open.busy());
+    try std.testing.expectEqual(@as(usize, 1), counting.freed);
+    try std.testing.expectEqual(@as(usize, 0), counting.finalized);
+    try std.testing.expect(try home.lockFree());
+}
+
+test "Esc while the worker runs leaves its result to the poll, and an Enter meanwhile waits for that result to be freed" {
+    var home: OpenTestHome = undefined;
+    try home.init(1);
+    defer home.deinit();
+    var open: SessionPickerOpen = .{};
+    defer open.deinit();
+
+    try std.testing.expect(try open.enter(&home.store, try home.request()));
+    open.cancel("test");
+    // Abandoned: the row no longer shows it as opening.
+    try std.testing.expect(open.openingId() == null and open.busy());
+    try std.testing.expect(try open.enter(&home.store, try home.request()));
+    try std.testing.expectEqualStrings(home.id, open.openingId().?);
+
+    const abandoned = try waitForOpenStage(&open);
+    try std.testing.expectEqual(SessionPickerOpen.DonePlan.drop, SessionPickerOpen.planDone(abandoned.abandoned, abandoned.stage, abandoned.failure));
+    try open.finish();
+    // The queued open starts only now, and reads the session whole.
+    const read = try waitForOpenStage(&open);
+    try std.testing.expectEqual(@as(?anyerror, null), read.failure);
+    try std.testing.expect(!read.abandoned);
+    try open.finish();
+    try std.testing.expect(try home.lockFree());
+}
+
+test "an open of a session that is gone fails with its reason and holds nothing" {
+    var home: OpenTestHome = undefined;
+    try home.init(1);
+    defer home.deinit();
+    var open: SessionPickerOpen = .{};
+    defer open.deinit();
+
+    try std.testing.expect(try open.enter(&home.store, try SessionPickerOpen.Request.init("missing", "/w")));
+    const task = try waitForOpenStage(&open);
+    try std.testing.expect(task.failure != null);
+    try std.testing.expectEqual(SessionPickerOpen.DonePlan.fail, SessionPickerOpen.planDone(task.abandoned, task.stage, task.failure));
+    try std.testing.expect(task.session == null);
+    try open.finish();
+    try std.testing.expect(!open.busy());
+}
+
+test "a listing's first part shows from the cache but is never fresh, and the whole listing replaces it" {
+    const alloc = std.heap.c_allocator;
+    var cache: SessionPickerCatalogCache = .{};
+    defer cache.deinit();
+    var part: session_catalog_cache.ActionableSessionCatalog = .{};
+    try part.summaries.append(alloc, .{
+        .id = try alloc.dupe(u8, "v2"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = types.ConversationLanguage.default(),
+        .history_len = 1,
+    });
+    try cache.installFirstPart(&part, null);
+    try std.testing.expect(cache.matches(null));
+    // A reopen shows these rows and lists again for v1's.
+    try std.testing.expect(!cache.isFresh());
+
+    var whole: session_catalog_cache.ActionableSessionCatalog = .{};
+    for ([_][]const u8{ "v1", "v2" }) |id| {
+        try whole.summaries.append(alloc, .{
+            .id = try alloc.dupe(u8, id),
+            .created_at_ms = 1,
+            .updated_at_ms = 2,
+            .conversation_language = types.ConversationLanguage.default(),
+            .history_len = 1,
+        });
+    }
+    try cache.install(&whole, null);
+    try std.testing.expect(cache.isFresh());
+    try std.testing.expectEqual(@as(usize, 2), cache.catalog.summaries.items.len);
 }

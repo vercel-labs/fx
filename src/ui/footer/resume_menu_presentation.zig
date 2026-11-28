@@ -8,6 +8,7 @@ const ui_render = @import("../render.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
+const render_request = @import("../render_request.zig");
 
 const Allocator = std.mem.Allocator;
 const SessionMenuProjection = render_input.SessionMenuProjection;
@@ -250,8 +251,23 @@ pub fn composeSessionMenuRow(
             width,
         );
     }
-    return composeTitleRow(alloc, summary.*, display_index == layout.selected, projection.now_ms, columns, width);
+    const opening: ?OpeningMark = if (projection.isOpening(summary.*)) .{ .marker_phase = projection.marker_phase } else null;
+    return composeTitleRowOpening(alloc, summary.*, display_index == layout.selected, projection.now_ms, columns, width, opening);
 }
+
+/// A row whose session opens: its right cluster says so, after fx's
+/// loading marker, which blinks while the open runs.
+const OpeningMark = struct {
+    marker_phase: i16,
+
+    const label = "Opening…";
+    /// `row_text.appendLoadingMarker`'s two columns.
+    const marker_width: usize = 2;
+
+    fn width() usize {
+        return marker_width + display_width.visibleWidth(label);
+    }
+};
 
 fn sessionWindowStart(projection: SessionMenuProjection, layout: SessionMenuLayout) usize {
     if (layout.session_count == 0 or layout.visible_session_items == 0) return 0;
@@ -353,6 +369,18 @@ fn composeTitleRow(
     columns: MetadataColumns,
     width: u16,
 ) !std.ArrayList(u8) {
+    return composeTitleRowOpening(alloc, summary, selected, now_ms, columns, width, null);
+}
+
+fn composeTitleRowOpening(
+    alloc: Allocator,
+    summary: session_store.SessionSummary,
+    selected: bool,
+    now_ms: i64,
+    columns: MetadataColumns,
+    width: u16,
+    opening: ?OpeningMark,
+) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
 
@@ -370,7 +398,10 @@ fn composeTitleRow(
     const workspace_col = @max(columns.workspace, display_width.visibleWidth(workspace));
     const age_col = @max(columns.age, display_width.visibleWidth(age));
     const turns_col = @max(columns.turns, display_width.visibleWidth(turns));
-    const metadata_width = workspace_col + MetadataColumns.separator_width + age_col + MetadataColumns.separator_width + turns_col;
+    const cluster_width = workspace_col + MetadataColumns.separator_width + age_col + MetadataColumns.separator_width + turns_col;
+    // The opening row keeps the title column where the other rows have it,
+    // and still fits its mark where they drop their cluster.
+    const metadata_width = if (opening != null) @max(cluster_width, OpeningMark.width()) else cluster_width;
 
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
     const content_width: usize = @as(usize, width) -| 1;
@@ -383,8 +414,13 @@ fn composeTitleRow(
     else
         @as(usize, width) -| prefix_width;
     const metadata_start = prefix_width + title_col + picker_presentation.inline_picker_column_gap_width;
+    // Where the cluster drops, the opening mark still follows the title
+    // when the row has room for it.
+    const mark_fits = opening != null and @as(usize, width) >= prefix_width + 1 + OpeningMark.width();
     const title_budget = if (show_metadata)
         title_col
+    else if (mark_fits)
+        @as(usize, width) -| prefix_width -| (1 + OpeningMark.width())
     else
         @as(usize, width) -| prefix_width;
 
@@ -394,6 +430,15 @@ fn composeTitleRow(
     try row_text.appendSingleLineMiddleEllipsized(alloc, &row, session_catalog.displayTitle(summary), title_budget);
     try row.appendSlice(alloc, ui_render.reset_style);
 
+    if (opening) |mark| {
+        if (!show_metadata and !mark_fits) return row;
+        if (show_metadata) try row_text.appendSpacesToColumn(alloc, &row, metadata_start) else try row.append(alloc, ' ');
+        _ = try row_text.appendLoadingMarker(alloc, &row, mark.marker_phase, OpeningMark.width());
+        try row.appendSlice(alloc, ui_render.selected_completion_style);
+        try row.appendSlice(alloc, OpeningMark.label);
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
+    }
     if (show_metadata) {
         try row_text.appendSpacesToColumn(alloc, &row, metadata_start);
         // The metadata cluster tracks the row's selection: bold bright with the
@@ -439,7 +484,8 @@ fn composeStateRow(alloc: Allocator, projection: SessionMenuProjection, width: u
     const message = switch (projection.load_state) {
         .loading => "Loading sessions…",
         .failed => "Unable to load sessions.",
-        .ready => "No sessions found.",
+        // The first part has no match yet; the rest may have one.
+        .ready => if (projection.rest_loading) "Loading sessions…" else "No sessions found.",
     };
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
@@ -1013,4 +1059,98 @@ test "resume menu keeps the selected paginated action visible in two rows" {
     var selected_load_more = try composeSessionMenuRow(alloc, projection, 1, 80, 2);
     defer selected_load_more.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected_load_more.items, "Load more") != null);
+}
+
+test "resume menu shows the opening session's row as opening, in the column the cluster starts in" {
+    const alloc = std.testing.allocator;
+    const summaries = [_]session_store.SessionSummary{
+        .{
+            .id = @constCast("one"),
+            .workspace_root = @constCast("/Users/example/app"),
+            .title = @constCast("First session"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 3,
+        },
+        .{
+            .id = @constCast("two"),
+            .workspace_root = @constCast("/Users/example/app"),
+            .title = @constCast("Second session"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 5,
+        },
+    };
+    var projection: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .summaries = &summaries,
+        .selected_index = 1,
+        .now_ms = 1_000 + 8 * std.time.ms_per_min,
+        .opening_id = "two",
+    };
+    try std.testing.expect(projection.showsOpening());
+
+    const plain_text = try menuRowText(alloc, projection, 2, 100);
+    defer alloc.free(plain_text);
+    const opening_text = try menuRowText(alloc, projection, 3, 100);
+    defer alloc.free(opening_text);
+    try std.testing.expect(std.mem.find(u8, plain_text, "app · 8m · 3 turns") != null);
+    try std.testing.expect(std.mem.find(u8, plain_text, "Opening") == null);
+    try std.testing.expect(std.mem.find(u8, opening_text, "Second session") != null);
+    try std.testing.expect(std.mem.find(u8, opening_text, "5 turns") == null);
+    // fx's loading marker, the `•` of `• Thinking`, where the cluster starts.
+    try std.testing.expectEqual(std.mem.find(u8, plain_text, "app ·").?, std.mem.find(u8, opening_text, "• Opening…").?);
+    var opening = try composeSessionMenuRow(alloc, projection, 3, 100, 5);
+    defer opening.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, opening.items, ui_render.permission_auto_style) != null);
+
+    // The blink's off phase keeps the label where it was.
+    projection.marker_phase = render_request.blink_half_period_frames - render_request.animation_padding;
+    const dark_text = try menuRowText(alloc, projection, 3, 100);
+    defer alloc.free(dark_text);
+    try std.testing.expect(std.mem.find(u8, dark_text, "•") == null);
+    const lit_column = display_width.visibleWidth(opening_text[0..std.mem.find(u8, opening_text, "Opening…").?]);
+    const dark_column = display_width.visibleWidth(dark_text[0..std.mem.find(u8, dark_text, "Opening…").?]);
+    try std.testing.expectEqual(lit_column, dark_column);
+
+    // Too narrow for the cluster: the mark still follows the title.
+    projection.marker_phase = 0;
+    const narrow_text = try menuRowText(alloc, projection, 3, 24);
+    defer alloc.free(narrow_text);
+    try std.testing.expect(std.mem.find(u8, narrow_text, "• Opening…") != null);
+
+    // Once the row is filtered out, or nothing opens, no row shows it.
+    projection.opening_id = "three";
+    try std.testing.expect(!projection.showsOpening());
+    projection.opening_id = null;
+    try std.testing.expect(!projection.showsOpening());
+}
+
+/// Row `row_index` of the session menu as a terminal shows it. Caller owns.
+fn menuRowText(alloc: Allocator, projection: SessionMenuProjection, row_index: u16, width: u16) ![]u8 {
+    var row = try composeSessionMenuRow(alloc, projection, row_index, width, 5);
+    defer row.deinit(alloc);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
+    var grid = try vt_emulator.Grid.init(alloc, width, 1);
+    defer grid.deinit();
+    try grid.feed(row.items);
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(alloc);
+    try grid.rowTextTrimmed(1, &text);
+    return text.toOwnedSlice(alloc);
+}
+
+test "resume menu says sessions still load when a search has no match in the first part of a listing" {
+    const alloc = std.testing.allocator;
+    var projection: SessionMenuProjection = .{ .active = true, .load_state = .ready, .rest_loading = true };
+    var row = try composeSessionMenuRow(alloc, projection, 2, 80, 3);
+    defer row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, row.items, "Loading sessions…") != null);
+    projection.rest_loading = false;
+    var done = try composeSessionMenuRow(alloc, projection, 2, 80, 3);
+    defer done.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, done.items, "No sessions found.") != null);
 }

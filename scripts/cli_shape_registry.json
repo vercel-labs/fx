@@ -261,6 +261,14 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SESSION_OPEN_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SESSION_OPEN_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SESSION_WRITE_HELD": {
       "job": "test",
       "stability": "internal"
