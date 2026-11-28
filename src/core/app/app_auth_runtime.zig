@@ -9,6 +9,7 @@ const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const sign_in_trace = @import("../auth/sign_in_trace.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const pending_revocation = @import("../auth/pending_revocation.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
@@ -2309,6 +2310,16 @@ pub fn Runtime(comptime App: type) type {
             return recoverCredentialFailure(app, agent, source, err);
         }
 
+        /// The screen `agent`'s notices show on: main's, or another agent's
+        /// own view, named by its `screen_id`, which a later agent never
+        /// reuses even when it takes a closed agent's memory.
+        fn noticeScreen(app: *App, agent: *AppAgent) auth_runtime.NoticeScreen {
+            if (comptime !@hasField(App, "main_agent")) return auth_runtime.main_notice_screen;
+            if (agent == &app.main_agent) return auth_runtime.main_notice_screen;
+            if (comptime !@hasField(AppAgent, "screen_id")) return @intFromPtr(agent);
+            return agent.screen_id;
+        }
+
         fn recoverCredentialFailure(app: *App, agent: *AppAgent, source: credentials.Source, err: anyerror) !bool {
             debug_trace.logf("auth", "prompt credential refresh failed source={t} err={s}", .{ source, @errorName(err) });
             if (config_runtime.sessionConnectionNotice(err)) |notice| {
@@ -2329,9 +2340,17 @@ pub fn Runtime(comptime App: type) type {
             const notify = !compactionOwnsCredentialFeedback(app, agent);
             const should_notify = if (app.auth.credentialSource() == source and
                 comptime @hasDecl(@TypeOf(app.auth), "recordCredentialFailure"))
-                app.auth.recordCredentialFailure(failure, .{ .notify = notify })
+                app.auth.recordCredentialFailure(failure, .{ .notify = notify, .screen = noticeScreen(app, agent) })
             else
                 notify;
+            sign_in_trace.record(.prompt, true, "outcome=credential_failed screen={s} source={t} reason={t} retryable={} err={s} notice={s}", .{
+                sign_in_trace.screenName(agent),
+                failure.source,
+                failure.reason,
+                failure.retryable(),
+                @errorName(err),
+                if (should_notify) "shown" else "not_shown",
+            });
             if (!should_notify) return false;
             const recovery = try credentialRecoveryText(app.alloc, failure);
             defer app.alloc.free(recovery);
@@ -2773,7 +2792,7 @@ const TestAuth = struct {
     logout_reconcile_count: usize = 0,
     source_inventory_refresh_count: usize = 0,
     credential_failure: ?auth_runtime.CredentialFailure = null,
-    credential_notice_claimed: bool = false,
+    credential_notice_screens: auth_runtime.NoticeScreens = .{},
     picker_opened: bool = false,
     picker_provider: model_provider.ProviderId = .gateway,
     picker_closed: bool = false,
@@ -3009,7 +3028,7 @@ const TestAuth = struct {
     pub fn recordCredentialFailure(
         self: *TestAuth,
         failure: auth_runtime.CredentialFailure,
-        options: struct { notify: bool = true },
+        options: struct { notify: bool = true, screen: auth_runtime.NoticeScreen = auth_runtime.main_notice_screen },
     ) bool {
         const same_failure = if (self.credential_failure) |current|
             current.source == failure.source and current.reason == failure.reason
@@ -3017,10 +3036,10 @@ const TestAuth = struct {
             false;
         if (!same_failure) {
             self.credential_failure = failure;
-            self.credential_notice_claimed = false;
+            self.credential_notice_screens = .{};
         }
-        if (!options.notify or self.credential_notice_claimed) return false;
-        self.credential_notice_claimed = true;
+        if (!options.notify or self.credential_notice_screens.contains(options.screen)) return false;
+        self.credential_notice_screens.add(options.screen);
         return true;
     }
 

@@ -232,7 +232,7 @@ CI retries a failed end-to-end file once. A file that passes only on the retry g
 
 When the detector can't read the change, the `macOS arm64` check fails instead of passing.
 
-`scripts/detect-ci-need.sh` decides whether a pull request runs CI's five model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
+`scripts/detect-ci-need.sh` decides whether a pull request runs CI's six model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
 
 - `sdk/`
 - The SDK models in `tests/tla/sdk/` or their drivers in `tests/tla/drivers/*.mjs`
@@ -263,7 +263,13 @@ The `TLA+ shell quiet notice model` job takes about 2 minutes and runs its check
 - The model in `tests/tla/managed_execution/` or its drivers in `tests/tla/drivers/managed_execution/`
 - The shared code in `tests/tla/lib/`, `tests/tla/drivers/lib/`, and `tests/tla/drivers/graph.mjs`, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
 
-All five run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
+The `TLA+ ACP models and drivers` job takes about 5 minutes and runs its checks when the change touches:
+
+- `src/acp/`
+- The models in `tests/tla/acp/` or their drivers in `tests/tla/drivers/acp/`
+- The code those drivers share: `tests/tla/drivers/lib/` and `tests/tla/lib/`, or the helpers they load: the fake Gateway in `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
+
+All six run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
 
 Other workflows and benchmark jobs also report on pull requests, such as the `Examples` workflow when `examples/` changes and the `Shell command overhead` benchmark. Only the five checks above are required to merge, but look into any check that fails. Two of the others need more explanation:
 
@@ -331,6 +337,14 @@ For example:
 Maintainers prepare each release in a pull request that bumps `pub const version` in `src/main.zig` and adds the new entry to `CHANGELOG.md`. When that pull request merges, the release workflow finds no tag for the new version, builds the binaries for every platform, creates the tag, and publishes the GitHub Release along with the binaries that the install script and `fx upgrade` download. Later pushes to `main` under the same version don't start a release. If a release fails and needs a fix, merge the fix, then run **Actions > Release** on `main` with `validate_only` off. Never create a version tag by hand. The [Releasing](AGENTS.md#releasing) section of AGENTS.md describes the changelog format and release markers.
 
 To check release artifacts without publishing anything, run **Actions > Release** on `main` with `validate_only` enabled. The run builds every target, runs the PGSO qualification, and notarizes the macOS binaries. It creates no tag or GitHub Release, uploads nothing to the CDN, and changes no update channel.
+
+Before you open a release pull request, run that validate-only release on current `main`, the code the release pull request will build on:
+
+```bash
+gh workflow run release.yml --ref main -f validate_only=true
+```
+
+It takes about as long as a release build. A failure means a PGSO training, behavior, size, or performance gate failed on code that would ship. Fix what failed, run it again, and open the release pull request only after it passes.
 
 After CI passes on `main`, the dev release workflow publishes binaries for that commit. Run `fx upgrade --channel dev` to follow those builds, and `fx upgrade --channel stable` to go back to tagged releases.
 
