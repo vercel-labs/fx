@@ -777,7 +777,11 @@ fn statusLine(alloc: Allocator, s: mcp_runtime.Status) Allocator.Error!?struct {
 /// server, whatever its state, can only be renamed in the file it comes
 /// from; that is decided before the state is. The caller owns it.
 fn statusFix(alloc: Allocator, s: mcp_runtime.Status) Allocator.Error![]u8 {
-    if (readsAsOption(s.name)) return alloc.print("rename the server in {s} so its name does not start with \"-\"", .{configFile(s.source)});
+    if (readsAsOption(s.name)) {
+        const file = try configFile(alloc, s);
+        defer alloc.free(file);
+        return alloc.print("rename the server in {s} so its name does not start with \"-\"", .{file});
+    }
     return switch (s.state) {
         .waiting_for_approval => mcpCommand(alloc, "approve", s.name),
         .missing_env, .invalid_env => {
@@ -788,6 +792,11 @@ fn statusFix(alloc: Allocator, s: mcp_runtime.Status) Allocator.Error![]u8 {
         .unsupported => {
             const quoted = try command_lex.quoteWord(alloc, s.name);
             defer alloc.free(quoted);
+            if (s.source == .mod) {
+                const file = try configFile(alloc, s);
+                defer alloc.free(file);
+                return alloc.print("give {s} a stdio command or an HTTP URL in {s}", .{ quoted, file });
+            }
             return alloc.print("give {s} a stdio command or an HTTP URL, or run fx mcp remove {s}", .{ quoted, quoted });
         },
         .idle, .failed, .connecting, .ready, .retrying, .rejected, .disabled => mcpCommand(alloc, "show", s.name),
@@ -796,10 +805,11 @@ fn statusFix(alloc: Allocator, s: mcp_runtime.Status) Allocator.Error![]u8 {
 
 /// The file a server's config comes from, as fx names it to the user. Only
 /// an ACP client gives `acp` servers, and doctor never runs under one.
-fn configFile(source: mcp_contract.ConfigSource) []const u8 {
-    return switch (source) {
-        .workspace => ".mcp.json",
-        .profile, .acp => profile_paths.displayText("~/.fx/mcp.json"),
+fn configFile(alloc: Allocator, s: mcp_runtime.Status) Allocator.Error![]u8 {
+    return switch (s.source) {
+        .workspace => alloc.dupe(u8, ".mcp.json"),
+        .profile, .acp => alloc.dupe(u8, profile_paths.displayText("~/.fx/mcp.json")),
+        .mod => alloc.print("{s}/mods/{s}/mod.json", .{ profile_paths.displayRoot(), s.mod_name orelse "unknown" }),
     };
 }
 
@@ -1058,6 +1068,16 @@ test "a server whose name fx mcp would read as an option gets no child and a ren
     try std.testing.expectEqualStrings(profile_fix, checks.items[5].fix.?);
     try std.testing.expectEqualStrings("-i needs an environment variable", checks.items[6].detail);
     try std.testing.expectEqualStrings(project_fix, checks.items[6].fix.?);
+
+    var mod_checks: std.ArrayList(Check) = .empty;
+    defer freeChecks(alloc, &mod_checks);
+    try serverStatusChecks(&mod_checks, alloc, &.{
+        .{ .name = "-mod", .source = .mod, .mod_name = "alpha", .transport = .stdio, .state = .idle },
+        .{ .name = "old-sse", .source = .mod, .mod_name = "alpha", .transport = .sse, .state = .unsupported },
+    });
+    try std.testing.expectEqual(@as(usize, 2), mod_checks.items.len);
+    try std.testing.expectEqualStrings("rename the server in ~/.fx/mods/alpha/mod.json so its name does not start with \"-\"", mod_checks.items[0].fix.?);
+    try std.testing.expectEqualStrings("give old-sse a stdio command or an HTTP URL in ~/.fx/mods/alpha/mod.json", mod_checks.items[1].fix.?);
 
     var waiters: std.Io.Group = .init;
     var processes: std.ArrayList(*ProcessProbe) = .empty;

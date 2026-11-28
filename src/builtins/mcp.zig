@@ -15,6 +15,7 @@ const config_runtime = @import("../core/config/config_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const mods_mod = if (build_options.libfx) struct {} else @import("../core/mods/mods.zig");
 
 const Allocator = std.mem.Allocator;
 const McpServerConfig = mcp_contract.McpServerConfig;
@@ -33,18 +34,89 @@ pub fn configPathFromHome(alloc: Allocator, home: []const u8) ![]u8 {
 pub const NativeConfigs = struct {
     configs: std.ArrayList(McpServerConfig) = .empty,
     diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty,
+    mod_pins: if (build_options.libfx) struct {} else ?mods_mod.ModPins = if (build_options.libfx) .{} else null,
+    mods_root: if (build_options.libfx) struct {} else ?[]u8 = if (build_options.libfx) .{} else null,
 
     pub fn deinit(self: *NativeConfigs, alloc: Allocator) void {
         freeConfigs(alloc, &self.configs);
         for (self.diagnostics.items) |*diagnostic| diagnostic.deinit(alloc);
         self.diagnostics.deinit(alloc);
+        if (comptime !build_options.libfx) {
+            if (self.mod_pins) |*pins| pins.deinit(alloc);
+            if (self.mods_root) |root| alloc.free(root);
+        }
         self.* = undefined;
     }
 };
 
+/// Shared helper used by `loadNativeConfigs`, `inspectLocalConfig`, and ACP
+/// `appendMcpConfigs` to load enabled mods' `"mcp"` servers under pins,
+/// skipping profile-shadowed servers and cross-mod clashes. Broken mods trace
+/// to `debug_trace` only so PR 2's notes are never repeated.
+pub fn loadModServersForProfile(
+    alloc: Allocator,
+    home: []const u8,
+    profile: []const McpServerConfig,
+    diagnostics: ?*std.ArrayList(project_config.WorkspaceDiagnostic),
+    out_pins: if (build_options.libfx) struct {} else *?mods_mod.ModPins,
+    out_mods_root: if (build_options.libfx) struct {} else *?[]u8,
+) error{OutOfMemory}!std.ArrayList(McpServerConfig) {
+    if (comptime build_options.libfx) {
+        _ = .{ home, profile, diagnostics, out_pins, out_mods_root };
+        return .empty;
+    }
+    const mods_dir = try profile_paths.modsDir(alloc, home);
+    errdefer alloc.free(mods_dir);
+
+    var pinned = mods_mod.loadModPins(alloc, mods_dir) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("mcp", "mod MCP pins unavailable err={s}", .{@errorName(err)});
+            alloc.free(mods_dir);
+            return .empty;
+        },
+    };
+    errdefer pinned.deinit(alloc);
+
+    var loaded_mods = try mods_mod.loadModMcpServersFromPins(alloc, &pinned, profile);
+    errdefer loaded_mods.deinit(alloc);
+
+    if (diagnostics) |diag_list| {
+        for (loaded_mods.clashes) |clash| {
+            const server_name = try alloc.dupe(u8, clash.server);
+            errdefer alloc.free(server_name);
+            var mod_list: std.Io.Writer.Allocating = .init(alloc);
+            defer mod_list.deinit();
+            for (clash.mods, 0..) |mod_name, idx| {
+                if (idx > 0) mod_list.writer.writeAll(", ") catch return error.OutOfMemory;
+                mod_list.writer.writeAll(mod_name) catch return error.OutOfMemory;
+            }
+            const joined = mod_list.toOwnedSlice() catch return error.OutOfMemory;
+            errdefer alloc.free(joined);
+            try diag_list.append(alloc, .{
+                .profile = true,
+                .server_name = server_name,
+                .mod_list = joined,
+                .cause = .mod_clash,
+            });
+        }
+    }
+    for (loaded_mods.clashes) |*clash| clash.deinit(alloc);
+    if (loaded_mods.clashes.len > 0) alloc.free(loaded_mods.clashes);
+    loaded_mods.clashes = &.{};
+
+    if (out_pins.*) |*old| old.deinit(alloc);
+    out_pins.* = pinned;
+    if (out_mods_root.*) |old| alloc.free(old);
+    out_mods_root.* = mods_dir;
+    return loaded_mods.configs;
+}
+
 pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeConfigs {
     var profile: std.ArrayList(McpServerConfig) = .empty;
     errdefer freeConfigs(alloc, &profile);
+    var mod_configs: std.ArrayList(McpServerConfig) = .empty;
+    errdefer freeConfigs(alloc, &mod_configs);
     // A profile entry fx can't read is skipped with a note, ahead of the
     // project's notes.
     var loaded: NativeConfigs = .{};
@@ -53,12 +125,16 @@ pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeCo
         const config_path = try configPathFromHome(alloc, home);
         defer alloc.free(config_path);
         profile = try readProfile(alloc, config_path, &loaded.diagnostics);
+        if (comptime !build_options.libfx) {
+            mod_configs = try loadModServersForProfile(alloc, home, profile.items, &loaded.diagnostics, &loaded.mod_pins, &loaded.mods_root);
+        }
     }
 
     var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "workspace MCP choices unavailable err={s}", .{@errorName(err)});
-        loaded.configs = profile;
+        var empty_workspace: std.ArrayList(McpServerConfig) = .empty;
+        loaded.configs = try project_config.mergeNativeWithMods(alloc, &profile, &mod_configs, &empty_workspace);
         try project_config.noteIgnoredKeys(alloc, &loaded.diagnostics, loaded.configs.items);
         return loaded;
     };
@@ -86,25 +162,41 @@ pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeCo
     );
     defer workspace.deinit(alloc);
     traceWorkspaceDiagnostics(workspace.diagnostics.items);
-    try mergeNativeConfigs(alloc, &loaded, &profile, &workspace);
+    try mergeNativeConfigsWithMods(alloc, &loaded, &profile, &mod_configs, &workspace);
     return loaded;
 }
 
-/// Merges the profile's servers and the project's into `loaded`: the profile's first, and a project server that a
-/// profile server shadows is left out. The project's notes move over, so `workspace.deinit` frees only its list. Both
-/// lists are consumed. The terminal app and an ACP session that asks for the profile's servers merge them here.
+/// Merges the profile's servers and the project's into `loaded`.
 pub fn mergeNativeConfigs(
     alloc: Allocator,
     loaded: *NativeConfigs,
     profile: *std.ArrayList(McpServerConfig),
     workspace: *project_config.WorkspaceParseResult,
 ) !void {
+    var empty_mods: std.ArrayList(McpServerConfig) = .empty;
+    return mergeNativeConfigsWithMods(alloc, loaded, profile, &empty_mods, workspace);
+}
+
+/// Merges the profile's servers, enabled mods' servers, and the project's into
+/// `loaded`: profile wins over mods, and mods win over the project. All lists
+/// are consumed and the project's notes move with them so `workspace.deinit`
+/// frees only its list. Both the terminal app and an ACP session that asks for
+/// the profile's servers merge here (R1.4).
+pub fn mergeNativeConfigsWithMods(
+    alloc: Allocator,
+    loaded: *NativeConfigs,
+    profile: *std.ArrayList(McpServerConfig),
+    mod_configs: *std.ArrayList(McpServerConfig),
+    workspace: *project_config.WorkspaceParseResult,
+) !void {
     try loaded.diagnostics.appendSlice(alloc, workspace.diagnostics.items);
     workspace.diagnostics.clearRetainingCapacity();
-    loaded.configs = try project_config.mergeNative(alloc, profile, &workspace.configs);
-    profile.deinit(alloc);
+    loaded.configs = try project_config.mergeNativeWithMods(alloc, profile, mod_configs, &workspace.configs);
     // Empty, not freed memory, so a caller that frees it again on a later error frees nothing.
+    profile.deinit(alloc);
     profile.* = .empty;
+    mod_configs.deinit(alloc);
+    mod_configs.* = .empty;
     try project_config.noteIgnoredKeys(alloc, &loaded.diagnostics, loaded.configs.items);
 }
 
@@ -145,7 +237,9 @@ fn skipUnprintableNames(alloc: Allocator, loaded: *NativeConfigs) Allocator.Erro
         }
         try loaded.diagnostics.ensureUnusedCapacity(alloc, 1);
         const name = try alloc.dupe(u8, c.name);
-        loaded.diagnostics.appendAssumeCapacity(.{ .profile = c.source != .workspace, .server_name = name, .cause = .invalid_entry, .problem = .name });
+        errdefer alloc.free(name);
+        const mod_name = if (c.mod_name) |m| try alloc.dupe(u8, m) else null;
+        loaded.diagnostics.appendAssumeCapacity(.{ .profile = c.source != .workspace, .mod_name = mod_name, .server_name = name, .cause = .invalid_entry, .problem = .name });
         var removed = loaded.configs.orderedRemove(i);
         removed.deinit(alloc);
     }
@@ -169,10 +263,30 @@ pub fn loadHost(
     try composeHostConfigs(alloc, &loaded, &.{}, &inherited);
     // A host with no servers still carries the notes saying why.
     if (loaded.configs.items.len == 0 and loaded.diagnostics.items.len == 0) return null;
-    if (extras.reuse) |h| {
+    if (extras.reuse) |h| reuse: {
         // Only the servers whose config changed restart. The host owns the
         // notes either way.
-        if (h.reload(loaded.configs.items, &inherited, try renderNotes(alloc, loaded.diagnostics.items))) |_| return h else |err| {
+        var cloned_pins: if (build_options.libfx) struct {} else ?mods_mod.ModPins = if (build_options.libfx) .{} else null;
+        defer if (comptime !build_options.libfx) if (cloned_pins) |*p| p.deinit(h.gpa);
+        if (comptime !build_options.libfx) {
+            // Without its own copy of the pins, the reloaded host would start
+            // mod servers that no pin protects, so a new host takes `loaded`'s
+            // pins instead (`tests/tla/mods/ModServe.tla` ServersPinned).
+            if (loaded.mod_pins) |*p| cloned_pins = p.clone(h.gpa, mods_mod.realModPinsOps()) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    debug_trace.logf("mcp", "MCP host not reloaded in place, starting a new one err={s} reason=mod pins not copied", .{@errorName(err)});
+                    break :reuse;
+                },
+            };
+        }
+        if (h.reloadWithPins(
+            loaded.configs.items,
+            &inherited,
+            try renderNotes(alloc, loaded.diagnostics.items),
+            if (build_options.libfx) .{} else if (cloned_pins != null) &cloned_pins.? else null,
+            if (build_options.libfx) .{} else loaded.mods_root,
+        )) |_| return h else |err| {
             debug_trace.logf("mcp", "MCP host not reloaded in place, starting a new one err={s}", .{@errorName(err)});
         }
     }
@@ -198,6 +312,8 @@ pub fn loadHost(
         .slash_commands = extras.slash_commands,
         .idle_ms = mcp_host.idleMs(),
         .share = if (fx_home) |path| .{ .fx_home = path } else null,
+        .mod_pins = if (build_options.libfx) .{} else if (loaded.mod_pins != null) &loaded.mod_pins.? else null,
+        .mods_root = if (build_options.libfx) .{} else loaded.mods_root,
     }, builtins);
     h.notes = notes;
     return h;
@@ -269,6 +385,13 @@ pub fn inspectLocalConfig(
 ) error{OutOfMemory}!mcp_health.LocalConfigInspection {
     var profile: std.ArrayList(McpServerConfig) = .empty;
     defer freeConfigs(alloc, &profile);
+    var mod_configs: std.ArrayList(McpServerConfig) = .empty;
+    defer freeConfigs(alloc, &mod_configs);
+    var mod_pins: if (build_options.libfx) struct {} else ?mods_mod.ModPins = if (build_options.libfx) .{} else null;
+    defer if (comptime !build_options.libfx) if (mod_pins) |*p| p.deinit(alloc);
+    var mods_root: if (build_options.libfx) struct {} else ?[]u8 = if (build_options.libfx) .{} else null;
+    defer if (comptime !build_options.libfx) if (mods_root) |root| alloc.free(root);
+
     // The profile entries fx skips, as the runtime skips them, ahead of the project's notes.
     var profile_notes: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
     defer freeDiagnostics(alloc, &profile_notes);
@@ -287,13 +410,19 @@ pub fn inspectLocalConfig(
             .clear;
         profile = document.configs;
         document.configs = .empty;
+        if (comptime !build_options.libfx) {
+            mod_configs = try loadModServersForProfile(alloc, home, profile.items, null, &mod_pins, &mods_root);
+        }
     }
 
     var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        var empty_workspace: std.ArrayList(McpServerConfig) = .empty;
+        var fallback = project_config.mergeNativeWithMods(alloc, &profile, &mod_configs, &empty_workspace) catch return error.OutOfMemory;
+        defer freeConfigs(alloc, &fallback);
         return localInspectionFromConfigs(
             alloc,
-            profile.items,
+            fallback.items,
             profile_notes.items,
             profile_diagnostic,
             null,
@@ -314,9 +443,10 @@ pub fn inspectLocalConfig(
         );
     };
     defer workspace.deinit(alloc);
-    var configs = project_config.mergeNative(
+    var configs = project_config.mergeNativeWithMods(
         alloc,
         &profile,
+        &mod_configs,
         &workspace.configs,
     ) catch return error.OutOfMemory;
     defer freeConfigs(alloc, &configs);
@@ -368,10 +498,13 @@ fn localInspectionFromConfigs(
     }
     for (configs, 0..) |config, index| {
         var encoded_name = try text_utils.encodeTerminalSafe(alloc, config.name, 256);
+        errdefer encoded_name.deinit(alloc);
+        const mod_name = if (config.mod_name) |m| try alloc.dupe(u8, m) else null;
         servers[index] = .{
             .configured_name = encoded_name.bytes,
             .source = config.source,
             .scope = config.scope,
+            .mod_name = mod_name,
             .workspace_admission = config.workspace_admission,
             .required = config.required,
             .transport = config.transport,
@@ -387,9 +520,13 @@ fn localInspectionFromConfigs(
         alloc.free(issues);
     }
     for (diagnostics, 0..) |diagnostic, index| {
+        const message = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
+        errdefer alloc.free(message);
+        const mod_name = if (diagnostic.mod_name) |m| try alloc.dupe(u8, m) else null;
         issues[index] = .{
-            .message = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic),
+            .message = message,
             .profile = diagnostic.profile,
+            .mod_name = mod_name,
         };
         issues_initialized += 1;
     }
@@ -1324,4 +1461,149 @@ test "freeConfigs accepts an empty ArrayList" {
     const alloc = std.testing.allocator;
     var configs: std.ArrayList(McpServerConfig) = .empty;
     freeConfigs(alloc, &configs);
+}
+
+test "loadNativeConfigs and inspectLocalConfig merge profile, mods, and project in order with clash and missing env notes" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "home/.fx/mods");
+    try tmp.dir.createDirPath(io, "workspace");
+    try tmp.dir.createDirPath(io, "src-alpha");
+    try tmp.dir.createDirPath(io, "src-beta");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const mods_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/mods");
+    defer alloc.free(mods_dir);
+    const alpha_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src-alpha");
+    defer alloc.free(alpha_src);
+    const beta_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src-beta");
+    defer alloc.free(beta_src);
+
+    var home_guard = try TestHome.install(alloc, home);
+    defer home_guard.deinit();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "home/.fx/mcp.json",
+        .data = "{\"mcp\":{\"win_prof\":{\"command\":\"prof-cmd\"}}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "workspace/.mcp.json",
+        .data = "{\"mcpServers\":{\"win_mod\":{\"command\":\"proj-cmd\"},\"proj_only\":{\"command\":\"only-cmd\"}}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "src-alpha/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"win_prof\":{\"command\":\"alpha-prof\"},\"win_mod\":{\"command\":\"bin/srv\"},\"clash\":{\"command\":\"bin/c1\"},\"needs_env\":{\"command\":\"node\",\"args\":[\"${FX_MISSING_MOD_ENV}\"]}}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "src-beta/mod.json",
+        .data = "{\"name\":\"beta\",\"version\":\"1.0.0\",\"mcp\":{\"clash\":{\"command\":\"bin/c2\"}}}",
+    });
+
+    try std.testing.expectEqual(mods_mod.Outcome.ok, try mods_mod.add(alloc, mods_dir, "alpha", alpha_src));
+    try std.testing.expectEqual(mods_mod.Outcome.ok, try mods_mod.add(alloc, mods_dir, "beta", beta_src));
+
+    var loaded = try loadNativeConfigs(alloc, workspace);
+    defer loaded.deinit(alloc);
+
+    var inherited = std.process.Environ.Map.init(alloc);
+    defer inherited.deinit();
+    try composeHostConfigs(alloc, &loaded, &.{}, &inherited);
+
+    // Order: win_prof (profile), win_mod (alpha, shadows .mcp.json), proj_only (workspace).
+    // `clash` loads from neither; `needs_env` is held back by ${FX_MISSING_MOD_ENV}.
+    try std.testing.expectEqual(@as(usize, 3), loaded.configs.items.len);
+    try std.testing.expectEqualStrings("win_prof", loaded.configs.items[0].name);
+    try std.testing.expectEqual(mcp_contract.ConfigSource.profile, loaded.configs.items[0].source);
+    try std.testing.expectEqualStrings("win_mod", loaded.configs.items[1].name);
+    try std.testing.expectEqual(mcp_contract.ConfigSource.mod, loaded.configs.items[1].source);
+    try std.testing.expectEqualStrings("alpha", loaded.configs.items[1].mod_name.?);
+    try std.testing.expect(std.mem.find(u8, loaded.configs.items[1].command.?, "/.store/alpha-") != null);
+    try std.testing.expectEqualStrings("proj_only", loaded.configs.items[2].name);
+    try std.testing.expectEqual(mcp_contract.ConfigSource.workspace, loaded.configs.items[2].source);
+
+    const notes = try renderNotes(alloc, loaded.diagnostics.items);
+    defer {
+        for (notes) |note| alloc.free(note);
+        alloc.free(notes);
+    }
+    var saw_clash = false;
+    var saw_missing_env = false;
+    for (notes) |note| {
+        if (std.mem.find(u8, note, "MCP server 'clash' is defined by multiple mods (alpha, beta), so neither loads.") != null) saw_clash = true;
+        if (std.mem.find(u8, note, "mods/alpha/mod.json server 'needs_env' field argument requires environment variable 'FX_MISSING_MOD_ENV'") != null) saw_missing_env = true;
+    }
+    try std.testing.expect(saw_clash);
+    try std.testing.expect(saw_missing_env);
+
+    // inspectLocalConfig sees the same merged servers without duplicating mod_clash into configuration_issues.
+    var inspected = try inspectLocalConfig(alloc, workspace);
+    defer inspected.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), inspected.snapshot.servers.len);
+    try std.testing.expectEqual(@as(usize, 0), inspected.snapshot.configuration_issues.len);
+}
+
+test "a broken mod MCP manifest in the store skips only that mod and keeps profile servers" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "home/.fx/mods");
+    try tmp.dir.createDirPath(io, "workspace");
+    try tmp.dir.createDirPath(io, "src-bad");
+    try tmp.dir.createDirPath(io, "src-good");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const mods_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/mods");
+    defer alloc.free(mods_dir);
+    const bad_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src-bad");
+    defer alloc.free(bad_src);
+    const good_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src-good");
+    defer alloc.free(good_src);
+
+    var home_guard = try TestHome.install(alloc, home);
+    defer home_guard.deinit();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "home/.fx/mcp.json",
+        .data = "{\"mcp\":{\"prof_srv\":{\"command\":\"prof-cmd\"}}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "src-bad/mod.json",
+        .data = "{\"name\":\"badmod\",\"version\":\"1.0.0\",\"mcp\":{\"badsrv\":{\"command\":\"node\"}}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "src-good/mod.json",
+        .data = "{\"name\":\"goodmod\",\"version\":\"1.0.0\",\"mcp\":{\"goodsrv\":{\"command\":\"node\"}}}",
+    });
+
+    try std.testing.expectEqual(mods_mod.Outcome.ok, try mods_mod.add(alloc, mods_dir, "badmod", bad_src));
+    try std.testing.expectEqual(mods_mod.Outcome.ok, try mods_mod.add(alloc, mods_dir, "goodmod", good_src));
+
+    // Tamper the installed store manifest for `badmod` with an invalid mcp object.
+    var bad_link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var mods_d = try std.Io.Dir.cwd().openDir(io, mods_dir, .{});
+    defer mods_d.close(io);
+    const target_len = try mods_d.readLink(io, "badmod", &bad_link_buf);
+    var bad_store_dir = try mods_d.openDir(io, bad_link_buf[0..target_len], .{});
+    defer bad_store_dir.close(io);
+    try bad_store_dir.writeFile(io, .{
+        .sub_path = "mod.json",
+        .data = "{\"name\":\"badmod\",\"version\":\"1.0.0\",\"mcp\":{\"badsrv\":{\"command\":\"../outside\"}}}",
+    });
+
+    var loaded = try loadNativeConfigs(alloc, workspace);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), loaded.configs.items.len);
+    try std.testing.expectEqualStrings("prof_srv", loaded.configs.items[0].name);
+    try std.testing.expectEqualStrings("goodsrv", loaded.configs.items[1].name);
 }

@@ -1,9 +1,11 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
+const mods_mod = if (build_options.libfx) struct {} else @import("../mods/mods.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const elicitation = @import("../mcp/elicitation.zig");
@@ -59,6 +61,13 @@ fn configStamp(alloc: Allocator, home: ?[]const u8, workspace_root: []const u8) 
                 for (names) |name| stampBytes(&h, name);
             }
         } else |err| stampError(&h, err);
+        if (comptime !build_options.libfx) {
+            if (profile_paths.modsDir(alloc, dir)) |mods_dir| {
+                defer alloc.free(mods_dir);
+                const mods_stamp = mods_mod.mod_pins.computeStamp(io_mod.getIo(), mods_dir);
+                h.update(std.mem.asBytes(&mods_stamp));
+            } else |err| stampError(&h, err);
+        }
     }
     return h.final();
 }
@@ -663,6 +672,10 @@ pub const State = struct {
     /// Whether a `/mcp` command changed the config since the last call.
     pub fn takeHostReload(self: *State) bool {
         return self.host_reload_requested.swap(false, .acq_rel);
+    }
+
+    pub fn requestHostReload(self: *State) void {
+        self.host_reload_requested.store(true, .release);
     }
 
     /// Runs `/mcp ARGS` off the UI thread, since `show` may wait for a
@@ -1363,6 +1376,28 @@ test "the config stamp follows the MCP config files and project choices, and not
     defer alloc.free(unrelated);
     try writeTestFile(&tmp, "home/.fx/settings.json", unrelated);
     try std.testing.expectEqual(project, configStamp(alloc, home, root));
+
+    if (comptime !build_options.libfx) {
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/mods");
+        try tmp.dir.createDirPath(io_mod.getIo(), "src-mod");
+        const mods_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/mods");
+        defer alloc.free(mods_dir);
+        const src_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src-mod");
+        defer alloc.free(src_dir);
+        try writeTestFile(&tmp, "src-mod/mod.json", "{\"name\":\"alpha\",\"version\":\"1.0.0\"}");
+        try std.testing.expectEqual(mods_mod.Outcome.ok, try mods_mod.add(alloc, mods_dir, "alpha", src_dir));
+        const mod_added = configStamp(alloc, home, root);
+        try std.testing.expect(mod_added != project);
+
+        try writeTestFile(&tmp, "src-mod/mod.json", "{\"name\":\"alpha\",\"version\":\"2.0.0\"}");
+        try std.testing.expectEqual(mods_mod.Outcome.ok, try mods_mod.update(alloc, mods_dir, "alpha", src_dir));
+        const mod_updated = configStamp(alloc, home, root);
+        try std.testing.expect(mod_updated != mod_added);
+
+        try std.testing.expectEqual(mods_mod.Outcome.ok, try mods_mod.setOn(alloc, mods_dir, "alpha", false));
+        const mod_disabled = configStamp(alloc, home, root);
+        try std.testing.expect(mod_disabled != mod_updated);
+    }
 
     const approved = try alloc.print("{{\"workspaces\":{{\"{s}\":{{\"" ++ @import("../mcp/project_config.zig").enabled_servers_key ++ "\":[\"p\"]}}}}}}", .{root});
     defer alloc.free(approved);

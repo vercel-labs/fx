@@ -2094,6 +2094,15 @@ const App = struct {
         return self.mods.takeSkillsRefresh();
     }
 
+    pub fn takeModMcpReload(self: *App) bool {
+        if (comptime build_options.libfx or !host_profile.mods) return false;
+        return self.mods.takeMcpReload();
+    }
+
+    pub fn requestMcpHostReload(self: *App) void {
+        self.mcp.requestHostReload();
+    }
+
     pub fn refreshMcpCompletion(self: *App) void {
         self.mcp.refreshCompletion();
     }
@@ -3569,8 +3578,8 @@ const App = struct {
         if (try app_commands.Handlers(App).collectInfoPanelFacts(self)) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
-        try app_commands.Handlers(App).collectMcpHostFacts(self, self.screenAgent());
         if (comptime !build_options.libfx) try app_commands.Handlers(App).collectModFacts(self);
+        try app_commands.Handlers(App).collectMcpHostFacts(self, self.screenAgent());
         if (self.launch_completion.refresh(self.alloc, self.input_runtime.edit_state.input.items, io_mod.homeDir(), self.workspace_root, self.instances.seed.launchDefaults())) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }

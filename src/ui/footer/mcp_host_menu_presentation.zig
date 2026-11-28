@@ -72,8 +72,12 @@ pub const Projection = struct {
         return (url.len + w - 1) / w;
     }
 
-    fn fileOf(p: Projection, r: menu.Row) []const u8 {
-        return if (r.status.source == .workspace) p.project_file else profile_paths.displayText("~/.fx/mcp.json");
+    fn fileOf(p: Projection, r: menu.Row, buf: *[128]u8) []const u8 {
+        return switch (r.status.source) {
+            .workspace => p.project_file,
+            .profile, .acp => profile_paths.displayText("~/.fx/mcp.json"),
+            .mod => std.mem.print(buf, "mod {s}", .{r.status.mod_name orelse "unknown"}) catch "mod",
+        };
     }
 };
 
@@ -282,7 +286,15 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     if (show_source) {
         try row_text.appendSpacesToColumn(alloc, &row, source_col);
         try row.appendSlice(alloc, ui_render.dim_style);
-        try row.appendSlice(alloc, if (r.status.source == .workspace) "project" else "profile");
+        switch (r.status.source) {
+            .workspace => try row.appendSlice(alloc, "project"),
+            .profile, .acp => try row.appendSlice(alloc, "profile"),
+            .mod => {
+                const label = try arena.print("mod {s}", .{r.status.mod_name orelse "unknown"});
+                const room = @as(usize, width) -| display_width.visibleWidthIgnoringAnsi(row.items);
+                try row_text.appendTerminalSafeSingleLine(alloc, &row, label, @min(room, 28));
+            },
+        }
         try row.appendSlice(alloc, ui_render.reset_style);
     }
     return row;
@@ -301,7 +313,10 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
         const facts = l.lead - 1;
         if (line >= facts) return .empty;
         if (line == 0) return row_text.composeFactRow(alloc, if (r.status.transport == .stdio) "runs" else @tagName(r.status.transport), r.target orelse "", width, fact_col, "");
-        if (line == 1) return row_text.composeFactRow(alloc, "file", p.fileOf(r), width, fact_col, "");
+        if (line == 1) {
+            var file_buf: [128]u8 = undefined;
+            return row_text.composeFactRow(alloc, "file", p.fileOf(r, &file_buf), width, fact_col, "");
+        }
         if (line == 2) return row_text.composeFactRow(alloc, "status", try statusFact(arena, r), width, fact_col, "");
         // Then the facts a server has only sometimes, in the order `fx mcp show` prints them: the tools fx left out, its
         // protocol, its error.
@@ -474,8 +489,9 @@ fn confirmLines(p: Projection, r: menu.Row, width: u16, out: *Confirm) []const C
     out.lines[n] = .{ .text = "", .style = .detail };
     n += 1;
     const name = r.status.name;
+    var file_buf: [128]u8 = undefined;
     const q = switch (c) {
-        .remove => std.mem.print(&out.question, "Remove {s} from {s}?", .{ name, p.fileOf(r) }),
+        .remove => std.mem.print(&out.question, "Remove {s} from {s}?", .{ name, p.fileOf(r, &file_buf) }),
         .approve => std.mem.print(&out.question, "Approve {s} for this project? It {s}:", .{ name, if (r.status.transport == .stdio) "runs" else "connects to" }),
         .reject => std.mem.print(&out.question, "Reject {s}? fx won't start it in this project.", .{name}),
         .login, .logout => std.mem.print(&out.question, "{s} {s}?", .{ c.label(), name }),
@@ -554,11 +570,12 @@ fn serverHints(p: Projection) []const []const u8 {
 /// safe, so a name of any bytes stays inert.
 fn question(arena: Allocator, p: Projection, r: menu.Row, c: menu.Choice) ![]const u8 {
     const name = r.status.name;
+    var file_buf: [128]u8 = undefined;
     return switch (c) {
         .remove => if (r.status.signed_in)
-            arena.print("Remove {s} and its login from {s}?", .{ name, p.fileOf(r) })
+            arena.print("Remove {s} and its login from {s}?", .{ name, p.fileOf(r, &file_buf) })
         else
-            arena.print("Remove {s} from {s}?", .{ name, p.fileOf(r) }),
+            arena.print("Remove {s} from {s}?", .{ name, p.fileOf(r, &file_buf) }),
         else => arena.print("Reject {s}? fx won't start it in this project.", .{name}),
     };
 }
@@ -1206,4 +1223,25 @@ test "a server that needs a login says so, once" {
         \\  Its tools show here once you log in.
         \\
     , text);
+}
+
+test "a mod server shows mod <name> in list and detail, omits Remove, and keeps hostile mod names inert" {
+    const mod_srv: host_runtime.Status = .{ .name = "fs", .source = .mod, .mod_name = "alpha", .transport = .stdio, .state = .idle };
+    const evil_mod: host_runtime.Status = .{ .name = "evil", .source = .mod, .mod_name = "a\x1b[31mb", .transport = .http, .state = .idle, .needs_login = true };
+    const rows = [_]menu.Row{
+        .{ .status = mod_srv, .target = "/m/alpha/bin/fs" },
+        .{ .status = evil_mod, .target = "https://e.example/mcp" },
+    };
+    var p: Projection = .{ .rows = &rows };
+    menu.open(&p.state);
+    const list = try render(p, 88);
+    defer testing.allocator.free(list);
+    try testing.expect(std.mem.find(u8, list, "mod alpha") != null);
+    try testing.expect(std.mem.findScalar(u8, list, 0x1b) == null);
+
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    const detail = try render(p, 88);
+    defer testing.allocator.free(detail);
+    try testing.expect(std.mem.find(u8, detail, "file      mod alpha") != null);
+    try testing.expect(std.mem.find(u8, detail, "Remove") == null);
 }

@@ -21,6 +21,10 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const Key = [32]u8;
 
 pub fn of(config: mcp.engine.Config) Key {
+    return ofMod(config, null);
+}
+
+pub fn ofMod(config: mcp.engine.Config, mod_name: ?[]const u8) Key {
     var hasher = Sha256.init(.{});
     feedText(&hasher, config.name);
     switch (config.transport) {
@@ -49,6 +53,9 @@ pub fn of(config: mcp.engine.Config) Key {
     feedValue(&hasher, config.auth.flow);
     feedByte(&hasher, @intFromBool(config.timeouts != null));
     if (config.timeouts) |timeouts| feedValue(&hasher, timeouts);
+    // Last and only for a mod's server, so every other key stays what an
+    // older fx computes, and fx versions that run side by side keep sharing.
+    if (mod_name) |name| feedText(&hasher, name);
     const digest = hasher.finalResult();
     return std.fmt.bytesToHex(digest[0..16].*, .lower);
 }
@@ -254,4 +261,28 @@ test "no environment and an empty environment are different configs and keys" {
     try testing.expect(!std.mem.eql(u8, &of(none), &of(empty)));
     // And two configs with no environment stay one key.
     try testing.expectEqual(of(none), of(none));
+}
+
+test "a server that is not a mod's keeps the key that earlier fx versions compute" {
+    // Computed by share_key.zig before mods; fx versions that run side by side
+    // share an owner only while this stays the same.
+    const argv = [_][]const u8{ "node", "s.js" };
+    const cfg: engine.Config = .{
+        .name = "x",
+        .transport = .{ .stdio = .{ .argv = &argv, .cwd = "/w" } },
+        .auth = .{ .client_id = "c1" },
+        .timeouts = .{ .start_ms = 1_000 },
+    };
+    try testing.expectEqualStrings("4e811370ffeaf2e7d4348a1cd6f4d567", &of(cfg));
+}
+
+test "mod_name isolates share keys across mods and from non-mod configs" {
+    const argv = [_][]const u8{"node"};
+    const cfg: engine.Config = .{ .name = "x", .transport = .{ .stdio = .{ .argv = &argv, .cwd = "/m" } } };
+    const k_none = ofMod(cfg, null);
+    const k_alpha = ofMod(cfg, "alpha");
+    const k_beta = ofMod(cfg, "beta");
+    try testing.expectEqual(of(cfg), k_none);
+    try testing.expect(!std.mem.eql(u8, &k_none, &k_alpha));
+    try testing.expect(!std.mem.eql(u8, &k_alpha, &k_beta));
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const request_fragment = @import("request_fragment.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const mod_program = @import("../shared/mod_program.zig");
 const Allocator = std.mem.Allocator;
 
 pub const max_providers = 32;
@@ -579,26 +580,15 @@ fn command_arg(owned: Allocator, value: std.json.Value, is_program: bool, mod_di
     const arg = value.string;
     if (arg.len == 0) return error.InvalidAuth;
     if (arg.len > max_command_arg_bytes) return error.LimitExceeded;
+    if (is_program) {
+        return mod_program.resolve(owned, arg, mod_dir) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidProgram => error.InvalidAuth,
+            error.PathTooLong => error.LimitExceeded,
+        };
+    }
     if (std.mem.findScalar(u8, arg, 0) != null) return error.InvalidAuth;
-    if (is_program and arg[0] != '/' and std.mem.findScalar(u8, arg, '/') != null) {
-        const base = mod_dir orelse return error.InvalidAuth;
-        if (has_dot_dot_segment(arg) or arg[arg.len - 1] == '/') return error.InvalidAuth;
-        const resolved = try std.Io.Dir.path.resolve(owned, &.{ base, arg });
-        if (resolved.len > std.Io.Dir.max_path_bytes) return error.LimitExceeded;
-        return resolved;
-    }
-    if (is_program and mod_dir != null and (std.mem.eql(u8, arg, ".") or std.mem.eql(u8, arg, ".."))) {
-        return error.InvalidAuth;
-    }
     return owned.dupe(u8, arg);
-}
-
-fn has_dot_dot_segment(path: []const u8) bool {
-    var segments = std.mem.splitScalar(u8, path, '/');
-    while (segments.next()) |segment| {
-        if (std.mem.eql(u8, segment, "..")) return true;
-    }
-    return false;
 }
 
 /// The name of an environment variable, borrowed from `value`.

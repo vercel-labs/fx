@@ -33,6 +33,7 @@ pub const Server = struct {
     name: []const u8,
     source: mcp_contract.ConfigSource,
     scope: mcp_contract.ConfigScope,
+    mod_name: ?[]const u8 = null,
     transport: mcp_contract.McpTransport,
     /// An HTTP server's URL, which also keys its credential; null for stdio.
     url: ?[]const u8,
@@ -57,7 +58,7 @@ pub const Server = struct {
 
     /// What an HTTP server's login is saved under.
     pub fn credentialKey(s: Server) credentials.Key {
-        return .{ .name = s.name, .url = s.url.?, .workspace = s.workspace };
+        return .{ .name = s.name, .url = s.url.?, .workspace = s.workspace, .mod_name = s.mod_name };
     }
 };
 
@@ -148,6 +149,7 @@ pub fn resolve(
             .name = try arena.dupe(u8, c.name),
             .source = c.source,
             .scope = c.scope,
+            .mod_name = if (c.mod_name) |m| try arena.dupe(u8, m) else null,
             .transport = c.transport,
             .url = if (c.url) |u| try arena.dupe(u8, u) else null,
             .command = if (c.command) |command| try commandLine(arena, command, c.args) else null,
@@ -226,7 +228,7 @@ pub fn keepServers(arena: Allocator, servers: []const Server, prior: []const Ser
         } else null;
         o.* = s;
         o.name = if (old) |p| p.name else try arena.dupe(u8, s.name);
-        inline for (.{ "url", "command", "missing", "workspace" }) |field| {
+        inline for (.{ "url", "command", "missing", "workspace", "mod_name" }) |field| {
             @field(o, field) = try reuse(arena, @field(s, field), if (old) |p| @field(p, field) else null);
         }
     }
@@ -260,7 +262,7 @@ fn heldFor(c: *const McpServerConfig) ?Held {
 /// and it does not opt out: one copy for every session whose launch config
 /// matches (`src/core/mcp_host/share_key.zig`).
 fn isShared(c: *const McpServerConfig, held: ?Held) bool {
-    return c.transport == .stdio and c.enabled and held == null and c.acp_server_id == null and c.shared;
+    return c.transport == .stdio and c.enabled and held == null and c.acp_server_id == null and c.shared and c.source != .mod;
 }
 
 /// What a stdio server gets of fx's environment, as the MCP SDKs give it:
@@ -588,4 +590,24 @@ test "a stdio server's command line quotes what a shell would split" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("node server.js --port 3", try commandLine(arena.allocator(), "node", &.{ "server.js", "--port", "3" }));
     try std.testing.expectEqualStrings("npx '' 'a b' 'it'\\''s' '$HOME'", try commandLine(arena.allocator(), "npx", &.{ "", "a b", "it's", "$HOME" }));
+}
+
+test "a mod server is never shared, carries mod_name on Server and credentialKey, and uses its cwd" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var inherited: std.process.Environ.Map = .init(testing.allocator);
+    defer inherited.deinit();
+    const configs = [_]McpServerConfig{
+        .{ .name = "fs", .source = .mod, .scope = .profile, .mod_name = "alpha", .command = "/m/alpha/bin/fs", .cwd = "/m/alpha", .shared = true },
+        .{ .name = "web", .source = .mod, .scope = .profile, .mod_name = "alpha", .transport = .http, .url = "https://a.example/mcp", .allow_stored_credentials = true },
+    };
+    const r = try resolve(arena_state.allocator(), &configs, &inherited, "/Users/example/repo", "/Users/example");
+    try testing.expectEqual(@as(usize, 2), r.engine.len);
+    try testing.expect(!r.shared[0]);
+    try testing.expect(!r.servers[0].shared);
+    try testing.expectEqual(@as(?Held, null), r.servers[0].held);
+    try testing.expectEqualStrings("alpha", r.servers[0].mod_name.?);
+    try testing.expectEqualStrings("/m/alpha", r.engine[0].transport.stdio.cwd.?);
+    try testing.expectEqualStrings("alpha", r.servers[1].credentialKey().mod_name.?);
+    try testing.expectEqual(@as(?[]const u8, null), r.servers[1].credentialKey().workspace);
 }

@@ -464,10 +464,14 @@ pub const Catalog = struct {
                 else => {},
             }
             try servers.ensureUnusedCapacity(alloc, 1);
+            const id_name = try alloc.dupe(u8, s.name);
+            errdefer alloc.free(id_name);
+            const id_mod = if (s.mod_name) |m| try alloc.dupe(u8, m) else null;
             servers.appendAssumeCapacity(.{
-                .name = try alloc.dupe(u8, s.name),
+                .name = id_name,
                 .source = s.source,
                 .scope = s.scope,
+                .mod_name = id_mod,
                 .connection_generation = l.generation,
                 .catalog_generation = l.generation,
                 .auth_generation = 0,

@@ -12,4 +12,7 @@ pub const Host = struct {
     /// Called from that server's reader task, so it must be safe
     /// to call from any thread, and it must not block for long.
     log: *const fn (context: *anyopaque, server: []const u8, line: []const u8) void,
+    /// Called when `Engine` destroys a server slot after its process stopped
+    /// (retired on reload, or engine deinit), with `Config.host_tag`.
+    slot_destroyed: ?*const fn (context: *anyopaque, host_tag: u64) void = null,
 };

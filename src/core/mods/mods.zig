@@ -11,6 +11,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 pub const manifest = @import("manifest.zig");
+pub const mcp_config = @import("mcp_config.zig");
 pub const mod_pins = @import("mod_pins.zig");
 pub const pins = @import("pins.zig");
 pub const source = @import("source.zig");
@@ -168,10 +169,16 @@ pub const PreparedUpdate = struct {
     new_commit: ?[]const u8 = null,
     files_changed: bool = true,
     old_providers: ?configured_provider.Registry = null,
+    /// The servers of the installed version and of the new one, parsed under the
+    /// folders they run from, so an update can tell what it adds or changes.
+    old_mcp: std.ArrayList(mcp_config.McpServerConfig) = .empty,
+    new_mcp: std.ArrayList(mcp_config.McpServerConfig) = .empty,
     install: PreparedInstall,
 
     pub fn discard(self: *PreparedUpdate, alloc: std.mem.Allocator) void {
         if (self.old_providers) |*reg| reg.deinit(alloc);
+        mcp_config.deinitConfigs(alloc, &self.old_mcp);
+        mcp_config.deinitConfigs(alloc, &self.new_mcp);
         self.install.discard(alloc);
         self.* = undefined;
     }
@@ -192,6 +199,10 @@ pub const PrepareUpdateResult = union(enum) {
     bad_providers: struct {
         path: []const u8,
         err: anyerror,
+    },
+    bad_mcp: struct {
+        server: []const u8,
+        reason: []const u8,
     },
     refused: store.Outcome,
 };
@@ -225,6 +236,10 @@ pub const PrepareResult = union(enum) {
     bad_providers: struct {
         path: []const u8,
         err: anyerror,
+    },
+    bad_mcp: struct {
+        server: []const u8,
+        reason: []const u8,
     },
 };
 
@@ -291,6 +306,7 @@ pub fn install(
         .bad_providers => |bad| .{ .refused = .{ .invalid = switch (bad.err) {
             else => .bad_manifest,
         } } },
+        .bad_mcp => .{ .refused = .{ .invalid = .bad_manifest } },
     };
 }
 
@@ -365,6 +381,14 @@ pub fn prepareUpdate(
             const owned = p.arena.allocator();
             const old_commit_copy = if (record.commit) |c| try owned.dupe(u8, c) else null;
             const old_state = readInstalledState(alloc, root_path, name, old_on, old_path_copy);
+            var old_mcp = old_state.mcp;
+            errdefer mcp_config.deinitConfigs(alloc, &old_mcp);
+            var new_mcp = (try parseServers(alloc, p.manifest.mcp, name, p.dir)) orelse {
+                mcp_config.deinitConfigs(alloc, &old_mcp);
+                p_mut.discard(alloc);
+                return .{ .refused = .{ .invalid = .bad_manifest } };
+            };
+            errdefer mcp_config.deinitConfigs(alloc, &new_mcp);
             const new_digest = store.treeDigest(alloc, io_mod.getIo(), p.dir);
             const files_changed = if (old_state.digest != null and new_digest != null)
                 !std.mem.eql(u8, &old_state.digest.?, &new_digest.?)
@@ -377,6 +401,8 @@ pub fn prepareUpdate(
                 .new_commit = p.commit,
                 .files_changed = files_changed,
                 .old_providers = old_state.providers,
+                .old_mcp = old_mcp,
+                .new_mcp = new_mcp,
                 .install = p,
             } };
         },
@@ -386,13 +412,31 @@ pub fn prepareUpdate(
         .no_manifest => return .no_manifest,
         .bad_manifest => |err| return .{ .bad_manifest = err },
         .bad_providers => |bad| return .{ .bad_providers = .{ .path = bad.path, .err = bad.err } },
+        .bad_mcp => |bad| return .{ .bad_mcp = .{ .server = bad.server, .reason = bad.reason } },
     }
 }
 
 const InstalledState = struct {
     providers: ?configured_provider.Registry = null,
     digest: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
+    mcp: std.ArrayList(mcp_config.McpServerConfig) = .empty,
 };
+
+const ServerList = std.ArrayList(mcp_config.McpServerConfig);
+
+/// The servers of a mod's `mcp` map under `dir`. Null when the map is invalid,
+/// which `prepareFrom` already refuses for the same folder.
+fn parseServers(alloc: std.mem.Allocator, raw: ?std.json.Value, name: []const u8, dir: []const u8) !?ServerList {
+    const value = raw orelse return ServerList.empty;
+    return switch (try mcp_config.parse(alloc, value, .{ .name = name, .dir = dir })) {
+        .ok => |configs| configs,
+        .invalid => |bad| {
+            var failure = bad;
+            failure.deinit(alloc);
+            return null;
+        },
+    };
+}
 
 fn readInstalledState(
     alloc: std.mem.Allocator,
@@ -423,16 +467,21 @@ fn readInstalledState(
         .ok => |m| m,
         .missing, .bad => return .{ .digest = digest },
     };
-    const providers_val = decoded.providers orelse return .{ .digest = digest };
-    const canonical_link = std.Io.Dir.path.join(scratch, &.{ root_path, name }) catch return .{ .digest = digest };
+    // A server map that cannot be read leaves no old servers, so every new server asks again.
+    var state: InstalledState = .{
+        .digest = digest,
+        .mcp = (parseServers(alloc, decoded.mcp, name, read_dir) catch null) orelse ServerList.empty,
+    };
+    const providers_val = decoded.providers orelse return state;
+    const canonical_link = std.Io.Dir.path.join(scratch, &.{ root_path, name }) catch return state;
     var at: configured_provider.FailurePath = .{};
-    const reg = configured_provider.Registry.parse_located_for_mod(
+    state.providers = configured_provider.Registry.parse_located_for_mod(
         alloc,
         providers_val,
         &at,
         .{ .name = name, .dir = canonical_link },
     ) catch null;
-    return .{ .providers = reg, .digest = digest };
+    return state;
 }
 
 /// Commits a prepared update into the store under its lock.
@@ -477,6 +526,7 @@ pub fn refresh(
         .no_manifest => .{ .refused = .{ .invalid = .no_manifest } },
         .bad_manifest => .{ .refused = .{ .invalid = .bad_manifest } },
         .bad_providers => .{ .refused = .{ .invalid = .bad_manifest } },
+        .bad_mcp => .{ .refused = .{ .invalid = .bad_manifest } },
         .refused => |outcome| .{ .refused = outcome },
     };
 }
@@ -567,8 +617,8 @@ fn prepareFrom(
 
     var providers_reg: ?configured_provider.Registry = null;
     errdefer if (providers_reg) |*reg| reg.deinit(alloc);
+    const link_path = try std.Io.Dir.path.join(owned, &.{ root_path, decoded.name });
     if (decoded.providers) |providers_val| {
-        const link_path = try std.Io.Dir.path.join(owned, &.{ root_path, decoded.name });
         var at: configured_provider.FailurePath = .{};
         providers_reg = configured_provider.Registry.parse_located_for_mod(
             alloc,
@@ -585,6 +635,25 @@ fn prepareFrom(
                 return .{ .bad_providers = .{ .path = bad_path, .err = err } };
             },
         };
+    }
+
+    if (decoded.mcp) |mcp_val| {
+        switch (try mcp_config.parse(alloc, mcp_val, .{ .name = decoded.name, .dir = link_path })) {
+            .ok => |configs| {
+                var mut = configs;
+                mcp_config.deinitConfigs(alloc, &mut);
+            },
+            .invalid => |bad| {
+                if (temp_to_discard) |temp| source.discard(io_mod.getIo(), temp);
+                if (providers_reg) |*reg| {
+                    reg.deinit(alloc);
+                    providers_reg = null;
+                }
+                arena.deinit();
+                alloc.destroy(arena);
+                return .{ .bad_mcp = .{ .server = bad.server, .reason = bad.reason } };
+            },
+        }
     }
 
     return .{ .prepared = .{
@@ -636,6 +705,41 @@ fn gitOps() source.Ops {
         .run = runGit,
         .fill_token = store.defaultFillToken,
     };
+}
+
+pub const ModMcpClash = mcp_config.ModMcpClash;
+pub const LoadedModServers = mcp_config.LoadedModServers;
+
+pub fn loadModMcpServersFromPins(
+    alloc: std.mem.Allocator,
+    pinned: *const ModPins,
+    profile_configs: []const mcp_config.McpServerConfig,
+) !LoadedModServers {
+    return mcp_config.loadFromPinned(alloc, io_mod.getIo(), pinned, profile_configs);
+}
+
+pub fn findModMcpClashes(
+    alloc: std.mem.Allocator,
+    mods_dir: []const u8,
+    profile_configs: []const mcp_config.McpServerConfig,
+) ![]ModMcpClash {
+    const Ctx = struct {
+        alloc: std.mem.Allocator,
+        profile_configs: []const mcp_config.McpServerConfig,
+    };
+    const Body = struct {
+        fn run(ctx: Ctx, pinned: *const ModPins) anyerror![]ModMcpClash {
+            var loaded = try mcp_config.loadFromPinned(ctx.alloc, io_mod.getIo(), pinned, ctx.profile_configs);
+            const clashes = loaded.clashes;
+            loaded.clashes = &.{};
+            loaded.deinit(ctx.alloc);
+            return clashes;
+        }
+    };
+    return withPinnedMods(alloc, mods_dir, Ctx{
+        .alloc = alloc,
+        .profile_configs = profile_configs,
+    }, []ModMcpClash, Body.run);
 }
 
 pub const ModProviderEntry = struct {
@@ -1390,4 +1494,114 @@ test "prepareInstall parses providers before prompt and cleans up on discard" {
     var after_load = try load(alloc, root, "glm");
     defer after_load.deinit(alloc);
     try std.testing.expect(after_load == .mod);
+}
+
+test "prepareInstall and prepareUpdate strictly refuse invalid mod mcp servers" {
+    _ = mcp_config;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "mods");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "mods");
+    defer alloc.free(root);
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "src");
+    const src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src");
+    defer alloc.free(src);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Authorization header is refused on add.
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"web\":{\"type\":\"http\",\"url\":\"https://example.com/mcp\",\"headers\":{\"Authorization\":\"Bearer x\"}}}}",
+    });
+    const bad_add = try prepareInstall(arena, root, src, null);
+    try std.testing.expect(bad_add == .bad_mcp);
+    try std.testing.expectEqualStrings("web", bad_add.bad_mcp.server);
+    try std.testing.expect(std.mem.find(u8, bad_add.bad_mcp.reason, "Authorization header") != null);
+
+    // Valid mod installs, then an update with `..` in stdio command is refused.
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"fs\":{\"command\":\"bin/fs\"}}}",
+    });
+    const good_add = try prepareInstall(arena, root, src, null);
+    try std.testing.expect(good_add == .prepared);
+    var prep = good_add.prepared;
+    defer prep.discard(arena);
+    try std.testing.expect((try commitInstall(arena, root, &prep)) == .installed);
+
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"2.0.0\",\"mcp\":{\"fs\":{\"command\":\"../outside\"}}}",
+    });
+    const bad_upd = try prepareUpdate(arena, root, "alpha", null);
+    try std.testing.expect(bad_upd == .bad_mcp);
+    try std.testing.expectEqualStrings("fs", bad_upd.bad_mcp.server);
+    try std.testing.expect(std.mem.find(u8, bad_upd.bad_mcp.reason, "must stay inside the mod") != null);
+}
+
+test "loadModMcpServersFromPins resolves against pinned version path, enforces clashes, and shadows profile" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "mods");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "mods");
+    defer alloc.free(root);
+
+    try tmp.dir.createDirPath(io, "alpha");
+    try tmp.dir.createDirPath(io, "beta");
+    const alpha_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "alpha");
+    defer alloc.free(alpha_src);
+    const beta_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "beta");
+    defer alloc.free(beta_src);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "alpha/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"a\":{\"command\":\"bin/a\"},\"shared\":{\"command\":\"bin/sa\"},\"prof\":{\"command\":\"bin/pa\"}}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "beta/mod.json",
+        .data = "{\"name\":\"beta\",\"version\":\"1.0.0\",\"mcp\":{\"b\":{\"type\":\"http\",\"url\":\"https://b.example/mcp\"},\"shared\":{\"command\":\"bin/sb\"},\"prof\":{\"command\":\"bin/pb\"}}}",
+    });
+
+    try std.testing.expectEqual(Outcome.ok, try add(alloc, root, "alpha", alpha_src));
+    try std.testing.expectEqual(Outcome.ok, try add(alloc, root, "beta", beta_src));
+
+    var pinned = try loadModPins(alloc, root);
+    defer pinned.deinit(alloc);
+
+    const profile = [_]mcp_config.McpServerConfig{.{ .name = "prof", .command = "profile-prof" }};
+    var loaded = try loadModMcpServersFromPins(alloc, &pinned, &profile);
+    defer loaded.deinit(alloc);
+
+    // `a` and `b` load in mod name order; `prof` is shadowed by profile (no clash); `shared` clashes and loads from neither.
+    try std.testing.expectEqual(@as(usize, 2), loaded.configs.items.len);
+    try std.testing.expectEqualStrings("a", loaded.configs.items[0].name);
+    try std.testing.expectEqualStrings("alpha", loaded.configs.items[0].mod_name.?);
+    try std.testing.expect(std.mem.find(u8, loaded.configs.items[0].command.?, "/.store/alpha-") != null);
+    try std.testing.expect(std.mem.endsWith(u8, loaded.configs.items[0].command.?, "/bin/a"));
+    try std.testing.expect(std.mem.find(u8, loaded.configs.items[0].cwd.?, "/.store/alpha-") != null);
+    try std.testing.expectEqualStrings("b", loaded.configs.items[1].name);
+    try std.testing.expectEqualStrings("beta", loaded.configs.items[1].mod_name.?);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.clashes.len);
+    try std.testing.expectEqualStrings("shared", loaded.clashes[0].server);
+    try std.testing.expectEqual(@as(usize, 2), loaded.clashes[0].mods.len);
+    try std.testing.expectEqualStrings("alpha", loaded.clashes[0].mods[0]);
+    try std.testing.expectEqualStrings("beta", loaded.clashes[0].mods[1]);
+
+    const clashes = try findModMcpClashes(alloc, root, &profile);
+    defer {
+        for (clashes) |*c| c.deinit(alloc);
+        alloc.free(clashes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), clashes.len);
+    try std.testing.expectEqualStrings("shared", clashes[0].server);
 }

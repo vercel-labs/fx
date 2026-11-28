@@ -58,10 +58,14 @@ pub const Key = struct {
     name: []const u8,
     url: []const u8,
     workspace: ?[]const u8 = null,
+    mod_name: ?[]const u8 = null,
 
     fn matches(k: Key, e: Entry) bool {
-        const same_workspace = if (k.workspace) |w| (if (e.workspace) |ew| std.mem.eql(u8, w, ew) else false) else e.workspace == null;
-        return same_workspace and std.mem.eql(u8, e.name, k.name) and std.mem.eql(u8, e.url, k.url);
+        return optEql(k.workspace, e.workspace) and optEql(k.mod_name, e.mod_name) and std.mem.eql(u8, e.name, k.name) and std.mem.eql(u8, e.url, k.url);
+    }
+
+    fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
+        return if (a) |av| (if (b) |bv| std.mem.eql(u8, av, bv) else false) else b == null;
     }
 };
 
@@ -362,6 +366,10 @@ fn refreshLockName(key: Key) RefreshLockName {
         h.update(part);
         h.update(&.{0});
     }
+    if (key.mod_name) |mod_name| {
+        h.update(mod_name);
+        h.update(&.{0});
+    }
     var d: [32]u8 = undefined;
     h.final(&d);
     var name: RefreshLockName = undefined;
@@ -410,6 +418,8 @@ const Entry = struct {
     url: []u8,
     /// The workspace a `.mcp.json` server's credential belongs to; null for others.
     workspace: ?[]u8 = null,
+    /// The mod a `.mod` server's credential belongs to; null for others.
+    mod_name: ?[]u8 = null,
     credential: []u8,
 
     /// Copies of `key` and `credential`, owned by `alloc`.
@@ -420,13 +430,16 @@ const Entry = struct {
         errdefer alloc.free(url);
         const workspace = if (key.workspace) |w| try alloc.dupe(u8, w) else null;
         errdefer if (workspace) |w| alloc.free(w);
-        return .{ .name = name, .url = url, .workspace = workspace, .credential = try alloc.dupe(u8, credential) };
+        const mod_name = if (key.mod_name) |m| try alloc.dupe(u8, m) else null;
+        errdefer if (mod_name) |m| alloc.free(m);
+        return .{ .name = name, .url = url, .workspace = workspace, .mod_name = mod_name, .credential = try alloc.dupe(u8, credential) };
     }
 
     fn deinit(e: *Entry, alloc: Allocator) void {
         alloc.free(e.name);
         alloc.free(e.url);
         if (e.workspace) |w| alloc.free(w);
+        if (e.mod_name) |m| alloc.free(m);
         secret.zeroAndFree(alloc, e.credential);
     }
 };
@@ -456,7 +469,7 @@ const Doc = struct {
         // An older fx's `imported_v1` flag is ignored.
         const Saved = struct {
             version: u32,
-            servers: []const struct { name: []const u8, url: []const u8, workspace: ?[]const u8 = null, credential: []const u8 },
+            servers: []const struct { name: []const u8, url: []const u8, workspace: ?[]const u8 = null, mod_name: ?[]const u8 = null, credential: []const u8 },
         };
         var arena: std.heap.ArenaAllocator = .init(alloc);
         defer arena.deinit();
@@ -466,7 +479,7 @@ const Doc = struct {
         errdefer doc.deinit(alloc);
         try doc.entries.ensureTotalCapacity(alloc, saved.servers.len);
         for (saved.servers) |entry| {
-            doc.entries.appendAssumeCapacity(try Entry.of(alloc, .{ .name = entry.name, .url = entry.url, .workspace = entry.workspace }, entry.credential));
+            doc.entries.appendAssumeCapacity(try Entry.of(alloc, .{ .name = entry.name, .url = entry.url, .workspace = entry.workspace, .mod_name = entry.mod_name }, entry.credential));
             std.crypto.secureZero(u8, @constCast(entry.credential));
         }
         return doc;
@@ -969,4 +982,42 @@ test "a refused login removes only its own: one another fx saved since stays" {
     try testing.expectEqualStrings("{\"access\":\"theirs\"}", kept);
     try testing.expect(try store.removeIfSame(testing.allocator, .{ .name = "linear", .url = url }, digest("{\"access\":\"theirs\"}")));
     try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "linear", .url = url }));
+}
+
+test "mod credentials stay separate per mod_name, and old entries without mod_name read as non-mod" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    const store: Store = .{ .home = home, .backend = .file };
+    const url = "https://mcp.linear.app/mcp";
+
+    // Seed an older v2 entry without `mod_name`.
+    const dir_rel = ".fx/" ++ profile_paths.mcp_credentials_dir_name;
+    try tmp.dir.createDirPath(testing.io, dir_rel);
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = dir_rel ++ "/" ++ file_name,
+        .data = "{\"version\":2,\"servers\":[{\"name\":\"linear\",\"url\":\"https://mcp.linear.app/mcp\",\"credential\":\"{\\\"access\\\":\\\"profile\\\"}\"}]}",
+    });
+
+    const profile_key: Key = .{ .name = "linear", .url = url };
+    const alpha_key: Key = .{ .name = "linear", .url = url, .mod_name = "alpha" };
+    const beta_key: Key = .{ .name = "linear", .url = url, .mod_name = "beta" };
+
+    // Older entry matches only non-mod key.
+    const old_got = (try store.get(testing.allocator, profile_key)).?;
+    defer secret.zeroAndFree(testing.allocator, old_got);
+    try testing.expectEqualStrings("{\"access\":\"profile\"}", old_got);
+    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, alpha_key));
+
+    // Separate mod logins coexist on the same server name and URL.
+    try store.put(testing.allocator, alpha_key, "{\"access\":\"a\"}");
+    try store.put(testing.allocator, beta_key, "{\"access\":\"b\"}");
+    var snap = try store.snapshot(testing.allocator);
+    defer snap.deinit(testing.allocator);
+    try testing.expectEqualStrings("{\"access\":\"profile\"}", snap.get(profile_key).?);
+    try testing.expectEqualStrings("{\"access\":\"a\"}", snap.get(alpha_key).?);
+    try testing.expectEqualStrings("{\"access\":\"b\"}", snap.get(beta_key).?);
+    try testing.expect(!std.mem.eql(u8, &refreshLockName(profile_key), &refreshLockName(alpha_key)));
+    try testing.expect(!std.mem.eql(u8, &refreshLockName(alpha_key), &refreshLockName(beta_key)));
 }

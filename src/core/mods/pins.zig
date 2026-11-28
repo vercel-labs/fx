@@ -206,49 +206,87 @@ pub fn pin(
 
         ops.step(ops.ctx, .resolved);
 
-        var folder_buf: [manifest.max_name_bytes + 1 + token_hex_bytes]u8 = undefined;
-        const folder_name = formatVersionFolder(&folder_buf, name, &token);
-
-        var pins_dir = if (ops.prepare_pins_dir) |prepare|
-            try prepare(ops.ctx, io, root_dir)
-        else
-            try openOrCreatePrivatePinsDir(root_dir, io);
-        defer pins_dir.close(io);
-
-        var lock_file = switch (try acquireSharedWithDeadline(io, pins_dir, folder_name, ops.lock_deadline_ms)) {
-            .acquired => |f| f,
+        switch (try pinVersionAtDir(alloc, root_dir, root_path, name, token, ops)) {
+            .pinned => |p| return .{ .pinned = p },
             .busy => return .busy,
-        };
-        var keep_lock = false;
-        defer if (!keep_lock) {
-            lock_file.unlock(io);
-            lock_file.close(io);
-        };
-
-        ops.step(ops.ctx, .locked);
-
-        if (!try versionDirExists(root_dir, io, folder_name)) {
-            lock_file.unlock(io);
-            lock_file.close(io);
-            keep_lock = true; // already unlocked and closed above
-            ops.step(ops.ctx, .retry);
-            continue;
+            .not_installed => continue,
+            .bad_link => return .bad_link,
         }
-
-        const abs_path = try resolveVersionAbsPath(alloc, root_dir, io, root_path, folder_name);
-        errdefer alloc.free(abs_path);
-        const owned_name = try alloc.dupe(u8, name);
-
-        ops.step(ops.ctx, .checked);
-        keep_lock = true;
-        return .{ .pinned = .{
-            .name = owned_name,
-            .token = token,
-            .path = abs_path,
-            .file = lock_file,
-        } };
     }
     return .busy;
+}
+
+/// Takes a shared pin on the exact `(name, token)` version folder under `root_path`.
+pub fn pinVersion(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+    name: []const u8,
+    token: [token_hex_bytes]u8,
+    ops: Ops,
+) !PinResult {
+    if (!manifest.validName(name)) return .bad_link;
+    const io = ops.io;
+    var root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{
+        .iterate = false,
+        .follow_symlinks = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .not_installed,
+        else => return err,
+    };
+    defer root_dir.close(io);
+    return pinVersionAtDir(alloc, root_dir, root_path, name, token, ops);
+}
+
+fn pinVersionAtDir(
+    alloc: std.mem.Allocator,
+    root_dir: std.Io.Dir,
+    root_path: []const u8,
+    name: []const u8,
+    token: [token_hex_bytes]u8,
+    ops: Ops,
+) !PinResult {
+    const io = ops.io;
+    var folder_buf: [manifest.max_name_bytes + 1 + token_hex_bytes]u8 = undefined;
+    const folder_name = formatVersionFolder(&folder_buf, name, &token);
+
+    var pins_dir = if (ops.prepare_pins_dir) |prepare|
+        try prepare(ops.ctx, io, root_dir)
+    else
+        try openOrCreatePrivatePinsDir(root_dir, io);
+    defer pins_dir.close(io);
+
+    var lock_file = switch (try acquireSharedWithDeadline(io, pins_dir, folder_name, ops.lock_deadline_ms)) {
+        .acquired => |f| f,
+        .busy => return .busy,
+    };
+    var keep_lock = false;
+    defer if (!keep_lock) {
+        lock_file.unlock(io);
+        lock_file.close(io);
+    };
+
+    ops.step(ops.ctx, .locked);
+
+    if (!try versionDirExists(root_dir, io, folder_name)) {
+        lock_file.unlock(io);
+        lock_file.close(io);
+        keep_lock = true; // already unlocked and closed above
+        ops.step(ops.ctx, .retry);
+        return .not_installed;
+    }
+
+    const abs_path = try resolveVersionAbsPath(alloc, root_dir, io, root_path, folder_name);
+    errdefer alloc.free(abs_path);
+    const owned_name = try alloc.dupe(u8, name);
+
+    ops.step(ops.ctx, .checked);
+    keep_lock = true;
+    return .{ .pinned = .{
+        .name = owned_name,
+        .token = token,
+        .path = abs_path,
+        .file = lock_file,
+    } };
 }
 
 /// Pins the current enabled version of `name` first, then releases `old_pin`

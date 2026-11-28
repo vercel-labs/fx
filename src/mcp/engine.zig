@@ -39,6 +39,10 @@ pub const Config = struct {
     auth: auth_client.Options = .{},
     /// This server's own limits; null for the engine's.
     timeouts: ?request.Timeouts = null,
+    /// Host-owned identifier passed back to `Host.slot_destroyed` when this
+    /// slot is destroyed (`tests/tla/mods/ModServe.tla` ServersPinned); ignored
+    /// by `same()`.
+    host_tag: u64 = 0,
 };
 
 pub const Options = struct {
@@ -688,6 +692,7 @@ pub const Engine = struct {
             },
             .auth = c.auth,
             .timeouts = c.timeouts,
+            .host_tag = c.host_tag,
         };
         const auth = &slot.config.auth;
         auth.client_name = try a.dupe(u8, c.auth.client_name);
@@ -698,6 +703,7 @@ pub const Engine = struct {
     }
 
     fn destroySlot(e: *Engine, slot: *Slot) void {
+        const tag = slot.config.host_tag;
         if (slot.server) |s| {
             s.deinit();
             e.gpa.destroy(s);
@@ -706,6 +712,7 @@ pub const Engine = struct {
         slot.calls.deinit(e.gpa);
         slot.arena.deinit();
         e.gpa.destroy(slot);
+        if (e.host.slot_destroyed) |cb| cb(e.host.context, tag);
     }
 
     fn find(e: *Engine, name: []const u8) Error!*Slot {

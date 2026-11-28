@@ -22,6 +22,7 @@ pub const State = struct {
     active_jobs: std.atomic.Value(usize) = .init(0),
     closing: std.atomic.Value(bool) = .init(false),
     skills_refresh_needed: std.atomic.Value(bool) = .init(false),
+    mcp_reload_needed: std.atomic.Value(bool) = .init(false),
 
     pub fn pushNotice(self: *State, text: []u8, warning: bool) void {
         self.sink_mutex.lockUncancelable(io_mod.getIo());
@@ -39,6 +40,10 @@ pub const State = struct {
 
     pub fn takeSkillsRefresh(self: *State) bool {
         return self.skills_refresh_needed.swap(false, .acq_rel);
+    }
+
+    pub fn takeMcpReload(self: *State) bool {
+        return self.mcp_reload_needed.swap(false, .acq_rel);
     }
 
     pub fn runVerbs(self: *State, home: []const u8, rest: []const u8) !void {
@@ -138,6 +143,7 @@ pub const State = struct {
             }, args);
             if (changed and !self.closing.load(.acquire)) {
                 self.skills_refresh_needed.store(true, .release);
+                self.mcp_reload_needed.store(true, .release);
             }
             for ([_]*std.Io.Writer.Allocating{ &out, &err }, [_]bool{ false, true }) |w, warning| {
                 const text = std.mem.trimEnd(u8, w.written(), "\n");
@@ -201,11 +207,14 @@ test "app_mods_runtime records skills refresh only on a successful mod change" {
     }
     try std.testing.expect(state.takeSkillsRefresh());
     try std.testing.expect(!state.takeSkillsRefresh());
+    try std.testing.expect(state.takeMcpReload());
+    try std.testing.expect(!state.takeMcpReload());
 
-    // A non-mutating command (`list`) does not request a skill refresh.
+    // A non-mutating command (`list`) does not request a skill or MCP reload.
     try state.runVerbs(home, "list");
     while (state.active_jobs.load(.acquire) > 0) {
         io_mod.getIo().sleep(.fromMilliseconds(5), .awake) catch {};
     }
     try std.testing.expect(!state.takeSkillsRefresh());
+    try std.testing.expect(!state.takeMcpReload());
 }

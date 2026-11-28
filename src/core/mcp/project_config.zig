@@ -48,7 +48,7 @@ pub const ProjectMcpTransition = struct {
     authority_reduced: bool,
 };
 
-const ParsePolicy = struct {
+pub const ParsePolicy = struct {
     source: mcp_contract.ConfigSource,
     scope: mcp_contract.ConfigScope,
     force_optional: bool = false,
@@ -76,6 +76,8 @@ pub const WorkspaceDiagnosticCause = enum {
     ignored_key,
     /// A profile key that looks like a misspelling of its servers key.
     misspelled_key,
+    /// Two or more enabled mods define the same MCP server name.
+    mod_clash,
 };
 
 /// The keys fx reads but doesn't act on.
@@ -134,7 +136,7 @@ fn noteInvalidEntry(alloc: Allocator, notes: *std.ArrayList(WorkspaceDiagnostic)
 /// `entryProblem`, with the URL's own reason when the entry's URL is what failed.
 /// The strict parse keeps its one error for a URL (`McpConfigInvalidUrl`), so the
 /// reason is found again here from the entry's "url".
-fn entryProblemOf(err: anyerror, value: std.json.Value) EntryProblem {
+pub fn entryProblemOf(err: anyerror, value: std.json.Value) EntryProblem {
     if (err == error.McpConfigInvalidUrl) if (urlProblem(value)) |problem| return problem;
     return entryProblem(err);
 }
@@ -180,6 +182,8 @@ fn entryProblem(err: anyerror) EntryProblem {
 pub const WorkspaceDiagnostic = struct {
     /// About `~/.fx/mcp.json` rather than `.mcp.json`.
     profile: bool = false,
+    mod_name: ?[]u8 = null,
+    mod_list: ?[]u8 = null,
     server_name: ?[]u8 = null,
     environment_variable: ?[]u8 = null,
     environment_field: ?WorkspaceEnvironmentField = null,
@@ -192,6 +196,8 @@ pub const WorkspaceDiagnostic = struct {
     cause: WorkspaceDiagnosticCause,
 
     pub fn deinit(self: *WorkspaceDiagnostic, alloc: Allocator) void {
+        if (self.mod_name) |mod_name| alloc.free(mod_name);
+        if (self.mod_list) |mod_list| alloc.free(mod_list);
         if (self.server_name) |name| alloc.free(name);
         if (self.environment_variable) |name| alloc.free(name);
         self.* = undefined;
@@ -208,6 +214,8 @@ pub fn renderWorkspaceDiagnostic(
         160,
     );
     defer encoded_server.deinit(alloc);
+    const file = try diagnosticFileAlloc(alloc, diagnostic);
+    defer alloc.free(file);
     if (diagnostic.cause == .missing_environment_variable) {
         var encoded_variable = try text_utils.encodeTerminalSafe(
             alloc,
@@ -222,7 +230,7 @@ pub fn renderWorkspaceDiagnostic(
         return alloc.print(
             "{s} server '{s}' field {s} requires environment variable '{s}'; set it or use ${{{s}:-default}}.",
             .{
-                diagnosticFile(diagnostic),
+                file,
                 encoded_server.bytes,
                 field,
                 encoded_variable.bytes,
@@ -232,14 +240,18 @@ pub fn renderWorkspaceDiagnostic(
     }
     if (diagnostic.cause == .ignored_key) return alloc.print(
         "{s} server '{s}' sets \"{s}\", which fx ignores; remove it.",
-        .{ diagnosticFile(diagnostic), encoded_server.bytes, @tagName(diagnostic.ignored_key orelse .required) },
+        .{ file, encoded_server.bytes, @tagName(diagnostic.ignored_key orelse .required) },
     );
     if (diagnostic.cause == .misspelled_key) {
         const misspelled = diagnostic.misspelled orelse return alloc.dupe(u8, "the profile has a key that looks like a misspelling of its servers key.");
         const words = try misspelledWords(alloc, misspelled);
         defer alloc.free(words);
-        return alloc.print("{s}: {s}.", .{ diagnosticFile(diagnostic), words });
+        return alloc.print("{s}: {s}.", .{ file, words });
     }
+    if (diagnostic.cause == .mod_clash) return alloc.print(
+        "MCP server '{s}' is defined by multiple mods ({s}), so neither loads.",
+        .{ encoded_server.bytes, diagnostic.mod_list orelse "multiple mods" },
+    );
     // Every reason is a constant, so this is the one `print` there is.
     const why: []const u8 = if (diagnostic.cause == .invalid_entry) entryProblemWords(diagnostic.problem orelse .other) else if (diagnostic.cause == .ignored_alias)
         "the file has both \"mcp\" and \"mcpServers\", and fx reads only \"mcp\"; merge them into one"
@@ -247,7 +259,7 @@ pub fn renderWorkspaceDiagnostic(
         @tagName(diagnostic.cause);
     return alloc.print(
         "{s} server '{s}' was skipped: {s}.",
-        .{ diagnosticFile(diagnostic), encoded_server.bytes, why },
+        .{ file, encoded_server.bytes, why },
     );
 }
 
@@ -287,13 +299,20 @@ pub fn noteIgnoredKeys(
         for (keys) |maybe| if (maybe) |key| {
             const owned = try alloc.dupe(u8, c.name);
             errdefer alloc.free(owned);
-            try notes.append(alloc, .{ .profile = c.source != .workspace, .server_name = owned, .cause = .ignored_key, .ignored_key = key });
+            const owned_mod = if (c.mod_name) |m| try alloc.dupe(u8, m) else null;
+            errdefer if (owned_mod) |m| alloc.free(m);
+            try notes.append(alloc, .{ .profile = c.source != .workspace, .mod_name = owned_mod, .server_name = owned, .cause = .ignored_key, .ignored_key = key });
         };
     }
 }
 
-fn diagnosticFile(diagnostic: WorkspaceDiagnostic) []const u8 {
-    return if (diagnostic.profile) profile_paths.displayText("~/.fx/mcp.json") else ".mcp.json";
+fn diagnosticFileAlloc(alloc: Allocator, diagnostic: WorkspaceDiagnostic) Allocator.Error![]u8 {
+    if (diagnostic.mod_name) |mod_name| {
+        var encoded_mod = try text_utils.encodeTerminalSafe(alloc, mod_name, 160);
+        defer encoded_mod.deinit(alloc);
+        return alloc.print("{s}/mods/{s}/mod.json", .{ profile_paths.displayRoot(), encoded_mod.bytes });
+    }
+    return alloc.dupe(u8, if (diagnostic.profile) profile_paths.displayText("~/.fx/mcp.json") else ".mcp.json");
 }
 
 pub const WorkspaceParseResult = struct {
@@ -433,7 +452,11 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8, skipped: ?*
     // keep working, and the ones under the misspelled key are not read.
     const real_is_mcp = canonical != null;
     if (canonical orelse alias) |servers| {
-        var result = ProfileParseResult{ .configs = try parseProfileServerMap(alloc, servers, skipped) };
+        var result = ProfileParseResult{ .configs = try parseProfileServerMap(alloc, servers, .{
+            .source = .profile,
+            .scope = .profile,
+            .allow_stored_credentials = true,
+        }, skipped) };
         errdefer result.deinit(alloc);
         switch (scanSuspiciousProfileKeys(object)) {
             .clear => if (canonical != null and alias != null and profileAliasIsNonEmpty(alias.?)) {
@@ -485,9 +508,10 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8, skipped: ?*
     };
 }
 
-fn parseProfileServerMap(
+pub fn parseProfileServerMap(
     alloc: Allocator,
     servers: std.json.Value,
+    policy: ParsePolicy,
     skipped: ?*std.ArrayList(WorkspaceDiagnostic),
 ) !std.ArrayList(McpServerConfig) {
     if (servers != .object) return error.McpConfigServersMustBeObject;
@@ -496,14 +520,10 @@ fn parseProfileServerMap(
     errdefer deinitConfigs(alloc, &configs);
     var it = servers.object.iterator();
     while (it.next()) |entry| {
-        const config = parseServerEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, .{
-            .source = .profile,
-            .scope = .profile,
-            .allow_stored_credentials = true,
-        }) catch |err| {
+        const config = parseServerEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, policy) catch |err| {
             const notes = skipped orelse return err;
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            try noteInvalidEntry(alloc, notes, true, entry.key_ptr.*, err, entry.value_ptr.*);
+            try noteInvalidEntry(alloc, notes, policy.source != .workspace, entry.key_ptr.*, err, entry.value_ptr.*);
             continue;
         };
         configs.append(alloc, config) catch |err| {
@@ -837,7 +857,7 @@ fn expandConfigs(
     var index: usize = 0;
     while (index < configs.items.len) {
         const config = &configs.items[index];
-        const expands = if (profile) config.source == .profile else config.workspace_admission == .approved;
+        const expands = if (profile) (config.source == .profile or config.source == .mod) else config.workspace_admission == .approved;
         if (!expands) {
             index += 1;
             continue;
@@ -853,11 +873,14 @@ fn expandConfigs(
         };
         const server_name = try alloc.dupe(u8, config.name);
         errdefer mem_utils.free(alloc, server_name);
+        const mod_name = if (config.mod_name) |m| try alloc.dupe(u8, m) else null;
+        errdefer if (mod_name) |m| alloc.free(m);
         switch (failure) {
             .missing => |missing| {
                 errdefer mem_utils.free(alloc, missing.variable_name);
                 try diagnostics.append(alloc, .{
                     .profile = profile,
+                    .mod_name = mod_name,
                     .server_name = server_name,
                     .environment_variable = missing.variable_name,
                     .environment_field = missing.field,
@@ -866,12 +889,14 @@ fn expandConfigs(
             },
             .invalid => try diagnostics.append(alloc, .{
                 .profile = profile,
+                .mod_name = mod_name,
                 .server_name = server_name,
                 .cause = .invalid_entry,
                 .problem = .variable,
             }),
             .limit_exceeded => try diagnostics.append(alloc, .{
                 .profile = profile,
+                .mod_name = mod_name,
                 .server_name = server_name,
                 .cause = .environment_expansion_limit_exceeded,
             }),
@@ -916,6 +941,35 @@ const WorkspaceTemplateExpansion = union(enum) {
         self.* = undefined;
     }
 };
+
+pub fn hasValidEnvTemplates(config: *const McpServerConfig) bool {
+    if (config.command) |command| if (!validateTemplateSyntax(command)) return false;
+    for (config.args) |argument| if (!validateTemplateSyntax(argument)) return false;
+    for (config.env) |entry| if (!validateTemplateSyntax(entry.value)) return false;
+    for (config.headers) |header| if (!validateTemplateSyntax(header.value)) return false;
+    return true;
+}
+
+pub fn validateTemplateSyntax(input: []const u8) bool {
+    var cursor: usize = 0;
+    while (cursor < input.len) {
+        const relative_start = std.mem.find(u8, input[cursor..], "${") orelse return true;
+        const start = cursor + relative_start;
+        if (start > cursor and input[start - 1] == '$') {
+            cursor = start + 2;
+            continue;
+        }
+        const expression_start = start + 2;
+        const relative_end = std.mem.findScalar(u8, input[expression_start..], '}') orelse return false;
+        const end = expression_start + relative_end;
+        const expression = input[expression_start..end];
+        const default_marker = std.mem.find(u8, expression, ":-");
+        const variable_name = if (default_marker) |index| expression[0..index] else expression;
+        if (!isValidEnvName(variable_name)) return false;
+        cursor = end + 1;
+    }
+    return true;
+}
 
 fn expandWorkspaceTemplate(
     alloc: Allocator,
@@ -1179,10 +1233,31 @@ pub fn mergeNative(
     primary: *std.ArrayList(McpServerConfig),
     workspace: *std.ArrayList(McpServerConfig),
 ) !std.ArrayList(McpServerConfig) {
+    var empty_mods: std.ArrayList(McpServerConfig) = .empty;
+    return mergeNativeWithMods(alloc, primary, &empty_mods, workspace);
+}
+
+/// Merges `primary` (`~/.fx/mcp.json`), then `mod_configs` (mods in name order),
+/// then `workspace` (`.mcp.json`) into one list without changing `primary` +
+/// `workspace` semantics when `mod_configs` is empty. Consumes all three lists.
+pub fn mergeNativeWithMods(
+    alloc: Allocator,
+    primary: *std.ArrayList(McpServerConfig),
+    mod_configs: *std.ArrayList(McpServerConfig),
+    workspace: *std.ArrayList(McpServerConfig),
+) !std.ArrayList(McpServerConfig) {
     var merged: std.ArrayList(McpServerConfig) = .empty;
     errdefer deinitConfigs(alloc, &merged);
-    try merged.ensureTotalCapacity(alloc, primary.items.len + workspace.items.len);
+    try merged.ensureTotalCapacity(alloc, primary.items.len + mod_configs.items.len + workspace.items.len);
     while (primary.items.len > 0) merged.appendAssumeCapacity(primary.orderedRemove(0));
+    while (mod_configs.items.len > 0) {
+        var candidate = mod_configs.orderedRemove(0);
+        if (configNamePresent(merged.items, candidate.name)) {
+            candidate.deinit(alloc);
+            continue;
+        }
+        merged.appendAssumeCapacity(candidate);
+    }
     while (workspace.items.len > 0) {
         var candidate = workspace.orderedRemove(0);
         if (configNamePresent(merged.items, candidate.name)) {
@@ -1858,7 +1933,7 @@ pub fn configNamePresent(configs: []const McpServerConfig, name: []const u8) boo
     return false;
 }
 
-fn deinitConfigs(alloc: Allocator, configs: *std.ArrayList(McpServerConfig)) void {
+pub fn deinitConfigs(alloc: Allocator, configs: *std.ArrayList(McpServerConfig)) void {
     for (configs.items) |*config| config.deinit(alloc);
     configs.deinit(alloc);
 }
@@ -2573,4 +2648,37 @@ test "a profile server defaults to shared" {
     try std.testing.expectEqual(@as(usize, 2), result.configs.items.len);
     try std.testing.expect(result.configs.items[0].shared);
     try std.testing.expect(!result.configs.items[1].shared);
+}
+
+test "parseProfileServerMap with mod policy and renderWorkspaceDiagnostic name the mod" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"web":{"type":"http","url":"https://example.com/mcp","bearer_token_env":"TOKEN"}}
+    , .{ .duplicate_field_behavior = .@"error" });
+    defer parsed.deinit();
+
+    var configs = try parseProfileServerMap(alloc, parsed.value, .{
+        .source = .mod,
+        .scope = .profile,
+        .allow_stored_credentials = true,
+        .allow_authorization_header = false,
+        .force_optional = false,
+    }, null);
+    defer deinitConfigs(alloc, &configs);
+    try std.testing.expectEqual(@as(usize, 1), configs.items.len);
+    try std.testing.expectEqual(mcp_contract.ConfigSource.mod, configs.items[0].source);
+    try std.testing.expect(configs.items[0].allow_stored_credentials);
+    try std.testing.expect(hasValidEnvTemplates(&configs.items[0]));
+
+    var diag: WorkspaceDiagnostic = .{
+        .profile = true,
+        .mod_name = try alloc.dupe(u8, "alpha"),
+        .server_name = try alloc.dupe(u8, "web"),
+        .cause = .invalid_entry,
+        .problem = .authorization,
+    };
+    defer diag.deinit(alloc);
+    const rendered = try renderWorkspaceDiagnostic(alloc, diag);
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "~/.fx/mods/alpha/mod.json server 'web' was skipped:"));
 }

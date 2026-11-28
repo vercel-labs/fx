@@ -1191,7 +1191,7 @@ describe("mod preview, update confirmation, and live TUI refresh", () => {
       writeFile(folder, "bin/auth-v1", "#!/bin/sh\necho tok-1-tampered\n", true);
       const tampered = await fxMod(f, ["update", "glm"]);
       expect(tampered.code).toBe(1);
-      expect(tampered.stderr).toContain("This update changes the files of a mod that runs a sign-in command.");
+      expect(tampered.stderr).toContain("This update changes the files of a mod that runs a program.");
       expect(tampered.stderr).toContain("--yes");
       expect((await listJson(f)).mods[0]).toMatchObject({ version: "1.0.0" });
 
@@ -1200,7 +1200,7 @@ describe("mod preview, update confirmation, and live TUI refresh", () => {
       const refused = await fxMod(f, ["update", "glm"]);
       expect(refused.code).toBe(1);
       expect(refused.stderr).toContain("This update adds or changes a sign-in command.");
-      expect(refused.stderr).toContain("This update changes the files of a mod that runs a sign-in command.");
+      expect(refused.stderr).toContain("This update changes the files of a mod that runs a program.");
       expect(refused.stderr).toContain("--yes");
       expect((await listJson(f)).mods[0]).toMatchObject({ version: "1.0.0" });
 
@@ -1320,4 +1320,306 @@ describe("mod preview, update confirmation, and live TUI refresh", () => {
       f.close();
     }
   }, 90000);
+});
+
+describe("mod MCP servers", () => {
+  const MODERN_STDIO_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
+
+  function modServerFile(resultText?: string): string {
+    const body = readFileSync(MODERN_STDIO_FIXTURE, "utf8");
+    return resultText === undefined
+      ? body
+      : body.replace('process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT"', JSON.stringify(resultText));
+  }
+
+  test("fx mcp list shows mod <name>, fx ask calls its tool without project approval, and order/clash rules hold", async () => {
+    const f = fixture(body => {
+      const messages = Array.isArray(body.messages) ? body.messages : [];
+      const toolCount = messages.filter((m: any) => m.role === "tool").length;
+      if (toolCount === 0) {
+        return toolCompletion(body.model, "toolbox", { open: "mcp_modsrv_echo" }, "open_mod_echo");
+      }
+      if (toolCount === 1) {
+        return toolCompletion(body.model, "toolbox", { run: "mcp_modsrv_echo", arguments: { text: "ping" } }, "call_mod_echo");
+      }
+      const lastTool = messages.findLast((m: any) => m.role === "tool")?.content ?? "";
+      return completion(body.model, `TOOL_OUT:${lastTool}`);
+    });
+    try {
+      const alpha = makeModFolder(
+        f,
+        "alpha",
+        {
+          name: "alpha",
+          version: "1.0.0",
+          mcp: {
+            modsrv: { command: [process.execPath, "bin/server.mjs"], env: { FX_MCP_RESULT_TEXT: "ALPHA_MOD_RESULT" } },
+            prof_wins: { command: [process.execPath, "bin/server.mjs"], env: { FX_MCP_RESULT_TEXT: "MOD_SHOULD_LOSE" } },
+            clash_srv: { command: [process.execPath, "bin/server.mjs"] },
+          },
+        },
+        { "bin/server.mjs": modServerFile() },
+      );
+      const beta = makeModFolder(
+        f,
+        "beta",
+        {
+          name: "beta",
+          version: "1.0.0",
+          mcp: {
+            clash_srv: { command: [process.execPath, "bin/server.mjs"] },
+          },
+        },
+        { "bin/server.mjs": modServerFile() },
+      );
+      writeFileSync(
+        join(f.home, ".fx", "mcp.json"),
+        JSON.stringify({
+          mcp: {
+            prof_wins: { command: process.execPath, args: [MODERN_STDIO_FIXTURE], env: { FX_MCP_RESULT_TEXT: "PROFILE_WINS" } },
+          },
+        }),
+      );
+      writeFileSync(
+        join(f.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            modsrv: { command: process.execPath, args: [MODERN_STDIO_FIXTURE], env: { FX_MCP_RESULT_TEXT: "PROJECT_SHOULD_LOSE" } },
+            proj_only: { command: process.execPath, args: [MODERN_STDIO_FIXTURE] },
+          },
+        }),
+      );
+
+      expect((await fxMod(f, ["add", "--yes", alpha])).code).toBe(0);
+      expect((await fxMod(f, ["add", "--yes", beta])).code).toBe(0);
+
+      // `fx mcp list` shows mod <name>, profile wins, mod shadows project, clash loads neither with note.
+      const listed = await runFx(["mcp", "list"], { cwd: f.workspace, env: f.env, timeoutMs: TIMEOUT_MS });
+      expect(listed.code, listed.stderr).toBe(0);
+      expect(listed.stderr).toContain("MCP server 'clash_srv' is defined by multiple mods (alpha, beta), so neither loads.");
+      expect(listed.stdout).toContain("modsrv");
+      expect(listed.stdout).toContain("mod alpha");
+      expect(listed.stdout).toContain("prof_wins");
+      expect(listed.stdout).toContain("proj_only");
+      expect(listed.stdout).not.toContain("clash_srv");
+
+      const listJsonOut = await runFx(["mcp", "list", "--json"], { cwd: f.workspace, env: f.env, timeoutMs: TIMEOUT_MS });
+      expect(listJsonOut.code, listJsonOut.stderr).toBe(0);
+      const servers = JSON.parse(listJsonOut.stdout).servers as Array<Record<string, any>>;
+      const modEntry = servers.find(s => s.name === "modsrv");
+      expect(modEntry).toMatchObject({
+        name: "modsrv",
+        source: "mod",
+        mod: "alpha",
+        file: join(modsDir(f), "alpha", "mod.json"),
+        transport: "stdio",
+      });
+      expect(servers.find(s => s.name === "prof_wins")).toMatchObject({ source: "profile" });
+      expect(servers.find(s => s.name === "clash_srv")).toBeUndefined();
+
+      // `fx doctor` warns on the cross-mod clash under `mcp`.
+      const doc = await doctorJson(f);
+      const docParsed = JSON.parse(doc.stdout);
+      expect(docParsed.checks.some((c: any) => c.name === "mcp" && c.status === "warn" && String(c.detail).includes("clash_srv"))).toBe(true);
+
+      // `fx ask` calls the mod server's tool without workspace approval.
+      const asked = await runFx(["ask", "--json", "--full-access", "--no-save", "Use modsrv echo."], {
+        cwd: f.workspace,
+        env: f.env,
+        timeoutMs: TIMEOUT_MS,
+      });
+      expect(asked.code, asked.stderr).toBe(0);
+      expect(JSON.parse(asked.stdout).output).toContain("ALPHA_MOD_RESULT");
+      expect(JSON.parse(asked.stdout).output).not.toContain("PROJECT_SHOULD_LOSE");
+    } finally {
+      f.close();
+    }
+  }, 90000);
+
+  test.skipIf(!tmuxAvailable())("updating a mod from another process restarts its server on the next prompt and collects the old version", async () => {
+    let phase = 0;
+    const f = fixture(body => {
+      const messages = Array.isArray(body.messages) ? body.messages : [];
+      const toolCount = messages.filter((m: any) => m.role === "tool").length;
+      if (phase === 0) {
+        if (toolCount === 0) return toolCompletion(body.model, "toolbox", { open: "mcp_modsrv_echo" }, "open_1");
+        if (toolCount === 1) return toolCompletion(body.model, "toolbox", { run: "mcp_modsrv_echo", arguments: { text: "go1" } }, "call_1");
+        phase = 1;
+        const lastTool = messages.findLast((m: any) => m.role === "tool")?.content ?? "";
+        return completion(body.model, `GOT1:${lastTool}`);
+      }
+      if (toolCount === 2) return toolCompletion(body.model, "toolbox", { run: "mcp_modsrv_echo", arguments: { text: "go2" } }, "call_2");
+      const lastTool = messages.findLast((m: any) => m.role === "tool")?.content ?? "";
+      return completion(body.model, `GOT2:${lastTool}`);
+    });
+    let session: TmuxSession | null = null;
+    try {
+      f.settings.permission_mode = "full-access";
+      f.save();
+
+      const folder = makeModFolder(
+        f,
+        "alpha",
+        {
+          name: "alpha",
+          version: "1.0.0",
+          mcp: { modsrv: { command: [process.execPath, "bin/server.mjs"] } },
+        },
+        { "bin/server.mjs": modServerFile("V1_MOD_SERVER") },
+      );
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+      const v1Dir = realpathSync(join(modsDir(f), "alpha"));
+
+      session = await openTui(f);
+      await session.waitForComposer(TIMEOUT_MS);
+      await session.sendText("first turn");
+      await session.waitForText("V1_MOD_SERVER", TIMEOUT_MS);
+
+      // Update mod alpha to v2 from outside the TUI.
+      writeFile(folder, "bin/server.mjs", modServerFile("V2_MOD_SERVER"));
+      writeFile(folder, "mod.json", JSON.stringify({
+        name: "alpha",
+        version: "2.0.0",
+        mcp: { modsrv: { command: [process.execPath, "bin/server.mjs"] } },
+      }));
+      expect((await fxMod(f, ["update", "alpha", "--yes"])).code).toBe(0);
+      const v2Dir = realpathSync(join(modsDir(f), "alpha"));
+      expect(v2Dir).not.toBe(v1Dir);
+
+      // Next prompt reloads the host, calls the v2 server, and collects v1 after v1's server exits.
+      await session.sendText("second turn");
+      await session.waitForText("V2_MOD_SERVER", TIMEOUT_MS);
+
+      await waitForCondition(() => !existsSync(v1Dir), 10_000, 100);
+      expect(existsSync(v2Dir)).toBe(true);
+    } finally {
+      if (session) await session.kill();
+      f.close();
+    }
+  }, 90000);
+});
+
+describe("mod MCP servers in the install screen and update question", () => {
+  test("the install screen and fx mod show --json list each server's transport, program, URL, variables, and headers", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    try {
+      const folder = makeModFolder(
+        f,
+        "fs-pack",
+        {
+          name: "fs-pack",
+          version: "1.0.0",
+          description: "Files and remote tools",
+          mcp: {
+            fs: { command: ["bin/fs-server", "--stdio"], env: { LOG_LEVEL: "${FS_LOG:-warn}" } },
+            remote: {
+              type: "http",
+              url: "https://mcp.example.com/mcp",
+              headers: { "X-Team": "static" },
+              header_env: { "X-Route": "ROUTE_ENV" },
+              bearer_token_env: "MCP_TOKEN",
+            },
+          },
+        },
+        { "bin/fs-server": "#!/bin/sh\necho ok\n" },
+        ["bin/fs-server"],
+      );
+
+      const preview = await fxMod(f, ["add", folder]);
+      expect(preview.code).toBe(1);
+      expect(preview.stderr).toContain("  mcp          2\n");
+      // LOG_LEVEL is set by the mod; fx reads only FS_LOG from your environment.
+      expect(preview.stderr).toContain("    fs  stdio  bin/fs-server --stdio\n      uses $FS_LOG\n");
+      expect(preview.stderr).toContain(
+        "    remote  http  https://mcp.example.com/mcp\n      uses $ROUTE_ENV, $MCP_TOKEN\n      header X-Team\n      header X-Route from $ROUTE_ENV\n",
+      );
+      expect(preview.stderr).not.toContain("static");
+
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+      const shown = await fxMod(f, ["show", "fs-pack", "--json"]);
+      expect(shown.code, shown.stderr).toBe(0);
+      expect(JSON.parse(shown.stdout).mcp).toEqual([
+        {
+          name: "fs",
+          transport: "stdio",
+          command: "bin/fs-server",
+          args: ["--stdio"],
+          url: null,
+          variables: ["FS_LOG"],
+          headers: [],
+        },
+        {
+          name: "remote",
+          transport: "http",
+          command: null,
+          args: [],
+          url: "https://mcp.example.com/mcp",
+          variables: ["ROUTE_ENV", "MCP_TOKEN"],
+          headers: [
+            { name: "X-Team", env: null },
+            { name: "X-Route", env: "ROUTE_ENV" },
+          ],
+        },
+      ]);
+    } finally {
+      f.close();
+    }
+  }, 60000);
+
+  test("an update that changes a server's command is refused without a terminal, keeps the old version, and updates with --yes", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    try {
+      const folder = makeModFolder(
+        f,
+        "tools",
+        { name: "tools", version: "1.0.0", description: "Tool server", mcp: { tools: { command: ["bin/tools-v1"] } } },
+        { "bin/tools-v1": "#!/bin/sh\necho v1\n", "bin/tools-v2": "#!/bin/sh\necho v2\n" },
+        ["bin/tools-v1", "bin/tools-v2"],
+      );
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+
+      writeFile(
+        folder,
+        "mod.json",
+        JSON.stringify({ name: "tools", version: "2.0.0", description: "Tool server", mcp: { tools: { command: ["bin/tools-v2"] } } }),
+      );
+      const refused = await fxMod(f, ["update", "tools"]);
+      expect(refused.code).toBe(1);
+      expect(refused.stderr).toContain("This update adds or changes an MCP server.\n");
+      expect(refused.stderr).toContain("This update changes the files of a mod that runs a program.\n");
+      expect(refused.stderr).toContain("--yes");
+      expect((await listJson(f)).mods[0]).toMatchObject({ version: "1.0.0" });
+
+      const forced = await fxMod(f, ["update", "tools", "--yes"]);
+      expect(forced.code, forced.stderr).toBe(0);
+      expect(forced.stdout).toContain("Updated tools from folder.");
+      expect((await listJson(f)).mods[0]).toMatchObject({ version: "2.0.0" });
+    } finally {
+      f.close();
+    }
+  }, 60000);
+
+  test("a changed byte in a stdio server's program is refused without a terminal, and the old version stays", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    try {
+      const folder = makeModFolder(
+        f,
+        "tools",
+        { name: "tools", version: "1.0.0", description: "Tool server", mcp: { tools: { command: ["bin/tools"] } } },
+        { "bin/tools": "#!/bin/sh\necho v1\n" },
+        ["bin/tools"],
+      );
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+
+      writeFile(folder, "bin/tools", "#!/bin/sh\necho tampered\n", true);
+      const tampered = await fxMod(f, ["update", "tools"]);
+      expect(tampered.code).toBe(1);
+      expect(tampered.stderr).toContain("This update changes the files of a mod that runs a program.\n");
+      expect(tampered.stderr).not.toContain("adds or changes an MCP server");
+      expect(tampered.stderr).toContain("--yes");
+      expect((await listJson(f)).mods[0]).toMatchObject({ version: "1.0.0" });
+    } finally {
+      f.close();
+    }
+  }, 60000);
 });

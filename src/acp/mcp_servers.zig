@@ -11,6 +11,7 @@ const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const mods_mod = if (build_options.libfx) struct {} else @import("../core/mods/mods.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -44,12 +45,18 @@ pub const OwnedServerConfigs = struct {
     /// What fx skipped from the profile and the project, as a host holds it: the notes `/mcp list` shows. Owned, in
     /// `alloc`; `prepare` and `reloadHost` give a host its own copy.
     notes: []const []const u8 = &.{},
+    mod_pins: if (build_options.libfx) struct {} else ?mods_mod.ModPins = if (build_options.libfx) .{} else null,
+    mods_root: if (build_options.libfx) struct {} else ?[]u8 = if (build_options.libfx) .{} else null,
 
     pub fn deinit(self: *OwnedServerConfigs, alloc: Allocator) void {
         for (self.items.items) |*config| config.deinit(alloc);
         self.items.deinit(alloc);
         for (self.notes) |note| alloc.free(note);
         alloc.free(self.notes);
+        if (comptime !build_options.libfx) {
+            if (self.mod_pins) |*pins| pins.deinit(alloc);
+            if (self.mods_root) |root| alloc.free(root);
+        }
         self.* = undefined;
     }
 
@@ -174,6 +181,17 @@ pub fn prepare(
         break :blk null;
     };
     defer if (fx_home) |path| alloc.free(path);
+    var cloned_pins: if (build_options.libfx) struct {} else ?mods_mod.ModPins = if (build_options.libfx) .{} else null;
+    defer if (comptime !build_options.libfx) if (cloned_pins) |*p| p.deinit(alloc);
+    if (comptime !build_options.libfx) {
+        if (configs.mod_pins) |*p| cloned_pins = p.clone(alloc, mods_mod.realModPinsOps()) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => blk: {
+                debug_trace.logf("mcp", "mod MCP pins not cloned err={s}", .{@errorName(err)});
+                break :blk null;
+            },
+        };
+    }
     const h = mcp_host.Host.create(alloc, io_mod.getIo(), configs.items.items, &inherited, .{
         .client_version = build_options.app_version,
         .credentials = .{ .detect = home },
@@ -182,6 +200,8 @@ pub fn prepare(
         .url_completions = url_completions,
         .idle_ms = mcp_host.idleMs(),
         .share = if (fx_home) |path| .{ .fx_home = path } else null,
+        .mod_pins = if (build_options.libfx) .{} else if (cloned_pins != null) &cloned_pins.? else null,
+        .mods_root = if (build_options.libfx) .{} else configs.mods_root,
     }, builtin_tools.registry) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failed = try alloc.print("MCP servers could not start: {s}", .{@errorName(err)}) },
@@ -203,8 +223,25 @@ pub fn reloadHost(alloc: Allocator, host: *mcp_host.Host, configs: *const OwnedS
     // Read only while the host reloads.
     var inherited = try io_mod.cloneEnvironMap(alloc);
     defer inherited.deinit();
+    var cloned_pins: if (build_options.libfx) struct {} else ?mods_mod.ModPins = if (build_options.libfx) .{} else null;
+    defer if (comptime !build_options.libfx) if (cloned_pins) |*p| p.deinit(host.gpa);
+    if (comptime !build_options.libfx) {
+        if (configs.mod_pins) |*p| cloned_pins = p.clone(host.gpa, mods_mod.realModPinsOps()) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => blk: {
+                debug_trace.logf("mcp", "mod MCP pins not cloned err={s}", .{@errorName(err)});
+                break :blk null;
+            },
+        };
+    }
     // The host owns these from here, also when the reload fails.
-    try host.reload(configs.items.items, &inherited, try copyNotes(alloc, configs.notes));
+    try host.reloadWithPins(
+        configs.items.items,
+        &inherited,
+        try copyNotes(alloc, configs.notes),
+        if (build_options.libfx) .{} else if (cloned_pins != null) &cloned_pins.? else null,
+        if (build_options.libfx) .{} else configs.mods_root,
+    );
 }
 
 pub fn parseErrorMessage(err: ParseError) []const u8 {

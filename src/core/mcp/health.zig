@@ -9,9 +9,11 @@ pub const ConfigurationIssue = struct {
     message: []u8,
     /// The entry is in `~/.fx/mcp.json`, not the project's `.mcp.json`.
     profile: bool = false,
+    mod_name: ?[]u8 = null,
 
     pub fn deinit(self: *ConfigurationIssue, alloc: Allocator) void {
         alloc.free(self.message);
+        if (self.mod_name) |mod_name| alloc.free(mod_name);
         self.* = undefined;
     }
 };
@@ -20,12 +22,14 @@ pub const ConfiguredServerSnapshot = struct {
     configured_name: []u8,
     source: mcp_contract.ConfigSource,
     scope: mcp_contract.ConfigScope,
+    mod_name: ?[]u8 = null,
     workspace_admission: ?mcp_contract.WorkspaceAdmission = null,
     required: bool,
     transport: mcp_contract.McpTransport,
 
     pub fn deinit(self: *ConfiguredServerSnapshot, alloc: Allocator) void {
         alloc.free(self.configured_name);
+        if (self.mod_name) |mod_name| alloc.free(mod_name);
         self.* = undefined;
     }
 };

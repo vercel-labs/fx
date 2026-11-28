@@ -382,6 +382,11 @@ pub fn Handlers(comptime App: type) type {
                     };
                 }
             }
+            if (comptime @hasDecl(App, "takeModMcpReload") and @hasDecl(App, "requestMcpHostReload")) {
+                if (app.takeModMcpReload()) {
+                    app.requestMcpHostReload();
+                }
+            }
         }
 
         pub fn collectShellSnapshotFacts(app: *App) !void {
