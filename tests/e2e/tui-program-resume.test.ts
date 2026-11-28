@@ -464,7 +464,7 @@ test.skipIf(!tmuxAvailable())(
       await session.waitForStableComposer(TIMEOUT);
 
       await session.sendText(SECOND_PROMPT);
-      await session.waitForPane((pane) => pane.includes(SECOND_ANSWER) && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd(SECOND_ANSWER, TIMEOUT);
       await session.sendKeys("C-o");
       await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await session.waitForText(PROBE_EXIT_LINE, TIMEOUT);

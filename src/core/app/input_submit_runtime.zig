@@ -72,7 +72,7 @@ fn buildPendingPromptDraft(
     };
 }
 
-const restart_held_submit_notice = "fx restarts for the upgrade once the running turns stop and the prompt is empty; send this after the restart";
+const restart_held_submit_notice = "fx restarts for the update once the running turns stop and the prompt is empty; send this after the restart";
 
 /// What a prompt sent while fx waits to restart for an upgrade gets. Ctrl+G
 /// cancels a restart only while it waits for its turns, not once the held
@@ -662,7 +662,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (app.upgrader.restart != .none and !submitsQuit(app)) {
                     debug_trace.logf("input", "submit held reason=upgrade_restart_waits input_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
                     try app.writeDomainNotice(.{
-                        .topic = "upgrade",
+                        .topic = "update",
                         .tone = .neutral,
                         .body = restartHeldSubmitNotice(app.upgrader.restart == .waiting),
                     }, true);
