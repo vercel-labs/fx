@@ -2063,8 +2063,8 @@ const App = struct {
         return self.mcp.takeHostNotices();
     }
 
-    pub fn takeStartupTrustNotice(self: *App) ?[]const u8 {
-        return self.mcp.takeStartupTrustNotice();
+    pub fn takeStartupTrustNotice(self: *App) Allocator.Error!?[]const u8 {
+        return self.mcp.takeStartupTrustNotice(self.alloc, self.workspace_root);
     }
 
     pub fn refreshMcpCompletion(self: *App) void {

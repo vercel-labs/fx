@@ -1800,6 +1800,45 @@ describe.skipIf(!tmuxAvailable())("tui: a new folder opens straight to the compo
   );
 
   test(
+    "/trust in a folder without .mcp.json servers saves nothing",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-trust-no-servers-")));
+      const home = realpathSync(createIsolatedTestHome());
+      const repo = join(root, "repo");
+      const stderrPath = join(root, "stderr.log");
+      const settingsPath = join(home, ".fx", "settings.json");
+      mkdirSync(repo);
+      execFileSync("git", ["init"], { cwd: repo, stdio: "pipe" });
+      const repoKey = realpathSync(repo);
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await startTrustSession(repo, home, stderrPath);
+        await session.waitForComposer(15_000);
+        const grid = await session.capturePaneGrid();
+        expect(grid.join("\n")).not.toContain("This repo contains .mcp.json");
+
+        await session.sendText("/trust");
+        await session.waitForText("This folder's .mcp.json has no servers to trust.", 15_000);
+        expect(trustSaved(settingsPath, repoKey)).toBe(false);
+        if (existsSync(settingsPath)) {
+          const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+          expect(settings.workspaces?.[repoKey]?.enableAllProjectMcpServers).toBeUndefined();
+        }
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "Ctrl+C exits at startup",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-trust-ctrl-c-")));

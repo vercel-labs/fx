@@ -372,7 +372,7 @@ pub fn Handlers(comptime App: type) type {
             // A reload that fails leaves its warning among the notices.
             app.applyMcpHostReload(agent);
             if (comptime runtime_profile.allows(App, .mcp) and @hasDecl(App, "takeStartupTrustNotice")) {
-                if (app.takeStartupTrustNotice()) |notice| {
+                if (try app.takeStartupTrustNotice()) |notice| {
                     try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = notice }, true);
                 }
             }
@@ -2980,7 +2980,7 @@ test "collectMcpHostFacts emits startup trust notice once with empty topic when 
 
         pub fn applyMcpHostReload(_: *@This(), _: anytype) void {}
 
-        pub fn takeStartupTrustNotice(self: *@This()) ?[]const u8 {
+        pub fn takeStartupTrustNotice(self: *@This()) std.mem.Allocator.Error!?[]const u8 {
             const out = self.pending_trust;
             self.pending_trust = null;
             return out;
@@ -3062,7 +3062,47 @@ test "trustFolder reloads host and writes neutral notice on success, and warning
     try std.testing.expectEqual(@as(usize, 1), app.reloaded);
     try std.testing.expectEqualStrings("mcp", app.notice_topic.?);
     try std.testing.expectEqual(types.NoticeTone.warning, app.notice_tone.?);
-    try std.testing.expectEqualStrings("Couldn't trust this folder: permission denied", app.notice_body.items);
+    try std.testing.expectEqualStrings(
+        "Couldn't trust this folder: permission denied. Check that ~/.fx/settings.json is writable, then run /trust again.",
+        app.notice_body.items,
+    );
+
+    try app_mcp_runtime.writeTrustRefusal(&app, .special_folder);
+    try std.testing.expectEqual(@as(usize, 1), app.reloaded);
+    try std.testing.expectEqualStrings("mcp", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
+    try std.testing.expectEqualStrings(
+        "fx doesn't trust this folder as a whole. Approve one server with /mcp approve NAME.",
+        app.notice_body.items,
+    );
+
+    try app_mcp_runtime.writeTrustRefusal(&app, .no_servers);
+    try std.testing.expectEqual(@as(usize, 1), app.reloaded);
+    try std.testing.expectEqualStrings("mcp", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
+    try std.testing.expectEqualStrings(
+        "This folder's .mcp.json has no servers to trust.",
+        app.notice_body.items,
+    );
+}
+
+test "trustRefusal blocks root, home parents, and profile folders, and requires a workspace server" {
+    const ws_only = [_]test_mcp_config.Server{testServer(.workspace, .waiting_for_approval)};
+    const profile_only = [_]test_mcp_config.Server{testServer(.profile, null)};
+    const home = "/Users/example";
+    const profile = "/Users/example/.fx";
+
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("/", home, profile, &ws_only).?);
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("///", home, profile, &ws_only).?);
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("/Users", home, profile, &ws_only).?);
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("/Users/", "/Users/example/", profile, &ws_only).?);
+    try std.testing.expectEqual(@as(?app_mcp_runtime.TrustRefusal, null), app_mcp_runtime.trustRefusal("/Users/example", home, profile, &ws_only));
+    try std.testing.expectEqual(@as(?app_mcp_runtime.TrustRefusal, null), app_mcp_runtime.trustRefusal("/Users/example/", home, profile, &ws_only));
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("/Users/example/.fx", home, profile, &ws_only).?);
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("/Users/example/.fx/x", home, profile, &ws_only).?);
+    try std.testing.expectEqual(@as(?app_mcp_runtime.TrustRefusal, null), app_mcp_runtime.trustRefusal("/Users/example2", home, profile, &ws_only));
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.no_servers, app_mcp_runtime.trustRefusal("/Users/example/repo", home, profile, &profile_only).?);
+    try std.testing.expectEqual(@as(?app_mcp_runtime.TrustRefusal, null), app_mcp_runtime.trustRefusal("/Users/example/repo", home, profile, &ws_only));
 }
 
 fn testServer(source: test_mcp_contract.ConfigSource, held: ?test_mcp_config.Held) test_mcp_config.Server {
@@ -3140,14 +3180,54 @@ test "takeStartupTrustNotice emits once on first load and never repeats on reloa
     defer state.deinit();
 
     try state.loadHost(Loader.load, alloc, home, root, registry, .{});
-    const first = state.takeStartupTrustNotice() orelse return error.TestExpectedEqual;
+    const first = (try state.takeStartupTrustNotice(alloc, root)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings(
         "This repo contains .mcp.json – it's ignored until you trust this folder. Run /trust.",
         first,
     );
-    try std.testing.expectEqual(@as(?[]const u8, null), state.takeStartupTrustNotice());
+    try std.testing.expectEqual(@as(?[]const u8, null), try state.takeStartupTrustNotice(alloc, root));
 
     state.host_reload_requested.store(true, .release);
     try std.testing.expect(state.refreshHost(alloc, home, root, registry, .requested));
-    try std.testing.expectEqual(@as(?[]const u8, null), state.takeStartupTrustNotice());
+    try std.testing.expectEqual(@as(?[]const u8, null), try state.takeStartupTrustNotice(alloc, root));
+}
+
+test "takeStartupTrustNotice stays silent in a special folder" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    const Loader = struct {
+        fn load(a: std.mem.Allocator, ws: []const u8, builtins: test_tool_dispatch.Registry, extras: test_mcp_host.Extras) anyerror!?*test_mcp_host.Host {
+            _ = extras;
+            var env = std.process.Environ.Map.init(a);
+            defer env.deinit();
+            const configs = [_]test_mcp_contract.McpServerConfig{.{
+                .name = "project",
+                .source = .workspace,
+                .scope = .workspace,
+                .transport = .stdio,
+                .command = "node",
+                .workspace_admission = .pending,
+            }};
+            return try test_mcp_host.Host.create(a, io_mod.getIo(), &configs, &env, .{
+                .client_version = "test",
+                .credentials = .{ .detect = ws },
+                .workspace_root = ws,
+            }, builtins);
+        }
+    };
+
+    const registry: test_tool_dispatch.Registry = .{ .tools = &.{} };
+    var state: app_mcp_runtime.State = .{};
+    defer state.deinit();
+
+    try state.loadHost(Loader.load, alloc, home, root, registry, .{});
+    try std.testing.expectEqual(@as(?[]const u8, null), try state.takeStartupTrustNotice(alloc, "/"));
 }

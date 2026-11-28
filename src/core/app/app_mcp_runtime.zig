@@ -1164,8 +1164,9 @@ pub const State = struct {
     }
 
     /// Returns the one-time startup notice when the first loaded config holds
-    /// at least one project server for approval; null on every later check.
-    pub fn takeStartupTrustNotice(self: *State) ?[]const u8 {
+    /// at least one project server for approval in a trustable folder; null on
+    /// every later check or in a special folder.
+    pub fn takeStartupTrustNotice(self: *State, alloc: Allocator, workspace_root: []const u8) Allocator.Error!?[]const u8 {
         if (self.trust_line_checked) return null;
         const lease = self.leaseHost() orelse {
             if (self.host_load != null) self.trust_line_checked = true;
@@ -1173,12 +1174,95 @@ pub const State = struct {
         };
         defer lease.deinit();
         self.trust_line_checked = true;
-        if (!needsTrustLine(lease.host.runtime.servers())) return null;
+        const servers = lease.host.runtime.servers();
+        if (!needsTrustLine(servers)) return null;
+        var paths = try resolveTrustPaths(alloc);
+        defer paths.deinit(alloc);
+        if (trustRefusal(workspace_root, paths.home, paths.profile_root, servers) != null) return null;
         return startup_trust_notice;
     }
 };
 
 pub const startup_trust_notice = "This repo contains .mcp.json – it's ignored until you trust this folder. Run /trust.";
+
+pub const TrustRefusal = enum { special_folder, no_servers };
+
+pub fn trustRefusal(
+    workspace_root: []const u8,
+    home: ?[]const u8,
+    profile_root: ?[]const u8,
+    servers: []const mcp_config.Server,
+) ?TrustRefusal {
+    const ws = trimTrailingSlashes(workspace_root);
+    if (std.mem.eql(u8, ws, "/")) return .special_folder;
+    if (home) |h| {
+        if (isStrictParent(ws, trimTrailingSlashes(h))) return .special_folder;
+    }
+    if (profile_root) |p| {
+        if (isSameOrInside(trimTrailingSlashes(p), ws)) return .special_folder;
+    }
+    for (servers) |s| {
+        if (s.source == .workspace) return null;
+    }
+    return .no_servers;
+}
+
+fn trimTrailingSlashes(path: []const u8) []const u8 {
+    if (path.len == 0) return "";
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    return if (trimmed.len == 0) "/" else trimmed;
+}
+
+fn isSameOrInside(root: []const u8, candidate: []const u8) bool {
+    if (root.len == 0 or candidate.len == 0) return false;
+    if (std.mem.eql(u8, root, "/")) return candidate[0] == '/';
+    if (std.mem.eql(u8, root, candidate)) return true;
+    return candidate.len > root.len and
+        std.mem.startsWith(u8, candidate, root) and
+        candidate[root.len] == '/';
+}
+
+fn isStrictParent(parent: []const u8, child: []const u8) bool {
+    if (std.mem.eql(u8, parent, child)) return false;
+    return isSameOrInside(parent, child);
+}
+
+const TrustPaths = struct {
+    home: ?[]u8 = null,
+    profile_root: ?[]u8 = null,
+
+    fn deinit(self: TrustPaths, alloc: Allocator) void {
+        if (self.home) |h| alloc.free(h);
+        if (self.profile_root) |p| alloc.free(p);
+    }
+};
+
+fn realpathOrFallback(alloc: Allocator, path: []const u8) Allocator.Error![]u8 {
+    return io_mod.realpathAlloc(alloc, path) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => alloc.dupe(u8, path),
+    };
+}
+
+fn resolveTrustPaths(alloc: Allocator) Allocator.Error!TrustPaths {
+    const home = if (io_mod.homeDir()) |h| try realpathOrFallback(alloc, h) else null;
+    errdefer if (home) |h| alloc.free(h);
+
+    const raw_profile = (try profile_paths.activeRoot(alloc, home)) orelse {
+        return .{ .home = home, .profile_root = null };
+    };
+    defer alloc.free(raw_profile);
+
+    const profile_root = io_mod.realpathAlloc(alloc, raw_profile) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => blk: {
+            const real_parent = try realpathOrFallback(alloc, profile_paths.rootParent(home orelse ""));
+            defer alloc.free(real_parent);
+            break :blk try std.Io.Dir.path.join(alloc, &.{ real_parent, profile_paths.rootName() });
+        },
+    };
+    return .{ .home = home, .profile_root = profile_root };
+}
 
 pub fn needsTrustLine(servers: []const mcp_config.Server) bool {
     for (servers) |s| {
@@ -1188,7 +1272,30 @@ pub fn needsTrustLine(servers: []const mcp_config.Server) bool {
 }
 
 pub fn trustFolder(app: anytype) !void {
+    const refusal = blk: {
+        const lease = app.mcp.leaseHost();
+        defer if (lease) |l| l.deinit();
+        const servers: []const mcp_config.Server = if (lease) |l| l.host.runtime.servers() else &.{};
+        var paths = try resolveTrustPaths(app.alloc);
+        defer paths.deinit(app.alloc);
+        break :blk trustRefusal(app.workspace_root, paths.home, paths.profile_root, servers);
+    };
+    if (refusal) |r| {
+        try writeTrustRefusal(app, r);
+        return;
+    }
     try trustFolderWithAttempt(app, config_runtime.attemptProjectMcpMutation(app.alloc, app.workspace_root, .approve_all));
+}
+
+pub fn writeTrustRefusal(app: anytype, refusal: TrustRefusal) !void {
+    try app.writeDomainNotice(.{
+        .topic = "mcp",
+        .tone = .neutral,
+        .body = switch (refusal) {
+            .special_folder => "fx doesn't trust this folder as a whole. Approve one server with /mcp approve NAME.",
+            .no_servers => "This folder's .mcp.json has no servers to trust.",
+        },
+    }, true);
 }
 
 pub fn trustFolderWithAttempt(app: anytype, attempt_value: config_runtime.CommitAttempt) !void {
@@ -1197,7 +1304,10 @@ pub fn trustFolderWithAttempt(app: anytype, attempt_value: config_runtime.Commit
     switch (attempt) {
         .failure => |f| {
             debug_trace.logf("mcp", "MCP trust folder failed reason={s}", .{@errorName(f.err)});
-            const message = try app.alloc.print("Couldn't trust this folder: {s}", .{mcp_verbs.describe(f.err)});
+            const message = try app.alloc.print(
+                "Couldn't trust this folder: {s}. Check that {s} is writable, then run /trust again.",
+                .{ mcp_verbs.describe(f.err), profile_paths.displayText("~/.fx/settings.json") },
+            );
             defer app.alloc.free(message);
             try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = message }, true);
             return;

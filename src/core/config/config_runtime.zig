@@ -1257,7 +1257,7 @@ pub fn attemptProjectMcpMutation(
 }
 
 /// Like attemptProjectMcpMutation, for callers and tests with an explicit home.
-pub fn attemptProjectMcpMutationInHome(
+fn attemptProjectMcpMutationInHome(
     alloc: Allocator,
     home: []const u8,
     workspace_root: []const u8,
