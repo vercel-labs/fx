@@ -120,14 +120,17 @@ Close(c, s) ==
     /\ UNCHANGED <<exists, st, owner, saved, deleted, ver, chan, subs, seen, hinted,
                    refused, badOrder, turns, changes>>
 
-\* session/prompt on an idle session starts a turn.
+\* session/prompt on an idle session starts a turn. The first prompt also saves
+\* the session, so its folder's list changes when the turn starts.
 Prompt(c, s) ==
     /\ s \in open[c] /\ st[s] = "idle" /\ turns < MaxTurns
     /\ st' = [st EXCEPT ![s] = "running"]
     /\ owner' = [owner EXCEPT ![s] = c]
     /\ turns' = turns + 1
-    /\ Write(s, "running", "none", FALSE)
-    /\ UNCHANGED <<exists, open, saved, deleted, ver, view, subs, seen, hinted,
+    /\ ver' = IF saved[s] THEN ver ELSE [ver EXCEPT ![FolderOf[s]] = @ + 1]
+    /\ saved' = [saved EXCEPT ![s] = TRUE]
+    /\ Write(s, "running", "none", ~saved[s])
+    /\ UNCHANGED <<exists, open, deleted, view, subs, seen, hinted,
                    refused, badOrder, changes>>
 
 \* An update of the running turn, such as a message chunk, to every
@@ -194,12 +197,17 @@ List(c, f) ==
             /\ refused' = FALSE
     /\ UNCHANGED <<exists, open, st, owner, saved, deleted, ver, chan, view, badOrder, turns, changes>>
 
+\* fx knows session s: it was created, is not deleted, and is saved or held.
+Known(s) == exists[s] /\ ~deleted[s] /\ (saved[s] \/ Held(s))
+\* The status and state that session/status reports for a known session.
+StatusOf(s) == IF Held(s) THEN "open" ELSE "saved"
+StateOf(s) == IF Held(s) THEN st[s] ELSE "none"
+
 \* What session/status should answer for session s.
 Truth(s) ==
-    IF ~exists[s] \/ deleted[s] \/ (~saved[s] /\ ~Held(s))
+    IF ~Known(s)
     THEN [kind |-> "unknown", status |-> "none", state |-> "none"]
-    ELSE [kind |-> "ok", status |-> IF Held(s) THEN "open" ELSE "saved",
-          state |-> IF Held(s) THEN st[s] ELSE "none"]
+    ELSE [kind |-> "ok", status |-> StatusOf(s), state |-> StateOf(s)]
 
 \* What fx answers.
 Answer(c, s) ==
@@ -262,6 +270,12 @@ ListAnswered == ~refused
 
 \* A session/status request that any connection sends now gets what is true.
 \* fx's answer depends only on the current state, so checking it in every
-\* state checks every request.
-StatusTruthful == \A c \in Conns, s \in Sessions : Answer(c, s) = Truth(s)
+\* state checks every request. The check compares each answer with the rule's
+\* status and state, not with Truth, so a wrong Truth fails it too.
+StatusTruthful ==
+    \A c \in Conns, s \in Sessions :
+        LET a == Answer(c, s) IN
+        IF Known(s)
+        THEN a.kind = "ok" /\ a.status = StatusOf(s) /\ a.state = StateOf(s)
+        ELSE a.kind = "unknown"
 =============================================================================

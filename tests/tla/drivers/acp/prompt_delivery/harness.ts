@@ -130,6 +130,8 @@ export class Fixture {
   readonly holds: Hold[] = [];
   readonly processes: Array<{ exit: number; stderr: string }> = [];
   acp: Acp | null = null;
+  /// Other fx processes on this home, started by startPeer.
+  readonly peers: Acp[] = [];
   private gateway: any = null;
   private tools = 0;
 
@@ -197,6 +199,19 @@ export class Fixture {
   }
 
   async start(init: Record<string, unknown> = { protocolVersion: 1 }): Promise<Acp> {
+    this.acp = await this.spawnAcp(init);
+    return this.acp;
+  }
+
+  /// Starts another `fx acp` on this home. It reads the session index that the
+  /// first process writes, as a second window does.
+  async startPeer(init: Record<string, unknown> = { protocolVersion: 1 }): Promise<Acp> {
+    const peer = await this.spawnAcp(init);
+    this.peers.push(peer);
+    return peer;
+  }
+
+  private async spawnAcp(init: Record<string, unknown>): Promise<Acp> {
     const env = testEnvironment({
       NO_COLOR: "1",
       HOME: this.home,
@@ -209,13 +224,13 @@ export class Fixture {
       FX_TRACE_LOG: this.traceLog,
       FX_TRACE_SCOPES: "acp",
     });
-    this.acp = new Acp(
+    const acp = new Acp(
       Bun.spawn([this.fxBin, "acp"], { cwd: this.workspace, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" }),
       (entry) => this.acpLog.push(entry),
     );
-    const initialized = await this.acp.request("initialize", init);
+    const initialized = await acp.request("initialize", init);
     if (initialized.error) throw new Error(`initialize failed: ${JSON.stringify(initialized.error)}`);
-    return this.acp;
+    return acp;
   }
 
   async dispose() {
@@ -223,6 +238,7 @@ export class Fixture {
     for (let n = 1; n <= this.tools; n += 1) writeFileSync(this.toolFiles(n).go, "");
     for (const hold of this.holds) hold.end("final");
     if (this.acp) this.processes.push(await this.acp.close());
+    for (const peer of this.peers) this.processes.push(await peer.close());
     this.acp = null;
     this.gateway?.stop();
     rmSync(this.root, { recursive: true, force: true });
