@@ -1663,7 +1663,9 @@ pub fn Runtime(comptime App: type) type {
                         // composer; it closes first and gives back the draft
                         // it set aside, so the rule below sees the real draft.
                         if (comptime @hasDecl(@TypeOf(app.input_runtime), "cancelEffortMenu")) {
-                            _ = app.input_runtime.cancelEffortMenu(app.alloc, "failed_prompt_restored");
+                            if (app.input_runtime.cancelEffortMenu(app.alloc, "failed_prompt_restored")) {
+                                app.shell.render_requests.request(.footer);
+                            }
                         }
                         // Never clobber a draft the user typed while the doomed
                         // turn was still retrying; only an empty composer gets
