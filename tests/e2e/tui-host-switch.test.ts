@@ -2603,7 +2603,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "a prompt on a subagent's screen says its sign-in refresh failed after main's screen showed the same failure",
+    "a prompt on a subagent's screen says its sign-in refresh failed after main's screen showed the same failure, and main's screen does not say it again",
     async () => {
       // A failed refresh of the saved login parks the prompt until the person
       // retries or signs in. Main's screen already told the person once; the
@@ -2643,6 +2643,21 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           );
           expect(pane).toContain("press enter to retry. Your prompt is saved.");
           expect(subagentAsked.some((asked) => asked.includes("SWITCH_ROAD_PROMPT"))).toBe(false);
+
+          // Back on main, a new prompt meets the same failure: main's screen
+          // already showed it, so it gets no second copy.
+          const dropped = () => traceText().split("reason=ctrl_c_pending_submission").length - 1;
+          const waiting = () => traceText().split("pending_prompt_awaiting_auth").length - 1;
+          const droppedBefore = dropped();
+          await session.sendKeys("C-c");
+          await until("the roadmap prompt dropped", () => dropped() > droppedBefore, 15_000);
+          await showAgent(session, "main");
+          const waitingBefore = waiting();
+          await session.sendText("SWITCH_MAIN_AGAIN");
+          await until("main's new prompt waits", () => waiting() > waitingBefore, 30_000);
+          await session.waitForPane((shown) => shown.includes("SWITCH_MAIN_AGAIN"), 15_000);
+          const mainScreen = await session.captureFullScrollback();
+          expect(mainScreen.split("credential refresh failed").length - 1).toBe(1);
         }, (home) => writeFxLogin(home, issuer.issuerUrl, "seeded-token"), false, {
           FX_DISABLE_KEYCHAIN: "1",
           FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,

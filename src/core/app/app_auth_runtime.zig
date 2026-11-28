@@ -2781,7 +2781,7 @@ const TestAuth = struct {
     logout_reconcile_count: usize = 0,
     source_inventory_refresh_count: usize = 0,
     credential_failure: ?auth_runtime.CredentialFailure = null,
-    credential_notice_screen: ?auth_runtime.NoticeScreen = null,
+    credential_notice_screens: auth_runtime.NoticeScreens = .{},
     picker_opened: bool = false,
     picker_provider: model_provider.ProviderId = .gateway,
     picker_closed: bool = false,
@@ -3025,10 +3025,10 @@ const TestAuth = struct {
             false;
         if (!same_failure) {
             self.credential_failure = failure;
-            self.credential_notice_screen = null;
+            self.credential_notice_screens = .{};
         }
-        if (!options.notify or self.credential_notice_screen == options.screen) return false;
-        self.credential_notice_screen = options.screen;
+        if (!options.notify or self.credential_notice_screens.contains(options.screen)) return false;
+        self.credential_notice_screens.add(options.screen);
         return true;
     }
 
