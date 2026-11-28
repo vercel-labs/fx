@@ -98,9 +98,12 @@ fn listedModelCount(p: Projection) usize {
 }
 
 fn listedModelAt(p: Projection, display_index: usize) ?ModelRow {
-    const models = rawModels(p);
-    const raw_index = modelFilter(p).at(display_index) orelse return null;
-    return models[raw_index];
+    // Borrows `p.snapshot` for lookup without taking ownership.
+    const state: usage_menu.State = .{
+        .period = p.period,
+        .snapshot = if (p.snapshot) |s| s.* else null,
+    };
+    return state.filteredModelAt(p.query, display_index);
 }
 
 fn clampedSelectedModel(p: Projection, count: usize) usize {
@@ -564,7 +567,7 @@ fn composeHeading(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(
             defer right.deinit(alloc);
             if (plan.account_room > 0) {
                 try right.appendSlice(alloc, ui_render.dim_style);
-                try row_text.appendSingleLineMiddleEllipsized(alloc, &right, account, plan.account_room);
+                try row_text.appendSingleLineEllipsized(alloc, &right, account, plan.account_room);
                 if (plan.show_status) try right.appendSlice(alloc, " · ");
                 try right.appendSlice(alloc, ui_render.reset_style);
             }
@@ -2690,7 +2693,7 @@ test "the usage dashboard matches the catalog header, period tabs, selection sty
     var at_80 = try draw(p, 80, 40);
     defer at_80.deinit();
     try testing.expectEqualStrings(
-        "Usage 14  today  7d  [month]  acme-design-tool…tform (fx login) · updated 2m ago",
+        "Usage 14  today  7d  [month]  acme-design-tools-platform (fx l… · updated 2m ago",
         at_80.row(0),
     );
     try testing.expectEqualStrings("period        spent  requests  tokens", at_80.row(2));
@@ -2732,7 +2735,7 @@ test "the usage dashboard matches the catalog header, period tabs, selection sty
     var filtered_80 = try draw(filtered_proj, 80, 40);
     defer filtered_80.deinit();
     try testing.expectEqualStrings(
-        "Usage 4  today  7d  [month]  acme-design-tools…tform (fx login) · updated 2m ago",
+        "Usage 4  today  7d  [month]  acme-design-tools-platform (fx lo… · updated 2m ago",
         filtered_80.row(0),
     );
     try testing.expectEqualStrings("period        spent  requests  tokens", filtered_80.row(2));
@@ -2759,7 +2762,7 @@ test "the usage dashboard matches the catalog header, period tabs, selection sty
     var empty_match = try draw(.{ .active = true, .query = "zzz", .snapshot = &snapshot }, 80, 40);
     defer empty_match.deinit();
     try testing.expectEqualStrings(
-        "Usage 0  today  7d  [month]  acme-design-tools…tform (fx login) · updated 2m ago",
+        "Usage 0  today  7d  [month]  acme-design-tools-platform (fx lo… · updated 2m ago",
         empty_match.row(0),
     );
     try testing.expectEqualStrings("  No matching models", empty_match.row(8));
@@ -2891,4 +2894,19 @@ test "header shows account before freshness at 80 cols, ellipsizes or drops it b
     var gk_30 = try draw(gk_proj, 30, 40);
     defer gk_30.deinit();
     try testing.expectEqualStrings("Usage 2       updated just now", gk_30.row(0));
+
+    // Long Codex profile name cuts at the end so the start stays readable and freshness stays whole.
+    var long_codex_usage = test_business;
+    var long_profile = test_profile;
+    long_profile.name = "Alexandria Quintessa Vandermeer-Okonkwo";
+    long_codex_usage.profile = long_profile;
+    var long_cx = try codexSnapshot(.ready, long_codex_usage);
+    defer long_cx.deinit();
+    long_cx.codex_at_ms = test_now;
+    var long_cx_80 = try draw(.{ .active = true, .snapshot = &long_cx }, 80, 40);
+    defer long_cx_80.deinit();
+    try testing.expectEqualStrings(
+        "Usage 9  today  7d  [month]  codex (ChatGPT), Alexandria Qui… · updated just now",
+        long_cx_80.row(0),
+    );
 }

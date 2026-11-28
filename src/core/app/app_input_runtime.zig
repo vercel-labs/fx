@@ -1,6 +1,7 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const ctrl_r_byte: u8 = 18;
 const file_picker_path = @import("../input/file_picker_path.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const wait_card = @import("../agent/wait_card.zig");
@@ -1569,7 +1570,7 @@ pub fn Runtime(comptime App: type) type {
                         }
                     }
                 },
-                18 => {
+                ctrl_r_byte => {
                     if (usageMenuActive(app)) {
                         if (comptime runtime_profile.allows(App, .profile_usage)) {
                             try reloadUsageMenu(app, app.input_runtime.usage_menu.period);
@@ -3341,6 +3342,7 @@ pub fn Runtime(comptime App: type) type {
             const query = app.input_runtime.edit_state.input.items;
             if (query.len > 0) {
                 const prev_name = app.input_runtime.usage_menu.selectedModelName(query);
+                debug_trace.logf("input", "usage search cleared bytes={d} reason=esc", .{query.len});
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
                 app.input_runtime.usage_menu.preserveSelectionAfterQueryClear(prev_name);

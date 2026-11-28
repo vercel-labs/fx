@@ -20,7 +20,7 @@ pub fn modelFilter(models: []const usage.report.ModelRow, query: []const u8) fuz
     return .init(.{ .models = models, .query = query }, models.len);
 }
 
-pub const ShareMatches = struct {
+const ShareMatches = struct {
     shares: []const usage.codex.Share,
     query: []const u8,
 
@@ -29,11 +29,11 @@ pub const ShareMatches = struct {
     }
 };
 
-pub fn codexModelFilter(shares: []const usage.codex.Share, query: []const u8) fuzzy_match.Filter(ShareMatches) {
+fn codexModelFilter(shares: []const usage.codex.Share, query: []const u8) fuzzy_match.Filter(ShareMatches) {
     return .init(.{ .shares = shares, .query = query }, shares.len);
 }
 
-pub const ProductMatches = struct {
+const ProductMatches = struct {
     products: []const usage.grok.Product,
     query: []const u8,
 
@@ -174,11 +174,11 @@ pub const State = struct {
         return true;
     }
 
-    pub fn listedModels(self: *const State) []const usage.report.ModelRow {
+    fn listedModels(self: *const State) []const usage.report.ModelRow {
         return if (self.snapshot) |*s| s.of(self.period).models else &.{};
     }
 
-    pub fn filteredModelCount(self: *const State, query: []const u8) usize {
+    fn filteredModelCount(self: *const State, query: []const u8) usize {
         return modelFilter(self.listedModels(), query).count();
     }
 

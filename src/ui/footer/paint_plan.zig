@@ -839,17 +839,7 @@ pub fn composeFooterFrame(
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
         } else if (input.picker_kind == .usage and ctx.usage_menu.active) {
-            var menu_row_index: u16 = 0;
-            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
-                var menu_row = try usage_presentation.composeRow(
-                    alloc,
-                    ctx.usage_menu,
-                    menu_row_index,
-                    input.picker_rows,
-                    shell.layout.cols,
-                );
-                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
-            }
+            try composeAndPushUsageMenuRows(alloc, &frame, plan, rows.picker_start, input.picker_rows, shell.layout.cols, ctx.usage_menu);
         } else if (input.picker_kind == .skills and ctx.skills_menu.active) {
             var prepared = try skills_menu_presentation.prepareInlineSkillsMenu(
                 alloc,
@@ -1161,6 +1151,22 @@ fn composeAndPushVisibleInputRows(
         line_idx += 1;
     }
     return placement;
+}
+
+fn composeAndPushUsageMenuRows(
+    alloc: Allocator,
+    frame: *footer_viewport.ComposedFooterFrame,
+    plan: PaintPlan,
+    picker_start: u16,
+    picker_rows: u16,
+    cols: u16,
+    usage_menu: usage_presentation.Projection,
+) !void {
+    var menu_row_index: u16 = 0;
+    while (menu_row_index < picker_rows) : (menu_row_index += 1) {
+        var menu_row = try usage_presentation.composeRow(alloc, usage_menu, menu_row_index, picker_rows, cols);
+        try pushFooterBandRow(alloc, frame, plan, picker_start + menu_row_index, &menu_row);
+    }
 }
 
 fn pushFooterBandRow(
