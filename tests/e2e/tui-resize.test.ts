@@ -4257,13 +4257,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.sendText(
         "first medium width turn with enough words to wrap the user card before resize",
       );
-      await session.waitForText(firstMarker, TIMEOUT);
-      await session.waitForPane(turnSettled, TIMEOUT);
+      await session.waitForReplyAndTurnEnd(firstMarker, TIMEOUT);
       await session.sendText(
         "second medium width turn with enough words to wrap the user card before resize",
       );
-      await session.waitForText(secondMarker, TIMEOUT);
-      await session.waitForPane(turnSettled, TIMEOUT);
+      await session.waitForReplyAndTurnEnd(secondMarker, TIMEOUT);
       await session.waitForStableComposer(10_000);
       await waitForGatewayRequestCount(gateway, 2);
 

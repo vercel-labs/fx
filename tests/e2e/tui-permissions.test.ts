@@ -1743,10 +1743,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const { session, stderrPath } = await launch(root, gateway);
 
       await session.sendText("Attempt the requested edit once.");
-      const settled = await session.waitForPane(
-        (pane) => pane.includes("edit failure handled") && turnSettled(pane),
-        TIMEOUT,
-      );
+      const settled = await session.waitForReplyAndTurnEnd("edit failure handled", TIMEOUT);
       const scrollback = await session.captureFullScrollback();
 
       expect(scrollback).toContain("old_string not found in file");
@@ -1773,10 +1770,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const { session, stderrPath } = await launch(root, gateway);
 
       await session.sendText("Search the generated map once.");
-      const settled = await session.waitForPane(
-        (pane) => pane.includes("search failure handled") && turnSettled(pane),
-        TIMEOUT,
-      );
+      const settled = await session.waitForReplyAndTurnEnd("search failure handled", TIMEOUT);
       const scrollback = await session.captureFullScrollback();
 
       expect(scrollback).toContain(
