@@ -2569,8 +2569,9 @@ pub const UpgradeSnapshot = struct {
                 }
             },
             .up_to_date => {
-                // fx refuses a dev build with a lower build number even when its commit
-                // differs, so the line names the running build, not the manifest's.
+                // fx refuses an older target, a dev build with a lower build number
+                // or a stable release with a lower version, so the line names the
+                // running build, not the target's.
                 const running_known = self.current_revision.len > 0;
                 const revision = if (running_known) self.current_revision else self.latest_revision;
                 const version = if (running_known) self.current else self.latest;
@@ -2579,7 +2580,7 @@ pub const UpgradeSnapshot = struct {
                     try writeVersionWithPrefix(&out.writer, version);
                 } else {
                     try out.writer.writeAll("fx is already up to date (");
-                    try writeVersionWithPrefix(&out.writer, self.latest);
+                    try writeVersionWithPrefix(&out.writer, if (self.current.len > 0) self.current else self.latest);
                 }
                 try out.writer.writeAll(")\n");
             },
@@ -4380,7 +4381,16 @@ test "core upgrade snapshot renders errors and statuses" {
 
     const up_to_date_text = try up_to_date.renderText(std.testing.allocator);
     defer std.testing.allocator.free(up_to_date_text);
-    try std.testing.expectEqualStrings("fx is already up to date (v0.2.10)\n", up_to_date_text);
+    try std.testing.expectEqualStrings("fx is already up to date (v0.2.9)\n", up_to_date_text);
+
+    // A refused older stable release names the running version.
+    const older_text = try (UpgradeSnapshot{
+        .current = "0.0.2",
+        .latest = "0.0.1",
+        .status = .up_to_date,
+    }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(older_text);
+    try std.testing.expectEqualStrings("fx is already up to date (v0.0.2)\n", older_text);
 
     const failed_text = try (UpgradeSnapshot{
         .current = "0.2.9",
