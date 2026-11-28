@@ -4,6 +4,7 @@ const observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_admission = @import("../permissions/command_admission.zig");
+const sandbox_policy = @import("../runner/runner.zig");
 const core_permissions = @import("../permissions/permissions.zig");
 const core_types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -245,12 +246,24 @@ pub const RunCommandBackend = struct {
     }
 };
 
+/// The tool context's values that remote setup reads for a shell run. The
+/// session key is null unless setup is allowed, and the turn id scopes a decline mark.
+pub const RemoteSetupContext = struct {
+    allowed: bool = false,
+    session_key: ?[]const u8 = null,
+    turn_id: u64 = 0,
+};
+
 /// Context shared by core tool dispatch, validation, and execution.
 pub const DispatchContext = struct {
     allocator: Allocator,
     permission_mode: permission_gate.PermissionMode = .ask,
     permission_decider: ?PermissionDecider = null,
     execution_authority: ?command_admission.ToolExecutionAuthority = null,
+    /// The sandbox policy a shell run is placed with. Null runs every command here.
+    sandbox_policy: ?*const sandbox_policy.Policy = null,
+    /// What a remote run needs to set up remote. The default fails closed: no setup, so a run that needs it is refused (E10).
+    remote_setup: RemoteSetupContext = .{},
     workspace_root: []const u8 = "",
     access_scope: ?workspace_access.AccessScope = null,
     ignored_list_entries: []const []const u8 = &default_ignored_list_entries,
@@ -318,7 +331,6 @@ pub const DispatchContext = struct {
     mcp_access_changed: ?tool_mcp_runtime.AccessChangedFn = null,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     mcp_call_options: tool_mcp_runtime.CallOptions = .{},
-    mcp_call_status_sink: ?*?tool_mcp_runtime.CallStatus = null,
     mcp_execution_error_sink: ?*?anyerror = null,
     /// Lent to `fx mcp call` while this tool call runs; see
     /// `mcp_call_capability.zig`. Only the shell tool uses it.

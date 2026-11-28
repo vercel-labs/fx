@@ -64,6 +64,9 @@ pub const ToolDetailRecord = struct {
     command_display: ?[]u8 = null,
     command_action_label: ?[]u8 = null,
     result: ?[]u8 = null,
+    /// The notice lines of a shell run's result, joined by newlines, as the person sees them
+    /// (`ToolResultMemory.notice`). Only the call's own end sets it.
+    notice: ?[]u8 = null,
     result_handle: ?[]u8 = null,
     command_artifact_handle: ?[]u8 = null,
     command_output_replay: ?types.CommandOutputReplay = null,
@@ -96,6 +99,11 @@ pub const ToolDetailRecord = struct {
     /// A `subagent` message that made a new subagent, as its host said
     /// live and its session saved (D101).
     subagent_started: bool = false,
+    /// Where an admitted shell command ran, from admission's placement
+    /// (`ToolLifecycleEvent.authoritative_started.command_placement` and
+    /// `ToolResultMemory.command_placement`). Null for any other call or a
+    /// row restored from a saved session (R3.5).
+    command_placement: ?types.CommandPlacement = null,
     /// The MCP server a call's tool is on and the tool's own name, as core
     /// knew them when the call started or the session recorded them
     /// (`types.McpToolName`); null for any other call, or one core could not
@@ -115,6 +123,7 @@ pub const ToolDetailRecord = struct {
         if (self.command_display) |value| alloc.free(value);
         if (self.command_action_label) |value| alloc.free(value);
         if (self.result) |value| alloc.free(value);
+        if (self.notice) |value| alloc.free(value);
         if (self.result_handle) |value| alloc.free(value);
         if (self.command_artifact_handle) |value| alloc.free(value);
         if (self.command_output_replay) |replay| {

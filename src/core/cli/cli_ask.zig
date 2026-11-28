@@ -89,6 +89,7 @@ const test_builtin_gateway = if (std_builtin.is_test)
 else
     struct {};
 const builtin_tools = @import("../../builtins/tools.zig");
+const shell_projection = @import("../../builtins/shell_projection.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_projection_mod = @import("../tooling/tool_projection.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
@@ -99,6 +100,8 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
+const sandbox_policy = @import("../runner/runner.zig");
+const host_target = @import("../hosts/target.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
@@ -282,8 +285,9 @@ fn runAskChild(
     cancel: *std.atomic.Value(bool),
 ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw.?));
-    var child_projection = ctx.cfg.mode_registry.buildModelToolProjection(
+    var child_projection = shell_projection.buildModelToolProjection(
         ctx.alloc,
+        ctx.cfg.mode_registry,
         ctx.deps.tool_set,
         ctx.mode_id,
         .{
@@ -292,12 +296,27 @@ fn runAskChild(
             .subagent_available = true,
             .behind_toolbox = ctx.toolbox_behind.slice(),
         },
+        .{ .runner = ctx.sandbox_policy != null },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
+    // The child copies the sign-in its run owns, and web search is configured
+    // from that copy, in one section: the parent's next refresh frees the
+    // token `ctx.api_key` points at (`src/core/cli/cli_ask.zig` "an ask
+    // subagent keeps the sign-in a refresh replaces").
+    const child_setup = blk: {
+        ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+        defer ctx.credential_mutex.unlock(io_mod.getIo());
+        const captured = ChildSignIn.captureLocked(ctx.alloc, ctx) catch return error.OutOfMemory;
+        break :blk .{ .sign_in = captured, .tool_context = ctx.toolContext() };
+    };
+    var sign_in = child_setup.sign_in;
+    defer sign_in.deinit(ctx.alloc);
+    var tool_context = child_setup.tool_context;
+    sign_in.apply(&tool_context);
     return subagent_agent_adapter.run(.{
         .toolbox_behind = ctx.toolbox_behind.slice(),
         .host = ctx.subagent_host orelse return error.ProviderFailed,
-        .tool_context = ctx.toolContext(),
+        .tool_context = tool_context,
         .provider_set = ctx.cfg.provider_set,
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
@@ -563,47 +582,12 @@ fn buildAskGatewayToolProjection(
     mode_id: []const u8,
     options: tool_projection_mod.Options,
     has_child_capability: bool,
+    sandbox_on: bool,
 ) !tool_projection_mod.EffectiveToolProjection {
-    if (has_child_capability) {
-        return registry.buildModelToolProjection(
-            alloc,
-            tool_set,
-            mode_id,
-            options,
-        );
-    }
-
-    const shell_index = for (tool_set.registry.tools, 0..) |tool, index| {
-        if (tool.executor_kind == .terminal and
-            std.mem.eql(u8, tool.name, "shell"))
-        {
-            break index;
-        }
-    } else {
-        return registry.buildModelToolProjection(
-            alloc,
-            tool_set,
-            mode_id,
-            options,
-        );
-    };
-
-    const projected_tools = try alloc.dupe(
-        tool_dispatch.Tool,
-        tool_set.registry.tools,
-    );
-    defer alloc.free(projected_tools);
-    projected_tools[shell_index] = builtin_tools.shellProcessOnlySpec();
-    return registry.buildModelToolProjection(
-        alloc,
-        .{
-            .registry = .{ .tools = projected_tools },
-            .order = tool_set.order,
-            .read_only_tool_names = tool_set.read_only_tool_names,
-        },
-        mode_id,
-        options,
-    );
+    return shell_projection.buildModelToolProjection(alloc, registry, tool_set, mode_id, options, .{
+        .process_only = !has_child_capability,
+        .runner = sandbox_on,
+    });
 }
 
 const StdinSource = union(enum) {
@@ -615,12 +599,65 @@ const StdinSource = union(enum) {
 
 const stdin_prompt_resource_byte_limit: usize = 8 * 1024 * 1024;
 
+/// The sign-in one ask subagent run owns. A parent refresh replaces the key
+/// `AskContext` points at and frees the one it held, while the child still
+/// runs, so the child copies the three values under `credential_mutex`, which
+/// `adoptRefreshedAskCredential` holds while it replaces and frees them
+/// (`src/core/cli/cli_ask.zig` "an ask subagent keeps the sign-in a refresh
+/// replaces").
+const ChildSignIn = struct {
+    api_key: []u8,
+    credential_source: ?types.CredentialSource,
+    account_id: ?[]u8,
+    gateway_team: ?[]u8,
+
+    fn capture(alloc: Allocator, ctx: *AskContext) !ChildSignIn {
+        ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+        defer ctx.credential_mutex.unlock(io_mod.getIo());
+        return captureLocked(alloc, ctx);
+    }
+
+    /// The same copy with `credential_mutex` already held, for `runAskChild`,
+    /// which configures web search from the copy in the same section: a
+    /// refresh would otherwise free the bytes `OwnedText.set` reads.
+    fn captureLocked(alloc: Allocator, ctx: *AskContext) !ChildSignIn {
+        const api_key = try alloc.dupe(u8, ctx.api_key);
+        errdefer secret.zeroAndFree(alloc, api_key);
+        const account_id = if (ctx.account_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (account_id) |value| alloc.free(value);
+        const gateway_team = if (ctx.gateway_team) |value| try alloc.dupe(u8, value) else null;
+        return .{
+            .api_key = api_key,
+            .credential_source = ctx.credential_source,
+            .account_id = account_id,
+            .gateway_team = gateway_team,
+        };
+    }
+
+    /// The child's context sends and reports these copies.
+    fn apply(self: ChildSignIn, tool_ctx: *tool_runtime.Context) void {
+        tool_ctx.api_key = self.api_key;
+        tool_ctx.credential_source = self.credential_source;
+        tool_ctx.account_id = self.account_id;
+        tool_ctx.gateway_team = self.gateway_team;
+    }
+
+    fn deinit(self: *ChildSignIn, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.api_key);
+        if (self.account_id) |value| alloc.free(value);
+        if (self.gateway_team) |value| alloc.free(value);
+    }
+};
+
 const AskContext = struct {
     alloc: Allocator,
     cfg: Config,
     deps: RunDeps,
     workspace_root: []const u8,
     workspace_access: workspace_access.WorkspaceAccess = .{},
+    /// Guards the fields below against a refresh on the turn's thread while a
+    /// subagent's slot thread copies them (`ChildSignIn.capture`).
+    credential_mutex: std.Io.Mutex = .init,
     api_key: []const u8 = "",
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
@@ -673,6 +710,8 @@ const AskContext = struct {
     session_write_mutex: std.Io.Mutex = .init,
     /// `experimental.workspace_capture`, from startup.
     workspace_capture: bool = false,
+    /// The sandbox policy, loaded when `experimental.sandbox_execution` is on.
+    sandbox_policy: ?*sandbox_policy.Policy = null,
     /// This run's turn captures, when `workspace_capture` is on (D98).
     turn_capture: turn_capture.TurnCapture = .{},
     requested_resume: ?ResumeTarget = null,
@@ -722,6 +761,9 @@ const AskContext = struct {
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
     active_turn_id: u64 = 0,
+    /// The turn of this `fx ask` process, set once at its start. Mail turns that
+    /// follow run under it too (the known U4 gap).
+    user_turn_id: u64 = 0,
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
@@ -777,6 +819,9 @@ const AskContext = struct {
         self.terminal_client.deinit();
         self.workspace_access.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
+        // The subagents and the worker that could place a command have ended.
+        if (self.sandbox_policy) |loaded| loaded.destroy();
+        self.sandbox_policy = null;
         self.turn_capture.deinit();
         // `fx ask` is the whole process: retention's maintenance ends here.
         if (comptime turn_capture.supported) turn_capture.finishMaintenance();
@@ -1058,6 +1103,7 @@ const AskContext = struct {
         }
         var tc: tool_runtime.Context = .{
             .workspace_root = self.workspace_root,
+            .sandbox_policy = self.sandbox_policy,
             .access_scope = self.workspace_access.scope(self.workspace_root),
             .ignored_list_entries = self.cfg.ignored_list_entries,
             .max_list_entries = self.cfg.max_list_entries,
@@ -1132,18 +1178,10 @@ const AskContext = struct {
             .interactive = false,
             .lifecycle_view = self.lifecycle_view,
             .lifecycle_scope = self.lifecycleContext().scope,
+            .user_turn_id = self.user_turn_id,
         };
         if (self.mcp_host) |h| h.catalog.wire(&tc);
-        // On a terminal, a server's question is put to the user.
-        if (self.mcp_host != null and self.mcp_elicitation_capabilities.any()) {
-            tc.mcp_input_responder = .{
-                .context = @ptrCast(self),
-                .capabilities = self.mcp_elicitation_capabilities,
-                .legacy_url_manual_completion = true,
-                .callback = respondToAskMcpInput,
-                .declined_notice = tellAskMcpDeclined,
-            };
-        }
+        tc.mcp_input_responder = askInputResponder(@ptrCast(self), self.mcp_elicitation_capabilities);
         return tc;
     }
 
@@ -1227,6 +1265,23 @@ fn askElicitationCapabilities(
 ) @import("../mcp/elicitation.zig").Capabilities {
     if (!output_mode.isTerminal() or !stdin_is_tty or !stderr_is_tty) return .{};
     return .{ .form = true, .url = true };
+}
+
+/// The responder `fx ask` gives its tools when a terminal can show a prompt. The
+/// capabilities come from the terminal alone, so a run with no MCP server has
+/// the same channel as one with a server.
+fn askInputResponder(
+    context: *anyopaque,
+    capabilities: mcp_elicitation.Capabilities,
+) ?tool_mcp_runtime.InputResponder {
+    if (!capabilities.any()) return null;
+    return .{
+        .context = context,
+        .capabilities = capabilities,
+        .legacy_url_manual_completion = true,
+        .callback = respondToAskMcpInput,
+        .declined_notice = tellAskMcpDeclined,
+    };
 }
 
 fn checkHeadlessCancellation(deps: RunDeps) !void {
@@ -1684,6 +1739,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
     ctx.context_enabled = startup.context_enabled;
     ctx.workspace_capture = startup.workspace_capture;
+    if (comptime !host_target.is_wasm) {
+        if (startup.sandbox_execution) ctx.sandbox_policy = sandbox_policy.loadForProcess(alloc);
+    }
     ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     if (options.save_session) {
         try ctx.checkCancellation();
@@ -1897,7 +1955,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
         .behind_toolbox = ctx.toolbox_behind.slice(),
-    }, session_child_capability != null);
+    }, session_child_capability != null, ctx.sandbox_policy != null);
     defer tool_projection.deinit(alloc);
 
     const context_history = try ctx.session.snapshotHistory(alloc);
@@ -1909,6 +1967,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     );
     defer alloc.free(root_user_intent_context);
     ctx.active_turn_id = debug_trace.nextTurnId();
+    ctx.user_turn_id = ctx.active_turn_id;
 
     const job: worker_runtime.QueuedPrompt = .{
         .turn_id = ctx.active_turn_id,
@@ -2160,13 +2219,33 @@ fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) 
     }
 }
 
-/// Reports a pending shell snapshot fallback once, on stderr.
+/// Reports a pending shell snapshot fallback once.
 fn writeShellSnapshotNotice(ctx: *AskContext) void {
     var buffer: [shell_snapshot.max_notice_bytes]u8 = undefined;
     const notice = shell_snapshot.processOwner().takeUiNotice(&buffer) orelse return;
+    if (ctx.presenter) |presenter| {
+        // A failed draw stays pending in the presentation and is reported at finish.
+        presenter.pushNotice(.{ .topic = "startup", .tone = .warning, .body = notice }) catch return;
+        return;
+    }
     ctx.writeStderr("fx ask: warning: ") catch return;
     ctx.writeStderr(notice) catch return;
     ctx.writeStderr("\n") catch return;
+}
+
+/// Writes a shell run's notice lines to stderr, each once, when the call ends. Raw and
+/// quiet output show them; `--json` output is unchanged, and a terminal shows them in the row.
+fn writeShellRunNotice(ctx: *AskContext, memory: types.ToolResultMemory) void {
+    if (ctx.output_mode != .raw and ctx.output_mode != .quiet) return;
+    const notice = memory.notice orelse return;
+    var lines = std.mem.splitScalar(u8, notice, '\n');
+    while (lines.next()) |line| {
+        // A line that cannot be written leaves nothing else to report, so the rest is dropped.
+        const safe_line = ctx.alloc.print("{f}", .{text_utils.terminalSafe(line)}) catch return;
+        defer ctx.alloc.free(safe_line);
+        ctx.writeStderr(safe_line) catch return;
+        ctx.writeStderr("\n") catch return;
+    }
 }
 
 fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
@@ -2263,6 +2342,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
+        .resolve_command_placement = resolveCommandPlacement,
         .describe_tool_action = describeToolAction,
         .describe_tool_action_completed = describeToolActionCompleted,
         .describe_tool_action_denied = describeToolActionDenied,
@@ -2341,6 +2421,8 @@ fn adoptRefreshedAskCredential(
     worker_alloc: Allocator,
     refreshed: *credentials.Credential,
 ) ![]u8 {
+    ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.credential_mutex.unlock(io_mod.getIo());
     if (ctx.credential_source != refreshed.source) return error.CredentialAuthorityChanged;
     if (!optionalCredentialFieldEqual(ctx.account_id, refreshed.accountId()) or
         !optionalCredentialFieldEqual(ctx.gateway_team, refreshed.gatewayTeam()))
@@ -2681,6 +2763,13 @@ fn writeBlockedActionGuidance(
     reason: []const u8,
     hint: []const u8,
 ) !void {
+    // In terminal mode the guidance goes to the presentation, so it starts on its own row.
+    // Writing it at the presentation's cursor would run it into the tool header above.
+    if (ctx.presenter) |presenter| {
+        const body = try ctx.alloc.print("{s}\nfx ask: blocked action: {s}\nfx ask: reason={s}\n{s}", .{ headline, label, reason, std.mem.trimEnd(u8, hint, "\n") });
+        defer ctx.alloc.free(body);
+        return presenter.pushNotice(.{ .topic = "permission", .tone = .warning, .body = body });
+    }
     try ctx.writeLine(headline);
     try ctx.writeStderr("fx ask: blocked action: ");
     try ctx.writeStderr(label);
@@ -2711,6 +2800,11 @@ fn promptCliPermissionApproval(
     label: []const u8,
 ) !PermissionApprovalPromptResult {
     if (!cliContextPermissionPromptAllowed(ctx)) return .unavailable;
+    // The approval prompt writes rows only when it can read an answer, which needs a
+    // terminal on stdin. Only then does the presentation restart around it.
+    const outside = ctx.presenter != null and (std.Io.File.stdin().isTty(io_mod.getIo()) catch false);
+    if (outside) try ctx.presenter.?.beginOutsidePrompt();
+    defer if (outside) ctx.presenter.?.endOutsidePrompt();
     return try ctx.deps.permission_approval_prompt(
         ctx.deps.permission_approval_prompt_ctx,
         ctx.deps.stderr_ctx,
@@ -2753,6 +2847,7 @@ fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, dis
         .workspace_root = ctx.workspace_root,
         .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
+        .command_placement = call.command_placement,
     });
 }
 
@@ -2768,6 +2863,11 @@ fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: T
     );
 }
 
+fn resolveCommandPlacement(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?types.CommandPlacement {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_admission.runCommandPlacement(ctx.toolContext().admissionInput(), arena, call);
+}
+
 fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (try tool_presentation.formatSubagentPlainAction(arena, call, .completed)) |line| return line;
@@ -2777,6 +2877,7 @@ fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: Tool
         .workspace_root = ctx.workspace_root,
         .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
+        .command_placement = call.command_placement,
     });
 }
 
@@ -2789,6 +2890,7 @@ fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCal
         .workspace_root = ctx.workspace_root,
         .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
+        .command_placement = call.command_placement,
     });
     return arena.print("{s}: {s}", .{ label, action });
 }
@@ -3463,6 +3565,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             // Report a fallback right after the command it affected; a later
             // recapture in the same run would otherwise clear it unseen.
             writeShellSnapshotNotice(ctx);
+            if (value.result_memory) |memory| writeShellRunNotice(ctx, memory);
         },
     }
 }
@@ -3770,6 +3873,10 @@ fn askTerminalMcpQuestion(
         for (answers[0..answered]) |answer| alloc.free(answer);
         alloc.free(answers);
     }
+    // The prompt writes rows the presentation does not track, so the presentation
+    // draws first and restarts below the prompt once the answers are read.
+    if (ctx.presenter) |presenter| try presenter.beginOutsidePrompt();
+    defer if (ctx.presenter) |presenter| presenter.endOutsidePrompt();
     for (entries) |entry| {
         try ctx.writeStderr("\n");
         try ctx.writeStderr(entry.question);
@@ -3801,7 +3908,7 @@ fn askTerminalMcpQuestion(
             return null;
         };
         defer alloc.free(line);
-        answers[answered] = try mapTerminalAnswer(alloc, entry.options, line);
+        answers[answered] = try mapTerminalAnswer(alloc, entry.submission, entry.options, line);
         answered += 1;
     }
     return answers;
@@ -3809,11 +3916,22 @@ fn askTerminalMcpQuestion(
 
 fn mapTerminalAnswer(
     alloc: Allocator,
+    submission: @FieldType(types.QuestionBatchEntry, "submission"),
     options: []const types.QuestionOption,
     line: []const u8,
 ) ![]u8 {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
     const ordinal = std.fmt.parseInt(usize, trimmed, 10) catch 0;
+    if (submission == .choice) {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (ordinal > 0 and ordinal <= options.len) {
+            try out.writer.print("{{\"option\":{d}}}", .{ordinal - 1});
+        } else {
+            try std.json.Stringify.value(.{ .value = trimmed }, .{}, &out.writer);
+        }
+        return out.toOwnedSlice();
+    }
     if (ordinal > 0 and ordinal <= options.len) return alloc.dupe(u8, options[ordinal - 1].label);
     for (options) |option| {
         if (std.mem.eql(u8, trimmed, option.label)) return alloc.dupe(u8, option.label);
@@ -4764,9 +4882,13 @@ fn testProcessQueuedPromptChecksTimeout(_: *agent_runtime.Agent, deps: *const ag
     try std.testing.expect(tool_ctx.web_fetch_runtime.? == &ctx.web_fetch_runtime);
     try std.testing.expect(tool_ctx.web_fetch_progress_ctx != null);
     try std.testing.expect(tool_ctx.on_web_fetch_progress != null);
-    try std.testing.expectEqualStrings(ctx.model, ctx.web_search_runtime.worker_model);
-    try std.testing.expectEqual(ctx.cfg.gateway_retry_count, ctx.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gateway_chat_url);
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(std.testing.allocator);
+        defer live.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(ctx.model, live.worker_model);
+        try std.testing.expectEqual(ctx.cfg.gateway_retry_count, live.gateway_retry_count);
+        try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, live.gateway_chat_url);
+    }
     try std.testing.expect(ctx.web_search_runtime.provider.?.execute_fn == ctx.cfg.provider_set.gateway.fx_search.?.execute_fn);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try testPushAssistantText(deps, "assistant text");
@@ -5305,7 +5427,11 @@ test "CLI prompt projection configures web search then blocks native execution" 
     try append_static(deps.ctx, arena, &messages);
     try deps.append_runtime_context(deps.ctx, arena, ctx.model, &messages);
 
-    try std.testing.expectEqualStrings("stale-key", ctx.web_search_runtime.api_key);
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("stale-key", live.api_key);
+    }
 
     const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
     const validation = try validate(deps.ctx, arena, .{
@@ -5314,10 +5440,14 @@ test "CLI prompt projection configures web search then blocks native execution" 
         .arguments_json = "{\"query\":\"x\"}",
     });
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
-    try std.testing.expectEqualStrings(ctx.api_key, ctx.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(ctx.model, ctx.web_search_runtime.worker_model);
-    try std.testing.expectEqual(ctx.cfg.gateway_retry_count, ctx.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gateway_chat_url);
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings(ctx.api_key, live.api_key);
+        try std.testing.expectEqualStrings(ctx.model, live.worker_model);
+        try std.testing.expectEqual(ctx.cfg.gateway_retry_count, live.gateway_retry_count);
+        try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, live.gateway_chat_url);
+    }
 
     const execute = deps.execute_tool_call;
     const execution = try execute(deps.ctx, .{
@@ -5333,10 +5463,14 @@ test "CLI prompt projection configures web search then blocks native execution" 
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = ctx.max_tool_result_bytes,
     });
-    try std.testing.expectEqualStrings(ctx.api_key, ctx.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(ctx.model, ctx.web_search_runtime.worker_model);
-    try std.testing.expectEqual(ctx.cfg.gateway_retry_count, ctx.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gateway_chat_url);
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings(ctx.api_key, live.api_key);
+        try std.testing.expectEqualStrings(ctx.model, live.worker_model);
+        try std.testing.expectEqual(ctx.cfg.gateway_retry_count, live.gateway_retry_count);
+        try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, live.gateway_chat_url);
+    }
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }
@@ -5376,6 +5510,61 @@ test "fx ask publishes a complete refreshed credential before later consumers" {
         "fresh-token",
         ctx.model_catalog_access.authorizationCredential().?,
     );
+}
+
+test "an ask subagent keeps the sign-in a refresh replaces" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.api_key = "first-token";
+    ctx.credential_source = .fx_login;
+    ctx.gateway_team = "team_123";
+
+    // What `runAskChild` does, unchanged: one locked section copies the
+    // sign-in and configures web search from it.
+    const child_setup = blk: {
+        ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+        defer ctx.credential_mutex.unlock(io_mod.getIo());
+        break :blk .{
+            .sign_in = try ChildSignIn.captureLocked(alloc, &ctx),
+            .tool_context = ctx.toolContext(),
+        };
+    };
+    var sign_in = child_setup.sign_in;
+    defer sign_in.deinit(alloc);
+    var child_ctx = child_setup.tool_context;
+    sign_in.apply(&child_ctx);
+
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "second-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+    };
+    defer refreshed.deinit(alloc);
+    const worker_token = try adoptRefreshedAskCredential(&ctx, alloc, &refreshed);
+    defer secret.zeroAndFree(alloc, worker_token);
+
+    // The refresh replaced the parent's key and freed the one it held; the
+    // child and the runtime it configured still hold their own copies.
+    try std.testing.expectEqualStrings("second-token", ctx.api_key);
+    try std.testing.expectEqualStrings("first-token", child_ctx.api_key);
+    try std.testing.expect(child_ctx.api_key.ptr != ctx.api_key.ptr);
+    try std.testing.expectEqualStrings("team_123", child_ctx.gateway_team.?);
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("first-token", live.api_key);
+        try std.testing.expect(live.api_key.ptr != ctx.api_key.ptr);
+    }
 }
 
 test "fx ask refuses a refreshed login on another team" {
@@ -6757,6 +6946,30 @@ test "disabled headless ask scope leaves the interactive SIGINT handler untouche
     try std.testing.expectEqual(@as(usize, 1), test_previous_sigint_count.load(.seq_cst));
 }
 
+test "fx ask's prompt channel needs a terminal, not an MCP host" {
+    var anchor: u8 = 0;
+    // The responder takes no MCP host, so a run with a server gets this same answer.
+    const cases = [_]struct { mode: OutputMode, stdin_tty: bool, stderr_tty: bool, expected: bool }{
+        .{ .mode = .terminal, .stdin_tty = true, .stderr_tty = true, .expected = true },
+        .{ .mode = .terminal_no_color, .stdin_tty = true, .stderr_tty = true, .expected = true },
+        .{ .mode = .json, .stdin_tty = true, .stderr_tty = true, .expected = false },
+        .{ .mode = .raw, .stdin_tty = true, .stderr_tty = true, .expected = false },
+        .{ .mode = .quiet, .stdin_tty = true, .stderr_tty = true, .expected = false },
+        .{ .mode = .terminal, .stdin_tty = false, .stderr_tty = true, .expected = false },
+        .{ .mode = .terminal, .stdin_tty = true, .stderr_tty = false, .expected = false },
+    };
+    for (cases) |case| {
+        const capabilities = askElicitationCapabilities(case.mode, case.stdin_tty, case.stderr_tty);
+        const responder = askInputResponder(&anchor, capabilities);
+        try std.testing.expectEqual(case.expected, responder != null);
+        if (responder) |value| {
+            try std.testing.expect(value.capabilities.form);
+            try std.testing.expect(value.legacy_url_manual_completion);
+            try std.testing.expect(value.context == @as(*anyopaque, &anchor));
+        }
+    }
+}
+
 test "fx ask auto mode applies automatic clear and caution without a prompt" {
     const FakeClassifier = struct {
         calls: usize = 0,
@@ -7582,6 +7795,7 @@ test "exec-only terminal projection propagates view allocation failure" {
             builtin_tools.advertisement_set,
             "inspect",
             .{},
+            false,
             false,
         ),
     );

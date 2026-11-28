@@ -24,7 +24,6 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 
 const ENABLED = process.env.FX_TUI_PERFORMANCE === "1";
@@ -936,7 +935,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         if (cycle >= WARMUPS) appendMeasured(samples.questionNavigate, navigation);
       }
       session.sendKeysImmediate(["2"]);
-      await session.waitForPane((pane) => pane.includes("PERF_QUESTION_DONE") && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd("PERF_QUESTION_DONE", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
 
       await session.sendText("Open the performance approval.");
@@ -952,18 +951,18 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         if (cycle >= WARMUPS) appendMeasured(samples.approvalNavigate, navigation);
       }
       session.sendKeysImmediate(["3"]);
-      await session.waitForPane((pane) => pane.includes("PERF_APPROVAL_DONE") && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd("PERF_APPROVAL_DONE", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
 
       await session.sendText("Start the performance terminal.");
       await session.waitForText("PERF_TERMINAL_READY", TIMEOUT);
       session.sendKeysImmediate(["1"]);
-      await session.waitForPane((pane) => pane.includes("PERF_TERMINAL_AGENT_READY") && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd("PERF_TERMINAL_AGENT_READY", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Close the performance terminal.");
       await session.waitForText("shell stop", TIMEOUT);
       session.sendKeysImmediate(["1"]);
-      await session.waitForPane((pane) => pane.includes("PERF_TERMINAL_CLOSED") && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd("PERF_TERMINAL_CLOSED", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
       const resourcesBefore = await waitForResourceStability(pid);
       expect(resourcesBefore.threads - preFeatureResources.threads).toBeLessThanOrEqual(2);

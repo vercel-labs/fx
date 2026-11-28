@@ -1,0 +1,23 @@
+{
+  "covers": [
+    "AC-10"
+  ],
+  "title": "The connection drops after the exec body, before the id: exit 255 and one exec request.",
+  "run": {
+    "events": [
+      "push_ok",
+      "send_ran",
+      "no_id",
+      "exit_255"
+    ]
+  },
+  "tamper": {
+    "run": "resend-after-unknown"
+  },
+  "drive": {
+    "command": "true",
+    "faults": {
+      "dropAfterExecBody": "ran"
+    }
+  }
+}
