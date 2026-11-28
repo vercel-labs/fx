@@ -616,6 +616,7 @@ pub fn Runtime(comptime App: type) type {
                 if (launch_overrides.effort_from_profile) app.instances.seed.agent_effort = persisted_effort;
             }
             if (comptime @hasField(App, "review_model")) app.review_model = startup.takeReviewModel();
+            if (comptime @hasField(App, "theme_source")) app.theme_source = startup.takeThemeSource();
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),
             );
@@ -654,7 +655,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 errdefer loaded.deinit(std.heap.c_allocator);
                 skill_runtime.traceDiagnostics("interactive_startup", loaded.diagnostics);
-                try app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+                try app.skills.replaceLoadedWithMods(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics, loaded.mod_pins);
                 loaded = .{};
             }
             if (comptime @hasField(App, "trust")) {

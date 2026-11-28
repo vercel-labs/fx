@@ -174,11 +174,19 @@ pub const LaunchCompletion = struct {
         // A named effort keeps its label inline, so it is copied from here.
         const effort_value = defaults.effort_override orelse entry.effort orelse defaults.effort;
         const effort = try cellText(arena, effort_value.displayLabel(), 16);
+        const source_text = switch (entry.source) {
+            .project => "project",
+            .mod => if (entry.mod_name) |mod_name| blk: {
+                const raw = try arena.print("mod {s}", .{mod_name});
+                break :blk try cellText(arena, raw, 32);
+            } else "mod",
+            .home, .builtin => "",
+        };
         return .{
             model,
             effort,
             toolsText(entry),
-            if (entry.source == .project) "project" else "",
+            source_text,
         };
     }
 
@@ -281,6 +289,11 @@ test "a launch row shows the overrides fx started with, and a profile's control 
     const overridden = try LaunchCompletion.rowOf(arena, entry, .{ .model = "openai/gpt-5", .model_override = "openai/gpt-5.4-mini", .effort_override = .literal("low") });
     try std.testing.expectEqualStrings("gpt-5.4-mini", overridden[0]);
     try std.testing.expectEqualStrings("low", overridden[1]);
+    try std.testing.expectEqualStrings("project", overridden[3]);
+
+    const mod_entry: profiles.Entry = .{ .name = "m", .description = "", .source = .mod, .mod_name = "alpha" };
+    const mod_row = try LaunchCompletion.rowOf(arena, mod_entry, .{ .model = "openai/gpt-5" });
+    try std.testing.expectEqualStrings("mod alpha", mod_row[3]);
 }
 
 test "launch completion lists profiles only while the composer holds /launch" {
@@ -412,10 +425,11 @@ pub fn Runtime(comptime App: type) type {
                     try names.appendSlice(app.alloc, tool.name);
                 }
             } else try names.append(app.alloc, '*');
-            debug_trace.eventf("profile", "profile_resolved", .{}, "agent={s} name={s} source={s} prompt={s} tools={s}", .{
+            debug_trace.eventf("profile", "profile_resolved", .{}, "agent={s} name={s} source={s} mod={s} prompt={s} tools={s}", .{
                 label,
                 held.profile.name,
                 @tagName(held.profile.source),
+                held.profile.mod_name orelse "",
                 if (held.system_prompt == null) "fx" else @tagName(held.profile.prompt_mode),
                 names.items,
             });

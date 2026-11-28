@@ -375,6 +375,13 @@ pub fn Handlers(comptime App: type) type {
                 std.heap.c_allocator.free(notices);
             }
             for (notices) |n| try app.writeDomainNotice(.{ .topic = "mods", .tone = if (n.warning) .warning else .neutral, .body = n.text }, true);
+            if (comptime @hasDecl(App, "takeModSkillsRefresh") and @hasDecl(App, "requestSkillsRefresh")) {
+                if (app.takeModSkillsRefresh()) {
+                    _ = app.requestSkillsRefresh() catch |err| {
+                        debug_trace.logf("mods", "skills_refresh_failed err={s}", .{@errorName(err)});
+                    };
+                }
+            }
         }
 
         pub fn collectShellSnapshotFacts(app: *App) !void {
@@ -1145,7 +1152,7 @@ pub fn Handlers(comptime App: type) type {
         fn skillInfoForProvider(skill: skill_runtime.Skill) skill_commands.SkillInfo {
             return .{
                 .path = skill.path,
-                .source_label = skill_runtime.skillSourceLabel(skill.source),
+                .source_label = skill.mod_label orelse skill_runtime.skillSourceLabel(skill.source),
                 .managed_install = skill_runtime.isManagedInstallSkill(skill),
             };
         }

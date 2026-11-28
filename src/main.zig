@@ -699,6 +699,7 @@ const App = struct {
     upgrader: auto_upgrade.AutoUpgrade = .{},
     mcp: app_mcp_runtime.State = .{},
     mods: if (build_options.libfx) struct {} else app_mods_runtime.State = .{},
+    theme_source: @import("core/shared/theme.zig").PinnedSource = .{},
     /// The profiles `/launch` completes.
     launch_completion: app_profile_runtime.LaunchCompletion = .{},
     skills: skill_runtime.Runtime = .{},
@@ -1174,7 +1175,10 @@ const App = struct {
         self.trust.deinit(self.alloc);
         shutdown_trace.mark("credentials_saved");
         self.mcp.deinitForProcessExit();
-        if (comptime !build_options.libfx) self.mods.deinit();
+        if (comptime !build_options.libfx) {
+            self.mods.deinit();
+            self.theme_source.deinit(self.alloc);
+        }
         shutdown_trace.mark("mcp_children_terminated");
         if (comptime !build_options.libfx) command_auth.shutdown();
         shutdown_trace.mark("complete");
@@ -1267,7 +1271,10 @@ const App = struct {
         for (main_agent.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
         main_agent.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit();
-        if (comptime !build_options.libfx) self.mods.deinit();
+        if (comptime !build_options.libfx) {
+            self.mods.deinit();
+            self.theme_source.deinit(self.alloc);
+        }
         shutdown_trace.mark("mcp_deinit");
         self.launch_completion.deinit();
         self.skills.deinit(std.heap.c_allocator);
@@ -2080,6 +2087,11 @@ const App = struct {
     pub fn takeModNotices(self: *App) if (build_options.libfx) []struct { text: []u8, warning: bool } else []app_mods_runtime.ModNotice {
         if (comptime build_options.libfx or !host_profile.mods) return &.{};
         return self.mods.takeNotices();
+    }
+
+    pub fn takeModSkillsRefresh(self: *App) bool {
+        if (comptime build_options.libfx or !host_profile.mods) return false;
+        return self.mods.takeSkillsRefresh();
     }
 
     pub fn refreshMcpCompletion(self: *App) void {
@@ -5803,6 +5815,8 @@ test {
     _ = @import("core/auth/command_helper.zig");
     _ = @import("core/auth/command_auth.zig");
     _ = @import("core/mods/manifest.zig");
+    _ = @import("core/mods/mod_pins.zig");
+    _ = @import("core/mods/pins.zig");
     _ = @import("core/mods/source.zig");
     _ = @import("core/mods/mods.zig");
     _ = @import("core/mods/verbs.zig");

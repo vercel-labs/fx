@@ -35,9 +35,11 @@ pub const max_bytes: usize = 3072;
 const version: u32 = 1;
 
 pub const StartedWith = struct {
-    /// Where the profile came from. A repository's and fx's own profiles never
-    /// set a mode, and fx's own set no lists.
+    /// Where the profile came from. A mod's, a repository's, and fx's own
+    /// profiles never set a mode, and fx's own set no lists.
     source: profiles.Source,
+    /// Set when `source == .mod`: the name of the mod that supplied it.
+    mod_name: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
     /// A list the profile set, as written. Null when it set none.
     tools: ?[]const []const u8 = null,
@@ -48,6 +50,7 @@ pub const StartedWith = struct {
 pub fn of(profile: *const profiles.Profile) StartedWith {
     return .{
         .source = profile.source,
+        .mod_name = if (profile.source == .mod) profile.mod_name else null,
         .permission_mode = if (profile.source == .home) profile.permission_mode else null,
         .tools = if (profile.source == .builtin) null else profile.tools,
         .mcp_servers = if (profile.source == .builtin) null else profile.mcp_servers,
@@ -62,6 +65,7 @@ pub fn toProfile(started: StartedWith, name: []const u8) profiles.Profile {
         .name = name,
         .description = "",
         .source = started.source,
+        .mod_name = started.mod_name,
         .permission_mode = started.permission_mode,
         .tools = started.tools,
         .mcp_servers = started.mcp_servers,
@@ -71,6 +75,7 @@ pub fn toProfile(started: StartedWith, name: []const u8) profiles.Profile {
 const Wire = struct {
     v: u32 = version,
     from: []const u8,
+    mod: ?[]const u8 = null,
     permission_mode: ?[]const u8 = null,
     tools: ?[]const []const u8 = null,
     mcp_servers: ?[]const []const u8 = null,
@@ -82,6 +87,7 @@ pub fn encode(arena: Allocator, started: StartedWith) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     std.json.Stringify.value(Wire{
         .from = @tagName(started.source),
+        .mod = if (started.source == .mod) started.mod_name else null,
         .permission_mode = if (started.permission_mode) |mode| @tagName(mode) else null,
         .tools = started.tools,
         .mcp_servers = started.mcp_servers,
@@ -145,6 +151,9 @@ fn extract(arena: Allocator, block: std.json.Value) Allocator.Error!?StartedWith
             if (value != .string) return null;
             started.source = std.meta.stringToEnum(profiles.Source, value.string) orelse return null;
             has_source = true;
+        } else if (std.mem.eql(u8, name, "mod")) {
+            if (value != .string or !validModName(value.string)) return null;
+            started.mod_name = try arena.dupe(u8, value.string);
         } else if (std.mem.eql(u8, name, "permission_mode")) {
             if (value != .string) return null;
             started.permission_mode = std.meta.stringToEnum(types.PermissionMode, value.string) orelse return null;
@@ -155,9 +164,19 @@ fn extract(arena: Allocator, block: std.json.Value) Allocator.Error!?StartedWith
         } else return null;
     }
     if (!has_version or !has_source) return null;
+    if ((started.source == .mod) != (started.mod_name != null)) return null;
     if (started.source != .home and started.permission_mode != null) return null;
     if (started.source == .builtin and (started.tools != null or started.mcp_servers != null)) return null;
     return started;
+}
+
+fn validModName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64 or name[0] == '-') return false;
+    for (name) |byte| switch (byte) {
+        'a'...'z', '0'...'9', '-' => {},
+        else => return false,
+    };
+    return true;
 }
 
 fn names(arena: Allocator, value: std.json.Value) Allocator.Error!?[]const []const u8 {
@@ -169,13 +188,22 @@ fn names(arena: Allocator, value: std.json.Value) Allocator.Error!?[]const []con
 
 /// A copy of `started` that `alloc` owns. Free it with `free`.
 pub fn dupe(alloc: Allocator, started: StartedWith) Allocator.Error!StartedWith {
+    const mod_name = if (started.mod_name) |text| try alloc.dupe(u8, text) else null;
+    errdefer if (mod_name) |text| alloc.free(text);
     const tools = if (started.tools) |list| try profiles.cloneNames(alloc, list) else null;
     errdefer if (tools) |list| freeNames(alloc, list);
     const mcp_servers = if (started.mcp_servers) |list| try profiles.cloneNames(alloc, list) else null;
-    return .{ .source = started.source, .permission_mode = started.permission_mode, .tools = tools, .mcp_servers = mcp_servers };
+    return .{
+        .source = started.source,
+        .mod_name = mod_name,
+        .permission_mode = started.permission_mode,
+        .tools = tools,
+        .mcp_servers = mcp_servers,
+    };
 }
 
 pub fn free(alloc: Allocator, started: StartedWith) void {
+    if (started.mod_name) |text| alloc.free(text);
     if (started.tools) |list| freeNames(alloc, list);
     if (started.mcp_servers) |list| freeNames(alloc, list);
 }
@@ -186,8 +214,15 @@ fn freeNames(alloc: Allocator, list: []const []const u8) void {
 }
 
 pub fn eql(a: StartedWith, b: StartedWith) bool {
-    return a.source == b.source and a.permission_mode == b.permission_mode and
+    return a.source == b.source and optEql(a.mod_name, b.mod_name) and
+        a.permission_mode == b.permission_mode and
         namesEql(a.tools, b.tools) and namesEql(a.mcp_servers, b.mcp_servers);
+}
+
+fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
+    const left = a orelse return b == null;
+    const right = b orelse return false;
+    return std.mem.eql(u8, left, right);
 }
 
 fn namesEql(a: ?[]const []const u8, b: ?[]const []const u8) bool {
@@ -393,4 +428,54 @@ test "a saved profile block stays canonical for fuzzed spawn data" {
             "{\"started_with\": { \"v\": 1, \"from\": \"pr\\u006fject\", \"tools\": [ \"read_file\" ] }}",
         }) ++ @import("fuzz_corpus").subagent_started_with.*),
     });
+}
+
+test "a mod profile started_with round trips with its mod name and never carries permission_mode" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const mod_profile: profiles.Profile = .{
+        .name = "helper",
+        .description = "Helps",
+        .source = .mod,
+        .mod_name = "alpha",
+        .permission_mode = .yolo,
+        .tools = &.{ "read_file", "!shell" },
+        .mcp_servers = &.{"github"},
+    };
+    const started = of(&mod_profile);
+    try testing.expect(started.permission_mode == null);
+    try testing.expectEqualStrings("alpha", started.mod_name.?);
+
+    const encoded = try encode(arena, started);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"from\":\"mod\",\"mod\":\"alpha\",\"tools\":[\"read_file\",\"!shell\"],\"mcp_servers\":[\"github\"]}",
+        encoded,
+    );
+    const spawn_line = try arena.print("{{\"agent\":\"kid\",\"started_with\":{s}}}", .{encoded});
+    const parsed = try read(arena, spawn_line);
+    try testing.expect(parsed == .started);
+    try testing.expect(eql(started, parsed.started));
+
+    const duped = try dupe(testing.allocator, parsed.started);
+    defer free(testing.allocator, duped);
+    try testing.expect(eql(started, duped));
+
+    const built = toProfile(duped, "helper");
+    try testing.expectEqual(profiles.Source.mod, built.source);
+    try testing.expectEqualStrings("alpha", built.mod_name.?);
+
+    // Invalid combinations and unknown future sources read as `.invalid`
+    // without failing the session (matching `child_state.savedStartedWith`).
+    const invalid_cases = [_][]const u8{
+        "{\"started_with\":{\"v\":1,\"from\":\"mod\"}}",
+        "{\"started_with\":{\"v\":1,\"from\":\"home\",\"mod\":\"alpha\"}}",
+        "{\"started_with\":{\"v\":1,\"from\":\"mod\",\"mod\":\"alpha\",\"permission_mode\":\"yolo\"}}",
+        "{\"started_with\":{\"v\":1,\"from\":\"mod\",\"mod\":\"../evil\"}}",
+        "{\"started_with\":{\"v\":1,\"from\":\"future_source\",\"extra\":\"x\"}}",
+    };
+    for (invalid_cases) |raw| {
+        try testing.expectEqual(Read.invalid, try read(arena, raw));
+    }
 }

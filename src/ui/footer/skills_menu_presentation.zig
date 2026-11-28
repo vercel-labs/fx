@@ -292,7 +292,7 @@ fn scopeColumnWidth(
     var visible_offset: usize = 0;
     while (visible_offset < visible_items) : (visible_offset += 1) {
         const skill = projection.itemAt(window_start + visible_offset) orelse continue;
-        col = @max(col, display_width.visibleWidth(skillSourceScopeLabel(skill.source)));
+        col = @max(col, display_width.visibleWidth((skill.mod_label orelse skillSourceScopeLabel(skill.source))));
     }
     return col;
 }
@@ -376,7 +376,7 @@ fn composeSkillTitleRow(
     const indent_width: usize = if (width <= 4) 0 else 2;
     if (indent_width > 0) try row.appendSlice(alloc, "  ");
 
-    const scope = skillSourceScopeLabel(skill.source);
+    const scope = (skill.mod_label orelse skillSourceScopeLabel(skill.source));
     const scope_width = @max(scope_col, display_width.visibleWidth(scope));
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
     const content_width: usize = @as(usize, width) -| 1;
@@ -450,6 +450,7 @@ fn skillSourceScopeLabel(source: skill_runtime.SkillSource) []const u8 {
         .global_agents => "Agents · Global",
         .workspace_claw => "Claw · Workspace",
         .global_claw => "Claw · Global",
+        .mod => "Mod",
     };
 }
 

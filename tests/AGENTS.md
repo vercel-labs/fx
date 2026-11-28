@@ -93,7 +93,7 @@ Every TLA+ spec, its TLC checker, the Bun drivers that walk code along a spec, a
 - When a change alters behavior that a spec models, update the spec in the same change and run its checker. CI runs the `sdk/`, `mcp/`, `mcp_host/`, `managed_execution/`, and `subagent/` models, the session-write and live sessions models in `session/`, and their drivers on `main` and on pull requests that change the code they cover (`scripts/detect-ci-need.sh`), the `mcp_call/` model on `main` and on pull requests labeled `ci:tla-mcp-call`, the `recovery/`, `agent_runtime/`, `compaction_progress/`, `acp_eof/`, `web_fetch_dns/`, `terminal_hangup/`, and `cli_hangup/` models and their drivers on every pull request, the `TerminalLifecycle` design config of `terminal/` on every pull request (its `ShellSnapshot` config and planted mutants stay local), and the `session_title/` model, without its driver, on every pull request; run the others yourself.
 - A new model, checker, or driver gets a row in `tests/tla/README.md`.
 - CI runs the `configured_provider/` model and its drivers only on pull requests labeled `ci:tla-configured-provider` and on a dispatch of `tla-configured-provider.yml`.
-- CI runs the `mods/` model and its driver on `main`, on pull requests labeled `ci:tla-mods`, and on a dispatch of `tla-mods.yml`.
+- CI runs the `mods/` models and their driver on `main`, on pull requests labeled `ci:tla-mods`, and on a dispatch of `tla-mods.yml`.
 
 ## Cite tests and specs from `src/`
 

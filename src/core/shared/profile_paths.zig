@@ -159,6 +159,13 @@ pub fn modsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{mods_dir_name});
 }
 
+/// The mods folder that sits beside a managed skills folder under the same
+/// fx folder (`rootPath` joins both). Null when the path has no parent.
+pub fn modsDirBesideSkills(alloc: Allocator, managed_skills_dir: []const u8) !?[]u8 {
+    const fx_folder = std.Io.Dir.path.dirname(managed_skills_dir) orelse return null;
+    return try std.Io.Dir.path.join(alloc, &.{ fx_folder, mods_dir_name });
+}
+
 /// `managedSkillsDir` inside `root_parent`, the folder that holds fx's
 /// folder, such as the real path of `rootParent`. The caller owns the result.
 pub fn managedSkillsDirIn(alloc: Allocator, root_parent: []const u8) ![]u8 {

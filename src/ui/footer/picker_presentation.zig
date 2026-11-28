@@ -1302,7 +1302,7 @@ fn slashMenuRowContent(
         .skill => |skill| .{
             .label = skill.name,
             .description = skill.description,
-            .metadata = if (include_metadata) skill_runtime.skillSourceShortLabel(skill.source) else "",
+            .metadata = if (include_metadata) skill_runtime.skillShortLabel(skill) else "",
         },
     };
 }
@@ -1324,7 +1324,7 @@ fn preparedSlashMenuRowContent(
         .skill => |skill| .{
             .label = skill.name,
             .description = skill.description,
-            .metadata = if (include_metadata) skill_runtime.skillSourceShortLabel(skill.source) else "",
+            .metadata = if (include_metadata) skill_runtime.skillShortLabel(skill.*) else "",
         },
     };
 }
@@ -1537,7 +1537,7 @@ fn composeSkillCompletionOptionRow(
         try row.append(alloc, ' ');
     }
 
-    const source = skill_runtime.skillSourceShortLabel(skill.source);
+    const source = skill_runtime.skillShortLabel(skill);
     if (before_label_width + visible < width_usize) {
         try row.appendSlice(alloc, ui_render.dim_style);
         const desc_remaining: u16 = @intCast(width_usize - before_label_width - visible);

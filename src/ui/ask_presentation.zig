@@ -490,7 +490,9 @@ fn probeTerminal(
         if (shared_theme.sourceName()) |name| {
             // Custom themes resolve after detection picks the variant, same
             // rule as the interactive shell.
-            const custom = shared_theme.resolveNamed(std.heap.c_allocator, name, theme.light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch null;
+            var theme_source: shared_theme.PinnedSource = .{};
+            defer theme_source.deinit(std.heap.c_allocator);
+            const custom = theme_source.resolveNamed(std.heap.c_allocator, name, theme.light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch null;
             if (custom) |resolved| {
                 ui_render.applyTheme(resolved, theme.rgb);
             } else {

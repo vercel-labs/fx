@@ -884,6 +884,19 @@ pub const ModProviderSend = struct {
     header: []const u8,
 };
 
+pub const ModProfileView = struct {
+    name: []const u8,
+    permission_mode_ignored: bool = false,
+};
+
+pub const ModAssetsView = struct {
+    skills: []const []const u8 = &.{},
+    profiles: []const ModProfileView = &.{},
+    themes: []const []const u8 = &.{},
+};
+
+pub const max_mod_preview_assets: usize = 32;
+
 pub const ModEntrySnapshot = struct {
     name: []const u8,
     version: ?[]const u8 = null,
@@ -1005,6 +1018,7 @@ pub const ModShowSnapshot = struct {
     path: ?[]const u8 = null,
     err: ?[]const u8 = null,
     providers: []const ModProviderView = &.{},
+    assets: ModAssetsView = .{},
 
     pub fn render(self: ModShowSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -1030,6 +1044,7 @@ pub const ModShowSnapshot = struct {
         if (self.path) |p| try out.writer.print("  path         {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, p, 1024)).bytes});
         if (self.err) |e| try out.writer.print("  error        {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, e, 256)).bytes});
         try writeModProvidersText(&out.writer, arena, self.providers);
+        try writeModAssetsText(&out.writer, arena, self.assets);
         return try out.toOwnedSlice();
     }
 
@@ -1062,32 +1077,8 @@ pub const ModShowSnapshot = struct {
         try jw.write(self.path);
         try jw.objectField("error");
         try jw.write(self.err);
-        try jw.objectField("providers");
-        try jw.beginArray();
-        for (self.providers) |p| {
-            try jw.beginObject();
-            try jw.objectField("name");
-            try jw.write(p.name);
-            try jw.objectField("protocol");
-            try jw.write(p.protocol);
-            try jw.objectField("base_url");
-            try jw.write(p.base_url);
-            try jw.objectField("command");
-            try jw.write(p.command);
-            try jw.objectField("sends");
-            try jw.beginArray();
-            for (p.sends) |send| {
-                try jw.beginObject();
-                try jw.objectField("env");
-                try jw.write(send.env);
-                try jw.objectField("header");
-                try jw.write(send.header);
-                try jw.endObject();
-            }
-            try jw.endArray();
-            try jw.endObject();
-        }
-        try jw.endArray();
+        try writeModProvidersJson(&jw, self.providers);
+        try writeModAssetsJson(&jw, self.assets);
         try jw.endObject();
         return try out.toOwnedSlice();
     }
@@ -1100,6 +1091,14 @@ pub const ModInstallPreviewSnapshot = struct {
     source: []const u8,
     commit: ?[]const u8 = null,
     providers: []const ModProviderView = &.{},
+    assets: ModAssetsView = .{},
+
+    pub fn render(self: ModInstallPreviewSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
 
     pub fn renderText(self: ModInstallPreviewSnapshot, alloc: Allocator) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(alloc);
@@ -1120,6 +1119,30 @@ pub const ModInstallPreviewSnapshot = struct {
             try out.writer.print("  description  {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, self.description, 512)).bytes});
         }
         try writeModProvidersText(&out.writer, arena, self.providers);
+        try writeModAssetsText(&out.writer, arena, self.assets);
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: ModInstallPreviewSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write("mod_preview");
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("description");
+        try jw.write(self.description);
+        try jw.objectField("source");
+        try jw.write(self.source);
+        try jw.objectField("commit");
+        try jw.write(self.commit);
+        try writeModProvidersJson(&jw, self.providers);
+        try writeModAssetsJson(&jw, self.assets);
+        try jw.endObject();
         return try out.toOwnedSlice();
     }
 };
@@ -1155,6 +1178,78 @@ fn writeModProvidersText(w: *std.Io.Writer, arena: Allocator, providers: []const
             });
         }
     }
+}
+
+fn writeModProvidersJson(jw: *std.json.Stringify, providers: []const ModProviderView) !void {
+    try jw.objectField("providers");
+    try jw.beginArray();
+    for (providers) |p| {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(p.name);
+        try jw.objectField("protocol");
+        try jw.write(p.protocol);
+        try jw.objectField("base_url");
+        try jw.write(p.base_url);
+        try jw.objectField("command");
+        try jw.write(p.command);
+        try jw.objectField("sends");
+        try jw.beginArray();
+        for (p.sends) |send| {
+            try jw.beginObject();
+            try jw.objectField("env");
+            try jw.write(send.env);
+            try jw.objectField("header");
+            try jw.write(send.header);
+            try jw.endObject();
+        }
+        try jw.endArray();
+        try jw.endObject();
+    }
+    try jw.endArray();
+}
+
+fn writeModAssetsText(w: *std.Io.Writer, arena: Allocator, assets: ModAssetsView) !void {
+    try writeModAssetNameList(w, arena, "  skills       ", assets.skills);
+    if (assets.profiles.len > 0) {
+        try w.print("  profiles     {d}\n", .{assets.profiles.len});
+        const shown = @min(assets.profiles.len, max_mod_preview_assets);
+        for (assets.profiles[0..shown]) |profile| {
+            try w.print("    {s}", .{(try text_utils.encodeTerminalSafeInline(arena, profile.name, 128)).bytes});
+            if (profile.permission_mode_ignored) try w.writeAll("  (fx ignores its permission_mode)");
+            try w.writeByte('\n');
+        }
+        if (assets.profiles.len > shown) try w.print("    and {d} more\n", .{assets.profiles.len - shown});
+    }
+    try writeModAssetNameList(w, arena, "  themes       ", assets.themes);
+}
+
+fn writeModAssetNameList(w: *std.Io.Writer, arena: Allocator, label: []const u8, items: []const []const u8) !void {
+    if (items.len == 0) return;
+    try w.print("{s}{d}\n", .{ label, items.len });
+    const shown = @min(items.len, max_mod_preview_assets);
+    for (items[0..shown]) |item| {
+        try w.print("    {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, item, 128)).bytes});
+    }
+    if (items.len > shown) try w.print("    and {d} more\n", .{items.len - shown});
+}
+
+fn writeModAssetsJson(jw: *std.json.Stringify, assets: ModAssetsView) !void {
+    try jw.objectField("skills");
+    try jw.write(assets.skills);
+    try jw.objectField("profiles");
+    try jw.beginArray();
+    for (assets.profiles) |profile| {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(profile.name);
+        try jw.objectField("permission_mode_ignored");
+        try jw.write(profile.permission_mode_ignored);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.objectField("themes");
+    try jw.write(assets.themes);
 }
 
 pub const StatusSnapshot = struct {
@@ -5214,9 +5309,35 @@ test "ModListSnapshot, ModShowSnapshot, and ModInstallPreviewSnapshot render ter
         .source = "/tmp/glm",
         .path = "/tmp/.fx/mods/glm",
         .providers = &providers,
+        .assets = .{
+            .skills = &.{"review"},
+            .profiles = &.{.{ .name = "helper", .permission_mode_ignored = true }},
+            .themes = &.{"nord"},
+        },
     }).render(alloc, .json);
     defer alloc.free(show_json);
     try std.testing.expect(std.mem.find(u8, show_json, "\"kind\":\"mod_show\"") != null);
     try std.testing.expect(std.mem.find(u8, show_json, "\"providers\":[{") != null);
     try std.testing.expect(std.mem.find(u8, show_json, "\"sends\":[{\"env\":\"GLM_TEAM\",\"header\":\"X-Team\"}]") != null);
+    try std.testing.expect(std.mem.find(u8, show_json, "\"skills\":[\"review\"]") != null);
+    try std.testing.expect(std.mem.find(u8, show_json, "\"profiles\":[{\"name\":\"helper\",\"permission_mode_ignored\":true}]") != null);
+    try std.testing.expect(std.mem.find(u8, show_json, "\"themes\":[\"nord\"]") != null);
+
+    var many_skills: [max_mod_preview_assets + 2][]const u8 = undefined;
+    for (&many_skills) |*slot| slot.* = "skill";
+    const bounded_preview = try (ModInstallPreviewSnapshot{
+        .name = "glm",
+        .version = "1.0.0",
+        .source = "/tmp/glm",
+        .assets = .{
+            .skills = &many_skills,
+            .profiles = &.{.{ .name = "helper", .permission_mode_ignored = true }},
+            .themes = &.{"nord"},
+        },
+    }).renderText(alloc);
+    defer alloc.free(bounded_preview);
+    try std.testing.expect(std.mem.find(u8, bounded_preview, "skills       34\n") != null);
+    try std.testing.expect(std.mem.find(u8, bounded_preview, "and 2 more\n") != null);
+    try std.testing.expect(std.mem.find(u8, bounded_preview, "helper  (fx ignores its permission_mode)\n") != null);
+    try std.testing.expect(std.mem.find(u8, bounded_preview, "themes       1\n") != null);
 }

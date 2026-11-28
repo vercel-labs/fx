@@ -494,8 +494,12 @@ pub fn Runtime(comptime App: type) type {
             var resolved_target: ?shared_theme.Theme = null;
             if (shared_theme.sourceName() orelse ui_render.explicitThemeName()) |name| {
                 // Custom themes re-resolve on live flips: sibling swap or
-                // builtin fallback, same rule as startup.
-                resolved_target = shared_theme.resolveNamed(app.alloc, name, light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch |err| blk: {
+                // builtin fallback, same rule as startup, keeping the mod pin
+                // taken at startup so mid-session updates never mix versions.
+                resolved_target = (if (comptime @hasField(App, "theme_source"))
+                    app.theme_source.resolveNamed(app.alloc, name, light, .{ .truecolor = ui_render.truecolorIsEnabled() })
+                else
+                    shared_theme.resolveNamed(app.alloc, name, light, .{ .truecolor = ui_render.truecolorIsEnabled() })) catch |err| blk: {
                     debug_trace.logf("theme", "live_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
                     break :blk null;
                 };

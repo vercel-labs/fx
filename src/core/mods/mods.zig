@@ -11,10 +11,19 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 pub const manifest = @import("manifest.zig");
+pub const mod_pins = @import("mod_pins.zig");
+pub const pins = @import("pins.zig");
 pub const source = @import("source.zig");
 pub const store = @import("store.zig");
 
 pub const Manifest = manifest.Manifest;
+pub const ModPins = mod_pins.ModPins;
+pub const ModRoot = mod_pins.ModRoot;
+pub const ModRoots = mod_pins.ModRoots;
+pub const RootKind = mod_pins.RootKind;
+pub const Pin = pins.Pin;
+pub const PinResult = pins.PinResult;
+pub const PinOps = pins.Ops;
 pub const Step = store.Step;
 pub const Outcome = store.Outcome;
 pub const Invalid = store.Invalid;
@@ -35,6 +44,47 @@ pub fn realOps() Ops {
         .lock_deadline_ms = default_lock_deadline_ms,
         .acquire_lock = acquireRealModLock,
     };
+}
+
+pub fn realPinOps() PinOps {
+    return .{
+        .io = io_mod.getIo(),
+        .lock_deadline_ms = default_lock_deadline_ms,
+        .prepare_pins_dir = prepareRealPinsDir,
+    };
+}
+
+pub fn realModPinsOps() ModPins.Ops {
+    return .{
+        .store_ops = realOps(),
+        .pin_ops = realPinOps(),
+    };
+}
+
+pub fn loadModPins(alloc: std.mem.Allocator, root_path: []const u8) !ModPins {
+    return ModPins.load(alloc, root_path, realModPinsOps());
+}
+
+pub fn withPinnedMods(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+    ctx: anytype,
+    comptime R: type,
+    comptime body: fn (@TypeOf(ctx), *const ModPins) anyerror!R,
+) !R {
+    return mod_pins.withPinnedMods(alloc, root_path, realModPinsOps(), ctx, R, body);
+}
+
+pub fn pin(alloc: std.mem.Allocator, root_path: []const u8, name: []const u8) !PinResult {
+    return pins.pin(alloc, root_path, name, realPinOps());
+}
+
+pub fn reloadPin(alloc: std.mem.Allocator, root_path: []const u8, name: []const u8, old_pin: *?Pin) !PinResult {
+    return pins.reload(alloc, root_path, name, old_pin, realPinOps());
+}
+
+pub fn collect(root_path: []const u8, name: []const u8) !Outcome {
+    return store.collect(realStore(root_path), name);
 }
 
 pub fn realStore(root_path: []const u8) Store {
@@ -108,6 +158,41 @@ pub const RefreshResult = union(enum) {
     folder_copied,
     source_missing: []const u8,
     fetch_failed: source.Failed,
+    refused: store.Outcome,
+};
+
+pub const PreparedUpdate = struct {
+    name: []const u8,
+    is_git: bool,
+    old_commit: ?[]const u8 = null,
+    new_commit: ?[]const u8 = null,
+    files_changed: bool = true,
+    old_providers: ?configured_provider.Registry = null,
+    install: PreparedInstall,
+
+    pub fn discard(self: *PreparedUpdate, alloc: std.mem.Allocator) void {
+        if (self.old_providers) |*reg| reg.deinit(alloc);
+        self.install.discard(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PrepareUpdateResult = union(enum) {
+    prepared: PreparedUpdate,
+    not_installed,
+    bad_mod,
+    no_record,
+    bad_record,
+    pinned: []const u8,
+    up_to_date: []const u8,
+    source_missing: []const u8,
+    fetch_failed: source.Failed,
+    no_manifest,
+    bad_manifest: manifest.DecodeError,
+    bad_providers: struct {
+        path: []const u8,
+        err: anyerror,
+    },
     refused: store.Outcome,
 };
 
@@ -209,22 +294,26 @@ pub fn install(
     };
 }
 
-/// A pinned mod is left alone. A git mod fetches its default branch: the same
-/// commit is up to date, and a new one replaces the mod. A folder mod copies
-/// the folder again when it still exists.
-pub fn refresh(
+/// Prepares an update for installed mod `name` without modifying the store:
+/// reads the currently installed providers (under a short pin when enabled),
+/// fetches the new version, decodes `mod.json`, and parses any new providers.
+/// On `.prepared`, caller must call `prepared.discard(alloc)` afterward.
+pub fn prepareUpdate(
     alloc: std.mem.Allocator,
     root_path: []const u8,
     name: []const u8,
     cancel: ?*const std.atomic.Value(bool),
-) !RefreshResult {
+) !PrepareUpdateResult {
     var loaded = try store.load(alloc, realStore(root_path), name);
     defer loaded.deinit(alloc);
-    switch (loaded) {
+    const old_mod = switch (loaded) {
         .none => return .not_installed,
         .bad => return .bad_mod,
-        .mod => {},
-    }
+        .mod => |m| m,
+    };
+    const old_on = old_mod.on;
+    const old_path_copy = try alloc.dupe(u8, old_mod.path);
+    defer alloc.free(old_path_copy);
 
     const maybe_bytes = store.readRecord(alloc, realStore(root_path), name) catch |err| switch (err) {
         error.RecordTooLarge => return .bad_record,
@@ -236,10 +325,159 @@ pub fn refresh(
         error.BadRecord => return .bad_record,
     };
     if (record.pinned) return .{ .pinned = record.ref orelse "" };
-    return switch (source.parse(record.source)) {
-        .git => |git| refreshGit(alloc, root_path, name, record, git, cancel),
-        .local => |path| refreshFolder(alloc, root_path, name, path),
-        .invalid => .bad_record,
+
+    var is_git = false;
+    var prep_res: PrepareResult = undefined;
+    switch (source.parse(record.source)) {
+        .git => |git| {
+            is_git = true;
+            const scratch = try std.Io.Dir.path.join(alloc, &.{ root_path, scratch_dir_name });
+            defer alloc.free(scratch);
+            const fetched = switch (try source.fetch(alloc, gitOps(), git, scratch, cancel)) {
+                .ok => |ok| ok,
+                .failed => |failed| return .{ .fetch_failed = failed },
+            };
+            if (record.commit) |old_commit| {
+                if (std.mem.eql(u8, old_commit, fetched.commit)) {
+                    source.discard(io_mod.getIo(), fetched.temp);
+                    return .{ .up_to_date = fetched.commit };
+                }
+            }
+            prep_res = try prepareFrom(alloc, root_path, fetched.dir, git.url, fetched.commit, fetched.record, fetched.temp);
+        },
+        .local => |path| {
+            const folder = (try resolveFolder(alloc, io_mod.getIo(), path)) orelse return .{ .source_missing = path };
+            defer alloc.free(folder);
+            const new_record = try source.folderRecord(alloc, folder);
+            defer alloc.free(new_record);
+            prep_res = try prepareFrom(alloc, root_path, folder, folder, null, new_record, null);
+        },
+        .invalid => return .bad_record,
+    }
+
+    switch (prep_res) {
+        .prepared => |p| {
+            var p_mut = p;
+            if (!std.mem.eql(u8, p.manifest.name, name)) {
+                p_mut.discard(alloc);
+                return .{ .refused = .{ .invalid = .name_mismatch } };
+            }
+            const owned = p.arena.allocator();
+            const old_commit_copy = if (record.commit) |c| try owned.dupe(u8, c) else null;
+            const old_state = readInstalledState(alloc, root_path, name, old_on, old_path_copy);
+            const new_digest = store.treeDigest(alloc, io_mod.getIo(), p.dir);
+            const files_changed = if (old_state.digest != null and new_digest != null)
+                !std.mem.eql(u8, &old_state.digest.?, &new_digest.?)
+            else
+                true;
+            return .{ .prepared = .{
+                .name = try owned.dupe(u8, name),
+                .is_git = is_git,
+                .old_commit = old_commit_copy,
+                .new_commit = p.commit,
+                .files_changed = files_changed,
+                .old_providers = old_state.providers,
+                .install = p,
+            } };
+        },
+        .not_a_folder => |path| return .{ .source_missing = path },
+        .source_invalid => return .bad_record,
+        .fetch_failed => |failed| return .{ .fetch_failed = failed },
+        .no_manifest => return .no_manifest,
+        .bad_manifest => |err| return .{ .bad_manifest = err },
+        .bad_providers => |bad| return .{ .bad_providers = .{ .path = bad.path, .err = bad.err } },
+    }
+}
+
+const InstalledState = struct {
+    providers: ?configured_provider.Registry = null,
+    digest: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
+};
+
+fn readInstalledState(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+    name: []const u8,
+    old_on: bool,
+    old_link_path: []const u8,
+) InstalledState {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    var pinned_opt: ?Pin = null;
+    defer if (pinned_opt) |*p| p.release(alloc, io_mod.getIo());
+
+    const read_dir: []const u8 = if (old_on) blk: {
+        switch (pin(alloc, root_path, name) catch return .{}) {
+            .pinned => |p| {
+                pinned_opt = p;
+                break :blk p.path;
+            },
+            .not_installed, .bad_link, .busy => return .{},
+        }
+    } else old_link_path;
+
+    const digest = store.treeDigest(alloc, io_mod.getIo(), read_dir);
+    const decoded = switch (readManifest(scratch, io_mod.getIo(), read_dir) catch return .{ .digest = digest }) {
+        .ok => |m| m,
+        .missing, .bad => return .{ .digest = digest },
+    };
+    const providers_val = decoded.providers orelse return .{ .digest = digest };
+    const canonical_link = std.Io.Dir.path.join(scratch, &.{ root_path, name }) catch return .{ .digest = digest };
+    var at: configured_provider.FailurePath = .{};
+    const reg = configured_provider.Registry.parse_located_for_mod(
+        alloc,
+        providers_val,
+        &at,
+        .{ .name = name, .dir = canonical_link },
+    ) catch null;
+    return .{ .providers = reg, .digest = digest };
+}
+
+/// Commits a prepared update into the store under its lock.
+pub fn commitUpdate(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+    prepared: *const PreparedUpdate,
+) !RefreshResult {
+    const outcome = try store.update(alloc, realStore(root_path), prepared.name, prepared.install.dir, prepared.install.record);
+    return switch (outcome) {
+        .ok => if (prepared.is_git)
+            .{ .updated = .{ .old_commit = prepared.old_commit, .new_commit = prepared.new_commit orelse "" } }
+        else
+            .folder_copied,
+        else => .{ .refused = outcome },
+    };
+}
+
+/// A pinned mod is left alone. A git mod fetches its default branch: the same
+/// commit is up to date, and a new one replaces the mod. A folder mod copies
+/// the folder again when it still exists.
+pub fn refresh(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+    name: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+) !RefreshResult {
+    return switch (try prepareUpdate(alloc, root_path, name, cancel)) {
+        .prepared => |prep_const| blk: {
+            var prep = prep_const;
+            defer prep.discard(alloc);
+            break :blk commitUpdate(alloc, root_path, &prep);
+        },
+        .not_installed => .not_installed,
+        .bad_mod => .bad_mod,
+        .no_record => .no_record,
+        .bad_record => .bad_record,
+        .pinned => |ref| .{ .pinned = ref },
+        .up_to_date => |commit| .{ .up_to_date = commit },
+        .source_missing => |path| .{ .source_missing = path },
+        .fetch_failed => |failed| .{ .fetch_failed = failed },
+        .no_manifest => .{ .refused = .{ .invalid = .no_manifest } },
+        .bad_manifest => .{ .refused = .{ .invalid = .bad_manifest } },
+        .bad_providers => .{ .refused = .{ .invalid = .bad_manifest } },
+        .refused => |outcome| .{ .refused = outcome },
     };
 }
 
@@ -359,39 +597,6 @@ fn prepareFrom(
         .temp_to_discard = if (temp_to_discard) |t| try owned.dupe(u8, t) else null,
         .arena = arena,
     } };
-}
-
-fn refreshGit(
-    alloc: std.mem.Allocator,
-    root_path: []const u8,
-    name: []const u8,
-    old: source.Record,
-    git: source.Git,
-    cancel: ?*const std.atomic.Value(bool),
-) !RefreshResult {
-    const scratch = try std.Io.Dir.path.join(alloc, &.{ root_path, scratch_dir_name });
-    const fetched = switch (try source.fetch(alloc, gitOps(), git, scratch, cancel)) {
-        .ok => |ok| ok,
-        .failed => |failed| return .{ .fetch_failed = failed },
-    };
-    defer source.discard(io_mod.getIo(), fetched.temp);
-    if (old.commit) |old_commit| {
-        if (std.mem.eql(u8, old_commit, fetched.commit)) return .{ .up_to_date = fetched.commit };
-    }
-    const outcome = try store.update(alloc, realStore(root_path), name, fetched.dir, fetched.record);
-    return switch (outcome) {
-        .ok => .{ .updated = .{ .old_commit = old.commit, .new_commit = fetched.commit } },
-        else => .{ .refused = outcome },
-    };
-}
-
-fn refreshFolder(alloc: std.mem.Allocator, root_path: []const u8, name: []const u8, path: []const u8) !RefreshResult {
-    const folder = (try resolveFolder(alloc, io_mod.getIo(), path)) orelse return .{ .source_missing = path };
-    const record = try source.folderRecord(alloc, folder);
-    return switch (try store.update(alloc, realStore(root_path), name, folder, record)) {
-        .ok => .folder_copied,
-        else => |outcome| .{ .refused = outcome },
-    };
 }
 
 /// The real path of `path` when it is a folder, null when it is not one.
@@ -677,6 +882,13 @@ fn acquireRealModLock(
 fn releaseRealModLock(self: *store.Lock, _: std.Io) void {
     var lock: io_mod.TimedAdvisoryLock = .{ .file = self.file };
     lock.release();
+}
+
+fn prepareRealPinsDir(_: ?*anyopaque, _: std.Io, root_dir: std.Io.Dir) anyerror!std.Io.Dir {
+    var lock_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(root_dir, locks_dir_name);
+    defer lock_dir.close();
+    const pins_dir = try io_mod.openOrCreateVerifiedPrivateDir(&lock_dir, pins.pins_dir_name);
+    return pins_dir.dir;
 }
 
 fn gitRun(alloc: std.mem.Allocator, argv: []const []const u8) ![]u8 {
@@ -1001,14 +1213,47 @@ test "mods front door runs real store lifecycle and enforces verified private lo
     try std.testing.expectEqual(@as(u32, 0o700), locks_stat.permissions.toMode() & 0o777);
 
     // Contention while lock file is held returns `.busy` at deadline.
-    var lock_file = try locks_dir.openFile(io_mod.getIo(), "glm", .{ .mode = .read_write });
-    defer lock_file.close(io_mod.getIo());
-    try std.testing.expect(try lock_file.tryLock(io_mod.getIo(), .exclusive));
-    defer lock_file.unlock(io_mod.getIo());
+    {
+        var lock_file = try locks_dir.openFile(io_mod.getIo(), "glm", .{ .mode = .read_write });
+        defer lock_file.close(io_mod.getIo());
+        try std.testing.expect(try lock_file.tryLock(io_mod.getIo(), .exclusive));
+        defer lock_file.unlock(io_mod.getIo());
 
-    var short_ops = realOps();
-    short_ops.lock_deadline_ms = 10;
-    try std.testing.expectEqual(Outcome.busy, try store.setOn(alloc, .{ .root_path = root, .ops = short_ops }, "glm", false));
+        var short_ops = realOps();
+        short_ops.lock_deadline_ms = 10;
+        try std.testing.expectEqual(Outcome.busy, try store.setOn(alloc, .{ .root_path = root, .ops = short_ops }, "glm", false));
+    }
+
+    // Real pin, reloadPin, and collect wrappers through the mods front door.
+    var pinned: ?Pin = switch (try pin(alloc, root, "glm")) {
+        .pinned => |p| p,
+        else => return error.TestUnexpectedResult,
+    };
+    defer if (pinned) |*p| p.release(alloc, io_mod.getIo());
+    try std.testing.expectEqual(Outcome.ok, try update(alloc, root, "glm", src));
+    const reloaded = try reloadPin(alloc, root, "glm", &pinned);
+    try std.testing.expect(reloaded == .pinned);
+    pinned = reloaded.pinned;
+    try std.testing.expectEqual(Outcome.ok, try collect(root, "glm"));
+    if (pinned) |*p| {
+        p.release(alloc, io_mod.getIo());
+        pinned = null;
+    }
+
+    // Real ModPins verifies `.locks` with io.zig's private-dir check.
+    var set = try loadModPins(alloc, root);
+    defer set.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), set.pins.len);
+    set.deinit(alloc);
+
+    var mods_dir = try tmp.dir.openDir(io_mod.getIo(), "mods", .{});
+    defer mods_dir.close(io_mod.getIo());
+    try mods_dir.deleteTree(io_mod.getIo(), ".locks");
+    try tmp.dir.createDirPath(io_mod.getIo(), "fake_locks");
+    const fake_locks = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fake_locks");
+    defer alloc.free(fake_locks);
+    try mods_dir.symLink(io_mod.getIo(), fake_locks, ".locks", .{ .is_directory = true });
+    try std.testing.expectError(error.DurablePathUnsafe, pin(alloc, root, "glm"));
 }
 
 test "loadModProviders returns sorted enabled providers, ignores disabled mods, and reports broken mods" {

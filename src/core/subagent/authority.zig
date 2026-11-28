@@ -7,6 +7,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
 const profiles = @import("../profiles/profiles.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const started_with_mod = @import("../profiles/started_with.zig");
 const tool_placement = @import("../config/tool_placement.zig");
 const toolbox = @import("../tooling/toolbox.zig");
@@ -302,24 +303,45 @@ pub const ProfileCache = struct {
         const facts = try started_with_mod.dupe(arena, saved);
         var profile = started_with_mod.toProfile(facts, try arena.dupe(u8, name));
         var prompt: []const u8 = "none";
-        if (saved.source != .builtin) {
-            const roots = try profiles.Roots.init(
-                arena,
-                if (saved.source == .home) home else null,
-                if (saved.source == .project) workspace_root else null,
-            );
-            var failure: ?[]const u8 = null;
-            if (profiles.load(arena, roots, name, &failure)) |loaded| {
-                // With one folder to look in, only a built-in of the same name can answer instead.
-                if (loaded.source == saved.source) {
-                    profile.prompt = loaded.prompt;
-                    profile.prompt_mode = loaded.prompt_mode;
-                    prompt = "read";
-                } else prompt = "not_in_source";
-            } else |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => prompt = "not_loaded",
-            }
+        switch (saved.source) {
+            .builtin => {},
+            .mod => {
+                if (saved.mod_name) |mod_name| {
+                    const mods_dir = if (home) |h| try profile_paths.modsDir(arena, h) else null;
+                    var failure: ?[]const u8 = null;
+                    if (profiles.loadFromMod(arena, mods_dir, mod_name, name, &failure)) |loaded| {
+                        profile.prompt = loaded.prompt;
+                        profile.prompt_mode = loaded.prompt_mode;
+                        prompt = "read";
+                    } else |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => prompt = "not_loaded",
+                    }
+                } else {
+                    prompt = "not_in_source";
+                }
+            },
+            .home, .project => {
+                var roots = try profiles.Roots.init(
+                    arena,
+                    if (saved.source == .home) home else null,
+                    if (saved.source == .project) workspace_root else null,
+                );
+                // Restore reads only the saved source, never mods.
+                roots.mods_dir = null;
+                var failure: ?[]const u8 = null;
+                if (profiles.load(arena, roots, name, &failure)) |loaded| {
+                    // With one folder to look in, only a built-in of the same name can answer instead.
+                    if (loaded.source == saved.source) {
+                        profile.prompt = loaded.prompt;
+                        profile.prompt_mode = loaded.prompt_mode;
+                        prompt = "read";
+                    } else prompt = "not_in_source";
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => prompt = "not_loaded",
+                }
+            },
         }
         held.* = .{ .arena = next, .profile = profile };
         self.clearFailure(child_id);
@@ -1809,6 +1831,49 @@ test "a saved profile reads its prompt from the folder of the source it started 
     try std.testing.expectEqualStrings("", (try elsewhere.get("replaced", "agent", .{ .source = .project, .tools = &.{"read_file"} })).prompt);
     // And the user's profile is read in whatever repository fx runs in.
     try std.testing.expectEqualStrings("Mine.", (try elsewhere.get("mine", "reviewer", .{ .source = .home })).prompt);
+}
+
+test "a child started from a mod restores its prompt from that mod only" {
+    if (comptime @import("build_options").libfx) return error.SkipZigTest;
+    const mods_mod = @import("../mods/mods.zig");
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try profiles.writeTestFile(tmp.dir, "home/.fx/agents/reviewer/profile.json", "{\"description\": \"Home\"}");
+    try profiles.writeTestFile(tmp.dir, "home/.fx/agents/reviewer/prompt.md", "Home prompt.");
+    try profiles.writeTestFile(tmp.dir, "src-alpha/mod.json", "{\"name\":\"alpha\",\"version\":\"1.0.0\"}");
+    try profiles.writeTestFile(tmp.dir, "src-alpha/agents/reviewer/profile.json", "{\"description\": \"Alpha\"}");
+    try profiles.writeTestFile(tmp.dir, "src-alpha/agents/reviewer/prompt.md", "Alpha v1 prompt.");
+    try profiles.writeTestFile(tmp.dir, "src-beta/mod.json", "{\"name\":\"beta\",\"version\":\"1.0.0\"}");
+    try profiles.writeTestFile(tmp.dir, "src-beta/agents/reviewer/profile.json", "{\"description\": \"Beta\"}");
+    try profiles.writeTestFile(tmp.dir, "src-beta/agents/reviewer/prompt.md", "Beta prompt.");
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/mods");
+    const fx_home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
+    const mods_dir = try std.Io.Dir.path.join(arena, &.{ fx_home, ".fx", "mods" });
+    try std.testing.expect((try mods_mod.add(arena, mods_dir, "alpha", try io_mod.dirRealpathAlloc(arena, tmp.dir, "src-alpha"))) == .ok);
+    try std.testing.expect((try mods_mod.add(arena, mods_dir, "beta", try io_mod.dirRealpathAlloc(arena, tmp.dir, "src-beta"))) == .ok);
+
+    var cache: ProfileCache = .{ .alloc = alloc, .roots = .{ .home = fx_home, .workspace_root = null } };
+    defer cache.deinit();
+    // Even though home and beta also define `reviewer`, `alpha` restores its own prompt.
+    try std.testing.expectEqualStrings("Alpha v1 prompt.", (try cache.get("kid-a", "reviewer", .{ .source = .mod, .mod_name = "alpha" })).prompt);
+
+    // Updating `alpha` applies to a subsequent restore.
+    try profiles.writeTestFile(tmp.dir, "src-alpha/mod.json", "{\"name\":\"alpha\",\"version\":\"2.0.0\"}");
+    try profiles.writeTestFile(tmp.dir, "src-alpha/agents/reviewer/prompt.md", "Alpha v2 prompt.");
+    try std.testing.expect((try mods_mod.update(arena, mods_dir, "alpha", try io_mod.dirRealpathAlloc(arena, tmp.dir, "src-alpha"))) == .ok);
+    try std.testing.expectEqualStrings("Alpha v2 prompt.", (try cache.get("kid-a2", "reviewer", .{ .source = .mod, .mod_name = "alpha" })).prompt);
+
+    // Disabling `alpha` keeps the child working with saved tools and empty prompt.
+    try std.testing.expect((try mods_mod.setOn(arena, mods_dir, "alpha", false)) == .ok);
+    const disabled = try cache.get("kid-off", "reviewer", .{ .source = .mod, .mod_name = "alpha", .tools = &.{"read_file"} });
+    try std.testing.expectEqualStrings("", disabled.prompt);
+    try std.testing.expect(profiles.setsTools(disabled));
 }
 
 test "a profile that could not be loaded keeps its message until a load works" {

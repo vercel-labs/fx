@@ -21,6 +21,7 @@ pub const State = struct {
     notices: std.ArrayList(ModNotice) = .empty,
     active_jobs: std.atomic.Value(usize) = .init(0),
     closing: std.atomic.Value(bool) = .init(false),
+    skills_refresh_needed: std.atomic.Value(bool) = .init(false),
 
     pub fn pushNotice(self: *State, text: []u8, warning: bool) void {
         self.sink_mutex.lockUncancelable(io_mod.getIo());
@@ -34,6 +35,10 @@ pub const State = struct {
         self.sink_mutex.lockUncancelable(io_mod.getIo());
         defer self.sink_mutex.unlock(io_mod.getIo());
         return self.notices.toOwnedSlice(std.heap.c_allocator) catch &.{};
+    }
+
+    pub fn takeSkillsRefresh(self: *State) bool {
+        return self.skills_refresh_needed.swap(false, .acq_rel);
     }
 
     pub fn runVerbs(self: *State, home: []const u8, rest: []const u8) !void {
@@ -121,6 +126,7 @@ pub const State = struct {
             defer out.deinit();
             var err: std.Io.Writer.Allocating = .init(a);
             defer err.deinit();
+            var changed = false;
             _ = mod_verbs.run(.{
                 .gpa = a,
                 .out = &out.writer,
@@ -128,7 +134,11 @@ pub const State = struct {
                 .surface = .shell,
                 .home = job.home,
                 .cancel = &self.closing,
+                .changed = &changed,
             }, args);
+            if (changed and !self.closing.load(.acquire)) {
+                self.skills_refresh_needed.store(true, .release);
+            }
             for ([_]*std.Io.Writer.Allocating{ &out, &err }, [_]bool{ false, true }) |w, warning| {
                 const text = std.mem.trimEnd(u8, w.written(), "\n");
                 if (text.len == 0) continue;
@@ -164,4 +174,38 @@ test "app_mods_runtime keeps the cancel set for a job that outlives the exit wai
     try std.testing.expect(state.closing.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), state.active_jobs.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), state.notices.items.len);
+}
+
+test "app_mods_runtime records skills refresh only on a successful mod change" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "src");
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"glm\",\"version\":\"1.0.0\"}",
+    });
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home);
+    const src = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "src");
+    defer std.testing.allocator.free(src);
+
+    var state: State = .{};
+    defer state.deinit();
+
+    const add_cmd = try std.testing.allocator.print("add {s} --yes", .{src});
+    defer std.testing.allocator.free(add_cmd);
+    try state.runVerbs(home, add_cmd);
+    while (state.active_jobs.load(.acquire) > 0) {
+        io_mod.getIo().sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(state.takeSkillsRefresh());
+    try std.testing.expect(!state.takeSkillsRefresh());
+
+    // A non-mutating command (`list`) does not request a skill refresh.
+    try state.runVerbs(home, "list");
+    while (state.active_jobs.load(.acquire) > 0) {
+        io_mod.getIo().sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(!state.takeSkillsRefresh());
 }
