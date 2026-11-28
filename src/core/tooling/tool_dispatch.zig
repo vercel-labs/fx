@@ -12,6 +12,7 @@ const command_environment = @import("../execution/command_environment.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
+const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const mod_registry = @import("../mods/registry.zig");
 const permission_gate = @import("../permissions/permission_gate.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
@@ -594,6 +595,42 @@ pub const Tool = struct {
 };
 
 pub const Registry = mod_registry.ToolRegistry(Tool);
+
+/// Returns the registered name of the visible shell tool, if one is present.
+fn registeredShellToolName(registry: Registry) ?[]const u8 {
+    for (registry.tools) |tool| {
+        if (!tool.model_visible) continue;
+        if (tool.executor_kind == .terminal or tool.executor_kind == .run_command) {
+            return tool.name;
+        }
+    }
+    return null;
+}
+
+/// Formats the model-facing output for an unsupported tool call. Only a call
+/// to `bash` when no `bash` tool is registered and a visible shell tool exists
+/// adds a hint naming that shell tool.
+pub fn unsupportedToolOutput(alloc: Allocator, registry: Registry, name: []const u8) Allocator.Error![]u8 {
+    const shell_name = if (std.mem.eql(u8, name, "bash") and registry.lookup("bash") == null)
+        registeredShellToolName(registry)
+    else
+        null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    writeUnsupportedTool(&out.writer, name, shell_name) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeUnsupportedTool(writer: *std.Io.Writer, name: []const u8, shell_name: ?[]const u8) std.Io.Writer.Error!void {
+    try writer.writeAll("Unsupported tool: ");
+    if (shell_name) |hint| {
+        try writer.writeAll("bash. Use ");
+        try model_context_encoding.writeScalar(writer, hint);
+        try writer.writeAll(" instead.");
+        return;
+    }
+    try model_context_encoding.writeScalar(writer, name);
+}
 
 pub const ProgressLabelKind = enum {
     none,
@@ -1648,4 +1685,43 @@ test "terminal tool capability facts follow the host support matrix" {
             capabilities.terminalAvailable(),
         );
     }
+}
+
+test "unsupportedToolOutput hints only bash using the visible shell tool name" {
+    const alloc = std.testing.allocator;
+    var shell_tool = mock_tool;
+    shell_tool.name = "shell";
+    shell_tool.executor_kind = .terminal;
+    var renamed_shell = mock_tool;
+    renamed_shell.name = "terminal";
+    renamed_shell.executor_kind = .run_command;
+    var bash_tool = mock_tool;
+    bash_tool.name = "bash";
+    var hidden_shell = shell_tool;
+    hidden_shell.model_visible = false;
+
+    const with_shell = Registry{ .tools = &.{ mock_tool, shell_tool } };
+    const with_renamed_shell = Registry{ .tools = &.{renamed_shell} };
+    const with_bash = Registry{ .tools = &.{ shell_tool, bash_tool } };
+    const without_shell = Registry{ .tools = &.{ mock_tool, hidden_shell } };
+
+    const hinted = try unsupportedToolOutput(alloc, with_shell, "bash");
+    defer alloc.free(hinted);
+    try std.testing.expectEqualStrings("Unsupported tool: bash. Use shell instead.", hinted);
+
+    const renamed = try unsupportedToolOutput(alloc, with_renamed_shell, "bash");
+    defer alloc.free(renamed);
+    try std.testing.expectEqualStrings("Unsupported tool: bash. Use terminal instead.", renamed);
+
+    const placeholder = try unsupportedToolOutput(alloc, with_shell, "bash_placeholder");
+    defer alloc.free(placeholder);
+    try std.testing.expectEqualStrings("Unsupported tool: bash_placeholder", placeholder);
+
+    const has_bash = try unsupportedToolOutput(alloc, with_bash, "bash");
+    defer alloc.free(has_bash);
+    try std.testing.expectEqualStrings("Unsupported tool: bash", has_bash);
+
+    const no_shell = try unsupportedToolOutput(alloc, without_shell, "bash");
+    defer alloc.free(no_shell);
+    try std.testing.expectEqualStrings("Unsupported tool: bash", no_shell);
 }

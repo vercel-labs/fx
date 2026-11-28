@@ -820,13 +820,13 @@ fn executeWorkspaceToolCallInner(
         }
     }
     const spec = registeredToolSpec(ctx, call.name) orelse
-        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
+        return semanticFailure(try tool_dispatch.unsupportedToolOutput(arena, ctx.tool_registry, call.name));
     if (ctx.tool_registry.tools.len != 1 or
         !std.mem.eql(u8, spec.name, "shell") or
         spec.executor_kind != .run_command or
         spec.runtime_provider != .run_command)
     {
-        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
+        return semanticFailure(try tool_dispatch.unsupportedToolOutput(arena, ctx.tool_registry, call.name));
     }
 
     var command_backend = RunCommandBackendState{ .runtime = ctx };
@@ -877,7 +877,10 @@ fn resolveToolDispatchPrelude(
             try tool_mcp_runtime.notSelectedOutput(arena, call.name),
         ) },
         .unsupported => .{ .completed = semanticFailure(
-            try tool_mcp_registry.unsupportedOutput(arena, call.name, call.carried_by),
+            if (call.carried_by == null)
+                try tool_dispatch.unsupportedToolOutput(arena, ctx.tool_registry, call.name)
+            else
+                try tool_mcp_registry.unsupportedOutput(arena, call.name, call.carried_by),
         ) },
     };
 }
@@ -4088,6 +4091,46 @@ test "a workspace call of a tool that is not the one shell tool answers as an un
     try std.testing.expectEqualStrings("Unsupported tool: read_file", result.model_output);
 }
 
+test "a workspace call of unsupported bash hints the visible shell tool unless bash is registered or no shell exists" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var workspace_rt = TestRuntime{ .tool_registry = test_browser_workspace_tools.registry };
+    defer workspace_rt.deinit(std.testing.allocator);
+    const hinted = try executeWorkspaceToolCallInner(workspace_rt.context(), arena, .{
+        .id = "bash-ws",
+        .name = "bash",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, hinted.status);
+    try std.testing.expectEqualStrings("Unsupported tool: bash. Use shell instead.", hinted.model_output);
+
+    var no_shell_rt = TestRuntime{ .tool_registry = .{ .tools = &.{test_builtin_tools.read_file} } };
+    defer no_shell_rt.deinit(std.testing.allocator);
+    const no_shell = try executeWorkspaceToolCallInner(no_shell_rt.context(), arena, .{
+        .id = "bash-no-shell",
+        .name = "bash",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, no_shell.status);
+    try std.testing.expectEqualStrings("Unsupported tool: bash", no_shell.model_output);
+
+    var bash_tool = test_builtin_tools.read_file;
+    bash_tool.name = "bash";
+    bash_tool.model_schema.name = "bash";
+    const with_bash_tools = [_]tool_dispatch.Tool{ test_builtin_tools.shell, bash_tool };
+    var with_bash_rt = TestRuntime{ .tool_registry = .{ .tools = &with_bash_tools } };
+    defer with_bash_rt.deinit(std.testing.allocator);
+    const registered_bash = try executeWorkspaceToolCallInner(with_bash_rt.context(), arena, .{
+        .id = "bash-registered",
+        .name = "bash",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, registered_bash.status);
+    try std.testing.expectEqualStrings("Unsupported tool: bash", registered_bash.model_output);
+}
+
 fn registryOwnedWebFetchCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
@@ -5815,7 +5858,7 @@ test "web_fetch exact session grant authorizes only matching canonical domain" {
     const arena = arena_state.allocator();
 
     const grants = [_]PermissionGrant{
-        .{ .tool_name = @constCast("web_fetch"), .target_path = @constCast("domain:example.com") },
+        .{ .tool_name = @constCast("web_fetch"), .target_path = @constCast("domain:example.com"), .shell_epoch = 0 },
     };
     var ask_rules = [_]types.PermissionRule{
         .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:example.com"), .action = .ask },
@@ -8133,7 +8176,7 @@ test "a session grant for skill authorizes a toolbox open of that skill" {
     defer rt.deinit(alloc);
 
     const grants = [_]PermissionGrant{
-        .{ .tool_name = @constCast("skill"), .target_path = @constCast("workflow") },
+        .{ .tool_name = @constCast("skill"), .target_path = @constCast("workflow"), .shell_epoch = 0 },
     };
 
     const decision = (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena_state.allocator(), .{
@@ -9314,8 +9357,8 @@ const mcp_call_wire = @import("../mcp_host/mcp_call_wire.zig");
 
 test "a command's fx mcp call is checked against the approvals its tool call began with" {
     if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
-    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo") }};
-    const other = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_other"), .target_path = @constCast("mcp_fixture_other") }};
+    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo"), .shell_epoch = 0 }};
+    const other = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_other"), .target_path = @constCast("mcp_fixture_other"), .shell_epoch = 0 }};
     var counting = McpFixture.CountingContext{};
     var rt = TestRuntime{
         .tool_registry = bridge_test_registry,
@@ -9354,7 +9397,7 @@ test "a command's fx mcp call is checked against the approvals its tool call beg
 
 test "in auto mode a command's fx mcp call skips the safety check for the approved tool only" {
     if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
-    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo") }};
+    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo"), .shell_epoch = 0 }};
     var counting = McpFixture.CountingContext{};
     var reviewer = TestAutoReview{};
     var rt = TestRuntime{

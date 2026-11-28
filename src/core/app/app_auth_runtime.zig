@@ -2310,12 +2310,14 @@ pub fn Runtime(comptime App: type) type {
             return recoverCredentialFailure(app, agent, source, err);
         }
 
-        /// The screen `agent`'s notices show on: main's, or a subagent's own
-        /// view, named by the agent's address.
+        /// The screen `agent`'s notices show on: main's, or another agent's
+        /// own view, named by its `screen_id`, which a later agent never
+        /// reuses even when it takes a closed agent's memory.
         fn noticeScreen(app: *App, agent: *AppAgent) auth_runtime.NoticeScreen {
             if (comptime !@hasField(App, "main_agent")) return auth_runtime.main_notice_screen;
             if (agent == &app.main_agent) return auth_runtime.main_notice_screen;
-            return @intFromPtr(agent);
+            if (comptime !@hasField(AppAgent, "screen_id")) return @intFromPtr(agent);
+            return agent.screen_id;
         }
 
         fn recoverCredentialFailure(app: *App, agent: *AppAgent, source: credentials.Source, err: anyerror) !bool {
