@@ -145,8 +145,8 @@ pub fn InterruptRuntime(comptime App: type) type {
 
         fn cancelActiveStream(app: *App, agent: *AppAgent) !void {
             if (!agent.stream.active or turnCancelled(agent)) return;
-            try cancelActiveStreamSilent(app, agent);
             if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
+            try cancelActiveStreamSilent(app, agent);
         }
 
         pub fn traceInterruptRequested(app: *App, agent: *AppAgent, source: []const u8) void {

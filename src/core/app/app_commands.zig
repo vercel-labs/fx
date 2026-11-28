@@ -483,16 +483,18 @@ pub fn Handlers(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !@hasDecl(App, "stopWorkingSubagents")) return;
             const result = app.stopWorkingSubagents();
-            var body_buf: [64]u8 = undefined;
-            const body = if (result.stopped == 0)
-                "No subagent is working."
-            else
-                try std.mem.print(&body_buf, "Stopped {d} subagent{s}.", .{ result.stopped, if (result.stopped == 1) "" else "s" });
-            try app.writeDomainNotice(.{
-                .topic = "subagent",
-                .tone = .neutral,
-                .body = body,
-            }, true);
+            if (result.stopped > 0 or result.failed == 0) {
+                var body_buf: [64]u8 = undefined;
+                const body = if (result.stopped == 0)
+                    "No subagent is working."
+                else
+                    try std.mem.print(&body_buf, "Stopped {d} subagent{s}.", .{ result.stopped, if (result.stopped == 1) "" else "s" });
+                try app.writeDomainNotice(.{
+                    .topic = "subagent",
+                    .tone = .neutral,
+                    .body = body,
+                }, true);
+            }
             if (result.first_error) |err| {
                 var err_buf: [128]u8 = undefined;
                 const err_body = try std.mem.print(
@@ -2991,5 +2993,13 @@ test "/stop command writes stopped count or idle notice" {
     app.first_error = error.OutOfMemory;
     try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
     try std.testing.expectEqualStrings("Stopped 2 subagents.\nFailed to stop 1 subagent: OutOfMemory.", app.notices.items);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.notice_tone.?);
+
+    app.notices.clearRetainingCapacity();
+    app.stop_result = 0;
+    app.fail_count = 1;
+    app.first_error = error.OutOfMemory;
+    try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
+    try std.testing.expectEqualStrings("Failed to stop 1 subagent: OutOfMemory.", app.notices.items);
     try std.testing.expectEqual(types.NoticeTone.@"error", app.notice_tone.?);
 }

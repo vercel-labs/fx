@@ -3634,7 +3634,6 @@ const FakeApprovalShell = struct {
 const routing_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general },
     .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "clear the terminal transcript", .presentation_category = .general },
-    .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show help", .presentation_category = .general },
     .{ .kind = .stop_subagents, .command = "/stop", .help_entry = "/stop", .completion_description = "stop every working subagent", .presentation_category = .agents },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
