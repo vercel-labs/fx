@@ -136,6 +136,8 @@ const Writable = enum {
     max_tool_result_bytes,
     @"prompt_history.enabled",
     provider_strict,
+    sandbox_project,
+    sandbox_team,
     session_titles,
     slash_menu_categories,
     @"sound.attention_required",
@@ -197,6 +199,16 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
             patch.update_channel = update_target.Channel.parse(raw) orelse return invalid(problem, "stable or dev");
             return .{ .patch = patch, .value = .{ .string = patch.update_channel.?.label() } };
         },
+        .sandbox_team => {
+            if (!settings_keys.fitsText(.resource_name, raw)) return invalid(problem, resource_name_values);
+            patch.sandbox_team = raw;
+            return .{ .patch = patch, .value = .{ .string = raw } };
+        },
+        .sandbox_project => {
+            if (!settings_keys.fitsText(.resource_name, raw)) return invalid(problem, resource_name_values);
+            patch.sandbox_project = raw;
+            return .{ .patch = patch, .value = .{ .string = raw } };
+        },
         .theme => {
             const saved: []const u8 = switch (theme.classifyValue(raw) orelse return invalid(problem, profile_paths.displayText(theme_values))) {
                 .pin_light => "light",
@@ -248,12 +260,13 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .@"status_line.session" => patch.statusline_item = .{ .item = .session, .enabled = enabled },
         .@"status_line.workspace" => patch.statusline_item = .{ .item = .workspace, .enabled = enabled },
         .ultrafast_mode => patch.ultrafast_mode = enabled,
-        .effort, .update_channel, .theme, .max_agent_steps, .max_tool_result_bytes, .auto_compact_percent => unreachable,
+        .effort, .update_channel, .theme, .max_agent_steps, .max_tool_result_bytes, .auto_compact_percent, .sandbox_team, .sandbox_project => unreachable,
     }
     return .{ .patch = patch, .value = .{ .bool = enabled } };
 }
 
 const theme_values = "light, dark, or the name of a theme file in ~/.fx/themes";
+const resource_name_values = "1 to 100 letters, digits, -, _, or .";
 
 fn invalid(problem: *WriteProblem, expected: []const u8) error{InvalidConfigValue} {
     problem.* = .{ .invalid_value = expected };
@@ -563,10 +576,11 @@ pub const resolved_keys = [_][]const u8{
     "first_call_tool_choice",         "max_agent_steps",                "max_tool_result_bytes",
     "permission_mode",                "prompt_history.enabled",         "provider",
     "provider_order",                 "provider_strict",                "review_model",
-    "session_titles",                 "slash_menu_categories",          "sound.attention_required",
-    "sound.max",                      "sound.turn_end",                 "status_line.context",
-    "status_line.session",            "status_line.workspace",          "theme",
-    "ultrafast_mode",                 "update_channel",
+    "sandbox_project",                "sandbox_team",                   "session_titles",
+    "slash_menu_categories",          "sound.attention_required",       "sound.max",
+    "sound.turn_end",                 "status_line.context",            "status_line.session",
+    "status_line.workspace",          "theme",                          "ultrafast_mode",
+    "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -1166,6 +1180,78 @@ test "fx config set writes each key with the type the settings list gives it" {
         };
         try std.testing.expectEqual(want, std.meta.activeTag(planned.value.?));
     }
+}
+
+test "sandbox names set, unset, and read as plain strings" {
+    var problem: WriteProblem = .none;
+    const team = try changeForTest(&.{ "set", "sandbox_team", "acme" }, &problem);
+    try std.testing.expectEqualStrings("acme", team.patch.sandbox_team.?);
+    try std.testing.expectEqualStrings("acme", team.value.?.string);
+    const project = try changeForTest(&.{ "set", "sandbox_project", "fx.sandbox-2_b" }, &problem);
+    try std.testing.expectEqualStrings("fx.sandbox-2_b", project.patch.sandbox_project.?);
+    const removed = try changeForTest(&.{ "unset", "sandbox_team" }, &problem);
+    try std.testing.expectEqualStrings("sandbox_team", removed.patch.remove.?);
+    try std.testing.expect(removed.value == null);
+}
+
+test "a sandbox name that is not a Vercel name is refused with the rule" {
+    const alloc = std.testing.allocator;
+    const too_long = text_utils.repeat("a", 101);
+    for ([_][]const u8{ "", "acme corp", "acme/corp", "acme;rm", too_long }) |value| {
+        var problem: WriteProblem = .none;
+        try std.testing.expectError(error.InvalidConfigValue, change(.{ .action = .set, .key = "sandbox_project", .value = value }, &problem));
+    }
+    var problem: WriteProblem = .none;
+    try std.testing.expectError(error.InvalidConfigValue, change(.{ .action = .set, .key = "sandbox_team", .value = "acme corp" }, &problem));
+    const message = try formatWriteProblem(alloc, "sandbox_team", "acme corp", problem, "fx config");
+    defer alloc.free(message);
+    try std.testing.expectEqualStrings("invalid value for sandbox_team: acme corp (use 1 to 100 letters, digits, -, _, or .)", message);
+}
+
+fn saveForTest(alloc: Allocator, store: *settings_store.Store, planned: Change) !void {
+    var outcome = try store.applyUserPatch(alloc, planned.patch);
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+}
+
+fn loadGlobalForTest(alloc: Allocator, paths: config_runtime.Paths) !Loaded {
+    var failed: ?[]const u8 = null;
+    return load(alloc, paths, "/w", .global, &failed);
+}
+
+test "sandbox names round trip through settings.json: set, list, get, unset" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "home/.fx");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.fx/settings.json", .data = "{}\n" });
+    const io_mod = @import("../shared/io.zig");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const settings_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/settings.json");
+    defer alloc.free(settings_path);
+    var paths: config_runtime.Paths = .{
+        .user_settings = try alloc.dupe(u8, settings_path),
+        .workspace_settings = try alloc.dupe(u8, "/nonexistent/.fx.json"),
+        .workspace_root = try alloc.dupe(u8, "/w"),
+    };
+    defer paths.deinit(alloc);
+    var store = try settings_store.Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    var problem: WriteProblem = .none;
+
+    try saveForTest(alloc, &store, try change(.{ .action = .set, .key = "sandbox_team", .value = "acme" }, &problem));
+    var saved = try loadGlobalForTest(alloc, paths);
+    defer saved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), saved.entries.items.len);
+    try std.testing.expectEqualStrings("sandbox_team", saved.entries.items[0].key);
+    try std.testing.expectEqualStrings("acme", saved.entries.items[0].value.string);
+
+    try saveForTest(alloc, &store, try change(.{ .action = .unset, .key = "sandbox_team" }, &problem));
+    var removed = try loadGlobalForTest(alloc, paths);
+    defer removed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), removed.entries.items.len);
 }
 
 test "fx config schema takes only --project" {

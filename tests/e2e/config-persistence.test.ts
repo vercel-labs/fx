@@ -1701,6 +1701,50 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     30_000,
   );
 
+  test(
+    "fx config sets, reads, lists, and unsets sandbox_team and refuses a value that is not a Vercel name",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-sandbox-config-")));
+      try {
+        const home = join(root, "home");
+        const cwd = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(cwd);
+        const settingsPath = join(home, ".fx", "settings.json");
+        writeFileSync(settingsPath, "{}\n", { mode: 0o600 });
+        const env = { ...NO_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
+        const settings = () => JSON.parse(readFileSync(settingsPath, "utf8"));
+
+        const set = await runFx(["config", "set", "sandbox_team", "acme"], { cwd, env });
+        expect([set.code, set.stdout, set.stderr]).toEqual([0, "sandbox_team set to acme in ~/.fx/settings.json.\n", ""]);
+        expect(settings()).toEqual({ sandbox_team: "acme" });
+        const get = await runFx(["config", "get", "sandbox_team"], { cwd, env });
+        expect([get.code, get.stdout, get.stderr]).toEqual([0, "acme\n", ""]);
+        const list = await runFx(["config", "list", "--global", "--show-origin"], { cwd, env });
+        expect([list.code, list.stdout]).toEqual([0, "file:~/.fx/settings.json\tsandbox_team=acme\n"]);
+
+        const bad = await runFx(["config", "set", "sandbox_project", "acme corp"], { cwd, env });
+        expect([bad.code, bad.stdout, bad.stderr]).toEqual([
+          2,
+          "",
+          "fx config: invalid value for sandbox_project: acme corp (use 1 to 100 letters, digits, -, _, or .)\n",
+        ]);
+        const tooLong = await runFx(["config", "set", "sandbox_project", "a".repeat(101)], { cwd, env });
+        expect(tooLong.code).toBe(2);
+        expect(settings()).toEqual({ sandbox_team: "acme" });
+
+        const unset = await runFx(["config", "unset", "sandbox_team"], { cwd, env });
+        expect([unset.code, unset.stdout]).toEqual([0, "sandbox_team removed from ~/.fx/settings.json.\n"]);
+        expect(settings()).toEqual({});
+        const unsetGet = await runFx(["config", "get", "sandbox_team"], { cwd, env });
+        expect([unsetGet.code, unsetGet.stdout]).toEqual([1, ""]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   serialTest("config diagnostics preserve invalid, oversized, and unsafe primaries", async () => {
     const root = mkdtempSync(join(tmpdir(), "fx-config-diagnostics-"));
     try {

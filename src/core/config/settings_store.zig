@@ -124,6 +124,9 @@ pub const UserSettingsPatch = struct {
     notification_max: ?bool = null,
     /// `light`, `dark`, or a theme file name under ~/.fx/themes.
     theme: ?[]const u8 = null,
+    /// `sandbox_team` and `sandbox_project`, Vercel names the remote runner copies to.
+    sandbox_team: ?[]const u8 = null,
+    sandbox_project: ?[]const u8 = null,
     auto_upgrade: ?bool = null,
     max_agent_steps: ?u32 = null,
     max_tool_result_bytes: ?u32 = null,
@@ -162,6 +165,8 @@ pub const UserSettingsPatch = struct {
             self.notification_attention_required == null and
             self.notification_max == null and
             self.theme == null and
+            self.sandbox_team == null and
+            self.sandbox_project == null and
             self.auto_upgrade == null and
             self.max_agent_steps == null and
             self.max_tool_result_bytes == null and
@@ -1033,6 +1038,12 @@ fn validateUserPatch(patch: UserSettingsPatch) !void {
             .custom => |name| if (!theme_mod.validThemeName(name)) return error.InvalidSettingsFormat,
         } else return error.InvalidSettingsFormat;
     }
+    if (patch.sandbox_team) |team| {
+        if (!settings_keys.fitsText(.resource_name, team)) return error.InvalidSettingsFormat;
+    }
+    if (patch.sandbox_project) |project| {
+        if (!settings_keys.fitsText(.resource_name, project)) return error.InvalidSettingsFormat;
+    }
     if (patch.max_tool_result_bytes) |bytes| {
         if (bytes < tool_result_limits.min_configured_tool_result_bytes) return error.InvalidSettingsFormat;
     }
@@ -1444,6 +1455,8 @@ fn applyUserPatchToRoot(
         }
     }
     if (patch.theme) |value| application.changed = try putString(arena, &root.object, "theme", value) or application.changed;
+    if (patch.sandbox_team) |value| application.changed = try putString(arena, &root.object, "sandbox_team", value) or application.changed;
+    if (patch.sandbox_project) |value| application.changed = try putString(arena, &root.object, "sandbox_project", value) or application.changed;
     if (patch.auto_upgrade) |value| application.changed = try putBool(arena, &root.object, "auto_upgrade", value) or application.changed;
     if (patch.max_agent_steps) |value| application.changed = try putInteger(arena, &root.object, "max_agent_steps", value) or application.changed;
     if (patch.max_tool_result_bytes) |value| application.changed = try putInteger(arena, &root.object, "max_tool_result_bytes", value) or application.changed;
@@ -1627,9 +1640,11 @@ fn cleanupLegacyWorkspacePreferences(
 
 /// The settings paths a patch from `fx config set` or `unset` writes that the
 /// `/settings` cleanup above doesn't already cover.
-fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
+fn configWrittenPaths(patch: UserSettingsPatch) [11]?[]const u8 {
     return .{
         if (patch.theme != null) "theme" else null,
+        if (patch.sandbox_team != null) "sandbox_team" else null,
+        if (patch.sandbox_project != null) "sandbox_project" else null,
         if (patch.auto_upgrade != null) "auto_upgrade" else null,
         if (patch.max_agent_steps != null) "max_agent_steps" else null,
         if (patch.max_tool_result_bytes != null) "max_tool_result_bytes" else null,

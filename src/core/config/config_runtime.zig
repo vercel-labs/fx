@@ -81,6 +81,12 @@ pub const Settings = struct {
     /// Optional review-model override for automatic permission review. Owned by
     /// this Settings; freed in deinit. Null keeps the provider's default.
     review_model: ?[]const u8 = null,
+    /// Vercel team slug the remote runner copies a repository into, owned. Null
+    /// leaves the team to the Vercel CLI. Profile-only.
+    sandbox_team: ?[]const u8 = null,
+    /// Vercel project name the remote runner copies a repository into, owned.
+    /// Null uses `fx-sandbox`. Profile-only.
+    sandbox_project: ?[]const u8 = null,
     statusline_context: ?bool = null,
     statusline_session: ?bool = null,
     statusline_workspace: ?bool = null,
@@ -115,6 +121,8 @@ pub const Settings = struct {
         if (self.providers) |*providers| providers.deinit(alloc);
         self.permission_rules.deinit(alloc);
         if (self.review_model) |value| alloc.free(value);
+        if (self.sandbox_team) |value| alloc.free(value);
+        if (self.sandbox_project) |value| alloc.free(value);
         if (self.theme) |value| alloc.free(value);
         if (self.provider_order) |order| {
             for (order) |slug| alloc.free(@constCast(slug));
@@ -1956,6 +1964,18 @@ fn parseProfileOnlyFields(
         }
     }
 
+    if (root.object.get("sandbox_team")) |value| {
+        if (value != .string) return error.InvalidSandboxTeamType;
+        if (!settings_keys.fitsText(.resource_name, value.string)) return error.InvalidSandboxTeamValue;
+        settings.sandbox_team = try alloc.dupe(u8, value.string);
+    }
+
+    if (root.object.get("sandbox_project")) |value| {
+        if (value != .string) return error.InvalidSandboxProjectType;
+        if (!settings_keys.fitsText(.resource_name, value.string)) return error.InvalidSandboxProjectValue;
+        settings.sandbox_project = try alloc.dupe(u8, value.string);
+    }
+
     if (root.object.get("fast_mode")) |fast_mode_value| {
         const value = fast_mode_value;
         if (value != .bool) return error.InvalidFastModeType;
@@ -2295,6 +2315,16 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
         if (target.review_model) |old| alloc.free(old);
         target.review_model = value;
         incoming.review_model = null;
+    }
+    if (incoming.sandbox_team) |value| {
+        if (target.sandbox_team) |old| alloc.free(old);
+        target.sandbox_team = value;
+        incoming.sandbox_team = null;
+    }
+    if (incoming.sandbox_project) |value| {
+        if (target.sandbox_project) |old| alloc.free(old);
+        target.sandbox_project = value;
+        incoming.sandbox_project = null;
     }
 
     if (incoming.statusline_context) |value| target.statusline_context = value;
@@ -3220,6 +3250,59 @@ test "review_model parses, merges, and yields to FX_REVIEW_MODEL" {
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("process/review", result.settings.review_model.?);
+}
+
+test "sandbox_team and sandbox_project parse, merge, and refuse what is not a Vercel name" {
+    const alloc = std.testing.allocator;
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expect(absent.sandbox_team == null and absent.sandbox_project == null);
+
+    var base = try parseSettingsJson(alloc, "{\"sandbox_team\":\"acme\",\"sandbox_project\":\"fx-sandbox\"}");
+    defer base.deinit(alloc);
+    try std.testing.expectEqualStrings("acme", base.sandbox_team.?);
+    try std.testing.expectEqualStrings("fx-sandbox", base.sandbox_project.?);
+
+    var over = try parseSettingsJson(alloc, "{\"sandbox_team\":\"other.team-2_x\"}");
+    defer over.deinit(alloc);
+    try mergeSettings(&base, &over, alloc);
+    try std.testing.expectEqualStrings("other.team-2_x", base.sandbox_team.?);
+    try std.testing.expectEqualStrings("fx-sandbox", base.sandbox_project.?);
+    try std.testing.expect(over.sandbox_team == null);
+
+    try std.testing.expectError(error.InvalidSandboxTeamType, parseSettingsJson(alloc, "{\"sandbox_team\":5}"));
+    try std.testing.expectError(error.InvalidSandboxTeamValue, parseSettingsJson(alloc, "{\"sandbox_team\":\"\"}"));
+    try std.testing.expectError(error.InvalidSandboxTeamValue, parseSettingsJson(alloc, "{\"sandbox_team\":\"a b\"}"));
+    try std.testing.expectError(error.InvalidSandboxTeamValue, parseSettingsJson(alloc, "{\"sandbox_team\":\"acme/evil\"}"));
+    const long_name: []const u8 = &@as([101]u8, @splat('a'));
+    const too_long = try alloc.print("{{\"sandbox_team\":\"{s}\"}}", .{long_name});
+    defer alloc.free(too_long);
+    try std.testing.expectError(error.InvalidSandboxTeamValue, parseSettingsJson(alloc, too_long));
+
+    try std.testing.expectError(error.InvalidSandboxProjectType, parseSettingsJson(alloc, "{\"sandbox_project\":true}"));
+    try std.testing.expectError(error.InvalidSandboxProjectValue, parseSettingsJson(alloc, "{\"sandbox_project\":\"a$b\"}"));
+}
+
+test "sandbox names in a project .fx.json are ignored with the profile-only warning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"sandbox_team\":\"acme\"}\n");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"sandbox_team\":\"other\",\"sandbox_project\":\"x y\"}\n");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("acme", result.settings.sandbox_team.?);
+    try std.testing.expect(result.settings.sandbox_project == null);
+    try std.testing.expectEqual(@as(usize, 2), result.diagnostics.len);
+    try expectIgnoredProjectKey(result.diagnostics, "sandbox_team");
+    try expectIgnoredProjectKey(result.diagnostics, "sandbox_project");
 }
 
 test "old renamed groups are not read; status_line and sound are" {

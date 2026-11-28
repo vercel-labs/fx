@@ -5887,6 +5887,8 @@ test {
     _ = @import("core/slash_commands/command_specs.zig");
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/config/settings_store.zig");
+    _ = @import("core/config/settings_schema.zig");
+    _ = @import("core/cli/cli_config.zig");
     _ = @import("core/session/session_title_generation.zig");
     _ = @import("ui/footer/agents_menu_presentation.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");

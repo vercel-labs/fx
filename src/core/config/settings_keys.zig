@@ -22,6 +22,34 @@ pub const Where = enum {
     editor,
 };
 
+/// What a string key's text must look like, beyond its kind.
+pub const Text = enum {
+    /// Any text.
+    any,
+    /// A Vercel team slug or project name: 1 to `max_resource_name_bytes`
+    /// bytes of ASCII letters, digits, `-`, `_`, and `.`.
+    resource_name,
+};
+
+pub const max_resource_name_bytes = 100;
+/// `Text.resource_name` as a JSON Schema pattern. `fitsText` checks the same characters.
+pub const resource_name_pattern = "^[A-Za-z0-9._-]+$";
+
+/// Whether `value` is text that a key with rule `rule` takes.
+pub fn fitsText(rule: Text, value: []const u8) bool {
+    switch (rule) {
+        .any => return true,
+        .resource_name => {
+            if (value.len == 0 or value.len > max_resource_name_bytes) return false;
+            for (value) |byte| switch (byte) {
+                'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
+                else => return false,
+            };
+            return true;
+        },
+    }
+}
+
 /// The JSON value fx accepts for a key, as `fx config schema` describes it.
 pub const Kind = enum {
     /// Anything. Only retired keys, which fx ignores, use it.
@@ -61,6 +89,8 @@ pub const Key = struct {
     /// map, with a fixed set. fx ignores case; the schema lists the spellings
     /// fx writes and documents.
     values: []const []const u8 = &.{},
+    /// The rule a string key's text must follow, beyond being a string.
+    text: Text = .any,
     /// Inclusive bounds of an integer key.
     minimum: ?i64 = null,
     maximum: ?i64 = null,
@@ -143,6 +173,8 @@ pub const keys = [_]Key{
     .{ .name = "providers", .where = .profile, .kind = .object, .map = true, .top_level_only = true, .description = "Named custom model connections" },
     .{ .name = "review_model", .where = .profile, .kind = .string, .description = "The AI Gateway model that reviews actions in auto mode" },
     .{ .name = "sandbox", .where = .retired, .kind = .any, .description = retired_description },
+    .{ .name = "sandbox_project", .where = .profile, .kind = .string, .text = .resource_name, .description = "Vercel project name the remote runner copies the repository into; unset uses fx-sandbox" },
+    .{ .name = "sandbox_team", .where = .profile, .kind = .string, .text = .resource_name, .description = "Vercel team slug the remote runner copies the repository into; unset uses the Vercel CLI's current team" },
     .{ .name = "session_titles", .where = .profile, .kind = .boolean, .description = "Name each session from its first prompt" },
     .{ .name = "shortcuts", .where = .profile, .kind = .shortcuts, .map = true, .top_level_only = true, .description = "Personal key shortcuts: a key chord such as ctrl+1 or alt+m runs one fx command line, such as \"/fast\", or a saved model preset" },
     // Retired, but still read so that fx can explain the migration.
@@ -391,4 +423,30 @@ test "a non-object file has no unknown keys" {
     const unknown = try findUnknown(std.testing.allocator, .{ .integer = 3 }, .profile);
     defer std.testing.allocator.free(unknown);
     try std.testing.expectEqual(@as(usize, 0), unknown.len);
+}
+
+test "sandbox names are profile settings that take a Vercel name" {
+    for ([_][]const u8{ "sandbox_team", "sandbox_project" }) |name| {
+        const key = find(name).?;
+        try std.testing.expectEqual(Where.profile, key.where);
+        try std.testing.expectEqual(Kind.string, key.kind);
+        try std.testing.expectEqual(Text.resource_name, key.text);
+        try std.testing.expect(ignoredInProject(name));
+    }
+    try std.testing.expectEqual(Text.any, find("theme").?.text);
+}
+
+test "a resource name is 1 to 100 bytes of letters, digits, dash, underscore, and dot" {
+    try std.testing.expect(fitsText(.resource_name, "acme"));
+    try std.testing.expect(fitsText(.resource_name, "fx-sandbox"));
+    try std.testing.expect(fitsText(.resource_name, "Team.Name_2"));
+    const longest = @as([100]u8, @splat('a'));
+    try std.testing.expect(fitsText(.resource_name, &longest));
+    const too_long = @as([101]u8, @splat('a'));
+    try std.testing.expect(!fitsText(.resource_name, &too_long));
+    for ([_][]const u8{ "", "a b", "a/b", "a;b", "a$b", "../x", "caf\u{e9}", "a\n" }) |bad| {
+        try std.testing.expect(!fitsText(.resource_name, bad));
+    }
+    try std.testing.expect(fitsText(.any, ""));
+    try std.testing.expect(fitsText(.any, "anything at all"));
 }

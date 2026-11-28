@@ -109,6 +109,13 @@ fn writeKey(jw: *std.json.Stringify, key: settings_keys.Key) !void {
                 try jw.objectField("enum");
                 try jw.write(key.values);
             }
+            if (key.text == .resource_name) {
+                try jw.objectField("minLength");
+                try jw.write(@as(usize, 1));
+                try jw.objectField("maxLength");
+                try jw.write(settings_keys.max_resource_name_bytes);
+                try field(jw, "pattern", settings_keys.resource_name_pattern);
+            }
         },
         .string_or_null => {
             try jw.objectField("type");
@@ -302,6 +309,19 @@ test "the settings.json schema bounds shortcuts by count and key length, with a 
     try std.testing.expectEqual(@as(usize, 4), preset.get("required").?.array.items.len);
     try std.testing.expect(!preset.get("additionalProperties").?.bool);
     try std.testing.expect(!preset.get("properties").?.object.contains("action"));
+}
+
+test "the settings.json schema bounds sandbox names to Vercel name characters" {
+    const parsed = try parseSchema(std.testing.allocator, .profile);
+    defer parsed.deinit();
+    const properties = parsed.value.object.get("properties").?.object;
+    for ([_][]const u8{ "sandbox_team", "sandbox_project" }) |name| {
+        const schema = properties.get(name).?.object;
+        try std.testing.expectEqualStrings("string", schema.get("type").?.string);
+        try std.testing.expectEqual(@as(i64, 1), schema.get("minLength").?.integer);
+        try std.testing.expectEqual(@as(i64, settings_keys.max_resource_name_bytes), schema.get("maxLength").?.integer);
+        try std.testing.expectEqualStrings(settings_keys.resource_name_pattern, schema.get("pattern").?.string);
+    }
 }
 
 test "the .fx.json schema lists only the project-safe keys" {
