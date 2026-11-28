@@ -100,6 +100,112 @@ pub fn terminalInputGone(fd: std.posix.fd_t) bool {
     return terminalGone(fd, error.InputOutput);
 }
 
+/// What `terminalGone` saw of a descriptor after a failed read. Each field is one observation.
+pub const GoneEvidence = struct {
+    character_device: bool,
+    null_device: bool,
+    hangup_at_first_poll: bool,
+    foreign_foreground: bool,
+    still_terminal: bool,
+    hangup_at_second_poll: bool,
+};
+
+/// Decides from the observations alone whether the terminal is gone.
+pub fn goneFromEvidence(evidence: GoneEvidence) bool {
+    if (!evidence.character_device) return false;
+    if (evidence.null_device) return false;
+    if (evidence.hangup_at_first_poll or evidence.foreign_foreground) return true;
+    return evidence.hangup_at_second_poll;
+}
+
+test "a failed read on a terminal that polls no hang-up and is still a terminal is not gone" {
+    try std.testing.expect(!goneFromEvidence(.{
+        .character_device = true,
+        .null_device = false,
+        .hangup_at_first_poll = false,
+        .foreign_foreground = false,
+        .still_terminal = true,
+        .hangup_at_second_poll = false,
+    }));
+}
+
+test "a failed read on a terminal that polls readable only and is no longer a terminal is gone" {
+    try std.testing.expect(goneFromEvidence(.{
+        .character_device = true,
+        .null_device = false,
+        .hangup_at_first_poll = false,
+        .foreign_foreground = false,
+        .still_terminal = false,
+        .hangup_at_second_poll = false,
+    }));
+}
+
+test "a failed read on a file, pipe, or other non-device is never gone" {
+    try std.testing.expect(!goneFromEvidence(.{
+        .character_device = false,
+        .null_device = false,
+        .hangup_at_first_poll = true,
+        .foreign_foreground = true,
+        .still_terminal = false,
+        .hangup_at_second_poll = true,
+    }));
+}
+
+test "a failed read on /dev/null is never gone, even when its poll shows a hang-up" {
+    try std.testing.expect(!goneFromEvidence(.{
+        .character_device = true,
+        .null_device = true,
+        .hangup_at_first_poll = true,
+        .foreign_foreground = true,
+        .still_terminal = false,
+        .hangup_at_second_poll = true,
+    }));
+}
+
+test "a hang-up at the first poll is gone" {
+    try std.testing.expect(goneFromEvidence(.{
+        .character_device = true,
+        .null_device = false,
+        .hangup_at_first_poll = true,
+        .foreign_foreground = false,
+        .still_terminal = true,
+        .hangup_at_second_poll = false,
+    }));
+}
+
+test "a foreign foreground group is gone" {
+    try std.testing.expect(goneFromEvidence(.{
+        .character_device = true,
+        .null_device = false,
+        .hangup_at_first_poll = false,
+        .foreign_foreground = true,
+        .still_terminal = true,
+        .hangup_at_second_poll = false,
+    }));
+}
+
+test "a hang-up at the second poll is gone" {
+    try std.testing.expect(goneFromEvidence(.{
+        .character_device = true,
+        .null_device = false,
+        .hangup_at_first_poll = false,
+        .foreign_foreground = false,
+        .still_terminal = true,
+        .hangup_at_second_poll = true,
+    }));
+}
+
+test "a second poll that shows only readable, on a terminal still there, is not gone" {
+    try std.testing.expect(!goneFromEvidence(.{
+        .character_device = true,
+        .null_device = false,
+        .hangup_at_first_poll = false,
+        .foreign_foreground = false,
+        .still_terminal = true,
+        .hangup_at_second_poll = false,
+    }));
+}
+
 pub const interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?7l";
 const tmux_interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[?2004h\x1b[?7l";
 pub const bracketed_paste_enable_sequence = "\x1b[?2004h";

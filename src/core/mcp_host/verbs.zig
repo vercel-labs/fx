@@ -23,6 +23,7 @@ const login_words = @import("login_words.zig");
 const runtime_mod = @import("runtime.zig");
 const mcp = @import("../../mcp/mcp.zig");
 const mcp_call_client = @import("mcp_call_client.zig");
+const ui_terminal = @import("../../ui/terminal/terminal.zig");
 const Host = @import("host.zig").Host;
 
 const Allocator = std.mem.Allocator;
@@ -1365,8 +1366,14 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
 fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
     var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
     if (try std.posix.poll(&fds, 100) == 0) return null;
+    return readPastedFrom(arena, line, std.posix.STDIN_FILENO, std.posix.read, ui_terminal.terminalGone);
+}
+
+/// Reads what waits on `fd` and takes a complete line from it. Test seam for the read and the hang-up check.
+fn readPastedFrom(arena: Allocator, line: *std.ArrayList(u8), fd: std.posix.fd_t, comptime readFn: anytype, comptime goneFn: anytype) !?[]const u8 {
+    _ = goneFn;
     var buffer: [1024]u8 = undefined;
-    const n = std.posix.read(std.posix.STDIN_FILENO, &buffer) catch return null;
+    const n = readFn(fd, &buffer) catch return null;
     if (n == 0) {
         // stdin closed: wait for the browser instead.
         io_mod.sleep(100 * std.time.ns_per_ms);
@@ -1381,6 +1388,64 @@ fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
 }
 
 const testing = std.testing;
+
+fn readEio(_: std.posix.fd_t, _: []u8) std.posix.ReadError!usize {
+    return error.InputOutput;
+}
+
+fn readNothing(_: std.posix.fd_t, _: []u8) std.posix.ReadError!usize {
+    return 0;
+}
+
+fn readPastedLine(_: std.posix.fd_t, buffer: []u8) std.posix.ReadError!usize {
+    const text = "abc\n";
+    @memcpy(buffer[0..text.len], text);
+    return text.len;
+}
+
+fn goneYes(_: std.posix.fd_t, _: anyerror) bool {
+    return true;
+}
+
+fn goneNo(_: std.posix.fd_t, _: anyerror) bool {
+    return false;
+}
+
+/// A slice of the paste wait, which a failed or empty read must sleep out.
+const min_paste_slice_ns: i128 = 50 * std.time.ns_per_ms;
+
+test "a failed paste read on a terminal that is gone ends the login as a hang-up" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var line: std.ArrayList(u8) = .empty;
+    try testing.expectError(error.TerminalHungUp, readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readEio, goneYes));
+}
+
+test "a failed paste read on a terminal that is still there sleeps out its slice before it returns" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var line: std.ArrayList(u8) = .empty;
+    const started = io_mod.nanoTimestamp();
+    try testing.expectEqual(@as(?[]const u8, null), try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readEio, goneNo));
+    try testing.expect(io_mod.nanoTimestamp() - started >= min_paste_slice_ns);
+}
+
+test "a paste read of zero bytes sleeps out its slice and keeps waiting for the browser" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var line: std.ArrayList(u8) = .empty;
+    const started = io_mod.nanoTimestamp();
+    try testing.expectEqual(@as(?[]const u8, null), try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readNothing, goneNo));
+    try testing.expect(io_mod.nanoTimestamp() - started >= min_paste_slice_ns);
+}
+
+test "a complete pasted line is returned without its line break" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var line: std.ArrayList(u8) = .empty;
+    const pasted = (try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readPastedLine, goneNo)).?;
+    try testing.expectEqualStrings("abc", pasted);
+}
 
 fn parseCli(arena: Allocator, args: []const []const u8) !Parsed {
     return parse(arena, .cli, args);
