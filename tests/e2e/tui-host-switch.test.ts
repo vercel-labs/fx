@@ -6133,6 +6133,60 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
     TIMEOUT,
   );
 
+  // The hook is a test switch like any other: only an on value fails a screen.
+  // `0` leaves it off, so the request opens its screen and a key answers it.
+  test(
+    "a zero approval screen fail value leaves the approval screen open for the key",
+    async () => {
+      const arrived = held();
+      let childCalls = 0;
+      await withFx(
+        (body) => {
+          if (!SPIKE_MAIN(body)) {
+            childCalls += 1;
+            // The write waits for the person to be on the subagent's own
+            // screen, so the request opens its screen there.
+            if (childCalls === 1) {
+              return arrived.promise.then(() =>
+                toolCall("child_e8_write", "write_file", { path: "spike-e8.txt", content: "SPIKE_WROTE\n" })
+              );
+            }
+            return text("child_e8_done", "SPIKE_E8_WROTE");
+          }
+          if (!body.includes('"main_e8_start"')) {
+            return toolCall("main_e8_start", "subagent", {
+              request: { action: "message", agent: "writer", message: "SPIKE_E8_TASK", profile: "writer" },
+            });
+          }
+          return text("main_e8_tail", "SPIKE_E8_MAIN_DONE");
+        },
+        async (session, { workspace, stderrPath }) => {
+          await session.sendText("SPIKE_USER_e8");
+          await session.waitForText("SPIKE_E8_MAIN_DONE", 30_000);
+          await showAgent(session, "writer");
+          arrived.release();
+          // The screen opens as usual, and its key answers the request.
+          await session.waitForText("Apply this change?", 30_000);
+          expect(await session.capturePane()).toContain("spike-e8.txt");
+          await session.sendKeys("1");
+          await until("the write", () => existsSync(join(workspace, "spike-e8.txt")));
+          expect(readFileSync(join(workspace, "spike-e8.txt"), "utf8")).toBe("SPIKE_WROTE\n");
+          await session.waitForText("SPIKE_E8_WROTE", 30_000);
+          expect(await session.capturePane()).not.toContain("could not open");
+          expect(stderrPath).toBeDefined();
+          expect(readFileSync(stderrPath!, "utf8")).toBe("");
+        },
+        writeSpikeWriter,
+        false,
+        { FX_TEST_APPROVAL_SCREEN_FAIL: "0" },
+        {},
+        "",
+        true,
+      );
+    },
+    TIMEOUT,
+  );
+
   test(
     "two subagents wait at once, and main answers both",
     async () => {

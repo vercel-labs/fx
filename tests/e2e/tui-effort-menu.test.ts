@@ -5,7 +5,7 @@
 // `fx replay`, and the highlight from the bytes fx wrote for it, so these
 // tests check what the terminal showed, not the live pane alone.
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
@@ -287,11 +287,14 @@ test.skipIf(!tmuxAvailable())("/effort lists the model's levels with the one in 
   await waitForEffortMenu(current, "high     current");
   await session.sendKeys("Escape");
   await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
-  // A typed character closes the menu and lands in the composer.
+  // A typed character stays in the composer as the menu's query, and Esc
+  // closes the menu.
   await session.sendText("/effort");
   await waitForEffortMenu(current);
   await session.sendLiteral("x");
-  await session.waitForPane((pane) => !pane.includes("Effort 5") && /^┃ x$/m.test(pane), 5_000);
+  await session.waitForPane((pane) => pane.includes("Effort 1") && /^┃ x$/m.test(pane), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort 1"), 5_000);
   await session.sendKeys("C-u");
   expect(savedEffort(current)).toBe("high");
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
@@ -373,6 +376,198 @@ test.skipIf(!tmuxAvailable())("/effort on GPT-6 keeps the session's first effort
   expect(second.prompt[at]).toEqual(update);
   expect(JSON.stringify(second.prompt[at + 1])).toContain("second question");
   expect(second.prompt.filter((message) => JSON.stringify(message).includes("reasoningEffortUpdate"))).toHaveLength(1);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("typing over the open /effort menu filters its levels, as typing over the /model menu filters its models", async () => {
+  const current = await launch();
+  const { session, gateway } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  // The typed text stays in the composer as the query, and the first match
+  // is highlighted.
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await press(session, "Down");
+  await session.sendKeys("Enter");
+  await session.waitForText("Reasoning effort set to xhigh for acme/thinker", 5_000);
+  expect(savedEffort(current)).toBe("xhigh");
+
+  // A query with no match lists no level, and Enter neither applies one nor
+  // sends the query as a prompt: Backspace still edits the menu's query, and
+  // an empty query lists every level again with the one in use highlighted.
+  await session.sendText("/effort");
+  await waitForEffortMenu(current, "xhigh    current");
+  await session.sendLiteral("zz");
+  await session.waitForPane((pane) => pane.includes("Effort 0") && pane.includes("No levels found.") && /^┃ zz$/m.test(pane), 5_000);
+  await session.sendKeys("Enter");
+  await session.sendKeys("BSpace");
+  await session.sendKeys("BSpace");
+  await session.waitForPane((pane) => pane.includes("Effort 5") && /^┃ *$/m.test(pane), 5_000);
+  await session.sendKeys("Enter");
+  await session.waitForPane((pane) => count(pane, "Reasoning effort set to xhigh for acme/thinker") === 2, 5_000);
+  expect(savedEffort(current)).toBe("xhigh");
+  expect(gateway.requests.some((request) => request.body.includes("zz"))).toBe(false);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+
+  const views = menuViews(current, "filter").map((view) => view.menu);
+  expect(views).toContainEqual({ count: 2, model: MODEL, levels: ["high", "xhigh"], current: null });
+  expect(views).toContainEqual({ count: 0, model: MODEL, levels: [], current: null });
+  expect(views.at(-1)).toEqual({ count: 5, model: MODEL, levels: LEVELS, current: "xhigh" });
+  expect(highlightsAfter(current, /^h$/)).toEqual(["high"]);
+  expect(highlightsAfter(current, ARROW)).toEqual(["xhigh"]);
+  expect(highlightsAfter(current, /^\x7f$/).at(-1)).toBe("xhigh");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("Ctrl+P over the open /effort menu closes it with its query, and the /model menu it opens takes the typing and Enter", async () => {
+  const current = await launch();
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await session.sendKeys("C-p");
+  await session.waitForPane((pane) => pane.includes("Models 2") && !pane.includes("Effort 2") && /^┃ *$/m.test(pane), 5_000);
+  await session.sendLiteral("plain");
+  await session.waitForPane((pane) => pane.includes("Models 1"), 5_000);
+  await session.sendKeys("Enter");
+  await session.waitForText(`* Switched to ${PLAIN_MODEL}`, 5_000);
+  // The effort query is not given back as a draft when the /model menu closes.
+  await session.waitForPane((pane) => /^┃ *$/m.test(pane) && !pane.includes("Models "), 5_000);
+  expect(savedEffort(current)).toBeUndefined();
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=model_menu_opened query_bytes=1");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("a typed $ over the open /effort menu is part of its query and opens no skill list", async () => {
+  const current = await launch();
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("$");
+  await session.waitForPane((pane) => pane.includes("Effort 0") && pane.includes("No levels found.") && /^┃ \$$/m.test(pane), 5_000);
+  // Enter applies nothing for a query with no match, even the level that
+  // was highlighted before the $.
+  await session.sendKeys("Enter");
+  await session.sendKeys("BSpace");
+  await session.sendLiteral("x");
+  await session.waitForPane((pane) => pane.includes("Effort 1") && /^┃ x$/m.test(pane), 5_000);
+  await session.sendKeys("Enter");
+  await session.waitForText("Reasoning effort set to xhigh for acme/thinker", 5_000);
+  expect(await session.capturePane()).not.toContain("Reasoning effort set to default");
+  expect(savedEffort(current)).toBe("xhigh");
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("Tab over the open /effort menu leaves its query as typed, even when the query reads like a command", async () => {
+  const current = await launch();
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  for (const query of ["/effort h", "/model", "/effort"]) {
+    await session.sendLiteral(query);
+    await session.waitForPane((pane) => pane.includes("Effort 0") && new RegExp(`^┃ ${query.replace("/", "\\/")}$`, "m").test(pane), 5_000);
+    await session.sendKeys("Tab");
+    await session.sendKeys("C-u");
+    await session.waitForPane((pane) => pane.includes("Effort 5") && /^┃ *$/m.test(pane), 5_000);
+  }
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  // No frame showed a completion that Tab wrote into the query.
+  const rows = [...replayGrids(FX_BIN, current.tape, join(current.root, "tab.frames")).values()]
+    .flatMap((grid) => grid.map((row) => row.trimEnd()));
+  expect(rows).not.toContain("┃ /effort high");
+  expect(rows.filter((row) => /^┃ \/model \S/.test(row))).toEqual([]);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("the /effort menu sets an image draft aside while its query filters, and gives it back on Esc", async () => {
+  const current = await launch();
+  const { session } = current;
+  const image = join(current.root, "workspace", "i.png");
+  writeFileSync(image, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64"));
+  await session.sendHexBytes([...Buffer.from(`\x1b[200~${image}\x1b[201~`)].map((byte) => byte.toString(16).padStart(2, "0")));
+  await session.waitForPane((pane) => /^┃ \[Image 1\]/m.test(pane), 5_000);
+  await session.sendLiteral("/effort");
+  await session.sendKeys("Enter");
+  await waitForEffortMenu(current);
+  // The query starts empty: the image waits outside the composer.
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ \[Image 1\]/m.test(pane), 5_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await session.sendKeys("C-u");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=escape query_bytes=1 pasted_blocks=0 image_tokens=0 skill_tokens=0 draft_restored=true");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("a failed prompt that fx gives back closes the open /effort menu and stays in the composer", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let attempts = 0;
+  const current = await launch({
+    respond: (body) => {
+      if (!body.includes("first question")) return fakeGatewayFinalText("ANSWER");
+      attempts += 1;
+      // A dropped stream, which fx resends, then a reply no retry can fix,
+      // so the turn stops and gives the prompt back.
+      if (attempts === 1) return held.then(() => new Response("", { headers: { "content-type": "text/event-stream" } }));
+      return new Response(`data: ${"[".repeat(300)}${"]".repeat(300)}\n\n`, { headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  const { session } = current;
+  await session.sendText("first question");
+  await session.waitForText("Thinking", 10_000);
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  release();
+  await session.waitForPane((pane) => /^┃ first question$/m.test(pane) && !pane.includes("Effort "), 20_000);
+  expect(attempts).toBe(2);
+  expect(savedEffort(current)).toBeUndefined();
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await session.sendKeys("C-u");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=failed_prompt_restored query_bytes=1");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("switching models from the out-of-credits card closes the open /effort menu, and the prompt, not its query, comes back as the draft", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const current = await launch({
+    respond: (body) => body.includes("first question")
+      ? held.then(() => new Response(
+        JSON.stringify({ error: { code: "credit_card_required", message: "Buy credits to use AI Gateway." } }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      ))
+      : fakeGatewayFinalText("ANSWER"),
+  });
+  const { session } = current;
+  await session.sendText("first question");
+  await session.waitForText("Thinking", 10_000);
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  release();
+  await session.waitForText("Switch to another model", 10_000);
+  await session.sendKeys("Down");
+  await session.sendKeys("Enter");
+  await session.waitForPane((pane) => /^┃ \/model *$/m.test(pane) && !pane.includes("Effort "), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => /^┃ first question$/m.test(pane), 5_000);
+  expect(savedEffort(current)).toBeUndefined();
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await session.sendKeys("C-u");
+  await quit(current);
+  // The card gives the prompt back before it opens the picker, and that
+  // closes the menu first.
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=failed_prompt_restored query_bytes=1");
 }, TIMEOUT);
 
 test.skipIf(!tmuxAvailable())("a level the model does not offer, or a malformed one, changes nothing and names the levels", async () => {
