@@ -122,8 +122,8 @@
   },
   {
     "description": "A logout leaves the login that waits for its check request going: the answer saves and reports it",
-    "old": "            /\\ phase' = Ended(live[cur])\n            /\\ live' = [live EXCEPT ![cur] = 0]\n            /\\ indicator' = FALSE\n       ELSE UNCHANGED <<gone, phase, live, indicator>>",
-    "new": "            /\\ phase' = phase\n            /\\ live' = live\n            /\\ indicator' = indicator\n       ELSE UNCHANGED <<gone, phase, live, indicator>>",
+    "old": "            /\\ phase' = Ended(live[cur])\n            /\\ live' = [live EXCEPT ![cur] = 0]\n            /\\ indicator' = FALSE\n            /\\ events' = Recorded(events, live[cur])\n       ELSE UNCHANGED <<gone, phase, live, indicator, events>>",
+    "new": "            /\\ phase' = phase\n            /\\ live' = live\n            /\\ indicator' = indicator\n            /\\ events' = events\n       ELSE UNCHANGED <<gone, phase, live, indicator, events>>",
     "invariant": "LoggedOutNeverSaved"
   },
   {
@@ -149,5 +149,65 @@
     "old": "          /\\ saved' = IF ~refused THEN saved \\cup {k} ELSE saved\n",
     "new": "          /\\ saved' = saved \\cup {k}\n",
     "invariant": "RefusedNeverSaved"
+  },
+  {
+    "description": "A callback whose state isn't the live flow's ends the sign-in with no event",
+    "old": "               /\\ events' = Recorded(events, k)\n               /\\ UNCHANGED badRedeem",
+    "new": "               /\\ UNCHANGED <<badRedeem, events>>",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A token endpoint that refuses the code ends the sign-in with no event",
+    "old": "                  /\\ events' = IF ok THEN events ELSE Recorded(events, k)\n",
+    "new": "                  /\\ events' = events\n",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A refused check request ends the sign-in with no event",
+    "old": "          /\\ events' = IF a \\in Refusals THEN Recorded(events, k) ELSE events\n",
+    "new": "          /\\ events' = events\n",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "The 45 second deadline refuses a login with no event",
+    "old": "          /\\ events' = IF refused THEN Recorded(events, k) ELSE events\n",
+    "new": "          /\\ events' = events\n",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A logout that cuts off a login waiting for its check leaves no event",
+    "old": "            /\\ events' = Recorded(events, live[cur])\n       ELSE UNCHANGED <<gone, phase, live, indicator, events>>",
+    "new": "            /\\ events' = events\n       ELSE UNCHANGED <<gone, phase, live, indicator, events>>",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A browser that never comes back ends the sign-in at its deadline with no event",
+    "old": "          /\\ events' = Recorded(events, k)\n    /\\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone>>\n\n\\* A host's end",
+    "new": "    /\\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone, events>>\n\n\\* A host's end",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A host's end closes its sign-ins and leaves no event",
+    "old": "LoggedGone(h) == [k \\in Logins |-> IF hostOf[k] = h /\\ Pending(k) THEN Append(events[k], \"end\") ELSE events[k]]",
+    "new": "LoggedGone(h) == events",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A reload that drops the server ends its sign-in with no event",
+    "old": "            /\\ events' = Recorded(events, live[cur])\n       ELSE UNCHANGED <<phase, live, indicator, unread, swapped, gone, events>>",
+    "new": "            /\\ events' = events\n       ELSE UNCHANGED <<phase, live, indicator, unread, swapped, gone, events>>",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "The engine's late failure after a login's end is recorded as a second event, which `/trace` then reads as the reason",
+    "old": "LateFailure(k) ==\n    /\\ Len(events[k]) = 1\n    /\\ UNCHANGED vars",
+    "new": "LateFailure(k) ==\n    /\\ Len(events[k]) = 1\n    /\\ events' = [events EXCEPT ![k] = Append(@, \"late\")]\n    /\\ UNCHANGED <<cur, alive, retired, leases, phase, hostOf, got, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone>>",
+    "invariant": "ProblemNamesTheEnd"
+  },
+  {
+    "description": "A browser that never comes back records its end twice",
+    "old": "          /\\ events' = Recorded(events, k)\n    /\\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone>>\n\n\\* A host's end",
+    "new": "          /\\ events' = Recorded(Recorded(events, k), k)\n    /\\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone>>\n\n\\* A host's end",
+    "invariant": "OneEndOneEvent"
   }
 ]

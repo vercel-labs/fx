@@ -9,6 +9,7 @@
 //! `tests/tla/mcp_host/ElicitationRouting.tla`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const observation = @import("../agent/runtime/observation.zig");
 const mcp = @import("../../mcp/mcp.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -22,6 +23,7 @@ const config = @import("config.zig");
 const credentials = @import("credentials.zig");
 const kept_sign_outs = @import("kept_sign_outs.zig");
 const login_words = @import("login_words.zig");
+const sign_in_events = @import("sign_in_events.zig");
 const loopback = @import("login.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const core_mrtr = @import("../mcp/mrtr.zig");
@@ -591,6 +593,20 @@ pub const Runtime = struct {
         inherited: *const std.process.Environ.Map,
         options: Options,
     ) !void {
+        return r.startOwner(gpa, io, configs, inherited, options, true);
+    }
+
+    /// `start`, and with `owner_thread` false the owner thread is left unstarted, so a test can run the
+    /// owner's steps itself, one at a time, and `deinit` ends it.
+    fn startOwner(
+        r: *Runtime,
+        gpa: Allocator,
+        io: std.Io,
+        configs: []const mcp_contract.McpServerConfig,
+        inherited: *const std.process.Environ.Map,
+        options: Options,
+        comptime owner_thread: bool,
+    ) !void {
         r.* = .{
             .gpa = gpa,
             .io = io,
@@ -683,7 +699,7 @@ pub const Runtime = struct {
         }, local_engine.items);
         errdefer r.engine.deinit();
         try r.publish();
-        r.thread = try std.Thread.spawn(.{}, run, .{r});
+        if (owner_thread) r.thread = try std.Thread.spawn(.{}, run, .{r});
     }
 
     /// Replaced: from now until `deinit`, no other runtime starts a server.
@@ -704,7 +720,9 @@ pub const Runtime = struct {
         r.stopping = true;
         r.mutex.unlock(r.io);
         r.engine.wake();
-        if (r.thread) |t| t.join();
+        // The no-thread path is for tests only: one started with `startOwner(…, false)` ends its owner's steps here.
+        // It is compiled only into tests, so other builds, such as the terminal wasm, never reach the owner's loop.
+        if (r.thread) |t| t.join() else if (builtin.is_test) r.shutdown();
         // The owner ended every request; let their callers leave first.
         while (r.active.load(.acquire) != 0) std.Io.sleep(r.io, .fromMilliseconds(1), .awake) catch {};
         r.queue.deinit(r.gpa);
@@ -1308,7 +1326,7 @@ pub const Runtime = struct {
                 if (r.confirmingLogin(i)) {
                     debug_trace.logf("mcp", "MCP login dropped server={s} reason=signed out while it waited for the server", .{s.name});
                     r.endLogin(i);
-                    r.notify(.{ .sign_in_failed = .{ .server = s.name, .reason = "signed out before the server answered" } });
+                    r.signInEnded(.{ .sign_in_failed = .{ .server = s.name, .reason = "signed out before the server answered" } }, .{ .host = .signed_out });
                 }
                 r.flags[i] = .{};
                 // A program that exits next would lose a revocation still on
@@ -1427,7 +1445,7 @@ pub const Runtime = struct {
                 try r.saveCredential(i);
                 r.flags[i] = .{ .signed_in = true };
                 r.endLogin(i);
-                r.notify(if (how == .accepted) .{ .signed_in = name } else .{ .signed_in_unchecked = name });
+                r.signInEnded(if (how == .accepted) .{ .signed_in = name } else .{ .signed_in_unchecked = name }, .none);
             },
             .refused => |reason| {
                 debug_trace.logf("mcp", "MCP new login dropped server={s} reason=server refused the new login status=401 error={s}", .{ name, logCode(reason.code) });
@@ -1441,7 +1459,7 @@ pub const Runtime = struct {
                 // Nothing was saved, so there is nothing to say beyond the sign-in's failure.
                 r.flags[i] = .{ .needs_login = true, .refused_new_ms = r.nowMs() };
                 r.endLogin(i);
-                r.notify(.{ .sign_in_failed = .{ .server = name, .reason = text } });
+                r.signInEnded(.{ .sign_in_failed = .{ .server = name, .reason = text } }, .{ .login = reason.kind });
                 r.endToolWaiters(i, .needs_login);
             },
         }
@@ -1536,7 +1554,7 @@ pub const Runtime = struct {
                 continue;
             }
             r.engine.cancelSignIn(name) catch {};
-            r.notify(.{ .sign_in_failed = .{ .server = name, .reason = "the browser didn't come back within 5 minutes" } });
+            r.signInEnded(.{ .sign_in_failed = .{ .server = name, .reason = "the browser didn't come back within 5 minutes" } }, .{ .host = .browser_timeout });
             r.endLogin(l.server);
         }
     }
@@ -1735,6 +1753,7 @@ pub const Runtime = struct {
                         // Why the server refused is kept for when the store reads: the status
                         // says the store can't be read until then.
                         r.flags[i].login.set(reasonOf(required));
+                        sign_in_events.record(name, .needs_login, .{ .host = .store_unreadable });
                         debug_trace.logf("mcp", "MCP login not asked for server={s} reason=saved logins not read err={s}", .{ name, @errorName(err) });
                         return r.endToolWaiters(i, .failed);
                     }
@@ -1752,7 +1771,7 @@ pub const Runtime = struct {
                 } else {
                     debug_trace.logf("mcp", "MCP login needed server={s} reason={s}", .{ name, if (required.step_up) "more scopes" else "sign-in required" });
                 }
-                r.notify(.{ .needs_login = name });
+                r.signInEnded(.{ .needs_login = name }, .{ .login = reason.kind });
                 // Nothing comes until someone logs in.
                 r.endToolWaiters(i, .needs_login);
             },
@@ -1775,7 +1794,7 @@ pub const Runtime = struct {
                 const l = r.loginFor(i) orelse {
                     try r.saveCredential(i);
                     r.flags[i] = .{ .signed_in = true };
-                    return r.notify(.{ .signed_in = name });
+                    return r.signInEnded(.{ .signed_in = name }, .none);
                 };
                 l.confirming = true;
                 l.deadline_ms = r.nowMs() + confirm_wait_ms;
@@ -1786,12 +1805,15 @@ pub const Runtime = struct {
                 };
             },
             .sign_in_failed => |f| {
+                // The host's own end of a login (the browser's deadline, a logout, a config change) cancels the
+                // engine's flow, which then reports it as cancelled: a login has one end, the host's first.
+                if (r.loginFor(i) == null) return debug_trace.logf("mcp", "MCP late sign-in end dropped server={s} why={s}", .{ name, @tagName(f.why) });
                 // The message can point into the callback address the login
                 // holds, so it is put in words before the login goes.
                 var buffer: [512]u8 = undefined;
                 const reason = signInFailure(&buffer, f.why, f.message);
                 r.endLogin(i);
-                r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
+                r.signInEnded(.{ .sign_in_failed = .{ .server = name, .reason = reason } }, .{ .failure = f.why });
             },
             .tools_stale => _ = r.tools_epochs[i].fetchAdd(1, .release),
             // A new login's tokens are saved once the server has taken them
@@ -2078,7 +2100,7 @@ pub const Runtime = struct {
                 if (r.flags[i].not_saved) return;
                 r.flags[i].not_saved = true;
                 var buf: [320]u8 = undefined;
-                r.notify(.{ .not_saved = .{ .server = s.name, .reason = r.ensureCredentialStore().writeFailure(&buf, err) } });
+                r.signInEnded(.{ .not_saved = .{ .server = s.name, .reason = r.ensureCredentialStore().writeFailure(&buf, err) } }, .{ .host = .store_write_failed });
             }
         } else {
             // The tokens are gone, so this process is signed out whatever
@@ -2276,7 +2298,7 @@ pub const Runtime = struct {
                 std.mem.print(&buf, "the MCP config changed before the browser came back; run /mcp login {s} again", .{name}) catch "the MCP config changed before the browser came back"
             else
                 "the MCP config changed before the browser came back";
-            r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
+            r.signInEnded(.{ .sign_in_failed = .{ .server = name, .reason = reason } }, .{ .host = .config_changed });
             r.endLogin(i);
         }
         var k: usize = 0;
@@ -2382,7 +2404,7 @@ pub const Runtime = struct {
             var buf: [320]u8 = undefined;
             const reason = std.mem.print(&buf, "the MCP config changed before the browser came back; run /mcp login {s} again", .{name}) catch
                 "the MCP config changed before the browser came back; sign in again";
-            r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
+            r.signInEnded(.{ .sign_in_failed = .{ .server = name, .reason = reason } }, .{ .host = .config_changed });
             r.endLogin(server);
         }
         // A shared call still waiting ends as cancelled: the owner is told,
@@ -2558,6 +2580,13 @@ pub const Runtime = struct {
 
     fn notify(r: *Runtime, notice: Notice) void {
         if (r.options.notify) |n| n.notice(n.context, notice);
+    }
+
+    /// A sign-in's end: kept for `/trace` first (`sign_in_events`), so what the shell then
+    /// says is already in the report.
+    fn signInEnded(r: *Runtime, notice: Notice, reason: sign_in_events.Reason) void {
+        if (signInEvent(notice)) |event| sign_in_events.record(event.server, event.kind, reason);
+        r.notify(notice);
     }
 
     fn serverIndex(r: *const Runtime, name: []const u8) ?usize {
@@ -2831,7 +2860,7 @@ pub const Runtime = struct {
             return true;
         }
         debug_trace.logf("mcp", "MCP login saved by another fx taken server={s}", .{s.name});
-        r.notify(.{ .signed_in = s.name });
+        r.signInEnded(.{ .signed_in = s.name }, .none);
         return true;
     }
 
@@ -3057,6 +3086,18 @@ fn declaredCapabilities(questions: elicitation.Capabilities) []const u8 {
     return "{}";
 }
 
+/// The event a notice leaves for `/trace`. The address a login opens at is no end.
+fn signInEvent(notice: Notice) ?struct { server: []const u8, kind: sign_in_events.Kind } {
+    return switch (notice) {
+        .authorize => null,
+        .signed_in => |server| .{ .server = server, .kind = .signed_in },
+        .signed_in_unchecked => |server| .{ .server = server, .kind = .signed_in_unchecked },
+        .sign_in_failed => |failed| .{ .server = failed.server, .kind = .sign_in_failed },
+        .needs_login => |server| .{ .server = server, .kind = .needs_login },
+        .not_saved => |saved| .{ .server = saved.server, .kind = .not_saved },
+    };
+}
+
 /// Why a sign-in failed, in words, with the authorization server's own when
 /// it gave some.
 fn signInFailure(buffer: []u8, why: mcp.auth.client.Failure, message: ?[]const u8) []const u8 {
@@ -3090,6 +3131,88 @@ test "a saved login taken back counts as the one from before a refusal only for 
     try std.testing.expect(!refusalRecent(5_000, 5_000 + refusal_pickup_ms + 1));
     // Hours later, a login another fx saved is a new login.
     try std.testing.expect(!refusalRecent(5_000, 5_000 + 3 * 60 * 60 * 1000));
+}
+
+test "every notice but the address to sign in at leaves an event of its own kind for the server it names" {
+    const pairs = [_]struct { Notice, sign_in_events.Kind }{
+        .{ .{ .signed_in = "a" }, .signed_in },
+        .{ .{ .signed_in_unchecked = "a" }, .signed_in_unchecked },
+        .{ .{ .sign_in_failed = .{ .server = "a", .reason = "it said no" } }, .sign_in_failed },
+        .{ .{ .needs_login = "a" }, .needs_login },
+        .{ .{ .not_saved = .{ .server = "a", .reason = "disk full" } }, .not_saved },
+    };
+    for (pairs) |pair| {
+        const event = signInEvent(pair[0]).?;
+        try std.testing.expectEqualStrings("a", event.server);
+        try std.testing.expectEqual(pair[1], event.kind);
+    }
+    try std.testing.expect(signInEvent(.{ .authorize = .{ .server = "a", .url = "https://as.example/authorize" } }) == null);
+}
+
+test "a notice's words never reach the event it leaves" {
+    sign_in_events.reset();
+    defer sign_in_events.reset();
+    var runtime: Runtime = undefined;
+    runtime.options = .{ .client_version = "test", .credentials = .{ .detect = "" } };
+    const hostile = "token=sk-live-0123456789abcdef \x1b[31m";
+    runtime.signInEnded(.{ .sign_in_failed = .{ .server = "fixture", .reason = hostile } }, .{ .failure = .redemption });
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const snap = try sign_in_events.snapshot(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), snap.events.len);
+    try std.testing.expectEqualStrings("fixture", snap.events[0].server());
+    try std.testing.expectEqualStrings("redemption", snap.events[0].reason.name());
+    try std.testing.expect(std.mem.find(u8, std.mem.asBytes(&snap.events[0]), "sk-live") == null);
+}
+
+/// Counts what the host tells the shell about sign-ins.
+const SignInNotices = struct {
+    failed: usize = 0,
+
+    fn notice(context: *anyopaque, n: Notice) void {
+        const counts: *SignInNotices = @ptrCast(@alignCast(context));
+        if (n == .sign_in_failed) counts.failed += 1;
+    }
+};
+
+/// A login of server 0 that the browser never came back to, past its deadline. The test is the owner thread.
+fn startExpiredLogin(r: *Runtime, f: *Fixture, counts: *SignInNotices, configs: []const mcp_contract.McpServerConfig) !void {
+    var options = f.options();
+    options.notify = .{ .context = counts, .notice = SignInNotices.notice };
+    try r.startOwner(testing.allocator, testing.io, configs, &f.inherited, options, false);
+    errdefer r.deinit();
+    var listener = try loopback.Listener.open(r.io, null);
+    errdefer listener.close(r.io);
+    const l = try r.gpa.create(Login);
+    errdefer r.gpa.destroy(l);
+    l.* = .{ .runtime = r, .server = 0, .name = r.resolved.servers[0].name, .listener = listener, .deadline_ms = r.nowMs() - 1, .open_browser = false };
+    try r.logins.append(r.gpa, l);
+}
+
+test "a login the host ended at its browser deadline has that one end, whatever the engine says after" {
+    sign_in_events.reset();
+    defer sign_in_events.reset();
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var counts: SignInNotices = .{};
+    var r: Runtime = undefined;
+    try startExpiredLogin(&r, &f, &counts, &configs);
+    defer r.deinit();
+
+    r.expireLogins();
+    try testing.expect(r.loginFor(0) == null);
+    // The engine's flow, cancelled by that end, reports it as cancelled a moment later.
+    try r.onServer(0, "fake", .{ .sign_in_failed = .{ .why = .cancelled, .message = null } });
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const snap = try sign_in_events.snapshot(arena.allocator());
+    try testing.expectEqual(@as(usize, 1), snap.events.len);
+    try testing.expectEqual(sign_in_events.Kind.sign_in_failed, snap.events[0].kind);
+    try testing.expectEqualStrings("browser_timeout", snap.latestWhy("fake").?.reason.name());
+    try testing.expectEqual(@as(usize, 1), counts.failed);
 }
 
 test "a failed sign-in says why in words, with the server's own" {
