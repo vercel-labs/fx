@@ -30,7 +30,21 @@ pub const ToolActionInput = struct {
     workspace_root: []const u8 = "",
     display_target: ?[]const u8 = null,
     is_available_dynamic_mcp_tool: bool = false,
+    command_placement: ?types.CommandPlacement = null,
 };
+
+/// Formats a command action label with its non-local placement suffix (`"on remote"`,
+/// `"on isolated"`). Local or unplaced runs keep `base_label` unchanged.
+/// Returned slices either borrow `base_label` or live in `alloc`.
+pub fn formatCommandPlacementLabel(
+    alloc: Allocator,
+    base_label: []const u8,
+    placement: ?types.CommandPlacement,
+) Allocator.Error![]const u8 {
+    const value = placement orelse return base_label;
+    const suffix = value.runnerPhrase() orelse return base_label;
+    return alloc.print("{s} {s}", .{ base_label, suffix });
+}
 
 pub const SubagentActionState = union(enum) {
     identity,
@@ -1192,6 +1206,13 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     if (try formatRunCommandActivity(alloc, input.tool_registry, input.workspace_root, call)) |activity| {
         defer alloc.free(activity.detail);
         const action_label = if (activity.compatibility_tool) |tool| tool.action_label else "Running";
+        if (activity.compatibility_tool == null) {
+            if (input.command_placement) |placement| {
+                if (placement.runnerPhrase()) |suffix| {
+                    return alloc.print("{s} {s} {f}", .{ action_label, suffix, text_utils.terminalSafe(activity.detail) });
+                }
+            }
+        }
         return alloc.print("{s} {f}", .{ action_label, text_utils.terminalSafe(activity.detail) });
     }
 
@@ -1224,6 +1245,60 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     // The value is what the model asked for, such as a toolbox open's target,
     // so a control sequence in it is written as visible text.
     return alloc.print("{s} {f}", .{ presentation.action_label, text_utils.terminalSafe(value) });
+}
+
+/// Returns the short, terminal-safe target string shown in a tool call's header
+/// (or empty string when the call has none). The caller owns the returned slice.
+pub fn formatShortSafeTarget(alloc: Allocator, input: ToolActionInput) ![]const u8 {
+    var shown_state = std.heap.ArenaAllocator.init(alloc);
+    defer shown_state.deinit();
+    const call = try toolbox.shownBuiltinRun(shown_state.allocator(), input.tool_registry, input.call) orelse input.call;
+    if (input.tool_registry.lookup(call.name) != null) {
+        if (try subagentAction(shown_state.allocator(), call, .active)) |action| {
+            const encoded = try text_utils.encodeTerminalSafe(
+                alloc,
+                action.detail,
+                max_run_command_activity_bytes,
+            );
+            return encoded.bytes;
+        }
+    }
+    if (try formatRunCommandActivity(alloc, input.tool_registry, input.workspace_root, call)) |activity| {
+        return activity.detail;
+    }
+
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const scratch = scratch_state.allocator();
+
+    const spec = input.tool_registry.lookup(call.name) orelse {
+        if (isProviderSearchAlias(call.name)) {
+            const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch return alloc.dupe(u8, "");
+            const detail = try formatWebSearchActionDetail(scratch, args);
+            const encoded = try text_utils.encodeTerminalSafe(alloc, detail, max_run_command_activity_bytes);
+            return encoded.bytes;
+        }
+        return alloc.dupe(u8, "");
+    };
+    const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
+        return alloc.dupe(u8, "");
+    };
+    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
+    if (spec.executor_kind == .web_search) {
+        const detail = try formatWebSearchActionDetail(scratch, args);
+        const encoded = try text_utils.encodeTerminalSafe(alloc, detail, max_run_command_activity_bytes);
+        return encoded.bytes;
+    }
+    const value = input.display_target orelse
+        call.resolved_display_target orelse
+        tool_dispatch.presentationLabelValue(presentation, args) orelse
+        "";
+    const encoded = try text_utils.encodeTerminalSafe(
+        alloc,
+        value,
+        max_run_command_activity_bytes,
+    );
+    return encoded.bytes;
 }
 
 /// Names an earlier call in the row of a later call that reads its saved
@@ -1827,6 +1902,19 @@ test "tool presentation preserves plain action fallbacks" {
         defer alloc.free(label);
         try std.testing.expectEqualStrings(case.expected, label);
     }
+
+    const shell_call = ToolCall{ .id = "shell-run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"uname -a\"}" };
+    const remote_label = try formatPlainAction(alloc, .{ .tool_registry = test_tool_registry, .call = shell_call, .command_placement = .remote });
+    defer alloc.free(remote_label);
+    try std.testing.expectEqualStrings("Running on remote uname -a", remote_label);
+
+    const isolated_label = try formatPlainAction(alloc, .{ .tool_registry = test_tool_registry, .call = shell_call, .command_placement = .isolated });
+    defer alloc.free(isolated_label);
+    try std.testing.expectEqualStrings("Running on isolated uname -a", isolated_label);
+
+    const local_label = try formatPlainAction(alloc, .{ .tool_registry = test_tool_registry, .call = shell_call, .command_placement = .local });
+    defer alloc.free(local_label);
+    try std.testing.expectEqualStrings("Running uname -a", local_label);
 }
 
 test "a plain action of a toolbox run of a built-in tool reads as a direct call of it" {

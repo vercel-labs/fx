@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync, spawnSync } from "node:child_process";
 import { processAlive as isProcessAlive } from "./process-alive";
 import { createServer, type AddressInfo, type Socket } from "node:net";
 import {
@@ -344,7 +345,7 @@ test("the user talks to the parent while its subagent works, and a stop ends the
     await tui.waitForStableComposer(15000);
     await tui.sendText("STEERING_START");
     // The parent's turn ends with the receipt while its subagent works.
-    await tui.waitForPane((pane) => pane.includes("START_SENT") && turnSettled(pane), 10000);
+    await tui.waitForReplyAndTurnEnd("START_SENT", 10000);
     await tui.waitForPane(() => childRequests === 1, 10000);
     await tui.waitForPane(() => work().spawns === 1, 10000);
     const original = work();
@@ -352,17 +353,17 @@ test("the user talks to the parent while its subagent works, and a stop ends the
 
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_FIRST");
-    await tui.waitForPane((pane) => pane.includes("FIRST_ACCEPTED") && turnSettled(pane), 10000);
+    await tui.waitForReplyAndTurnEnd("FIRST_ACCEPTED", 10000);
     // Still the one piece of work, still running.
     expect(work()).toEqual(original);
 
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_STOP");
-    await tui.waitForPane((pane) => pane.includes("STOP_DONE") && turnSettled(pane), 10000);
+    await tui.waitForReplyAndTurnEnd("STOP_DONE", 10000);
     await tui.waitForPane(() => work().outcome === "cancelled", 10000);
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_LATER");
-    await tui.waitForPane((pane) => pane.includes("LATER_OK") && turnSettled(pane), 10000);
+    await tui.waitForReplyAndTurnEnd("LATER_OK", 10000);
     expect(childRequests).toBe(1);
     // A stop is answered by the stop call, never by a report.
     expect(reportTurns).toBe(0);
@@ -730,6 +731,7 @@ function parseAskJson(stdout: string): {
   recovery?: {
     state: string;
     attempt: number;
+    cause?: string;
     need?: string;
     message?: string;
   };
@@ -1590,7 +1592,7 @@ describe("gateway stream lifecycle", () => {
       });
       await session.waitForStableComposer(15_000);
       await session.sendText("!echo bang-routing-probe");
-      await session.waitForPane((pane) => pane.includes("BANG_PROMPT_ROUTED") && turnSettled(pane), 15_000);
+      await session.waitForReplyAndTurnEnd("BANG_PROMPT_ROUTED", 15_000);
       expect(gateway.requests).toHaveLength(1);
       await session.sendText("/quit");
       await session.waitForPane(() => session!.paneStatus().dead, 10_000);
@@ -2538,6 +2540,77 @@ describe("gateway stream lifecycle", () => {
     }
   }, 60_000);
 
+  test("a workspace outside HOME lists no skills from folders above its repository or itself", async () => {
+    const root = createFixtureRoot("skill-walk-boundary");
+    const tracePath = join(root.root, "trace.log");
+    const writeSkill = (base: string, name: string) => {
+      const directory = join(base, ".agents", "skills", name);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        join(directory, "SKILL.md"),
+        `---\nname: ${name}\ndescription: ${name} fixture\n---\n\nbody\n`,
+      );
+    };
+    const gitInit = (directory: string) => {
+      mkdirSync(directory, { recursive: true });
+      const result = Bun.spawnSync(["git", "init", "-q", "--template=", directory], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          HOME: root.home,
+          GIT_CONFIG_NOSYSTEM: "1",
+          LC_ALL: "C",
+        },
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(`git init failed: ${result.stderr.toString()}`);
+      }
+    };
+    // The fixture's HOME is beside these two workspaces, not above them.
+    const repository = join(root.root, "top", "mid", "repo");
+    gitInit(repository);
+    writeSkill(join(root.root, "top"), "walk-above-repository");
+    writeSkill(repository, "walk-repository");
+    const plainParent = join(root.root, "plain");
+    const plainWorkspace = join(plainParent, "workspace");
+    writeSkill(plainParent, "walk-above-workspace");
+    writeSkill(plainWorkspace, "walk-workspace");
+    // A repository under HOME keeps loading the folders up to HOME.
+    const homeRepository = join(root.home, "projects", "repo");
+    gitInit(homeRepository);
+    writeSkill(join(root.home, "projects"), "walk-above-home-repository");
+
+    const gateway = startGateway(() => fakeGatewayFinalText("SKILL_WALK_DONE"));
+    const firstRequest = async (cwd: string) => {
+      const index = gateway.requestCount();
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Say done."],
+        {
+          cwd,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_SOUND: "0" },
+          timeoutMs: 30_000,
+        },
+      );
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("SKILL_WALK_DONE");
+      return gateway.requests[index]!.body;
+    };
+    try {
+      const inRepository = await firstRequest(repository);
+      expect(advertisedSkillOpenKeys(inRepository, "walk-repository")).toHaveLength(1);
+      expect(advertisedSkillOpenKeys(inRepository, "walk-above-repository")).toEqual([]);
+
+      const inPlainWorkspace = await firstRequest(plainWorkspace);
+      expect(advertisedSkillOpenKeys(inPlainWorkspace, "walk-workspace")).toHaveLength(1);
+      expect(advertisedSkillOpenKeys(inPlainWorkspace, "walk-above-workspace")).toEqual([]);
+
+      const inHomeRepository = await firstRequest(homeRepository);
+      expect(advertisedSkillOpenKeys(inHomeRepository, "walk-above-home-repository")).toHaveLength(1);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("skill_symlink_authorities setting admits external skill links", async () => {
     const root = createFixtureRoot("skill-symlink-authorities");
     const tracePath = join(root.root, "trace.log");
@@ -2652,10 +2725,7 @@ describe("gateway stream lifecycle", () => {
         await tui.sendText("verify the bounded project context");
         let compact: string;
         try {
-          compact = await tui.waitForPane(
-            (text) => text.includes("CONTEXT_LIMIT_FIRST_COMPLETE") && turnSettled(text),
-            30_000,
-          );
+          compact = await tui.waitForReplyAndTurnEnd("CONTEXT_LIMIT_FIRST_COMPLETE", 30_000);
         } catch (error) {
           throw new Error(
             `${error}\nstderr:\n${readFileSync(stderrPath, "utf8")}\ntrace:\n${readFileSync(tracePath, "utf8").slice(-12_000)}\nscrollback:\n${await tui.captureFullScrollback()}`,
@@ -2702,7 +2772,7 @@ describe("gateway stream lifecycle", () => {
         expect(restored).not.toContain("toolbox menu shortened");
 
         await tui.sendText("verify the bounded project context again");
-        await tui.waitForPane((text) => text.includes("CONTEXT_LIMIT_SECOND_COMPLETE") && turnSettled(text), 30_000);
+        await tui.waitForReplyAndTurnEnd("CONTEXT_LIMIT_SECOND_COMPLETE", 30_000);
         expect(gateway.requestCount()).toBe(2);
         await tui.resizeWindow(119, 32);
         await tui.resizeWindow(123, 34);
@@ -2818,10 +2888,7 @@ describe("gateway stream lifecycle", () => {
         });
         await tui.waitForComposer(15_000);
         await tui.sendText("inspect the deeply scoped target");
-        const compact = await tui.waitForPane(
-          (text) => text.includes("PROJECT_OMISSION_TUI_COMPLETE") && turnSettled(text),
-          30_000,
-        );
+        const compact = await tui.waitForReplyAndTurnEnd("PROJECT_OMISSION_TUI_COMPLETE", 30_000);
         const compactScrollback = await tui.captureFullScrollback();
         expect(compact).not.toContain("reason=oversized rule file");
         expect(compact).not.toContain("reason=selection cap");
@@ -2908,10 +2975,7 @@ describe("gateway stream lifecycle", () => {
         await tui.waitForComposer(15_000);
         await waitForMcpServerReady(tui, "fixture", mcp);
         await tui.sendText("Load the bounded skill and select the MCP tool.");
-        const compact = await tui.waitForPane(
-          (text) => text.includes("TOOL_TIME_CONTEXT_COMPLETE") && turnSettled(text),
-          30_000,
-        );
+        const compact = await tui.waitForReplyAndTurnEnd("TOOL_TIME_CONTEXT_COMPLETE", 30_000);
         const compactScrollback = await tui.captureFullScrollback();
         expect(compact).not.toContain("skill resource");
         expect(compact).not.toContain("MCP schema");
@@ -3682,7 +3746,7 @@ describe("gateway stream lifecycle", () => {
             releaseFinish();
           } else {
             releaseFinish();
-            await tui.waitForPane((pane) => pane.includes("HELD_SKILL_RESOURCE_COMPLETE") && turnSettled(pane), 15_000);
+            await tui.waitForReplyAndTurnEnd("HELD_SKILL_RESOURCE_COMPLETE", 15_000);
             await tui.waitForStableComposer(10_000);
             const completed = await tui.captureFullScrollback();
             expect(completed).toContain(`Read skill resource ${resource}`);
@@ -3691,7 +3755,7 @@ describe("gateway stream lifecycle", () => {
             expect(gateway.requestCount()).toBe(heldRequestCount + 1);
           }
           await tui.sendText("Confirm later input still works.");
-          await tui.waitForPane((pane) => pane.includes("HELD_SKILL_LATER_INPUT_OK") && turnSettled(pane), 15_000);
+          await tui.waitForReplyAndTurnEnd("HELD_SKILL_LATER_INPUT_OK", 15_000);
           await tui.waitForStableComposer(10_000);
           expect(gateway.requestCount()).toBe(heldRequestCount + (scenario.cancel ? 1 : 2));
           const scrollback = await tui.captureFullScrollback();
@@ -9350,7 +9414,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         });
         await tui.waitForComposer(15_000);
         await tui.sendText("FIRST_PROMPT_COMPACTION_SENTINEL");
-        await tui.waitForPane((pane) => pane.includes("FIRST_REPLY_COMPACTION_SENTINEL") && turnSettled(pane), 15_000);
+        await tui.waitForReplyAndTurnEnd("FIRST_REPLY_COMPACTION_SENTINEL", 15_000);
         await tui.sendText("SECOND_PROMPT_COMPACTION_SENTINEL");
         await tui.waitForPane(
           (pane) =>
@@ -10301,6 +10365,154 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 60_000);
 
+  const canDropLoopbackPackets = spawnSync("sudo", ["-n", "iptables", "-S", "INPUT"]).status === 0;
+
+  test.skipIf(!canDropLoopbackPackets)(
+    "default fx ask resends on a new connection when the pooled one stops acknowledging the request",
+    async () => {
+      const expectedOutput = "Answered on a new connection.";
+      const toolCallBody = await fakeGatewayToolCall("read_notes", "read_file", {
+        path: "notes.txt",
+      }).text();
+      const finalBody = await fakeGatewayFinalText(expectedOutput).text();
+
+      const root = createFixtureRoot("unacked-pooled-connection");
+      const tracePath = join(root.root, "trace.log");
+      writeFileSync(join(root.workspace, "notes.txt"), "pooled connection fixture\n");
+      const sockets = new Set<Socket>();
+      const requestSockets = new Set<Socket>();
+      let connections = 0;
+      let requests = 0;
+      let socketFailure: Error | undefined;
+      let serverPort = 0;
+      let iptablesRuleArgs: string[] | undefined;
+
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("error", (error) => {
+          socketFailure ??= error;
+        });
+        connections += 1;
+
+        let request = Buffer.alloc(0);
+        let requestHandled = false;
+        socket.on("data", (chunk) => {
+          requestSockets.add(socket);
+          if (requestHandled) return;
+          if (request.length + chunk.length > 1024 * 1024) {
+            socketFailure ??= new Error("pooled connection fixture request exceeded 1 MiB");
+            socket.destroy();
+            return;
+          }
+          request = Buffer.concat([request, chunk]);
+          const headerEnd = request.indexOf("\r\n\r\n");
+          if (headerEnd < 0) return;
+          const headers = request.subarray(0, headerEnd).toString("utf8");
+          const lengthMatch = /\r\ncontent-length:\s*(\d+)/i.exec(`\r\n${headers}`);
+          const contentLength = lengthMatch ? Number.parseInt(lengthMatch[1]!, 10) : 0;
+          if (request.length < headerEnd + 4 + contentLength) return;
+
+          requestHandled = true;
+          requests += 1;
+          if (requests === 1) {
+            const clientPort = socket.remotePort;
+            if (clientPort === undefined) {
+              socketFailure ??= new Error("missing socket.remotePort");
+              return;
+            }
+            // Drop only fx's packets on this connection: the reply still arrives, but fx's next request is never acknowledged.
+            const args = [
+              "INPUT",
+              "-i",
+              "lo",
+              "-p",
+              "tcp",
+              "--sport",
+              String(clientPort),
+              "--dport",
+              String(serverPort),
+              "-j",
+              "DROP",
+            ];
+            execFileSync("sudo", ["iptables", "-I", ...args]);
+            iptablesRuleArgs = args;
+            socket.write(
+              "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: text/event-stream\r\n" +
+                `Content-Length: ${Buffer.byteLength(toolCallBody)}\r\n\r\n` +
+                toolCallBody,
+            );
+            return;
+          }
+          socket.end(
+            "HTTP/1.1 200 OK\r\n" +
+              "Content-Type: text/event-stream\r\n" +
+              `Content-Length: ${Buffer.byteLength(finalBody)}\r\n` +
+              "Connection: close\r\n\r\n" +
+              finalBody,
+          );
+        });
+      });
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(0, "127.0.0.1", resolve);
+        });
+        const address = server.address();
+        if (address === null || typeof address === "string") {
+          throw new Error("missing pooled connection fixture address");
+        }
+        serverPort = address.port;
+
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Read notes.txt, then answer."],
+          {
+            cwd: root.workspace,
+            env: {
+              FX_SOUND: "0",
+              HOME: root.home,
+              AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_TEST_GATEWAY_CHAT_URL:
+                `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
+              FX_MODEL: MODEL,
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "agent,core,gateway,stream",
+            },
+            timeoutMs: 120_000,
+          },
+        );
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+        expect(socketFailure).toBeUndefined();
+        expect(result.timedOut).toBe(false);
+        expect(result.code).toBe(0);
+        const json = parseAskJson(result.stdout);
+
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toContain(expectedOutput);
+        expect(json.recovery).toEqual({ state: "recovered", attempt: 2, cause: "dropped" });
+        expect(result.elapsedMs).toBeGreaterThanOrEqual(40_000);
+        expect(result.elapsedMs).toBeLessThan(90_000);
+        expect(connections).toBeGreaterThanOrEqual(2);
+        expect(requests).toBe(2);
+        expect(requestSockets.size).toBe(2);
+        expect(trace).toContain("socket_err=ConnectionTimedOut");
+      } finally {
+        if (iptablesRuleArgs) {
+          spawnSync("sudo", ["iptables", "-D", ...iptablesRuleArgs]);
+        }
+        for (const socket of sockets) socket.destroy();
+        if (server.listening) {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    150_000,
+  );
+
   test("default fx ask starts fresh network pacing after explicitly timed provider retries", async () => {
     const root = createFixtureRoot("mixed-provider-network-pacing");
     const tracePath = join(root.root, "trace.log");
@@ -11138,7 +11350,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       await within(childReadBack.promise, 15_000, "the child to read notes.txt back");
       // The reply's last words show before its turn ends, so the wait also
       // holds for the turn's end before the composer and trace reads below.
-      await session.waitForPane((pane) => pane.includes("MAIN_SAW_SEARCHER_READY") && turnSettled(pane), 15_000);
+      await session.waitForReplyAndTurnEnd("MAIN_SAW_SEARCHER_READY", 15_000);
       await session.waitForStableComposer(15_000);
       expect(childRequests).toBe(3);
       const lines = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("call_id=approval-search "));
@@ -12504,16 +12716,32 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
         !latestUserIsReport(request.body))!;
       const resumedChild = gateway.requests.find((request) =>
         !request.body.includes('"name":"subagent"') && promptText(request.body).includes(secondMessage))!;
-      const parentCatalog = taggedBlock(resumedParent.body, "toolbox");
-      const childCatalog = taggedBlock(resumedChild.body, "toolbox");
+      const firstParent = gateway.requests.find((request) =>
+        promptText(request.body).includes("RESUME_PERSISTENT_FIRST") &&
+        !promptText(request.body).includes("RESUME_PERSISTENT_SECOND") &&
+        !hasCurrentToolResult(request.body, "persistent_resume_one") &&
+        !latestUserIsReport(request.body))!;
+      const firstChild = gateway.requests.find((request) =>
+        !request.body.includes('"name":"subagent"') &&
+        promptText(request.body).includes(firstMessage) &&
+        !promptText(request.body).includes(secondMessage))!;
       expect(resumedParent.headers.get("ai-language-model-id")).toBe(smallModel);
       expect(resumedChild.headers.get("ai-language-model-id")).toBe(MODEL);
-      for (const catalog of [parentCatalog, childCatalog]) {
-        expect(catalog).not.toContain("original-workspace-only");
-        for (const name of skillNames) expect(catalog).toContain(`- ${name}:`);
+      // A resume, here in another workspace with a smaller model, sends the
+      // menu each conversation sent first, byte for byte, and the toolbox it
+      // holds now arrives as a change note at the end of the new turn
+      // (tests/tla/toolbox/Toolbox.tla MenuFixed and Informed, D103). The
+      // persistent child resumes its own saved conversation the same way.
+      for (const [first, resumed] of [[firstParent, resumedParent], [firstChild, resumedChild]] as const) {
+        const firstMenu = taggedBlock(first.body, "toolbox");
+        expect(firstMenu).toContain("- original-workspace-only:");
+        for (const name of skillNames) expect(firstMenu).not.toContain(name);
+        expect(taggedBlock(resumed.body, "toolbox")).toBe(firstMenu);
+        const turnEnd = contentText(gatewayRequest(resumed.body).prompt.at(-1)!.content);
+        expect(turnEnd).toContain("The toolbox now holds something other than the toolbox menu above lists.");
+        for (const name of skillNames) expect(turnEnd).toContain(name);
+        expect(turnEnd).not.toContain("original-workspace-only");
       }
-      // Each menu gives a skill one short line, so the two models' windows
-      // change it only when the budget forces a cut.
 
       const directChildResume = await runFx(
         [
@@ -13646,7 +13874,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       child.release("CHILD_REPORT_TEXT");
       await tui.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), 10000);
       parentHold.release!();
-      await tui.waitForPane((pane) => pane.includes("EMPTY_REPORT_ALL_DONE") && turnSettled(pane), 10000);
+      await tui.waitForReplyAndTurnEnd("EMPTY_REPORT_ALL_DONE", 10000);
 
       expect(childRequests).toBe(1);
       expect(parentBodies).toHaveLength(3);
@@ -13769,7 +13997,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
         10000,
       );
       writeFileSync(paths.release, "");
-      await tui.waitForPane((pane) => pane.includes("EMPTY_HANDOFF_ALL_DONE") && turnSettled(pane), 10000);
+      await tui.waitForReplyAndTurnEnd("EMPTY_HANDOFF_ALL_DONE", 10000);
 
       expect(childRequests()).toBe(1);
       // The report takes the nudge's place, as one that waited in the
@@ -13819,7 +14047,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
         10000,
       );
       writeFileSync(paths.release, "");
-      await tui.waitForPane((pane) => pane.includes("EMPTY_MESSAGE_ALL_DONE") && turnSettled(pane), 10000);
+      await tui.waitForReplyAndTurnEnd("EMPTY_MESSAGE_ALL_DONE", 10000);
 
       const next = parentBodies[2]!;
       expect(next).toContain("CHILD_MESSAGE_TEXT");
@@ -13911,7 +14139,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       secondHold.release!();
       await tui.waitForText("Continue with a follow-up prompt if needed.", 10000);
       writeFileSync(paths.release, "");
-      await tui.waitForPane((pane) => pane.includes("EMPTY_SECOND_REPORT_DONE") && turnSettled(pane), 10000);
+      await tui.waitForReplyAndTurnEnd("EMPTY_SECOND_REPORT_DONE", 10000);
 
       expect(parentBodies).toHaveLength(4);
       expect(parentBodies[3]).toContain("CHILD_REPORT_TEXT");
@@ -13940,7 +14168,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       tui = await startHandoffTui(root, gateway, paths);
       await tui.waitForStableComposer(15000);
       await tui.sendText("EMPTY_PLAIN_START");
-      await tui.waitForPane((pane) => pane.includes("EMPTY_PLAIN_ALL_DONE") && turnSettled(pane), 10000);
+      await tui.waitForReplyAndTurnEnd("EMPTY_PLAIN_ALL_DONE", 10000);
 
       expect(parentBodies).toHaveLength(2);
       expect(parentBodies[1]).toContain(EMPTY_REPLY_NUDGE);
@@ -14284,6 +14512,38 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
   }, 20_000);
 
 
+  test("fx ask --json hints the shell tool when a model calls bash", async () => {
+    const root = createFixtureRoot("bash-tool-hint");
+    const tracePath = join(root.root, "trace.log");
+    const responses = [
+      fakeGatewayToolCall("bash_1", "bash", { command: "printf ok" }),
+      fakeGatewayFinalText("Recovered after bash hint."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Run a command."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.final_output).toBe("Recovered after bash hint.");
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("Unsupported tool: bash. Use shell instead.");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("model response recovery keeps retrying status failures past ten real requests", async () => {
     const root = createFixtureRoot("provider-attempt-budget");
     const tracePath = join(root.root, "trace.log");
@@ -14319,6 +14579,196 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("fx ask --json stops retrying 503 responses once the retry budget passes", async () => {
+    const root = createFixtureRoot("ask-retry-budget-503");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => unavailableResponse("1"));
+    const started = Date.now();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Stop retrying after the budget."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+          timeoutMs: 8_000,
+        },
+      );
+      const elapsedMs = Date.now() - started;
+
+      expect(result.timedOut).toBe(false);
+      expect(result.code).toBe(1);
+      expect(elapsedMs).toBeLessThan(6_000);
+      const json = parseAskJson(result.stdout);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(json.recovery).toEqual({
+        state: "failed",
+        attempt: 2,
+        cause: "server",
+      });
+      expect(result.stderr).toContain("fx ask: API request failed · HTTP 503 · provider temporarily unavailable");
+      expect(gateway.requestCount()).toBe(2);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("fx ask --json stops retrying provider_error events once the retry budget passes", async () => {
+    const root = createFixtureRoot("ask-retry-budget-provider-error");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => providerErrorResponse("always broken provider"));
+    const started = Date.now();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Stop retrying provider errors after the budget."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+          timeoutMs: 8_000,
+        },
+      );
+      const elapsedMs = Date.now() - started;
+
+      expect(result.timedOut).toBe(false);
+      expect(result.code).toBe(1);
+      expect(elapsedMs).toBeLessThan(6_000);
+      const json = parseAskJson(result.stdout);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBe("ModelError");
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.cause).toBe("server");
+      expect(json.recovery?.attempt).toBe(2);
+      expect(result.stderr).toContain("[notice] ⚠ Provider unavailable · provider_error: always broken provider · stopped after 2 attempts");
+      expect(gateway.requestCount()).toBe(2);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("fx ask --json exits when its own 503 retry budget expires even with a subagent running", async () => {
+    const root = createFixtureRoot("ask-retry-budget-503-with-subagent");
+    const tracePath = join(root.root, "trace.log");
+    let sawParentStartCall = false;
+    let sawChildRequest = false;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"') && body.includes("Keep working while the gateway fails.")) {
+        sawChildRequest = true;
+      }
+      if (!sawParentStartCall && body.includes('"name":"subagent"') && !hasCurrentToolResult(body, "start_worker")) {
+        sawParentStartCall = true;
+        return fakeGatewayToolCall("start_worker", "subagent", {
+          request: {
+            action: "message",
+            agent: "worker",
+            message: "Keep working while the gateway fails.",
+          },
+        });
+      }
+      return unavailableResponse("1");
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const started = Date.now();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Start a subagent and stop if retries run out."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+          timeoutMs: 60_000,
+        },
+      );
+      const elapsedMs = Date.now() - started;
+
+      expect(result.timedOut).toBe(false);
+      expect(elapsedMs).toBeLessThan(15_000);
+      expect(sawChildRequest).toBe(true);
+      expect(result.code).toBe(1);
+      const json = parseAskJson(result.stdout);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.cause).toBe("server");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  test("fx ask --json still waits for its subagent when a retried turn fails for a non-budget reason", async () => {
+    const root = createFixtureRoot("ask-retry-then-non-budget-fail-waits-subagent");
+    const tracePath = join(root.root, "trace.log");
+    let sawParentStartCall = false;
+    let parentFailures = 0;
+    let sawParentReportTurn = false;
+    let releaseChild: () => void = () => {};
+    const childHeld = new Promise<void>((resolve) => { releaseChild = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"') && body.includes("CHILD_AFTER_PARENT_ERROR")) {
+        await childHeld;
+        return fakeGatewayFinalText("CHILD_FINISHES_TASK");
+      }
+      if (body.includes("CHILD_FINISHES_TASK")) {
+        sawParentReportTurn = true;
+        return fakeGatewayFinalText("MAIN_AFTER_CHILD_REPORT");
+      }
+      if (!sawParentStartCall && body.includes('"name":"subagent"') && !hasCurrentToolResult(body, "start_worker")) {
+        sawParentStartCall = true;
+        return fakeGatewayToolCall("start_worker", "subagent", {
+          request: {
+            action: "message",
+            agent: "worker",
+            message: "CHILD_AFTER_PARENT_ERROR",
+          },
+        });
+      }
+      parentFailures += 1;
+      if (parentFailures === 1) return unavailableResponse("0");
+      return new Response(JSON.stringify({ error: { message: "bad request after retry" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const released = (async () => {
+      if (await waitUntil(() => mainTurnsEnded(tracePath) >= 1, 20_000)) releaseChild();
+    })();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Start a subagent, retry once, then fail with 400."],
+        {
+          cwd: root.workspace,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "worker" },
+          timeoutMs: 30_000,
+        },
+      );
+      await released;
+
+      expect(result.timedOut).toBe(false);
+      expect(sawParentReportTurn).toBe(true);
+      const json = parseAskJson(result.stdout);
+      expect(json.final_output).toBe("MAIN_AFTER_CHILD_REPORT");
+    } finally {
+      releaseChild();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test("a retried model request leaves its recovery timeline in the session log", async () => {
     const root = createFixtureRoot("recovery-timeline");
@@ -17400,6 +17850,55 @@ test("a repeated subagent message with the same model and effort is delivered an
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 60_000);
+
+test("fx ask --json reports unsupported tty shell as a failed tool result and continues", async () => {
+  const root = createFixtureRoot("unsupported-shell-tool-result");
+  const tracePath = join(root.root, "trace.log");
+  writeFileSync(
+    join(root.home, ".fx", "settings.json"),
+    JSON.stringify({ permission_mode: "full-access" }),
+  );
+  const responses = [
+    fakeGatewayToolCall("bad_shell_1", "shell", {
+      request: {
+        action: "run",
+        command: "echo hi",
+        tty: true,
+        shell: { kind: "executable", path: "/nonexistent_eb47_shell" },
+      },
+    }),
+    fakeGatewayFinalText("Saw unsupported shell error."),
+  ];
+  const gateway = startGateway(() =>
+    responses.shift() ?? new Response("unexpected request", { status: 500 })
+  );
+  try {
+    const result = await runFx(
+      ["ask", "--json", "Run echo hi with the unsupported shell."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 15_000,
+      },
+    );
+    expect(result.code, `stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
+    const json = parseAskJson(result.stdout);
+    expect(json.exit_code).toBe(0);
+    expect(json.output).toBe("Saw unsupported shell error.");
+    expect(gateway.requestCount()).toBe(2);
+    const toolOutput = toolResultOutput(gateway.requests[1]!.body, "bad_shell_1");
+    expect(toolOutput).toContain("Unsupported shell");
+    expect(toolOutput).toContain("/nonexistent_eb47_shell");
+    expect(toolOutput).toContain("bash");
+    expect(toolOutput).toContain("zsh");
+    expect(json.tool_calls).toContainEqual(
+      expect.objectContaining({ name: "shell", status: "error" }),
+    );
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+});
 
 test("subagent close with agents closes two subagents in one call and a later message starts a new one", async () => {
   const root = createFixtureRoot("subagent-batch-close");

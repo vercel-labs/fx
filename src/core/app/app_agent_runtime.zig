@@ -37,6 +37,7 @@ const session_child_store = @import("../session/session_child_store.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
+const app_auth_runtime = @import("app_auth_runtime.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_authority = @import("../subagent/authority.zig");
@@ -238,6 +239,7 @@ pub fn Runtime(comptime App: type) type {
         /// not stop a call to it; `childLiveToolAuthority` refuses any tool
         /// outside the admission.
         fn applyChildToolContext(app: *App, ctx: *tool_runtime.Context, run: *agents.ChildRun) void {
+            ctx.remote_setup_allowed = false;
             ctx.session_grants = run.admission.grants;
             ctx.permission_state_override = &run.admission.permission_state;
             ctx.advertised_dynamic_tool_names = run.admission.integration_names;
@@ -393,6 +395,7 @@ pub fn Runtime(comptime App: type) type {
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace.root,
+                .sandbox_policy = if (comptime @hasField(App, "sandbox_policy")) app.sandbox_policy else null,
                 .access_scope = workspace.access_scope,
                 .ignored_list_entries = ignored_list_entries,
                 .max_list_entries = max_list_entries,
@@ -402,14 +405,19 @@ pub fn Runtime(comptime App: type) type {
                 .max_command_output_bytes = max_command_output_bytes,
                 .max_tool_result_bytes = agent_settings.max_tool_result_bytes,
                 .auto_compact_percent = agent_settings.auto_compact_percent,
-                .api_key = app.auth.apiKey() orelse "",
+                // The call's own sign-in comes from its lease
+                // (`applyCredentialLease`): the app replaces and frees the one
+                // it holds on its own thread (`src/core/app/app_agent_runtime.zig`
+                // "a tool call keeps the sign-in a refresh replaces, and web
+                // search follows the app's").
+                .api_key = "",
                 .agent_stream_provider = if (comptime @hasDecl(App, "agentStreamProvider"))
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
-                .gateway_team = app.auth.gatewayTeam(),
+                .gateway_team = null,
                 .credential_source = app.auth.credentialSource(),
-                .account_id = app.auth.accountId(),
+                .account_id = null,
                 .provider = selected_provider,
                 .provider_capabilities = provider_capabilities,
                 .oauth_transport = app.auth.oauthTransport(),
@@ -484,6 +492,7 @@ pub fn Runtime(comptime App: type) type {
                 .subagent_status_renderer = app_callbacks.Bindings(App).subagentStatusRenderer(agent),
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app, agent).scope,
+                .user_turn_id = agent.worker.activeTurnId(),
             };
             if (comptime @hasField(App, "web_fetch_runtime")) {
                 ctx.web_fetch_runtime = &app.web_fetch_runtime;
@@ -494,14 +503,6 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasField(App, "web_search_runtime")) {
                 if (provider_capabilities.fx_search) {
-                    app.web_search_runtime.configure(.{
-                        .api_key = app.auth.apiKey() orelse "",
-                        .credential_source = app.auth.credentialSource(),
-                        .gateway_team = app.auth.gatewayTeam(),
-                        .worker_model = provider_runtime.modelOf(app, agent),
-                        .gateway_retry_count = gateway_retry_count,
-                        .gateway_chat_url = gateway_chat_url,
-                    });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 }
                 ctx.web_search_runtime_ready = false;
@@ -697,6 +698,24 @@ pub fn Runtime(comptime App: type) type {
                 ctx.managed_executions,
                 call,
             );
+        }
+
+        pub fn resolveCommandPlacement(
+            app: *App,
+            agent: *AppAgent,
+            arena: Allocator,
+            call: ToolCall,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) !?types.CommandPlacement {
+            const ctx = toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            return tool_admission.runCommandPlacement(ctx.admissionInput(), arena, call);
         }
 
         pub fn releaseAgentTerminalLease(
@@ -1048,7 +1067,10 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) void {
-            const credential_secret = credential.secret() orelse return;
+            // The turn owns this sign-in (`TurnSignIn`), so the call sends
+            // bytes that outlive an adoption on the app's thread. A
+            // host-managed credential keeps no local key.
+            const credential_secret = credential.secret() orelse "";
             const credential_source = credential.credentialSource();
             ctx.api_key = credential_secret;
             ctx.credential_source = credential_source;
@@ -1420,6 +1442,7 @@ pub fn Runtime(comptime App: type) type {
                     .records = if (app_session_runtime.Runtime(App).childCapability(agent)) |capability| result_store.compactorStore(capability) else null,
                     .cancel_flag = &agent.worker.worker_cancel_requested,
                     .trace_ctx = .{ .turn_id = job.turn_id },
+                    .toolbox_menu = try agent.session.agent.compactionToolboxMenu(arena, job.history),
                 },
             }) catch |err| {
                 if (err == error.Cancelled and agent.worker.worker_cancel_requested.load(.seq_cst)) return;
@@ -1487,7 +1510,12 @@ pub fn Runtime(comptime App: type) type {
             var run = try prepareChildRun(app, turn, message, admission);
             var completion: agents.ChildRunCompletion = .{};
             run.completion = &completion;
-            var post = app_agents_runtime.Post{ .turn = turn, .run = run, .message = message.content };
+            var post = app_agents_runtime.Post{
+                .turn = turn,
+                .run = run,
+                .message = message.content,
+                .continues_yielded = if (comptime runtime_profile.allows(App, .auto_upgrade)) message.continues_yielded else false,
+            };
             defer if (post.run) |*unsent| {
                 unsent.completion = null;
                 unsent.turn = null;
@@ -1788,13 +1816,17 @@ fn formatToolAction(
     };
     if (try tool_presentation.formatRunCommandActivity(arena, ctx.tool_registry, ctx.workspace_root, call)) |activity| {
         defer arena.free(activity.detail);
-        const label = if (activity.compatibility_tool) |compatibility_tool|
+        const base_label = if (activity.compatibility_tool) |compatibility_tool|
             specLabel(compatibility_tool, state, denied_label)
         else switch (state) {
             .active => "Running",
             .completed => "Ran",
             .denied => denied_label.?,
         };
+        const label = if (activity.compatibility_tool == null)
+            try tool_presentation.formatCommandPlacementLabel(arena, base_label, call.command_placement)
+        else
+            base_label;
         return formatCommandActionValue(
             arena,
             label,
@@ -2598,9 +2630,15 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     };
     try app.permission_engine.allow(alloc, "run_command", "/tmp/workspace::zig build");
 
+    var web_search_before = try app.web_search_runtime.inputsSnapshot(alloc);
+    defer web_search_before.deinit(alloc);
     const ctx = testToolContext(&app);
     try std.testing.expectEqualStrings("/tmp/workspace", ctx.workspace_root);
-    try std.testing.expectEqualStrings("api-key", ctx.api_key);
+    // The call's sign-in comes from its own lease (`applyCredentialLease`), so
+    // a context built here never holds the app's slices
+    // (`src/core/app/app_agent_runtime.zig` "a tool call keeps the sign-in a
+    // refresh replaces, and web search follows the app's").
+    try std.testing.expectEqual(@as(usize, 0), ctx.api_key.len);
     try std.testing.expectEqualStrings("test-model", ctx.model);
     try std.testing.expect(ctx.tool_registry.lookup("web_search") != null);
     try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
@@ -2630,9 +2668,15 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     try std.testing.expect(ctx.web_fetch_runtime.? == &app.web_fetch_runtime);
     try std.testing.expect(ctx.web_fetch_progress_ctx != null);
     try std.testing.expect(ctx.on_web_fetch_progress != null);
-    try std.testing.expectEqualStrings("test-model", app.web_search_runtime.worker_model);
-    try std.testing.expectEqual(ctx.gateway_retry_count, app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.gateway_chat_url, app.web_search_runtime.gateway_chat_url);
+    // Building a context leaves the shared web-search runtime as it is: the
+    // call configures it from its own sign-in when it runs
+    // (`src/core/app/app_agent_runtime.zig` "a tool call keeps the sign-in a
+    // refresh replaces, and web search follows the app's").
+    var web_search_after = try app.web_search_runtime.inputsSnapshot(alloc);
+    defer web_search_after.deinit(alloc);
+    try std.testing.expectEqualStrings(web_search_before.worker_model, web_search_after.worker_model);
+    try std.testing.expectEqual(web_search_before.gateway_retry_count, web_search_after.gateway_retry_count);
+    try std.testing.expectEqualStrings(web_search_before.gateway_chat_url, web_search_after.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", ctx.gateway_models_path);
     try std.testing.expectEqual(@as(usize, 4096), ctx.max_tool_result_bytes);
     try std.testing.expectEqual(types.ToolChoice.none, ctx.first_call_tool_choice);
@@ -2771,7 +2815,11 @@ test "app prompt projection configures web search then blocks native execution" 
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try app.appendRuntimeContextMessage(app.agent(), arena, app.selected_model.items, &messages);
 
-    try std.testing.expectEqualStrings("stale-key", app.web_search_runtime.api_key);
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("stale-key", live.api_key);
+    }
 
     const validation = try app.validateToolCall(app.agent(), arena, .{
         .id = "search",
@@ -2779,11 +2827,23 @@ test "app prompt projection configures web search then blocks native execution" 
         .arguments_json = "{\"query\":\"x\"}",
     });
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
-    try std.testing.expectEqualStrings(app.auth.apiKey().?, app.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(app.selected_model.items, app.web_search_runtime.worker_model);
-    try std.testing.expectEqual(@as(usize, 2), app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(test_gateway_chat_url, app.web_search_runtime.gateway_chat_url);
+    // The projection and the check configure nothing: the app's sign-in is not
+    // borrowed, so the runtime keeps what it was last given
+    // (`src/core/app/app_agent_runtime.zig` "a tool call keeps the sign-in a
+    // refresh replaces, and web search follows the app's").
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("stale-key", live.api_key);
+        try std.testing.expectEqualStrings("stale-model", live.worker_model);
+        try std.testing.expectEqual(@as(usize, 99), live.gateway_retry_count);
+        try std.testing.expectEqualStrings("https://stale.invalid/chat", live.gateway_chat_url);
+    }
 
+    // The call configures it from the turn's own copy of the sign-in, which its
+    // queued prompt owns.
+    const turn_key = try alloc.dupe(u8, "turn-key");
+    defer alloc.free(turn_key);
     const execution = try app.executeToolCall(app.agent(), .{
         .call_allocator = arena,
         .result_allocator = arena,
@@ -2796,13 +2856,33 @@ test "app prompt projection configures web search then blocks native execution" 
         .session_grants = &.{},
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = 2048,
+        .credential = .{ .direct = .{ .secret_bytes = turn_key, .source = .ai_gateway_api_key } },
     });
-    try std.testing.expectEqualStrings(app.auth.apiKey().?, app.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(app.selected_model.items, app.web_search_runtime.worker_model);
-    try std.testing.expectEqual(@as(usize, 2), app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(test_gateway_chat_url, app.web_search_runtime.gateway_chat_url);
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings(turn_key, live.api_key);
+        try std.testing.expectEqualStrings(app.selected_model.items, live.worker_model);
+        try std.testing.expectEqual(@as(usize, 2), live.gateway_retry_count);
+        try std.testing.expectEqualStrings(test_gateway_chat_url, live.gateway_chat_url);
+    }
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
+}
+
+test "a host-managed lease leaves the call and web search without a key" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var ctx = testToolContext(&app);
+    Runtime(FakeApp).applyCredentialLease(&app, app.agent(), &ctx, .host_managed, 2, test_gateway_chat_url);
+
+    try std.testing.expectEqual(@as(usize, 0), ctx.api_key.len);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, ctx.credential_source.?);
+    var live = try app.web_search_runtime.inputsSnapshot(alloc);
+    defer live.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), live.api_key.len);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, live.credential_source.?);
 }
 
 test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
@@ -2831,6 +2911,49 @@ test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
     );
     try std.testing.expect(ctx.web_search_backend == null);
     try std.testing.expect(ctx.permission_reviewer_provider == null);
+}
+
+test "a tool call keeps the sign-in a refresh replaces, and web search follows the app's" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    var first = credentials.Credential{
+        .token = try alloc.dupe(u8, "first-token"),
+        .source = .ai_gateway_api_key,
+    };
+    defer first.deinit(alloc);
+    _ = app.auth.adoptCredential(alloc, &first);
+
+    var ctx = testToolContext(&app);
+    // With no lease yet the context holds no sign-in at all: it never borrows
+    // the app's, which the app frees when it adopts another.
+    try std.testing.expectEqual(@as(usize, 0), ctx.api_key.len);
+    // The turn owns its own copy of the sign-in, which its queued prompt frees.
+    const turn_token = try alloc.dupe(u8, "first-token");
+    defer alloc.free(turn_token);
+    Runtime(FakeApp).applyCredentialLease(&app, (&app).agent(), &ctx, .{ .direct = .{
+        .secret_bytes = turn_token,
+        .source = .ai_gateway_api_key,
+    } }, 2, test_gateway_chat_url);
+
+    var second = credentials.Credential{
+        .token = try alloc.dupe(u8, "second-token"),
+        .source = .ai_gateway_api_key,
+    };
+    defer second.deinit(alloc);
+    var prepared = try second.clone(alloc);
+    _ = app.auth.adoptPreparedCredential(alloc, &prepared);
+
+    // The call still sends the sign-in it started with, and the runtime it
+    // pointed at holds that sign-in as its own copy, not as the lease's slice.
+    try std.testing.expectEqualStrings("first-token", ctx.api_key);
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("first-token", live.api_key);
+        try std.testing.expect(live.api_key.ptr != turn_token.ptr);
+    }
 }
 
 test "app agent runtime tool context combines active settings with live permission mode" {
@@ -3953,4 +4076,39 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
+}
+
+test "app agent runtime formats shell run labels for remote, isolated, local, and unplaced calls" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    const base_call: ToolCall = .{
+        .id = "1",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"uname -a\"}",
+    };
+
+    var remote_call = base_call;
+    remote_call.command_placement = .remote;
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, remote_call), "● Running on remote\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, remote_call), "● Ran on remote\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionDenied(app.agent(), arena, remote_call, "Exited 1"), "● Exited 1 on remote\x1b[0m "));
+
+    var isolated_call = base_call;
+    isolated_call.command_placement = .isolated;
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, isolated_call), "● Running on isolated\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, isolated_call), "● Ran on isolated\x1b[0m "));
+
+    var local_call = base_call;
+    local_call.command_placement = .local;
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, local_call), "● Running\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, local_call), "● Ran\x1b[0m "));
+
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, base_call), "● Running\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, base_call), "● Ran\x1b[0m "));
 }
