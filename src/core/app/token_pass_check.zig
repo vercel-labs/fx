@@ -3,8 +3,10 @@
 //! asks the credits endpoint in the background, as `/credits` does, and
 //! saves the new answer. A team with Token Pass starts a new session on the
 //! Token Pass default model when nothing else chose the model. Without a
-//! saved answer, the first prompt of a session waits up to
-//! `first_prompt_wait_ms` for the check.
+//! saved answer, what depends on the answer waits up to
+//! `first_prompt_wait_ms` after the check starts: the app's first prompt,
+//! `fx ask`'s prompt, and in ACP a new session that nothing chose a model
+//! for, and a prompt.
 const std = @import("std");
 const builtin = @import("builtin");
 const agents = @import("../agents/agents.zig");
@@ -23,8 +25,8 @@ const session_commands = @import("../session/session_commands.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// How long the first prompt of a session waits for a check whose answer fx
-/// has not saved before.
+/// How long after a check starts a new session or its first prompt waits
+/// for an answer fx has not saved before.
 pub const first_prompt_wait_ms: i64 = 2_000;
 
 const Identity = [token_pass.identity_len]u8;
@@ -99,12 +101,10 @@ pub fn answerOf(snapshot: output_contracts.CreditsSnapshot) ?token_pass.Answer {
     return null;
 }
 
-/// How often a wait looks for the check's answer.
-const answer_poll_ms: u64 = 10;
-
 /// For `fx ask` and ACP: the answer saved for the team, refreshed by a
 /// credits check that runs while the session works. Without a saved answer,
-/// `begin` waits for the check, as the first prompt in the app does.
+/// what depends on it waits for the check with `awaitAnswer`, as the first
+/// prompt in the app does.
 pub const Check = struct {
     lookup: credits_lookup.Lookup = .{},
     named: Named,
@@ -112,18 +112,26 @@ pub const Check = struct {
     has_pass: bool = false,
     /// Whether the credits check answered in this run.
     answered: bool = false,
+    had_saved: bool = false,
+    /// On the awake clock.
+    started_ms: ?i64 = null,
+    /// Guards the lookup and the answer after `begin`: ACP's prompt thread
+    /// waits for the answer while its reader takes it for other requests.
+    mutex: std.Io.Mutex = .init,
+    /// The threads that wait on the lookup without the lock
+    /// (`awaitFinishUnlocked`).
+    waiters: u32 = 0,
 
-    /// Starts the check with the saved answer, or waits at most `wait_ms`
-    /// for one when fx has none. Publishes whether the team has Token Pass
-    /// to `token_pass_team`.
+    /// Starts from the saved answer and never waits. Runs before any other
+    /// thread uses the check.
     pub fn begin(
         self: *Check,
         alloc: Allocator,
         provider: gateway_provider.CreditsProvider,
         input: gateway_provider.CreditsLookupInput,
-        wait_ms: i64,
     ) void {
         const saved: ?token_pass.Answer = if (self.home) |dir| if (self.named.saved_as) |id| token_pass_memory.load(alloc, dir, &id) else null else null;
+        self.had_saved = saved != null;
         self.has_pass = saved == .has_pass;
         token_pass_team.publishAnswer(saved, false);
         if (comptime builtin.single_threaded) return;
@@ -137,19 +145,113 @@ pub const Check = struct {
             debug_trace.logf("token_pass", "check start failed err={s}", .{@errorName(err)});
             return;
         };
+        self.started_ms = io_mod.awakeMilliTimestamp();
         debug_trace.logf("token_pass", "check started saved={s}", .{answerLabel(saved)});
-        if (saved == null) self.waitForAnswer(alloc, wait_ms);
     }
 
-    /// Takes the answer if it has arrived, without waiting.
-    pub fn poll(self: *Check, alloc: Allocator) void {
-        self.waitForAnswer(alloc, 0);
+    /// Waits while fx knows nothing of the team (`requestWaitMs`), or until
+    /// `cancel` is set. The lookup wakes the wait when it finishes, and
+    /// `wakeWaiter` once `cancel` is set.
+    pub fn awaitAnswer(self: *Check, alloc: Allocator, cancel: ?*const std.atomic.Value(bool)) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        // Read before each look at the answer and the cancel flag, so a
+        // wake after the look ends the wait that follows it.
+        var seen = self.lookup.wakeCount();
+        var wait_ms = self.takeAnswerLocked(alloc);
+        if (wait_ms == 0) return;
+        debug_trace.logf("token_pass", "check wait started", .{});
+        while (wait_ms > 0) {
+            if (cancel) |flag| if (flag.load(.seq_cst)) {
+                debug_trace.logf("token_pass", "check wait stopped reason=cancelled", .{});
+                return;
+            };
+            self.awaitFinishUnlocked(seen, wait_ms) catch |err| switch (err) {
+                error.Canceled => {
+                    debug_trace.logf("token_pass", "check wait stopped reason=cancelled", .{});
+                    return;
+                },
+            };
+            seen = self.lookup.wakeCount();
+            wait_ms = self.takeAnswerLocked(alloc);
+        }
+        if (self.lookup.task != null) debug_trace.logf("token_pass", "check wait ended without an answer wait_ms={d}", .{first_prompt_wait_ms});
+    }
+
+    /// Ends a wait in `awaitAnswer` at once, so it looks at its cancel flag
+    /// again. Call it after setting that flag.
+    pub fn wakeWaiter(self: *Check) void {
+        // The lock keeps the lookup's task, which the wait sleeps on, from
+        // being taken and freed meanwhile.
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.lookup.wake();
+    }
+
+    /// Waits up to `wait_ms` for the lookup without the lock, so another
+    /// thread takes the answer meanwhile. The lookup's task, whose wake
+    /// count this waits on, stays until the wait ends (`waiters`).
+    fn awaitFinishUnlocked(self: *Check, seen: u32, wait_ms: i64) std.Io.Cancelable!void {
+        self.waiters += 1;
+        self.mutex.unlock(io_mod.getIo());
+        defer {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            self.waiters -= 1;
+        }
+        try self.lookup.awaitFinish(seen, wait_ms);
+    }
+
+    fn takeAnswerLocked(self: *Check, alloc: Allocator) i64 {
+        self.pollLocked(alloc);
+        _ = self.observeCatalogLocked(alloc);
+        return self.requestWaitMs(self.lookup.task != null, io_mod.awakeMilliTimestamp());
+    }
+
+    pub fn takeAnswer(self: *Check, alloc: Allocator) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        _ = self.takeAnswerLocked(alloc);
+    }
+
+    pub fn hasPass(self: *Check) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.has_pass;
+    }
+
+    fn requestWaitMs(self: *const Check, running: bool, now_ms: i64) i64 {
+        if (!running or self.had_saved or self.answered or self.has_pass) return 0;
+        return firstWaitLeftMs(self.started_ms, now_ms);
+    }
+
+    fn pollLocked(self: *Check, alloc: Allocator) void {
+        // A waiter takes the answer once it wakes; taking it frees the task
+        // it waits on.
+        if (self.waiters > 0) return;
+        var result = self.lookup.take() orelse return;
+        defer result.deinit();
+        const answer = answerOf(result.snapshot);
+        if (answer) |fresh| {
+            self.has_pass = fresh == .has_pass;
+            self.answered = true;
+            token_pass_team.publishAnswer(fresh, true);
+            if (self.home) |dir| if (self.named.saved_as) |id| saveAnswer(alloc, dir, &id, fresh);
+        }
+        // Logged once the answer is saved, so a reader of the trace finds
+        // the file current.
+        debug_trace.logf("token_pass", "check answered answer={s}", .{answerLabel(answer)});
     }
 
     /// Takes the catalog's Token Pass marks as the team's answer while AI
     /// Gateway has given none in this run (`token_pass_team.catalogAnswers`),
     /// and saves it. Returns true when it changed what fx knows.
     pub fn observeCatalog(self: *Check, alloc: Allocator) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.observeCatalogLocked(alloc);
+    }
+
+    fn observeCatalogLocked(self: *Check, alloc: Allocator) bool {
         if (self.has_pass or !token_pass_team.catalogAnswers()) return false;
         self.has_pass = true;
         token_pass_team.publishAnswer(.has_pass, false);
@@ -161,38 +263,23 @@ pub const Check = struct {
     /// Takes an answer that has arrived, then stops the check. `reason`
     /// names why, for the trace, when the check had not answered.
     pub fn finish(self: *Check, alloc: Allocator, reason: []const u8) void {
-        self.waitForAnswer(alloc, 0);
-        _ = self.observeCatalog(alloc);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        // The caller ends every thread that waits on the check first.
+        std.debug.assert(self.waiters == 0);
+        self.pollLocked(alloc);
+        _ = self.observeCatalogLocked(alloc);
         if (self.lookup.task != null) debug_trace.logf("token_pass", "check dropped reason={s}", .{reason});
         self.lookup.deinit();
     }
-
-    fn waitForAnswer(self: *Check, alloc: Allocator, wait_ms: i64) void {
-        const deadline = io_mod.awakeMilliTimestamp() + wait_ms;
-        while (self.lookup.task != null) {
-            if (self.lookup.take()) |taken| {
-                var result = taken;
-                defer result.deinit();
-                const answer = answerOf(result.snapshot);
-                if (answer) |fresh| {
-                    self.has_pass = fresh == .has_pass;
-                    self.answered = true;
-                    token_pass_team.publishAnswer(fresh, true);
-                    if (self.home) |dir| if (self.named.saved_as) |id| saveAnswer(alloc, dir, &id, fresh);
-                }
-                // Logged once the answer is saved, so a reader of the trace
-                // finds the file current.
-                debug_trace.logf("token_pass", "check answered answer={s}", .{answerLabel(answer)});
-                return;
-            }
-            if (io_mod.awakeMilliTimestamp() >= deadline) {
-                if (wait_ms > 0) debug_trace.logf("token_pass", "check wait ended without an answer wait_ms={d}", .{wait_ms});
-                return;
-            }
-            io_mod.sleep(answer_poll_ms * std.time.ns_per_ms);
-        }
-    }
 };
+
+/// The wait counts from the check's start, not from the request, so later
+/// requests never wait longer than the first.
+fn firstWaitLeftMs(started_ms: ?i64, now_ms: i64) i64 {
+    const started = started_ms orelse return 0;
+    return @max(0, started + first_prompt_wait_ms - now_ms);
+}
 
 fn saveAnswer(alloc: Allocator, home: []const u8, id: []const u8, answer: token_pass.Answer) void {
     token_pass_memory.save(alloc, home, id, answer) catch |err| {
@@ -256,8 +343,7 @@ pub const State = struct {
     /// Gateway, such as a catalog that marks Token Pass models.
     fn holdsFirstPrompt(self: *const State, now_ms: i64) bool {
         if (self.start_settled or self.had_saved or self.answer != null) return false;
-        const started = self.started_ms orelse return false;
-        return now_ms - started < first_prompt_wait_ms;
+        return firstWaitLeftMs(self.started_ms, now_ms) > 0;
     }
 };
 
@@ -581,6 +667,29 @@ test "token pass check: the first prompt waits only for an answer fx has not sav
     try std.testing.expect(!state.holdsFirstPrompt(1_000));
     state = .{};
     try std.testing.expect(!state.holdsFirstPrompt(1_000));
+}
+
+test "token pass check: a request waits only while nothing is known of the team, until the wait from the check's start runs out" {
+    const named: Named = .{ .asked = @splat(0), .saved_as = null };
+    var check: Check = .{ .named = named, .home = null, .started_ms = 1_000 };
+    try std.testing.expectEqual(first_prompt_wait_ms, check.requestWaitMs(true, 1_000));
+    // The wait counts from the check's start, not from the request.
+    try std.testing.expectEqual(@as(i64, 1), check.requestWaitMs(true, 1_000 + first_prompt_wait_ms - 1));
+    try std.testing.expectEqual(@as(i64, 0), check.requestWaitMs(true, 1_000 + first_prompt_wait_ms));
+    try std.testing.expectEqual(@as(i64, 0), check.requestWaitMs(true, 1_000 + 2 * first_prompt_wait_ms));
+    // A check that ended, with or without an answer, holds nothing.
+    try std.testing.expectEqual(@as(i64, 0), check.requestWaitMs(false, 1_000));
+
+    // A saved answer, this run's answer, or the catalog's marks end the wait.
+    check = .{ .named = named, .home = null, .started_ms = 1_000, .had_saved = true };
+    try std.testing.expectEqual(@as(i64, 0), check.requestWaitMs(true, 1_000));
+    check = .{ .named = named, .home = null, .started_ms = 1_000, .answered = true };
+    try std.testing.expectEqual(@as(i64, 0), check.requestWaitMs(true, 1_000));
+    check = .{ .named = named, .home = null, .started_ms = 1_000, .has_pass = true };
+    try std.testing.expectEqual(@as(i64, 0), check.requestWaitMs(true, 1_000));
+    // A check that never started holds nothing.
+    check = .{ .named = named, .home = null };
+    try std.testing.expectEqual(@as(i64, 0), check.requestWaitMs(true, 1_000));
 }
 
 test "token pass check: the transcript says Token Pass is active only once it is known in this run" {

@@ -2045,6 +2045,196 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP answers initialize before the Token Pass check answers, and session/new waits for the answer",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-token-pass-late-");
+      const tracePath = join(root.root, "trace.log");
+      const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+      let releaseCredits = () => {};
+      const creditsReleased = new Promise<void>((resolve) => { releaseCredits = resolve; });
+      let creditsRequests = 0;
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_LATE_TOKEN_PASS_OK"), {
+        // A catalog without marks, so only the credits check answers for the team.
+        models: tokenPassCatalog(false),
+        usage: (url) => {
+          if (url.pathname !== "/coding-agent/v1/credits") return null;
+          creditsRequests += 1;
+          return creditsReleased.then(() => Response.json({ balance: "5.00", token_pass: { remaining: "79.92906" } }));
+        },
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_MODEL: undefined,
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "token_pass",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        // fx has no saved answer, and the credits endpoint holds its reply.
+        expect(trace()).toContain("check started saved=none");
+        expect(trace()).not.toContain("check answered");
+        expect(trace()).not.toContain("check wait");
+
+        const created = client.request("session/new", { mcpServers: [] }, 2) as Promise<any>;
+        await waitForCondition("session/new to wait for the Token Pass check", () => trace().includes("check wait started"));
+        releaseCredits();
+        const model = (await created).result.configOptions.find((option: any) => option.id === "model");
+        expect(model.currentValue).toBe("deepseek/deepseek-v4.1-flash");
+        expect(trace()).not.toContain("check wait ended");
+        expect(creditsRequests).toBe(1);
+        const saved = JSON.parse(readFileSync(join(root.home, ".fx", "token-pass.json"), "utf8"));
+        expect(Object.values(saved.teams)).toEqual(["has_pass"]);
+        expect(client.stderr).toBe("");
+      } finally {
+        releaseCredits();
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP reads session/cancel and EOF at once while a prompt waits for the Token Pass check",
+    async () => {
+      for (const way of ["session/cancel", "EOF"] as const) {
+        const root = createIsolatedRoot("fx-acp-token-pass-prompt-wait-");
+        const tracePath = join(root.root, "trace.log");
+        const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+        let releaseCredits = () => {};
+        const creditsReleased = new Promise<void>((resolve) => { releaseCredits = resolve; });
+        // The model never answers, so only the cancel ends the turn.
+        const gateway = startDynamicFakeGateway(() => new Promise<Response>(() => {}), {
+          titleResponses: [() => new Promise<Response>(() => {})],
+          models: tokenPassCatalog(false),
+          usage: (url) => url.pathname === "/coding-agent/v1/credits"
+            ? creditsReleased.then(() => Response.json({ balance: "5.00", token_pass: { remaining: "79.92906" } }))
+            : null,
+        });
+        try {
+          // FX_MODEL chose the model, so session/new does not wait for the check.
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "token_pass" },
+          });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          await client.request("session/new", { mcpServers: [] }, 2);
+          await client.readLine();
+          expect(trace()).not.toContain("check wait started");
+          sendPrompt(client, 3, "Which model answers?");
+          await waitForCondition("the prompt to wait for the Token Pass check", () => trace().includes("check wait started"));
+          const sentAt = Date.now();
+          if (way === "session/cancel") {
+            client.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+            const reply = await readResponse(client, 3, 8_000);
+            expect(reply.result.stopReason).toBe("cancelled");
+          } else {
+            client.endStdin();
+            await client.waitForExit(8_000);
+          }
+          // A reader blocked by the wait reads the cancel only once the
+          // wait runs out, 2 s after the check started.
+          expect(Date.now() - sentAt).toBeLessThan(1_000);
+          expect(trace()).toContain("check wait stopped reason=cancelled");
+          expect(trace()).not.toContain("check wait ended");
+          expect(client.stderr).toBe("");
+        } finally {
+          releaseCredits();
+          await client?.close();
+          client = undefined;
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP starts a session/new that replaces a prompt waiting for the Token Pass check on the answer, cancels that prompt at once, and never waits for a session/new it rejects",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-token-pass-new-during-prompt-");
+      const tracePath = join(root.root, "trace.log");
+      const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+      let holdCredits = false;
+      let releaseCredits = () => {};
+      const creditsReleased = new Promise<void>((resolve) => { releaseCredits = resolve; });
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_NEW_DURING_PROMPT_OK"), {
+        models: tokenPassCatalog(false),
+        // The first fx saves no answer, so the second has none and waits.
+        usage: (url) => url.pathname !== "/coding-agent/v1/credits"
+          ? null
+          : holdCredits
+            ? creditsReleased.then(() => Response.json({ balance: "5.00", token_pass: { remaining: "79.92906" } }))
+            : new Response("unavailable", { status: 503 }),
+      });
+      // Nothing chose the model, so a new session waits for the answer.
+      const env = { ...fakeGatewayEnv(root, gateway), FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "token_pass" };
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const saved = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        const sessionId = saved.result.sessionId as string;
+        sendPrompt(client, 3, "Save this chat.");
+        expect((await readResponse(client, 3)).result.stopReason).toBe("end_turn");
+        await client.close();
+        // The second fx's trace starts empty, without the first's wait.
+        rmSync(tracePath, { force: true });
+
+        holdCredits = true;
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        // A reader that waited would answer 2 s after the check started.
+        let sentAt = Date.now();
+        const rejected = await client.request("session/new", { mcpServers: [], systemPromptMode: "append" }, 2) as any;
+        expect(rejected.error.message).toBe("systemPromptMode requires systemPrompt");
+        expect(Date.now() - sentAt).toBeLessThan(1_000);
+        expect(trace()).not.toContain("check wait started");
+
+        // Opening a saved chat never waits for the answer.
+        await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 3, 1_000);
+        sendPrompt(client, 4, "Which model answers?");
+        await waitForCondition("the prompt to wait for the Token Pass check", () => trace().includes("check wait started"));
+        const replies = new Map<number, { message: any; at: number }>();
+        const reply = async (id: number) => {
+          while (!replies.has(id)) {
+            const message = await client!.readLine(8_000) as any;
+            if (message.id !== undefined && (message.result !== undefined || message.error !== undefined)) {
+              replies.set(message.id, { message, at: Date.now() });
+            }
+          }
+          return replies.get(id)!;
+        };
+        sentAt = Date.now();
+        client.send({ jsonrpc: "2.0", id: 5, method: "session/new", params: { mcpServers: [] } });
+        // The new session replaces the one whose prompt waited, and ends that
+        // prompt before it waits for the answer itself.
+        const cancelled = await reply(4);
+        expect(cancelled.message.result.stopReason).toBe("cancelled");
+        expect(cancelled.at - sentAt).toBeLessThan(1_000);
+        releaseCredits();
+        const created = await reply(5);
+        const model = created.message.result.configOptions.find((option: any) => option.id === "model");
+        expect(model.currentValue).toBe("deepseek/deepseek-v4.1-flash");
+        expect(trace()).not.toContain("check wait ended");
+        expect(client.stderr).toBe("");
+      } finally {
+        releaseCredits();
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP titles a session with the login another fx refreshed after session/new",
     async () => {
       const root = createIsolatedRoot("fx-acp-title-rotated-login-");
