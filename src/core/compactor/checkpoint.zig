@@ -162,7 +162,27 @@ pub const Payload = struct {
     /// changes (D94). Empty when the copy is kept elsewhere: in `provider`'s
     /// block, or with the turn that captured it.
     runtime_context: []const []const u8 = &.{},
+    /// The toolbox menu the conversation sent before this compaction, which
+    /// every later request sends unchanged (D103,
+    /// `tests/tla/toolbox/Toolbox.tla` MenuFixed). Null in checkpoints written
+    /// before it, and for a conversation that sent none; an older fx ignores
+    /// it.
+    toolbox_menu: ?ToolboxMenu = null,
 };
+
+/// A conversation's toolbox menu as a checkpoint keeps it.
+pub const ToolboxMenu = struct {
+    /// The lead and the menu, as the requests send them.
+    text: []const u8,
+    /// `toolbox.entriesHash` of what the menu lists.
+    entries_hash: u64,
+};
+
+/// The toolbox menu a checkpoint keeps, or null when it keeps none.
+pub fn toolboxMenu(arena: Allocator, summary: []const u8) Allocator.Error!?ToolboxMenu {
+    const payload = try parse(arena, summary) orelse return null;
+    return payload.toolbox_menu;
+}
 
 /// A compaction block a provider wrote over the turns a checkpoint replaces
 /// (`tests/tla/compaction/ProviderCompaction.tla` KeepCompaction and
@@ -793,6 +813,41 @@ test "the saved line names only what can be opened" {
     try testing.expect(std.mem.find(u8, one, "Saved word for word: turn M1. Search them by text, or open one by its ID (like M1)") != null);
 }
 
+test "a checkpoint keeps the conversation's toolbox menu, and one written before it reads as before (D103)" {
+    const alloc = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tools = [_]Tool{.{ .number = 1, .line = "shell make (2 bytes)" }};
+    const without: Payload = .{
+        .turns = &.{.{ .number = 1, .users = &.{"build it"}, .final = "Built.", .first_tool = 1, .last_tool = 1, .tools = &tools }},
+        .entries = &.{.{ .id = "F1", .text = "F1 (T1): make works" }},
+        .turn_count = 1,
+        .tool_count = 1,
+        .provider = .{ .provider = "gateway", .model = "anthropic/claude-fable-5.2", .parts_json = "[]", .runtime_context = &.{"ctx"} },
+    };
+    var with = without;
+    with.toolbox_menu = .{ .text = "lead\n- review", .entries_hash = std.math.maxInt(u64) };
+
+    const saved = try encode(arena, with);
+    const kept = (try toolboxMenu(arena, saved)).?;
+    try testing.expectEqualStrings("lead\n- review", kept.text);
+    try testing.expectEqual(std.math.maxInt(u64), kept.entries_hash);
+
+    // An fx from before the field wrote the same bytes without it: it reads
+    // with no menu, and written again keeps every other field's bytes.
+    const new_bytes = try encode(arena, without);
+    const null_field = ",\"toolbox_menu\":null";
+    try testing.expect(std.mem.endsWith(u8, new_bytes, null_field ++ "}"));
+    const older = try std.mem.concat(arena, u8, &.{ new_bytes[0 .. new_bytes.len - null_field.len - 1], "}" });
+    const read = (try parse(arena, older)).?;
+    try testing.expect(read.toolbox_menu == null);
+    try testing.expectEqualStrings(new_bytes, try encode(arena, read));
+    try testing.expect(try toolboxMenu(arena, older) == null);
+    // Other checkpoints hold no menu.
+    try testing.expect(try toolboxMenu(arena, legacy_handoff_open ++ "summary") == null);
+}
+
 test "older checkpoints are recognized but not parsed" {
     const alloc = testing.allocator;
     const handoff = legacy_handoff_open ++ "\n## Conversation summary\n> earlier\n</context_handoff>";
@@ -843,12 +898,11 @@ test "a payload saved before the summary kept a runtime context reads the same, 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const empty_field = ",\"runtime_context\":[]}";
-    // The field is the payload's last, so fx before it wrote these same
-    // bytes without it.
+    const empty_field = ",\"runtime_context\":[]";
+    // fx before the field wrote these same bytes without it.
     const current = try encode(arena, sample_payload);
-    try testing.expect(std.mem.endsWith(u8, current, empty_field));
-    const older = try std.mem.concat(arena, u8, &.{ current[0 .. current.len - empty_field.len], "}" });
+    const at = std.mem.find(u8, current, empty_field).?;
+    const older = try std.mem.concat(arena, u8, &.{ current[0..at], current[at + empty_field.len ..] });
 
     const back = (try parse(arena, older)).?;
     try testing.expectEqual(@as(usize, 0), back.runtime_context.len);
@@ -859,7 +913,8 @@ test "a payload saved before the summary kept a runtime context reads the same, 
     var with_copy = sample_payload;
     with_copy.runtime_context = &.{ "<fx-turn-context>\nmodel: anthropic/claude-fable-5.2\n</fx-turn-context>", "Runtime context: permission mode is ask." };
     const saved = try encode(arena, with_copy);
-    try testing.expectEqualStrings(older[0 .. older.len - 1], saved[0 .. older.len - 1]);
+    try testing.expectEqualStrings(older[0..at], saved[0..at]);
+    try testing.expectEqualStrings(saved, try encode(arena, (try parse(arena, saved)).?));
     const copy = try savedRuntimeContext(arena, saved);
     try testing.expectEqual(@as(usize, 2), copy.len);
     for (with_copy.runtime_context, copy) |want, got| try testing.expectEqualStrings(want, got);

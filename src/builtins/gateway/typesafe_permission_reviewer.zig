@@ -208,10 +208,13 @@ fn buildReviewBody(
     _: []const u8,
     instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
+    follow_up: []const types.ChatMessage,
     target_call_id: []const u8,
     _: std.Io.Clock.Timestamp,
     _: *std.atomic.Value(bool),
 ) anyerror![]u8 {
+    // This reviewer does not read stored answers, so it never gets read turns.
+    if (follow_up.len > 0) return error.ReadTurnsUnsupported;
     return requestBodyJson(alloc, model, instructions, messages, target_call_id);
 }
 

@@ -15,6 +15,7 @@ stateDiagram-v2
     Ready --> Shutting: you quit with /exit
     Turn --> Shutting: you quit with /exit (cancels the request)
     Shutting --> Ended: releaseTerminal restores the tty
+    Shutting --> EndedRawTty: TERM/HUP after uninstall before disableRawMode (BREAKS TtyRestored)
     Shutting --> Shutting: SIGINT is ignored by the guard
     Ready --> Closing: SIGTERM or SIGHUP
     Turn --> Closing: SIGTERM or SIGHUP

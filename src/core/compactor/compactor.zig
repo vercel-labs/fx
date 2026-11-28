@@ -76,6 +76,8 @@ pub const replacesPriorContext = checkpoint.replacesPriorContext;
 pub const ProviderBlock = checkpoint.ProviderBlock;
 pub const providerBlock = checkpoint.providerBlock;
 pub const savedRuntimeContext = checkpoint.savedRuntimeContext;
+pub const ToolboxMenu = checkpoint.ToolboxMenu;
+pub const toolboxMenu = checkpoint.toolboxMenu;
 
 // Saved turns (M1, M2, ...), tool calls (T1, T2, ...) and earlier
 // compactions (L1, L2, ...).
@@ -157,6 +159,9 @@ pub const Request = struct {
     /// and resumes send it unchanged (D94). Empty when the copy stays where
     /// it is. A provider block keeps `runtime_context` instead.
     summary_runtime_context: []const []const u8 = &.{},
+    /// The toolbox menu the conversation sends. The checkpoint keeps it, so
+    /// a resume after the compaction sends it too (D103).
+    toolbox_menu: ?ToolboxMenu = null,
 };
 
 /// Owns everything it points to except the turns it shares with
@@ -269,14 +274,15 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .counter = if (counts) &counter else null,
     }, summarizer.model(), request.records);
     defer summary.deinit();
-    var compacted = summary.compacted;
-    compacted.runtime_context = request.summary_runtime_context;
     trace.info(trace_ctx, .provider_completed, "model={s} summaries={d} shown_turns={d} turns={d} tools={d} entries={d} used={d} text_bytes={d} fallback={s}", .{ caller.model, summarizer.summaries, summary.compacted.turns.len, summary.compacted.turn_count, summary.compacted.tool_count, summary.compacted.entries.len, summary.compacted.used.len, summary.text.len, summarizer.fallback_used orelse "none" });
+    var payload = summary.compacted;
+    payload.toolbox_menu = request.toolbox_menu;
+    payload.runtime_context = request.summary_runtime_context;
 
     return .{
         .arena = arena,
         .checkpoint = .{
-            .summary = try checkpoint.encode(out, compacted),
+            .summary = try checkpoint.encode(out, payload),
             .removed_turn_count = chosen_fx.cut.turns,
             .compaction_count = latestCompactionCount(request.history) + 1,
         },
@@ -349,6 +355,7 @@ fn compactWithProvider(
         .kept_turns = chosen.retained_history.len,
         .runtime_context = request.runtime_context,
     };
+    payload.toolbox_menu = request.toolbox_menu;
     trace.info(trace_ctx, .provider_completed, "model={s} path=provider_block text_bytes={d} parts_bytes={d} turns={d} tools={d}", .{ caller.model, block.text.len, block.parts_json.len, exact.compacted.turn_count, exact.compacted.tool_count });
     return .{
         .arena = arena,
