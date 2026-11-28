@@ -10,7 +10,7 @@ When ACP has a proposal for a feature, the extension takes the proposal's shape 
 
 ### Names
 
-Every name that `sh.fx` adds starts with `sh.fx`, the fx.sh domain in reverse-DNS order, as ACP's [extension rules](https://agentclientprotocol.com/protocol/v1/extensibility) require:
+Every name that `sh.fx` adds starts with `sh.fx`, or with `_sh.fx` for a method or notification. Both prefixes are the fx.sh domain in reverse-DNS order, as ACP's [extension rules](https://agentclientprotocol.com/protocol/v1/extensibility) require:
 
 | Name | Form |
 | --- | --- |
@@ -66,7 +66,7 @@ In this exchange, `sh.fx/example` stands for a real capability name:
 
 After `initialize`, these rules apply to the connection:
 
-- fx sends an extension's notifications and `_meta` keys to a client only when both lists name the extension. A client that lists no `sh.fx/` capability receives only standard ACP messages.
+- fx sends an extension's notifications and `_meta` keys to a client only when both lists name the extension. Once fx has moved to the new names and the period that accepts the old ones has ended, a client that lists no `sh.fx/` capability receives only standard ACP messages. Until then, fx sends the `libfx/*` names from the table under Names in use today, as it does today.
 - A client calls an extension's methods only when fx's list names the extension. fx answers a method it doesn't support with the JSON-RPC error `-32601`, "Method not found".
 - Each side ignores the names it doesn't know in the other side's list.
 
@@ -121,13 +121,13 @@ For example, this prompt steers the running turn:
 
 These rules apply to both deliveries:
 
-- A prompt that arrives while no turn runs starts a turn right away, whatever its delivery.
+- A prompt that arrives while no turn runs starts a turn right away, whatever its delivery. A prompt that starts a turn may hold any content block that `session/prompt` accepts.
 - A prompt without `sh.fx/delivery` that arrives while a turn runs fails with `-32600`, "Prompt already in progress".
 - fx keeps one order for each session across all of its clients.
 
 #### Steers
 
-- A steer holds only text content blocks. fx joins their text, which must be 1 byte to 64 KiB long. A steer with any other block fails with `-32602`, and the client can send the same prompt with `"queue"`.
+- A steer that joins a running turn holds only text content blocks. fx joins their text, which must be 1 byte to 64 KiB long. A steer that joins a running turn with any other block fails with `-32602`, and the client can send the same prompt with `"queue"`.
 - A session holds at most 64 steers and 1 MiB of steer text that no turn has taken yet. A steer past either limit fails with `-32600`, "Steering queue is full".
 - If the model is writing a reply when a steer arrives, fx stops the reply. The turn takes the steer at its next safe point, before its next model request.
 - A steer that arrives between two model requests waits for the turn's next one: after the running tool, or, when the model's reply has ended, the turn goes on with the steer instead of ending.
@@ -141,6 +141,8 @@ The response to a steer arrives when the turn that took it ends. It carries that
 | --- | --- |
 | `"absorbed"` | The turn that was running took the steer |
 | `"next_turn"` | The turn that was running had stopped taking input, or the client stopped it, so the steer ran in the next turn |
+
+A prompt that starts its own turn, because no turn was running, gets the normal answer of that turn with no delivery result: its `_meta` holds no `sh.fx/steeringDelivery`.
 
 #### Queued prompts
 
@@ -156,7 +158,7 @@ The response to a steer arrives when the turn that took it ends. It carries that
 
 ACP v2's rule for [prompts during active work](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) differs on one point: there, `session/cancel` also answers the prompts that haven't run with `-32800`. ACP v1 has no such rule. fx revisits this point when it moves to ACP v2.
 
-`tests/tla/acp/AcpPromptDelivery.tla` models these rules, and TLC checks them in every order of steers, queued prompts, stops, withdrawals, and closing. Its `Today` configs show where fx's ACP path breaks them now, and `tests/tla/drivers/acp/prompt_delivery/driver.ts` runs `fx acp` along the model.
+`tests/tla/acp/AcpPromptDelivery.tla` models these rules, and TLC checks every order of up to five prompts, with one tool call, one stop, and one close, within the bounds of its configs. Its `Today` configs show where fx's ACP path breaks them now, and `tests/tla/drivers/acp/prompt_delivery/driver.ts` runs `fx acp` along the model. The model does not check the caps of 64 steers, 1 MiB of steer text, and 64 queued prompts; the 64 KiB limit on steer text; the `sh.fx/steerInput` update; capability gating; or the host methods.
 
 #### Host steering
 
@@ -176,31 +178,35 @@ A `user_message_chunk` update for a host steer carries a `requestId` of `null` i
 A session can be open on several connections at once, which ACP v2's [session setup](https://agentclientprotocol.com/protocol/v2/session-setup) allows an Agent to do. A client joins a session that another client runs with ACP's own methods, on a connection to the fx process that runs the session:
 
 - `session/load` replays the whole session, then the updates that the running turn has sent so far, then live updates.
-- `session/resume` sends live updates from that point on.
+- `session/resume` sends live updates from that point on. It serves only a client that has every saved turn. Any other client uses `session/load` with its position, as under "Catching up".
 
 Joining needs no capability, so a client that knows only ACP can follow a session.
 
-While the session is open on another connection, fx keeps the session's `cwd`, `additionalDirectories`, and `mcpServers`, and doesn't use the ones in the joining client's request. The response's `_meta` gives the session's folder as `sh.fx/cwd`. A `systemPrompt` in the request applies as on any load or resume: a prompt that differs from the session's replaces it from the next turn, for every client.
+While the session is open on another connection, fx keeps the session's `cwd`, `additionalDirectories`, and `mcpServers`, and doesn't use the ones in the joining client's request. The response's `_meta` gives the session's folder as `sh.fx/cwd`. A `systemPrompt` in a `session/load` or `session/resume` request that differs from the session's prompt replaces it from the next turn, for every client. Today fx reads `systemPrompt` only on `session/new`.
 
 Every client of a session may send prompts. A prompt that arrives while a turn runs follows "Steering and queued prompts", and fx keeps one order for the input of all clients.
 
-`session/close` closes the session on the calling connection only. While the session is open on another connection, it stays open there, and a running turn goes on. A connection that closes acts the same way.
+`session/close` closes the session on the calling connection only. While the session is open on another connection, it stays open there, and a running turn goes on. A connection that closes acts the same way. When the last connection with the session open closes during a turn, fx stops the turn and saves it, as fx does today.
+
+A compaction changes only what fx sends the model. The saved turns, their positions, and what a load replays stay as they are, so a compaction can happen while connections have the session open. fx sends ACP's `compaction_update` to each open connection that lists the `session.compaction` capability, and gives each other open connection one short text line when a compaction completes. fx never sends the summary text, so it sends no `compaction_summary_chunk`.
 
 #### Catching up
 
-A client that lists `sh.fx/logPosition` learns its place in the session's log, so that after a reconnect it receives only what it misses.
+A client that lists `sh.fx/logPosition` learns its place in the session's log, so that after a reconnect it receives only what it misses. A client keeps the messages it holds together with its position. A client that loses its messages sends no position, so its next `session/load` replays the whole session.
 
 fx's session log saves whole turns. A position names the last turn saved, as an opaque string that the client stores and sends back unchanged. fx gives the current position in these places:
 
 - the `_meta` of the response to `session/load` and `session/resume`, as `sh.fx/position`;
 - the `_meta` of a `session_info_update` that fx sends to every client of the session when it saves a turn, with `updatedAt` set to the time of the save.
 
-To catch up, the client sends the position in the `_meta` of `session/load` as `sh.fx/replayFrom`. fx replays only the turns saved after that position, then the updates of the running turn so far, then live updates. When fx doesn't know the position, for example after a compaction rewrote the log, it replays the whole session. The response's `sh.fx/replay` says which one happened:
+To catch up, the client sends the position in the `_meta` of `session/load` as `sh.fx/replayFrom`. fx replays only the turns saved after that position, then the updates of the running turn so far, then live updates. When fx doesn't know the position, for example one that it never gave the client, it replays the whole session. The response's `sh.fx/replay` says which one happened:
 
 | `sh.fx/replay` | Meaning |
 | --- | --- |
 | `"after_position"` | fx replayed the turns saved after the position |
 | `"full"` | fx didn't know the position and replayed the whole session |
+
+The client keeps the messages it holds when the answer's `sh.fx/replay` is `"after_position"`, and drops them when it is `"full"`. So the value must match what fx sent: after a `"full"` replay, a kept copy gives the client every turn twice, and after an `"after_position"` replay, a dropped copy misses the turns before the position. A `sh.fx/replayFrom` that is not an object with a `position` string fails with `-32602`.
 
 For example, a client that comes back after a lost connection sends:
 
@@ -234,7 +240,9 @@ After the replay, fx answers:
 }
 ```
 
-`tests/tla/acp/AcpFollow.tla` models these rules, with stable message ids (a replayed message keeps the id it had when it was live), and TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
+`tests/tla/acp/AcpFollow.tla` models the joins, the folder, the position and replay rules, the close rule, a client's copy and its loss, compactions while connections have the session open, and stable message ids (a replayed message keeps the id it had when it was live). TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
+
+The model leaves out these parts of this section: the `systemPrompt` rule; `additionalDirectories` and `mcpServers`, since the model has only the folder; one input order for all clients; the running turn's partial updates; `updatedAt` in `session_info_update`; and capability gating for `sh.fx/logPosition`, since every client in the model catches up.
 
 #### Prompts from other clients
 
@@ -374,7 +382,7 @@ fx's ACP server names its additions today with a `libfx/` prefix, which doesn't 
 | `libfx/tool_call` | fx to client, request | `_sh.fx/tools/call` | Asks the client to run a tool that the client listed at `initialize` |
 | `session/remove` | client to fx, request | `session/delete` | Deletes a session. The new name is ACP's standard method |
 
-For some releases after fx moves to the new names, fx also accepts the `libfx/*` names, and it sends a client the old names unless the client lists the extension's capability. `session/remove` moves to `session/delete` with no such period.
+For some releases after fx moves to the new names, fx also accepts the `libfx/*` names. Once an extension's section defines its capability, a client that lists the capability gets the new names, and other clients get the old names for that period. Until then, fx sends the old names. `session/remove` moves to `session/delete` with no such period.
 
 ## Keys in use today
 
@@ -386,13 +394,14 @@ fx's ACP server puts its extra data under `_meta.fx.<key>` today, and it reads t
 | `_meta.fx.steering` | the `session/prompt` response to a steer | `sh.fx/steeringDelivery` | `_meta` key | How the steer ran: `absorbed` or `next_turn`. Today's `dropped` goes away, because a steer that a turn doesn't take runs in the next turn |
 | `_meta.fx.steering` | a `user_message_chunk` update that shows a steer | `sh.fx/steerInput` | `_meta` key | The steer's request id and input id |
 | `_meta.fx.steer` | `session/prompt` params | `sh.fx/delivery` | `_meta` key | What fx does with a prompt sent during a running turn: `steer` or `queue`. Today's `true` means `steer` |
-| `_meta.fx.hooksVersion` | the `session/new` and `session/load` responses | `sh.fx/hooks` | capability | That fx supports hooks, now listed in `agentCapabilities` |
-| `_meta.fx.hooks` | `session/new` params | `sh.fx/hooks` | `_meta` key | The client's hook settings, such as `captureContent` |
+| `_meta.fx.hooksVersion` | the `session/new`, `session/load`, and `session/resume` responses | `sh.fx/hooks` | capability | That fx supports hooks, now listed in `agentCapabilities` |
+| `_meta.fx.hooks` | `session/new`, `session/load`, and `session/resume` params | `sh.fx/hooks` | `_meta` key | The client's hook settings, such as `captureContent` |
 | `_meta.fx.permissionMode` | each value of the `mode` config option | `sh.fx/permissionMode` | `_meta` key | The permission mode that the session mode applies, with fx's original names, such as `yolo` for full access |
-| `_meta.fx.modelResponseRecovery` | `session_info_update` | `sh.fx/modelResponseRecovery` | `_meta` key | A model request that an earlier fx process was running when it stopped, reported when the session loads |
+| `_meta.fx.modelResponseRecovery` | `session_info_update` during a running turn | `sh.fx/modelResponseRecovery` | `_meta` key | The live retry status of a model request in a running turn: its state and attempt, plus its cause, need, and message when the status has them. Null clears it |
 | `_meta.fx.toolCall` | `tool_call` updates | `sh.fx/toolCall` | `_meta` key | Whether the call is fx's own bookkeeping step, and the server and tool name of an MCP call |
 | `_meta.fx.alwaysLoaded` | each MCP server that a client supplies | `sh.fx/alwaysLoaded` | `_meta` key | Whether the server's tools stay advertised on every turn. The default is `true` |
-| `_meta.fx.profileMcpServers` | `session/new` params | `sh.fx/profileMcpServers` | `_meta` key | Whether fx also loads the MCP servers of the user's profile |
+| `_meta.fx.shared` | each MCP server that a client supplies in `session/new`, `session/load`, and `session/resume` params | `sh.fx/shared` | `_meta` key | Whether fx may share the server with other sessions whose launch config matches. The default is `true` |
+| `_meta.fx.profileMcpServers` | `session/new`, `session/load`, and `session/resume` params | `sh.fx/profileMcpServers` | `_meta` key | Whether fx also loads the MCP servers of the user's profile |
 | `_meta.fx.terminal` | `initialize` params | `sh.fx/terminalUi` | `_meta` key | Whether the client is a terminal UI, which picks fx's system prompt. The default is `true` |
 | `_meta.fx.attachment` | an image content block in `session/prompt` | `sh.fx/attachment` | `_meta` key | The id of the binary attachment that holds the image's bytes, in place of `data` |
 | `_meta.fx.stored` | an image content block in `session/prompt` | `sh.fx/storedImage` | `_meta` key | The name under which the host already stored the image |
@@ -403,10 +412,10 @@ fx's ACP server puts its extra data under `_meta.fx.<key>` today, and it reads t
 | `_meta.fx.turnId` | `session/prompt` params | `sh.fx/turnId` | `_meta` key | The host's id for the turn that the prompt starts |
 | `_meta.fx.rerun` | `session/prompt` params | `sh.fx/rerun` | `_meta` key | Tool calls that a crash left running, which the host asks fx to run again |
 | `_meta.fx.yieldAt` | `session/prompt` params | `sh.fx/yieldAt` | `_meta` key | The time, in milliseconds since the epoch, at which a journaled turn yields in place of its next model request |
-| `_meta.fx.systemPrompt` | `session/new` params | - | removed | A copy of `systemPrompt`. Clients send ACP's standard `systemPrompt` field |
+| `_meta.fx.systemPrompt` | `session/new` params | - | removed | A copy of `systemPrompt`. Clients send ACP's standard `systemPrompt`, which ACP v1 defines as `{ "mode", "content" }`. fx reads only a bare array of text blocks as its value until it reads that object form |
 | `systemPromptMode` | `session/new` params, a custom field at the root | - | removed | How fx combines the system prompt with its own. ACP v1 puts it in `systemPrompt.mode` |
 | `clientCapabilities.libfx.tools` | the `initialize` request | `sh.fx/hostTools` | capability | The tools that the client runs for fx, as `{ "tools": [...] }` in the capability's value |
-| `clientCapabilities.libfx.instructions` | the `initialize` request | - | removed | Text that the client adds to fx's system prompt. The client sends it as ACP's standard `systemPrompt` in `append` mode on each session |
+| `clientCapabilities.libfx.instructions` | the `initialize` request | - | removed | Text that the client adds to fx's system prompt. fx reads it today as a string of up to 64 KiB and rejects anything else. The client sends it instead as ACP's standard `systemPrompt` with `mode` set to `append`, once fx reads that object form. Until then, fx reads only a bare array of text blocks as the `systemPrompt` value |
 
 The keys and capabilities move with the method names, under the same rules: for some releases fx also accepts the old forms, and it sends a client the old ones unless the client lists the extension's capability.
 

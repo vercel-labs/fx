@@ -152,7 +152,42 @@ pub const Payload = struct {
     /// False when the session is not saved, so no turn or tool call can be
     /// opened later.
     saved: bool = true,
+    /// The provider's own compaction block, when the conversation's model
+    /// wrote one: requests to that model send it in place of the compacted
+    /// turns, and requests to any other model read the rest of this payload.
+    provider: ?ProviderBlock = null,
 };
+
+/// A compaction block a provider wrote over the turns a checkpoint replaces
+/// (`tests/tla/compaction/ProviderCompaction.tla` KeepCompaction and
+/// WholeCompaction).
+pub const ProviderBlock = struct {
+    /// The provider authority that holds it, as `model_provider.ProviderId`
+    /// names it.
+    provider: []const u8,
+    /// The model that wrote it; only that model reads it.
+    model: []const u8,
+    /// The reply's text: Anthropic's summary, or empty for OpenAI's sealed
+    /// item.
+    text: []const u8 = "",
+    /// The reply's parts as its provider replay records them.
+    parts_json: []const u8,
+    /// How many whole turns the compaction kept right after the block. Their
+    /// reasoning from any other model goes as text: that model reads fx's
+    /// summary in place of the block, so the reasoning would follow a prefix
+    /// it was never written after (ProviderCompaction.tla KeptAfterBlock).
+    kept_turns: usize = 0,
+    /// The runtime context the turns after the block were sent with, one
+    /// system message text each. Later requests send it unchanged, so
+    /// nothing before those turns changes (D94).
+    runtime_context: []const []const u8 = &.{},
+};
+
+/// The provider block a checkpoint holds, or null for fx's own summary.
+pub fn providerBlock(arena: Allocator, summary: []const u8) Allocator.Error!?ProviderBlock {
+    const payload = try parse(arena, summary) orelse return null;
+    return payload.provider;
+}
 
 /// The highest number of each kind of entry `payload` has used, in
 /// `entry_kinds` order.

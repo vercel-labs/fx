@@ -19,8 +19,8 @@
   },
   {
     "description": "Waiting calls stay behind when their server is ready",
-    "old": "    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]\n    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>",
-    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, call, ended, allowed, cause, host, stayed, dropped>>",
+    "old": "    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]\n    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ kept' = [kept EXCEPT ![s] = FALSE]\n    \\* Without the idle stop no list is modeled, so a need is answered here.\n    /\\ asked' = [asked EXCEPT ![s] = IdleStop /\\ asked[s]]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped, armed>>",
+    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ kept' = [kept EXCEPT ![s] = FALSE]\n    \\* Without the idle stop no list is modeled, so a need is answered here.\n    /\\ asked' = [asked EXCEPT ![s] = IdleStop /\\ asked[s]]\n    /\\ UNCHANGED <<attempts, call, ended, allowed, cause, host, stayed, dropped, armed>>",
     "invariant": "StatusConsistent"
   },
   {
@@ -79,8 +79,8 @@
   },
   {
     "description": "A ready server keeps the tool list need",
-    "old": "    /\\ need' = [need EXCEPT ![s] = FALSE]\n    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]",
-    "new": "    /\\ need' = need\n    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]",
+    "old": "    /\\ need' = [need EXCEPT ![s] = FALSE]\n    /\\ listing' = [listing EXCEPT ![s] = IdleStop /\\ (need[s] \\/ kept[s])]\n    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]",
+    "new": "    /\\ need' = need\n    /\\ listing' = [listing EXCEPT ![s] = IdleStop /\\ (need[s] \\/ kept[s])]\n    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]",
     "invariant": "StatusConsistent"
   },
   {
@@ -91,8 +91,8 @@
   },
   {
     "description": "A server's tries start over the moment it is up, so one that dies after every start loops",
-    "old": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>",
-    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ attempts' = [attempts EXCEPT ![s] = 0]\n    /\\ UNCHANGED <<ended, allowed, cause, host, stayed, dropped>>",
+    "old": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ kept' = [kept EXCEPT ![s] = FALSE]\n    \\* Without the idle stop no list is modeled, so a need is answered here.\n    /\\ asked' = [asked EXCEPT ![s] = IdleStop /\\ asked[s]]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped, armed>>",
+    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ kept' = [kept EXCEPT ![s] = FALSE]\n    \\* Without the idle stop no list is modeled, so a need is answered here.\n    /\\ asked' = [asked EXCEPT ![s] = IdleStop /\\ asked[s]]\n    /\\ attempts' = [attempts EXCEPT ![s] = 0]\n    /\\ UNCHANGED <<ended, allowed, cause, host, stayed, dropped, armed>>",
     "invariant": "StayedBeforeFreshTries"
   },
   {
@@ -103,7 +103,7 @@
   },
   {
     "description": "A disconnect clears the tool list need without answering it, so a host waiting for it waits for ever",
-    "old": "    /\\ asked' = [asked EXCEPT ![s] = asked[s] /\\ keep]",
+    "old": "    /\\ asked' = [asked EXCEPT ![s] = asked[s] /\\ need[s] /\\ keep]",
     "new": "    /\\ asked' = asked",
     "invariant": "AskedHasNeed"
   },
@@ -112,5 +112,45 @@
     "old": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ c \\in Waiting(s) THEN \"done\" ELSE call[c]]\n       /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"lost\"\n                                    ELSE IF c \\in Waiting(s) THEN \"failed\" ELSE ended[c]]",
     "new": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ (gaveUp /\\ c \\in Waiting(s)) THEN \"done\" ELSE call[c]]\n       /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"lost\"\n                                    ELSE IF gaveUp /\\ c \\in Waiting(s) THEN \"failed\" ELSE ended[c]]",
     "property": "WaitsForOneStart"
+  },
+  {
+    "description": "An idle stop with a call in flight cuts the call",
+    "old": "    /\\ IF phase[s] = \"ready\" /\\ Quiet(s) /\\ attempts[s] = 0\n       THEN /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n            /\\ retry' = [retry EXCEPT ![s] = FALSE]\n            /\\ kept' = [kept EXCEPT ![s] = TRUE]\n            /\\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, stayed, dropped, asked, listing, lost>>\n       ELSE /\\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, kept, listing, lost>>",
+    "new": "    /\\ IF phase[s] = \"ready\" /\\ attempts[s] = 0\n       THEN /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n            /\\ retry' = [retry EXCEPT ![s] = FALSE]\n            /\\ kept' = [kept EXCEPT ![s] = TRUE]\n            \\* The stop cuts the calls still in flight.\n            /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"done\" ELSE call[c]]\n            /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"cut\" ELSE ended[c]]\n            /\\ UNCHANGED <<attempts, need, allowed, cause, host, stayed, dropped, asked, listing, lost>>\n       ELSE /\\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, kept, listing, lost>>",
+    "invariant": "IdleEndsNothing",
+    "config": "Engine.idle.cfg"
+  },
+  {
+    "description": "An idle stop without the try check stops a server with no try left",
+    "old": "    /\\ IF phase[s] = \"ready\" /\\ Quiet(s) /\\ attempts[s] = 0",
+    "new": "    /\\ IF phase[s] = \"ready\" /\\ Quiet(s)",
+    "property": "EveryCallEnds",
+    "config": "Engine.idle.cfg"
+  },
+  {
+    "description": "The idle timer fires with a tool list in flight (12a)",
+    "old": "Quiet(s) == Sent(s) = {} /\\ Waiting(s) = {} /\\ ~need[s] /\\ ~listing[s]",
+    "new": "Quiet(s) == Sent(s) = {} /\\ Waiting(s) = {} /\\ ~need[s]",
+    "invariant": "IdleStopsNoList",
+    "config": "Engine.idle.cfg"
+  },
+  {
+    "description": "The engine restarts a link after one lost call",
+    "old": "    /\\ lost[s] = LostLimit\n    /\\ Sent(s) = {}",
+    "new": "    /\\ lost[s] >= 1\n    /\\ Sent(s) = {}",
+    "property": "RestartOnlyAfterLosses"
+  },
+  {
+    "description": "The engine restarts a link with a call in flight",
+    "old": "    /\\ Sent(s) = {}\n    /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n",
+    "new": "    /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n",
+    "config": "Engine.lost.cfg",
+    "invariant": "StatusConsistent"
+  },
+  {
+    "description": "The engine never restarts a link that loses calls",
+    "old": "    /\\ phase[s] = \"ready\"\n    /\\ lost[s] = LostLimit",
+    "new": "    /\\ phase[s] = \"ready\" /\\ need[s]\n    /\\ lost[s] = LostLimit",
+    "property": "LossesRestart"
   }
 ]

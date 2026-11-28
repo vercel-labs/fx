@@ -54,6 +54,7 @@ pub fn makePersistedToolResult(
         .command_output_replay = command_output_replay,
         .command_process_presentation = if (memory) |info| info.command_process_presentation else null,
         .terminal_action_presentation = if (memory) |info| info.terminal_action_presentation else null,
+        .subagent_started = if (memory) |info| info.subagent_started else false,
     };
     if (memory) |info| {
         if (info.committed_file_presentation) |presentation| {

@@ -34,8 +34,15 @@ pub const Event = union(enum) {
     page_received: struct { more: bool, ttl_ms: u32, now_ms: i64 },
     /// -32602 for a continuation page.
     invalid_cursor,
-    /// Any other end of the page request (an error, `input_required`, a
-    /// malformed page, a timeout, or a lost connection).
+    /// The server answered the page request, and the answer was no page fx
+    /// could use: an error, `input_required`, a malformed page, or an HTTP
+    /// answer with no JSON-RPC message (a status, or a body that is no JSON)
+    /// that no other flow reads. The listing fails, and `refused` says so
+    /// until the next list or process.
+    page_refused,
+    /// Any other end of the page request: a timeout, a lost connection, a
+    /// cancel, or a sign-in needed first. The server gave no answer fx could
+    /// judge, so `refused` stays as it was.
     page_failed,
     /// `notifications/tools/list_changed`, a call answer that suggests
     /// the list changed, or the host.
@@ -86,6 +93,7 @@ pub const Projection = struct {
     pending: Pending,
     waiting: bool,
     answer: Answer,
+    refused: bool,
 };
 
 pub const Transition = struct {
@@ -133,6 +141,7 @@ pub const Catalog = struct {
     listing: bool = false,
     start_generation: Generation = 0,
     page: u32 = 0,
+    /// Restarts of the running listing after an invalid cursor: 0 when it starts from a need, 1 after its restart.
     restarts: u1 = 0,
     /// The shortest TTL of the running listing's pages so far.
     ttl_min: u32 = std.math.maxInt(u32),
@@ -143,6 +152,11 @@ pub const Catalog = struct {
     pending: Pending = .none,
     waiting: bool = false,
     answer: Answer = .none,
+    /// The last listing the server answered was refused: its answer was no
+    /// usable page (`page_refused`, or an invalid cursor again after the
+    /// restart). A published list and a new process clear it; a listing the
+    /// server never answered leaves it.
+    refused: bool = false,
 
     pub fn init(config: Config) Catalog {
         std.debug.assert(config.max_pages > 0);
@@ -158,6 +172,7 @@ pub const Catalog = struct {
                 if (c.listing) return error.Listing;
                 c.process += 1;
                 c.era = era;
+                c.refused = false;
                 c.invalidate();
             },
             .need => {
@@ -169,6 +184,8 @@ pub const Catalog = struct {
                 } else {
                     c.listing = true;
                     c.waiting = true;
+                    // Each listing may restart once: the count is the listing's own, as `StartListing` has it.
+                    c.restarts = 0;
                     c.startListing(out);
                 }
             },
@@ -193,7 +210,15 @@ pub const Catalog = struct {
                     c.restarts = 1;
                     out.push(.discard_pages);
                     c.startListing(out);
-                } else c.failListing(out);
+                } else {
+                    c.refused = true;
+                    c.failListing(out);
+                }
+            },
+            .page_refused => {
+                if (c.pending == .none) return error.NotReady;
+                c.refused = true;
+                c.failListing(out);
             },
             .page_failed => {
                 if (c.pending == .none) return error.NotReady;
@@ -234,6 +259,7 @@ pub const Catalog = struct {
             .pending = c.pending,
             .waiting = c.waiting,
             .answer = c.answer,
+            .refused = c.refused,
         };
     }
 
@@ -261,6 +287,7 @@ pub const Catalog = struct {
         c.cached_zero = zero;
         c.cached_lapsed = c.lapsed;
         c.answer = .list;
+        c.refused = false;
         c.endListing();
         out.push(.{ .publish = fresh });
         // Fresh and modern: every page has a TTL and none has expired, so
@@ -321,6 +348,7 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, out: *const Outpu
             .last_good => "lastGood",
             else => |a| @tagName(a),
         } } },
+        .{ .name = "refused", .value = .{ .boolean = s.refused } },
     };
     @memcpy(fields[count..][0..projected.len], &projected);
     count += projected.len;
@@ -365,6 +393,9 @@ const World = struct {
     fresh: bool = false,
     /// Armed expiry timers that haven't fired.
     timers: [4]?Generation = @splat(null),
+    /// How the last listing the server answered ended, since the last
+    /// process: RefusedIffLastAnswerRefused.
+    last_answer: enum { none, list, refused } = .none,
 };
 
 /// A page move's `now_ms` is how long after the last page it arrives.
@@ -376,7 +407,7 @@ fn apply(c: *Catalog, w: *World, move: Move) !bool {
     if (event == .page_received) event.page_received.now_ms += w.clock;
     switch (event) {
         .process_started => if (w.processes >= 2 or w.listing) return false,
-        .page_received, .page_failed => if (!w.listing) return false,
+        .page_received, .page_failed, .page_refused => if (!w.listing) return false,
         .invalid_cursor => if (!w.listing or w.pages == 0) return false,
         .invalidated => if (w.invalidations >= 3) return false,
         .expired => |g| {
@@ -399,6 +430,7 @@ fn apply(c: *Catalog, w: *World, move: Move) !bool {
             w.era = era;
             w.invalidations += 1;
             w.fresh = false;
+            w.last_answer = .none;
         },
         .need => w.waiters += 1,
         .page_received => |page| {
@@ -433,6 +465,8 @@ fn apply(c: *Catalog, w: *World, move: Move) !bool {
                     // OneListing: a listing starts only when none runs.
                     try testing.expect(!w.listing);
                     w.restarts = 0;
+                    // The catalog's own count starts at 0 too, whatever the listings before it did.
+                    try testing.expectEqual(@as(u1, 0), c.restarts);
                 } else {
                     // A restart after an invalid cursor, once.
                     try testing.expect(event == .invalid_cursor);
@@ -462,6 +496,7 @@ fn apply(c: *Catalog, w: *World, move: Move) !bool {
             w.waiters = 0;
             w.fresh = fresh;
             w.listed = true;
+            w.last_answer = .list;
         },
         .fail => {
             // LastGoodOnFailure.
@@ -491,6 +526,11 @@ fn apply(c: *Catalog, w: *World, move: Move) !bool {
     };
     // A restart drops the pages gathered so far before asking again.
     if (event == .invalid_cursor and w.listing) try testing.expectEqual(Effect.discard_pages, out.effects()[0]);
+    // A refusal is the end of a listing the server answered with no usable page.
+    if (event == .page_refused or (event == .invalid_cursor and !c.listing)) w.last_answer = .refused;
+    // RefusedIffLastAnswerRefused, RefusedListIsNotFresh and RefusedMeansFailureAnswer.
+    try testing.expectEqual(w.last_answer == .refused, c.refused);
+    if (c.refused) try testing.expect(c.cache != .fresh and (c.answer == .failure or c.answer == .last_good));
     // WaitingMeansListing.
     try testing.expectEqual(w.listing, c.waiting);
     try testing.expectEqual(c.waiting, c.listing);
@@ -503,7 +543,7 @@ fn apply(c: *Catalog, w: *World, move: Move) !bool {
 
 fn candidateMoves(buffer: []Event) []Event {
     var n: usize = 0;
-    for ([_]Event{ .{ .process_started = .modern }, .{ .process_started = .legacy }, .need, .invalid_cursor, .page_failed, .invalidated, .{ .expired = 1 }, .{ .expired = 2 }, .{ .expired = 3 }, .{ .expired = 4 } }) |m| {
+    for ([_]Event{ .{ .process_started = .modern }, .{ .process_started = .legacy }, .need, .invalid_cursor, .page_failed, .page_refused, .invalidated, .{ .expired = 1 }, .{ .expired = 2 }, .{ .expired = 3 }, .{ .expired = 4 } }) |m| {
         buffer[n] = m;
         n += 1;
     }
@@ -620,6 +660,35 @@ test "pages stop at the limit; an invalid cursor restarts once" {
     try testing.expectError(error.NotReady, c.step(.invalid_cursor, &out));
 }
 
+test "a later listing restarts after its own first invalid cursor, as the model's StartListing resets the count" {
+    var c: Catalog = .init(.{});
+    var out: Output = .{};
+    const more: Event = .{ .page_received = .{ .more = true, .ttl_ms = 9, .now_ms = 0 } };
+    const last: Event = .{ .page_received = .{ .more = false, .ttl_ms = 9, .now_ms = 0 } };
+    try c.step(.{ .process_started = .modern }, &out);
+    // Listing 1: its first invalid cursor restarts it, and it ends.
+    try c.step(.need, &out);
+    try c.step(more, &out);
+    try c.step(.invalid_cursor, &out);
+    try testing.expectEqualSlices(Effect, &.{ .discard_pages, .{ .send_page = .first } }, out.effects());
+    try testing.expectEqual(@as(u1, 1), c.restarts);
+    try c.step(last, &out);
+    try testing.expect(out.effects()[0] == .publish);
+    // The list changes and listing 2 starts: its count is its own, so its first invalid cursor restarts it and refuses nothing.
+    try c.step(.invalidated, &out);
+    try c.step(.need, &out);
+    try testing.expectEqual(@as(u1, 0), c.restarts);
+    try c.step(more, &out);
+    try c.step(.invalid_cursor, &out);
+    try testing.expectEqualSlices(Effect, &.{ .discard_pages, .{ .send_page = .first } }, out.effects());
+    try testing.expect(!c.refused);
+    // Its second one refuses it, and the older list is served.
+    try c.step(more, &out);
+    try c.step(.invalid_cursor, &out);
+    try testing.expectEqualSlices(Effect, &.{.serve_last}, out.effects());
+    try testing.expect(c.refused);
+}
+
 test "later needs join a running listing; nothing lists before a server is ready" {
     var c: Catalog = .init(.{});
     var out: Output = .{};
@@ -667,4 +736,49 @@ test "a failed listing hands over the last list, still stale, and the next need 
     try testing.expectEqual(Cache.stale, c.cache);
     try c.step(.need, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .send_page = .first }}, out.effects());
+}
+
+test "a refused page is remembered until a list is published, a new process starts, or the server refuses again" {
+    var c: Catalog = .init(.{});
+    var out: Output = .{};
+    try c.step(.{ .process_started = .modern }, &out);
+    try c.step(.need, &out);
+    try c.step(.page_refused, &out);
+    try testing.expectEqualSlices(Effect, &.{.fail}, out.effects());
+    try testing.expect(c.refused and out.transition.?.state.refused);
+    // A listing the server never answers does not say whether it would refuse.
+    try c.step(.need, &out);
+    try c.step(.page_failed, &out);
+    try testing.expect(c.refused);
+    // A list is published: the refusal is gone.
+    try c.step(.need, &out);
+    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 500, .now_ms = 0 } }, &out);
+    try testing.expect(!c.refused);
+    // With a list already published, a refusal hands it over and is remembered too.
+    try c.step(.invalidated, &out);
+    try c.step(.need, &out);
+    try c.step(.page_refused, &out);
+    try testing.expectEqualSlices(Effect, &.{.serve_last}, out.effects());
+    try testing.expect(c.refused);
+    try c.step(.{ .process_started = .modern }, &out);
+    try testing.expect(!c.refused);
+}
+
+test "an invalid cursor again after the restart is a refusal, and a lost page is not" {
+    var c: Catalog = .init(.{});
+    var out: Output = .{};
+    try c.step(.{ .process_started = .modern }, &out);
+    try c.step(.need, &out);
+    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 9, .now_ms = 0 } }, &out);
+    try c.step(.invalid_cursor, &out);
+    try testing.expect(!c.refused);
+    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 9, .now_ms = 0 } }, &out);
+    try c.step(.invalid_cursor, &out);
+    try testing.expectEqualSlices(Effect, &.{.fail}, out.effects());
+    try testing.expect(c.refused);
+    var lost: Catalog = .init(.{});
+    try lost.step(.{ .process_started = .modern }, &out);
+    try lost.step(.need, &out);
+    try lost.step(.page_failed, &out);
+    try testing.expect(!lost.refused);
 }

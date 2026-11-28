@@ -701,7 +701,10 @@ pub const StreamCallbacks = struct {
 
 const ToolAccumulator = struct {
     output_index: i64,
+    /// The id the call keeps in fx (`tool_call_ids.ReplyIds`).
     id: []u8,
+    /// The `call_id` the server sent, which its later events must repeat.
+    source_id: ?[]u8 = null,
     name: []u8,
     item_id: ?[]u8 = null,
     arguments: std.ArrayList(u8) = .empty,
@@ -709,6 +712,7 @@ const ToolAccumulator = struct {
 
     fn deinit(self: *ToolAccumulator, alloc: std.mem.Allocator) void {
         alloc.free(self.id);
+        if (self.source_id) |id| alloc.free(id);
         alloc.free(self.name);
         if (self.item_id) |id| alloc.free(id);
         self.arguments.deinit(alloc);
@@ -722,7 +726,7 @@ const ToolAccumulator = struct {
         item_id_key: []const u8,
         limits: StreamLimits,
     ) !void {
-        try checkOptionalIdentity(fields, "call_id", self.id);
+        if (self.source_id) |source_id| try checkOptionalIdentity(fields, "call_id", source_id);
         try checkOptionalIdentity(fields, "name", self.name);
         if (fields.get(item_id_key)) |value| {
             if (value != .string or value.string.len == 0) return error.InvalidEvent;
@@ -878,12 +882,15 @@ pub const Reducer = struct {
     text_bytes: usize = 0,
     event_count: usize = 0,
     aggregate_bytes: usize = 0,
+    call_ids: tool_call_ids.ReplyIds,
 
-    pub fn init(_: std.mem.Allocator) Reducer {
-        return .{};
+    /// Borrows `conversation` until deinit.
+    pub fn init(alloc: std.mem.Allocator, conversation: tool_call_ids.Conversation) !Reducer {
+        return .{ .call_ids = try tool_call_ids.ReplyIds.init(alloc, conversation) };
     }
 
     pub fn deinit(self: *Reducer, alloc: std.mem.Allocator) void {
+        self.call_ids.deinit();
         self.content.deinit(alloc);
         self.message_items.deinit(alloc);
         self.text_parts.deinit(alloc);
@@ -938,10 +945,17 @@ pub const Reducer = struct {
             const item_type = stringField(item.object, "type") orelse return false;
             if (std.mem.eql(u8, item_type, "function_call")) {
                 try self.check_output_kind(output_index, .function_call);
-                const call_id = stringField(item.object, "call_id") orelse return false;
+                const call_id: ?[]const u8 = if (item.object.get("call_id")) |value| switch (value) {
+                    .string => |text| text,
+                    .null => null,
+                    else => return false,
+                } else null;
                 const name = stringField(item.object, "name") orelse return false;
                 if (findTool(self.tools.items, output_index) == null) {
-                    try appendTool(alloc, &self.tools, output_index, call_id, name, limits);
+                    // An empty or oversized id is no id, and the call gets an fx id.
+                    const source_id = if (call_id) |id| if (id.len == 0 or id.len > limits.tool_identity_bytes) null else id else null;
+                    const id = try self.call_ids.assign(source_id);
+                    try appendTool(alloc, &self.tools, output_index, source_id, id, name, limits);
                     const tool = &self.tools.items[self.tools.items.len - 1];
                     try tool.reconcileIdentity(alloc, item.object, "id", limits);
                     if (item.object.get("arguments")) |value| {
@@ -949,7 +963,7 @@ pub const Reducer = struct {
                         try appendToolArguments(alloc, &tool.arguments, value.string, limits.tool_arguments_bytes);
                     }
                     if (callbacks.on_tool_start) |callback| {
-                        callback(callbacks.context, call_id, name, null, null);
+                        callback(callbacks.context, tool.id, name, null, null);
                     }
                 } else {
                     const index = findTool(self.tools.items, output_index).?;
@@ -1293,6 +1307,20 @@ pub const Reducer = struct {
         }
     }
 
+    /// Gives a call that repeats a call from an earlier reply, the same id,
+    /// tool, and arguments, that id back (`tool_call_ids.ReplyIds.sameCallAgain`).
+    /// Returns the id fx gave it when it was added, which its live start
+    /// named, as its provisional id; the caller owns it.
+    fn restore_sent_again(self: *Reducer, tool: *ToolAccumulator, arguments: []const u8) !?[]u8 {
+        const source = tool.source_id orelse return null;
+        if (std.mem.eql(u8, source, tool.id)) return null;
+        if (!try self.call_ids.sameCallAgain(source, tool.name, arguments)) return null;
+        const added = tool.id;
+        tool.id = source;
+        tool.source_id = null;
+        return added;
+    }
+
     pub fn finish(
         self: *Reducer,
         alloc: std.mem.Allocator,
@@ -1337,21 +1365,20 @@ pub const Reducer = struct {
             &.{};
         errdefer if (owned_tools.len > 0) alloc.free(owned_tools);
         var initialized: usize = 0;
-        errdefer for (owned_tools[0..initialized]) |call| {
-            alloc.free(call.id);
-            alloc.free(call.name);
-            alloc.free(call.arguments_json);
-        };
+        errdefer for (owned_tools[0..initialized]) |call| types.freeToolCall(alloc, call);
         for (self.tools.items, 0..) |*tool, index| {
             const arguments = if (tool.arguments_finalized or tool.arguments.items.len > 0)
                 try tool.arguments.toOwnedSlice(alloc)
             else
                 try alloc.dupe(u8, "{}");
             tool.arguments = .empty;
+            errdefer alloc.free(arguments);
+            const provisional_id = try self.restore_sent_again(tool, arguments);
             owned_tools[index] = .{
                 .id = tool.id,
                 .name = tool.name,
                 .arguments_json = arguments,
+                .provisional_id = provisional_id,
             };
             tool.id = &.{};
             tool.name = &.{};
@@ -1393,7 +1420,8 @@ const ToolRecordTest = struct {
     const terminal = "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}";
 
     fn init(alloc: std.mem.Allocator) ToolRecordTest {
-        return .{ .alloc = alloc, .reducer = .init(alloc) };
+        // A reply to no conversation takes no ids and allocates nothing.
+        return .{ .alloc = alloc, .reducer = Reducer.init(alloc, .{}) catch unreachable };
     }
 
     fn deinit(self: *ToolRecordTest) void {
@@ -2014,7 +2042,8 @@ const TextRecordTest = struct {
     limits: StreamLimits = ToolRecordTest.limits,
 
     fn init(alloc: std.mem.Allocator) TextRecordTest {
-        return .{ .alloc = alloc, .reducer = .init(alloc) };
+        // A reply to no conversation takes no ids and allocates nothing.
+        return .{ .alloc = alloc, .reducer = Reducer.init(alloc, .{}) catch unreachable };
     }
 
     fn deinit(self: *TextRecordTest) void {
@@ -2487,23 +2516,26 @@ fn appendTool(
     alloc: std.mem.Allocator,
     tools: *std.ArrayList(ToolAccumulator),
     output_index: i64,
-    call_id: []const u8,
+    source_id: ?[]const u8,
+    id: []const u8,
     name: []const u8,
     limits: StreamLimits,
 ) !void {
     if (tools.items.len >= limits.tool_calls or
-        call_id.len == 0 or call_id.len > limits.tool_identity_bytes or
         name.len == 0 or name.len > limits.tool_identity_bytes)
     {
         return error.ToolCallLimitExceeded;
     }
-    const id = try alloc.dupe(u8, call_id);
-    errdefer alloc.free(id);
+    const owned_id = try alloc.dupe(u8, id);
+    errdefer alloc.free(owned_id);
+    const owned_source_id = if (source_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (owned_source_id) |value| alloc.free(value);
     const owned_name = try alloc.dupe(u8, name);
     errdefer alloc.free(owned_name);
     try tools.append(alloc, .{
         .output_index = output_index,
-        .id = id,
+        .id = owned_id,
+        .source_id = owned_source_id,
         .name = owned_name,
     });
 }

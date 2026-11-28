@@ -11,10 +11,8 @@ const host_stream = @import("host_stream_provider.zig");
 const host_model_catalog = @import("host_model_catalog.zig");
 const openai_codex = @import("openai_codex.zig");
 const openai_codex_models = @import("openai_codex_models.zig");
-const version_lookup = @import("provider_versions.zig");
 
 const Allocator = std.mem.Allocator;
-const max_version_bytes = 64 * 1024;
 
 pub const Context = struct {
     transport: host_stream.Transport,
@@ -48,22 +46,7 @@ fn fetchCatalog(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchIn
     const context: *Context = @ptrCast(@alignCast(raw.?));
     const headers = [_]std.http.Header{.{ .name = "originator", .value = "fx" }};
 
-    const version_url = version_lookup.versionUrl(.codex) catch
-        return .{ .failure = .{ .category = .runtime } };
-    const version_body = switch (try host_model_catalog.get(alloc, context.transport, version_url, &.{}, input.cancel_flag, max_version_bytes)) {
-        .body => |body| body,
-        .failure => |failure| return .{ .failure = .{
-            .category = if (failure.category == .cancellation) .cancellation else .transport,
-            .retryable = failure.category != .cancellation,
-        } },
-    };
-    defer alloc.free(version_body);
-    const version = version_lookup.parseResponse(alloc, .codex, version_body) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = .{ .category = .transport, .retryable = true } };
-    };
-
-    const url = openai_codex_models.modelsUrl(alloc, version) catch |err| {
+    const url = openai_codex_models.modelsUrl(alloc, versions.codex_client_version) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
     };
@@ -191,7 +174,7 @@ test "host Codex stream refuses a Gateway credential without sending" {
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
-test "host Codex catalog resolves the client version through the host" {
+test "host Codex catalog sends the pinned client version through the host" {
     const models =
         \\{"models":[
         \\  {"slug":"gpt-6.1-sol","visibility":"list","supported_in_api":true,"priority":1,"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"additional_speed_tiers":[],"input_modalities":["text","image"],"context_window":272000},
@@ -199,7 +182,6 @@ test "host Codex catalog resolves the client version through the host" {
         \\]}
     ;
     var fake = FakeTransport{ .responses = &.{
-        .{ .status = 200, .body = "{\"version\":\"0.162.1\",\"name\":\"@openai/codex\"}" },
         .{ .status = 200, .body = models },
     } };
     defer fake.deinit();
@@ -212,11 +194,10 @@ test "host Codex catalog resolves the client version through the host" {
     var catalog = result.catalog;
     defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
 
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqualStrings("GET", fake.methods[0]);
-    try std.testing.expectEqualStrings("https://registry.npmjs.org/@openai/codex/latest", fake.urls[0]);
-    try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/models?client_version=0.162.1", fake.urls[1]);
-    try std.testing.expectEqualStrings("[{\"name\":\"originator\",\"value\":\"fx\"}]", fake.headers[1]);
+    try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/models?client_version=" ++ versions.codex_client_version, fake.urls[0]);
+    try std.testing.expectEqualStrings("[{\"name\":\"originator\",\"value\":\"fx\"}]", fake.headers[0]);
     try std.testing.expectEqualStrings("gpt-6.1-sol", catalog.items[0].id);
 }
 

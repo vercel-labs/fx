@@ -16,7 +16,7 @@ that run; later specs and later model changes are not in it.
 | `WriterLock` | 3,257 | 1,016 | 24 | No error |
 | `ResumeSnapshot` | 5,461 | 5,461 | 7 | No error |
 | `Fork` | 375,727 | 51,776 | 16 | No error |
-| `Subagents` | 204,097 | 120,297 | 23 | No error |
+| `Subagents` | 303,843 | 175,397 | 23 | No error |
 | `Catalog` | 645,269 | 94,482 | 19 | No error |
 | `Lifecycle` | 9,553 | 144 | 13 | No error |
 
@@ -38,6 +38,12 @@ work numbers per child, at most one unfinished work item per child, `failed`
 finishes and a parent `cancelled`. `LostMeansNoLog` became an action
 property, checked on the step that writes the line, because a persistent
 child marked lost for one work item may create its log with a later one.
+
+`Subagents` was widened on 2026-11-12 with `StartFail`: the thread can fail to
+start after the spawn line is written, and fx then finishes the work as
+`failed` with no child log, so the child is idle and takes a new work. A work
+left unfinished with no thread is what `NoIndeterminate` rules out, and the
+new mutant that leaves it so is caught.
 
 `./mutants.py` plants realistic bugs, one or more per spec, and requires TLC
 to report the matching invariant or action property as violated. The first
@@ -69,7 +75,7 @@ to report the matching invariant or action property as violated. The first
 | `Lifecycle.tla` | Lazy creation and publish (L2) | Nothing on disk before the first turn; a visible session has a durable line 1; an acknowledged first turn survives a machine crash | `VisibleHasLine1`, `AckedIsVisible`, `NothingBeforeFirstTurn` |
 | `Fork.tla` | Fork and blobs (L2) | Every referenced blob exists; a fork keeps its prefix after the source changes or is deleted; forks start at turn boundaries | `RefsExist`, `ForkKeepsPrefix`, `ForkAtBoundary`, `FirstLine` |
 | `ForkChildren.tla` | `/fork` taking copies of the source's subagents (D97) | Only children made by the fork point are offered; each copy is its child's log up to the fork point, a turn open there ended as cancelled; the fork names only copies on disk and has all of them or none; the source and its children are never written | `OnlyEligible`, `CopyAtPoint`, `CopyClosed`, `RegisteredExist`, `AllOrNone`, property `ForkLeavesSources` |
-| `Subagents.tla` | Children, persistent work, cancel, parent crash and repair (L2) | Every work item ends in a known state; one unfinished work item per child; `lost` only without a log; no orphan child logs | `OneOpenWork`, `FinishClosesOpenWork`, `NoOrphanChild`, `NoIndeterminate`, property `LostMeansNoLog` |
+| `Subagents.tla` | Children, persistent work, a start that fails, cancel, parent crash and repair (L2) | Every work item ends in a known state; one unfinished work item per child; `lost` only without a log; no orphan child logs | `OneOpenWork`, `FinishClosesOpenWork`, `NoOrphanChild`, `NoIndeterminate`, property `LostMeansNoLog` |
 | `Catalog.tla` | index.jsonl, list self-heal, delete, rebuild (L3) | list never returns a missing session; a deleted id never comes back; rebuild is exact | `ListedAreLive`, `NoResurrection`, `IndexNamesPublished`, property `RebuildIsExact` |
 
 Every spec also checks `TypeOK` where one is defined.

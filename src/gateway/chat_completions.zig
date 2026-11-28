@@ -393,3 +393,48 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
     owned.* = result;
     return .{ .completion = .{ .completion = owned.completed.completion, .context = owned, .deinit_fn = free_result } };
 }
+
+test "eb03: ChatMessage.input_id leaves configured protocol request bodies byte-identical" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{
+        \\  "chat": {"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"}},
+        \\  "resp": {"protocol":"openai-responses","base_url":"http://localhost:1234/v1","auth":{"type":"none"}},
+        \\  "anth": {"protocol":"anthropic-messages","base_url":"http://localhost:1234/v1","auth":{"type":"none"}}
+        \\}
+    );
+    defer registry.deinit(alloc);
+
+    const tool_call = types.ToolCall{ .id = "call_1", .name = "read_file", .arguments_json = "{}" };
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
+    const without_id = [_]types.ChatMessage{
+        .{ .role = .user, .content = "initial prompt" },
+        .{ .role = .assistant, .tool_calls = &.{tool_call} },
+        .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "ok", .tool_result_status = .success },
+        .{ .role = .user, .content = "follow up steer", .restored_steering = true },
+    };
+    var with_id = without_id;
+    with_id[0].input_id = 42;
+    with_id[3].input_id = 43;
+
+    for ([_][]const u8{ "chat", "resp", "anth" }) |name| {
+        const definition = registry.get(name).?;
+        const body_without = try build_for(definition, alloc, .{
+            .model = "model",
+            .instructions = &instructions,
+            .messages = &without_id,
+            .tool_choice = .auto,
+            .provider_options = .{},
+        });
+        defer alloc.free(body_without);
+        const body_with = try build_for(definition, alloc, .{
+            .model = "model",
+            .instructions = &instructions,
+            .messages = &with_id,
+            .tool_choice = .auto,
+            .provider_options = .{},
+        });
+        defer alloc.free(body_with);
+        try std.testing.expectEqualStrings(body_without, body_with);
+    }
+}

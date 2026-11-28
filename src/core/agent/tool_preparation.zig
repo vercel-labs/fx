@@ -433,6 +433,37 @@ pub fn ordinaryApplicableTargetsFreshInScope(
     return applicableTargetsEqual(candidate.applicable_targets, current);
 }
 
+/// Re-prepares the targets of a call whose preparation could not resolve them
+/// (`.legacy_target_resolution`). Returns the targets that resolve now, owned
+/// by the caller and allocated with `alloc`, or null when the candidate was
+/// resolved at preparation time or the call still does not resolve.
+pub fn lateResolvedApplicableTargets(
+    alloc: Allocator,
+    call: ToolCall,
+    tool_registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    access_scope: ?workspace_access.AccessScope,
+    candidate: *const Candidate,
+) Allocator.Error!?[]context_contract.ApplicableTarget {
+    if (candidate.kind != .legacy_target_resolution) return null;
+    const tool = tool_registry.lookup(call.name) orelse return null;
+    const current = switch (try prepareRegisteredApplicableTargets(
+        alloc,
+        workspace_root,
+        access_scope,
+        call,
+        tool.*,
+    )) {
+        .legacy_candidate => return null,
+        .prepared => |targets| targets,
+    };
+    if (current.len == 0) {
+        freeApplicableTargets(alloc, current);
+        return null;
+    }
+    return current;
+}
+
 fn applicableTargetsEqual(
     expected: []const context_contract.ApplicableTarget,
     current: []const context_contract.ApplicableTarget,
@@ -919,6 +950,101 @@ test "legacy ordinary applicable target freshness detects newly resolvable scope
         config.workspace_root,
         &missing.candidate,
     ));
+}
+
+test "late resolved applicable targets return a file created after preparation" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
+    const config: Config = .{
+        .tool_registry = .{ .tools = &tools },
+        .workspace_root = workspace,
+        .classifiers = test_classifiers,
+    };
+    const call: ToolCall = .{
+        .id = "late",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"made.txt\"}",
+    };
+
+    var missing = try prepareReadyCall(alloc, call, config);
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(
+        CandidateKind.legacy_target_resolution,
+        missing.candidate.kind,
+    );
+
+    // The file is still missing, so the call still does not resolve.
+    try std.testing.expect(try lateResolvedApplicableTargets(
+        alloc,
+        call,
+        config.tool_registry,
+        config.workspace_root,
+        null,
+        &missing.candidate,
+    ) == null);
+
+    var file = try tmp.dir.createFile(std.testing.io, "workspace/made.txt", .{});
+    file.close(std.testing.io);
+    const made_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/made.txt");
+    defer alloc.free(made_path);
+
+    const targets = (try lateResolvedApplicableTargets(
+        alloc,
+        call,
+        config.tool_registry,
+        config.workspace_root,
+        null,
+        &missing.candidate,
+    )).?;
+    defer freeApplicableTargets(alloc, targets);
+    try std.testing.expectEqual(@as(usize, 1), targets.len);
+    try std.testing.expectEqual(context_contract.TargetKind.file, targets[0].kind);
+    try std.testing.expectEqualStrings(made_path, targets[0].path);
+}
+
+test "late resolved applicable targets ignore candidates resolved at preparation" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "workspace/existing.txt", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "contents");
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
+    const config: Config = .{
+        .tool_registry = .{ .tools = &tools },
+        .workspace_root = workspace,
+        .classifiers = test_classifiers,
+    };
+    const call: ToolCall = .{
+        .id = "existing",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"existing.txt\"}",
+    };
+
+    var prepared = try prepareReadyCall(alloc, call, config);
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(CandidateKind.registered, prepared.candidate.kind);
+    try std.testing.expectEqual(@as(usize, 1), prepared.candidate.applicable_targets.len);
+    try std.testing.expect(try lateResolvedApplicableTargets(
+        alloc,
+        call,
+        config.tool_registry,
+        config.workspace_root,
+        null,
+        &prepared.candidate,
+    ) == null);
 }
 
 fn checkPreparationAllocationFailures(alloc: Allocator, workspace: []const u8) !void {

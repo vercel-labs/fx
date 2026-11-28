@@ -488,7 +488,10 @@ const Block = struct {
 };
 
 const Tool = struct {
+    /// The id the call keeps in fx (`tool_call_ids.ReplyIds`).
     id: ?[]u8 = null,
+    /// The id the server sent, when it sent one fx could read.
+    source_id: ?[]u8 = null,
     name: ?[]u8 = null,
     arguments: std.ArrayList(u8) = .empty,
     /// The block's starting `input` as JSON, when it was not empty.
@@ -498,6 +501,7 @@ const Tool = struct {
 
     fn deinit(self: *Tool, alloc: Allocator) void {
         if (self.id) |id| alloc.free(id);
+        if (self.source_id) |id| alloc.free(id);
         if (self.name) |name| alloc.free(name);
         self.arguments.deinit(alloc);
         if (self.start_input) |input| alloc.free(input);
@@ -551,6 +555,7 @@ const Reducer = struct {
     limits: Limits,
     choice: types.ToolChoice,
     structured_name: ?[]const u8,
+    call_ids: tool_call_ids.ReplyIds,
     blocks: std.ArrayList(Block) = .empty,
     tools: std.ArrayList(Tool) = .empty,
     thinking: std.ArrayList(Thinking) = .empty,
@@ -573,10 +578,12 @@ const Reducer = struct {
             .limits = limits,
             .choice = request.tool_choice,
             .structured_name = if (request.response_format) |format| format.name else null,
+            .call_ids = try tool_call_ids.ReplyIds.init(alloc, .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages }),
         };
     }
 
     fn deinit(self: *Reducer) void {
+        self.call_ids.deinit();
         self.blocks.deinit(self.alloc);
         for (self.tools.items) |*tool| tool.deinit(self.alloc);
         self.tools.deinit(self.alloc);
@@ -687,20 +694,19 @@ const Reducer = struct {
     }
 
     fn start_tool(self: *Reducer, block: std.json.ObjectMap) Error!Deltas {
-        const id = try string(block.get("id") orelse return error.InvalidEvent);
+        const source_id = try self.tool_source_id(non_null(block, "id"));
         const name = try string(block.get("name") orelse return error.InvalidEvent);
-        if (id.len == 0) return error.InvalidEvent;
-        if (id.len > self.limits.identity_bytes or name.len > @min(max_name_bytes, self.limits.identity_bytes)) return error.IdentityTooLarge;
+        if (name.len > @min(max_name_bytes, self.limits.identity_bytes)) return error.IdentityTooLarge;
         const structured = if (self.structured_name) |expected| std.mem.eql(u8, expected, name) else false;
         // A structured request sends only its own tool, once; a request that
         // allows no tools sends none.
         if (self.structured_name != null and (!structured or self.tools.items.len != 0)) return error.UnexpectedToolCall;
         if (self.choice == .none and !structured) return error.UnexpectedToolCall;
         if (self.tools.items.len == self.limits.tool_calls) return error.TooManyTools;
-        for (self.tools.items) |prior| if (std.mem.eql(u8, prior.id.?, id)) return error.ConflictingIdentity;
         var tool: Tool = .{ .structured = structured };
         errdefer tool.deinit(self.alloc);
-        tool.id = try self.alloc.dupe(u8, id);
+        tool.id = try self.alloc.dupe(u8, try self.call_ids.assign(source_id));
+        if (source_id) |id| tool.source_id = try self.alloc.dupe(u8, id);
         tool.name = try self.alloc.dupe(u8, name);
         if (block.get("input")) |input| {
             if (input != .object) return error.InvalidEvent;
@@ -719,6 +725,28 @@ const Reducer = struct {
         if (structured) return .{};
         const stored = &self.tools.items[self.tools.items.len - 1];
         return .{ .tool_started = .{ .id = stored.id.?, .name = stored.name.? } };
+    }
+
+    /// The id the server gave a call, or null when it gave none fx can keep:
+    /// then the call gets an fx id (`tool_call_ids.ReplyIds`).
+    fn tool_source_id(self: *const Reducer, value: ?std.json.Value) Error!?[]const u8 {
+        const text = try string(value orelse return null);
+        if (text.len == 0 or text.len > self.limits.identity_bytes) return null;
+        return text;
+    }
+
+    /// Gives a call that repeats a call from an earlier reply, the same id,
+    /// tool, and arguments, that id back (`tool_call_ids.ReplyIds.sameCallAgain`).
+    /// Returns the id fx gave it at its start, which its live start named,
+    /// as its provisional id; the caller owns it.
+    fn restore_sent_again(self: *Reducer, tool: *Tool, arguments: []const u8) Error!?[]u8 {
+        const source = tool.source_id orelse return null;
+        const started = tool.id.?;
+        if (std.mem.eql(u8, source, started)) return null;
+        if (!try self.call_ids.sameCallAgain(source, tool.name.?, arguments)) return null;
+        tool.id = source;
+        tool.source_id = null;
+        return started;
     }
 
     fn accept_block_delta(self: *Reducer, root: std.json.ObjectMap) Error!Deltas {
@@ -895,11 +923,7 @@ const Reducer = struct {
         errdefer if (content) |text| self.alloc.free(text);
         var calls: std.ArrayList(types.ToolCall) = .empty;
         errdefer {
-            for (calls.items) |call| {
-                self.alloc.free(call.id);
-                self.alloc.free(call.name);
-                self.alloc.free(call.arguments_json);
-            }
+            for (calls.items) |call| types.freeToolCall(self.alloc, call);
             calls.deinit(self.alloc);
         }
         try calls.ensureTotalCapacityPrecise(self.alloc, self.tools.items.len);
@@ -911,7 +935,9 @@ const Reducer = struct {
                 content = arguments;
                 continue;
             }
-            calls.appendAssumeCapacity(.{ .id = tool.id.?, .name = tool.name.?, .arguments_json = arguments });
+            errdefer self.alloc.free(arguments);
+            const provisional_id = try self.restore_sent_again(tool, arguments);
+            calls.appendAssumeCapacity(.{ .id = tool.id.?, .name = tool.name.?, .arguments_json = arguments, .provisional_id = provisional_id });
             tool.id = null;
             tool.name = null;
         }
@@ -1821,6 +1847,84 @@ test "anthropic messages returns malformed tool arguments as sent" {
     try std.testing.expectEqualStrings("{\"path\":\"y\"}", whole.completed.completion.tool_calls[0].arguments_json);
 }
 
+fn test_tool_block(comptime index: []const u8, comptime id_field: []const u8) []const u8 {
+    return "{\"type\":\"content_block_start\",\"index\":" ++ index ++ ",\"content_block\":{\"type\":\"tool_use\"" ++ id_field ++ ",\"name\":\"read_file\",\"input\":{\"path\":\"x\"}}}";
+}
+
+fn test_block_stop(comptime index: []const u8) []const u8 {
+    return "{\"type\":\"content_block_stop\",\"index\":" ++ index ++ "}";
+}
+
+test "anthropic messages gives a call the id an earlier step used an fx id" {
+    const alloc = std.testing.allocator;
+    var request = test_tool_request();
+    const earlier = [_]types.ToolCall{.{ .id = "toolu_1", .name = "read_file", .arguments_json = "{}" }};
+    request.messages = &.{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "toolu_1", .tool_name = "read_file", .content = "read" },
+    };
+    var recorder: Recorder = .{ .alloc = alloc };
+    defer recorder.deinit();
+    var result = try test_consume(alloc, test_tool_wire, request, recorder.sink());
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    try std.testing.expectEqualStrings("fx_call_1", completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings("fx_call_1:read_file;", recorder.started.items);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(completion));
+}
+
+test "anthropic messages keeps the id of a call sent again with an earlier call's id, tool, and arguments" {
+    const alloc = std.testing.allocator;
+    var request = test_tool_request();
+    const earlier = [_]types.ToolCall{.{ .id = "toolu_1", .name = "read_file", .arguments_json = "{\"path\":\"x\"}" }};
+    request.messages = &.{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "toolu_1", .tool_name = "read_file", .content = "read" },
+    };
+    var recorder: Recorder = .{ .alloc = alloc };
+    defer recorder.deinit();
+    var result = try test_consume(alloc, test_tool_wire, request, recorder.sink());
+    defer result.deinit(alloc);
+    const call = result.completed.completion.tool_calls[0];
+    try std.testing.expectEqualStrings("toolu_1", call.id);
+    // The live start named the id fx gave it when the block began.
+    try std.testing.expectEqualStrings("fx_call_1:read_file;", recorder.started.items);
+    try std.testing.expectEqualStrings("fx_call_1", call.provisional_id.?);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(result.completed.completion));
+}
+
+test "anthropic messages gives repeated, missing, empty, and oversized call ids fx ids" {
+    const alloc = std.testing.allocator;
+    const wire = comptime sse_wire(&.{
+        test_start,
+        test_tool_block("0", ",\"id\":\"toolu_1\""),
+        test_block_stop("0"),
+        test_tool_block("1", ",\"id\":\"toolu_1\""),
+        test_block_stop("1"),
+        test_tool_block("2", ""),
+        test_block_stop("2"),
+        test_tool_block("3", ",\"id\":\"\""),
+        test_block_stop("3"),
+        test_tool_block("4", ",\"id\":\"" ++ text_utils.repeat("i", 257) ++ "\""),
+        test_block_stop("4"),
+        test_tool_use_stop,
+        test_message_stop,
+    });
+    var recorder: Recorder = .{ .alloc = alloc };
+    defer recorder.deinit();
+    var result = try test_consume(alloc, wire, test_tool_request(), recorder.sink());
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    var ids: std.ArrayList(u8) = .empty;
+    defer ids.deinit(alloc);
+    for (completion.tool_calls) |call| try ids.print(alloc, "{s}:{s};", .{ call.id, call.name });
+    try std.testing.expectEqualStrings("toolu_1:read_file;fx_call_1:read_file;fx_call_2:read_file;fx_call_3:read_file;fx_call_4:read_file;", ids.items);
+    try std.testing.expectEqualStrings(ids.items, recorder.started.items);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(completion));
+}
+
 test "anthropic messages ignores unknown events blocks and deltas but not misplaced ones" {
     const alloc = std.testing.allocator;
     const wire = sse_wire(&.{
@@ -1862,7 +1966,6 @@ test "anthropic messages ignores unknown events blocks and deltas but not mispla
         .{ .events = &.{ test_start, test_tool_start, test_text_delta }, .failure = error.InvalidEvent },
         .{ .events = &.{ test_start, "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}" }, .failure = error.InvalidEvent },
         .{ .events = &.{ test_start, test_end_turn, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}" }, .failure = error.InconsistentFinishReason },
-        .{ .events = &.{ test_start, test_tool_start, "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"shell\",\"input\":{}}}" }, .failure = error.ConflictingIdentity },
     }) |case| {
         const bad = try test_wire(alloc, case.events);
         defer alloc.free(bad);

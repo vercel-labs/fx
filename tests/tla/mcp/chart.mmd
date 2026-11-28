@@ -1,0 +1,55 @@
+%% One server in tests/tla/mcp/Engine.tla; regenerate when the model changes.
+stateDiagram-v2
+    state "Not started" as NS
+    state "Starting" as ST
+    state "Ready" as RD
+    state "Ready, 1 call lost" as R1
+    state "Ready, 2 calls lost, a call still running" as R2W
+    state "Waiting to retry" as WR
+    state "Gave up" as GU
+    state "Not started, but a call is still running" as BAD21
+    state "Ready, 2 calls lost, no restart" as BAD22
+
+    [*] --> NS
+    NS --> ST : a tool call or tool list needs it, or it starts again by itself
+    ST --> RD : the server answers its start
+    ST --> WR : the start fails, and calls waiting for it fail
+    ST --> GU : the start fails, with no tries left
+    WR --> NS : the backoff ends
+    GU --> NS : you sign in again, or the host reconnects it
+    RD --> R1 : a call's stream breaks
+    R1 --> RD : a call is answered, which clears the count
+    R1 --> R2W : a call's stream breaks, and another call is still running
+    R1 --> NS : a call's stream breaks, and no other call is running
+    R2W --> RD : a call is answered, which clears the count
+    R2W --> NS : the last running call's stream breaks
+    RD --> WR : the link dies
+    R1 --> WR : the link dies
+    R2W --> WR : the link dies
+    RD --> GU : the link dies, with no tries left
+    R1 --> GU : the link dies, with no tries left
+    R2W --> GU : the link dies, with no tries left
+    R2W --> BAD21 : planted bug 21 only, the link restarts with a call still running
+    R1 --> BAD22 : planted bug 22 only, no restart, and nothing is running
+
+    note right of BAD21
+        Rule broken: StatusConsistent, checked first, and RestartOnlyAfterLosses.
+        Shortest path, 8 steps: a call waits and starts the server, the server answers, a second and a third call go out, the first call is lost, the second call is lost, and the link restarts with the third call still running.
+    end note
+    note right of BAD22
+        Rule broken: LossesRestart.
+        Shortest path, 6 steps: a call waits and starts the server, the server answers, the first call is lost, a second call goes out and is lost, and the link stays ready with nothing running.
+        Each further lost call leaves it here, so the link keeps losing calls and never restarts.
+    end note
+
+%% Left out of this chart, on purpose:
+%% a permission refusal: the call ends at once, and no server state changes
+%% cancelling a call that waits
+%% a call to a server that gave up: it fails at once
+%% a call that goes out to a ready server: Ready covers it
+%% another call's stream breaks while one still runs: the chart stays in Ready, 2 calls lost, a call still running
+%% the stable timer, which clears the tries in a row
+%% a host disconnect, and a reconnect from any state other than Gave up
+%% the other servers: each one has its own chart
+%% when the link dies, calls in flight are lost and the count starts again
+%% the model may take other steps before a restart; the chart shows the engine's order

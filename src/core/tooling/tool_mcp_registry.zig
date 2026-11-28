@@ -17,20 +17,12 @@ pub fn resolve(
     runtime: tool_mcp_runtime.RuntimeCapabilities,
     name: []const u8,
 ) Resolution {
-    if (runtime.context != null and
-        !tool_mcp_runtime.isAdvertisedDynamicToolName(
-            advertised_dynamic_tool_names,
-            name,
-        ))
-    {
-        return .not_selected;
-    }
+    if (runtime.context == null) return .unsupported;
     if (!tool_mcp_runtime.isAdvertisedDynamicToolName(
         advertised_dynamic_tool_names,
         name,
-    ) or runtime.context == null or runtime.call_tool == null) {
-        return .unsupported;
-    }
+    )) return .not_selected;
+    if (runtime.call_tool == null) return .unsupported;
     return .{ .registered = dynamicTool(name) };
 }
 
@@ -47,7 +39,7 @@ fn dynamicTool(name: []const u8) tool_dispatch.Tool {
             .description = "Selected dynamic MCP tool.",
         },
         .executor_kind = .mcp_tool,
-        .activity_kind = .command,
+        .activity_kind = .mcp,
         .decode = decode,
         .call = call,
         .reads_only_fn = readsOnly,
@@ -235,6 +227,8 @@ test "dynamic MCP resolution preserves selected and unselected states" {
 
     try std.testing.expect(resolve(&advertised, runtime, "mcp_other") == .not_selected);
     try std.testing.expect(resolve(&advertised, .{}, "mcp_fs_read") == .unsupported);
+    try std.testing.expect(resolve(&advertised, .{}, "mcp_other") == .unsupported);
+    try std.testing.expect(resolve(&advertised, .{ .context = @ptrCast(&fixture) }, "mcp_fs_read") == .unsupported);
     try std.testing.expect(resolve(&advertised, runtime, "mcp_fs_read") == .registered);
 }
 
@@ -251,6 +245,12 @@ test "dynamic MCP descriptor executes through registered dispatch" {
     };
     const tools = [_]tool_dispatch.Tool{tool};
     const registry = tool_dispatch.Registry{ .tools = tools[0..] };
+    // A registry that holds the tool and one that does not name the same kind
+    // of call: an MCP tool's.
+    const without_it = tool_dispatch.Registry{ .tools = tools[0..0] };
+    const kind = tool_dispatch.toolActivityKind(registry, "mcp_fs_read");
+    try std.testing.expectEqual(@as(@TypeOf(kind), .mcp), kind);
+    try std.testing.expectEqual(tool_dispatch.toolActivityKind(without_it, "mcp_fs_read"), kind);
     var execution_error: ?anyerror = null;
     const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
         .allocator = std.testing.allocator,

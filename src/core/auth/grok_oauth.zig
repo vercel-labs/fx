@@ -9,8 +9,8 @@ const io_mod = @import("../shared/io.zig");
 const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
-const pending_revocation = @import("pending_revocation.zig");
 const secret = @import("secret.zig");
+const subscription_logout = @import("subscription_logout.zig");
 
 const Allocator = std.mem.Allocator;
 const FormBody = oauth.FormBody;
@@ -432,103 +432,11 @@ const StdinManualCodeReader = struct {
     }
 };
 
-pub const LogoutResult = struct {
-    deletion: grok_session.DeleteOutcome,
-    revocation_failed: bool,
-    /// The unconfirmed revocation's token is kept, and fx revokes it later
-    /// (`pending_revocation`).
-    retry_kept: bool = false,
-};
-
-pub fn logout(
-    alloc: Allocator,
-    transport: oauth_transport.Provider,
-    before_revocation: ?oauth.BeforeRevocation,
-) !LogoutResult {
-    const local = try logoutLocally(alloc);
-    defer if (local.refresh_token) |token| secret.zeroAndFree(alloc, token);
-    var result = local.result;
-    if (local.refresh_token) |token| {
-        if (before_revocation) |notice| notice.run(notice.context);
-        revokeToken(alloc, transport, token) catch |err| {
-            debug_trace.logf("auth", "Grok logout revocation failed err={s}", .{@errorName(err)});
-            result.revocation_failed = true;
-            result.retry_kept = local.kept and pending_revocation.retryable(err);
-            if (local.kept and !result.retry_kept) pending_revocation.forget(alloc, .grok, token);
-            return result;
-        };
-        if (local.kept) pending_revocation.forget(alloc, .grok, token);
-    }
-    return result;
-}
-
-/// The outcome of deleting the saved Grok session, with its refresh token kept
-/// so it can still be revoked.
-pub const LocalLogout = struct {
-    result: LogoutResult,
-    /// Owned by the caller when set; release it with `secret.zeroAndFree`
-    /// using the allocator passed to `logoutLocally`.
-    refresh_token: ?[]u8 = null,
-    /// Whether `refresh_token` is kept to revoke later (`pending_revocation`).
-    /// Forget it once its revocation is confirmed.
-    kept: bool = false,
-};
-
-/// Deletes the saved Grok session without contacting xAI. Revoke the returned
-/// refresh token with `revokeToken`, then release it. The session is deleted
-/// first, so a failed deletion never leaves a revoked token on disk.
-pub fn logoutLocally(alloc: Allocator) !LocalLogout {
-    var mutation = (try grok_session.beginExistingMutation()) orelse return .{ .result = .{
-        .deletion = .missing,
-        .revocation_failed = false,
-    } };
-    defer mutation.deinit();
-    var revocation_failed = false;
-    var refresh_token: ?[]u8 = null;
-    errdefer if (refresh_token) |token| secret.zeroAndFree(alloc, token);
-    var kept = false;
-    const loaded_session = mutation.load(alloc) catch |err| blk: {
-        debug_trace.logf("auth", "Grok logout could not load the saved credential err={s}", .{@errorName(err)});
-        revocation_failed = true;
-        break :blk null;
-    };
-    if (loaded_session) |loaded| {
-        var session = loaded;
-        defer session.deinit(alloc);
-        refresh_token = try alloc.dupe(u8, session.refresh_token);
-        // Kept before the login is deleted, so a revocation that never
-        // completes still leaves the token for a later retry.
-        kept = pending_revocation.keep(alloc, .grok, .{ .refresh_token = session.refresh_token });
-    }
-    const deletion = mutation.delete() catch |err| {
-        // The login is still saved, so its token must not be revoked later.
-        if (kept) pending_revocation.forget(alloc, .grok, refresh_token.?);
-        return err;
-    };
-    return .{
-        .result = .{
-            .deletion = deletion,
-            .revocation_failed = revocation_failed,
-        },
-        .refresh_token = refresh_token,
-        .kept = kept,
-    };
-}
-
-/// Revokes the Grok sign-outs that earlier logouts kept because the provider
-/// did not confirm them (`pending_revocation.retry`).
-pub fn retryKeptSignOuts(
-    alloc: Allocator,
-    transport: oauth_transport.Provider,
-    before_revocation: ?oauth.BeforeRevocation,
-) pending_revocation.RetryOutcome {
-    return pending_revocation.retry(alloc, .grok, .{ .context = &transport, .run = revokeKept }, before_revocation);
-}
-
-fn revokeKept(context: *const anyopaque, alloc: Allocator, tokens: pending_revocation.Tokens) anyerror!void {
-    const transport: *const oauth_transport.Provider = @ptrCast(@alignCast(context));
-    return revokeToken(alloc, transport.*, tokens.refresh_token);
-}
+const sign_out = subscription_logout.Provider(grok_session, .grok, revokeToken, "Grok");
+/// Deletes the saved Grok login, then revokes its refresh token at xAI.
+pub const logout = sign_out.logout;
+pub const logoutLocally = sign_out.logoutLocally;
+pub const retryKeptSignOuts = sign_out.retryKeptSignOuts;
 
 pub fn sourceExists(alloc: Allocator) !bool {
     var session = (try grok_session.load(alloc)) orelse return false;
@@ -777,16 +685,6 @@ fn configuredEndpoint(alloc: Allocator, env_name: []const u8, default_url: []con
     };
 }
 
-fn requestAccepted(
-    alloc: Allocator,
-    transport: oauth_transport.Provider,
-    method: oauth_transport.Method,
-    url: []const u8,
-    payload: []const u8,
-) ![]u8 {
-    return requestAcceptedWithBounds(alloc, transport, method, url, payload, null, null);
-}
-
 /// `outlives_cancel` for a refresh, which has already retired the old
 /// refresh token by the time it asks (`oauth_transport.Request`).
 fn fetchAccountId(
@@ -825,13 +723,7 @@ pub fn revokeToken(
 ) !void {
     const endpoint_url = try configuredEndpoint(alloc, e2e_revoke_url_env, revoke_url);
     defer alloc.free(endpoint_url);
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-    var form: FormBody = .{};
-    try form.append(&body.writer, "token", token);
-    try form.append(&body.writer, "client_id", client_id);
-    const bytes = try requestAccepted(alloc, transport, .post_form, endpoint_url, body.written());
-    secret.zeroAndFree(alloc, bytes);
+    try oauth.revokeToken(alloc, transport, endpoint_url, client_id, token, null);
 }
 
 fn requestAcceptedWithBounds(

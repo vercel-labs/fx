@@ -33,13 +33,17 @@
 //!
 //! - `fx_trace`: `format_version` (1), `fx_version`, `git_commit`,
 //!   `written_at`, and `notice`, the privacy warning.
+//! - `fatal_error`: only in a crash report, right after the header: `error`,
+//!   the error's name, `message`, the same plain words fx shows, and `at`, the
+//!   time the error ended the session.
 //! - `summary`: `os`, `arch`, `build` (`Debug`, `ReleaseSafe`, `ReleaseFast`,
 //!   or `ReleaseSmall`), `model`, `fast_mode`, `permission_mode`, `workspace`.
 //! - `current_state`: `session_id`, `session_dir`, `agent_step_limit`,
 //!   `effort`, `input_tokens`, `output_tokens`, `web_search_requests`; `auth`
 //!   {`source`, `refreshable`, `gateway_team`}; `process` {`pid`, `open_fds`,
 //!   and `memory` {`pid`, `ppid`, `rss_kib`, `vsz_kib`, `elapsed`, `stat`}, or
-//!   `memory_lines` with the `ps` output when it has another shape}; `worker`
+//!   `memory_lines` with the `ps` output when it has another shape. A crash
+//!   report writes `memory` as {`status`: `unavailable`} and runs no `ps`}; `worker`
 //!   {`processing`, `queued`, `cancel_requested`, `pending_permission`
 //!   (masked)}; `pending_questions` {`count`, `questions`: the first 3 as
 //!   {`question` (masked), `options`, a count}}; `pending_images` {`count`,
@@ -65,6 +69,13 @@
 //!   `detail`}, for the newest 3 failures.
 //! - `last_shutdown`: `status` (`recorded`, `none`, or `unreadable`),
 //!   `total_ms`, `recorded_at`, and `stages`, a list of {`name`, `step_ms`}.
+//! - `last_crash`: `status` (`recorded`, `none`, `too_large`, `unreadable`, `stale`, `future`, or `undated`), the crash
+//!   report that `writeCrashReport` saved. A missing file is `none`, and a file
+//!   that cannot be read is `unreadable`. When `recorded`: `error` and `message` (from the
+//!   `fatal_error` record), `at` and `at_ms`, `fx_version` and `git_commit`
+//!   (from the header), `records` (the lines embedded), and `skipped` (the
+//!   lines that are not JSON objects). Then a `last_crash_record` per embedded
+//!   line, with the line's object as `record`.
 //! - `compaction`: `retained`, `failed`, `overwritten_before`, the events the
 //!   bounded ring dropped; then a `compaction_event` per retained event:
 //!   `at`, `sequence`, `event`, `turn_id`, `step_id`, `subagent_id`, `failed`,
@@ -261,7 +272,10 @@
 //!   never in the trace.
 //! - `renderer_state`: `layout`, `cursor`, `transcript`, `projection`,
 //!   `replaceable`, and `shadow_grid` with `visible_rows`, a list of {`row`,
-//!   `text` (masked)}; `shadow_grid` is left out when fx has none.
+//!   `text` (masked, with the pieces of a secret that a wrap splits also
+//!   masked; all `[redacted]` past 1024 distinct secrets, and from the first
+//!   row that finds the piece compare budget spent onward)}; `shadow_grid` is
+//!   left out when fx has none.
 //! - `renderer_events`: `retained`, `capacity`, `overwritten_before`; then a
 //!   `renderer_event` per event: `at`, `sequence`, `kind`, `detail` (masked),
 //!   `truncated`. These are internal rendering decisions, not what the
@@ -270,7 +284,12 @@
 //!   `transcript_entry` per entry that has text: `at`, `kind` (`raw`, `user`,
 //!   `assistant`, `assistant_table`, `assistant_code_block`,
 //!   `assistant_thematic_rule`, or `semantic_notice`), and `text` (masked),
-//!   with ANSI escapes, blank lines, and banner lines removed.
+//!   with ANSI escapes, blank lines, and banner lines removed. A command output
+//!   entry's rows are masked with the values of the output lines that fx keeps
+//!   for it, so a piece of a secret that a wrap split is masked. They read
+//!   `[redacted]` when fx no longer keeps the line, when it holds more than 1024
+//!   distinct secrets, or when the piece compare budget is spent while they are
+//!   masked.
 //! - `trace_log`, only when a debug trace log is set and not empty: `path`
 //!   (masked), `bytes` read from its end (at most 6 KiB), `older_lines_cut`,
 //!   `lines`; then a `trace_log_line` per line, at most 80: `text` (masked).
@@ -314,10 +333,11 @@ const tool_presentation = @import("../tooling/tool_presentation.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig");
+const crash_panic = @import("crash_panic.zig");
 
 pub const format_version: u32 = 1;
 
-const notice_text = "Private diagnostic report. It may include prompts, file paths, command output, and file snippets.";
+pub const notice_text = "Private diagnostic report. It may include prompts, file paths, command output, and file snippets.";
 const tool_args_max_bytes: usize = 1200;
 const result_preview_max_bytes: usize = 180;
 const pending_items_shown: usize = 3;
@@ -338,6 +358,8 @@ const Records = struct {
     arena: std.mem.Allocator,
     json: std.json.Stringify,
     count: usize = 0,
+    /// The saved crash report that this trace includes, set by `writeLastCrash`.
+    included_crash: ?IncludedCrash = null,
 
     fn init(out: *std.Io.Writer, arena: std.mem.Allocator) Records {
         return .{ .out = out, .arena = arena, .json = .{ .writer = out } };
@@ -415,6 +437,13 @@ const Records = struct {
         try self.json.write(value);
     }
 
+    /// A value that is already parsed JSON, written under `name` with the same
+    /// fields and values.
+    fn parsedValue(self: *Records, name: []const u8, value: std.json.Value) !void {
+        try self.json.objectField(name);
+        try self.json.write(value);
+    }
+
     fn boolean(self: *Records, name: []const u8, value: bool) !void {
         try self.json.objectField(name);
         try self.json.write(value);
@@ -464,7 +493,7 @@ fn validUtf8(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
     return text_utils.dupeValidUtf8(arena, value);
 }
 
-fn formatUtc(buf: []u8, ms: i64) ![]const u8 {
+pub fn formatUtc(buf: []u8, ms: i64) ![]const u8 {
     const secs: u64 = @intCast(@divFloor(ms, 1000));
     const ms_part: u64 = @intCast(@mod(ms, 1000));
     const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = secs };
@@ -482,9 +511,42 @@ fn formatUtc(buf: []u8, ms: i64) ![]const u8 {
     });
 }
 
-/// Returns the trace as JSONL bytes that the caller owns.
-pub fn build(app: anytype) ![]u8 {
+/// `ms` as a UTC clock time to the minute, such as `2026-11-18 01:42 UTC`. The
+/// time must be one that `formatUtc` accepts, so check it first.
+pub fn formatUtcMinute(buf: []u8, ms: i64) ![]const u8 {
+    var iso_buf: [40]u8 = undefined;
+    const iso = try formatUtc(&iso_buf, ms);
+    return std.mem.print(buf, "{s} {s} UTC", .{ iso[0..10], iso[11..16] });
+}
+
+/// A saved crash report that a trace includes. A report is included only when it
+/// has a time, so the time is always here.
+pub const IncludedCrash = struct {
+    /// When the crash was saved, in Unix milliseconds.
+    at_ms: i64,
+};
+
+/// A trace, and the saved crash report that it includes, if any.
+const BuiltTrace = struct {
+    /// The trace's JSON Lines bytes. The caller owns them.
+    bytes: []u8,
+    /// The crash report that the trace includes as `last_crash`, or null.
+    crash: ?IncludedCrash,
+};
+
+/// Returns the trace as JSONL bytes that the caller owns, with the crash report
+/// it includes, if any.
+pub fn build(app: anytype) !BuiltTrace {
+    return buildReport(app, null);
+}
+
+/// Returns the trace as JSONL bytes that the caller owns. With `fatal`, the
+/// report also holds a `fatal_error` record right after the header, which
+/// names the error that ended the session.
+fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     const App = @TypeOf(app.*);
+    // Read once, so every age check in this trace uses the same time.
+    const now_ms = io_mod.milliTimestamp();
     var arena_state = std.heap.ArenaAllocator.init(app.alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -504,10 +566,13 @@ pub fn build(app: anytype) ![]u8 {
     shell_view.* = shell_snapshot.processOwner().traceView();
 
     try writeHeader(r, App.app_version, io_mod.milliTimestamp());
+    if (fatal) |err| try writeFatalError(r, err);
     try writeSummary(r, app, permissions.permissionModeLabel(permission_view.mode));
-    try writeCurrentState(r, app);
+    try writeCurrentState(r, app, fatal != null);
     try writeProblems(r, app);
-    try writeLastShutdown(r, app_lifecycle.readLastShutdownReport(arena));
+    try writeLastShutdownRead(r, app_lifecycle.readLastShutdownReport(arena));
+    // A crash report never embeds an older crash report, so the file cannot grow on each crash.
+    if (fatal == null) try writeLastCrashRead(r, readLastCrashReport(arena), now_ms);
     try writeCompaction(r);
     try writeInterruptedTurn(r, history);
     try writeSessionTitle(r, app);
@@ -522,14 +587,22 @@ pub fn build(app: anytype) ![]u8 {
     try writeSkills(r, app);
     try writeRuntimeContext(r, app);
     try writeShell(r, shell_view, shell_resolver.configuredLoginShellInto(try arena.alloc(u8, std.Io.Dir.max_path_bytes)));
-    try writeRendererState(r, app);
+    // Prepared first: masking the transcript collects the secrets the visible rows need.
+    const notebook = &app.shell.notebook;
+    const command_lines = try commandLines(arena, notebook);
+    var secrets: text_utils.SecretValues = .{};
+    // One budget and one set of drop logs for the whole trace, shared by the
+    // transcript and the visible rows.
+    var masking: PieceMasking = .{};
+    const transcript = try prepareTranscript(r, notebook.entries.items, &command_lines, &secrets, &masking);
+    try writeRendererState(r, app, &secrets, &masking);
     try writeRendererEvents(r);
-    try writeTranscript(r, app.shell.notebook.entries.items);
+    try writeTranscript(r, transcript);
     if (debug_trace.activeLogPath() orelse io_mod.getenv("FX_TRACE_LOG")) |path| {
         try writeTraceLog(r, path);
     }
     try writeEnd(r);
-    return out.toOwnedSlice();
+    return .{ .bytes = try out.toOwnedSlice(), .crash = records.included_crash };
 }
 
 fn writeHeader(r: *Records, fx_version: []const u8, now_ms: i64) !void {
@@ -539,6 +612,17 @@ fn writeHeader(r: *Records, fx_version: []const u8, now_ms: i64) !void {
     try r.text("git_commit", build_options.git_commit);
     try r.time("written_at", now_ms);
     try r.text("notice", notice_text);
+    try r.end();
+}
+
+/// The `fatal_error` record: the name of the error that ended the session and
+/// the same plain words fx shows for it.
+fn writeFatalError(r: *Records, err: anyerror) !void {
+    var words: [128]u8 = undefined;
+    try r.begin("fatal_error");
+    try r.text("error", @errorName(err));
+    try r.text("message", types.plainErrorText(@errorName(err), &words));
+    try r.time("at", io_mod.milliTimestamp());
     try r.end();
 }
 
@@ -570,7 +654,7 @@ fn writeSummary(r: *Records, app: anytype, permission_mode: []const u8) !void {
     try r.end();
 }
 
-noinline fn writeCurrentState(r: *Records, app: anytype) !void {
+noinline fn writeCurrentState(r: *Records, app: anytype, crash_report: bool) !void {
     const App = @TypeOf(app.*);
     const agent = agents.screenAgentOf(app);
     try r.begin("current_state");
@@ -589,7 +673,7 @@ noinline fn writeCurrentState(r: *Records, app: anytype) !void {
         try r.number("web_search_requests", agents.loadTotal(&agent.total_web_search_requests));
     }
     try writeAuthState(r, app);
-    try writeProcess(r);
+    try writeProcess(r, crash_report);
     if (comptime agents.hasAgentField(App, "worker")) {
         if (agent.worker.snapshotState(r.arena) catch null) |state| {
             defer state.deinit(r.arena);
@@ -690,12 +774,21 @@ fn writeAuthState(r: *Records, app: anytype) !void {
     try r.endObject();
 }
 
-fn writeProcess(r: *Records) !void {
+fn writeProcess(r: *Records, crash_report: bool) !void {
     const pid = std.c.getpid();
     try r.beginObject("process");
     try r.number("pid", pid);
     if (countOpenFileDescriptors()) |fd_count| try r.number("open_fds", fd_count);
-    if (processMemorySnapshot(r.arena, pid) catch null) |ps_output| try writeProcessMemory(r, ps_output);
+    // A crash report saves while the terminal is still raw, and nothing bounds
+    // `ps`, so it runs no `ps` and records the memory as unavailable, the object
+    // with a `status` that `/trace` gives a section it cannot read.
+    if (crash_report) {
+        try r.beginObject("memory");
+        try r.text("status", "unavailable");
+        try r.endObject();
+    } else if (processMemorySnapshot(r.arena, pid) catch null) |ps_output| {
+        try writeProcessMemory(r, ps_output);
+    }
     try r.endObject();
 }
 
@@ -942,6 +1035,20 @@ fn writeModelCatalogProblems(p: *Records) !void {
     }
 }
 
+/// Writes the last-shutdown section for a read of the saved report. A report
+/// that cannot be read as a regular file is `unreadable`.
+fn writeLastShutdownRead(r: *Records, read: io_mod.FileRead) !void {
+    switch (read) {
+        .bytes => |bytes| try writeLastShutdown(r, bytes),
+        .missing, .too_large => try writeLastShutdown(r, null),
+        .unreadable => {
+            try r.begin("last_shutdown");
+            try r.text("status", "unreadable");
+            try r.end();
+        },
+    }
+}
+
 /// `contents` is the saved last-shutdown report, or null when there is none.
 fn writeLastShutdown(r: *Records, contents: ?[]const u8) !void {
     try r.begin("last_shutdown");
@@ -973,6 +1080,183 @@ fn writeLastShutdown(r: *Records, contents: ?[]const u8) !void {
         try r.endArray();
     };
     try r.end();
+}
+
+/// The most bytes of the saved crash report that `readLastCrashReport` reads.
+/// A longer file reads as `too_large`.
+const last_crash_max_bytes = 16 * 1024 * 1024;
+
+/// The crash report that `writeCrashReport` saved, read for the /trace report.
+/// The bytes are allocated in `alloc`. A home folder that is not known reads as
+/// missing.
+fn readLastCrashReport(alloc: std.mem.Allocator) io_mod.FileRead {
+    const home = io_mod.homeDir() orelse return .missing;
+    const path = profile_paths.lastCrashReportPath(alloc, home) catch return .unreadable;
+    defer alloc.free(path);
+    return readLastCrashReportAt(alloc, path);
+}
+
+/// Reads the crash report at `path`, as `readLastCrashReport` does.
+fn readLastCrashReportAt(alloc: std.mem.Allocator, path: []const u8) io_mod.FileRead {
+    return io_mod.readRegularFile(alloc, path, last_crash_max_bytes);
+}
+
+/// Writes the last-crash section for a read of the saved report. A report that
+/// cannot be read as a regular file is `unreadable`; one over the cap is
+/// `too_large`; a missing one is `none`.
+fn writeLastCrashRead(r: *Records, read: io_mod.FileRead, now_ms: i64) !void {
+    switch (read) {
+        .bytes => |bytes| try writeLastCrash(r, bytes, now_ms),
+        .missing => try writeLastCrash(r, null, now_ms),
+        .too_large => try writeLastCrashStatus(r, "too_large"),
+        .unreadable => try writeLastCrashStatus(r, "unreadable"),
+    }
+}
+
+/// `contents` is the saved crash report, or null when there is none. Its
+/// first two lines must be the `fx_trace` header and the `fatal_error` record.
+/// Every JSON object line is then embedded as a `last_crash_record`; other
+/// lines are counted as skipped.
+fn writeLastCrash(r: *Records, contents: ?[]const u8, now_ms: i64) !void {
+    const report = contents orelse return writeLastCrashStatus(r, "none");
+    var objects: std.ArrayList(std.json.Value) = .empty;
+    var skipped: usize = 0;
+    var position: usize = 0;
+    var header: ?std.json.Value = null;
+    var fatal: ?std.json.Value = null;
+    var lines = std.mem.splitScalar(u8, report, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        position += 1;
+        const object = try parseObjectLine(r.arena, line);
+        if (position == 1) header = object;
+        if (position == 2) fatal = object;
+        if (object) |value| {
+            try objects.append(r.arena, value);
+        } else {
+            skipped += 1;
+        }
+    }
+    const head = recordOfType(header, "fx_trace") orelse return writeLastCrashStatus(r, "unreadable");
+    const crash = recordOfType(fatal, "fatal_error") orelse return writeLastCrashStatus(r, "unreadable");
+    const crash_at_ms = crashTimeMs(crash);
+    const known_at_ms = knownTime(crash_at_ms);
+    const check = checkCrashReport(crash_at_ms, now_ms);
+    if (check != .current) {
+        // The report stays on disk, but `/trace` shows only its status and time.
+        try r.begin("last_crash");
+        try r.text("status", @tagName(check));
+        if (known_at_ms) |ms| try r.time("at", ms);
+        return r.end();
+    }
+    if (known_at_ms) |ms| r.included_crash = .{ .at_ms = ms };
+    try r.begin("last_crash");
+    try r.text("status", "recorded");
+    try textField(r, "error", crash, "error");
+    try maskedTextField(r, "message", crash, "message");
+    if (known_at_ms) |ms| try r.time("at", ms);
+    try textField(r, "fx_version", head, "fx_version");
+    try textField(r, "git_commit", head, "git_commit");
+    try r.number("records", objects.items.len);
+    try r.number("skipped", skipped);
+    try r.end();
+    for (objects.items) |object| {
+        try r.begin("last_crash_record");
+        try r.parsedValue("record", try shownRecord(r.arena, object));
+        try r.end();
+    }
+}
+
+fn writeLastCrashStatus(r: *Records, status: []const u8) !void {
+    try r.begin("last_crash");
+    try r.text("status", status);
+    try r.end();
+}
+
+/// How old a crash can be and still be shown in `/trace`: 24 hours.
+const crash_report_max_age_ms: i64 = 24 * 60 * 60 * 1000;
+/// How far a crash time may be ahead of the clock, for clock skew: 5 minutes.
+const crash_report_max_skew_ms: i64 = 5 * 60 * 1000;
+
+/// Whether `/trace` shows a saved crash report, and if not, the `status` that
+/// it shows in its place.
+const CrashReportCheck = enum {
+    /// Shown: the crash is at most `crash_report_max_age_ms` old, and at most
+    /// `crash_report_max_skew_ms` ahead of the clock.
+    current,
+    /// The crash was more than `crash_report_max_age_ms` before now.
+    stale,
+    /// The crash time is more than `crash_report_max_skew_ms` after now.
+    future,
+    /// The report has no usable time.
+    undated,
+};
+
+/// The one place that decides which saved crash reports `/trace` shows. Times
+/// outside the years 1970 to 9999 count as no time.
+fn checkCrashReport(crash_at_ms: ?i64, now_ms: i64) CrashReportCheck {
+    const at_ms = knownTime(crash_at_ms) orelse return .undated;
+    if (at_ms > now_ms + crash_report_max_skew_ms) return .future;
+    if (at_ms < now_ms - crash_report_max_age_ms) return .stale;
+    return .current;
+}
+
+/// The time of a saved crash: the `fatal_error` line's `at_ms`. Null when the key
+/// is missing or its value is not a whole number. Both writers set `at` and
+/// `at_ms` together, so a report without `at_ms` has no time.
+fn crashTimeMs(crash: std.json.ObjectMap) ?i64 {
+    const value = crash.get("at_ms") orelse return null;
+    return if (value == .integer) value.integer else null;
+}
+
+/// `ms` when `formatUtc` can write it, or null when it is unknown or outside
+/// the years 1970 to 9999.
+fn knownTime(ms: ?i64) ?i64 {
+    const value = ms orelse return null;
+    if (value <= 0 or value > local_time.max_timestamp_ms) return null;
+    return value;
+}
+
+/// Writes `object[key]` as the text field `name`, with obvious secrets masked.
+fn maskedTextField(r: *Records, name: []const u8, object: std.json.ObjectMap, key: []const u8) !void {
+    if (object.get(key)) |value| if (value == .string) try r.masked(name, value.string);
+}
+
+/// The record as `/trace` shows it. The message of a `fatal_error` record is
+/// masked as the `last_crash` message is. The change is made on a copy, so the
+/// parsed record is not changed.
+fn shownRecord(arena: std.mem.Allocator, object: std.json.Value) !std.json.Value {
+    const crash = recordOfType(object, "fatal_error") orelse return object;
+    const message = crash.get("message") orelse return object;
+    if (message != .string) return object;
+    var copy = try crash.clone(arena);
+    try copy.put(arena, "message", .{ .string = try text_utils.maskSecretsCutShort(arena, message.string) });
+    return .{ .object = copy };
+}
+
+/// The line's JSON object, or null when the line is not one. Running out of
+/// memory is the only error.
+fn parseObjectLine(arena: std.mem.Allocator, line: []const u8) !?std.json.Value {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    return if (value == .object) value else null;
+}
+
+/// The object of `value` when it is a record of `record_type`, else null.
+fn recordOfType(value: ?std.json.Value, record_type: []const u8) ?std.json.ObjectMap {
+    const found = value orelse return null;
+    if (found != .object) return null;
+    const kind = found.object.get("type") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, record_type)) return null;
+    return found.object;
+}
+
+/// Writes `object[key]` as the text field `name` when it is a string.
+fn textField(r: *Records, name: []const u8, object: std.json.ObjectMap, key: []const u8) !void {
+    if (object.get(key)) |value| if (value == .string) try r.text(name, value.string);
 }
 
 /// The always-on compaction decisions and failures, so a shared trace
@@ -2167,7 +2451,12 @@ fn invocationBeforeCommand(arena: std.mem.Allocator, invocation: shell_resolver.
     return out.toOwnedSlice();
 }
 
-noinline fn writeRendererState(r: *Records, app: anytype) !void {
+noinline fn writeRendererState(
+    r: *Records,
+    app: anytype,
+    secrets: *const text_utils.SecretValues,
+    masking: *PieceMasking,
+) !void {
     const shell = &app.shell;
     const commit = shell.transcriptCommitDiagnostic();
     try r.begin("renderer_state");
@@ -2218,8 +2507,14 @@ noinline fn writeRendererState(r: *Records, app: anytype) !void {
         try r.number("cursor_col", grid.cursor_col);
         try r.boolean("cursor_visible", grid.cursor_visible);
         try r.boolean("sync_active", grid.sync_active);
+        // The secrets on screen are whole in the transcript, so their values
+        // mask the pieces that a wrap leaves in a row.
+        if (secrets.overflow) {
+            masking.log(.visible_rows_overflow, "visible rows redacted: more than {d} secret values, so every row is [redacted]", .{text_utils.SecretValues.max_values});
+        }
         try r.beginArray("visible_rows");
         var row: u16 = 1;
+        var budget_spent = false;
         while (row <= grid.rows) : (row += 1) {
             // rowTextTrimmed appends with the grid's own allocator.
             var row_text: std.ArrayList(u8) = .empty;
@@ -2229,13 +2524,37 @@ noinline fn writeRendererState(r: *Records, app: anytype) !void {
             if (trimmed.len == 0) continue;
             try r.beginItem();
             try r.number("row", row);
-            try r.masked("text", trimmed);
+            if (secrets.overflow or budget_spent) {
+                try r.text("text", "[redacted]");
+            } else if (try maskVisibleRow(r.arena, trimmed, secrets.values.items, masking, row)) |masked| {
+                try r.masked("text", masked);
+            } else {
+                budget_spent = true;
+                try r.text("text", "[redacted]");
+            }
             try r.endItem();
         }
         try r.endArray();
         try r.endObject();
     }
     try r.end();
+}
+
+/// Masks the pieces of one visible row with the trace's shared budget. Null when
+/// the budget is spent, so the row, and every row after it, reads `[redacted]`.
+fn maskVisibleRow(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    values: []const []const u8,
+    masking: *PieceMasking,
+    row: u16,
+) !?[]const u8 {
+    const masked = text_utils.maskSecretPieces(arena, text, values, &masking.budget) catch |err| {
+        if (err != error.SecretPieceBudgetSpent) return err;
+        masking.log(.budget_spent, "secret piece compare budget spent at visible row {d}: it and the rows after it read [redacted]", .{row});
+        return null;
+    };
+    return masked;
 }
 
 noinline fn writeRendererEvents(r: *Records) !void {
@@ -2257,19 +2576,93 @@ noinline fn writeRendererEvents(r: *Records) !void {
     }
 }
 
-/// Writes the `transcript` record and a `transcript_entry` per entry that
-/// has text after filtering.
-noinline fn writeTranscript(r: *Records, entries: anytype) !void {
-    const later = try Buffer.create(r.arena);
-    for (entries) |entry| try writeTranscriptEntry(&later.records, entry);
-    try r.begin("transcript");
-    try r.number("entries", entries.len);
-    try r.number("emitted", later.records.count);
-    try r.end();
-    try r.appendBuffer(later);
+/// The `transcript_entry` records of a transcript, built before the
+/// `transcript` record that counts them is written. See `prepareTranscript`.
+const PreparedTranscript = struct { entries: usize, later: *Buffer };
+
+/// What one /trace drops while it masks secret pieces, and the compare budget
+/// that all of its pieces share. A drop is logged once per /trace and reason, at
+/// the first entry or row that hits it, so the log says what was lost without a
+/// line for every row.
+const PieceMasking = struct {
+    /// The bytes that `maskSecretPieces` may still compare across this trace.
+    budget: usize = text_utils.max_piece_compare_bytes,
+    logged: std.EnumSet(Drop) = .empty,
+
+    const Drop = enum { no_line, own_values_overflow, budget_spent, visible_rows_overflow };
+
+    /// Writes `detail` to the trace log the first time `reason` happens.
+    fn log(self: *PieceMasking, reason: Drop, comptime detail: []const u8, args: anytype) void {
+        if (self.logged.contains(reason)) return;
+        self.logged.insert(reason);
+        debug_trace.logf("trace", detail, args);
+    }
+};
+
+/// The command output lines of each entry id, in the order fx shows them. See
+/// `commandLines`.
+const CommandLines = std.array_hash_map.Auto(u32, std.ArrayList([]const u8));
+
+/// The command output lines of the shown and folded blocks, by entry id. A
+/// command output entry holds only the rows fx wrapped its line into, so a
+/// secret that a wrap split is whole only in its line, and masking reads the
+/// lines from here. An entry can show more than one line.
+fn commandLines(arena: std.mem.Allocator, notebook: anytype) !CommandLines {
+    var lines: CommandLines = .empty;
+    for (notebook.command_output_blocks.items) |block| try addCommandLines(arena, &lines, block.lines.items);
+    for (notebook.folded_command_blocks.items) |block| try addCommandLines(arena, &lines, block.lines.items);
+    return lines;
 }
 
-fn writeTranscriptEntry(r: *Records, entry: anytype) !void {
+/// Adds the lines that have an entry id to `lines`.
+fn addCommandLines(arena: std.mem.Allocator, lines: *CommandLines, block_lines: anytype) !void {
+    for (block_lines) |line| {
+        const id = line.entry_id orelse continue;
+        try putCommandLine(arena, lines, id, line.text);
+    }
+}
+
+/// Appends `text` to the lines of entry `id`.
+fn putCommandLine(arena: std.mem.Allocator, lines: *CommandLines, id: u32, text: []const u8) !void {
+    const slot = try lines.getOrPut(arena, id);
+    if (!slot.found_existing) slot.value_ptr.* = .empty;
+    try slot.value_ptr.append(arena, text);
+}
+
+/// Builds the `transcript_entry` records of `entries` into a buffer. Building
+/// them before `renderer_state` is written lets the walk that masks their text
+/// also collect the secret values that the visible rows need.
+noinline fn prepareTranscript(
+    r: *Records,
+    entries: anytype,
+    command_lines: *const CommandLines,
+    secrets: *text_utils.SecretValues,
+    masking: *PieceMasking,
+) !PreparedTranscript {
+    const later = try Buffer.create(r.arena);
+    for (entries) |entry| try writeTranscriptEntry(&later.records, entry, command_lines, secrets, masking);
+    return .{ .entries = entries.len, .later = later };
+}
+
+/// Writes the `transcript` record, then the entries that `prepareTranscript`
+/// built.
+noinline fn writeTranscript(r: *Records, transcript: PreparedTranscript) !void {
+    try r.begin("transcript");
+    try r.number("entries", transcript.entries);
+    try r.number("emitted", transcript.later.records.count);
+    try r.end();
+    try r.appendBuffer(transcript.later);
+}
+
+/// Writes the `transcript_entry` record of `entry`, when its text has any
+/// after filtering. The secret values that its text masks go in `secrets`.
+fn writeTranscriptEntry(
+    r: *Records,
+    entry: anytype,
+    command_lines: *const CommandLines,
+    secrets: *text_utils.SecretValues,
+    masking: *PieceMasking,
+) !void {
     const arena = r.arena;
     const kind: []const u8 = switch (entry) {
         .raw_bytes => "raw",
@@ -2280,7 +2673,29 @@ fn writeTranscriptEntry(r: *Records, entry: anytype) !void {
         .assistant_thematic_rule => "assistant_thematic_rule",
         .semantic_notice => "semantic_notice",
     };
-    const text: []const u8 = switch (entry) {
+    const text = try entryText(arena, entry);
+    if (text.len == 0) return;
+
+    const body = switch (entry) {
+        .assistant_thematic_rule => try thematicRuleText(arena, text),
+        .raw_bytes => |e| if (e.class == .command_output)
+            try commandOutputBody(arena, e.id, text, command_lines, secrets, masking)
+        else
+            try timelineText(arena, text, secrets, null),
+        else => try timelineText(arena, text, secrets, null),
+    };
+    if (body.len == 0) return;
+
+    try r.begin("transcript_entry");
+    try r.time("at", entry.createdAtMs());
+    try r.text("kind", kind);
+    try r.text("text", body);
+    try r.end();
+}
+
+/// The text one transcript entry holds, before it is masked.
+fn entryText(arena: std.mem.Allocator, entry: anytype) ![]const u8 {
+    return switch (entry) {
         .raw_bytes => |e| e.bytes,
         .user_turn => |e| e.turn.text,
         .assistant_turn => |e| e.segments.text.items,
@@ -2312,24 +2727,68 @@ fn writeTranscriptEntry(r: *Records, entry: anytype) !void {
             std.math.maxInt(u16),
         ),
     };
-    if (text.len == 0) return;
-
-    const body = switch (entry) {
-        .assistant_thematic_rule => try thematicRuleText(arena, text),
-        else => try timelineText(arena, text),
-    };
-    if (body.len == 0) return;
-
-    try r.begin("transcript_entry");
-    try r.time("at", entry.createdAtMs());
-    try r.text("kind", kind);
-    try r.text("text", body);
-    try r.end();
 }
 
+/// The body of a command output entry, whose `rows` are the lines fx wrapped
+/// its output line into. The entry's own lines give the values that mask its
+/// rows, because a wrap can split a secret across rows and a line is the one
+/// place it is whole. Those lines also go into `secrets`, since the visible rows
+/// need every value. The entry reads `[redacted]` when fx no longer keeps its
+/// line, when the line holds more than `max_values` distinct secrets, or when
+/// the compare budget runs out while its rows are masked: its rows could hold a
+/// piece that no mask recognizes.
+fn commandOutputBody(
+    arena: std.mem.Allocator,
+    id: u32,
+    rows: []const u8,
+    command_lines: *const CommandLines,
+    secrets: *text_utils.SecretValues,
+    masking: *PieceMasking,
+) ![]const u8 {
+    const lines = command_lines.get(id) orelse {
+        masking.log(.no_line, "command output entry {d} written as [redacted]: no shown or folded block keeps its line", .{id});
+        return "[redacted]";
+    };
+    var own: text_utils.SecretValues = .{};
+    for (lines.items) |line| {
+        // Escape codes go first: a key right after one has a token byte before it, so findSecretSpan would not match it.
+        const stripped = try stripAnsiEscapes(arena, line);
+        try own.collect(arena, stripped);
+        try secrets.collect(arena, stripped);
+    }
+    if (own.overflow) {
+        masking.log(.own_values_overflow, "command output entry {d} written as [redacted]: its line holds more than {d} distinct secret values", .{ id, text_utils.SecretValues.max_values });
+        return "[redacted]";
+    }
+    const body = timelineText(arena, rows, secrets, .{ .values = own.values.items, .masking = masking }) catch |err| {
+        if (err != error.SecretPieceBudgetSpent) return err;
+        masking.log(.budget_spent, "secret piece compare budget spent at command output entry {d}: it and the entries after it read [redacted] where their pieces need comparing", .{id});
+        return "[redacted]";
+    };
+    return body;
+}
+
+/// The values that mask the pieces of a command output entry's rows, and the
+/// budget and drop logs they are charged to.
+const RowPieces = struct {
+    values: []const []const u8,
+    masking: *PieceMasking,
+};
+
 /// The entry's lines without ANSI escapes, blank lines, or banner lines,
-/// with obvious secrets masked, joined by line breaks.
-fn timelineText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+/// with obvious secrets masked, joined by line breaks. The secret values that
+/// are masked are collected in `secrets`. When `pieces` is given, which is only
+/// for the rows of a command output entry, the pieces of its values are masked
+/// first: a wrap splits a secret, so only those rows can hold a piece of one.
+/// The pieces go first so that no `[redacted]` marker is ever split by a piece
+/// match. A piece mask that runs out of budget returns
+/// `error.SecretPieceBudgetSpent`.
+fn timelineText(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    secrets: *text_utils.SecretValues,
+    pieces: ?RowPieces,
+) ![]const u8 {
     const stripped = try stripAnsiEscapes(arena, text);
     var out: std.ArrayList(u8) = .empty;
     var it = std.mem.splitScalar(u8, stripped, '\n');
@@ -2338,7 +2797,11 @@ fn timelineText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
         if (trimmed.len == 0) continue;
         if (isBannerNoiseLine(trimmed)) continue;
         if (out.items.len > 0) try out.append(arena, '\n');
-        try out.appendSlice(arena, try text_utils.maskSecretsCutShort(arena, trimmed));
+        const piece_masked = if (pieces) |p|
+            try text_utils.maskSecretPieces(arena, trimmed, p.values, &p.masking.budget)
+        else
+            trimmed;
+        try out.appendSlice(arena, try text_utils.maskSecretsCutShortCollect(arena, piece_masked, secrets));
     }
     return out.items;
 }
@@ -2381,9 +2844,10 @@ fn stripAnsiEscapes(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
 }
 
 /// Writes the end of the debug trace log at `path`; nothing when it cannot be
-/// read or is empty.
+/// read or is empty. The open refuses a FIFO before any read, so `/trace` never
+/// waits for a writer that is not there.
 fn writeTraceLog(r: *Records, path: []const u8) !void {
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return;
+    var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), path, .follow) catch return;
     defer file.close(io_mod.getIo());
     const stat = file.stat(io_mod.getIo()) catch return;
     const total_size: usize = @intCast(stat.size);
@@ -2476,6 +2940,76 @@ pub fn writeFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
         return path;
     }
     return error.PathAlreadyExists;
+}
+
+/// A saved crash report: its absolute path, which the caller owns and frees with
+/// `app.alloc`, and whether the disk confirmed the save. `synced` is false when
+/// the report is in place but its folder could not be synced, so a power loss
+/// may lose it.
+pub const SavedCrashReport = struct {
+    path: []u8,
+    synced: bool,
+};
+
+/// Saves the crash report to `~/.fx/diagnostics/last-crash.jsonl`. The file holds
+/// the same private data as a `/trace` report, and fx overwrites it on each crash.
+/// A failed write is logged to the debug trace and returned as its error, so the
+/// caller can tell the person.
+pub fn writeCrashReport(app: anytype, err: anyerror) anyerror!SavedCrashReport {
+    return writeCrashReportInner(app, err) catch |write_err| {
+        debug_trace.logf("core", "crash report write failed err={s}", .{@errorName(write_err)});
+        return write_err;
+    };
+}
+
+fn writeCrashReportInner(app: anytype, err: anyerror) !SavedCrashReport {
+    const alloc = app.alloc;
+    const home = io_mod.homeDir() orelse return error.NoHomeDir;
+    const path = try profile_paths.lastCrashReportPath(alloc, home);
+    errdefer alloc.free(path);
+
+    const report = (try buildReport(app, err)).bytes;
+    defer alloc.free(report);
+
+    var home_dir = io_mod.VerifiedDir{
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }),
+    };
+    defer home_dir.close();
+    var fx_dir = try openCrashFolder(&home_dir, profile_paths.rootName(), error.CrashRootUnsafe);
+    defer fx_dir.close();
+    var diagnostics_dir = try openCrashFolder(&fx_dir, profile_paths.diagnostics_dir_name, error.CrashDiagnosticsUnsafe);
+    defer diagnostics_dir.close();
+    const synced = try replaceCrashReport(alloc, &diagnostics_dir, report, .{});
+    return .{ .path = path, .synced = synced };
+}
+
+/// Opens `name` under `parent` as a private folder, as `openOrCreateVerifiedPrivateDir`
+/// does. A link or a non-folder there returns `unsafe`, which names the folder
+/// that failed, so the person is told which path to fix.
+fn openCrashFolder(parent: *io_mod.VerifiedDir, name: []const u8, unsafe: anyerror) !io_mod.VerifiedDir {
+    return io_mod.openOrCreateVerifiedPrivateDir(parent, name) catch |err| {
+        if (err == error.DurablePathUnsafe) return unsafe;
+        return err;
+    };
+}
+
+/// Replaces the saved crash report in `diagnostics_dir` and returns whether the
+/// disk confirmed it. A failure before the rename returns the error that stopped
+/// it, so the person sees its real cause (for example `NoSpaceLeft`), not the
+/// wrapper `DurableReplacePreRenameFailed`. A failure after the rename leaves the
+/// new report in place, so it counts as saved, but not synced. A link or a
+/// non-file at the report's path returns `CrashReportFileUnsafe`.
+fn replaceCrashReport(alloc: std.mem.Allocator, diagnostics_dir: *io_mod.VerifiedDir, report: []const u8, ops: io_mod.DurableOps) !bool {
+    var cause: ?anyerror = null;
+    var with_cause = ops;
+    with_cause.pre_rename_cause = &cause;
+    io_mod.durableReplaceVerifiedWithOps(alloc, diagnostics_dir, profile_paths.last_crash_report_file_name, report, with_cause) catch |err| switch (err) {
+        error.DurableReplacePostRenameFailed => return false,
+        error.DurableReplacePreRenameFailed => return cause orelse err,
+        error.DurablePathUnsafe => return error.CrashReportFileUnsafe,
+        else => return err,
+    };
+    return true;
 }
 
 // Tests read the records back the way a program would: each line on its own,
@@ -2672,6 +3206,404 @@ test "trace header and end records frame the file" {
     try std.testing.expectEqual(@as(i64, 2), try testInt(last, "records"));
 }
 
+test "fatal error record names the error and the words fx shows" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeFatalError(&w.records, error.InvalidTranscriptTransition);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const record = try trace.one("fatal_error");
+    try std.testing.expectEqualStrings("InvalidTranscriptTransition", try testString(record, "error"));
+    try std.testing.expectEqualStrings("invalid transcript transition", try testString(record, "message"));
+    try expectEndsWith(try testString(record, "at"), "Z");
+    try std.testing.expect((try testInt(record, "at_ms")) > 0);
+}
+
+// The crash report that `writeCrashReport` saves: a header, the fatal error,
+// and one record from the session.
+const crash_test_header =
+    \\{"type":"fx_trace","format_version":1,"fx_version":"9.9.9","git_commit":"abc1234","written_at":"2023-11-14T22:13:20.000Z","written_at_ms":1700000000000,"notice":"private"}
+    \\
+;
+const crash_test_fatal =
+    \\{"type":"fatal_error","error":"InvalidTranscriptTransition","message":"invalid transcript transition","at":"2023-11-14T22:13:20.123Z","at_ms":1700000000123}
+    \\
+;
+const crash_test_renderer =
+    \\{"type":"renderer_event","sequence":1,"kind":"commit","detail":"ok"}
+    \\
+;
+
+/// The fixed clock for these tests: one hour after the crash in the fixtures, so
+/// they are current. Tests never read the real clock.
+const crash_test_now_ms: i64 = 1_700_000_000_123 + 60 * 60 * 1000;
+
+test "trace last crash record is none without a crash report" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, null, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("none", try testString(try trace.one("last_crash"), "status"));
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+}
+
+test "trace last crash record embeds the lines of a crash report" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, crash_test_header ++ crash_test_fatal ++ crash_test_renderer, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const record = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("recorded", try testString(record, "status"));
+    try std.testing.expectEqualStrings("InvalidTranscriptTransition", try testString(record, "error"));
+    try std.testing.expectEqualStrings("invalid transcript transition", try testString(record, "message"));
+    try std.testing.expectEqualStrings("2023-11-14T22:13:20.123Z", try testString(record, "at"));
+    try std.testing.expectEqual(@as(i64, 1700000000123), try testInt(record, "at_ms"));
+    try std.testing.expectEqualStrings("9.9.9", try testString(record, "fx_version"));
+    try std.testing.expectEqualStrings("abc1234", try testString(record, "git_commit"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(record, "records"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(record, "skipped"));
+    try std.testing.expectEqual(@as(usize, 3), trace.count("last_crash_record"));
+    const kinds = [_][]const u8{ "fx_trace", "fatal_error", "renderer_event" };
+    for (kinds, 0..) |kind, index| {
+        const embedded = try testObject(try trace.nth("last_crash_record", index), "record");
+        try std.testing.expectEqualStrings(kind, try testString(embedded, "type"));
+    }
+}
+
+test "trace last crash record counts lines that are not JSON objects" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, crash_test_header ++ crash_test_fatal ++ "not json\n" ++ crash_test_renderer, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const record = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("recorded", try testString(record, "status"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(record, "records"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(record, "skipped"));
+    try std.testing.expectEqual(@as(usize, 3), trace.count("last_crash_record"));
+}
+
+test "trace last crash record is unreadable when the first line is not JSON" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, "not json\n" ++ crash_test_fatal ++ crash_test_renderer, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("unreadable", try testString(try trace.one("last_crash"), "status"));
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+}
+
+test "trace last crash record reads back a crash panic record" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var buf: [8192]u8 = undefined;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "panic", "index out of bounds");
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("recorded", try testString(crash, "status"));
+    try std.testing.expectEqualStrings("panic", try testString(crash, "error"));
+    try std.testing.expectEqualStrings("index out of bounds", try testString(crash, "message"));
+    try std.testing.expectEqualStrings("2023-11-14T22:13:20.123Z", try testString(crash, "at"));
+    try std.testing.expectEqual(@as(i64, 1700000000123), try testInt(crash, "at_ms"));
+    try std.testing.expectEqualStrings("9.9.9", try testString(crash, "fx_version"));
+    try std.testing.expectEqualStrings("abc1234", try testString(crash, "git_commit"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(crash, "records"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(crash, "skipped"));
+    try std.testing.expectEqual(@as(usize, 2), trace.count("last_crash_record"));
+}
+
+test "trace last crash record reads a signal record as recorded" {
+    var buf: [8192]u8 = undefined;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "signal", "Segmentation fault at address 0x1234");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("recorded", try testString(crash, "status"));
+    try std.testing.expectEqualStrings("signal", try testString(crash, "error"));
+    try std.testing.expectEqualStrings("Segmentation fault at address 0x1234", try testString(crash, "message"));
+    try std.testing.expectEqual(@as(usize, 2), trace.count("last_crash_record"));
+}
+
+test "trace last crash record masks a secret in the panic message in both places" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var buf: [8192]u8 = undefined;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "panic", "panic with AI_GATEWAY_API_KEY=abcdefghijklmnop inside");
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expect(std.mem.find(u8, try testString(crash, "message"), "abcdefghijklmnop") == null);
+    try std.testing.expect(std.mem.find(u8, try testString(crash, "message"), "[redacted]") != null);
+    const shown = try testObject(try trace.nth("last_crash_record", 1), "record");
+    try std.testing.expect(std.mem.find(u8, try testString(shown, "message"), "abcdefghijklmnop") == null);
+    try std.testing.expect(std.mem.find(u8, try testString(shown, "message"), "[redacted]") != null);
+}
+
+test "trace last crash record names the time of the crash it includes" {
+    var buf: [8192]u8 = undefined;
+    const timed = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "panic", "boom");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, timed, crash_test_now_ms);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_123), w.records.included_crash.?.at_ms);
+
+    const none = try TestWriter.create();
+    defer none.destroy();
+    try writeLastCrash(&none.records, null, crash_test_now_ms);
+    try std.testing.expect(none.records.included_crash == null);
+
+    // A crash saved without a usable time is not shown: its status says so.
+    const untimed = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", -5, "panic", "no clock");
+    const no_time = try TestWriter.create();
+    defer no_time.destroy();
+    try writeLastCrash(&no_time.records, untimed, crash_test_now_ms);
+    try std.testing.expect(no_time.records.included_crash == null);
+}
+
+test "trace last crash read refuses a FIFO and reads a regular file" {
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fifo = try std.Io.Dir.path.join(a, &.{ dir, "fifo-crash.jsonl" });
+    const fifo_z = try a.allocSentinel(u8, fifo.len, 0);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+    const blocked = try TestWriter.create();
+    defer blocked.destroy();
+    try writeLastCrashRead(&blocked.records, readLastCrashReportAt(a, fifo), crash_test_now_ms);
+    var blocked_trace = try blocked.trace();
+    defer blocked_trace.deinit();
+    try std.testing.expectEqualStrings("unreadable", try testString(try blocked_trace.one("last_crash"), "status"));
+
+    var buf: [8192]u8 = undefined;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", 1_700_000_000_123, "panic", "boom");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "normal-crash.jsonl", .data = record });
+    const normal = try std.Io.Dir.path.join(a, &.{ dir, "normal-crash.jsonl" });
+    const recorded = try TestWriter.create();
+    defer recorded.destroy();
+    try writeLastCrashRead(&recorded.records, readLastCrashReportAt(a, normal), crash_test_now_ms);
+    var recorded_trace = try recorded.trace();
+    defer recorded_trace.deinit();
+    try std.testing.expectEqualStrings("recorded", try testString(try recorded_trace.one("last_crash"), "status"));
+}
+
+fn failTempSyncWithNoSpace(_: ?*anyopaque, _: std.Io.File) anyerror!void {
+    return error.NoSpaceLeft;
+}
+
+test "trace crash save returns the cause of a failure before the rename" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+    try std.testing.expectError(
+        error.NoSpaceLeft,
+        replaceCrashReport(std.testing.allocator, &dir, "report\n", .{ .sync_file = failTempSyncWithNoSpace }),
+    );
+}
+
+fn failDirSyncAfterRename(_: ?*anyopaque, _: std.Io.Dir) anyerror!void {
+    return error.InjectedSyncFailure;
+}
+
+test "trace crash save counts a report the disk did not sync as saved" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+    const synced = try replaceCrashReport(std.testing.allocator, &dir, "report\n", .{ .sync_dir = failDirSyncAfterRename });
+    try std.testing.expect(!synced);
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "last-crash.jsonl", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("report\n", bytes);
+}
+
+test "trace crash save names the fx folder when it is a link" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "elsewhere");
+    try tmp.dir.symLink(std.testing.io, "elsewhere", ".fx", .{});
+    var parent = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer parent.close();
+    try std.testing.expectError(error.CrashRootUnsafe, openCrashFolder(&parent, ".fx", error.CrashRootUnsafe));
+}
+
+test "trace crash save names the report file when it is a link" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(std.testing.io, "missing", "last-crash.jsonl", .{});
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+    try std.testing.expectError(
+        error.CrashReportFileUnsafe,
+        replaceCrashReport(std.testing.allocator, &dir, "report\n", .{}),
+    );
+}
+
+test "trace time to the minute reads as a UTC clock time" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("2026-11-18 01:42 UTC", try formatUtcMinute(&buf, 1_794_966_120_000));
+    try std.testing.expectEqualStrings("2023-11-14 22:13 UTC", try formatUtcMinute(&buf, 1_700_000_000_123));
+}
+
+test "trace last crash record shows a crash one hour old" {
+    var buf: [8192]u8 = undefined;
+    const crash_at = crash_test_now_ms - 60 * 60 * 1000;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "panic", "boom");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("recorded", try testString(crash, "status"));
+    try std.testing.expectEqual(@as(usize, 2), trace.count("last_crash_record"));
+    try std.testing.expectEqual(crash_at, w.records.included_crash.?.at_ms);
+}
+
+test "trace last crash record leaves out a crash 25 hours old and its records" {
+    var buf: [8192]u8 = undefined;
+    const crash_at = crash_test_now_ms - 25 * 60 * 60 * 1000;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "panic", "boom");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("stale", try testString(crash, "status"));
+    try std.testing.expectEqual(crash_at, try testInt(crash, "at_ms"));
+    try expectAbsent(crash, "error");
+    try expectAbsent(crash, "message");
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+    try std.testing.expect(w.records.included_crash == null);
+}
+
+test "trace last crash record names an undated crash as undated" {
+    var buf: [8192]u8 = undefined;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", -5, "panic", "no clock");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("undated", try testString(crash, "status"));
+    try expectAbsent(crash, "at");
+    try expectAbsent(crash, "message");
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+    try std.testing.expect(w.records.included_crash == null);
+}
+
+test "trace last crash record leaves out a crash ten minutes in the future" {
+    var buf: [8192]u8 = undefined;
+    const crash_at = crash_test_now_ms + 10 * 60 * 1000;
+    const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", crash_at, "panic", "boom");
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, record, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("future", try testString(crash, "status"));
+    try std.testing.expectEqual(crash_at, try testInt(crash, "at_ms"));
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+    try std.testing.expect(w.records.included_crash == null);
+}
+
+test "trace last crash record window is 24 hours back and 5 minutes ahead" {
+    const cases = [_]struct { at_ms: i64, status: []const u8 }{
+        .{ .at_ms = crash_test_now_ms - 24 * 60 * 60 * 1000, .status = "recorded" },
+        .{ .at_ms = crash_test_now_ms - 24 * 60 * 60 * 1000 - 1, .status = "stale" },
+        .{ .at_ms = crash_test_now_ms + 5 * 60 * 1000, .status = "recorded" },
+        .{ .at_ms = crash_test_now_ms + 5 * 60 * 1000 + 1, .status = "future" },
+    };
+    for (cases) |case| {
+        var buf: [8192]u8 = undefined;
+        const record = crash_panic.formatRecord(&buf, "9.9.9", "abc1234", case.at_ms, "panic", "boom");
+        const w = try TestWriter.create();
+        defer w.destroy();
+        try writeLastCrash(&w.records, record, crash_test_now_ms);
+        var trace = try w.trace();
+        defer trace.deinit();
+        try std.testing.expectEqualStrings(case.status, try testString(try trace.one("last_crash"), "status"));
+    }
+}
+
+test "trace last crash record is undated when the crash line has no at_ms" {
+    const fatal = "{\"type\":\"fatal_error\",\"error\":\"panic\",\"message\":\"boom\"}\n";
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrash(&w.records, crash_test_header ++ fatal, crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("undated", try testString(try trace.one("last_crash"), "status"));
+    try std.testing.expect(w.records.included_crash == null);
+}
+
+test "trace last crash read reports a file over the cap as too_large" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const big = try std.testing.allocator.alloc(u8, last_crash_max_bytes + 1);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big-crash.jsonl", .data = big });
+    const path = try std.Io.Dir.path.join(a, &.{ dir, "big-crash.jsonl" });
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrashRead(&w.records, readLastCrashReportAt(a, path), crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("too_large", try testString(try trace.one("last_crash"), "status"));
+    try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+}
+
+test "trace log read refuses a FIFO at its path and writes no trace log" {
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fifo = try std.Io.Dir.path.join(a, &.{ dir, "trace.log" });
+    const fifo_z = try a.allocSentinel(u8, fifo.len, 0);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeTraceLog(&w.records, fifo);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, 0), trace.count("trace_log"));
+}
+
 test "trace times leave out unknown values" {
     const w = try TestWriter.create();
     defer w.destroy();
@@ -2723,6 +3655,32 @@ test "trace process memory reads ps output and keeps other shapes as lines" {
     try std.testing.expectEqual(@as(usize, 2), lines.len);
     try std.testing.expectEqualStrings("UID PID", lines[0].string);
     try expectAbsent(process, "memory");
+}
+
+test "trace crash report marks process memory as unavailable instead of running ps" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try w.records.begin("current_state");
+    try writeProcess(&w.records, true);
+    try w.records.end();
+    var trace = try w.trace();
+    defer trace.deinit();
+    const process = try testObject(try trace.one("current_state"), "process");
+    const memory = try testObject(process, "memory");
+    try std.testing.expectEqualStrings("unavailable", try testString(memory, "status"));
+    try expectAbsent(memory, "pid");
+}
+
+test "trace process memory still runs ps outside a crash report" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try w.records.begin("current_state");
+    try writeProcess(&w.records, false);
+    try w.records.end();
+    var trace = try w.trace();
+    defer trace.deinit();
+    const process = try testObject(try trace.one("current_state"), "process");
+    if (process.get("memory")) |memory| try std.testing.expect(memory != .string);
 }
 
 test "trace renderer events are available without opt-in file logging" {
@@ -2795,7 +3753,10 @@ test "trace transcript keeps semantic table, code block, and thematic rule conte
 
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeTranscript(&w.records, entries.items);
+    var command_lines: CommandLines = .empty;
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, entries.items, &command_lines, &secrets, &masking));
     var trace = try w.trace();
     defer trace.deinit();
     const summary = try trace.one("transcript");
@@ -2821,7 +3782,10 @@ test "trace transcript strips escapes, drops banner lines, masks secrets, and co
     };
     const w = try TestWriter.create();
     defer w.destroy();
-    try writeTranscript(&w.records, &entries);
+    var command_lines: CommandLines = .empty;
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
     var trace = try w.trace();
     defer trace.deinit();
     const summary = try trace.one("transcript");
@@ -2831,6 +3795,300 @@ test "trace transcript strips escapes, drops banner lines, masks secrets, and co
     try std.testing.expectEqualStrings("raw", try testString(entry, "kind"));
     try std.testing.expectEqualStrings("2023-11-14T22:13:20.000Z", try testString(entry, "at"));
     try std.testing.expectEqualStrings("bold line\nexport AI_GATEWAY_API_KEY=[redacted]", try testString(entry, "text"));
+}
+
+test "trace command output entry keeps its rows and masks the pieces of a wrapped secret" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const token = "ghp_" ++ text_utils.repeat("A", 40);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena_state.allocator(), &command_lines, 5, token);
+    // The entry holds only the rows that fx wrapped the line into.
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 5,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10) ++ " done",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    const entry = try trace.one("transcript_entry");
+    try std.testing.expectEqualStrings("│ [redacted]\n│ [redacted] done", try testString(entry, "text"));
+    try std.testing.expectEqual(@as(usize, 1), secrets.values.items.len);
+    try std.testing.expectEqualStrings(token, secrets.values.items[0]);
+}
+
+test "trace command output entry with rows and no kept line is written as redacted" {
+    var command_lines: CommandLines = .empty;
+    // The rows may hold a piece of a secret, and no block keeps the whole line.
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 6,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10),
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("[redacted]", try testString(try trace.one("transcript_entry"), "text"));
+}
+
+test "trace command output entry with empty bytes writes no record and collects nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const token = "ghp_" ++ text_utils.repeat("A", 40);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena_state.allocator(), &command_lines, 10, token);
+    // fx shows nothing for this entry, so its line is not output and not read.
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 10,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, 0), trace.count("transcript_entry"));
+    try std.testing.expectEqual(@as(usize, 0), secrets.values.items.len);
+}
+
+/// `count` lines, each a fake `ghp_` token with its own digits, to fill a secret
+/// set past a limit.
+fn fakeTokenLines(arena: std.mem.Allocator, count: usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (0..count) |index| {
+        try out.appendSlice(arena, try arena.print("ghp_{s}{d:0>4}\n", .{ text_utils.repeat("A", 32), index }));
+    }
+    return out.items;
+}
+
+test "trace command output entry keeps masking its rows when the shared secret values overflow" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var secrets: text_utils.SecretValues = .{};
+    // Fill the shared set to its limit, so this entry's token overflows it. Only
+    // the entry's own overflow redacts it: its own line still masks its rows.
+    try secrets.collect(arena, try fakeTokenLines(arena, text_utils.SecretValues.max_values));
+    const token = "ghp_" ++ text_utils.repeat("A", 40);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena, &command_lines, 11, token);
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 11,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10) ++ " done",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("│ [redacted]\n│ [redacted] done", try testString(try trace.one("transcript_entry"), "text"));
+    try std.testing.expect(secrets.overflow);
+    try std.testing.expect(!masking.logged.contains(.own_values_overflow));
+}
+
+test "trace command output entry is written as redacted when its own line holds too many secrets" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena, &command_lines, 14, try fakeTokenLines(arena, text_utils.SecretValues.max_values + 1));
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 14,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10) ++ " done",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("[redacted]", try testString(try trace.one("transcript_entry"), "text"));
+    try std.testing.expect(masking.logged.contains(.own_values_overflow));
+}
+
+test "trace command output entry is written as redacted once the piece compare budget is spent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token = "ghp_" ++ text_utils.repeat("A", 40);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena, &command_lines, 15, token);
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 15,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10) ++ " done",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    // A budget of one byte cannot pay for the first row's comparisons.
+    var masking: PieceMasking = .{ .budget = 1 };
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("[redacted]", try testString(try trace.one("transcript_entry"), "text"));
+    try std.testing.expectEqual(@as(usize, 0), masking.budget);
+    try std.testing.expect(masking.logged.contains(.budget_spent));
+}
+
+test "trace command output entry masks its rows with the values of every line it shows" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token = "ghp_" ++ text_utils.repeat("A", 40);
+    const key = "sk-" ++ text_utils.repeat("B", 30);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena, &command_lines, 16, token);
+    try putCommandLine(arena, &command_lines, 16, key);
+    // The token's rows come from its line, the key's from the second line.
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 16,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ ghp_" ++ text_utils.repeat("A", 30) ++ "\n│ " ++ text_utils.repeat("A", 10) ++ " │\n│ " ++ text_utils.repeat("B", 25) ++ " │",
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings(
+        "│ [redacted]\n│ [redacted] │\n│ [redacted] │",
+        try testString(try trace.one("transcript_entry"), "text"),
+    );
+    try std.testing.expectEqual(@as(usize, 2), secrets.values.items.len);
+}
+
+test "trace raw entry of another class keeps its own bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var command_lines: CommandLines = .empty;
+    // A line with the same id must not replace the bytes of an entry of another class.
+    try putCommandLine(arena_state.allocator(), &command_lines, 8, "other line");
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 8,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "plain status line",
+        .class = .tool_status,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings("plain status line", try testString(try trace.one("transcript_entry"), "text"));
+}
+
+test "trace command lines keep every line of an entry in order and skip lines without one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // A fake notebook: `commandLines` takes any value with these fields.
+    const Line = struct { text: []const u8, entry_id: ?u32 };
+    const Block = struct { lines: struct { items: []const Line } };
+    const Blocks = struct { items: []const Block };
+    const Notebook = struct { command_output_blocks: Blocks, folded_command_blocks: Blocks };
+    const shown = [_]Line{
+        .{ .text = "first", .entry_id = 7 },
+        .{ .text = "no entry", .entry_id = null },
+        .{ .text = "second", .entry_id = 7 },
+    };
+    const folded = [_]Line{.{ .text = "folded", .entry_id = 9 }};
+    const shown_blocks = [_]Block{.{ .lines = .{ .items = &shown } }};
+    const folded_blocks = [_]Block{.{ .lines = .{ .items = &folded } }};
+    const notebook: Notebook = .{
+        .command_output_blocks = .{ .items = &shown_blocks },
+        .folded_command_blocks = .{ .items = &folded_blocks },
+    };
+    const lines = try commandLines(arena_state.allocator(), notebook);
+    try std.testing.expectEqual(@as(usize, 2), lines.count());
+    const shown_lines = lines.get(7).?.items;
+    try std.testing.expectEqual(@as(usize, 2), shown_lines.len);
+    try std.testing.expectEqualStrings("first", shown_lines[0]);
+    try std.testing.expectEqualStrings("second", shown_lines[1]);
+    try std.testing.expectEqualStrings("folded", lines.get(9).?.items[0]);
+}
+
+test "trace command output rows mask a secret whose line has escape codes around it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const value = "Bearer " ++ text_utils.repeat("B", 30);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena_state.allocator(), &command_lines, 13, "\x1b[1m" ++ value ++ "\x1b[0m");
+    // The rows hold the wrapped pieces of the value: its first word, then its tail.
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 13,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ Bearer\n│ " ++ text_utils.repeat("B", 30),
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    // `Bearer` is a public prefix, so its row keeps it; the token's row is masked.
+    try std.testing.expectEqualStrings("│ Bearer\n│ [redacted]", try testString(try trace.one("transcript_entry"), "text"));
+    try std.testing.expectEqual(@as(usize, 2), secrets.values.items.len);
+    try std.testing.expectEqualStrings(value, secrets.values.items[0]);
+    try std.testing.expectEqualStrings(text_utils.repeat("B", 30), secrets.values.items[1]);
+}
+
+test "trace command output rows keep every redaction marker whole when a value starts like one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // The value is collected from the whole line, as an assignment.
+    const value = "ed" ++ text_utils.repeat("C", 30);
+    var command_lines: CommandLines = .empty;
+    try putCommandLine(arena_state.allocator(), &command_lines, 12, "API_KEY=" ++ value);
+    var entries = [_]TestTranscriptEntry{.{ .raw_bytes = .{
+        .id = 12,
+        .created_at_ms = 1_700_000_000_000,
+        .bytes = "│ x ghp_" ++ text_utils.repeat("A", 40) ++ " ed" ++ "CCCC\n│ ghp_" ++ text_utils.repeat("A", 40),
+        .class = .command_output,
+    } }};
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, &entries, &command_lines, &secrets, &masking));
+    var trace = try w.trace();
+    defer trace.deinit();
+    const text = try testString(try trace.one("transcript_entry"), "text");
+    try std.testing.expect(std.mem.find(u8, text, "[redact[") == null);
+    try std.testing.expectEqualStrings("│ x [redacted] [redacted]\n│ [redacted]", text);
+}
+
+// A narrow table cell shows only the column minimum of a token per row, so the piece rule must reach that size.
+test "trace cell piece length reaches the narrowest table column" {
+    try std.testing.expect(text_utils.min_secret_cell_piece_bytes <= transcript_blocks.table_min_column_width);
 }
 
 test "trace compaction records events without file tracing" {
@@ -5607,7 +6865,10 @@ test "trace stays well formed with every ring full and a long transcript" {
     try writeModelCatalog(&w.records, &struct {}{});
     try writeToolCalls(&w.records, &.{}, null);
     try writeRendererEvents(&w.records);
-    try writeTranscript(&w.records, entries);
+    var command_lines: CommandLines = .empty;
+    var secrets: text_utils.SecretValues = .{};
+    var masking: PieceMasking = .{};
+    try writeTranscript(&w.records, try prepareTranscript(&w.records, entries, &command_lines, &secrets, &masking));
     try writeEnd(&w.records);
 
     var trace = try w.trace();

@@ -7,8 +7,8 @@
 //! work still counts as running, so a test can send a message in that gap
 //! every time (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a message right
 //! after a stop starts the subagent's next turn";
-//! `tests/tla/drivers/subagent/stop-message.test.ts`). Only those tests set
-//! the controls, so the libfx artifacts leave them out.
+//! `tests/tla/drivers/subagent/stop-message.test.ts`). Only tests set the
+//! controls, so the libfx artifacts leave them out.
 //!
 //! Every hold reads two paths from the environment and uses them only when
 //! both are absolute (`holdFiles`): the file calls take no other kind, and a
@@ -24,13 +24,23 @@
 //! (`tests/e2e/gateway-stream-lifecycle.test.ts` and
 //! `tests/e2e/tui-host-switch.test.ts`, "a wait that starts as a subagent's
 //! work ends with nothing to report still returns").
+//!
+//! A third hold sits in the host, after the end of a user's turn has cleared
+//! the child's busy flag and before the end settles the child's close
+//! (`holdBeforeCloseSettle`). Test builds only: no file control sets it.
+//!
+//! A fourth hold sits in the host, after it has finished a turn that ended
+//! before its work opened, with the lock released, and before it settles the
+//! child again (`holdInSettle`). Test builds only: no file control sets it.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
+const hold_marker = @import("../shared/hold_marker.zig");
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
-const max_hold_ms = 60_000;
+/// The longest any hold waits for its release file. Every seam in this folder
+/// reads it from here.
+pub const max_hold_ms = 60_000;
 
 var holds = std.atomic.Value(u32).init(0);
 
@@ -107,6 +117,59 @@ pub fn holdAfterRun(child_id: []const u8, recorded: bool) void {
     }
 }
 
+/// Test builds only: an inline test sets it to hold the host in a parent's stop
+/// or close of a child, after the owner stopped the child's turn and before the
+/// host reads what the stop dropped, so the slot's end can run first. No file
+/// control sets it.
+pub var test_hold_stop: if (builtin.is_test) ?*const fn (child_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+/// Called by the host for `child_id` in a parent's stop or close, once the
+/// owner stopped the turn.
+pub fn holdInStop(child_id: []const u8) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_hold_stop) |hold| hold(child_id);
+    }
+}
+
+/// Test builds only: an inline test sets it to hold the end of a user's turn
+/// after the child's busy flag is clear and before the end settles the child's
+/// close, so the test can land a close from another thread there. No file
+/// control sets it.
+pub var test_hold_close_settle: if (builtin.is_test) ?*const fn (child_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+/// Called by the host for `child_id` once the end of a user's turn has cleared
+/// the child's busy flag, before the end settles the child's close.
+pub fn holdBeforeCloseSettle(child_id: []const u8) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_hold_close_settle) |hold| hold(child_id);
+    }
+}
+
+/// Test builds only: an inline test sets it to hold the host after it has
+/// finished a turn that ended before its work opened, with the lock released
+/// and before it settles the child again, so a close or a turn can land in
+/// that gap. No file control sets it.
+pub var test_in_settle_hold: if (builtin.is_test) ?*const fn (child_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+/// Whether an inline test holds the host after a turn's end, before it settles
+/// the child again.
+pub fn inSettleArmed() bool {
+    if (comptime build_options.libfx) return false;
+    if (builtin.is_test) return test_in_settle_hold != null;
+    return false;
+}
+
+/// Called by the host for `child_id` once it has finished a turn that ended
+/// before its work opened, before it settles the child again.
+pub fn holdInSettle(child_id: []const u8) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_in_settle_hold) |hold| hold(child_id);
+    }
+}
+
 /// The two paths of a hold's file controls.
 pub const HoldFiles = struct { held: []const u8, release: []const u8 };
 
@@ -117,10 +180,10 @@ pub fn holdFiles(held_var: []const u8, release_var: []const u8) ?HoldFiles {
 }
 
 fn usableHoldFiles(held: ?[]const u8, release: ?[]const u8) ?HoldFiles {
-    const held_path = held orelse return null;
-    const release_path = release orelse return null;
-    if (!std.Io.Dir.path.isAbsolute(held_path) or !std.Io.Dir.path.isAbsolute(release_path)) return null;
-    return .{ .held = held_path, .release = release_path };
+    return .{
+        .held = io_mod.absolutePath(held) orelse return null,
+        .release = io_mod.absolutePath(release) orelse return null,
+    };
 }
 
 /// Writes `<held>.<n>` with the text `fmt` makes, for the n-th hold counted
@@ -134,24 +197,16 @@ fn holdOnFiles(counter: *std.atomic.Value(u32), files: HoldFiles, comptime fmt: 
     const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ files.release, n }) catch return;
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, fmt, args) catch return;
-    writeMarker(marker, contents) catch return;
+    hold_marker.write(marker, contents) catch return;
     const deadline = io_mod.milliTimestamp() + max_hold_ms;
     while (!pathExists(files.release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);
     }
 }
 
-fn writeMarker(path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
-        .truncate = true,
-        .permissions = private_file_permissions,
-    });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), contents);
-    try file.sync(io_mod.getIo());
-}
-
-fn pathExists(path: []const u8) bool {
+/// Whether a hold's release file exists. Every seam in this folder checks it
+/// here.
+pub fn pathExists(path: []const u8) bool {
     std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
     return true;
 }
@@ -170,6 +225,12 @@ test "a test build holds the host before it settles an ended work only through i
     try std.testing.expectEqual(@as(u32, 0), settle_holds.load(.seq_cst));
 }
 
+test "a test build holds the host after a turn ends and before it settles the child again only through its hook" {
+    // Without a hook the host's call returns at once.
+    try std.testing.expect(!inSettleArmed());
+    holdInSettle("child");
+}
+
 test "a hold is armed only when both of its paths are absolute" {
     const files = usableHoldFiles("/tmp/held", "/tmp/release").?;
     try std.testing.expectEqualStrings("/tmp/held", files.held);
@@ -180,4 +241,16 @@ test "a hold is armed only when both of its paths are absolute" {
     try std.testing.expect(usableHoldFiles("/tmp/held", "release") == null);
     try std.testing.expect(usableHoldFiles("./held", "../release") == null);
     try std.testing.expect(usableHoldFiles("", "") == null);
+}
+
+test "a test build holds a parent's stop only through its hook" {
+    // Without a hook the host's call returns at once.
+    try std.testing.expect(test_hold_stop == null);
+    holdInStop("child");
+}
+
+test "a test build holds the end of a user's turn before it settles a close only through its hook" {
+    // Without a hook the host's call returns at once.
+    try std.testing.expect(test_hold_close_settle == null);
+    holdBeforeCloseSettle("child");
 }

@@ -19,10 +19,10 @@
 (*                                                                         *)
 (* Tool results arrive between records, in TOrder, as hidden RunTool      *)
 (* steps, each with the stamp the turn gave it: a result that arrives      *)
-(* without one is not a behavior of a real run. A compaction is a hidden   *)
-(* Compact step, allowed only before a decision whose stream did not stand. *)
-(* A real run injects no fault and does not recover, so Change, Drop and    *)
-(* Recover never occur.                                                    *)
+(* without one is not a behavior of a real run. A compaction changes       *)
+(* nothing the log saves of the turn (D87), so it is no step here. A real  *)
+(* run injects no fault and does not recover, so Change, Drop and Recover  *)
+(* never occur.                                                            *)
 (*                                                                         *)
 (* NotAllMatched is a sentinel: TLC reports it violated (exit 12) only     *)
 (* after every observation matched a step of the model. A search that ends *)
@@ -49,21 +49,13 @@ ASSUME Len(Observed) >= 1
 
 TraceInit == Init /\ k = 0
 
-(* The next result the run got arrives before the decision that counts it, *)
-(* or before one that a compaction shifted.                                *)
+(* The next result the run got arrives before the decision that counts it. *)
 Arrive(o) ==
   /\ o.phase \in {"stream", "commit"}
-  /\ Len(done) - cut < o.results \/ ~o.stood
+  /\ Len(done) < o.results
   /\ Len(done) < o.arrived
   /\ Len(done) < Len(TOrder)
   /\ RunTool(TOrder[Len(done) + 1], TRUE)
-  /\ UNCHANGED k
-
-(* A compaction before a decision whose stream no longer stood. *)
-Cut(o) ==
-  /\ o.phase \in {"stream", "commit"}
-  /\ ~o.stood
-  /\ \E n \in 1..Len(TOrder) : Compact(n)
   /\ UNCHANGED k
 
 (* The observation is bound before the step, so only the state is primed. *)
@@ -82,7 +74,7 @@ Check(o) ==
 
 TraceNext ==
   /\ k < Len(Observed)
-  /\ \E o \in {Observed[k + 1]} : Arrive(o) \/ Cut(o) \/ Follow(o) \/ Check(o)
+  /\ \E o \in {Observed[k + 1]} : Arrive(o) \/ Follow(o) \/ Check(o)
 
 TraceSpec == TraceInit /\ [][TraceNext]_traceVars
 

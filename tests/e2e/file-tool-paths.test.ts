@@ -1877,6 +1877,62 @@ describe("filesystem path handling", () => {
     TIMEOUT,
   );
 
+  test(
+    "read_file of a file that a shell call created in the same step runs",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([
+        sse([
+          {
+            type: "tool-call",
+            toolCallId: "make_file_1",
+            toolName: "shell",
+            input: { action: "run", command: "printf made-content > made.txt" },
+          },
+          {
+            type: "tool-call",
+            toolCallId: "read_made_1",
+            toolName: "read_file",
+            input: { path: "made.txt" },
+          },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          },
+        ]),
+        finalText("read after write handled"),
+      ]);
+      try {
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Create made.txt, then read it."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, root.home),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const json = parseFxJson(result);
+
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.remainingResponseCount()).toBe(0);
+        expect(readFileSync(join(root.workspace, "made.txt"), "utf8")).toBe(
+          "made-content",
+        );
+        const readOutput = toolResultOutput(gateway.requests[1].body, "read_made_1");
+        expect(readOutput).toContain("made-content");
+        expect(readOutput).not.toContain("Not executed");
+        expect(json.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
+          { name: "shell", status: "success" },
+          { name: "read_file", status: "success" },
+        ]);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   liveTest(
     "live Gateway uses shell for removed filesystem operations",
     async () => {

@@ -51,14 +51,12 @@ pub const model_picker_speed_options = [_][]const u8{ "normal", "fast", "ultrafa
 /// The composer text that opens the effort column for the current model.
 pub const effort_prefix = "/effort ";
 
-/// `/login` and `/setup` are aliases of `/provider`: all open the same
-/// columnar picker. Typed text keeps whichever spelling the user wrote;
-/// executing the bare command reseeds the composer with the canonical
-/// `/provider ` prefix.
+/// `/login` is an alias of `/provider`: both open the same columnar picker.
+/// Typed text keeps whichever spelling the user wrote; executing the bare
+/// command reseeds the composer with the canonical `/provider ` prefix.
 pub const provider_prefix = "/provider ";
 pub const login_prefix = "/login ";
-const setup_prefix = "/setup ";
-pub const provider_picker_prefixes = [_][]const u8{ provider_prefix, login_prefix, setup_prefix };
+pub const provider_picker_prefixes = [_][]const u8{ provider_prefix, login_prefix };
 
 /// The command a model picker query belongs to. `/effort ` opens the effort
 /// column of `/model` on its own, for the current model.

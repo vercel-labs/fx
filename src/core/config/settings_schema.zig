@@ -201,7 +201,7 @@ test "the settings.json schema lists every key fx reads there and nothing else" 
     const status_line = properties.get("status_line").?.object;
     try std.testing.expectEqualStrings("boolean", status_line.get("properties").?.object.get("context").?.object.get("type").?.string);
     try std.testing.expect(!status_line.contains("deprecated"));
-    try std.testing.expect(properties.get("statusLine").?.object.get("deprecated").?.bool);
+    try std.testing.expect(properties.get("statusLine") == null);
     try std.testing.expect(properties.get("model").?.object.get("deprecated").?.bool);
     try std.testing.expect(properties.get("skill_match_fuzzy").?.object.contains("not"));
 }

@@ -80,5 +80,6 @@ test "Codex reviewer builds a direct Responses request with gpt-5.6-luna" {
     try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.6-luna\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":\"required\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"input\":[{\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"Review the pending action.\"}]},") != null);
     try std.testing.expect(std.mem.find(u8, body, "ai-gateway") == null);
 }

@@ -66,8 +66,12 @@ function send(message) {
 // array of { bad, then, slowMs, progressEveryMs }. `bad` first writes a line fx refuses and cannot
 // attach to a call: "utf8_last" (bytes that are not UTF-8, the id after them), "deep_last" (JSON
 // nested past the engine's limit, the id last), "garbage" (a line with no JSON, as a notification
-// the server mangled would be), "cut" (a reply cut in the middle) or "duplicate_escaped" (the id first,
-// then `result` twice, the second time written `r\u0065sult`, which JSON reads as the same name). `then` is "silent" (nothing
+// the server mangled would be), "cut_no_id" (a reply cut in the middle, with no id), "duplicate_id" (the
+// id twice, which names no call) or, with the id first, so that fx can still tell which call the line
+// answers and ends it at once: "utf8_first" (bytes that are not UTF-8 after it), "deep_first" (JSON nested
+// past the engine's limit after it), "cut" (the reply cut in the middle after it), "duplicate_escaped"
+// (`result` twice, the second time written `r\u0065sult`, which JSON reads as the same name) or "other_id"
+// (the id of a call that is not in flight, then bytes that are not UTF-8). `then` is "silent" (nothing
 // more), "exit" (the server exits), or by default the valid reply, `slowMs` later, with progress
 // for the call's own token every `progressEveryMs` until then.
 const refused = JSON.parse(process.env.FX_MCP_REFUSED ?? "{}");
@@ -87,12 +91,22 @@ function refusedLine(id, bad) {
       ];
     case "deep_last":
       return [`{"jsonrpc":"2.0","result":{"content":[],"structuredContent":${'{"a":'.repeat(3000)}1${"}".repeat(3000)}},"id":${id}}\n`];
+    case "utf8_first":
+      return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"text","text":"x`, Buffer.from([0xff, 0xfe]), '"}]}}\n'];
+    case "deep_first":
+      return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[],"structuredContent":${'{"a":'.repeat(3000)}1${"}".repeat(3000)}}}\n`];
+    case "duplicate_id":
+      return [`{"jsonrpc":"2.0","id":${id},"id":${id},"result":{"content":[]}}\n`];
+    case "other_id":
+      return [`{"jsonrpc":"2.0","id":${id + 1000},"result":{"content":[{"type":"text","text":"x`, Buffer.from([0xff, 0xfe]), '"}]}}\n'];
     case "garbage":
       return [`${"x".repeat(80)}\n`];
     case "duplicate_escaped":
       return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[]},"r\\u0065sult":{"content":[]}}\n`];
     case "cut":
       return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"te\n`];
+    case "cut_no_id":
+      return [`{"jsonrpc":"2.0","result":{"content":[{"type":"te\n`];
     default:
       return [];
   }
@@ -500,17 +514,56 @@ function handle(message) {
       // A server built on the Go MCP SDK refuses arguments of the wrong type
       // with -32602, in its validator's words, then the tool's schema, as
       // Datadog's server does.
-      send({
+      // A server may explain a refusal in the error's data: FX_MCP_PROTOCOL_ERROR_DATA is
+      // its JSON, FX_MCP_PROTOCOL_ERROR_DATA_BYTES is a data member of about that size,
+      // and FX_MCP_PROTOCOL_ERROR_CODE is the code. FX_MCP_PROTOCOL_ERROR_FAULT breaks the
+      // reply: "pieces" writes it in small chunks, and "cut" stops in the middle of it.
+      const dataBytes = process.env.FX_MCP_PROTOCOL_ERROR_DATA_BYTES;
+      const dataText = process.env.FX_MCP_PROTOCOL_ERROR_DATA;
+      const reply = {
         jsonrpc: "2.0",
         id: message.id,
         error: {
-          code: -32602,
-          message: 'validating "arguments": validating root: validating /properties/limit: ' +
-            'type: "40" has type "string", want "number"\n\n' +
-            'Full input schema for tool "echo":\n' +
-            '{"type":"object","properties":{"limit":{"type":"number"}}}',
+          code: Number(process.env.FX_MCP_PROTOCOL_ERROR_CODE ?? -32602),
+          // FX_MCP_PROTOCOL_ERROR_MESSAGE replaces the whole message.
+          message: process.env.FX_MCP_PROTOCOL_ERROR_MESSAGE ??
+            ('validating "arguments": validating root: validating /properties/limit: ' +
+              'type: "40" has type "string", want "number"\n\n' +
+              'Full input schema for tool "echo":\n' +
+              '{"type":"object","properties":{"limit":{"type":"number"}}}'),
+          ...(dataBytes
+            ? { data: { detail: "d".repeat(Number(dataBytes)) } }
+            : dataText
+            ? { data: JSON.parse(dataText) }
+            : {}),
         },
-      });
+      };
+      const fault = process.env.FX_MCP_PROTOCOL_ERROR_FAULT;
+      // FX_MCP_PROTOCOL_ERROR_DATA_RAW is the data's text, written as it is, spaces and all.
+      const rawData = process.env.FX_MCP_PROTOCOL_ERROR_DATA_RAW;
+      if (rawData !== undefined) {
+        reply.error.data = "@@RAW@@";
+        process.stdout.write(JSON.stringify(reply).replace('"@@RAW@@"', () => rawData) + "\n");
+        return;
+      }
+      if (!fault) {
+        send(reply);
+        return;
+      }
+      const line = JSON.stringify(reply);
+      if (fault === "cut") {
+        process.stdout.write(line.slice(0, Math.floor(line.length / 2)), () => process.exit(0));
+      } else {
+        // "pieces": 1,000 bytes at a time, with a breath between them.
+        let sent = 0;
+        const next = () => {
+          if (sent >= line.length) return process.stdout.write("\n");
+          process.stdout.write(line.slice(sent, sent + 1000));
+          sent += 1000;
+          setTimeout(next, 1);
+        };
+        next();
+      }
       return;
     }
     if (mode === "draft7_schema" && draft7Pattern && !new RegExp(draft7Pattern, "u").test(message.params?.arguments?.text)) {
@@ -615,7 +668,7 @@ process.stdin.on("data", (chunk) => {
 
 // FX_MCP_DEEP_SITE nests JSON at one place, for the depth limit on a server's JSON. FX_MCP_DEEP_DEPTH is the
 // nesting depth of the root value fx checks (the result for the result sites, the tool object for the tool
-// sites), FX_MCP_DEEP_SHAPE is object (the default), array or mixed. Sites: structured, content_meta,
+// sites), FX_MCP_DEEP_ID_LAST (any value) writes a result's id after the result, FX_MCP_DEEP_SHAPE is object (the default), array or mixed. Sites: structured, content_meta,
 // content_annotations, error_data, tool_meta, tool_annotations, tool_icons.
 function deepSite() {
   return process.env.FX_MCP_DEEP_SITE ?? "";
@@ -689,5 +742,7 @@ function sendDeepResult(message) {
     result.content[0].annotations = { x: "@@DEEP@@" };
     inner = depth - 4;
   }
-  sendDeepText({ jsonrpc: "2.0", id: message.id, result }, { "@@DEEP@@": deepValue(inner, site === "structured" || site === "content_meta") });
+  // FX_MCP_DEEP_ID_LAST writes the id after the result, so a line fx cannot read names no call.
+  const reply = process.env.FX_MCP_DEEP_ID_LAST ? { jsonrpc: "2.0", result, id: message.id } : { jsonrpc: "2.0", id: message.id, result };
+  sendDeepText(reply, { "@@DEEP@@": deepValue(inner, site === "structured" || site === "content_meta") });
 }

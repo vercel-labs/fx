@@ -315,8 +315,13 @@ class Walk {
   async scan() {
     const listed = (await this.profile.live()).sessions.map((entry: any): Listed => {
       if (entry.state !== "working" && entry.state !== "idle") throw new Error(`state ${entry.state} for ${entry.id}`);
+      const slot = this.slotOf(entry.id);
+      // A scan runs between steps, so the process holding a listed session is always in `holders`.
+      const holder = [...this.holders.values()].find((candidate) => candidate.slot === slot);
+      if (!holder) throw new Error(`fx listed ${entry.id} at ${slot}, but no process holds ${slot}`);
+      if (entry.pid !== holder.process.child.pid) throw new Error(`fx listed pid ${entry.pid} for ${slot}, but ${holder.tag} runs as pid ${holder.process.child.pid}`);
       return {
-        id: this.slotOf(entry.id),
+        id: slot,
         working: entry.state === "working",
         agents: entry.agents.map((agent: any) => ({ name: agent.name, st: agent.state })),
       };

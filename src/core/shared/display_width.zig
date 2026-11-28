@@ -329,11 +329,22 @@ pub noinline fn decodeNextRune(text: []const u8, index: usize) DecodedRune {
     return .{ .len = len, .codepoint = codepoint };
 }
 
+/// The index right after the escape sequence that starts at `index`: a CSI
+/// sequence through its final byte, an OSC string through its BEL or ST, an
+/// escape with intermediate bytes, such as ESC ( B, through its final byte or
+/// up to a byte that can end no escape, and any other escape through the byte
+/// after it. A sequence the text cuts off runs to the end of the text.
 pub noinline fn ansiSequenceEnd(text: []const u8, index: usize) usize {
     if (index >= text.len or text[index] != 0x1b) return index;
     if (index + 1 >= text.len) return text.len;
 
     const kind = text[index + 1];
+    if (isEscapeIntermediate(kind)) {
+        var i = index + 2;
+        while (i < text.len and isEscapeIntermediate(text[i])) : (i += 1) {}
+        if (i < text.len and isEscapeFinal(text[i])) return i + 1;
+        return i;
+    }
     if (kind == '[') {
         var i = index + 2;
         while (i < text.len) : (i += 1) {
@@ -353,6 +364,16 @@ pub noinline fn ansiSequenceEnd(text: []const u8, index: usize) usize {
     }
 
     return @min(index + 2, text.len);
+}
+
+/// An escape sequence is ESC, then any intermediate bytes, then one final
+/// byte (ECMA-35), as in ESC ( B.
+pub fn isEscapeIntermediate(byte: u8) bool {
+    return byte >= 0x20 and byte <= 0x2f;
+}
+
+pub fn isEscapeFinal(byte: u8) bool {
+    return byte >= 0x30 and byte <= 0x7e;
 }
 
 pub noinline fn previousRuneStart(text: []const u8, end: usize) usize {
@@ -651,6 +672,28 @@ test "ansiSequenceEnd preserves current CSI OSC and ESC boundaries" {
 
     const bare_escape = "\x1b";
     try std.testing.expectEqual(bare_escape.len, ansiSequenceEnd(bare_escape, 0));
+}
+
+test "ansiSequenceEnd skips an escape with intermediate bytes through its final byte" {
+    // `tput sgr0` writes ESC ( B before ESC [ m.
+    try std.testing.expectEqual(@as(usize, 3), ansiSequenceEnd("\x1b(B\x1b[m", 0));
+    try std.testing.expectEqual(@as(usize, 3), ansiSequenceEnd("\x1b)0", 0));
+    try std.testing.expectEqual(@as(usize, 3), ansiSequenceEnd("\x1b#8", 0));
+    try std.testing.expectEqual(@as(usize, 3), ansiSequenceEnd("\x1b%G", 0));
+    try std.testing.expectEqual(@as(usize, 3), ansiSequenceEnd("\x1b F", 0));
+    try std.testing.expectEqual(@as(usize, 4), ansiSequenceEnd("\x1b$(B", 0));
+
+    // One the text cuts off runs to its end.
+    try std.testing.expectEqual(@as(usize, 2), ansiSequenceEnd("\x1b(", 0));
+    try std.testing.expectEqual(@as(usize, 3), ansiSequenceEnd("\x1b$(", 0));
+
+    // A byte that ends no escape is not part of it.
+    try std.testing.expectEqual(@as(usize, 2), ansiSequenceEnd("\x1b(\nB", 0));
+    try std.testing.expectEqual(@as(usize, 2), ansiSequenceEnd("\x1b(\x1b[m", 0));
+
+    try std.testing.expectEqual(@as(usize, 12), visibleWidthIgnoringAnsi("\x1b%G\x1b)0\x1b#8Build failed\x1b(B\x1b[m"));
+    try std.testing.expectEqual(@as(usize, 14), visibleWidthIgnoringAnsi("\x1b]8;;file:///x\x07Problems found\x1b]8;;\x07"));
+    try std.testing.expectEqual(@as(usize, 14), visibleWidthIgnoringAnsi("\x1b]8;;file:///x\x1b\\Problems found\x1b]8;;\x1b\\"));
 }
 
 test "previousRuneStart preserves byte-boundary behavior" {

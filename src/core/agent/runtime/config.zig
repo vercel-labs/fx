@@ -56,6 +56,10 @@ pub const Config = struct {
     /// waits for one closes without a new login, so the request tries the
     /// saved login once more.
     recovery_sign_in_closed_flag: ?*std.atomic.Value(bool) = null,
+    /// Set by a host that restarts between steps, which only the TUI does
+    /// for an upgrade (Ctrl+G): the turn stops at its next step boundary
+    /// after its first model request (`src/core/quiesce/`).
+    yield_flag: ?*const std.atomic.Value(bool) = null,
     review_enabled: bool = false,
     fast_mode: bool = false,
     ultrafast_mode: bool = false,

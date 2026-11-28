@@ -372,6 +372,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
 
             if (!already_cancelled and agent.stream.active) {
+                try app.shell.freezeAssistantTail(app.alloc, "cancel_approval");
                 app_worker_runtime.Runtime(App).clearPacer(app, agent, "cancel_approval");
                 app.stopStream(agent);
             }
