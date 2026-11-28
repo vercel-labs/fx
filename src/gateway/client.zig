@@ -259,6 +259,8 @@ var test_cancel_watcher_spawn_error: ?anyerror = null;
 var test_cancel_watcher_poll_ms: ?i64 = null;
 var test_cancel_watcher_waiting: ?*std.Io.Event = null;
 var test_open_poll_ms: ?i64 = null;
+/// Waits `waitForOpen` began while its open still ran.
+var test_open_waits_while_running: std.atomic.Value(u32) = .init(0);
 
 pub const StreamResult = struct {
     status: std.http.Status,
@@ -1570,6 +1572,7 @@ const OpenJob = struct {
                 null;
             const stopped = stop_reason orelse switch (self.handoff.poll()) {
                 .wait => {
+                    if (builtin.is_test and !self.finished.isSet()) _ = test_open_waits_while_running.fetchAdd(1, .monotonic);
                     // Once `run` set the event, this wait returns at once until
                     // publish lands: a short spin.
                     self.finished.waitTimeout(zio, .{ .duration = .{ .raw = .fromMilliseconds(openPollMs()), .clock = .awake } }) catch |err| switch (err) {
@@ -12869,6 +12872,7 @@ test "waitForOpen returns when the open finishes, not at the next poll" {
     const zio = io_mod.getIo();
     test_open_poll_ms = 60_000;
     defer test_open_poll_ms = null;
+    test_open_waits_while_running.store(0, .monotonic);
     var fixture: PooledOpenFixture = undefined;
     try fixture.init();
     defer fixture.deinit();
@@ -12878,7 +12882,8 @@ test "waitForOpen returns when the open finishes, not at the next poll" {
     const Release = struct {
         fn run(lookup: *StuckLookupOpen) void {
             lookup.waitEntered();
-            // Lets the waiter start its 60 s poll first, so code that waits for the next poll fails; any order passes on this code.
+            // Holds the open 50 ms. A loop that sleeps the old fixed 2 ms wakes about
+            // 25 times in it; a wait the finished open wakes begins once.
             io_mod.sleep(50 * std.time.ns_per_ms);
             lookup.release.store(true, .seq_cst);
         }
@@ -12892,7 +12897,10 @@ test "waitForOpen returns when the open finishes, not at the next poll" {
     var opened = try openGatewayRequestBounded(pool, try std.Uri.parse(fixture.url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
     defer opened.deinit();
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+    // Fails a wait that sleeps out the whole 60 s poll.
     try std.testing.expect(elapsed_ms < 5_000);
+    // Fails the old loop, which slept a fixed 2 ms and never read the poll hook.
+    try std.testing.expect(test_open_waits_while_running.load(.monotonic) <= 3);
     try waitForOpenJobs(pool);
 }
 

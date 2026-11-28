@@ -368,6 +368,7 @@ pub const CapabilityResolver = struct {
                     .failure = .{ .category = .transport },
                 } });
             }
+            if (builtin.is_test) _ = test_load_waits_while_running.fetchAdd(1, .monotonic);
             waitLoadPoll(load);
         }
         self.pending_load = null;
@@ -501,6 +502,8 @@ pub const catalog_connect_wait_ms: i64 = 2_000;
 /// wait while a load runs.
 const load_poll_ns = 2 * std.time.ns_per_ms;
 var test_load_poll_ns: ?u64 = null;
+/// Waits `CapabilityResolver.loadWithin` began while its load still ran.
+var test_load_waits_while_running: std.atomic.Value(u32) = .init(0);
 
 fn loadPollNs() u64 {
     if (builtin.is_test) {
@@ -1174,16 +1177,22 @@ test "loadWithin returns when the catalog load finishes, not at the next poll" {
     const zio = io_mod.getIo();
     test_load_poll_ns = 60 * std.time.ns_per_s;
     defer test_load_poll_ns = null;
+    test_load_waits_while_running.store(0, .monotonic);
     var gated: GatedCatalog = .{ .connects = true };
     var resolver: CapabilityResolver = .{};
     defer resolver.deinit(alloc);
 
+    // Holds the load 50 ms. A loop that sleeps the old fixed 2 ms wakes about 25
+    // times in it; a wait the finished load wakes begins once.
     const releaser = try gated.releaseAfter(50);
     defer releaser.join();
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
     const capabilities = try resolver.resolveWithin(alloc, gated.provider(), .{ .endpoint = "/v1/models" }, "provider/model", .{}, 60_000);
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+    // Fails a wait that sleeps out the whole 60 s poll.
     try std.testing.expect(elapsed_ms < 5_000);
+    // Fails the old loop, which slept a fixed 2 ms and never read the poll hook.
+    try std.testing.expect(test_load_waits_while_running.load(.monotonic) <= 3);
     try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
     try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
 }
