@@ -731,6 +731,7 @@ function parseAskJson(stdout: string): {
   recovery?: {
     state: string;
     attempt: number;
+    cause?: string;
     need?: string;
     message?: string;
   };
@@ -14507,6 +14508,196 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("fx ask --json stops retrying 503 responses once the retry budget passes", async () => {
+    const root = createFixtureRoot("ask-retry-budget-503");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => unavailableResponse("1"));
+    const started = Date.now();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Stop retrying after the budget."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+          timeoutMs: 8_000,
+        },
+      );
+      const elapsedMs = Date.now() - started;
+
+      expect(result.timedOut).toBe(false);
+      expect(result.code).toBe(1);
+      expect(elapsedMs).toBeLessThan(6_000);
+      const json = parseAskJson(result.stdout);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(json.recovery).toEqual({
+        state: "failed",
+        attempt: 2,
+        cause: "server",
+      });
+      expect(result.stderr).toContain("fx ask: API request failed · HTTP 503 · provider temporarily unavailable");
+      expect(gateway.requestCount()).toBe(2);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("fx ask --json stops retrying provider_error events once the retry budget passes", async () => {
+    const root = createFixtureRoot("ask-retry-budget-provider-error");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => providerErrorResponse("always broken provider"));
+    const started = Date.now();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Stop retrying provider errors after the budget."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+          timeoutMs: 8_000,
+        },
+      );
+      const elapsedMs = Date.now() - started;
+
+      expect(result.timedOut).toBe(false);
+      expect(result.code).toBe(1);
+      expect(elapsedMs).toBeLessThan(6_000);
+      const json = parseAskJson(result.stdout);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBe("ModelError");
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.cause).toBe("server");
+      expect(json.recovery?.attempt).toBe(2);
+      expect(result.stderr).toContain("[notice] ⚠ Provider unavailable · provider_error: always broken provider · stopped after 2 attempts");
+      expect(gateway.requestCount()).toBe(2);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("fx ask --json exits when its own 503 retry budget expires even with a subagent running", async () => {
+    const root = createFixtureRoot("ask-retry-budget-503-with-subagent");
+    const tracePath = join(root.root, "trace.log");
+    let sawParentStartCall = false;
+    let sawChildRequest = false;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"') && body.includes("Keep working while the gateway fails.")) {
+        sawChildRequest = true;
+      }
+      if (!sawParentStartCall && body.includes('"name":"subagent"') && !hasCurrentToolResult(body, "start_worker")) {
+        sawParentStartCall = true;
+        return fakeGatewayToolCall("start_worker", "subagent", {
+          request: {
+            action: "message",
+            agent: "worker",
+            message: "Keep working while the gateway fails.",
+          },
+        });
+      }
+      return unavailableResponse("1");
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const started = Date.now();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Start a subagent and stop if retries run out."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+          timeoutMs: 60_000,
+        },
+      );
+      const elapsedMs = Date.now() - started;
+
+      expect(result.timedOut).toBe(false);
+      expect(elapsedMs).toBeLessThan(15_000);
+      expect(sawChildRequest).toBe(true);
+      expect(result.code).toBe(1);
+      const json = parseAskJson(result.stdout);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.cause).toBe("server");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  test("fx ask --json still waits for its subagent when a retried turn fails for a non-budget reason", async () => {
+    const root = createFixtureRoot("ask-retry-then-non-budget-fail-waits-subagent");
+    const tracePath = join(root.root, "trace.log");
+    let sawParentStartCall = false;
+    let parentFailures = 0;
+    let sawParentReportTurn = false;
+    let releaseChild: () => void = () => {};
+    const childHeld = new Promise<void>((resolve) => { releaseChild = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"') && body.includes("CHILD_AFTER_PARENT_ERROR")) {
+        await childHeld;
+        return fakeGatewayFinalText("CHILD_FINISHES_TASK");
+      }
+      if (body.includes("CHILD_FINISHES_TASK")) {
+        sawParentReportTurn = true;
+        return fakeGatewayFinalText("MAIN_AFTER_CHILD_REPORT");
+      }
+      if (!sawParentStartCall && body.includes('"name":"subagent"') && !hasCurrentToolResult(body, "start_worker")) {
+        sawParentStartCall = true;
+        return fakeGatewayToolCall("start_worker", "subagent", {
+          request: {
+            action: "message",
+            agent: "worker",
+            message: "CHILD_AFTER_PARENT_ERROR",
+          },
+        });
+      }
+      parentFailures += 1;
+      if (parentFailures === 1) return unavailableResponse("0");
+      return new Response(JSON.stringify({ error: { message: "bad request after retry" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const released = (async () => {
+      if (await waitUntil(() => mainTurnsEnded(tracePath) >= 1, 20_000)) releaseChild();
+    })();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Start a subagent, retry once, then fail with 400."],
+        {
+          cwd: root.workspace,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "worker" },
+          timeoutMs: 30_000,
+        },
+      );
+      await released;
+
+      expect(result.timedOut).toBe(false);
+      expect(sawParentReportTurn).toBe(true);
+      const json = parseAskJson(result.stdout);
+      expect(json.final_output).toBe("MAIN_AFTER_CHILD_REPORT");
+    } finally {
+      releaseChild();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test("a retried model request leaves its recovery timeline in the session log", async () => {
     const root = createFixtureRoot("recovery-timeline");

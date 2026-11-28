@@ -65,6 +65,7 @@ const auto_classifier_context = @import("../permissions/auto_classifier_context.
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
+const recovery_policy = @import("../recovery/recovery.zig");
 const session_runtime = @import("../session/session.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -779,6 +780,7 @@ const AskContext = struct {
     /// kind or attempt changes, not on every one-second refresh.
     last_recovery_notice_kind: ?types.RouteRecoveryStatus.Kind = null,
     last_recovery_notice_attempt: usize = 0,
+    retry_budget_exhausted: bool = false,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -2128,6 +2130,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .max_tool_result_bytes = startup.max_tool_result_bytes,
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
+        .recovery_retry_budget_ms = recovery_policy.retryBudgetFromValue(io_mod.getenv("FX_TEST_RECOVERY_RETRY_BUDGET_MS")),
+        .recovery_retry_budget_exhausted = &ctx.retry_budget_exhausted,
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,
         .effort = ctx.effort,
@@ -2156,7 +2160,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job, false)) |early| return early;
     // The ask ends once its whole tree is quiet: mail that waits when a turn
     // ends runs as the ask's next turn, as one wakes an idle main.
+    // When fx ask's own turn ended because its retry budget ran out, stop
+    // waiting and let `ctx.deinit()` cancel and join any running subagents.
     while (ctx.subagent_host) |tree| {
+        if (ctx.retry_budget_exhausted) {
+            tree.closeTree();
+            break;
+        }
         switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag(), true)) {
             .quiet, .stopped => break,
             .mail => {},
@@ -2228,6 +2238,7 @@ fn runAskTurn(
     // (`tests/tla/subagent/MainMail.tla` JoinsOpenTurn).
     const processing = marked or (ctx.subagent_host != null and ctx.worker.beginDirectProcessing(job.turn_id));
     defer if (processing) ctx.worker.finishProcessing();
+    ctx.retry_budget_exhausted = false;
     const processed = options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job);
     // The next turn starts the agent's usage over, so this one's is taken
     // now, whether the turn ended well or not.
