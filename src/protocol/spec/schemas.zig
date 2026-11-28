@@ -135,6 +135,7 @@ test "ACP's method lists are version 1 and the unstable list includes every stab
         const stable_list = try requireField(stable.value, acp_meta.path, list);
         const unstable_list = try requireField(unstable.value, acp_meta_unstable.path, list);
         try std.testing.expect(stable_list == .object);
+        try std.testing.expect(unstable_list == .object);
         for (stable_list.object.values()) |method| {
             try std.testing.expect(method == .string);
             if (!hasStringValue(unstable_list, method.string)) {
