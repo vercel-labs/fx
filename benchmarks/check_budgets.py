@@ -6,7 +6,8 @@ binary in alternating rounds on one runner, so a slow host slows both. A command
 fails when its PR mean is more than MAX_REGRESSION above the base mean, or when
 its PR mean is above RAW_GUARD_SECONDS. The raw guard bounds slow creep across
 many changes: each change may not slow fx by the margin, and fx may not drift
-past the guard in total.
+past the guard in total. The median and min of each side are printed for
+comparison only; the mean decides.
 """
 
 import glob
@@ -56,6 +57,29 @@ def mean(samples):
     return sum(samples) / len(samples)
 
 
+def median(samples):
+    ordered = sorted(samples)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def summarize(samples):
+    return {"mean": mean(samples), "median": median(samples), "min": min(samples)}
+
+
+def print_statistic(name, statistic, pr_value, base_value):
+    if base_value <= 0:
+        change = "n/a"
+    else:
+        change = f"{pr_value / base_value - 1:+.1%}"
+    print(
+        f"  INFO  {name:<25} {statistic:<6}  pr={pr_value * 1000:>5.2f}ms  "
+        f"base={base_value * 1000:>5.2f}ms  change={change}  (not compared)"
+    )
+
+
 def print_baseline(pr, base):
     if PROCESS_BASELINE not in pr or PROCESS_BASELINE not in base:
         return
@@ -90,6 +114,10 @@ def check_command(name, pr_times, base_times, guard):
         f"change={pr_mean / base_mean - 1:+.1%}  "
         f"(margin {MAX_REGRESSION:.0%}, raw guard {guard * 1000:.0f}ms){suffix}"
     )
+    pr_stats = summarize(pr_times)
+    base_stats = summarize(base_times)
+    for statistic in ("median", "min"):
+        print_statistic(name, statistic, pr_stats[statistic], base_stats[statistic])
     return reason is None
 
 

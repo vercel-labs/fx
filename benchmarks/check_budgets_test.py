@@ -25,6 +25,10 @@ BASELINE = "process baseline"
 RUN_TIMES_PER_ROUND = 20
 
 
+def command_file_name(command):
+    return command.replace(" ", "_").replace("/", "_")
+
+
 def write_side(rounds_dir, side, command, round_means_ms):
     side_dir = rounds_dir / side
     side_dir.mkdir(parents=True, exist_ok=True)
@@ -39,18 +43,39 @@ def write_side(rounds_dir, side, command, round_means_ms):
             "stddev": 0.0,
             "times": [mean_s] * RUN_TIMES_PER_ROUND,
         }
-        name = command.replace(" ", "_").replace("/", "_")
-        (side_dir / f"{name}.{index}.json").write_text(json.dumps({"results": [result]}))
+        (side_dir / f"{command_file_name(command)}.{index}.json").write_text(
+            json.dumps({"results": [result]})
+        )
+
+
+def write_raw_side(rounds_dir, side, command, rounds_ms):
+    """Write one round file per list of run times, in milliseconds."""
+    side_dir = rounds_dir / side
+    side_dir.mkdir(parents=True, exist_ok=True)
+    for index, times_ms in enumerate(rounds_ms):
+        times = [value / 1000.0 for value in times_ms]
+        result = {
+            "command": command,
+            "mean": sum(times) / len(times),
+            "times": times,
+        }
+        (side_dir / f"{command_file_name(command)}.{index}.json").write_text(
+            json.dumps({"results": [result]})
+        )
 
 
 class BudgetComparisonTests(unittest.TestCase):
-    def run_checker(self, pr, base=None, raw_pr_files=None):
+    def run_checker(self, pr=None, base=None, raw_pr_files=None, pr_raw=None, base_raw=None):
         with tempfile.TemporaryDirectory() as tmp:
             rounds_dir = pathlib.Path(tmp) / "rounds"
-            for command, round_means_ms in pr.items():
+            for command, round_means_ms in (pr or {}).items():
                 write_side(rounds_dir, "pr", command, round_means_ms)
             for command, round_means_ms in (base or {}).items():
                 write_side(rounds_dir, "base", command, round_means_ms)
+            for command, rounds_ms in (pr_raw or {}).items():
+                write_raw_side(rounds_dir, "pr", command, rounds_ms)
+            for command, rounds_ms in (base_raw or {}).items():
+                write_raw_side(rounds_dir, "base", command, rounds_ms)
             for name, text in (raw_pr_files or {}).items():
                 side_dir = rounds_dir / "pr"
                 side_dir.mkdir(parents=True, exist_ok=True)
@@ -189,6 +214,21 @@ class BudgetComparisonTests(unittest.TestCase):
         self.assertTrue(passed)
         self.assertIn("not evaluated on Darwin", output.getvalue())
 
+    def test_outlier_fails_the_mean_rule_but_not_the_median(self) -> None:
+        # Nine runs at 1 ms and one at 10 ms: the mean is 1.9 ms, the median 1 ms.
+        result = self.run_checker(
+            pr_raw={SESSIONS: [[1.0] * 9 + [10.0]]},
+            base_raw={SESSIONS: [[1.0] * 10]},
+        )
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("FAIL  fx sessions --json", result.stdout)
+        median_line = next(
+            line
+            for line in result.stdout.splitlines()
+            if "median" in line and SESSIONS in line
+        )
+        self.assertIn("change=+0.0%", median_line)
+
     def test_margin_is_twenty_percent(self) -> None:
         self.assertEqual(0.20, check_budgets.MAX_REGRESSION)
 
@@ -199,6 +239,31 @@ class BudgetComparisonTests(unittest.TestCase):
         self.assertIsNone(
             check_budgets.command_budget("Darwin", SESSIONS),
         )
+
+
+class StatisticsTests(unittest.TestCase):
+    def test_median_of_odd_count_is_the_middle_value(self) -> None:
+        self.assertEqual(3.0, check_budgets.median([5.0, 1.0, 3.0, 4.0, 2.0]))
+
+    def test_median_of_even_count_averages_the_middle_pair(self) -> None:
+        self.assertEqual(2.5, check_budgets.median([4.0, 1.0, 3.0, 2.0]))
+
+    def test_outlier_moves_the_mean_but_not_the_median_or_min(self) -> None:
+        stats = check_budgets.summarize([1.0, 1.0, 1.0, 1.0, 10.0])
+        self.assertAlmostEqual(2.8, stats["mean"])
+        self.assertEqual(1.0, stats["median"])
+        self.assertEqual(1.0, stats["min"])
+
+    def test_pooled_median_is_taken_over_every_run(self) -> None:
+        # Pooling gives [1, 1, 1, 10, 10, 10, 10, 10]: median 10 ms, min 1 ms.
+        # The mean of the two round medians would be 5.5 ms, so this tells them apart.
+        with tempfile.TemporaryDirectory() as tmp:
+            rounds_dir = pathlib.Path(tmp)
+            write_raw_side(rounds_dir, "pr", SESSIONS, [[1.0, 1.0, 1.0], [10.0] * 5])
+            pooled = check_budgets.load_pooled(str(rounds_dir / "pr"))
+        stats = check_budgets.summarize(pooled[SESSIONS])
+        self.assertAlmostEqual(0.010, stats["median"])
+        self.assertAlmostEqual(0.001, stats["min"])
 
 
 if __name__ == "__main__":
