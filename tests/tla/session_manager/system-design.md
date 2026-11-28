@@ -240,7 +240,7 @@ inside fx's `usage` value; the index and `fx sessions` do not list them
 | `last_compaction_seq`, `compaction_offset` | newest `compacted` and its byte offset; fx's `data` may keep a tail of earlier lines, which the adapter reads back to |
 | `clean_exit` | the last line is `closed` |
 | `last_seq` | last good line |
-| `created_ms`, `updated_ms` | `ts` of line 1 and of the newest line; 0 before the first turn (D20) |
+| `created_ms`, `updated_ms` | `ts` of line 1 and of the newest activity line, a turn's start or end or an item; 0 before the first turn (D20, D104) |
 
 A snapshot carries this state without the identity fields and the two
 times: the session reads both from the log it opens and updates them on
@@ -272,7 +272,7 @@ Thirteen operations:
 open(.new{workspace, role, parent, host, id})   -> Session   no disk I/O until the first turn; `id` for a child only (D34)
 open(.resume{target, workspace, parent, host, lock_wait_ms})
                                                 -> Session   Busy, NotFound, ChildSession, Corrupt, UnsupportedVersion
-     target: id | .last (newest updated, any host) | .last_opened{host} (newest opened by that host)
+     target: id | .last (newest updated, any host) | .last_opened{host} (newest activity while that host had it open, D104)
      lock_wait_ms: this open's wait for the writer lock; unset uses the manager's (D38)
 open(.fork{source, at_turn, workspace, host})   -> Session   new id at a turn boundary; NotFound, InvalidForkPoint
 open(.import{id, workspace, role, parent, created_ts})
@@ -793,6 +793,7 @@ Settled in the 2026-09-27 pre-wiring API check:
   removed), and a converted
   session keeps its original times in the list rather than the conversion
   time. **Alternative:** the adapter looks the session up in `list`.
+  `updated_ms` now counts only activity lines (D104).
 - **D21 Decision:** a host may end a turn with `reason: failed` as well as
   `cancel`. **Why:** fx ends turns both ways
   (`src/core/shared/types.zig` lines 2243 to 2246), and recording a failure
@@ -2290,6 +2291,34 @@ cached prompt prefix):
   **Alternative:** keep the menu only in memory, which every resume, `fx ask
   --resume` and ACP `session/load` rebuild; or derive what a change note told
   from its text, which the note does not hold in full.
+
+- **D104 Decision:** a session's `updated_ms` is the `ts` of its newest
+  activity line: `turn_started`, an `item`, `turn_committed`, or a
+  `turn_interrupted` whose reason is not `crash`. `closed`, snapshots,
+  settings, child repairs, and the crash repair and `set workspace` a
+  resume writes are not activity, so opening a session and leaving it
+  without a turn changes neither its age in `fx -r`, `/resume`,
+  `fx sessions` and ACP `session/list`, nor its place in them. A close
+  that interrupts a running turn counts, since the turn ran until then.
+  - **Write:** the session moves `updated_ms` only for a batch that holds
+    an activity line, and every index write gives the host using the
+    session that time as its `opened` entry. `-c` (`.last_opened`) then
+    picks the session the host last worked in, not the one it last opened.
+  - **Read:** a resume, `peek`, and a rebuild find the newest activity line
+    in the same backward scan that finds the newest snapshot; when only
+    lines such as `closed` follow the snapshot, the scan goes on past it to
+    the last turn. A session with no turn, such as a fork at turn 0, uses
+    its `created_ms`.
+  - **Formats:** the log, the snapshot, and the index keep their fields.
+    An index entry an older fx wrote keeps its time until the session's
+    next index write or a rebuild, and `opened` entries only grow, so an
+    older open time stays until the host works in another session.
+
+  **Why:** the newest line of any kind made a session that was only opened
+  and closed read `now` and jump to the top of the list.
+  **Alternative:** fold the activity time into the state and its snapshots,
+  which adds a snapshot field, an older-snapshot path in verify, and a
+  change to `ResumeSnapshot.tla`, for a time one backward scan finds.
 
 ## Design Risks And Failure Behavior
 

@@ -226,8 +226,8 @@ pub const Session = struct {
     /// `ts` of line 1: set by an import, else by the first publish or fork,
     /// or read back on resume.
     created_ms: ?u64 = null,
-    /// `ts` of the newest line, never before `created_ms`; 0 until the
-    /// first write (D20). Under `mutex`.
+    /// `ts` of the newest activity line (`isActivity`), never before
+    /// `created_ms`; 0 until the first write (D20, D104). Under `mutex`.
     updated_ms: u64 = 0,
 
     // Scratch and held lines, under `mutex`.
@@ -321,9 +321,16 @@ pub const Session = struct {
         return copy;
     }
 
-    /// Lines stamped `ts` reached the log.
+    /// Activity lines stamped `ts` reached the log.
     fn wrote(session: *Session, ts: u64) void {
         session.updated_ms = @max(ts, session.created_ms orelse 0);
+    }
+
+    /// `wrote`, when `bodies` hold an activity line.
+    fn wroteBodies(session: *Session, bodies: []const schema.Body, ts: u64) void {
+        for (bodies) |body| {
+            if (isActivity(body)) return session.wrote(ts);
+        }
     }
 
     /// Appends a batch and returns the seq of its last line. The batch is
@@ -464,7 +471,7 @@ pub const Session = struct {
                 .body = body,
             });
         }
-        session.wrote(ts);
+        session.wroteBodies(bodies, ts);
     }
 
     /// Import only (D59): writes every held line through the staged publish
@@ -485,7 +492,8 @@ pub const Session = struct {
         session.phase = .{ .live = live };
         session.written_seq.store(io, session.state.last_seq);
         session.setSyncFile(live.log.file, session.state.last_seq);
-        try session.maybeSnapshot(&session.phase.live, &.{}, session.updated_ms);
+        // At the newest batch's time, so the log's times never go back.
+        try session.maybeSnapshot(&session.phase.live, &.{}, session.timestamp());
     }
 
     /// Import only: whether the batches still wait for `publishImport`.
@@ -754,7 +762,7 @@ pub const Session = struct {
             const offset = base + if (i == 0) 0 else session.bounds.items[i - 1];
             try fold.apply(gpa, &session.state, fork_seq, .{ .seq = first_seq + i, .offset = offset, .body = body });
         }
-        session.wrote(ts);
+        session.wroteBodies(bodies, ts);
         session.written_seq.store(session.env.s.io, session.state.last_seq);
     }
 
@@ -1099,6 +1107,18 @@ fn copyBlob(env: *const Env, source: storage.Dir, target: storage.Dir, name: []c
     s.sync(to) catch |io_err| return storage.ioFault(io_err);
 }
 
+/// Whether a line records work in the session: a turn's start or end, or an
+/// item in a turn. `closed`, snapshots, settings, and the crash repair a
+/// later open writes are not, so opening a session and leaving it moves
+/// neither its time in the list nor its place there (D104).
+fn isActivity(body: schema.Body) bool {
+    return switch (body) {
+        .turn_started, .item, .turn_committed => true,
+        .turn_interrupted => |interrupted| interrupted.reason != .crash,
+        else => false,
+    };
+}
+
 fn changesListing(events: []const fold.Event) bool {
     for (events) |event| switch (event) {
         .set => |s| if (s.key == .title or s.key == .workspace or s.key == .language) return true,
@@ -1323,7 +1343,7 @@ const Loaded = struct {
     state: fold.State,
     /// Log offset just past the newest snapshot, or 0.
     snapshot_end: u64,
-    /// `ts` of line 1 and of the last line.
+    /// `ts` of line 1 and of the newest activity line.
     created_ms: u64,
     updated_ms: u64,
 
@@ -1350,8 +1370,11 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
     errdefer identity.deinit(gpa);
     const line1_end = line1.offset + line1.bytes.len;
 
-    // The newest snapshot, scanning back from the end.
-    var snapshot: ?struct { seq: u64, end: u64, state: []const u8, ts_ms: u64 } = null;
+    // The newest snapshot and the newest activity line, scanning back from
+    // the end. When only lines such as `closed` follow the snapshot, the
+    // scan goes on past it to the session's last turn (D104).
+    var snapshot: ?struct { seq: u64, end: u64, state: []const u8 } = null;
+    var activity_ms: ?u64 = null;
     {
         var back = log_mod.BackwardReader.init(gpa, env.s, file, end);
         defer back.deinit();
@@ -1360,10 +1383,16 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
             return mapRead(err);
         }) |line| {
             if (line.offset < line1_end) break;
-            if (line.header.kind != .snapshot) continue;
-            const body = schema.parseBody(arena, .snapshot, line.body()) catch return error.Corrupt;
-            snapshot = .{ .seq = line.header.seq, .end = line.offset + line.bytes.len, .state = body.snapshot.state, .ts_ms = line.header.ts_ms };
-            break;
+            const kind = line.header.kind orelse continue;
+            if (activity_ms == null and kind != .snapshot) {
+                const body = schema.parseBody(arena, kind, line.body()) catch return error.Corrupt;
+                if (isActivity(body)) activity_ms = line.header.ts_ms;
+            }
+            if (snapshot == null and kind == .snapshot) {
+                const body = schema.parseBody(arena, .snapshot, line.body()) catch return error.Corrupt;
+                snapshot = .{ .seq = line.header.seq, .end = line.offset + line.bytes.len, .state = body.snapshot.state };
+            }
+            if (snapshot != null and activity_ms != null) break;
         }
     }
 
@@ -1384,7 +1413,6 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         from = snap.end;
         expected = snap.seq + 1;
     }
-    var updated_ms = if (snapshot) |snap| snap.ts_ms else line1.header.ts_ms;
     const created_ms = line1.header.ts_ms;
     var tail = log_mod.ForwardReader.init(gpa, env.s, file, from, end, expected);
     defer tail.deinit();
@@ -1395,7 +1423,6 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         return mapRead(err);
     }) |line| {
         _ = line_arena.reset(.retain_capacity);
-        updated_ms = line.header.ts_ms;
         const kind = line.header.kind orelse {
             state.last_seq = line.header.seq; // unknown kinds are skipped
             state.clean_exit = false;
@@ -1410,7 +1437,7 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         .snapshot_end = if (snapshot) |snap| snap.end else 0,
         .created_ms = created_ms,
         // A fork's copied lines keep the source's older times (D20).
-        .updated_ms = @max(updated_ms, created_ms),
+        .updated_ms = @max(activity_ms orelse created_ms, created_ms),
     };
 }
 
@@ -2761,6 +2788,51 @@ const session_tests = struct {
         try testing.expectEqual(@as(u64, 2), after.last_turn);
         try closeAndDestroy(r);
         try expectKinds(&t, id, &.{ .session_created, .turn_started, .item, .turn_interrupted, .turn_started, .item, .turn_committed, .closed });
+    }
+
+    /// Returns once the wall clock shows a later millisecond than when called.
+    fn nextMillisecond() !void {
+        const start = std.Io.Timestamp.now(io, .real).toMilliseconds();
+        while (std.Io.Timestamp.now(io, .real).toMilliseconds() == start) try io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    test "only turns and their items move the updated time, read back past a later snapshot (D104)" {
+        var t: TestEnv = undefined;
+        // A snapshot after every batch, so a resume starts after the last activity.
+        t.init(.{ .snapshot_every_bytes = 1 });
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{ .turn_started, item });
+        var worked = try s.stateCopy(gpa);
+        defer worked.deinit(gpa);
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        crash(&t, s);
+
+        // The crash repair, the move to another workspace, a title, and the
+        // close are lines fx writes later; none of them is activity.
+        try nextMillisecond();
+        const r = try session_mod.openResume(&t.env, .{ .id = id, .workspace = "/x", .host = .app });
+        _ = try r.append(&.{.{ .set = .{ .key = .title, .value = "\"later\"" } }});
+        var reopened = try r.stateCopy(gpa);
+        defer reopened.deinit(gpa);
+        try testing.expectEqual(worked.updated_ms, reopened.updated_ms);
+        try closeAndDestroy(r);
+        var listed = try session_mod.readSummary(&t.env, id);
+        defer listed.deinit(gpa);
+        try testing.expectEqual(worked.updated_ms, listed.updated_ms);
+
+        // A new turn is activity.
+        try nextMillisecond();
+        const again = try resumeRoot(&t, id);
+        _ = try again.append(&.{ .turn_started, item, .turn_committed });
+        var turned = try again.stateCopy(gpa);
+        defer turned.deinit(gpa);
+        try testing.expect(turned.updated_ms > worked.updated_ms);
+        try closeAndDestroy(again);
+        var relisted = try session_mod.readSummary(&t.env, id);
+        defer relisted.deinit(gpa);
+        try testing.expectEqual(turned.updated_ms, relisted.updated_ms);
     }
 
     test "a second writer gets Busy while the first holds the session" {

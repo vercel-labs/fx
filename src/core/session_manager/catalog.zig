@@ -45,7 +45,8 @@ pub const Summary = struct {
     updated_ms: u64,
     /// Turns that ended, committed or interrupted.
     turns: u64,
-    /// When each host last opened the session; 0 means never.
+    /// For each host, the session's activity time when that host last had
+    /// it open (D104); older indexes hold the open time. 0 means never.
     opened_ms: [host_count]u64 = @splat(0),
 };
 
