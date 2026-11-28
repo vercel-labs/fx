@@ -661,6 +661,7 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             ("stable", "dev", 0),
             ("dev", "dev", 0),
             ("dev", "latest", 1),
+            ("dev", "", 1),
             ("", "latest", 1),
             ("", "dev", 0),
         ]
