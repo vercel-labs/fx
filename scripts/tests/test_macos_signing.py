@@ -644,26 +644,33 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         step_header, step_script = publish_step.split("        run: |\n", 1)
 
         header_lines = step_header.splitlines()
-        key_pattern = re.compile(r"""^(\s*)["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*:\s*(.*?)\s*$""")
+        key_pattern = re.compile(r"""^( *)(["']?)([A-Za-z_][A-Za-z0-9_]*)\2\s*:\s*(.*?)\s*$""")
         step_keys = [
-            (match.group(2), match.group(3))
+            match.group(3)
             for match in map(key_pattern.match, header_lines)
             if match and len(match.group(1)) == 8
         ]
-        self.assertEqual(1, sum(key == "env" for key, _ in step_keys), step_keys)
+        self.assertEqual(1, step_keys.count("env"), step_keys)
         env_start = next(
             i
             for i, line in enumerate(header_lines)
-            if (match := key_pattern.match(line)) and len(match.group(1)) == 8 and match.group(2) == "env"
+            if (match := key_pattern.match(line)) and len(match.group(1)) == 8 and match.group(3) == "env"
         )
         env_block = []
         for line in header_lines[env_start + 1 :]:
-            if line.strip() and len(line) - len(line.lstrip()) <= 8:
+            if not line.strip() or line.strip().startswith("#"):
+                continue
+            if len(line) - len(line.lstrip()) <= 8:
                 break
             env_block.append(line)
-        env_keys = [
-            (match.group(2), match.group(3)) for match in map(key_pattern.match, env_block) if match
-        ]
+        env_keys = []
+        for line in env_block:
+            match = key_pattern.match(line)
+            self.assertTrue(
+                match and len(match.group(1)) == 10,
+                f"the publish step's env block has a line that is not one plain key: {line!r}",
+            )
+            env_keys.append((match.group(3), match.group(4)))
         for name, value in (
             ("NPM_TAG", "${{ needs.metadata.outputs.npm_tag }}"),
             ("CHANNEL", "${{ needs.metadata.outputs.channel }}"),
