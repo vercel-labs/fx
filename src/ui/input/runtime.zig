@@ -3,12 +3,14 @@ const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const approval_decision = @import("../../core/permissions/approval_decision.zig");
 const paste_blocks = @import("../../core/input/pasted_blocks.zig");
+const paste_framing = @import("../../core/input/paste_framing.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const native_clear_probe_runtime = @import("native_clear_probe.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
+const clipboard_protocol = @import("../terminal/clipboard_protocol.zig");
 const cursor_probe = @import("../terminal/cursor_probe.zig");
 const mode_rearm = @import("../terminal/mode_rearm.zig");
 const theme_monitor = @import("../terminal/theme_monitor.zig");
@@ -580,6 +582,19 @@ pub const DeferredSessionInput = union(enum) {
     delivery_epoch,
 };
 
+pub const PendingClipboardTextTarget = struct {
+    owner: paste_framing.Owner,
+    buffer_limit: usize,
+    max_input_len: usize,
+};
+
+pub const PendingClipboardRead = union(enum) {
+    none,
+    ctrl_v_image,
+    paste_event_image,
+    paste_event_text: PendingClipboardTextTarget,
+};
+
 pub const Runtime = struct {
     terminal_cursor_probe: cursor_probe.Parser = .{},
     terminal_theme_monitor: theme_monitor.Monitor = .{},
@@ -587,6 +602,14 @@ pub const Runtime = struct {
     /// it, the terminal sends a paste as typed keys, and each line break in
     /// the paste presses Enter.
     bracketed_paste_rearm: mode_rearm.Schedule = .{},
+    /// Session-scoped toggle for kitty paste events (DEC mode 5522). Turned
+    /// off if the terminal denies clipboard access (`EPERM`) for a paste event.
+    paste_events_enabled: bool = true,
+    /// Origin and target of the open OSC 5522 read, owned with the reader.
+    pending_clipboard_read: PendingClipboardRead = .none,
+    /// Reads a clipboard image from the terminal when fx cannot read the
+    /// clipboard itself, such as over SSH.
+    terminal_clipboard_reader: clipboard_protocol.Reader = .{},
     deferred_terminal_input_source: ?DeferredTerminalInputSource = null,
     deferred_session_input: std.ArrayList(DeferredSessionInput) = .empty,
     deferred_session_input_index: usize = 0,
@@ -599,6 +622,7 @@ pub const Runtime = struct {
         if (dropped > 0) debug_trace.logf("input", "deferred session input dropped bytes={d} reason=shutdown", .{dropped});
         self.deferred_session_input.deinit(alloc);
         self.native_clear_probe.deinit(alloc);
+        self.terminal_clipboard_reader.deinit(alloc);
     }
 
     pub fn hasDeferredSessionInput(self: *const Runtime) bool {

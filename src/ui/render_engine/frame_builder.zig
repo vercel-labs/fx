@@ -88,6 +88,11 @@ pub fn buildAndFlushFrame(
     const repaint_window = frameRepaintWindow(plan, options.transcript_body);
     logFrameBuildPlan(plan, options);
 
+    const paste_events_enabled = if (@hasField(@TypeOf(shell.*), "paste_events_enabled"))
+        shell.paste_events_enabled
+    else
+        true;
+
     var movement = try terminal_diff.prepareTerminalMovementForFrame(
         alloc,
         shadow,
@@ -102,7 +107,11 @@ pub fn buildAndFlushFrame(
             plan.layout,
         ),
         options.terminal_transition,
-        terminal_diff.FrameReset.fromPlan(plan.reset_terminal, shell.history_reset_uses_ris),
+        terminal_diff.FrameReset.fromPlanWithPasteEvents(
+            plan.reset_terminal,
+            shell.history_reset_uses_ris,
+            paste_events_enabled,
+        ),
     );
     defer movement.deinit(alloc);
 
@@ -120,6 +129,7 @@ pub fn buildAndFlushFrame(
         .repaint_window = repaint_window,
         .synchronized_update = plan.synchronized_update,
         .history_reset_uses_ris = shell.history_reset_uses_ris,
+        .paste_events_enabled = paste_events_enabled,
         .scroll_plan = options.scroll_plan,
         .document_append = options.document_append,
         .terminal_transition = options.terminal_transition,

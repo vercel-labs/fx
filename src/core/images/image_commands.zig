@@ -8,11 +8,20 @@ const render_request = @import("../../ui/render_request.zig");
 const edit_contract = @import("../input/editor_state.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 
+const clipboard_protocol = @import("../../ui/terminal/clipboard_protocol.zig");
+const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+
 const InsertImageResult = enum { inserted, rejected, input_full };
 const ImageSourceLifetime = enum { retained, temporary };
 
+pub const no_clipboard_image_notice = "no image found on clipboard";
+pub const terminal_clipboard_busy_notice = "terminal clipboard is busy; paste again";
+pub const terminal_clipboard_denied_notice = "clipboard access denied; allow it in the terminal and paste again";
+
 /// `no_image` covers an empty clipboard and an unsupported platform alike, so a
-/// caller can try text next. `handled` means a notice was already shown.
+/// caller can try text next. `handled` means a notice was already shown or the
+/// terminal answers later.
 pub const ClipboardImageResult = enum { attached, no_image, handled };
 
 const ClipboardImageAttempt = union(enum) {
@@ -103,15 +112,95 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn attemptClipboardImage(app: *App) !ClipboardImageAttempt {
+            // Where fx cannot read the clipboard itself, the terminal sends the
+            // image later; `attachTerminalClipboardOutcome` takes its reply.
+            if (comptime @hasDecl(App, "requestTerminalClipboardImage")) {
+                if (!image_attachments.nativeClipboardImageReadable()) {
+                    try app.requestTerminalClipboardImage();
+                    return .handled;
+                }
+            }
             var loaded = loadClipboardImage(app) catch |err| {
                 if (err == error.NoClipboardImage) return .{ .missing_image = .empty };
                 if (err == error.Unsupported) return .{ .missing_image = .unsupported };
-                const line = try app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)});
-                defer app.alloc.free(line);
-                try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
+                try writeClipboardPasteFailure(app, err);
                 return .handled;
             };
             defer loaded.deinit(app.alloc);
+            return insertClipboardImage(app, &loaded);
+        }
+
+        pub fn attachClipboardImage(app: *App) !ClipboardImageResult {
+            return switch (try attemptClipboardImage(app)) {
+                .attached => .attached,
+                .handled => .handled,
+                .missing_image => .no_image,
+            };
+        }
+
+        /// An empty bracketed paste reads only a clipboard fx can read itself:
+        /// asking the terminal on every empty paste would show an error in
+        /// terminals without the clipboard protocol, such as VS Code over SSH.
+        pub fn attachClipboardForEmptyPaste(app: *App) !void {
+            if (comptime @hasDecl(App, "requestTerminalClipboardImage")) {
+                if (!image_attachments.nativeClipboardImageReadable()) {
+                    debug_trace.logf("images", "empty paste clipboard check skipped reason=no_local_clipboard", .{});
+                    return;
+                }
+            }
+            return attachClipboard(app);
+        }
+
+        /// The `/paste` command: image only, with a notice when the clipboard has none.
+        pub fn attachClipboard(app: *App) !void {
+            switch (try attemptClipboardImage(app)) {
+                .attached, .handled => {},
+                .missing_image => |reason| {
+                    if (reason == .empty) {
+                        try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = no_clipboard_image_notice }, true);
+                    }
+                },
+            }
+        }
+
+        /// Attaches the image a terminal sent for a clipboard request, or says
+        /// why there is none. The caller keeps ownership of `outcome`.
+        pub fn attachTerminalClipboardOutcome(app: *App, outcome: clipboard_protocol.Outcome) !void {
+            const notice: types.SemanticNotice = switch (outcome) {
+                .image => |image| return attachTerminalClipboardImage(app, image.items),
+                .no_image => .{ .topic = "images", .tone = .neutral, .body = no_clipboard_image_notice },
+                .unsupported => .{
+                    .topic = "images",
+                    .tone = .@"error",
+                    .body = if (io_mod.getenv("TMUX") != null)
+                        "tmux can't pass clipboard images to fx; run fx outside tmux, or attach a file with /image <path>"
+                    else
+                        "this terminal can't send clipboard images; use kitty or Ghostty 1.4+, or attach a file with /image <path>",
+                },
+                .denied => .{ .topic = "images", .tone = .@"error", .body = terminal_clipboard_denied_notice },
+                .busy => .{ .topic = "images", .tone = .@"error", .body = terminal_clipboard_busy_notice },
+                .timed_out => .{ .topic = "images", .tone = .@"error", .body = "terminal didn't send the clipboard image; paste again" },
+                .too_large => return writeImageTooLargeNotice(app),
+                .malformed => .{ .topic = "images", .tone = .@"error", .body = "terminal sent an unreadable clipboard image; paste again" },
+            };
+            try app.writeDomainNotice(notice, true);
+        }
+
+        fn attachTerminalClipboardImage(app: *App, bytes: []const u8) !void {
+            var loaded = image_attachments.clipboardImageAttachmentFromBytes(app.alloc, bytes) catch |err| return switch (err) {
+                error.UnsupportedImageType => app.writeDomainNotice(.{
+                    .topic = "images",
+                    .tone = .@"error",
+                    .body = "unsupported image type",
+                }, true),
+                error.ImageTooLarge => writeImageTooLargeNotice(app),
+                else => writeClipboardPasteFailure(app, err),
+            };
+            defer loaded.deinit(app.alloc);
+            _ = try insertClipboardImage(app, &loaded);
+        }
+
+        fn insertClipboardImage(app: *App, loaded: *image_attachments.ClipboardImageAttachment) !ClipboardImageAttempt {
             switch (try insertImageAtCursor(App, app, loaded.takeAttachment(), .temporary)) {
                 .inserted => {
                     app.shell.render_requests.request(.footer);
@@ -125,24 +214,18 @@ pub fn Commands(comptime App: type) type {
             }
         }
 
-        pub fn attachClipboardImage(app: *App) !ClipboardImageResult {
-            return switch (try attemptClipboardImage(app)) {
-                .attached => .attached,
-                .handled => .handled,
-                .missing_image => .no_image,
-            };
+        fn writeClipboardPasteFailure(app: *App, err: anyerror) !void {
+            const line = try app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)});
+            defer app.alloc.free(line);
+            try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
         }
 
-        /// The `/paste` command: image only, with a notice when the clipboard has none.
-        pub fn attachClipboard(app: *App) !void {
-            switch (try attemptClipboardImage(app)) {
-                .attached, .handled => {},
-                .missing_image => |reason| {
-                    if (reason == .empty) {
-                        try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true);
-                    }
-                },
-            }
+        fn writeImageTooLargeNotice(app: *App) !void {
+            try app.writeDomainNotice(.{
+                .topic = "images",
+                .tone = .@"error",
+                .body = image_attachments.image_too_large_notice,
+            }, true);
         }
 
         fn insertImageAtCursor(
@@ -238,12 +321,17 @@ const FakeApp = struct {
     notice_count: usize = 0,
     capture_error: ?anyerror = null,
     snapshot_dir: ?[]const u8 = null,
+    terminal_clipboard_requests: usize = 0,
     clipboard_text_reads: usize = 0,
     clipboard_unsupported: bool = false,
 
     pub fn loadClipboardImageAttachment(self: *FakeApp) !image_attachments.ClipboardImageAttachment {
         if (self.clipboard_unsupported) return error.Unsupported;
         return error.NoClipboardImage;
+    }
+
+    pub fn requestTerminalClipboardImage(self: *FakeApp) !void {
+        self.terminal_clipboard_requests += 1;
     }
 
     pub fn readClipboardText(self: *FakeApp, _: std.mem.Allocator) !?[]u8 {
@@ -1034,6 +1122,21 @@ test "managePending reports empty lists populated lists and clear" {
     try std.testing.expectEqual(@as(usize, 0), app.agent().pending_images.items.len);
 }
 
+test "attachClipboard asks the terminal where fx cannot read the clipboard" {
+    if (image_attachments.nativeClipboardImageReadable()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachClipboard(&app);
+
+    try std.testing.expectEqual(@as(usize, 1), app.terminal_clipboard_requests);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+}
+
 test "attachClipboard is silent on unsupported platforms" {
     const alloc = std.testing.allocator;
     var app = FakeApp{ .alloc = alloc, .clipboard_unsupported = true };
@@ -1041,8 +1144,91 @@ test "attachClipboard is silent on unsupported platforms" {
 
     try Commands(FakeApp).attachClipboard(&app);
 
+    if (image_attachments.nativeClipboardImageReadable()) {
+        try std.testing.expectEqual(@as(usize, 0), app.terminal_clipboard_requests);
+    } else {
+        try std.testing.expectEqual(@as(usize, 1), app.terminal_clipboard_requests);
+    }
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
+test "an empty paste never asks the terminal for the clipboard" {
+    if (image_attachments.nativeClipboardImageReadable()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachClipboardForEmptyPaste(&app);
+
+    try std.testing.expectEqual(@as(usize, 0), app.terminal_clipboard_requests);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+}
+
+test "a terminal clipboard image is inserted at the cursor as a snapshot" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+
+    var app = FakeApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
+    defer app.deinit();
+    var image: std.ArrayList(u8) = .empty;
+    try image.appendSlice(alloc, "\x89PNG\r\n\x1a\nterminal");
+    var outcome: clipboard_protocol.Outcome = .{ .image = image };
+    defer outcome.deinit(alloc);
+
+    try Commands(FakeApp).attachTerminalClipboardOutcome(&app, outcome);
+
+    try std.testing.expectEqualStrings("[Image #1]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().pending_images.items.len);
+    const pending = app.agent().pending_images.items[0];
+    try std.testing.expectEqualStrings("image/png", pending.media_type);
+    try std.testing.expectEqualStrings(pending.snapshot_path.?, pending.path);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+}
+
+test "terminal clipboard failures leave the draft alone and say what to do" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { outcome: clipboard_protocol.Outcome, needle: []const u8, tone: types.NoticeTone }{
+        .{ .outcome = .no_image, .needle = no_clipboard_image_notice, .tone = .neutral },
+        .{ .outcome = .unsupported, .needle = "attach a file with /image <path>", .tone = .@"error" },
+        .{ .outcome = .denied, .needle = "clipboard access denied", .tone = .@"error" },
+        .{ .outcome = .busy, .needle = "terminal clipboard is busy", .tone = .@"error" },
+        .{ .outcome = .timed_out, .needle = "didn't send the clipboard image", .tone = .@"error" },
+        .{ .outcome = .too_large, .needle = image_attachments.image_too_large_notice, .tone = .@"error" },
+        .{ .outcome = .malformed, .needle = "unreadable clipboard image", .tone = .@"error" },
+    };
+    for (cases) |case| {
+        var app = FakeApp{ .alloc = alloc };
+        defer app.deinit();
+        try Commands(FakeApp).attachTerminalClipboardOutcome(&app, case.outcome);
+        try expectTranscriptContains(&app, case.needle);
+        try std.testing.expectEqual(case.tone, app.last_tone.?);
+        try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+        try std.testing.expectEqual(@as(usize, 0), app.agent().pending_images.items.len);
+    }
+}
+
+test "a terminal clipboard reply that is not an image is reported" {
+    const alloc = std.testing.allocator;
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+    var image: std.ArrayList(u8) = .empty;
+    try image.appendSlice(alloc, "plain text, not a PNG");
+    var outcome: clipboard_protocol.Outcome = .{ .image = image };
+    defer outcome.deinit(alloc);
+
+    try Commands(FakeApp).attachTerminalClipboardOutcome(&app, outcome);
+
+    try expectTranscriptContains(&app, "unsupported image type");
+    try std.testing.expectEqual(@as(usize, 0), app.agent().pending_images.items.len);
 }
 
 test "attachClipboard never reads clipboard text" {

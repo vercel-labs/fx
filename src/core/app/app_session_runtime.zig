@@ -3762,11 +3762,16 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn suspendToJobControl(app: *App, footer_rows: u16) !void {
+            const paste_events_enabled = if (comptime @hasField(App, "terminal_input_runtime"))
+                app.terminal_input_runtime.paste_events_enabled
+            else
+                true;
             return app_lifecycle.suspendToJobControl(
                 &app.terminal,
                 &app.shell,
                 &app.metrics,
                 footer_rows,
+                paste_events_enabled,
             );
         }
 

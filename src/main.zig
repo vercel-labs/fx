@@ -65,6 +65,7 @@ const app_profile_runtime = @import("core/app/app_profile_runtime.zig");
 const app_instances_runtime = @import("core/app/app_instances_runtime.zig");
 const profiles = @import("core/profiles/profiles.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
+const terminal_clipboard_runtime = @import("core/app/terminal_clipboard_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
 const trace_report = @import("core/app/trace_report.zig");
@@ -459,6 +460,16 @@ const App = struct {
     const AgentsAppRuntime = app_agents_runtime.Runtime(Self);
     const InstancesAppRuntime = app_instances_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
+    const TerminalClipboardAppRuntime = terminal_clipboard_runtime.Runtime(Self);
+
+    /// Ctrl+V and `/paste` call this where fx cannot read the clipboard itself.
+    pub fn requestTerminalClipboardImage(self: *Self) !void {
+        if (comptime host_target.is_wasm) {
+            return;
+        } else {
+            try TerminalClipboardAppRuntime.request(self);
+        }
+    }
 
     pub fn contextRegistry(self: *const Self) context_contract.Registry {
         var registry = default_context_registry;
@@ -3481,7 +3492,7 @@ const App = struct {
 
     fn collectBracketedPasteFacts(self: *App) void {
         if (!self.terminal_input_runtime.bracketed_paste_rearm.take(io_mod.milliTimestamp())) return;
-        self.terminal.enableBracketedPaste() catch |err| {
+        self.terminal.enableBracketedPaste(self.terminal_input_runtime.paste_events_enabled) catch |err| {
             debug_trace.logf("input", "bracketed_paste_rearm_failed err={s}", .{@errorName(err)});
         };
     }
@@ -3515,6 +3526,7 @@ const App = struct {
 
         try self.collectThemeFacts();
         self.collectBracketedPasteFacts();
+        if (comptime !host_target.is_wasm) try TerminalClipboardAppRuntime.collectFacts(self);
 
         if (comptime !host_target.is_wasm) {
             UpgradeAppRuntime.collectUpgradeFacts(self);
@@ -4036,11 +4048,20 @@ const App = struct {
     }
 
     fn handleThemeMonitorByte(self: *App, byte: u8) !void {
-        switch (self.terminal_input_runtime.terminal_theme_monitor.feed(
-            byte,
-            io_mod.milliTimestamp(),
-        )) {
+        const now_ms = io_mod.milliTimestamp();
+        const monitor = &self.terminal_input_runtime.terminal_theme_monitor;
+        if (comptime !host_target.is_wasm) {
+            monitor.expectClipboardReply(self.terminal_input_runtime.terminal_clipboard_reader.pending());
+        }
+        switch (monitor.feed(byte, now_ms)) {
             .pending, .consumed => {},
+            // The WebAssembly hosts never ask for the clipboard.
+            .clipboard_packet => if (comptime !host_target.is_wasm) {
+                self.terminal_input_runtime.terminal_clipboard_reader.beginPacket(self.alloc, now_ms);
+            },
+            .clipboard_mode => |support| if (comptime !host_target.is_wasm) {
+                self.terminal_input_runtime.terminal_clipboard_reader.noteModeReport(self.alloc, support, now_ms);
+            },
             .forward => |forwarded| {
                 for (forwarded.slice()) |forwarded_byte| {
                     try self.handleAfterThemeMonitorByte(forwarded_byte);
@@ -4064,6 +4085,17 @@ const App = struct {
                 .theme_monitor => try self.handleAfterThemeMonitorByte(byte),
             }
             return;
+        }
+
+        // A clipboard reply takes its bytes before anything else, so none of
+        // it reaches the composer. A byte it declines is ordinary input.
+        const clipboard_reader = &self.terminal_input_runtime.terminal_clipboard_reader;
+        if (comptime !host_target.is_wasm) {
+            if (clipboard_reader.ownsInput() and clipboard_reader.feedOwnedByte(
+                self.alloc,
+                byte,
+                io_mod.milliTimestamp(),
+            )) return;
         }
 
         switch (ui_input.terminalInputOwner(
@@ -7312,6 +7344,55 @@ test "the agent list previews each agent by switching, keeps every draft where i
     try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings("reviewer", first.displayName());
     try std.testing.expectEqualStrings("second", second.displayName());
+}
+
+test "terminal clipboard paste event closes the agents menu and pastes into composer" {
+    const alloc = std.testing.allocator;
+    var write_buf: [512]u8 = undefined;
+    var write_sink: std.Io.Writer = .fixed(&write_buf);
+    var app = App{ .alloc = alloc };
+    app.terminal.test_write_sink = &write_sink;
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer app.terminal_input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+
+    _ = try addTestChildAgent(&app, "reviewer");
+    try app.input_runtime.edit_state.setText(alloc, "draft");
+    app.input_runtime.edit_state.cursor = 5;
+    try app.openAgentsMenu();
+    try app.input_runtime.edit_state.setText(alloc, "search");
+    try std.testing.expect(App.AgentsAppRuntime.menuActive(&app));
+
+    const deliver = struct {
+        fn packet(target: *App, body: []const u8) void {
+            const reader = &target.terminal_input_runtime.terminal_clipboard_reader;
+            reader.beginPacket(target.alloc, 10);
+            for (body) |byte| _ = reader.feedOwnedByte(target.alloc, byte, 10);
+            for ("\x1b\\") |byte| _ = reader.feedOwnedByte(target.alloc, byte, 10);
+        }
+    }.packet;
+
+    deliver(&app, "type=read:status=OK:pw=c2VjcmV0MTIz");
+    deliver(&app, "type=read:status=DATA:mime=Lg==;dGV4dC9wbGFpbg==");
+    deliver(&app, "type=read:status=DONE");
+    try App.TerminalClipboardAppRuntime.collectFacts(&app);
+
+    try std.testing.expect(!App.AgentsAppRuntime.menuActive(&app));
+    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings(
+        "\x1b]5522;type=read:pw=c2VjcmV0MTIz:name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbg==\x1b\\",
+        write_sink.buffered(),
+    );
+
+    deliver(&app, "type=read:status=OK");
+    deliver(&app, "type=read:status=DATA:mime=dGV4dC9wbGFpbg==;IQ==");
+    deliver(&app, "type=read:status=DONE");
+    try App.TerminalClipboardAppRuntime.collectFacts(&app);
+
+    try std.testing.expectEqualStrings("draft!", app.input_runtime.edit_state.input.items);
 }
 
 test "a search edit that makes the agent list show another agent keeps the cursor and selection where they were in the search" {
