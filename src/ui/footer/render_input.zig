@@ -119,6 +119,12 @@ pub const SessionMenuProjection = struct {
     query: []const u8 = "",
     now_ms: i64 = 0,
     selection_failure: ?session_catalog.ResumeFailure = null,
+    /// The rows are a listing's first part; the rest still loads.
+    rest_loading: bool = false,
+    /// The session the picker opens, whose row shows it opening.
+    opening_id: ?[]const u8 = null,
+    /// The opening row's bullet, which blinks while the open runs.
+    opening_bullet_visible: bool = true,
 
     pub fn filteredItemCount(self: SessionMenuProjection) usize {
         return session_catalog.filteredCount(self.summaries, self.query);
@@ -134,6 +140,11 @@ pub const SessionMenuProjection = struct {
 
     pub fn itemAt(self: SessionMenuProjection, display_index: usize) ?*const session_store.SessionSummary {
         return session_catalog.summaryAt(self.summaries, self.query, display_index);
+    }
+
+    pub fn isOpening(self: SessionMenuProjection, summary: session_store.SessionSummary) bool {
+        const id = self.opening_id orelse return false;
+        return std.mem.eql(u8, id, summary.id);
     }
 };
 

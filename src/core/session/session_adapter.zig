@@ -7146,6 +7146,24 @@ pub fn listSummaries(
     active_id: ?[]const u8,
     cancel: *const std.atomic.Value(bool),
 ) !std.ArrayList(session_store.SessionSummary) {
+    return listSummariesWith(store, alloc, active_id, cancel, NoFirstListing{});
+}
+
+const NoFirstListing = struct {
+    pub fn v2Listed(_: NoFirstListing, _: []const session_store.SessionSummary) void {}
+};
+
+/// As `listSummaries`, and first tells `first` (its `v2Listed`) v2's
+/// sessions alone, newest first, from one read of the index, before v1's
+/// folders are read, which takes longer with many of them. The slice is
+/// borrowed for the call.
+pub fn listSummariesWith(
+    store: *Store,
+    alloc: Allocator,
+    active_id: ?[]const u8,
+    cancel: *const std.atomic.Value(bool),
+    first: anytype,
+) !std.ArrayList(session_store.SessionSummary) {
     var list: std.ArrayList(session_store.SessionSummary) = .empty;
     errdefer {
         for (list.items) |*summary| summary.deinit(alloc);
@@ -7165,6 +7183,8 @@ pub fn listSummaries(
             list.appendAssumeCapacity(try summaryOf(alloc, scratch.allocator(), item));
         }
     }
+    session_summary_codec.sortSummariesNewestFirst(list.items);
+    first.v2Listed(list.items);
     // And v1's roots not converted yet (D59), which v2 wins on an id.
     if (cancel.load(.acquire)) return error.Cancelled;
     var v1_roots = try v1_conversion.listRoots(alloc, store.home, active_id);
@@ -15509,6 +15529,49 @@ test "the picker's listing orders v2 sessions and v1's unconverted ones newest f
     try testing.expectEqual(@as(usize, 2), list.items.len);
     try testing.expectEqualStrings(newer, list.items[0].id);
     try testing.expectEqualStrings("v2-older", list.items[1].id);
+}
+
+test "the picker's listing tells v2's sessions first, before v1's folders, and the whole list after" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const v1_id = (try v1.fixture("plain", 1))[0];
+    for ([_][]const u8{ "v2-old", "v2-new" }, [_]u64{ 5000, 6000 }) |id, at| {
+        const s = try t.store.manager.openImport(.{ .id = id, .workspace = v1.workspace, .host = .ask, .created_ms = 1000 });
+        defer s.release();
+        _ = try s.appendAt(&.{ .turn_started, .turn_committed }, at);
+        try s.publishImport();
+    }
+    const First = struct {
+        calls: usize = 0,
+        ids: [4][]const u8 = undefined,
+        len: usize = 0,
+
+        pub fn v2Listed(self: *@This(), listed: []const session_store.SessionSummary) void {
+            self.calls += 1;
+            self.len = @min(listed.len, self.ids.len);
+            for (listed[0..self.len], 0..) |summary, index| self.ids[index] = summary.id;
+        }
+    };
+    var first: First = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    var list = try listSummariesWith(&t.store, alloc, null, &cancel, &first);
+    defer {
+        for (list.items) |*summary| summary.deinit(alloc);
+        list.deinit(alloc);
+    }
+    try testing.expectEqual(@as(usize, 1), first.calls);
+    // v2's alone, newest first; the borrowed ids still live in `list`.
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try testing.expectEqualStrings("v2-new", first.ids[0]);
+    try testing.expectEqualStrings("v2-old", first.ids[1]);
+    try testing.expectEqual(@as(usize, 3), list.items.len);
+    var has_v1 = false;
+    for (list.items) |summary| has_v1 = has_v1 or std.mem.eql(u8, summary.id, v1_id);
+    try testing.expect(has_v1);
 }
 
 test "-c says the remembered session cannot be read when v1's bookmark is not a file (D86)" {

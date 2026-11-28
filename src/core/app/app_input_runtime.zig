@@ -96,17 +96,7 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 pub const file_picker_completion_cap = input_completion_runtime.file_picker_completion_cap;
 const ctrl_g_upgrade_byte: u8 = 7;
 
-fn classifyResumeFailure(err: anyerror) session_catalog.ResumeFailure {
-    return switch (err) {
-        error.SessionBusy => .open_elsewhere,
-        error.SessionAuthorityBoundaryUnavailable,
-        error.SessionCommitBoundaryUnavailable,
-        => .being_updated,
-        error.ConfiguredProviderChanged => .connection_changed,
-        error.ConfiguredProviderRemoved => .connection_removed,
-        else => .unavailable,
-    };
-}
+const classifyResumeFailure = session_catalog.classifyResumeFailure;
 
 const ExplicitModelSelection = struct {
     model: []const u8,
@@ -3467,6 +3457,8 @@ pub fn Runtime(comptime App: type) type {
         fn cancelSessionMenu(app: *App, agent: *AppAgent) bool {
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             if (!agent.session_persistence.session_picker.active) return false;
+            // Esc while a row opens drops that open; the picker stays.
+            if (app_session_runtime.Runtime(App).cancelSessionPickerOpen(app, agent)) return true;
             app_session_runtime.Runtime(App).cancelSessionPickerToComposer(app, agent);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);

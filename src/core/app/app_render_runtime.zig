@@ -868,6 +868,8 @@ pub fn Runtime(comptime App: type) type {
                     .query = agent.session_persistence.session_picker.query(),
                     .now_ms = now_ms,
                     .selection_failure = agent.session_persistence.session_picker.selection_failure,
+                    .opening_id = agent.session_persistence.session_picker_open.openingId(),
+                    .rest_loading = agent.session_persistence.pickerListingRest(),
                 } else .{},
                 .fork_menu = if (comptime agents.hasAgentField(App, "session_persistence"))
                     app_session_runtime.forkMenuProjection(&agent.session_persistence.fork_menu)

@@ -28,6 +28,19 @@ pub const ResumeFailure = enum {
     unavailable,
 };
 
+/// What the picker's row says when opening its session failed with `err`.
+pub fn classifyResumeFailure(err: anyerror) ResumeFailure {
+    return switch (err) {
+        error.SessionBusy => .open_elsewhere,
+        error.SessionAuthorityBoundaryUnavailable,
+        error.SessionCommitBoundaryUnavailable,
+        => .being_updated,
+        error.ConfiguredProviderChanged => .connection_changed,
+        error.ConfiguredProviderRemoved => .connection_removed,
+        else => .unavailable,
+    };
+}
+
 pub fn filteredCount(summaries: []const session_store.SessionSummary, query: []const u8) usize {
     return pickerFilter(summaries, null, query, .any).count();
 }

@@ -1404,7 +1404,8 @@ const App = struct {
 
     fn loopTimeoutFacts(self: *App) loop_timeout.Facts {
         return .{
-            .next_iteration_due = self.takeDrainContinuationDue(),
+            .next_iteration_due = self.takeDrainContinuationDue() or
+                self.screenAgent().session_persistence.session_picker_open.replayDue(),
             .first_frame_pending = self.shell.render_requests.hasReason(.first_frame),
             .auth_refresh_active = self.auth.sourceInventoryRefreshActive(),
             .skills_refresh_active = self.skills.refreshActive(),
@@ -1450,7 +1451,8 @@ const App = struct {
         const mcp_loading = self.mcp.host_menu.active and self.mcp.host_menu_tools == .loading;
         const session_picker = &self.screenAgent().session_persistence.session_picker;
         const session_loading = session_picker.isLoading() or
-            (session_picker.active and session_picker.loading_more);
+            (session_picker.active and session_picker.loading_more) or
+            self.screenAgent().session_persistence.session_picker_open.busy();
         return self.input_runtime.usage_menu.active or
             file_listing_in_flight or
             model_loading or
@@ -1752,14 +1754,21 @@ const App = struct {
     }
 
     pub fn resumeSelectedSession(self: *App, agent: *agents.Agent) !bool {
-        // The startup picker resumes a whole host; an in-app
-        // `/resume` brings back only the session chosen.
+        return SessionAppRuntime.resumeSelectedSession(self, agent);
+    }
+
+    /// As the picker's open installs its session: whether this is the
+    /// startup picker, which resumes a whole host, where an in-app
+    /// `/resume` brings back only the session chosen. Asked once.
+    pub fn takeStartupPickerGroupRestore(self: *App, agent: *agents.Agent) bool {
         const startup_pick = self.instances.restore_on_pick and agent == &self.main_agent and
             SessionAppRuntime.activeSessionId(agent) == null;
         if (agent == &self.main_agent) self.instances.restore_on_pick = false;
-        const resumed = try SessionAppRuntime.resumeSelectedSession(self, agent);
-        if (resumed and startup_pick) InstancesAppRuntime.restoreGroup(self);
-        return resumed;
+        return startup_pick;
+    }
+
+    pub fn restoreStartupPickerGroup(self: *App) void {
+        InstancesAppRuntime.restoreGroup(self);
     }
 
     pub fn submitForkMenu(self: *App, agent: *agents.Agent, bring: ?bool) !?[]u8 {
