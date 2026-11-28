@@ -41,10 +41,11 @@ pub const ModelCaller = struct {
     /// conversation, and `compact_with_provider` asks for it. Null when it
     /// cannot (`vercel_model_policy.providerCompaction`).
     provider_compaction: ?model_capabilities.ProviderCompaction = null,
-    /// The same answer for any model whose replies the conversation holds,
-    /// from the policy that sets `provider_compaction`. Null when the caller
-    /// has none, so no other model's reasoning counts as bound.
-    provider_compaction_of: ?*const fn (model: []const u8) ?model_capabilities.ProviderCompaction = null,
+    /// Whether a reply `model` wrote keeps its reasoning only after the exact
+    /// messages it was written after, for any model whose replies the
+    /// conversation holds. Null when the caller's provider has no such
+    /// policy, so no reply's reasoning counts as bound.
+    binds_reasoning_of: ?*const fn (model: []const u8) bool = null,
 
     pub const VTable = struct {
         /// What `model` accepts.
@@ -67,8 +68,8 @@ pub const ModelCaller = struct {
     /// it was written after, as `bindsReasoning` says for the conversation's
     /// own model.
     pub fn modelBindsReasoning(self: ModelCaller, reply_model: []const u8) bool {
-        const find = self.provider_compaction_of orelse return false;
-        return find(reply_model) != null;
+        const binds = self.binds_reasoning_of orelse return false;
+        return binds(reply_model);
     }
 
     /// The provider can write this conversation's compaction block.

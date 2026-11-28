@@ -503,8 +503,8 @@ fn questionAnswers(arena: Allocator, output: []const u8) Allocator.Error![]const
 
 test "a kept turn's reasoning counts as bound only when its model's provider binds it" {
     const Policy = struct {
-        fn providerCompaction(reply_model: []const u8) ?model_capabilities.ProviderCompaction {
-            return if (std.mem.startsWith(u8, reply_model, "anthropic/")) .anthropic else null;
+        fn bindsReasoning(reply_model: []const u8) bool {
+            return std.mem.startsWith(u8, reply_model, "anthropic/");
         }
     };
     const caller: ModelCaller = .{
@@ -513,7 +513,7 @@ test "a kept turn's reasoning counts as bound only when its model's provider bin
         .model = "google/gemini-3-pro",
         .provider = .gateway,
         .credential_source = null,
-        .provider_compaction_of = Policy.providerCompaction,
+        .binds_reasoning_of = Policy.bindsReasoning,
     };
     const claude: types.ProviderReplay = .{ .source = .{ .provider = .gateway, .model = "anthropic/claude-fable-5.2" }, .parts_json = "[]" };
     const gemini: types.ProviderReplay = .{ .source = .{ .provider = .gateway, .model = "google/gemini-3-pro" }, .parts_json = "[]" };
@@ -530,7 +530,7 @@ test "a kept turn's reasoning counts as bound only when its model's provider bin
     try std.testing.expectEqualStrings("anthropic/claude-fable-5.2", boundReasoningModel(caller, &.{ unbound, bound_step }).?);
     // A caller with no policy counts no other model's reasoning as bound.
     var no_policy = caller;
-    no_policy.provider_compaction_of = null;
+    no_policy.binds_reasoning_of = null;
     try std.testing.expect(boundReasoningModel(no_policy, &.{bound_answer}) == null);
 }
 

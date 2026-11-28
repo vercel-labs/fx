@@ -760,6 +760,10 @@ pub const Provider = struct {
     /// Whose own on-demand compaction writes `model`'s compaction block
     /// through this provider; null when none does.
     provider_compaction_fn: ?*const fn (model: []const u8) ?model_capabilities.ProviderCompaction = null,
+    /// A reply `model` wrote through this provider keeps its reasoning only
+    /// after the exact messages it was written after. Set even where
+    /// `provider_compaction_fn` is not, so fx's own summary keeps no such reply.
+    binds_reasoning_fn: ?*const fn (model: []const u8) bool = null,
     /// A reply's provider replay parts hold one compaction block.
     holds_compaction_block_fn: ?*const fn (alloc: Allocator, parts_json: []const u8) bool = null,
 

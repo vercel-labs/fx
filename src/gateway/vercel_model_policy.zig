@@ -56,6 +56,14 @@ pub fn providerCompaction(model: []const u8) ?ProviderCompaction {
     return null;
 }
 
+/// A reply `model` wrote keeps its reasoning only after the exact messages it
+/// was written after: the models whose provider writes compaction blocks.
+/// Hosts without provider compaction ask this too, so fx's own summary keeps
+/// no such reply after it.
+pub fn bindsReasoning(model: []const u8) bool {
+    return providerCompaction(model) != null;
+}
+
 const first_claude_compaction: ModelVersion = .{ .major = 4, .minor = 6 };
 const first_gpt_compaction: ModelVersion = .{ .major = 6, .minor = 0 };
 
@@ -105,7 +113,10 @@ test "Claude 4.6 and later and GPT-6 and later compact through their provider" {
     }
     for ([_][]const u8{ "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.5", "anthropic/claude-sonnet-4.5", "anthropic/claude-sonnet", "anthropic/claude-", "openai/gpt-5.6-sol", "openai/gpt-5", "openai/gpt-oss-120b", "openai/gpt-", "zai/glm-5.3", "google/gemini-4-argon", "fixture/compaction" }) |model| {
         try std.testing.expectEqual(@as(?ProviderCompaction, null), providerCompaction(model));
+        try std.testing.expect(!bindsReasoning(model));
     }
+    try std.testing.expect(bindsReasoning("anthropic/claude-opus-5.1"));
+    try std.testing.expect(bindsReasoning("openai/gpt-6.1-sol"));
 }
 
 /// Whether `model` takes OpenAI's `promptCacheOptions`: GPT-5.6 and later.

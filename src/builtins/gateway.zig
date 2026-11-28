@@ -153,6 +153,7 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .build_request_fn = buildAgentRequestForProvider,
     .project_replay_fn = vercel_protocol.selectReplayParts,
     .provider_compaction_fn = vercel_model_policy.providerCompaction,
+    .binds_reasoning_fn = vercel_model_policy.bindsReasoning,
     .holds_compaction_block_fn = vercel_protocol.holdsCompactionBlock,
 };
 
@@ -378,6 +379,15 @@ fn finalizeAgentRequestBody(
     );
     alloc.free(body);
     return identified;
+}
+
+test "the Gateway stream says which replies bind their reasoning, as it says which compact" {
+    const binds = agent_stream_provider.binds_reasoning_fn.?;
+    for ([_][]const u8{ "anthropic/claude-opus-5.1", "openai/gpt-6.1-sol", "google/gemini-3-pro", "anthropic/claude-sonnet-4.5", "xai/grok-4" }) |model| {
+        try std.testing.expectEqual(agent_stream_provider.providerCompaction(model) != null, binds(model));
+    }
+    try std.testing.expect(binds("anthropic/claude-opus-5.1"));
+    try std.testing.expect(!binds("google/gemini-3-pro"));
 }
 
 test "configured credentials cannot authorize the Gateway transport" {

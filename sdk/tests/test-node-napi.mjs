@@ -39,6 +39,7 @@ const scripts = [
   "test-agent-effort.mjs",
   "test-agent-fast.mjs",
   "test-agent-prompt-cache.mjs",
+  "test-agent-summary-signed-replay.mjs",
   "test-agent-images.mjs",
   "test-agent-tool-start.mjs",
   "test-agent-reserved-tool-names.mjs",
