@@ -71,6 +71,8 @@ async function launch(options: {
   width?: number;
   height?: number;
   respond?: (body: string) => Response;
+  /// Writes files into the workspace before fx starts, such as a skill.
+  prepare?: (workspace: string) => void;
 } = {}): Promise<Shell> {
   const root = mkdtempSync(join(tmpdir(), "fx-effort-menu-"));
   roots.push(root);
@@ -78,6 +80,7 @@ async function launch(options: {
   const workspace = join(root, "workspace");
   mkdirSync(home);
   mkdirSync(workspace);
+  options.prepare?.(workspace);
   let catalogServed = 0;
   const gateway = startDynamicFakeGateway(options.respond ?? (() => fakeGatewayFinalText("ANSWER")), {
     models: () => {
@@ -533,6 +536,125 @@ test.skipIf(!tmuxAvailable())("switching models from the out-of-credits card clo
   // The card gives the prompt back before it opens the picker, and that
   // closes the menu first.
   expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=failed_prompt_restored query_bytes=1");
+}, TIMEOUT);
+
+const ONE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+async function bracketPaste(session: TmuxSession, text: string): Promise<void> {
+  await session.sendHexBytes([...Buffer.from(`\x1b[200~${text}\x1b[201~`)].map((byte) => byte.toString(16).padStart(2, "0")));
+}
+
+/// The images the last user message in a request body carries. The test
+/// model has no vision, so fx lists each pending image by name in an
+/// `<available_images>` block instead of sending its bytes.
+function userImages(body: string): number {
+  const prompt = (JSON.parse(body) as { prompt: { role: string; content: { type: string; text?: string }[] | string }[] }).prompt;
+  const content = prompt.findLast((entry) => entry.role === "user")?.content;
+  const text = Array.isArray(content) ? content.map((part) => part.text ?? "").join("") : content ?? "";
+  const listed = /<available_images>([\s\S]*?)<\/available_images>/.exec(text)?.[1] ?? "";
+  return (listed.match(/\[Image #\d+\]/g) ?? []).length;
+}
+
+test.skipIf(!tmuxAvailable())("Ctrl+U, Ctrl+C, and Ctrl+D over the open /effort menu keep the image draft it set aside", async () => {
+  const current = await launch();
+  const { session, gateway } = current;
+  const image = join(current.root, "workspace", "i.png");
+  writeFileSync(image, Buffer.from(ONE_PIXEL_PNG, "base64"));
+  await bracketPaste(session, image);
+  await session.waitForPane((pane) => /^┃ \[Image 1\]/m.test(pane), 5_000);
+
+  // Ctrl+U clears only the query; the menu stays.
+  await session.sendLiteral("/effort");
+  await session.sendKeys("Enter");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await session.sendKeys("C-u");
+  await session.waitForPane((pane) => pane.includes("Effort 5") && /^┃ *$/m.test(pane), 5_000);
+  // Ctrl+C closes the menu and gives the draft back.
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2"), 5_000);
+  await session.sendKeys("C-c");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ \[Image 1\]/m.test(pane), 5_000);
+  // Ctrl+D on an empty query closes the menu too, and fx keeps running.
+  await session.sendLiteral("/effort");
+  await session.sendKeys("Enter");
+  await waitForEffortMenu(current);
+  await session.sendKeys("C-d");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ \[Image 1\]/m.test(pane), 5_000);
+
+  await session.sendLiteral(" describe this");
+  await session.sendKeys("Enter");
+  await session.waitForPane(() => gateway.requests.some((request) => request.body.includes("describe this")), 10_000);
+  const sent = gateway.requests.find((request) => request.body.includes("describe this"))!;
+  expect(userImages(sent.body)).toBe(1);
+  await session.waitForComposer(10_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  const trace = readFileSync(current.trace, "utf8");
+  expect(trace).not.toContain("draft cleared reason=");
+  expect(trace).toContain("effort menu closed and its query cleared reason=ctrl_c");
+  expect(trace).toContain("effort menu closed and its query cleared reason=ctrl_d");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("an image path pasted over the open /effort menu stays text in its query and attaches nothing", async () => {
+  const current = await launch();
+  const { session, gateway } = current;
+  const image = join(current.root, "workspace", "secret.png");
+  writeFileSync(image, Buffer.from(ONE_PIXEL_PNG, "base64"));
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await bracketPaste(session, image);
+  await session.waitForPane((pane) => pane.includes("Effort 0") && pane.includes("secret.png") && !pane.includes("[Image 1]"), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ *$/m.test(pane), 5_000);
+  // Enter on the empty composer starts nothing; the next prompt carries no image.
+  await session.sendKeys("Enter");
+  await session.sendText("hello");
+  await session.waitForText("ANSWER", 10_000);
+  await session.waitForComposer(10_000);
+  const chats = gateway.requests.filter((request) => request.body.includes("\"prompt\""));
+  expect(chats.some((request) => request.body.includes("hello"))).toBe(true);
+  expect(chats.every((request) => userImages(request.body) === 0)).toBe(true);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("Space after a model name in the /effort query switches no model", async () => {
+  const current = await launch();
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral(`/model ${PLAIN_MODEL}`);
+  await session.waitForPane((pane) => pane.includes("Effort 0") && pane.includes(`┃ /model ${PLAIN_MODEL}`), 5_000);
+  await session.sendLiteral(" x");
+  await session.waitForPane((pane) => pane.includes(`┃ /model ${PLAIN_MODEL} x`) && pane.includes("Effort 0"), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort "), 5_000);
+  const pane = await session.capturePane();
+  expect(pane).not.toContain("Switched to");
+  expect(pane).toMatch(/^auto · thinker/m);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("a $skill pasted over the open /effort menu opens no skill list, so one Esc closes the menu", async () => {
+  const current = await launch({
+    prepare: (workspace) => {
+      const dir = join(workspace, ".agents", "skills", "demo");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "SKILL.md"), "---\nname: demo\ndescription: A skill for the effort menu test\n---\n\nbody\n");
+    },
+  });
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await bracketPaste(session, "$demo");
+  await session.waitForPane((pane) => pane.includes("Effort 0") && /^┃ \$demo$/m.test(pane), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ *$/m.test(pane), 5_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
 }, TIMEOUT);
 
 test.skipIf(!tmuxAvailable())("a level the model does not offer, or a malformed one, changes nothing and names the levels", async () => {

@@ -1187,6 +1187,16 @@ pub fn Runtime(comptime App: type) type {
                 .mouse_pointer,
                 => {},
                 .clear_line => {
+                    // The open `/effort` menu holds only its query in the
+                    // composer; the draft it set aside, and that draft's
+                    // pending images, stay for the menu to give back.
+                    if (app.input_runtime.effort_menu.active) {
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                        paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+                        syncEffortMenu(app);
+                        app.shell.render_requests.request(.footer);
+                        return .done;
+                    }
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                     if (draftHasState(app, agents.screenAgentOf(app))) {
                         clearDraftState(app, agents.screenAgentOf(app), "clear_line");
@@ -1576,7 +1586,11 @@ pub fn Runtime(comptime App: type) type {
                 },
                 ' ' => {
                     dismissMentionSkillsMenuForSpace(app);
+                    // Under the open `/effort` menu the composer is only its
+                    // query, so a typed `/model <id> ` switches nothing.
+                    const effort_menu_open = app.input_runtime.effort_menu.active;
                     if (app.input_runtime.edit_state.selectionRange() == null and
+                        !effort_menu_open and
                         !commandSkillsMenuActive(app) and
                         completion_rt.hasModelQuery(app))
                     {
@@ -1584,6 +1598,7 @@ pub fn Runtime(comptime App: type) type {
                             app.shell.render_requests.request(.footer);
                         }
                     } else if (app.input_runtime.edit_state.selectionRange() == null and
+                        !effort_menu_open and
                         !agent.stream.active and
                         !commandSkillsMenuActive(app) and
                         provider_picker_rt.hasQuery(app) and
@@ -1745,9 +1760,19 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Like the model picker, the open `/effort` menu borrows the
+        /// composer; Ctrl+C and Ctrl+D back out of it and give the draft
+        /// back instead of clearing that draft's images or exiting.
+        fn exitEffortMenuIfActive(app: *App, reason: []const u8) bool {
+            if (!cancelEffortMenu(app, reason)) return false;
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         fn handleSemanticCtrlC(app: *App, agent: *AppAgent) !void {
             if (exitModelPickerShortcutIfActive(app)) return;
             if (exitMcpHostMenuIfActive(app)) return;
+            if (exitEffortMenuIfActive(app, "ctrl_c")) return;
             if (agent.stream.active and draftHasState(app, agent)) {
                 clearDraftState(app, agent, "ctrl_c");
                 app.shell.render_requests.request(.footer);
@@ -1818,6 +1843,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn handleSemanticCtrlD(app: *App, agent: *AppAgent, max_input_len: usize) !void {
             if (exitModelPickerShortcutIfActive(app)) return;
+            if (exitEffortMenuIfActive(app, "ctrl_d")) return;
             if (app.input_runtime.edit_state.input.items.len > 0) {
                 try routeComposerShortcutAction(app, agent, .delete_forward, max_input_len);
                 return;
