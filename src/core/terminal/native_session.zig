@@ -18,6 +18,7 @@ const command_admission = @import("../permissions/command_admission.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const execution_router = @import("../execution/router.zig");
 const io_mod = @import("../shared/io.zig");
+const env_settings = @import("../config/env_settings.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
@@ -878,7 +879,7 @@ const SupportedRegistry = struct {
             return;
         }
 
-        if (io_mod.getenv("FX_TEST_TERMINAL_FAIL_CANCELLATION_OPEN") != null) {
+        if (cancellationOpenFails(io_mod.getenv("FX_TEST_TERMINAL_FAIL_CANCELLATION_OPEN"))) {
             return error.InjectedCancellationOpenFailure;
         }
         const durable = try self.profile.open_terminal(session_id);
@@ -3651,6 +3652,13 @@ test "terminal signaling accepts a process group that exited during descendant d
     ));
 }
 
+/// Whether `raw`, the value of `FX_TEST_TERMINAL_FAIL_CANCELLATION_OPEN`,
+/// makes the next cancellation fail to open its session. Only an on value such
+/// as `1` turns it on.
+fn cancellationOpenFails(raw: ?[]const u8) bool {
+    return env_settings.testSwitchOn(raw);
+}
+
 fn failSignalStageForTest(stage: []const u8) bool {
     const requested = io_mod.getenv("FX_TEST_TERMINAL_FAIL_SIGNAL_STAGE") orelse
         return false;
@@ -5661,4 +5669,12 @@ test "the exit close ends a launcher's session only while the launcher is the pr
     fds[0].revents = 0;
     try std.testing.expect(try std.posix.poll(&fds, 15_000) != 0);
     try std.testing.expectEqual(@as(usize, 0), try std.posix.read(reports, &line));
+}
+
+test "only an on value fails the next terminal cancellation open" {
+    try std.testing.expect(!cancellationOpenFails(null));
+    try std.testing.expect(!cancellationOpenFails("0"));
+    try std.testing.expect(!cancellationOpenFails(""));
+    try std.testing.expect(!cancellationOpenFails("false"));
+    try std.testing.expect(cancellationOpenFails("1"));
 }

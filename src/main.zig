@@ -3883,11 +3883,11 @@ const App = struct {
         return AgentsAppRuntime.keepLentApproval(self, agent, pending);
     }
 
-    /// The worker and id of the subagent whose approval main's prompt
-    /// shows, while main is on screen, or null for main's own.
-    pub fn lentApproval(self: *App) ?struct { worker: *WorkerRuntime, id: []const u8 } {
+    /// The id of the subagent whose approval main's prompt shows, while main
+    /// is on screen, or null for main's own.
+    pub fn lentApproval(self: *App) ?[]const u8 {
         const child = AgentsAppRuntime.lentApproval(self, self.screenAgent()) orelse return null;
-        return .{ .worker = &child.agent.worker, .id = child.id };
+        return child.id;
     }
 
     /// The worker that owns the approval on screen: the subagent's while its
@@ -8569,7 +8569,8 @@ test "a hidden subagent's approval is lent to main's screen, answered on its wor
     try std.testing.expect(app.approval_lender == writer);
     try std.testing.expect(app.main_agent.approval_prompt.isActive());
     try std.testing.expect(!writer.agent.approval_prompt.isActive());
-    try std.testing.expect(app.lentApproval().?.worker == &writer.agent.worker);
+    try std.testing.expectEqualStrings("writer-id", app.lentApproval().?);
+    try std.testing.expect(app.approvalWorker(&app.main_agent) == &writer.agent.worker);
     // Main keeps it while its own worker asks nothing, and no question is
     // lent over it.
     try std.testing.expect(app.keepLentApproval(app.screenAgent(), null));

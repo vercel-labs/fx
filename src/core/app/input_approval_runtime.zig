@@ -266,7 +266,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
             switch (result) {
                 .accepted => {
                     if (comptime @hasDecl(App, "screenAgentId")) {
-                        const asker = if (lent) |subagent| subagent.id else subagentIdOf(app, agent);
+                        const asker = if (lent) |id| id else subagentIdOf(app, agent);
                         if (asker) |id| debug_trace.eventf("host", "approval_answered", .{}, "agent={s} screen={s}", .{ id, app.screenAgentId() });
                     }
                     clearApprovalPromptAfterSubmission(app, agent);

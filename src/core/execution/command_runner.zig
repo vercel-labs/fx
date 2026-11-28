@@ -8,6 +8,7 @@ const io_mod = @import("../shared/io.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const env_settings = @import("../config/env_settings.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const artifact_digest = @import("../session/artifact_digest.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -3531,7 +3532,7 @@ const ProcessObserver = struct {
     fn statusFromTerm(
         term: std.process.Child.Term,
     ) command_contract.CommandStatus {
-        if (io_mod.getenv("FX_TEST_COMMAND_INDETERMINATE_AFTER_EXIT") != null) {
+        if (indeterminateAfterExitForced(io_mod.getenv("FX_TEST_COMMAND_INDETERMINATE_AFTER_EXIT"))) {
             debug_trace.logf(
                 "core",
                 "command termination became indeterminate reason=injected_after_exit",
@@ -4036,7 +4037,7 @@ fn collectSpawnedProcess(
     );
     wait_pending = false;
     var output_incomplete = collected_output.output_incomplete;
-    if (io_mod.getenv("FX_TEST_COMMAND_OUTPUT_INCOMPLETE_AFTER_EXIT") != null) {
+    if (outputIncompleteAfterExitForced(io_mod.getenv("FX_TEST_COMMAND_OUTPUT_INCOMPLETE_AFTER_EXIT"))) {
         recordOutputDrainFailure(
             &output_incomplete,
             "injected_after_exit",
@@ -4049,6 +4050,20 @@ fn collectSpawnedProcess(
         .output_incomplete = output_incomplete,
         .natural_completion_ms = collected_output.natural_completion_ms,
     };
+}
+
+/// Whether `raw`, the value of `FX_TEST_COMMAND_INDETERMINATE_AFTER_EXIT`,
+/// makes a finished command's status indeterminate. Only an on value such as
+/// `1` turns it on.
+fn indeterminateAfterExitForced(raw: ?[]const u8) bool {
+    return env_settings.testSwitchOn(raw);
+}
+
+/// Whether `raw`, the value of `FX_TEST_COMMAND_OUTPUT_INCOMPLETE_AFTER_EXIT`,
+/// makes a finished command's output incomplete. Only an on value such as `1`
+/// turns it on.
+fn outputIncompleteAfterExitForced(raw: ?[]const u8) bool {
+    return env_settings.testSwitchOn(raw);
 }
 
 fn mapTerminationError(
@@ -7379,4 +7394,20 @@ test "supervisor fallback force remains timeout dominant" {
     try std.testing.expect(returned_result == null);
     try std.testing.expect(delay.seen);
     try std.testing.expect(!absoluteFileExists(term_path));
+}
+
+test "only an on value makes a finished command's status indeterminate" {
+    try std.testing.expect(!indeterminateAfterExitForced(null));
+    try std.testing.expect(!indeterminateAfterExitForced("0"));
+    try std.testing.expect(!indeterminateAfterExitForced(""));
+    try std.testing.expect(!indeterminateAfterExitForced("false"));
+    try std.testing.expect(indeterminateAfterExitForced("1"));
+}
+
+test "only an on value makes a finished command's output incomplete" {
+    try std.testing.expect(!outputIncompleteAfterExitForced(null));
+    try std.testing.expect(!outputIncompleteAfterExitForced("0"));
+    try std.testing.expect(!outputIncompleteAfterExitForced(""));
+    try std.testing.expect(!outputIncompleteAfterExitForced("false"));
+    try std.testing.expect(outputIncompleteAfterExitForced("1"));
 }
