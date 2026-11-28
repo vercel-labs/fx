@@ -274,7 +274,8 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
   return {
     id: sessionIds[0]!,
     created_at_ms: lines[0].ts,
-    updated_at_ms: lines.at(-1).ts,
+    // The listing's time is the newest turn or item line, not `closed` (D104).
+    updated_at_ms: lines.findLast((line) => ["turn_started", "item", "turn_committed", "turn_interrupted"].includes(line.kind)).ts,
     workspace_root: created.workspace,
     origin_workspace_root: created.workspace,
     conversation_language: "en",
