@@ -37,6 +37,11 @@
 //! - `fatal_error`: only in a crash report, right after the header: `error`,
 //!   the error's name, `message`, the same plain words fx shows, and `at`, the
 //!   time the error ended the session.
+//! - `crash_report_truncated`: only in a crash report that was cut to fit
+//!   `last_crash_max_bytes`, right before `end`: `limit_bytes`,
+//!   `original_bytes` (the size before the cut), `dropped_transcript_records`
+//!   (the `transcript` and `transcript_entry` records), and
+//!   `dropped_other_records` (the trace log and every other record).
 //! - `summary`: `os`, `arch`, `build` (`Debug`, `ReleaseSafe`, `ReleaseFast`,
 //!   or `ReleaseSmall`), `model`, `fast_mode`, `permission_mode`, `workspace`.
 //! - `current_state`: `session_id`, `session_dir`, `agent_step_limit`,
@@ -68,7 +73,8 @@
 //!   `turn_id`, `detail`}, for the newest 3 failures; `mcp_server` {`issue`
 //!   (`failed`, `retrying`, `missing_env`, `invalid_env`, or `needs_login`),
 //!   `name`, `variable`, `error` (masked)}; `model_catalog` {`event`,
-//!   `detail`}, for the newest 3 failures.
+//!   `detail`}, for the newest 3 failures; `sign_in` {`at`, `event`,
+//!   `detail`}, for the newest 3 failed `sign_in_event` records.
 //! - `last_shutdown`: `status` (`recorded`, `none`, or `unreadable`),
 //!   `total_ms`, `recorded_at`, and `stages`, a list of {`name`, `step_ms`}.
 //! - `last_crash`: `status` (`recorded`, `none`, `too_large`, `unreadable`, `stale`, `future`, or `undated`), the crash
@@ -175,6 +181,33 @@
 //!   session. Then a `failed_model_catalog_event` per kept failure, oldest
 //!   first, with the `model_catalog_event` fields and the same `sequence`;
 //!   the `model_catalog` problems come from these.
+//! - `sign_in`: `events`, the events the bounded ring holds, at most 32;
+//!   `session_events`, every event this session; `kept_failures`, the failed
+//!   events kept apart from the ring, at most 32, which later successful
+//!   events never push out (a newer failure replaces the oldest);
+//!   `session_failures`, every failed event this session. Then a
+//!   `sign_in_event` per retained event, oldest first: `at`, `sequence`,
+//!   `event`, `failed`, `detail`, and `truncated`, whether the detail was cut
+//!   when recorded. Then a `failed_sign_in_event` per kept failure, oldest
+//!   first, with the same fields and `sequence`. `event` is `lock_wait`, a
+//!   wait for the fx login's `auth.lock` that every fx process sharing the
+//!   login takes (`outcome` `taken`, `given_up`, or the name of another lock
+//!   error, `waited_ms`, and for a failure `limit_ms`);
+//!   `refresh`, one refresh of the saved fx login (`mode`, then `outcome`
+//!   `rotated` or `saved_login_used` with `saved_expired` and `ms`,
+//!   `failed` with the `step` and `err` where it stopped and `ms`, or
+//!   `no_saved_login` with only the `step`, `lock` or `load`, that found no
+//!   login); `issuer`, its request to the issuer (`outcome`, `step`, `err`,
+//!   `ms`, `login_deleted`, whether fx deleted the saved login after the
+//!   request failed); or `prompt`, a prompt that stopped for its credential
+//!   or went on after a sign-in (`outcome`, `screen` `main` or `subagent`,
+//!   `turn_id`; for a failure `source`, `reason`, `retryable`, `err`, and
+//!   `notice` `shown` or `not_shown`; for `resumed`, `trigger`:
+//!   `auth_completion` after a sign-in, `submit` when Enter found the
+//!   credential current, or `retry` when Enter started a new refresh). A
+//!   `detail` holds only these names, counts, and durations, never a token
+//!   or an account. Sign-in events are recorded
+//!   even when `FX_TRACE` is off.
 //! - `tool_calls`: `retained`, `outcomes` {`succeeded`, `rejected`,
 //!   `command_failed`, `tool_failed`, `runtime_failed`}, `total_ms`, `session`
 //!   {`calls`, `outcomes`, `total_ms`}, `complete`, `web_search_retained`,
@@ -361,6 +394,7 @@ const os_error_problems_shown: usize = 3;
 const tool_problems_shown: usize = 5;
 const compaction_problems_shown: usize = 3;
 const model_catalog_problems_shown: usize = 3;
+const sign_in_problems_shown: usize = 3;
 const output_limit_problems_shown: usize = 5;
 const trace_tail_bytes: usize = 6 * 1024;
 const trace_max_lines: usize = 80;
@@ -596,6 +630,7 @@ fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     try writeSubagents(r, app);
     try writeNetwork(r);
     try writeModelCatalog(r, app);
+    try writeSignIn(r);
     try writeToolCalls(r, history, shell_view);
     try writePermissions(r, permission_grants);
     try writeAutoReviews(r);
@@ -615,11 +650,17 @@ fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     try writeRendererState(r, app, &secrets, &masking);
     try writeRendererEvents(r);
     try writeTranscript(r, transcript);
-    if (debug_trace.activeLogPath() orelse io_mod.getenv("FX_TRACE_LOG")) |path| {
+    if (traceLogPath()) |path| {
         try writeTraceLog(r, path);
     }
     try writeEnd(r);
     return .{ .bytes = try out.toOwnedSlice(), .crash = records.included_crash };
+}
+
+/// The trace log path a report names: only a path that a trace actually opened.
+/// A refused path is never reported, even when `FX_TRACE_LOG` names it.
+fn traceLogPath() ?[]const u8 {
+    return debug_trace.activeLogPath();
 }
 
 fn writeHeader(r: *Records, fx_version: []const u8, now_ms: i64) !void {
@@ -742,7 +783,7 @@ noinline fn writeCurrentState(r: *Records, app: anytype, crash_report: bool) !vo
         try r.endObject();
     }
     try r.boolean("fx_trace", envTruthy("FX_TRACE"));
-    if (debug_trace.activeLogPath() orelse io_mod.getenv("FX_TRACE_LOG")) |path| try r.masked("trace_log", path);
+    if (traceLogPath()) |path| try r.masked("trace_log", path);
     if (comptime agents.hasAgentField(App, "stream")) {
         const stream = &agent.stream;
         try r.beginObject("stream");
@@ -910,6 +951,7 @@ noinline fn writeProblems(r: *Records, app: anytype) !void {
     try writeCompactionProblems(p);
     try writeMcpHostProblems(p, app);
     try writeModelCatalogProblems(p);
+    try writeSignInProblems(p);
     try writeOutputLimitProblems(p);
 
     try r.begin("problems");
@@ -1070,6 +1112,24 @@ fn writeModelCatalogProblems(p: *Records) !void {
         const event = &events[index];
         reported += 1;
         try beginProblem(p, "model_catalog");
+        try p.text("event", event.name());
+        try p.optionalText("detail", event.detail());
+        try p.end();
+    }
+}
+
+/// The newest failed sign-in events: a refresh, an issuer request, or an
+/// `auth.lock` wait that failed, or a prompt that waits for a sign-in. They
+/// come from the kept failures, so later sign-in events never remove them.
+fn writeSignInProblems(p: *Records) !void {
+    var events: [diagnostics.failed_sign_in_event_capacity]diagnostics.SignInEvent = undefined;
+    const count = diagnostics.snapshotFailedSignInEvents(&events);
+    var index = count;
+    while (index > count -| sign_in_problems_shown) {
+        index -= 1;
+        const event = &events[index];
+        try beginProblem(p, "sign_in");
+        try p.time("at", event.timestamp_ms);
         try p.text("event", event.name());
         try p.optionalText("detail", event.detail());
         try p.end();
@@ -1797,6 +1857,43 @@ fn writeModelCatalog(r: *Records, app: anytype) !void {
         try writeModelCatalogEventFields(r, event);
         try r.end();
     }
+}
+
+/// The always-on sign-in events and the failed ones kept apart from them, so
+/// a shared trace shows why a prompt waited for a sign-in without FX_TRACE.
+fn writeSignIn(r: *Records) !void {
+    var events: [diagnostics.sign_in_ring_capacity]diagnostics.SignInEvent = undefined;
+    const count = diagnostics.snapshotSignInEvents(&events);
+    const kept = try r.arena.alloc(diagnostics.SignInEvent, diagnostics.failed_sign_in_event_capacity);
+    const kept_count = diagnostics.snapshotFailedSignInEvents(kept);
+
+    try r.begin("sign_in");
+    try r.number("events", count);
+    // Read after the snapshots, so neither is ever less than what they hold.
+    try r.number("session_events", diagnostics.signInEventCount());
+    try r.number("kept_failures", kept_count);
+    try r.number("session_failures", diagnostics.signInFailureCount());
+    try r.end();
+
+    for (events[0..count]) |*event| {
+        try r.begin("sign_in_event");
+        try writeSignInEventFields(r, event);
+        try r.end();
+    }
+    for (kept[0..kept_count]) |*event| {
+        try r.begin("failed_sign_in_event");
+        try writeSignInEventFields(r, event);
+        try r.end();
+    }
+}
+
+fn writeSignInEventFields(r: *Records, event: *const diagnostics.SignInEvent) !void {
+    try r.time("at", event.timestamp_ms);
+    try r.number("sequence", event.sequence);
+    try r.text("event", event.name());
+    try r.boolean("failed", event.failed);
+    try r.optionalText("detail", event.detail());
+    try r.boolean("truncated", event.truncated);
 }
 
 fn writeModelCatalogEventFields(r: *Records, event: *const diagnostics.ModelCatalogEvent) !void {
@@ -3034,7 +3131,8 @@ pub const SavedCrashReport = struct {
 /// Saves the crash report to `~/.fx/diagnostics/last-crash.jsonl`. The file holds
 /// the same private data as a `/trace` report, and fx overwrites it on each crash.
 /// A failed write is logged to the debug trace and returned as its error, so the
-/// caller can tell the person.
+/// caller can tell the person. A report too long for `/trace` to read is cut
+/// first, by `capCrashReportBytes`.
 pub fn writeCrashReport(app: anytype, err: anyerror) anyerror!SavedCrashReport {
     return writeCrashReportInner(app, err) catch |write_err| {
         debug_trace.logf("core", "crash report write failed err={s}", .{@errorName(write_err)});
@@ -3048,7 +3146,9 @@ fn writeCrashReportInner(app: anytype, err: anyerror) !SavedCrashReport {
     const path = try profile_paths.lastCrashReportPath(alloc, home);
     errdefer alloc.free(path);
 
-    const report = (try buildReport(app, err)).bytes;
+    const built = try buildReport(app, err);
+    defer alloc.free(built.bytes);
+    const report = try capCrashReportBytes(alloc, built.bytes, last_crash_max_bytes);
     defer alloc.free(report);
 
     var home_dir = io_mod.VerifiedDir{
@@ -3090,6 +3190,197 @@ fn replaceCrashReport(alloc: std.mem.Allocator, diagnostics_dir: *io_mod.Verifie
         else => return err,
     };
     return true;
+}
+
+/// The most bytes a `crash_report_truncated` record takes: its fixed text and
+/// four integers of at most 20 digits each.
+const crash_truncated_record_max_bytes: usize = 256;
+
+/// Which records of a crash report `capCrashReportBytes` may drop. The head and
+/// the end always stay.
+const CrashRecordKind = enum { head, end, transcript, trace_log, other };
+
+fn crashRecordKind(line: []const u8) CrashRecordKind {
+    const record_type = recordTypeOf(line) orelse return .other;
+    if (std.mem.eql(u8, record_type, "fx_trace") or std.mem.eql(u8, record_type, "fatal_error")) return .head;
+    if (std.mem.eql(u8, record_type, "end")) return .end;
+    if (std.mem.eql(u8, record_type, "transcript") or std.mem.eql(u8, record_type, "transcript_entry")) return .transcript;
+    if (std.mem.eql(u8, record_type, "trace_log") or std.mem.eql(u8, record_type, "trace_log_line")) return .trace_log;
+    return .other;
+}
+
+/// The `type` of a record line. `Records.begin` writes `type` first, so a line
+/// that does not start that way has none.
+fn recordTypeOf(line: []const u8) ?[]const u8 {
+    const prefix = "{\"type\":\"";
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    const rest = line[prefix.len..];
+    const name_end = std.mem.findScalar(u8, rest, '"') orelse return null;
+    return rest[0..name_end];
+}
+
+/// One record line of a crash report, without its newline.
+const CrashRecord = struct {
+    line: []const u8,
+    kind: CrashRecordKind,
+    dropped: bool = false,
+};
+
+/// A crash report split for `capCrashReportBytes`. `head` and `end` are always
+/// kept; `middle` holds the records between them, in order. Each `*_bytes` counts
+/// its lines with their newlines, so sizes add up exactly.
+const CrashParts = struct {
+    head: std.ArrayList([]const u8) = .empty,
+    middle: std.ArrayList(CrashRecord) = .empty,
+    end: ?[]const u8 = null,
+    head_bytes: usize = 0,
+    middle_bytes: usize = 0,
+    end_bytes: usize = 0,
+
+    fn deinit(self: *CrashParts, alloc: std.mem.Allocator) void {
+        self.head.deinit(alloc);
+        self.middle.deinit(alloc);
+    }
+};
+
+fn splitCrashReport(alloc: std.mem.Allocator, report: []const u8) !CrashParts {
+    var parts: CrashParts = .{};
+    errdefer parts.deinit(alloc);
+    var lines = std.mem.splitScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const cost = line.len + 1;
+        switch (crashRecordKind(line)) {
+            .head => {
+                try parts.head.append(alloc, line);
+                parts.head_bytes += cost;
+            },
+            .end => {
+                // A second `end` is an ordinary record: `end` is the one the reader checks last.
+                if (parts.end == null) {
+                    parts.end = line;
+                    parts.end_bytes = cost;
+                } else {
+                    try parts.middle.append(alloc, .{ .line = line, .kind = .other });
+                    parts.middle_bytes += cost;
+                }
+            },
+            else => |kind| {
+                try parts.middle.append(alloc, .{ .line = line, .kind = kind });
+                parts.middle_bytes += cost;
+            },
+        }
+    }
+    return parts;
+}
+
+/// The cut state of a crash report: which middle records are dropped, and the
+/// size the report has with those drops and its `crash_report_truncated` record.
+const CrashCut = struct {
+    parts: *CrashParts,
+    original_bytes: usize,
+    max_bytes: usize,
+    /// Bytes of the middle records that are not dropped.
+    kept_middle_bytes: usize,
+    dropped_transcript: usize = 0,
+    dropped_other: usize = 0,
+
+    fn notice(self: *const CrashCut, buf: []u8) []const u8 {
+        return crashTruncatedRecord(buf, self.max_bytes, self.original_bytes, self.dropped_transcript, self.dropped_other);
+    }
+
+    fn size(self: *const CrashCut) usize {
+        var buf: [crash_truncated_record_max_bytes]u8 = undefined;
+        return self.parts.head_bytes + self.parts.end_bytes + self.kept_middle_bytes + self.notice(&buf).len;
+    }
+
+    fn fits(self: *const CrashCut) bool {
+        // The reader rejects a file of exactly `max_bytes`, so the report must be shorter.
+        return self.size() < self.max_bytes;
+    }
+
+    fn drop(self: *CrashCut, index: usize) void {
+        const record = &self.parts.middle.items[index];
+        record.dropped = true;
+        self.kept_middle_bytes -= record.line.len + 1;
+        switch (record.kind) {
+            .transcript => {
+                self.dropped_transcript += 1;
+            },
+            else => {
+                self.dropped_other += 1;
+            },
+        }
+    }
+};
+
+/// The `crash_report_truncated` record, with its newline. Its values are integers,
+/// so it is formatted here, not written through `Records`.
+fn crashTruncatedRecord(buf: []u8, limit_bytes: usize, original_bytes: usize, dropped_transcript: usize, dropped_other: usize) []const u8 {
+    // The fixed text and four integers of at most 20 digits fit `buf`.
+    return std.mem.print(buf, "{{\"type\":\"crash_report_truncated\",\"limit_bytes\":{d},\"original_bytes\":{d},\"dropped_transcript_records\":{d},\"dropped_other_records\":{d}}}\n", .{ limit_bytes, original_bytes, dropped_transcript, dropped_other }) catch unreachable;
+}
+
+/// `report` cut to fit in `max_bytes`, which the caller frees. A report that is
+/// already shorter than `max_bytes` is returned as it is. The cut drops the
+/// oldest transcript records first, then the trace log, then the other records,
+/// oldest first, and writes a `crash_report_truncated` record in their place. If
+/// even that is too long, only the head records that fit are kept.
+fn capCrashReportBytes(alloc: std.mem.Allocator, report: []const u8, max_bytes: usize) ![]u8 {
+    if (report.len < max_bytes) return alloc.dupe(u8, report);
+
+    var parts = try splitCrashReport(alloc, report);
+    defer parts.deinit(alloc);
+    var cut: CrashCut = .{
+        .parts = &parts,
+        .original_bytes = report.len,
+        .max_bytes = max_bytes,
+        .kept_middle_bytes = parts.middle_bytes,
+    };
+    drops: for ([_]CrashRecordKind{ .transcript, .trace_log, .other }) |kind| {
+        for (parts.middle.items, 0..) |record, index| {
+            if (record.kind != kind) continue;
+            if (cut.fits()) break :drops;
+            cut.drop(index);
+        }
+    }
+    if (!cut.fits()) return headOnlyCrashReport(alloc, &parts, max_bytes);
+    return writeCutCrashReport(alloc, &parts, &cut);
+}
+
+fn writeCrashLine(w: *std.Io.Writer, line: []const u8) !void {
+    try w.writeAll(line);
+    try w.writeByte('\n');
+}
+
+/// The records that `capCrashReportBytes` keeps: the head, the middle that is not
+/// dropped, the notice, and the end.
+fn writeCutCrashReport(alloc: std.mem.Allocator, parts: *const CrashParts, cut: *const CrashCut) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    for (parts.head.items) |line| try writeCrashLine(&out.writer, line);
+    for (parts.middle.items) |record| {
+        if (!record.dropped) try writeCrashLine(&out.writer, record.line);
+    }
+    var buf: [crash_truncated_record_max_bytes]u8 = undefined;
+    try out.writer.writeAll(cut.notice(&buf));
+    if (parts.end) |line| try writeCrashLine(&out.writer, line);
+    std.debug.assert(out.written().len < cut.max_bytes);
+    return out.toOwnedSlice();
+}
+
+/// The head records that fit in `max_bytes`, in order. Used only when the head
+/// and the notice do not fit, so no notice is written.
+fn headOnlyCrashReport(alloc: std.mem.Allocator, parts: *const CrashParts, max_bytes: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var used: usize = 0;
+    for (parts.head.items) |line| {
+        if (used + line.len + 1 >= max_bytes) break;
+        try writeCrashLine(&out.writer, line);
+        used += line.len + 1;
+    }
+    return out.toOwnedSlice();
 }
 
 // Tests read the records back the way a program would: each line on its own,
@@ -3704,6 +3995,184 @@ test "trace last crash read reports a file over the cap as too_large" {
     defer trace.deinit();
     try std.testing.expectEqualStrings("too_large", try testString(try trace.one("last_crash"), "status"));
     try std.testing.expectEqual(@as(usize, 0), trace.count("last_crash_record"));
+}
+
+/// A record line that is `total` bytes long: `prefix`, then `x` padding, then the
+/// closing `"}` and a newline.
+fn testRecordLine(arena: std.mem.Allocator, prefix: []const u8, total: usize) ![]u8 {
+    var line: std.ArrayList(u8) = .empty;
+    try line.appendSlice(arena, prefix);
+    const closing = "\"}\n";
+    for (0..total -| (prefix.len + closing.len)) |_| try line.append(arena, 'x');
+    try line.appendSlice(arena, closing);
+    return line.items;
+}
+
+/// A crash report in the order `buildReport` writes it: the header, the fatal
+/// error, the transcript summary, `entries` transcript entries of about
+/// `entry_bytes` each, `extra` (one record line, or empty), the trace log, and
+/// the end. The end's count is not checked by these tests.
+fn testCrashReport(arena: std.mem.Allocator, entries: usize, entry_bytes: usize, extra: []const u8) ![]u8 {
+    var report: std.ArrayList(u8) = .empty;
+    try report.appendSlice(arena, crash_test_header);
+    try report.appendSlice(arena, crash_test_fatal);
+    try report.appendSlice(arena, try arena.print("{{\"type\":\"transcript\",\"entries\":{d},\"emitted\":{d}}}\n", .{ entries, entries }));
+    for (0..entries) |index| {
+        const prefix = try arena.print("{{\"type\":\"transcript_entry\",\"text\":\"e{d:0>4}", .{index});
+        try report.appendSlice(arena, try testRecordLine(arena, prefix, entry_bytes));
+    }
+    try report.appendSlice(arena, extra);
+    try report.appendSlice(arena, "{\"type\":\"trace_log\",\"path\":\"/tmp/fx.log\",\"bytes\":40,\"older_lines_cut\":false,\"lines\":2}\n");
+    try report.appendSlice(arena, "{\"type\":\"trace_log_line\",\"text\":\"first\"}\n");
+    try report.appendSlice(arena, "{\"type\":\"trace_log_line\",\"text\":\"second\"}\n");
+    try report.appendSlice(arena, "{\"type\":\"end\",\"records\":0}\n");
+    return report.items;
+}
+
+test "crash report cap returns a report under the limit unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const report = try testCrashReport(arena.allocator(), 3, 100, "");
+    const capped = try capCrashReportBytes(std.testing.allocator, report, report.len + 1);
+    defer std.testing.allocator.free(capped);
+    try std.testing.expectEqualStrings(report, capped);
+    try std.testing.expect(std.mem.find(u8, capped, "crash_report_truncated") == null);
+}
+
+test "crash report cap treats a report of exactly the limit as too long" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const report = try testCrashReport(arena.allocator(), 3, 100, "");
+    const capped = try capCrashReportBytes(std.testing.allocator, report, report.len);
+    defer std.testing.allocator.free(capped);
+    try std.testing.expect(capped.len < report.len);
+    try std.testing.expect(std.mem.find(u8, capped, "crash_report_truncated") != null);
+}
+
+test "crash report cap drops the oldest transcript records and keeps the newest" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const report = try testCrashReport(a, 40, 200, "");
+    const capped = try capCrashReportBytes(std.testing.allocator, report, 4096);
+    defer std.testing.allocator.free(capped);
+    try std.testing.expect(capped.len < 4096);
+
+    var trace = try TestTrace.parse(capped);
+    defer trace.deinit();
+    const kept = trace.count("transcript_entry");
+    try std.testing.expect(kept > 0 and kept < 40);
+    // The summary is the first transcript record, so it goes with the oldest entries.
+    try std.testing.expectEqual(@as(usize, 0), trace.count("transcript"));
+    for (0..kept) |index| {
+        const want = try a.print("e{d:0>4}", .{40 - kept + index});
+        try expectStartsWith(try testString(try trace.nth("transcript_entry", index), "text"), want);
+    }
+
+    const notice = try trace.one("crash_report_truncated");
+    try std.testing.expectEqual(@as(i64, 4096), try testInt(notice, "limit_bytes"));
+    try std.testing.expectEqual(@as(i64, @intCast(report.len)), try testInt(notice, "original_bytes"));
+    // The summary and the 40 - kept oldest entries.
+    try std.testing.expectEqual(@as(i64, @intCast(41 - kept)), try testInt(notice, "dropped_transcript_records"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(notice, "dropped_other_records"));
+    try std.testing.expectEqualStrings("fx_trace", try testString(trace.records[0], "type"));
+    _ = try trace.one("fatal_error");
+    try std.testing.expectEqual(@as(usize, 1), trace.count("trace_log"));
+    try std.testing.expectEqualStrings("crash_report_truncated", try testString(trace.records[trace.records.len - 2], "type"));
+    try std.testing.expectEqualStrings("end", try testString(trace.records[trace.records.len - 1], "type"));
+}
+
+test "crash report cap drops the trace log and other records once transcript records are not enough" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const extra = try testRecordLine(a, "{\"type\":\"renderer_event\",\"detail\":\"", 3000);
+    const report = try testCrashReport(a, 3, 100, extra);
+    const capped = try capCrashReportBytes(std.testing.allocator, report, 1024);
+    defer std.testing.allocator.free(capped);
+    try std.testing.expect(capped.len < 1024);
+
+    var trace = try TestTrace.parse(capped);
+    defer trace.deinit();
+    const notice = try trace.one("crash_report_truncated");
+    // The summary and the three entries; then the three trace log records and the renderer event.
+    try std.testing.expectEqual(@as(i64, 4), try testInt(notice, "dropped_transcript_records"));
+    try std.testing.expectEqual(@as(i64, 4), try testInt(notice, "dropped_other_records"));
+    try std.testing.expectEqual(@as(usize, 0), trace.count("renderer_event"));
+    try std.testing.expectEqual(@as(usize, 0), trace.count("trace_log"));
+    try std.testing.expectEqual(@as(usize, 0), trace.count("trace_log_line"));
+    try std.testing.expectEqualStrings("fx_trace", try testString(trace.records[0], "type"));
+    _ = try trace.one("fatal_error");
+    _ = try trace.one("end");
+}
+
+test "crash report cap keeps a crash that /trace reads back, where the full report is too long" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const limit: usize = 4096;
+    const report = try testCrashReport(a, 40, 200, "");
+    const capped = try capCrashReportBytes(a, report, limit);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "full-crash.jsonl", .data = report });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "capped-crash.jsonl", .data = capped });
+    const full_path = try std.Io.Dir.path.join(a, &.{ dir, "full-crash.jsonl" });
+    const capped_path = try std.Io.Dir.path.join(a, &.{ dir, "capped-crash.jsonl" });
+    // The uncut report is over the limit, so `/trace` reads it as too_large.
+    try std.testing.expectEqual(std.meta.Tag(io_mod.FileRead).too_large, std.meta.activeTag(io_mod.readRegularFile(a, full_path, limit)));
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeLastCrashRead(&w.records, io_mod.readRegularFile(a, capped_path, limit), crash_test_now_ms);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const crash = try trace.one("last_crash");
+    try std.testing.expectEqualStrings("recorded", try testString(crash, "status"));
+    try std.testing.expectEqualStrings("InvalidTranscriptTransition", try testString(crash, "error"));
+    try std.testing.expectEqualStrings("invalid transcript transition", try testString(crash, "message"));
+
+    var truncated: ?std.json.ObjectMap = null;
+    for (0..trace.count("last_crash_record")) |index| {
+        const embedded = try testObject(try trace.nth("last_crash_record", index), "record");
+        if (std.mem.eql(u8, try testString(embedded, "type"), "crash_report_truncated")) truncated = embedded;
+    }
+    const notice = truncated orelse return error.TestRecordMissing;
+    try std.testing.expectEqual(@as(i64, limit), try testInt(notice, "limit_bytes"));
+    try std.testing.expectEqual(@as(i64, @intCast(report.len)), try testInt(notice, "original_bytes"));
+    try std.testing.expect((try testInt(notice, "dropped_transcript_records")) > 0);
+}
+
+test "crash report cap keeps only the header when the limit is too small for the fatal error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const report = try testCrashReport(arena.allocator(), 3, 100, "");
+    const capped = try capCrashReportBytes(std.testing.allocator, report, 256);
+    defer std.testing.allocator.free(capped);
+    try std.testing.expect(capped.len < 256);
+
+    var trace = try TestTrace.parse(capped);
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, 1), trace.records.len);
+    try std.testing.expectEqualStrings("fx_trace", try testString(trace.records[0], "type"));
+}
+
+test "crash report cap holds the limit and valid JSONL at every limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const report = try testCrashReport(arena.allocator(), 6, 120, "");
+    // A limit of 0 has no output that fits, so the sweep starts at 1.
+    var limit: usize = 1;
+    while (limit <= report.len + 1) : (limit += 1) {
+        const capped = try capCrashReportBytes(std.testing.allocator, report, limit);
+        defer std.testing.allocator.free(capped);
+        try std.testing.expect(capped.len < limit);
+        var trace = try TestTrace.parse(capped);
+        defer trace.deinit();
+    }
 }
 
 test "trace log read refuses a FIFO at its path and writes no trace log" {
@@ -4346,6 +4815,56 @@ test "trace failed compaction details keep whole characters past the ring's boun
             if (!std.mem.eql(u8, record_type, "problem")) try std.testing.expect(try testBool(record, "truncated"));
         }
     }
+}
+
+test "trace sign-in records each lock wait and refresh, and keeps the failures as problems" {
+    const sign_in_trace = @import("../auth/sign_in_trace.zig");
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    const empty = try TestWriter.create();
+    defer empty.destroy();
+    try writeSignIn(&empty.records);
+    var empty_trace = try empty.trace();
+    defer empty_trace.deinit();
+    const none = try empty_trace.one("sign_in");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(none, "events"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(none, "kept_failures"));
+
+    sign_in_trace.record(.lock_wait, false, "outcome=taken waited_ms={d}", .{4_200});
+    sign_in_trace.record(.issuer, true, "outcome=failed step=token err={s} ms={d} login_deleted=false", .{ "Timeout", 15_000 });
+    sign_in_trace.record(.refresh, true, "mode=if_needed outcome=failed step=issuer err={s} ms={d}", .{ "Timeout", 19_200 });
+    sign_in_trace.record(.prompt, true, "outcome=waits_for_sign_in screen=subagent turn_id={d}", .{5});
+    // Later events that succeed never push the failures out.
+    for (0..diagnostics.sign_in_ring_capacity) |_| sign_in_trace.record(.lock_wait, false, "outcome=taken waited_ms={d}", .{0});
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSignIn(&w.records);
+    try writeSignInProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("sign_in");
+    try std.testing.expectEqual(@as(i64, diagnostics.sign_in_ring_capacity), try testInt(summary, "events"));
+    try std.testing.expectEqual(@as(i64, diagnostics.sign_in_ring_capacity + 4), try testInt(summary, "session_events"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "kept_failures"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "session_failures"));
+    try std.testing.expectEqual(diagnostics.sign_in_ring_capacity, trace.count("sign_in_event"));
+
+    try std.testing.expectEqual(@as(usize, 3), trace.count("failed_sign_in_event"));
+    const issuer = try trace.nth("failed_sign_in_event", 0);
+    try std.testing.expectEqualStrings("issuer", try testString(issuer, "event"));
+    try std.testing.expect(try testBool(issuer, "failed"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(issuer, "sequence"));
+    try std.testing.expectEqualStrings("outcome=failed step=token err=Timeout ms=15000 login_deleted=false", try testString(issuer, "detail"));
+
+    // Problems list the newest failure first.
+    try std.testing.expectEqual(@as(usize, sign_in_problems_shown), trace.count("problem"));
+    const newest = try trace.nth("problem", 0);
+    try std.testing.expectEqualStrings("sign_in", try testString(newest, "kind"));
+    try std.testing.expectEqualStrings("prompt", try testString(newest, "event"));
+    try std.testing.expectEqualStrings("outcome=waits_for_sign_in screen=subagent turn_id=5", try testString(newest, "detail"));
+    try std.testing.expectEqualStrings("issuer", try testString(try trace.nth("problem", 2), "event"));
 }
 
 test "trace model catalog records events and its problems" {
@@ -6298,8 +6817,8 @@ test "trace permissions and MCP servers become records with errors masked" {
         .{ .name = "env", .state = .missing_env, .transport = .stdio, .tools = 0, .signed_in = false, .needs_login = false, .missing = "API_TOKEN" },
     } };
     const grants = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("exa_search"), .target_path = @constCast("*") },
-        .{ .tool_name = @constCast("shell"), .target_path = @constCast("zig build") },
+        .{ .tool_name = @constCast("exa_search"), .target_path = @constCast("*"), .shell_epoch = 0 },
+        .{ .tool_name = @constCast("shell"), .target_path = @constCast("zig build"), .shell_epoch = 0 },
     };
     const w = try TestWriter.create();
     defer w.destroy();
@@ -7119,4 +7638,35 @@ test "trace stays well formed with every ring full and a long transcript" {
     try expectStartsWith(last_text, "AI_GATEWAY_API_KEY=[redacted]");
     try std.testing.expect(std.mem.find(u8, last_text, "\\xff\\xc3") != null);
     try expectEndsWith(last_text, "\nred line");
+}
+
+test "trace log path for a report never falls back to a refused FX_TRACE_LOG" {
+    const alloc = std.testing.allocator;
+    io_mod.resetEnvironForTest();
+    defer io_mod.resetEnvironForTest();
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const fifo = try std.Io.Dir.path.join(alloc, &.{ dir, "trace.log" });
+    defer alloc.free(fifo);
+    const fifo_z = try alloc.allocSentinel(u8, fifo.len, 0);
+    defer alloc.free(fifo_z);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("FX_TRACE_LOG", fifo);
+    io_mod.setEnvironMap(&env);
+
+    // Configuring refuses the FIFO without blocking, so no file sink is active.
+    try debug_trace.configureForTest(alloc, fifo);
+    try std.testing.expectEqual(@as(?[]const u8, null), debug_trace.activeLogPath());
+    try std.testing.expectEqual(@as(?[]const u8, null), traceLogPath());
 }

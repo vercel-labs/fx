@@ -3,6 +3,7 @@ const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const builtin = @import("builtin");
+const child_wait = @import("../shared/child_wait.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const display_width = @import("../shared/display_width.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
@@ -2127,8 +2128,8 @@ fn runBoundedChild(argv: []const []const u8, budget: CaptureBudget) !bool {
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    // Kills and reaps the child unless the loop below already reaped it.
-    defer child.kill(zio);
+    // SIGKILLs and reaps the child on every exit that has not reaped it yet.
+    defer child_wait.killAndReap(&child);
     const pid = child.id orelse return error.ProcessNotFound;
     while (true) {
         var status: c_int = 0;
@@ -2145,12 +2146,6 @@ fn runBoundedChild(argv: []const []const u8, budget: CaptureBudget) !bool {
         }
         budget.check() catch |err| {
             debug_trace.logf("images", "event=clipboard_export_stopped reason={s}", .{@errorName(err)});
-            // `child.kill` sends SIGTERM and waits, which a child that ignores
-            // SIGTERM would turn into a wait for its own exit. SIGKILL first, so
-            // the deferred kill only reaps it. Unreaped, the pid is still ours.
-            std.posix.kill(pid, .KILL) catch |kill_err| {
-                debug_trace.logf("images", "event=clipboard_export_kill_failed err={s}", .{@errorName(kill_err)});
-            };
             return err;
         };
         io_mod.sleep(bounded_child_poll_ns);

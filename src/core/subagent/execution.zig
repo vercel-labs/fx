@@ -2,6 +2,7 @@ const std = @import("std");
 const managed_execution = @import("../execution/managed_execution.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const runtime_deps = @import("../agent/runtime/deps.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const agents = @import("../agents/agents.zig");
@@ -31,6 +32,11 @@ const unannounced_approval_feedback = "fx could not tell your parent about this 
 
 /// What a child reads when fx could not hold the request for an answer.
 const unheld_approval_feedback = "fx could not hold this request for your parent's answer, so it was refused.";
+
+/// What a child reads when the approval screen for its request could not
+/// open, so fx denied the request without asking (`failApprovalScreen` in
+/// `src/core/app/app_render_runtime.zig`).
+pub const unshown_approval_feedback = "fx could not show this request, so it was refused.";
 
 /// Decides one tool call against a subagent's live authority, resolved fresh
 /// from `resolver` for `child_id`. The child engine and child agents both use
@@ -269,6 +275,16 @@ test "a hosted agent's waiter wakes when the last hold lets go, or times out" {
     try std.testing.expect(hosted.waitReleased(5_000));
 }
 
+/// The grant a subagent's approval offers when the call offers none: its tool
+/// and target, under the shell approval epoch it was made in.
+fn offeredChildGrant(call_name: []const u8, target: []const u8) types.PermissionGrant {
+    return .{
+        .tool_name = @constCast(call_name),
+        .target_path = @constCast(target),
+        .shell_epoch = shell_snapshot.processOwner().approvalEpoch(),
+    };
+}
+
 pub const TurnContext = struct {
     alloc: Allocator,
     runtime: session.SessionRuntime,
@@ -500,10 +516,7 @@ pub const TurnContext = struct {
         const child_id = self.child_id orelse return error.ChildNotAttached;
         const work_id = self.active_work_id orelse return error.StaleRequest;
         const prepared = approval_registry_mod.preparedRequestFingerprint(request);
-        const grant = types.PermissionGrant{
-            .tool_name = @constCast(call.name),
-            .target_path = @constCast(request.command orelse call.name),
-        };
+        const grant = offeredChildGrant(call.name, request.command orelse call.name);
         var context = PermissionObservation{
             .turn = self,
             .stable_id = approval_registry_mod.stableApprovalId(
@@ -1285,4 +1298,14 @@ test "a refused stop answer ends a child's permission wait with the reason" {
     defer answered.deinit();
     try std.testing.expectEqual(types.ToolPermissionDecision.deny, answered.decision);
     try std.testing.expect(std.mem.find(u8, answered.feedback.?, "Your parent stopped you before answering this request") != null);
+}
+
+test "a subagent's approval offer records the shell epoch it was made under" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    shell_snapshot.processOwner().markDirty(.user_reload);
+
+    const grant = offeredChildGrant("run_command", "npm test");
+    try std.testing.expectEqual(@as(u64, 1), grant.shell_epoch);
+    try std.testing.expectEqualStrings("npm test", grant.target_path);
 }

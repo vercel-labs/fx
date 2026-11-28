@@ -683,9 +683,17 @@ export function startUpgradeServer(
   argvLogPath: string,
   options: {
     revision?: string;
+    /** The dev release's build number in dev.json; left out when unset. */
+    build?: number;
     relaunchEnv?: Record<string, string>;
   } = {},
-): { baseUrl: string; setRevision: (revision: string) => void; stop: () => void } {
+): {
+  baseUrl: string;
+  setRevision: (revision: string, build?: number) => void;
+  /** How many times fx has read dev.json. */
+  devChecks: () => number;
+  stop: () => void;
+} {
   const relaunchExports = Object.entries(options.relaunchEnv ?? {})
     .map(([name, value]) => {
       if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) throw new Error(`relaunchEnv name ${name} is not a shell variable name`);
@@ -722,6 +730,8 @@ ${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
 
   const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
   let revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
+  let build = options.build;
+  let devChecks = 0;
   const stableRevision = revision;
   archiveFor(revision);
   const stableArchiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
@@ -733,7 +743,8 @@ ${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
       const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
       if (path === "/latest.txt") return new Response("v9.9.9\n");
       if (path === "/dev.json") {
-        return Response.json({ version: "9.9.9", commit: revision });
+        devChecks += 1;
+        return Response.json(build === undefined ? { version: "9.9.9", commit: revision } : { version: "9.9.9", commit: revision, build });
       }
       if (path === stableArchiveRoute) return new Response(archiveFor(stableRevision).archive);
       if (path === devArchiveRoute) return new Response(archiveFor(revision).archive);
@@ -744,13 +755,19 @@ ${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
   });
   return {
     baseUrl: `http://127.0.0.1:${server.port}`,
-    setRevision: (next: string) => {
+    setRevision: (next: string, nextBuild?: number) => {
       archiveFor(next);
       revision = next;
+      build = nextBuild;
     },
+    devChecks: () => devChecks,
     stop: () => server.stop(true),
   };
 }
+
+// Sessions that have not been killed. killLiveTmuxSessions ends them when the
+// test run ends, even when a timed-out test's body is still waiting.
+const liveSessions = new Set<TmuxSession>();
 
 export class TmuxSession {
   readonly name: string;
@@ -1000,6 +1017,7 @@ export class TmuxSession {
       throw err;
     }
     const session = new TmuxSession(name, exitStatusPath, resolvedSocketName);
+    liveSessions.add(session);
     try {
       for (const key of CREDENTIAL_ENV_KEYS) {
         try {
@@ -1530,6 +1548,14 @@ export class TmuxSession {
     );
   }
 
+  /** Waits for a reply's text and its turn's end together. The text can show before the turn ends, so a test that reads saved state or sends the next prompt waits here, not on the text alone. */
+  async waitForReplyAndTurnEnd(text: string, timeoutMs = 15_000): Promise<string> {
+    return this.waitForPane(
+      (pane) => pane.includes(text) && turnSettled(pane),
+      timeoutMs,
+    );
+  }
+
   async waitForComposer(timeoutMs = 15_000): Promise<string> {
     return this.waitForPane(hasEmptyComposer, timeoutMs);
   }
@@ -1615,6 +1641,7 @@ export class TmuxSession {
   }
 
   async kill(): Promise<void> {
+    liveSessions.delete(this);
     if (this.killed) return;
     this.killed = true;
     try {
@@ -1640,6 +1667,12 @@ export class TmuxSession {
     rmSync(this.exitStatusPath, { force: true });
   }
 
+  /// Closes the session's pane, as a closed terminal window does: tmux hangs
+  /// up the pane's program.
+  killPane(): void {
+    execFileSync("tmux", this.tmuxArgs(["kill-pane", "-t", this.name]), { stdio: "pipe" });
+  }
+
   /// The fx process's exit status once the pane has ended, or null.
   recordedExitStatus(): number | null {
     try {
@@ -1659,6 +1692,12 @@ export class TmuxSession {
       ? `tmux -L ${shellQuote(this.socketName)}`
       : "tmux";
   }
+}
+
+/// Ends every session that is still running. The test preload calls this once
+/// per run, so a test whose body outlives its timeout cannot leave fx behind.
+export async function killLiveTmuxSessions(): Promise<void> {
+  for (const session of [...liveSessions]) await session.kill();
 }
 
 function shellQuote(value: string): string {

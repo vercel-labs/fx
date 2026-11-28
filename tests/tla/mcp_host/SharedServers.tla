@@ -56,12 +56,15 @@ CallStates == {"none", "waiting", "sent", "done"}
 Ends == {"none", "answered", "lost", "failed", "cancelled", "cut"}
 QStates == {"none", "asked", "shown", "declined", "answered"}
 
+WaitStates == {"none", "waiting", "ready", "eof"}
+
 VARIABLES
     version,  \* the shared server's protocol version, fixed
     owners,   \* owner processes alive, at most 2 while one exits
     lock,     \* the owner lock: None, or "owner" while an owner holds it
     serving,  \* owners listening on the socket: 0, 1, or 2 without the lock
     saw,      \* [Sessions -> BOOLEAN]: it looked and found no owner
+    wait,     \* [Sessions -> {"none", "waiting", "ready", "eof"}]: pipe wait to spawned owner
     conn,     \* [Sessions -> BOOLEAN]: connected to the owner
     using,    \* [Sessions -> BOOLEAN]: holds the server, so it may call it
     alive,    \* [Sessions -> BOOLEAN]
@@ -75,7 +78,7 @@ VARIABLES
     qTo,      \* the session it shows in, or None
     crashes
 
-vars == <<version, owners, lock, serving, saw, conn, using, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
+vars == <<version, owners, lock, serving, saw, wait, conn, using, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
 
 InFlight(c) == call[c] \in {"waiting", "sent"}
 SentCalls == {c \in Calls: call[c] = "sent"}
@@ -90,6 +93,7 @@ TypeOK ==
     /\ lock \in {None, "owner"}
     /\ serving \in 0..2
     /\ saw \in [Sessions -> BOOLEAN]
+    /\ wait \in [Sessions -> WaitStates]
     /\ conn \in [Sessions -> BOOLEAN]
     /\ using \in [Sessions -> BOOLEAN]
     /\ alive \in [Sessions -> BOOLEAN]
@@ -109,6 +113,7 @@ Init ==
     /\ lock = None
     /\ serving = 0
     /\ saw = [x \in Sessions |-> FALSE]
+    /\ wait = [x \in Sessions |-> "none"]
     /\ conn = [x \in Sessions |-> FALSE]
     /\ using = [x \in Sessions |-> FALSE]
     /\ alive = [x \in Sessions |-> TRUE]
@@ -125,32 +130,47 @@ Init ==
 \* ---- Finding and starting the owner ----
 
 Probe(x) ==
-    /\ alive[x] /\ ~conn[x] /\ ~saw[x] /\ serving = 0
+    /\ alive[x] /\ ~conn[x] /\ ~saw[x] /\ wait[x] = "none" /\ serving = 0
     /\ saw' = [saw EXCEPT ![x] = TRUE]
-    /\ UNCHANGED <<version, owners, lock, serving, conn, using, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, wait, conn, using, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
 
-\* It found none a moment ago, so it starts one. Two processes may overlap
-\* while the first is still exiting.
+\* It found none a moment ago, so it starts one with a ready pipe. Two
+\* processes may overlap while the first is still exiting.
 StartOwner(x) ==
-    /\ alive[x] /\ saw[x]
+    /\ alive[x] /\ saw[x] /\ wait[x] = "none"
     /\ owners < 2
     /\ owners' = owners + 1
     /\ saw' = [saw EXCEPT ![x] = FALSE]
+    /\ wait' = [wait EXCEPT ![x] = "waiting"]
     /\ UNCHANGED <<version, lock, serving, conn, using, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
 
 \* The owner takes the lock itself as its first step. The one that finds it
-\* free takes it and listens; the lock is free only when nobody serves.
+\* free takes it, listens, and signals ready on its pipe; the lock is free
+\* only when nobody serves.
 OwnerTake ==
     /\ owners >= 1 /\ lock = None
     /\ lock' = "owner"
     /\ serving' = serving + 1
+    /\ IF \E x \in Sessions: wait[x] = "waiting"
+       THEN \E x \in Sessions: wait[x] = "waiting" /\ wait' = [wait EXCEPT ![x] = "ready"]
+       ELSE UNCHANGED wait
     /\ UNCHANGED <<version, owners, saw, conn, using, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
 
-\* A second process, started while the first still held the lock, exits.
+\* A second process, started while the first still held the lock, exits, giving
+\* EOF on its pipe.
 OwnerBusy ==
     /\ owners = 2 /\ lock # None
     /\ owners' = owners - 1
+    /\ IF \E x \in Sessions: wait[x] = "waiting"
+       THEN \E x \in Sessions: wait[x] = "waiting" /\ wait' = [wait EXCEPT ![x] = "eof"]
+       ELSE UNCHANGED wait
     /\ UNCHANGED <<version, lock, serving, saw, conn, using, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
+
+\* A session whose spawned owner exited sees EOF on its pipe and stops waiting.
+WaitEof(x) ==
+    /\ alive[x] /\ wait[x] = "eof"
+    /\ wait' = [wait EXCEPT ![x] = "none"]
+    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, using, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
 
 \* It registers the server as it connects: registration is lazy in fx, but no
 \* call can go out before it, so the two steps collapse.
@@ -159,6 +179,7 @@ Connect(x) ==
     /\ conn' = [conn EXCEPT ![x] = TRUE]
     /\ using' = [using EXCEPT ![x] = TRUE]
     /\ saw' = [saw EXCEPT ![x] = FALSE]
+    /\ wait' = [wait EXCEPT ![x] = "none"]
     /\ UNCHANGED <<version, owners, lock, serving, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
 
 \* It takes the server up again after dropping it, as re-adding a removed or
@@ -167,7 +188,7 @@ Connect(x) ==
 Register(x) ==
     /\ alive[x] /\ conn[x] /\ ~using[x] /\ serving >= 1
     /\ using' = [using EXCEPT ![x] = TRUE]
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
 
 \* ---- Calls ----
 
@@ -176,14 +197,14 @@ Ask(c) ==
     LET x == CallSession(c) IN
     /\ alive[x] /\ conn[x] /\ using[x] /\ serving >= 1 /\ call[c] = "none"
     /\ call' = [call EXCEPT ![c] = IF phase = "ready" THEN "sent" ELSE "waiting"]
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, using, alive, phase, ended, ended_by, armed, q, qFor, qTo, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, using, alive, phase, ended, ended_by, armed, q, qFor, qTo, crashes>>
 
 \* The first waiting call starts the server; once ready, every waiting call goes out.
 ServerStart ==
     /\ serving >= 1 /\ phase = "idle" /\ \E c \in Calls: call[c] = "waiting"
     /\ phase' = "ready"
     /\ call' = [c \in Calls |-> IF call[c] = "waiting" THEN "sent" ELSE call[c]]
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, using, alive, ended, ended_by, armed, q, qFor, qTo, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, using, alive, ended, ended_by, armed, q, qFor, qTo, crashes>>
 
 \* A call waiting on its question answers only once the question is over.
 Answer(c) ==
@@ -191,7 +212,7 @@ Answer(c) ==
     /\ ~(qFor = c /\ q \in {"asked", "shown"})
     /\ call' = [call EXCEPT ![c] = "done"]
     /\ ended' = [ended EXCEPT ![c] = "answered"]
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, using, alive, phase, ended_by, armed, q, qFor, qTo, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, using, alive, phase, ended_by, armed, q, qFor, qTo, crashes>>
 
 \* ---- Questions ----
 
@@ -199,7 +220,7 @@ ServerAsks(c) ==
     /\ q = "none" /\ call[c] = "sent"
     /\ q' = "asked"
     /\ qFor' = c
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, using, alive, phase, call, ended, ended_by, armed, qTo, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, using, alive, phase, call, ended, ended_by, armed, qTo, crashes>>
 
 \* A 2026 question names its call, so it shows in that call's session. A
 \* 2025 one names none: the owner shows it only when one session alone has
@@ -216,12 +237,12 @@ Route ==
             /\ qTo' = CHOOSE x \in callers: TRUE
        ELSE /\ q' = "declined"
             /\ qTo' = None
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, using, alive, phase, call, ended, ended_by, armed, qFor, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, using, alive, phase, call, ended, ended_by, armed, qFor, crashes>>
 
 AnswerQ ==
     /\ q = "shown" /\ alive[qTo]
     /\ q' = "answered"
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, using, alive, phase, call, ended, ended_by, armed, qFor, qTo, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, using, alive, phase, call, ended, ended_by, armed, qFor, qTo, crashes>>
 
 \* The call it was for ended, or the session it showed in left or dropped the
 \* server.
@@ -230,7 +251,7 @@ Withdraw ==
     /\ call[qFor] = "done" \/ (q = "shown" /\ (~alive[qTo] \/ ~using[qTo]))
     /\ q' = "declined"
     /\ qTo' = None
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, using, alive, phase, call, ended, ended_by, armed, qFor, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, using, alive, phase, call, ended, ended_by, armed, qFor, crashes>>
 
 \* ---- The idle timer, in the owner ----
 
@@ -240,7 +261,7 @@ Withdraw ==
 IdleArm(x) ==
     /\ serving >= 1 /\ phase = "ready" /\ armed = None /\ conn[x] /\ Quiet
     /\ armed' = x
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, using, alive, phase, call, ended, ended_by, q, qFor, qTo, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, using, alive, phase, call, ended, ended_by, q, qFor, qTo, crashes>>
 
 \* It fires; the server stops only if no session's call is in flight now.
 \* Were it to stop, the calls in flight would go with the process.
@@ -252,7 +273,7 @@ IdleFire ==
             /\ call' = [c \in Calls |-> IF call[c] = "sent" THEN "done" ELSE call[c]]
             /\ ended' = [c \in Calls |-> IF call[c] = "sent" THEN "cut" ELSE ended[c]]
        ELSE UNCHANGED <<phase, call, ended>>
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, using, alive, ended_by, q, qFor, qTo, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, using, alive, ended_by, q, qFor, qTo, crashes>>
 
 \* No session uses the server: the owner stops it now, with the normal stop,
 \* so no server outlives its last user. The idle timer is for a server a
@@ -260,7 +281,7 @@ IdleFire ==
 StopWithoutUsers ==
     /\ serving >= 1 /\ phase = "ready" /\ NoUsers
     /\ phase' = "idle"
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, using, alive, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, using, alive, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
 
 \* ---- Leaving and failing ----
 
@@ -277,7 +298,7 @@ Unregister(x) ==
        /\ ended_by' = [c \in Calls |-> IF CallSession(c) = x /\ InFlight(c) THEN x ELSE ended_by[c]]
        /\ phase' = IF last THEN "idle" ELSE phase
        /\ armed' = IF last THEN None ELSE armed
-    /\ UNCHANGED <<version, owners, lock, serving, saw, conn, alive, q, qFor, qTo, crashes>>
+    /\ UNCHANGED <<version, owners, lock, serving, saw, wait, conn, alive, q, qFor, qTo, crashes>>
 
 \* The owner ends the session's own calls: they were cancelled. A session
 \* whose leaving leaves nobody using the server also stops it, in the same
@@ -289,6 +310,7 @@ Exit(x) ==
        /\ conn' = [conn EXCEPT ![x] = FALSE]
        /\ using' = [using EXCEPT ![x] = FALSE]
        /\ saw' = [saw EXCEPT ![x] = FALSE]
+       /\ wait' = [wait EXCEPT ![x] = "none"]
        /\ call' = [c \in Calls |-> IF CallSession(c) = x /\ InFlight(c) THEN "done" ELSE call[c]]
        /\ ended' = [c \in Calls |-> IF CallSession(c) = x /\ InFlight(c) THEN "cancelled" ELSE ended[c]]
        /\ ended_by' = [c \in Calls |-> IF CallSession(c) = x /\ InFlight(c) THEN x ELSE ended_by[c]]
@@ -303,8 +325,14 @@ Crash ==
     /\ owners >= 1 /\ crashes < MaxCrash
     /\ crashes' = crashes + 1
     /\ owners' = owners - 1
-    /\ serving' = IF serving > 0 THEN serving - 1 ELSE 0
-    /\ lock' = IF serving' = 0 THEN None ELSE lock
+    /\ IF lock = "owner"
+       THEN /\ serving' = 0
+            /\ lock' = None
+            /\ wait' = [x \in Sessions |-> IF wait[x] = "ready" THEN "eof" ELSE wait[x]]
+       ELSE /\ UNCHANGED <<serving, lock>>
+            /\ IF \E x \in Sessions: wait[x] = "waiting"
+               THEN \E x \in Sessions: wait[x] = "waiting" /\ wait' = [wait EXCEPT ![x] = "eof"]
+               ELSE UNCHANGED wait
     /\ conn' = [x \in Sessions |-> FALSE]
     /\ using' = [x \in Sessions |-> FALSE]
     /\ phase' = "idle"
@@ -319,6 +347,7 @@ Crash ==
 OwnerClose ==
     /\ serving >= 1 /\ phase = "idle" /\ NoClients
     /\ serving' = serving - 1
+    /\ wait' = [x \in Sessions |-> IF wait[x] = "ready" THEN "eof" ELSE wait[x]]
     /\ armed' = None
     /\ UNCHANGED <<version, owners, lock, saw, conn, using, alive, phase, call, ended, ended_by, q, qFor, qTo, crashes>>
 
@@ -327,16 +356,17 @@ OwnerExit ==
     /\ owners = 1 /\ serving = 0
     /\ owners' = 0
     /\ lock' = None
+    /\ wait' = [x \in Sessions |-> IF wait[x] = "waiting" THEN "eof" ELSE wait[x]]
     /\ UNCHANGED <<version, serving, saw, conn, using, alive, phase, call, ended, ended_by, armed, q, qFor, qTo, crashes>>
 
 Next ==
-    \/ \E x \in Sessions: Probe(x) \/ StartOwner(x) \/ Connect(x) \/ Register(x) \/ Unregister(x) \/ IdleArm(x) \/ Exit(x)
+    \/ \E x \in Sessions: Probe(x) \/ StartOwner(x) \/ WaitEof(x) \/ Connect(x) \/ Register(x) \/ Unregister(x) \/ IdleArm(x) \/ Exit(x)
     \/ \E c \in Calls: Ask(c) \/ Answer(c) \/ ServerAsks(c)
     \/ OwnerTake \/ OwnerBusy \/ ServerStart \/ Route \/ AnswerQ \/ Withdraw \/ IdleFire \/ StopWithoutUsers \/ Crash \/ OwnerClose \/ OwnerExit
 
 Fairness ==
-    /\ \A x \in Sessions: WF_vars(StartOwner(x))
-    /\ WF_vars(OwnerTake) /\ WF_vars(OwnerExit)
+    /\ \A x \in Sessions: WF_vars(StartOwner(x)) /\ WF_vars(WaitEof(x)) /\ WF_vars(Connect(x))
+    /\ WF_vars(OwnerTake) /\ WF_vars(OwnerBusy) /\ WF_vars(OwnerExit)
     /\ WF_vars(ServerStart) /\ WF_vars(Route) /\ WF_vars(AnswerQ) /\ WF_vars(Withdraw)
     /\ WF_vars(StopWithoutUsers)
     /\ \A c \in Calls: WF_vars(Answer(c))
@@ -358,7 +388,11 @@ IdleEndsNothing == \A c \in Calls: ended[c] # "cut"
 \* the server. Both end only the calls of the session that does it.
 ExitEndsOwnOnly == \A c \in Calls: ended[c] = "cancelled" => ended_by[c] = CallSession(c)
 
+ReadyMeansServing == \A x \in Sessions: wait[x] = "ready" => serving >= 1
+
 \* ---- Properties ----
+
+WaitEnds == \A x \in Sessions: wait[x] \in {"waiting", "ready", "eof"} ~> wait[x] = "none"
 
 LostNotRetried == [][\A c \in Calls: call[c] = "done" => call'[c] = "done"]_vars
 

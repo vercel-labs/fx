@@ -22,7 +22,7 @@ const CaptureBudget = image_attachments.CaptureBudget;
 const ClipboardImageAttachment = image_attachments.ClipboardImageAttachment;
 
 /// How long osascript may run before the read stops it.
-pub const default_timeout: std.Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSeconds(10) };
+pub const default_timeout: std.Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSeconds(5) };
 
 /// How a read ended.
 pub const Outcome = union(enum) {

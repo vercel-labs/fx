@@ -27,7 +27,6 @@ import {
   TmuxSession,
   tmuxAvailable,
   tokenPassCatalog,
-  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -147,6 +146,21 @@ function reviewerText(body: string): string {
     .filter((part) => part.type === "text")
     .map((part) => part.text ?? "")
     .join("\n");
+}
+
+// The <permission_review> instruction of a review request, wherever the
+// provider puts it.
+function reviewInstruction(body: string): string {
+  const texts: string[] = [];
+  const collect = (value: unknown) => {
+    if (typeof value === "string") texts.push(value);
+    else if (Array.isArray(value)) value.forEach(collect);
+    else if (value && typeof value === "object") Object.values(value).forEach(collect);
+  };
+  collect(JSON.parse(body));
+  const instruction = texts.find((text) => text.includes("<permission_review>"));
+  expect(instruction).toBeDefined();
+  return instruction!;
 }
 
 function installRecorder(root: IsolatedRoot, name: string, marker: string) {
@@ -976,6 +990,56 @@ describe("lean auto mode reliability", () => {
         expect(review).toContain(`Run exactly this requested ${name} command.`);
         expect(review).not.toContain("trusted_user_permission_feedback:");
         expect(gateway.requests).toHaveLength(2);
+        expect(existsSync(marker)).toBe(true);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "command review names the shell that runs it and whether startup definitions apply",
+    async () => {
+      for (const [profile, startup] of [
+        ["user", "startup_files: read first; aliases and functions defined in the user startup files apply and can change what the command runs"],
+        ["clean", "startup_files: skipped; no aliases or functions from the user startup files apply"],
+      ] as const) {
+        const root = createIsolatedRoot();
+        const marker = join(root.root, `${profile}-reviewed-and-ran`);
+        const bin = installRecorder(root, "probe", marker);
+        const callId = `reviewed_${profile}`;
+        const gateway = startGateway(
+          [
+            fakeGatewayToolCall(callId, "shell", {
+              request: { action: "run", command: `${join(bin, "probe")} ${profile}`, profile, yield_time_ms: 30_000 },
+            }),
+            (body) => {
+              expect(toolResultText(body, callId)).toContain("\"exit_code\":0");
+              return fakeGatewayFinalText(`${profile} command reviewed and ran`);
+            },
+          ],
+          [fakeGatewayPermissionDecision("clear", `${profile}_review_clear`)],
+        );
+
+        const result = await runFx(
+          ["ask", "--quiet", "--json", "--no-save", `Run the ${profile} probe.`],
+          { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+        );
+
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(gateway.classifierRequests).toHaveLength(1);
+        const review = reviewInstruction(gateway.classifierRequests[0]!.body);
+        // The shell fx binds into the command's permission identity is the
+        // one that runs it; the action section must name that same shell.
+        const identity = new RegExp(`@fx-terminal-env:${profile}:(\\d+):`).exec(review);
+        expect(identity).not.toBeNull();
+        const start = identity!.index + identity![0].length;
+        const shell = review.slice(start, start + Number(identity![1]));
+        expect(shell).toMatch(/^\/.+\/(bash|zsh)$/);
+        const action = review.slice(review.lastIndexOf("\naction: command\n"));
+        expect(action).toMatch(/\ntarget_os: \w+\nenvironment: /);
+        expect(action).toContain(
+          `\nenvironment: ${profile}\nshell: ${shell}\n${startup}\naction_evidence_incomplete: false\n`,
+        );
         expect(existsSync(marker)).toBe(true);
       }
     },
@@ -2609,7 +2673,7 @@ describe("lean auto mode reliability", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Initialize the saved allow session.");
-      await activeSession.waitForPane((pane) => pane.includes("allow session initialized") && turnSettled(pane), TIMEOUT);
+      await activeSession.waitForReplyAndTurnEnd("allow session initialized", TIMEOUT);
       await activeSession.sendText(
         `/permissions remember allow shell ${JSON.stringify({ action: "run", timeout_ms: 600_000, command: allowedCommand })}`,
       );
@@ -2722,7 +2786,7 @@ describe("lean auto mode reliability", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Initialize this saved session.");
-      await activeSession.waitForPane((pane) => pane.includes("session initialized") && turnSettled(pane), TIMEOUT);
+      await activeSession.waitForReplyAndTurnEnd("session initialized", TIMEOUT);
       await activeSession.sendText(
         `/permissions remember deny shell ${JSON.stringify({ action: "run", timeout_ms: 600_000, command: blockedCommand })}`,
       );
@@ -2736,7 +2800,7 @@ describe("lean auto mode reliability", () => {
       const ruleId = idMatch![1];
 
       await activeSession.sendText("Complete the configured action safely.");
-      await activeSession.waitForPane((pane) => pane.includes("saved deny replan complete") && turnSettled(pane), TIMEOUT);
+      await activeSession.waitForReplyAndTurnEnd("saved deny replan complete", TIMEOUT);
       expect(existsSync(blockedMarker)).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(0);
 
@@ -2946,7 +3010,7 @@ describe("lean auto mode reliability", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the marker command.");
-      await activeSession.waitForPane((pane) => pane.includes("retried review traced") && turnSettled(pane), TIMEOUT);
+      await activeSession.waitForReplyAndTurnEnd("retried review traced", TIMEOUT);
       expect(existsSync(marker)).toBe(true);
 
       const report = await runTrace(activeSession, root.root);

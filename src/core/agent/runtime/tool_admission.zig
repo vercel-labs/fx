@@ -1086,6 +1086,8 @@ fn appendLocalGrant(arena: Allocator, grants: *std.ArrayList(PermissionGrant), g
     try grants.append(arena, grant);
 }
 
+/// The grants keep `shell_epoch`, the epoch the answer was given in, not the
+/// epoch current when they are recorded.
 pub fn applyInitialSessionGrants(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -1093,6 +1095,7 @@ pub fn applyInitialSessionGrants(
     workspace_root: []const u8,
     call: ToolCall,
     target_path: []const u8,
+    shell_epoch: u64,
 ) !void {
     const command_call = try tooling_tool_admission.callUsesCommandAuthority(
         hooks.tool_registry,
@@ -1112,11 +1115,9 @@ pub fn applyInitialSessionGrants(
         permission_name,
         target_path,
         target_kind,
+        shell_epoch,
     );
     for (grants) |grant| {
-        if (std.mem.eql(u8, permissions.permissionNameForTool(grant.tool_name), "bash")) {
-            shell_snapshot.processOwner().recordShellGrant(grant.target_path);
-        }
         try appendLocalGrant(arena, local_grants, grant);
         try propagateGrant(hooks, grant);
     }
@@ -1127,8 +1128,11 @@ pub fn applyFrozenFileMutationSessionGrants(
     hooks: *const AgentRuntimeDeps,
     local_grants: *std.ArrayList(PermissionGrant),
     frozen_grants: []const PermissionGrant,
+    shell_epoch: u64,
 ) !void {
-    for (frozen_grants) |grant| {
+    for (frozen_grants) |frozen| {
+        var grant = frozen;
+        grant.shell_epoch = shell_epoch;
         const existed = permissions.sessionGrantAllowed(
             local_grants.items,
             grant.tool_name,
@@ -1150,10 +1154,11 @@ pub fn appendFrozenFileMutationGrants(
 }
 
 fn propagateGrant(hooks: *const AgentRuntimeDeps, grant: PermissionGrant) !void {
-    try hooks.propagate_grant(hooks.ctx, grant.tool_name, grant.target_path);
+    try hooks.propagate_grant(hooks.ctx, grant.tool_name, grant.target_path, grant.shell_epoch);
     try hooks.push_event(hooks.ctx, .{ .session_grant = .{
         .tool_name = try std.heap.c_allocator.dupe(u8, grant.tool_name),
         .target_path = try std.heap.c_allocator.dupe(u8, grant.target_path),
+        .shell_epoch = grant.shell_epoch,
     } });
 }
 
@@ -1362,12 +1367,12 @@ test "turn file mutation denial state is local and does not retain approvals" {
     try root_denials.rememberHumanDenial(
         std.testing.allocator,
         action_a,
-        .{ .decision = .once, .human_approval = .once },
+        .{ .decision = .once, .human_approval = .{ .kind = .once, .shell_epoch = 0 } },
     );
     try root_denials.rememberHumanDenial(
         std.testing.allocator,
         action_a,
-        .{ .decision = .always, .human_approval = .always },
+        .{ .decision = .always, .human_approval = .{ .kind = .always, .shell_epoch = 0 } },
     );
     try root_denials.rememberHumanDenial(
         std.testing.allocator,

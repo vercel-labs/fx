@@ -1,0 +1,37 @@
+{
+  "covers": [
+    "AC-7"
+  ],
+  "title": "fx ask --json has no prompt channel: refused at once, no prompt, no write.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false
+      }
+    },
+    "teams": "one",
+    "surface": "headless",
+    "login": "valid",
+    "configured": false,
+    "configValid": true,
+    "answers": [],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "refused"
+      ]
+    },
+    "prompts": 0,
+    "writes": 0
+  },
+  "tamper": {
+    "setup": "prompt-without-channel"
+  },
+  "drive": {}
+}

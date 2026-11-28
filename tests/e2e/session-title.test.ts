@@ -20,7 +20,6 @@ import {
   startUpgradeServer,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 
 const MAIN_MODEL = "openai/gpt-5.5";
@@ -157,6 +156,7 @@ test("fx ask keeps the derived title when the title model output is unusable", a
 
 test("fx ask exits soon after its answer while the title request never answers", async () => {
   const root = createFixtureRoot("title-hang");
+  const tracePath = join(root.root, "trace.log");
   let titleArrived = false;
   const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
     models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
@@ -169,16 +169,17 @@ test("fx ask exits soon after its answer while the title request never answers",
     const started = Date.now();
     const result = await runFx(["ask", "refactor the renderer loop to fix the crash"], {
       cwd: root.workspace,
-      env: baseEnv(root, gateway),
+      env: { ...baseEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session" },
       timeoutMs: 30_000,
     });
     const elapsedMs = Date.now() - started;
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("MAIN_ANSWER_OK");
     expect(titleArrived).toBe(true);
-    // The title call's own deadline is 15 s; fx gives it a short grace after
-    // the answer and then leaves.
-    expect(elapsedMs).toBeLessThan(8_000);
+    // fx ask cancels a pending title at exit with zero wait instead of holding
+    // exit for the 2 s grace or 15 s deadline.
+    expect(elapsedMs).toBeLessThan(1_000);
+    expect(readFileSync(tracePath, "utf8")).toContain("event=title_generation_dropped reason=exit_no_wait");
 
     // The session keeps the title derived from its first prompt.
     const titles = sessionTitles(root);
@@ -197,21 +198,81 @@ test("fx ask exits soon after its answer while the title request never answers",
   }
 }, 45_000);
 
-test("fx ask keeps a generated title that arrives soon after its answer", async () => {
-  const root = createFixtureRoot("title-late");
+test("fx ask exits right after its answer when a title takes 3 s and fx sessions --json keeps the fallback title", async () => {
+  const root = createFixtureRoot("title-slow-3s");
+  const tracePath = join(root.root, "trace.log");
+  let titleArrived = false;
+  let slowTimer: ReturnType<typeof setTimeout> | undefined;
   const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
     models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
-    titleResponses: [() => Bun.sleep(1_000).then(() => fakeGatewayFinalText(GENERATED_TITLE))],
+    titleResponses: [() => {
+      titleArrived = true;
+      return new Promise<Response>((resolve) => {
+        slowTimer = setTimeout(() => resolve(fakeGatewayFinalText(GENERATED_TITLE)), 3_000);
+      });
+    }],
+  });
+  try {
+    const started = Date.now();
+    const result = await runFx(["ask", "refactor the renderer loop to fix the crash"], {
+      cwd: root.workspace,
+      env: { ...baseEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session" },
+      timeoutMs: 30_000,
+    });
+    const elapsedMs = Date.now() - started;
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("MAIN_ANSWER_OK");
+    expect(titleArrived).toBe(true);
+    expect(elapsedMs).toBeLessThan(1_000);
+    expect(readFileSync(tracePath, "utf8")).toContain("event=title_generation_dropped reason=exit_no_wait");
+
+    const list = await runFx(["sessions", "--json"], {
+      cwd: root.workspace,
+      env: baseEnv(root, gateway),
+      timeoutMs: 15_000,
+    });
+    expect(list.code).toBe(0);
+    const parsed = JSON.parse(list.stdout) as { sessions: Array<{ title: string }> };
+    expect(parsed.sessions).toHaveLength(1);
+    expect(parsed.sessions[0]!.title).toBe("refactor the renderer loop to fix the crash");
+    expect(parsed.sessions[0]!.title).not.toBe(GENERATED_TITLE);
+  } finally {
+    if (slowTimer) clearTimeout(slowTimer);
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45_000);
+
+test("fx ask keeps a generated title that finishes before the answer without waiting at exit", async () => {
+  const root = createFixtureRoot("title-fast-ready");
+  const tracePath = join(root.root, "trace.log");
+  const gateway = startDynamicFakeGateway(async () => {
+    await waitUntil(() => traceHas(tracePath, "event=title_generation result=generated"), "the title task to finish before the main answer");
+    return fakeGatewayFinalText("MAIN_ANSWER_OK");
+  }, {
+    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
+    titleResponses: [() => fakeGatewayFinalText(GENERATED_TITLE)],
   });
   try {
     const result = await runFx(["ask", "refactor the renderer loop to fix the crash"], {
       cwd: root.workspace,
-      env: baseEnv(root, gateway),
+      env: { ...baseEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session" },
       timeoutMs: 30_000,
     });
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("MAIN_ANSWER_OK");
     expect(sessionTitles(root)).toContain(GENERATED_TITLE);
+    expect(readFileSync(tracePath, "utf8")).not.toContain("event=title_generation_dropped");
+
+    const list = await runFx(["sessions", "--json"], {
+      cwd: root.workspace,
+      env: baseEnv(root, gateway),
+      timeoutMs: 15_000,
+    });
+    expect(list.code).toBe(0);
+    const parsed = JSON.parse(list.stdout) as { sessions: Array<{ title: string }> };
+    expect(parsed.sessions).toHaveLength(1);
+    expect(parsed.sessions[0]!.title).toBe(GENERATED_TITLE);
   } finally {
     gateway.stop();
     rmSync(root.root, { recursive: true, force: true });
@@ -666,7 +727,7 @@ test.skipIf(SKIP_TMUX)("tui titles a session once, from its first prompt, when t
     await tui.sendText("now write the regression test for it");
     await waitUntil(() => held.cancelled, "the interrupted first turn");
     await waitUntil(() => traceHas(tracePath, "event=title_generation_skipped reason=already_started"), "the gate to refuse a second title");
-    await tui.waitForPane((pane) => pane.includes("SECOND_ANSWER_OK") && turnSettled(pane), 20000);
+    await tui.waitForReplyAndTurnEnd("SECOND_ANSWER_OK", 20000);
     expect(gateway.titleRequests).toHaveLength(1);
     expect(gateway.titleRequests[0]!.body).toContain("refactor the renderer loop");
     expect(sessionTitles(root)).not.toContain(GENERATED_TITLE);
@@ -695,7 +756,7 @@ test.skipIf(SKIP_TMUX)("tui titles the next session after /new when the first se
     });
     await tui.waitForStableComposer(15000);
     await tui.sendText(FIRST_PROMPT);
-    await tui.waitForPane((pane) => pane.includes("MAIN_ANSWER_OK") && turnSettled(pane), 20000);
+    await tui.waitForReplyAndTurnEnd("MAIN_ANSWER_OK", 20000);
     await waitUntil(() => gateway.titleRequests.length === 1, "the first title request");
     await tui.sendText("/new");
     await tui.waitForStableComposer(15000);
