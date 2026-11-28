@@ -1888,10 +1888,33 @@ describe("MCP login", () => {
     expect(failed).toEqual([{ server: "fixture", kind: "sign_in_failed", reason: "signed_out" }]);
   }, 120_000);
 
-  test.skipIf(!tmuxAvailable())("/trace says a sign-in ended because a change to the MCP config removed its server", async () => {
+  test.skipIf(!tmuxAvailable())("/trace says a sign-in ended because a change to the MCP config removed the only server, and the host was replaced", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth, true, "http", auth.url, false);
+    const report = await traceOfSignIn(root, async (session) => {
+      await session.waitForText("fixture needs login · /mcp", 15_000);
+      await session.sendText("/mcp login fixture");
+      expect(await waitForFile(root.openLog, 20_000)).toBe(true);
+      await session.sendText("/mcp remove fixture");
+      await session.waitForText("Couldn't sign in to fixture: the MCP config changed before the browser came back", 20_000);
+      await session.waitForComposer(10_000);
+    });
+    const failed = signInEvents(report).filter((event) => event.kind === "sign_in_failed");
+    expect(failed).toEqual([{ server: "fixture", kind: "sign_in_failed", reason: "config_changed" }]);
+    // The server is gone, so it has no problem; the event is what is left to say how its sign-in ended.
+    expect(problemOf(report)).toBeUndefined();
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/trace says a sign-in ended because a change to the MCP config removed its server, and the host stayed", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    // Another server stays, so the change is applied in place and the host is not replaced.
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.other = { type: "http", url: upstream.url, startup_timeout_ms: 5_000 };
+    writeFileSync(profilePath, JSON.stringify(profile));
     const report = await traceOfSignIn(root, async (session) => {
       await session.waitForText("fixture needs login · /mcp", 15_000);
       await session.sendText("/mcp login fixture");
