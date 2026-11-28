@@ -24,6 +24,7 @@ const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const effort_menu_presentation = @import("effort_menu_presentation.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
 const agents_menu_presentation = @import("agents_menu_presentation.zig");
+const usage_presentation = @import("usage_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const wait_card_ui = @import("wait_card_ui.zig");
 const trust_prompt_ui = @import("trust_prompt_ui.zig");
@@ -421,7 +422,8 @@ fn buildFooterSurfaceProjection(
     const show_agents_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !modal_active and ctx.agents_menu.active();
     const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !show_agents_menu and !modal_active and ctx.model_menu.active;
     const show_effort_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !show_agents_menu and !show_models_menu and !modal_active and ctx.effort_menu.active;
-    const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_fork_menu or show_agents_menu or show_models_menu or show_effort_menu;
+    const show_usage_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !show_agents_menu and !show_models_menu and !show_effort_menu and !modal_active and ctx.usage_menu.active;
+    const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_fork_menu or show_agents_menu or show_models_menu or show_effort_menu or show_usage_menu;
     const show_skills_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !modal_active and ctx.skills_menu.active;
     const show_model_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and
         ctx.model_query_active;
@@ -526,6 +528,8 @@ fn buildFooterSurfaceProjection(
         .models
     else if (show_effort_menu)
         .effort
+    else if (show_usage_menu)
+        .usage
     else if (show_slash_query)
         .slash
     else if (show_auth_picker)
@@ -690,6 +694,13 @@ fn buildFooterSurfaceProjection(
         )
     else if (show_effort_menu)
         effort_menu_presentation.menuRowCount(ctx.effort_menu, effort_picker_row_budget)
+    else if (show_usage_menu)
+        picker_presentation.inlinePickerRowBudgetCapped(
+            shell.layout.rows,
+            geometry.input_extra,
+            banner_rows,
+            @intCast(@min(usage_presentation.desiredRowCount(ctx.usage_menu), std.math.maxInt(u16))),
+        )
     else if (show_skills_query)
         skills_menu_presentation.inlineMenuRowCount(
             ctx.skills_menu,

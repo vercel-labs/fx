@@ -12,6 +12,7 @@ const file_index = @import("../../core/workspace/file_index.zig");
 const ui_render = @import("../render.zig");
 const input_presentation = @import("input_presentation.zig");
 const row_text = @import("row_text.zig");
+const usage_presentation = @import("usage_presentation.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
@@ -832,8 +833,9 @@ pub noinline fn composePickerOptionRowAnnotated(
     if (start_col > 1) try row_text.appendAbsoluteColumn(alloc, &row, start_col);
     // Model, provider, model-catalog, and effort pickers signal selection by
     // brightness alone, like the question panel; other pickers keep the filled row.
+    // Exhaustive over PickerKind; `.usage` draws through composeAndPushUsageMenuRows.
     const selected_style = switch (kind) {
-        .model_stage, .provider_stage, .models, .effort => ui_render.selected_completion_style,
+        .model_stage, .provider_stage, .models, .effort, .usage => ui_render.selected_completion_style,
         .file, .slash, .skills, .help, .settings, .sessions, .fork, .agents, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     const base_style = if (selected) selected_style else ui_render.dim_style;
@@ -946,6 +948,7 @@ pub fn composePickerStatusRowWithProvider(
         .fork => "nothing to fork yet",
         .agents => "no fx instances open",
         .mcp => "no MCP items available",
+        .usage => usage_presentation.no_matching_models_text,
         .auth => "authentication actions unavailable",
     };
 

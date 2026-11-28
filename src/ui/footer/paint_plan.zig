@@ -29,6 +29,7 @@ const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const effort_menu_presentation = @import("effort_menu_presentation.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
 const agents_menu_presentation = @import("agents_menu_presentation.zig");
+const usage_presentation = @import("usage_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const wait_card_ui = @import("wait_card_ui.zig");
 const trust_prompt_ui = @import("trust_prompt_ui.zig");
@@ -838,6 +839,8 @@ pub fn composeFooterFrame(
                 );
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
+        } else if (input.picker_kind == .usage and ctx.usage_menu.active) {
+            try composeAndPushUsageMenuRows(alloc, &frame, plan, rows.picker_start, input.picker_rows, shell.layout.cols, ctx.usage_menu);
         } else if (input.picker_kind == .skills and ctx.skills_menu.active) {
             var prepared = try skills_menu_presentation.prepareInlineSkillsMenu(
                 alloc,
@@ -1032,6 +1035,8 @@ pub fn composeFooterFrame(
         try input_presentation.composeModelsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .effort)
         try input_presentation.composeEffortMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .usage)
+        try input_presentation.composeUsageMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, ctx.usage_menu)
     else if (input.show_picker and input.picker_kind == .slash and input.slash_menu_layout != null)
         try input_presentation.composeSlashMenuHintRow(alloc, shell.layout.cols)
     else blk: {
@@ -1147,6 +1152,22 @@ fn composeAndPushVisibleInputRows(
         line_idx += 1;
     }
     return placement;
+}
+
+fn composeAndPushUsageMenuRows(
+    alloc: Allocator,
+    frame: *footer_viewport.ComposedFooterFrame,
+    plan: PaintPlan,
+    picker_start: u16,
+    picker_rows: u16,
+    cols: u16,
+    usage_menu: usage_presentation.Projection,
+) !void {
+    var menu_row_index: u16 = 0;
+    while (menu_row_index < picker_rows) : (menu_row_index += 1) {
+        var menu_row = try usage_presentation.composeRow(alloc, usage_menu, menu_row_index, picker_rows, cols);
+        try pushFooterBandRow(alloc, frame, plan, picker_start + menu_row_index, &menu_row);
+    }
 }
 
 fn pushFooterBandRow(

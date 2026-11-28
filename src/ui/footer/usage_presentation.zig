@@ -1,15 +1,20 @@
-//! Draws the `/usage` dashboard from a `usage.Snapshot`, one row at a time,
-//! the way `df` prints: lowercase headers (table name bold, column labels
-//! dim), numbers right-aligned under them, and the current model in bold
-//! behind a `❯`. No color, in any theme. Tables are as wide as their content, never stretched
-//! to the terminal; narrow terminals drop columns before clipping names.
+//! Draws the `/usage` dashboard from a `usage.Snapshot`, one row at a time:
+//! catalog header (`Usage <count>` with period tabs), unfiltered summary
+//! tables, searchable model/product lists (`fuzzy_match.Filter`), theme
+//! selection highlighting (`selected_completion_style` vs `dim_style`), and
+//! content-sized columns that drop on narrow terminals before clipping names.
 
 const std = @import("std");
 const usage = @import("../../usage/usage.zig");
+const usage_menu = @import("../../core/session/usage_menu.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const list_window = @import("../../core/shared/list_window.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
+
+pub const no_matching_models_text = "No matching models";
+const no_matching_products_text = "No matching products";
 
 const Allocator = std.mem.Allocator;
 const ModelRow = usage.report.ModelRow;
@@ -25,6 +30,7 @@ pub const Projection = struct {
     model_window_start: usize = 0,
     /// The selected model's detail screen instead of the tables.
     detail: bool = false,
+    query: []const u8 = "",
     snapshot: ?*const usage.Snapshot = null,
 };
 
@@ -71,6 +77,7 @@ const Line = union(enum) {
     grok_limit_row,
     grok_product_header,
     grok_product_row: usize,
+    grok_no_products,
     grok_plan_header,
     grok_plan_row,
 };
@@ -79,9 +86,21 @@ const max_lines = 40;
 
 // ---------------------------------------------------------------- layout
 
-fn listedModels(p: Projection) []const ModelRow {
+fn rawModels(p: Projection) []const ModelRow {
     const s = p.snapshot orelse return &.{};
     return s.of(p.period).models;
+}
+
+fn modelFilter(p: Projection) usage_menu.NameFilter {
+    return usage_menu.modelFilter(rawModels(p), p.query);
+}
+
+fn listedModelCount(p: Projection) usize {
+    return usage_menu.filterCount(modelFilter(p));
+}
+
+fn clampedSelectedModel(p: Projection, count: usize) usize {
+    return if (count == 0) 0 else @min(p.selected_model, count - 1);
 }
 
 fn hasBudget(p: Projection) bool {
@@ -143,7 +162,7 @@ pub fn desiredRowCount(p: Projection) usize {
     if (isCodex(p)) return codexRows(p, codexSections(p, max_lines));
     if (isGrok(p)) return grokRows(grokSections(p, max_lines));
     if (p.detail) return detail_rows;
-    const models = listedModels(p).len;
+    const models = listedModelCount(p);
     if (models == 0) return tableRows(p) + 1;
     return tableRows(p) + @min(models, max_model_rows) + @intFromBool(models > max_model_rows);
 }
@@ -152,7 +171,7 @@ pub fn desiredRowCount(p: Projection) usize {
 /// one row for the "N more" line when not every model fits.
 pub fn visibleModelItems(p: Projection, visible_rows: u16) usize {
     if (isCodex(p)) return codexModelWindow(p, visible_rows).items;
-    const models = listedModels(p).len;
+    const models = listedModelCount(p);
     const area = @as(usize, visible_rows) -| tableRows(p);
     if (models <= @min(area, max_model_rows)) return @max(models, 1);
     return @max(@min(area -| 1, max_model_rows), 1);
@@ -226,6 +245,10 @@ fn layout(p: Projection, visible_rows: usize, buf: *[max_lines]Line) []const Lin
             push(buf, &n, .grok_product_header);
             for (0..sections.products) |i| push(buf, &n, .{ .grok_product_row = i });
             push(buf, &n, .blank);
+        } else if (sections.no_products) {
+            push(buf, &n, .grok_product_header);
+            push(buf, &n, .grok_no_products);
+            push(buf, &n, .blank);
         }
         push(buf, &n, .grok_plan_header);
         push(buf, &n, .grok_plan_row);
@@ -251,13 +274,19 @@ fn layout(p: Projection, visible_rows: usize, buf: *[max_lines]Line) []const Lin
         push(buf, &n, .blank);
     }
     push(buf, &n, .model_header);
-    const models = listedModels(p).len;
+    const models = listedModelCount(p);
     if (models == 0) {
         push(buf, &n, .no_models);
         return buf[0..n];
     }
     const visible = visibleModelItems(p, @intCast(@min(visible_rows, std.math.maxInt(u16))));
-    const start = @min(p.model_window_start, models -| visible);
+    const selected = clampedSelectedModel(p, models);
+    const start = list_window.updateEdgeStart(
+        p.model_window_start,
+        models,
+        selected,
+        @intCast(@min(visible, std.math.maxInt(u16))),
+    );
     const end = @min(start + visible, models);
     for (start..end) |index| push(buf, &n, .{ .model_row = index });
     if (end < models) push(buf, &n, .{ .more_row = end });
@@ -280,7 +309,13 @@ pub fn composeRow(alloc: Allocator, p: Projection, row_index: u16, visible_rows:
         .model_header => composeModelHeader(alloc, p, limit),
         .model_row => |index| composeModelRow(alloc, p, index, limit),
         .more_row => |first| composeMoreRow(alloc, p, first, limit),
-        .no_models => row_text.composeTextRow(alloc, noModelsText(p.period), width, ui_render.dim_style, 2),
+        .no_models => row_text.composeTextRow(
+            alloc,
+            if (rawModels(p).len > 0) no_matching_models_text else noModelsText(p.period),
+            width,
+            ui_render.dim_style,
+            2,
+        ),
         .detail_period_header => composeCells(alloc, &detail_period_header, .header, "", limit),
         .detail_period_row => |period| composeDetailPeriodRow(alloc, p, period, limit),
         .tokens_header => composeCells(alloc, if (limit >= wideTokensWidth()) &tokens_header_wide else &tokens_header_narrow, .header, "", limit),
@@ -306,6 +341,7 @@ pub fn composeRow(alloc: Allocator, p: Projection, row_index: u16, visible_rows:
         .grok_limit_row => composeGrokLimitRow(alloc, p, limit),
         .grok_product_header => composeGrokProductHeader(alloc, p, limit),
         .grok_product_row => |index| composeGrokProductRow(alloc, p, index, limit),
+        .grok_no_products => row_text.composeTextRow(alloc, no_matching_products_text, width, ui_render.dim_style, 2),
         .grok_plan_header => composeGrokPlanHeader(alloc, p, limit),
         .grok_plan_row => composeGrokPlanRow(alloc, p, limit),
     };
@@ -383,37 +419,190 @@ fn safeText(buf: []u8, text: []const u8) []const u8 {
 
 // ---------------------------------------------------------------- heading
 
-/// `usage: <who>` on the left; the status ("updated 2m ago", "updating…",
-/// a failure) in the right corner. A narrow terminal shortens the left part
-/// first and drops the status only when even a short name would not fit.
+fn headingShowsCatalogTabs(p: Projection) bool {
+    if (messageOnly(p) or p.detail) return false;
+    if (isCodex(p)) return codexHasPeriods(p);
+    return !isGrok(p);
+}
+
+fn headingListCount(p: Projection) ?usize {
+    if (messageOnly(p) or p.detail) return null;
+    if (isCodex(p)) {
+        if (!codexHasPeriods(p)) return null;
+        return usage_menu.codexModelCount(p.snapshot.?, p.period, p.query);
+    }
+    if (isGrok(p)) {
+        const u = grokUsage(p) orelse return null;
+        if (grokTeamUrl(u) != null or !u.hasBilling() or u.products.len == 0) return null;
+        return usage_menu.filterCount(usage_menu.grokProductFilter(u.products, p.query));
+    }
+    return listedModelCount(p);
+}
+
+fn appendStyled(alloc: Allocator, row: *std.ArrayList(u8), style: []const u8, text: []const u8) !void {
+    try row.appendSlice(alloc, style);
+    try row.appendSlice(alloc, text);
+    try row.appendSlice(alloc, ui_render.reset_style);
+}
+
+fn appendHeadingTabs(alloc: Allocator, row: *std.ArrayList(u8), active_period: Period, compact_only: bool) !void {
+    for (Period.all) |period| {
+        const active = period == active_period;
+        if (compact_only and !active) continue;
+        const style = if (active) ui_render.selected_completion_style else ui_render.dim_style;
+        try row.appendSlice(alloc, "  ");
+        try row.appendSlice(alloc, style);
+        if (active) try row.append(alloc, '[');
+        try row.appendSlice(alloc, period.label());
+        if (active) try row.append(alloc, ']');
+        try row.appendSlice(alloc, ui_render.reset_style);
+    }
+}
+
+fn appendHeadingStatus(alloc: Allocator, row: *std.ArrayList(u8), p: Projection, status: []const u8) !void {
+    const failed = if (p.snapshot) |snap| snap.status == .failed else false;
+    if (failed) {
+        try row.appendSlice(alloc, status);
+    } else {
+        try appendStyled(alloc, row, ui_render.dim_style, status);
+    }
+}
+
+const HeadingRightPlan = struct {
+    account_room: usize = 0,
+    show_status: bool = false,
+};
+
+fn tryFitHeadingRight(left_width: usize, account_width: usize, status_width: usize, limit: usize) ?HeadingRightPlan {
+    if (left_width > limit) return null;
+    const show_status = status_width > 0;
+    const status_gap: usize = if (show_status) 3 + status_width else 0;
+    if (account_width > 0) {
+        const full_needed = left_width + 2 + account_width + status_gap;
+        if (full_needed <= limit) {
+            return .{ .account_room = account_width, .show_status = show_status };
+        }
+        const min_needed = left_width + 2 + status_gap;
+        if (limit > min_needed) {
+            const room = limit - min_needed;
+            if (room >= @min(account_width, 8)) {
+                return .{ .account_room = room, .show_status = show_status };
+            }
+        }
+    }
+    if (left_width + (if (show_status) 2 + status_width else 0) <= limit) {
+        return .{ .show_status = show_status };
+    }
+    return null;
+}
+
+fn appendHeadingLeft(alloc: Allocator, out: *std.ArrayList(u8), title: []const u8, show_tabs: bool, period: Period, compact_only: bool) !void {
+    try appendStyled(alloc, out, ui_render.selected_completion_style, title);
+    if (show_tabs) try appendHeadingTabs(alloc, out, period, compact_only);
+}
+
+fn headingLeftWidth(title: []const u8, show_tabs: bool, active_period: Period, compact_only: bool) usize {
+    var width = title.len;
+    if (!show_tabs) return width;
+    for (Period.all) |period| {
+        const active = period == active_period;
+        if (compact_only and !active) continue;
+        width += 2 + period.label().len + if (active) @as(usize, 2) else 0;
+    }
+    return width;
+}
+
+/// `Usage <count>` with period tabs on the left and `<account> · <status>`
+/// right-aligned, matching `/model` and `/resume` headers. Unavailable, detail,
+/// and non-list plan views keep `Usage: <who>`.
 fn composeHeading(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
-    var left_buf: [320]u8 = undefined;
-    const left = headingLeft(&left_buf, p);
     var status_buf: [96]u8 = undefined;
     const status = headingStatus(&status_buf, p);
-    const prefix_width: usize = "usage: ".len;
-    const min_left: usize = 12;
     const status_width = display_width.visibleWidth(status);
+
+    if (headingListCount(p)) |count| {
+        const show_tabs = headingShowsCatalogTabs(p);
+        var account_buf: [256]u8 = undefined;
+        const account = headingSourceText(&account_buf, p);
+        const account_width = display_width.visibleWidth(account);
+
+        var title_buf: [32]u8 = undefined;
+        const title = std.mem.print(&title_buf, "Usage {d}", .{count}) catch "Usage";
+
+        var chosen_compact = false;
+        var left_width: usize = 0;
+        var right_plan: ?HeadingRightPlan = null;
+
+        for ([_]bool{ false, true }) |compact_only| {
+            if (compact_only and !show_tabs) break;
+            chosen_compact = compact_only;
+            left_width = headingLeftWidth(title, show_tabs, p.period, compact_only);
+            if (tryFitHeadingRight(left_width, account_width, status_width, limit)) |plan| {
+                right_plan = plan;
+                break;
+            }
+        }
+        if (right_plan == null and left_width <= limit) {
+            right_plan = .{};
+        }
+
+        if (right_plan) |plan| {
+            try appendHeadingLeft(alloc, &row, title, show_tabs, p.period, chosen_compact);
+            const shown_account = if (plan.account_room > 0) @min(account_width, plan.account_room) else 0;
+            const sep_width: usize = if (plan.account_room > 0 and plan.show_status) 3 else 0;
+            const right_width = shown_account + sep_width + (if (plan.show_status) status_width else 0);
+            if (right_width > 0) {
+                try row.appendNTimes(alloc, ' ', limit - left_width - right_width);
+                if (plan.account_room > 0) {
+                    try row.appendSlice(alloc, ui_render.dim_style);
+                    try row_text.appendSingleLineEllipsized(alloc, &row, account, plan.account_room);
+                    if (plan.show_status) try row.appendSlice(alloc, " · ");
+                    try row.appendSlice(alloc, ui_render.reset_style);
+                }
+                if (plan.show_status) {
+                    try appendHeadingStatus(alloc, &row, p, status);
+                }
+            }
+            return row;
+        }
+        return row_text.composeTextRow(alloc, title, @intCast(@min(limit, std.math.maxInt(u16))), ui_render.selected_completion_style, 0);
+    }
+
+    var left_buf: [320]u8 = undefined;
+    const left = headingLeft(&left_buf, p);
+    const prefix_width: usize = "Usage: ".len;
+    const min_left: usize = 12;
     const show_status = status_width > 0 and prefix_width + min_left + 2 + status_width <= limit;
     const left_room = if (show_status) limit - prefix_width - 2 - status_width else limit -| prefix_width;
 
-    try row.print(alloc, "{s}usage:{s} ", .{ ui_render.bold_style, ui_render.reset_style });
+    try appendStyled(alloc, &row, ui_render.selected_completion_style, "Usage:");
+    try row.append(alloc, ' ');
     const left_start = row.items.len;
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, left, left_room);
+    if (p.detail) {
+        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, left, left_room);
+    } else {
+        try row_text.appendSingleLineEllipsized(alloc, &row, left, left_room);
+    }
     if (show_status) {
         const used = prefix_width + display_width.visibleWidth(row.items[left_start..]);
         try row.appendNTimes(alloc, ' ', limit - used - status_width);
-        // A failure reads in normal weight; routine freshness stays dim.
-        const failed = if (p.snapshot) |snap| snap.status == .failed else false;
-        if (failed) {
-            try row.appendSlice(alloc, status);
-        } else {
-            try row.print(alloc, "{s}{s}{s}", .{ ui_render.dim_style, status, ui_render.reset_style });
-        }
+        try appendHeadingStatus(alloc, &row, p, status);
     }
     return row;
+}
+
+fn headingSourceText(buf: []u8, p: Projection) []const u8 {
+    const s = p.snapshot orelse return "AI Gateway";
+    if (s.label.len == 0) return "AI Gateway";
+    if (codexProfile(p)) |profile| if (profile.name) |name| {
+        var label_buf: [128]u8 = undefined;
+        var name_buf: [64]u8 = undefined;
+        const label = safeText(&label_buf, s.label);
+        return std.mem.print(buf, "{s}, {s}", .{ label, safeText(&name_buf, name) }) catch safeText(buf, s.label);
+    };
+    return safeText(buf, s.label);
 }
 
 /// Whose numbers these are, or on a detail screen which model.
@@ -426,21 +615,17 @@ fn headingLeft(buf: []u8, p: Projection) []const u8 {
         .refresh_needed => "the sign-in needs a refresh",
     };
     if (p.detail) {
-        const models = listedModels(p);
-        if (p.selected_model < models.len) {
+        const models = rawModels(p);
+        const filter = modelFilter(p);
+        const count = usage_menu.filterCount(filter);
+        const selected = clampedSelectedModel(p, count);
+        if (usage_menu.filterAt(filter, selected)) |raw_index| {
             var name_buf: [256]u8 = undefined;
-            const name = safeText(&name_buf, models[p.selected_model].model);
-            return std.mem.print(buf, "{s}, model {d} of {d}", .{ name, p.selected_model + 1, models.len }) catch name;
+            const name = safeText(&name_buf, models[raw_index].model);
+            return std.mem.print(buf, "{s}, model {d} of {d}", .{ name, selected + 1, count }) catch name;
         }
     }
-    if (s.label.len == 0) return "AI Gateway";
-    if (codexProfile(p)) |profile| if (profile.name) |name| {
-        var label_buf: [128]u8 = undefined;
-        var name_buf: [64]u8 = undefined;
-        const label = safeText(&label_buf, s.label);
-        return std.mem.print(buf, "{s}, {s}", .{ label, safeText(&name_buf, name) }) catch safeText(buf, s.label);
-    };
-    return safeText(buf, s.label);
+    return headingSourceText(buf, p);
 }
 
 fn headingStatus(buf: []u8, p: Projection) []const u8 {
@@ -496,7 +681,7 @@ fn composeMessage(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(
                 .refresh_needed => "(send a message to renew it, then reopen /usage)",
             },
             .fetching => std.mem.print(&fetching_buf, "fetching usage from {s}", .{serviceName(p)}) catch "fetching usage",
-            .failed => "(press r to retry)",
+            .failed => "(press ctrl+r to retry)",
             .ready => "no usage yet",
         };
     };
@@ -620,23 +805,19 @@ fn modelColumnsWidth(columns: ModelColumns) usize {
     };
 }
 
-/// The name column is as wide as the longest listed name (or the header),
-/// so the table never stretches; share, then tokens, give way first.
+/// The name column is as wide as the longest name in the period (or "model"),
+/// so the table never stretches or jumps as you filter; share, then tokens,
+/// give way first.
 fn modelLayout(p: Projection, limit: usize) ModelLayout {
-    var header_buf: [24]u8 = undefined;
-    var name_width = display_width.visibleWidth(modelHeaderText(&header_buf, p.period));
+    var name_width = display_width.visibleWidth("model");
     var safe_buf: [256]u8 = undefined;
     // Measure what is drawn: control bytes are shown as `?`.
-    for (listedModels(p)) |model| name_width = @max(name_width, display_width.visibleWidth(safeText(&safe_buf, model.model)));
+    for (rawModels(p)) |model| name_width = @max(name_width, display_width.visibleWidth(safeText(&safe_buf, model.model)));
     const room = limit -| gutter;
     for ([_]ModelColumns{ .full, .no_share, .small }) |columns| {
         if (name_width + modelColumnsWidth(columns) <= room) return .{ .columns = columns, .name_width = name_width };
     }
     return .{ .columns = .small, .name_width = @max(room -| modelColumnsWidth(.small), 8) };
-}
-
-fn modelHeaderText(buf: []u8, period: Period) []const u8 {
-    return std.mem.print(buf, "model ({s})", .{period.label()}) catch "model";
 }
 
 fn modelCells(columns: ModelColumns, spent: []const u8, share: []const u8, requests: []const u8, tokens: []const u8, out: *[4]Cell) []const Cell {
@@ -662,21 +843,21 @@ fn modelCells(columns: ModelColumns, spent: []const u8, share: []const u8, reque
 
 fn composeModelHeader(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(u8) {
     const l = modelLayout(p, limit);
-    var header_buf: [24]u8 = undefined;
     var rest: [4]Cell = undefined;
     const numbers = modelCells(l.columns, "spent", "share", "requests", "tokens", &rest);
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
     try row.appendNTimes(alloc, ' ', gutter);
-    const name = [_]Cell{.{ .text = modelHeaderText(&header_buf, p.period), .width = l.name_width, .left = true }};
+    const name = [_]Cell{.{ .text = "model", .width = l.name_width, .left = true }};
     const used = try appendCells(alloc, &row, &name, .header, gutter, limit);
     _ = try appendCells(alloc, &row, numbers, .header_labels, used, limit);
     return row;
 }
 
 fn composeModelRow(alloc: Allocator, p: Projection, index: usize, limit: usize) !std.ArrayList(u8) {
-    const models = listedModels(p);
-    const model = models[index];
+    const models = rawModels(p);
+    const info = usage_menu.filterAtWithCount(modelFilter(p), index);
+    const model = models[info.raw_index orelse return .empty];
     const total = p.snapshot.?.of(p.period).totals.total_cost;
     const l = modelLayout(p, limit);
     var spent: [32]u8 = undefined;
@@ -692,17 +873,14 @@ fn composeModelRow(alloc: Allocator, p: Projection, index: usize, limit: usize) 
         compact(&tokens, model.totals.totalTokens()),
         &rest,
     );
-    const selected = index == p.selected_model;
+    const selected = index == clampedSelectedModel(p, info.count);
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
-    if (selected) {
-        try row.print(alloc, "{s}❯ ", .{ui_render.bold_style});
-    } else {
-        try row.appendNTimes(alloc, ' ', gutter);
-    }
+    try row.appendNTimes(alloc, ' ', gutter);
+    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
     try appendName(alloc, &row, model.model, l.name_width);
     _ = try appendCells(alloc, &row, numbers, .data, gutter + l.name_width, limit);
-    if (selected) try row.appendSlice(alloc, ui_render.reset_style);
+    try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
 
@@ -716,9 +894,17 @@ fn appendName(alloc: Allocator, row: *std.ArrayList(u8), name: []const u8, name_
 }
 
 fn composeMoreRow(alloc: Allocator, p: Projection, first: usize, limit: usize) !std.ArrayList(u8) {
-    const models = listedModels(p);
+    const models = rawModels(p);
+    const filter = modelFilter(p);
     var sum: usage.report.Totals = .{};
-    for (models[first..]) |model| sum.add(model.totals);
+    var count: usize = 0;
+    var display_index: usize = 0;
+    for (models, 0..) |model, raw_index| {
+        if (!usage_menu.filterKeeps(filter, raw_index)) continue;
+        if (display_index >= first) sum.add(model.totals);
+        display_index += 1;
+        count += 1;
+    }
     const total = p.snapshot.?.of(p.period).totals.total_cost;
     const l = modelLayout(p, limit);
     var label_buf: [32]u8 = undefined;
@@ -739,7 +925,7 @@ fn composeMoreRow(alloc: Allocator, p: Projection, first: usize, limit: usize) !
     errdefer row.deinit(alloc);
     try row.appendSlice(alloc, ui_render.dim_style);
     try row.appendNTimes(alloc, ' ', gutter);
-    try appendName(alloc, &row, std.mem.print(&label_buf, "{d} more", .{models.len - first}) catch "more", l.name_width);
+    try appendName(alloc, &row, std.mem.print(&label_buf, "{d} more", .{count -| first}) catch "more", l.name_width);
     _ = try appendCells(alloc, &row, numbers, .data, gutter + l.name_width, limit);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
@@ -748,8 +934,11 @@ fn composeMoreRow(alloc: Allocator, p: Projection, first: usize, limit: usize) !
 // ----------------------------------------------------------------- detail
 
 fn selectedName(p: Projection) ?[]const u8 {
-    const models = listedModels(p);
-    return if (p.selected_model < models.len) models[p.selected_model].model else null;
+    const models = rawModels(p);
+    const filter = modelFilter(p);
+    const count = usage_menu.filterCount(filter);
+    const raw_index = usage_menu.filterAt(filter, clampedSelectedModel(p, count)) orelse return null;
+    return models[raw_index].model;
 }
 
 /// The selected model's row for `period`, or null when it had no usage then.
@@ -989,6 +1178,7 @@ const GrokSections = struct {
     note: bool = false,
     limit: bool = false,
     products: usize = 0,
+    no_products: bool = false,
 };
 
 fn grokRows(sections: GrokSections) usize {
@@ -996,6 +1186,7 @@ fn grokRows(sections: GrokSections) usize {
     if (sections.note) rows += 2;
     if (sections.limit) rows += 3;
     if (sections.products > 0) rows += 2 + sections.products;
+    if (sections.no_products) rows += 3;
     return rows;
 }
 
@@ -1004,8 +1195,16 @@ fn grokRows(sections: GrokSections) usize {
 fn grokSections(p: Projection, visible_rows: usize) GrokSections {
     const u = grokUsage(p) orelse return .{};
     if (grokTeamUrl(u) != null or !u.hasBilling()) return .{ .note = true };
-    var sections: GrokSections = .{ .limit = u.used_percent != null, .products = u.products.len };
-    if (grokRows(sections) > visible_rows) sections.products = 0;
+    const matched = if (u.products.len > 0) usage_menu.filterCount(usage_menu.grokProductFilter(u.products, p.query)) else 0;
+    var sections: GrokSections = .{
+        .limit = u.used_percent != null,
+        .products = matched,
+        .no_products = u.products.len > 0 and matched == 0,
+    };
+    if (grokRows(sections) > visible_rows) {
+        sections.products = 0;
+        sections.no_products = false;
+    }
     return sections;
 }
 
@@ -1068,8 +1267,8 @@ fn composeGrokProductHeader(alloc: Allocator, p: Projection, limit: usize) !std.
 
 fn composeGrokProductRow(alloc: Allocator, p: Projection, index: usize, limit: usize) !std.ArrayList(u8) {
     const u = grokUsage(p).?;
-    if (index >= u.products.len) return .empty;
-    const product = u.products[index];
+    const raw_index = usage_menu.filterAt(usage_menu.grokProductFilter(u.products, p.query), index) orelse return .empty;
+    const product = u.products[raw_index];
     const name_width = grokProductNameWidth(u);
     var name_buf: [64]u8 = undefined;
     var used_buf: [8]u8 = undefined;
@@ -1174,9 +1373,14 @@ pub fn codexHasPeriods(p: Projection) bool {
     return isCodex(p) and s.codexBreakdown() != null;
 }
 
-fn modelShares(p: Projection, buf: *[max_shares]Share) []Share {
+fn rawModelShares(p: Projection, buf: *[max_shares]Share) []Share {
     const s = p.snapshot orelse return buf[0..0];
     return s.codexModelShares(p.period, buf);
+}
+
+fn modelShares(p: Projection, buf: *[max_shares]Share) []Share {
+    const s = p.snapshot orelse return buf[0..0];
+    return usage_menu.filteredCodexShares(s, p.period, p.query, buf);
 }
 
 fn surfaceShares(p: Projection, buf: *[max_shares]Share) []Share {
@@ -1264,8 +1468,8 @@ const ModelWindow = struct {
 };
 
 fn codexModelWindow(p: Projection, visible_rows: usize) ModelWindow {
-    var buf: [max_shares]Share = undefined;
-    const count = modelShares(p, &buf).len;
+    const s = p.snapshot orelse return .{};
+    const count = usage_menu.codexModelCount(s, p.period, p.query);
     const rows = codexSections(p, visible_rows).model_rows;
     if (count <= rows) return .{ .items = count };
     const items = @max(rows -| 1, 1);
@@ -1296,10 +1500,10 @@ fn composeCodexTokensRow(alloc: Allocator, p: Projection, span: CodexSpan, limit
 /// A gap, the speed (`standard`, `fast`) and the share.
 const model_tail_width: usize = 2 + 8 + 7;
 
-/// As wide as the longest name in any period and the widest header, so Tab
-/// never moves the columns.
+/// As wide as the longest name in any period and "model", so Tab and search
+/// never move the columns.
 fn codexModelNameWidth(p: Projection, limit: usize) usize {
-    var width: usize = "model (month)".len;
+    var width: usize = "model".len;
     if (p.snapshot) |s| {
         var buf: [max_shares]Share = undefined;
         var safe_buf: [64]u8 = undefined;
@@ -1309,9 +1513,8 @@ fn codexModelNameWidth(p: Projection, limit: usize) usize {
 }
 
 fn composeCodexModelHeader(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(u8) {
-    var header_buf: [24]u8 = undefined;
     const cells = [_]Cell{
-        .{ .text = modelHeaderText(&header_buf, p.period), .width = codexModelNameWidth(p, limit), .left = true },
+        .{ .text = "model", .width = codexModelNameWidth(p, limit), .left = true },
         .{ .text = "", .width = 2 },
         .{ .text = "speed", .width = 8, .left = true },
         .{ .text = "share", .width = 7 },
@@ -1323,7 +1526,12 @@ fn composeCodexModelLine(alloc: Allocator, p: Projection, slot: usize, visible_r
     var buf: [max_shares]Share = undefined;
     const shares = modelShares(p, &buf);
     if (shares.len == 0) {
-        if (slot == 0) return row_text.composeTextRow(alloc, codexEmptyText(p.period), @intCast(@min(limit, std.math.maxInt(u16))), ui_render.dim_style, 2);
+        if (slot == 0) {
+            var raw_buf: [max_shares]Share = undefined;
+            const has_raw = rawModelShares(p, &raw_buf).len > 0;
+            const text = if (has_raw) no_matching_models_text else codexEmptyText(p.period);
+            return row_text.composeTextRow(alloc, text, @intCast(@min(limit, std.math.maxInt(u16))), ui_render.dim_style, 2);
+        }
         return .empty;
     }
     const window = codexModelWindow(p, visible_rows);
@@ -1629,6 +1837,7 @@ fn compact(buf: *[16]u8, value: u64) []const u8 {
 
 const testing = std.testing;
 const vt_emulator = @import("../../core/terminal/engine.zig");
+const input_presentation = @import("input_presentation.zig");
 
 const test_now: i64 = 20737 * std.time.ms_per_day + 8 * std.time.ms_per_hour + 16 * std.time.ms_per_min;
 const test_widths = [_]u16{ 40, 48, 56, 64, 80, 100, 120, 180, 240 };
@@ -1770,11 +1979,14 @@ test "the df view lines its numbers up under the headers at every width" {
     for (test_widths) |width| {
         var screen = try draw(p, width, 40);
         defer screen.deinit();
-        // The label on the left, the freshness in the right corner.
-        try testing.expect(std.mem.startsWith(u8, screen.row(0), "usage: acme-de"));
+        // Catalog header on the left, the freshness in the right corner.
+        if (width >= 43) {
+            try testing.expect(std.mem.startsWith(u8, screen.row(0), "Usage 5  today  7d  [month]"));
+        } else {
+            try testing.expect(std.mem.startsWith(u8, screen.row(0), "Usage 5  [month]"));
+        }
         try testing.expect(std.mem.endsWith(u8, screen.row(0), "updated 2m ago"));
         try testing.expectEqual(@as(usize, width), display_width.visibleWidth(screen.row(0)));
-        try testing.expectEqual(width >= 61, std.mem.find(u8, screen.row(0), "acme-design-tools-platform (fx login)") != null);
 
         // Period table: numbers end where their headers end.
         try testing.expectEqualStrings("period        spent  requests  tokens", screen.row(2));
@@ -1790,9 +2002,9 @@ test "the df view lines its numbers up under the headers at every width" {
         try testing.expectEqual(width >= 55, std.mem.find(u8, screen.row(budget + 1), "nov 1") != null);
         try testing.expectEqual(width >= 47, std.mem.find(u8, screen.row(budget), "size") != null);
 
-        // Model table: the current model carries the marker.
-        const header = screen.find("model (month)").?;
-        try testing.expect(std.mem.startsWith(u8, screen.row(header + 1), "❯ anthropi"));
+        // Model table: 2-space indent without cursor glyph.
+        const header = screen.find("  model").?;
+        try testing.expect(std.mem.startsWith(u8, screen.row(header + 1), "  anthropi"));
         try testing.expect(std.mem.startsWith(u8, screen.row(header + 2), "  openai/g"));
         // Names stay whole once the longest fits beside spent and requests.
         try testing.expectEqual(width >= gutter + 42 + modelColumnsWidth(.small), screen.find("google/gemini-3.1-flash-lite-image-preview") != null);
@@ -1824,12 +2036,12 @@ test "the df view stays content-sized on wide terminals and drops columns on nar
     // too. The names stay whole in both.
     var at_80 = try draw(p, 80, 40);
     defer at_80.deinit();
-    const h80 = at_80.row(at_80.find("model (month)").?);
+    const h80 = at_80.row(at_80.find("  model").?);
     try testing.expect(std.mem.find(u8, h80, "share") == null and std.mem.find(u8, h80, "tokens") != null);
     try testing.expect(at_80.find("google/gemini-3.1-flash-lite-image-preview") != null);
     var at_72 = try draw(p, 72, 40);
     defer at_72.deinit();
-    const h72 = at_72.row(at_72.find("model (month)").?);
+    const h72 = at_72.row(at_72.find("  model").?);
     try testing.expect(std.mem.find(u8, h72, "tokens") == null and std.mem.find(u8, h72, "requests") != null);
     try testing.expect(at_72.find("google/gemini-3.1-flash-lite-image-preview") != null);
     // 40 columns: the long name is clipped in the middle, never wrapped.
@@ -1904,14 +2116,14 @@ test "states without numbers say so in one line" {
     defer unavailable.deinit();
     var screen = try draw(.{ .active = true, .snapshot = &unavailable }, 80, 40);
     defer screen.deinit();
-    try testing.expectEqualStrings("usage: not signed in to AI Gateway", screen.row(0));
+    try testing.expectEqualStrings("Usage: not signed in to AI Gateway", screen.row(0));
     try testing.expectEqualStrings("  (use /login, or set AI_GATEWAY_API_KEY)", screen.row(2));
 
     var other = try testSnapshot(.{ .unavailable = .unsupported_provider }, false, &.{});
     defer other.deinit();
     var other_screen = try draw(.{ .active = true, .snapshot = &other }, 80, 40);
     defer other_screen.deinit();
-    try testing.expectEqualStrings("usage: this provider's usage isn't shown yet", other_screen.row(0));
+    try testing.expectEqualStrings("Usage: this provider's usage isn't shown yet", other_screen.row(0));
     try testing.expectEqualStrings("  (use /provider and pick AI Gateway to see AI Gateway usage)", other_screen.row(2));
 
     var fetching = try testSnapshot(.fetching, false, &.{});
@@ -1922,7 +2134,7 @@ test "states without numbers say so in one line" {
     }
     var first = try draw(.{ .active = true, .snapshot = &fetching }, 80, 40);
     defer first.deinit();
-    try testing.expect(std.mem.startsWith(u8, first.row(0), "usage: acme-design-tools-platform (fx login)  "));
+    try testing.expect(std.mem.startsWith(u8, first.row(0), "Usage: acme-design-tools-platform (fx login)  "));
     try testing.expect(std.mem.endsWith(u8, first.row(0), "fetching…"));
     try testing.expectEqual(@as(usize, 80), display_width.visibleWidth(first.row(0)));
 
@@ -1937,18 +2149,16 @@ test "states without numbers say so in one line" {
     try testing.expect(std.mem.startsWith(u8, today.row(3), "today       $0.0000"));
 }
 
-test "the current model is bold and colorless in every theme" {
+test "the current model uses selected_completion_style with 2-space indent and no cursor glyph" {
     var snapshot = try testSnapshot(.ready, false, &month_models);
     defer snapshot.deinit();
     const p: Projection = .{ .active = true, .snapshot = &snapshot };
     const alloc = testing.allocator;
     var row = try composeRow(alloc, p, @intCast(tableRows(p)), 40, 120);
     defer row.deinit(alloc);
-    try testing.expect(std.mem.startsWith(u8, row.items, ui_render.bold_style ++ "❯ "));
-    // No foreground or background color code anywhere in the row.
-    try testing.expect(std.mem.find(u8, row.items, "[3") == null);
-    try testing.expect(std.mem.find(u8, row.items, "[4") == null);
-    try testing.expect(std.mem.find(u8, row.items, ";3") == null);
+    var prefix_buf: [64]u8 = undefined;
+    try testing.expect(std.mem.startsWith(u8, row.items, try std.mem.print(&prefix_buf, "  {s}", .{ui_render.selected_completion_style})));
+    try testing.expect(std.mem.find(u8, row.items, "❯") == null);
 }
 
 test "network text cannot inject terminal controls" {
@@ -2018,7 +2228,7 @@ test "a Codex plan without activity or limit windows shows only the plan" {
         var screen = try draw(p, width, 40);
         defer screen.deinit();
         try testing.expectEqual(@as(usize, 4), screen.count);
-        try testing.expectEqualStrings("usage: codex (ChatGPT)", screen.row(0)[0.."usage: codex (ChatGPT)".len]);
+        try testing.expectEqualStrings("Usage: codex (ChatGPT)", screen.row(0)[0.."Usage: codex (ChatGPT)".len]);
         try testing.expect(std.mem.endsWith(u8, screen.row(0), "updated 2m ago"));
         try testing.expectEqualStrings("plan          credits   spend limit", screen.row(2));
         try testing.expectEqualStrings("business    unlimited   not reached", screen.row(3));
@@ -2139,9 +2349,12 @@ test "the Codex view lines up under its headers at every width" {
         var screen = try draw(p, width, 40);
         defer screen.deinit();
         try testing.expectEqual(@as(usize, 30), screen.count);
-        // The name shortens before the status drops on narrow terminals.
-        const full_heading = "usage: codex (ChatGPT), samdoe";
-        try testing.expect(std.mem.startsWith(u8, screen.row(0), if (width >= full_heading.len + 2 + "updated 2m ago".len) full_heading else "usage: codex"));
+        // The catalog header shows model count and period tabs; narrow drops inactive tabs before status.
+        if (width >= 43) {
+            try testing.expect(std.mem.startsWith(u8, screen.row(0), "Usage 9  today  7d  [month]"));
+        } else {
+            try testing.expect(std.mem.startsWith(u8, screen.row(0), "Usage 9  [month]"));
+        }
         try testing.expect(std.mem.endsWith(u8, screen.row(0), "updated 2m ago"));
         try testing.expectEqualStrings("period        tokens", screen.row(2));
         try testing.expectEqualStrings("today          39.9M", screen.row(3));
@@ -2149,7 +2362,7 @@ test "the Codex view lines up under its headers at every width" {
 
         // Models: every one listed, largest first, ties by name.
         const models = screen.row(8);
-        try testing.expect(std.mem.startsWith(u8, models, "model (month)"));
+        try testing.expect(std.mem.startsWith(u8, models, "model        "));
         const expected = [_]struct { []const u8, []const u8, []const u8 }{
             .{ "gpt-6-astra", "fast", "46.5%" },
             .{ "gpt-6.1-sol", "fast", "23.3%" },
@@ -2220,7 +2433,7 @@ test "Tab changes the Codex model and surface numbers without moving any row or 
     var today = try draw(.{ .active = true, .period = .today, .snapshot = &snapshot }, 80, 40);
     defer today.deinit();
     const models = today.row(8);
-    try testing.expect(std.mem.startsWith(u8, models, "model (today)"));
+    try testing.expect(std.mem.startsWith(u8, models, "model        "));
     try testing.expect(std.mem.startsWith(u8, today.row(9), "gpt-6.1-sol"));
     try testing.expectEqual(endColumn(models, "share").?, endColumn(today.row(9), "58.8%").?);
     try testing.expectEqual(endColumn(models, "share").?, endColumn(today.row(10), "41.2%").?);
@@ -2249,7 +2462,7 @@ test "a Codex period without usage says so and keeps its rows" {
     var screen = try draw(.{ .active = true, .period = .today, .snapshot = &snapshot }, 80, 40);
     defer screen.deinit();
     try testing.expectEqual(month.count, screen.count);
-    try testing.expect(std.mem.startsWith(u8, screen.row(8), "model (today)"));
+    try testing.expect(std.mem.startsWith(u8, screen.row(8), "model        "));
     try testing.expectEqualStrings("  no Codex usage reported today", screen.row(9));
     for (10..16) |i| try testing.expectEqualStrings("", screen.row(i));
     const where = screen.find("where (").?;
@@ -2333,7 +2546,7 @@ test "a Grok plan shows its period's use, products, credits and pay-as-you-go" {
         var screen = try draw(p, width, 40);
         defer screen.deinit();
         try testing.expectEqual(@as(usize, 11), screen.count);
-        try testing.expect(std.mem.startsWith(u8, screen.row(0), "usage: grok (xAI)"));
+        try testing.expect(std.mem.startsWith(u8, screen.row(0), "Usage 2"));
         try testing.expect(std.mem.endsWith(u8, screen.row(0), "updated 2m ago"));
 
         // The limit: the week, floored as Grok reports it, and its reset.
@@ -2447,6 +2660,260 @@ test "Codex states name ChatGPT, not AI Gateway" {
     defer expired.deinit();
     var expired_screen = try draw(.{ .active = true, .snapshot = &expired }, 80, 40);
     defer expired_screen.deinit();
-    try testing.expectEqualStrings("usage: the sign-in needs a refresh", expired_screen.row(0));
+    try testing.expectEqualStrings("Usage: the sign-in needs a refresh", expired_screen.row(0));
     try testing.expectEqualStrings("  (send a message to renew it, then reopen /usage)", expired_screen.row(2));
+}
+
+test "the usage dashboard matches the catalog header, period tabs, selection styles, and 80/50-column layout" {
+    const mockup_models = [_]ModelRow{
+        testRow("anthropic/claude-opus-4-6", 5.62, 21, 168_000),
+        testRow("openai/gpt-5", 3.00, 16, 127_000),
+        testRow("anthropic/claude-sonnet-4-5", 1.94, 22, 212_000),
+        testRow("openai/gpt-5-pro", 1.48, 4, 34_000),
+        testRow("google/gemini-2.5-pro", 0.72, 9, 75_000),
+        testRow("xai/grok-4", 0.54, 6, 49_000),
+        testRow("deepseek/deepseek-r1", 0.31, 8, 69_000),
+        testRow("meta/llama-4-maverick", 0.19, 5, 35_000),
+        testRow("mistral/mistral-large", 0.14, 3, 22_000),
+        testRow("cohere/command-a", 0.09, 2, 14_000),
+        testRow("qwen/qwen3-coder", 0.07, 4, 29_000),
+        testRow("perplexity/sonar-pro", 0.05, 2, 9_000),
+        testRow("moonshot/kimi-k2", 0.03, 1, 7_000),
+        testRow("minimax/minimax-m1", 0.02, 1, 5_000),
+    };
+    var snapshot = try testSnapshot(.ready, false, &mockup_models);
+    defer snapshot.deinit();
+    const p: Projection = .{ .active = true, .selected_model = 1, .snapshot = &snapshot };
+
+    var at_80 = try draw(p, 80, 40);
+    defer at_80.deinit();
+    try testing.expectEqualStrings(
+        "Usage 14  today  7d  [month]  acme-design-tools-platform (fx l… · updated 2m ago",
+        at_80.row(0),
+    );
+    try testing.expectEqualStrings("period        spent  requests  tokens", at_80.row(2));
+    try testing.expectEqualStrings("  model                            spent   share  requests  tokens", at_80.row(7));
+    try testing.expectEqualStrings("  anthropic/claude-opus-4-6        $5.62   39.6%        21    168K", at_80.row(8));
+    try testing.expectEqualStrings("  openai/gpt-5                     $3.00   21.1%        16    127K", at_80.row(9));
+    try testing.expectEqualStrings("  4 more                         $0.1700    1.2%         8     50K", at_80.row(18));
+
+    var at_50 = try draw(p, 50, 40);
+    defer at_50.deinit();
+    try testing.expectEqualStrings(
+        "Usage 14  today  7d  [month]        updated 2m ago",
+        at_50.row(0),
+    );
+    try testing.expectEqualStrings("  model                            spent  requests", at_50.row(7));
+    try testing.expectEqualStrings("  anthropic/claude-opus-4-6        $5.62        21", at_50.row(8));
+    try testing.expectEqualStrings("  openai/gpt-5                     $3.00        16", at_50.row(9));
+    try testing.expectEqualStrings("  4 more                         $0.1700         8", at_50.row(18));
+
+    const alloc = testing.allocator;
+    var span_buf: [128]u8 = undefined;
+    var heading_raw = try composeRow(alloc, p, 0, 40, 80);
+    defer heading_raw.deinit(alloc);
+    try testing.expect(std.mem.find(u8, heading_raw.items, try std.mem.print(&span_buf, "{s}Usage 14", .{ui_render.selected_completion_style})) != null);
+    try testing.expect(std.mem.find(u8, heading_raw.items, try std.mem.print(&span_buf, "{s}today", .{ui_render.dim_style})) != null);
+    try testing.expect(std.mem.find(u8, heading_raw.items, try std.mem.print(&span_buf, "{s}[month]", .{ui_render.selected_completion_style})) != null);
+
+    var unselected_raw = try composeRow(alloc, p, 8, 40, 80);
+    defer unselected_raw.deinit(alloc);
+    try testing.expect(std.mem.startsWith(u8, unselected_raw.items, try std.mem.print(&span_buf, "  {s}", .{ui_render.dim_style})));
+
+    var selected_raw = try composeRow(alloc, p, 9, 40, 80);
+    defer selected_raw.deinit(alloc);
+    try testing.expect(std.mem.startsWith(u8, selected_raw.items, try std.mem.print(&span_buf, "  {s}", .{ui_render.selected_completion_style})));
+    try testing.expect(std.mem.find(u8, selected_raw.items, "❯") == null);
+
+    // Filtered layout ("op") at 80 and 50 columns keeps period unfiltered and shows only matching rows.
+    const filtered_proj: Projection = .{ .active = true, .selected_model = 0, .query = "op", .snapshot = &snapshot };
+    var filtered_80 = try draw(filtered_proj, 80, 40);
+    defer filtered_80.deinit();
+    try testing.expectEqualStrings(
+        "Usage 4  today  7d  [month]  acme-design-tools-platform (fx lo… · updated 2m ago",
+        filtered_80.row(0),
+    );
+    try testing.expectEqualStrings("period        spent  requests  tokens", filtered_80.row(2));
+    try testing.expectEqualStrings("  model                            spent   share  requests  tokens", filtered_80.row(7));
+    try testing.expectEqualStrings("  anthropic/claude-opus-4-6        $5.62   39.6%        21    168K", filtered_80.row(8));
+    try testing.expectEqualStrings("  openai/gpt-5                     $3.00   21.1%        16    127K", filtered_80.row(9));
+    try testing.expectEqualStrings("  anthropic/claude-sonnet-4-5      $1.94   13.7%        22    212K", filtered_80.row(10));
+    try testing.expectEqualStrings("  openai/gpt-5-pro                 $1.48   10.4%         4     34K", filtered_80.row(11));
+    try testing.expectEqual(@as(usize, 12), filtered_80.count);
+
+    var filtered_50 = try draw(filtered_proj, 50, 40);
+    defer filtered_50.deinit();
+    try testing.expectEqualStrings(
+        "Usage 4  today  7d  [month]         updated 2m ago",
+        filtered_50.row(0),
+    );
+    try testing.expectEqualStrings("  model                            spent  requests", filtered_50.row(7));
+    try testing.expectEqualStrings("  anthropic/claude-opus-4-6        $5.62        21", filtered_50.row(8));
+    try testing.expectEqualStrings("  openai/gpt-5                     $3.00        16", filtered_50.row(9));
+    try testing.expectEqualStrings("  anthropic/claude-sonnet-4-5      $1.94        22", filtered_50.row(10));
+    try testing.expectEqualStrings("  openai/gpt-5-pro                 $1.48         4", filtered_50.row(11));
+
+    // Empty filter shows "No matching models".
+    var empty_match = try draw(.{ .active = true, .query = "zzz", .snapshot = &snapshot }, 80, 40);
+    defer empty_match.deinit();
+    try testing.expectEqualStrings(
+        "Usage 0  today  7d  [month]  acme-design-tools-platform (fx lo… · updated 2m ago",
+        empty_match.row(0),
+    );
+    try testing.expectEqualStrings("  No matching models", empty_match.row(8));
+
+    // Footer hint spans at 80 and 50 columns.
+    var hint_80 = try input_presentation.composeUsageMenuHintRow(alloc, 80, false, p);
+    defer hint_80.deinit(alloc);
+    try testing.expect(std.mem.startsWith(u8, hint_80.items, ui_render.dim_style));
+    try testing.expect(std.mem.find(u8, hint_80.items, "↑↓ navigate     tab period     enter detail     ctrl+r refresh     esc close") != null);
+
+    var hint_50 = try input_presentation.composeUsageMenuHintRow(alloc, 50, false, p);
+    defer hint_50.deinit(alloc);
+    try testing.expect(std.mem.startsWith(u8, hint_50.items, ui_render.dim_style));
+    try testing.expect(std.mem.find(u8, hint_50.items, "↑↓ move  tab period  enter detail  ctrl+r  esc") != null);
+
+    // Codex and Grok filterable lists also filter and show "No matching models" when empty.
+    var codex_snap = try codexSnapshot(.ready, test_business);
+    defer codex_snap.deinit();
+    var codex_filtered = try draw(.{ .active = true, .query = "luna", .snapshot = &codex_snap }, 80, 40);
+    defer codex_filtered.deinit();
+    try testing.expect(std.mem.startsWith(u8, codex_filtered.row(0), "Usage 3  today  7d  [month]"));
+    try testing.expect(std.mem.startsWith(u8, codex_filtered.row(9), "gpt-5.6-luna"));
+    var codex_empty = try draw(.{ .active = true, .query = "zzz", .snapshot = &codex_snap }, 80, 40);
+    defer codex_empty.deinit();
+    try testing.expectEqualStrings("  No matching models", codex_empty.row(9));
+
+    var grok_snap = try grokSnapshot(.ready, test_grok);
+    defer grok_snap.deinit();
+    var grok_filtered = try draw(.{ .active = true, .query = "build", .snapshot = &grok_snap }, 80, 40);
+    defer grok_filtered.deinit();
+    try testing.expect(std.mem.startsWith(u8, grok_filtered.row(0), "Usage 1 "));
+    try testing.expect(grok_filtered.find("grok build") != null and grok_filtered.find("chat") == null);
+    var grok_empty = try draw(.{ .active = true, .query = "zzz", .snapshot = &grok_snap }, 80, 40);
+    defer grok_empty.deinit();
+    try testing.expect(std.mem.startsWith(u8, grok_empty.row(0), "Usage 0 "));
+    try testing.expect(grok_empty.find("  No matching products") != null);
+}
+
+test "header shows account before freshness at 80 cols, ellipsizes or drops it before collapsing tabs, at 80, 50, and 30 columns" {
+    const alloc = testing.allocator;
+
+    // 1. AI Gateway (API key)
+    var gw_models: [14]ModelRow = undefined;
+    var gw_names: [14][16]u8 = undefined;
+    for (&gw_models, 0..) |*row, i| {
+        row.* = testRow(std.mem.print(&gw_names[i], "provider/m{d:0>2}", .{i}) catch unreachable, @floatFromInt(100 - i), 10, 1000);
+    }
+    var gw = try testSnapshot(.ready, false, &gw_models);
+    defer gw.deinit();
+    gw.label = "API key (AI_GATEWAY_API_KEY)";
+    for (&gw.views) |*v| v.fetched_at_ms = test_now;
+    const gw_proj: Projection = .{ .active = true, .snapshot = &gw };
+
+    var gw_80 = try draw(gw_proj, 80, 40);
+    defer gw_80.deinit();
+    try testing.expectEqualStrings(
+        "Usage 14  today  7d  [month]     API key (AI_GATEWAY_API_KEY) · updated just now",
+        gw_80.row(0),
+    );
+    var gw_80_raw = try composeRow(alloc, gw_proj, 0, 40, 80);
+    defer gw_80_raw.deinit(alloc);
+    var dim_buf: [128]u8 = undefined;
+    try testing.expect(std.mem.find(u8, gw_80_raw.items, try std.mem.print(&dim_buf, "{s}API key (AI_GATEWAY_API_KEY) · ", .{ui_render.dim_style})) != null);
+
+    var gw_65 = try draw(gw_proj, 65, 40);
+    defer gw_65.deinit();
+    try testing.expect(std.mem.startsWith(u8, gw_65.row(0), "Usage 14  today  7d  [month]"));
+    try testing.expect(std.mem.endsWith(u8, gw_65.row(0), " · updated just now"));
+    try testing.expect(std.mem.find(u8, gw_65.row(0), "…") != null);
+
+    var gw_50 = try draw(gw_proj, 50, 40);
+    defer gw_50.deinit();
+    try testing.expectEqualStrings(
+        "Usage 14  today  7d  [month]      updated just now",
+        gw_50.row(0),
+    );
+
+    var gw_30 = try draw(gw_proj, 30, 40);
+    defer gw_30.deinit();
+    try testing.expectEqualStrings("Usage 14  [month]", gw_30.row(0));
+
+    // 2. Codex ("codex (ChatGPT), samdoe")
+    var cx = try codexSnapshot(.ready, test_business);
+    defer cx.deinit();
+    cx.codex_at_ms = test_now;
+    const cx_proj: Projection = .{ .active = true, .snapshot = &cx };
+
+    var cx_80 = try draw(cx_proj, 80, 40);
+    defer cx_80.deinit();
+    try testing.expectEqualStrings(
+        "Usage 9  today  7d  [month]           codex (ChatGPT), samdoe · updated just now",
+        cx_80.row(0),
+    );
+    var cx_80_raw = try composeRow(alloc, cx_proj, 0, 40, 80);
+    defer cx_80_raw.deinit(alloc);
+    try testing.expect(std.mem.find(u8, cx_80_raw.items, try std.mem.print(&dim_buf, "{s}codex (ChatGPT), samdoe · ", .{ui_render.dim_style})) != null);
+
+    var cx_50 = try draw(cx_proj, 50, 40);
+    defer cx_50.deinit();
+    try testing.expectEqualStrings(
+        "Usage 9  today  7d  [month]       updated just now",
+        cx_50.row(0),
+    );
+
+    var cx_30 = try draw(cx_proj, 30, 40);
+    defer cx_30.deinit();
+    try testing.expectEqualStrings("Usage 9  [month]", cx_30.row(0));
+
+    // 3. Grok ("grok (xAI)")
+    var gk = try grokSnapshot(.ready, test_grok);
+    defer gk.deinit();
+    gk.grok_at_ms = test_now;
+    const gk_proj: Projection = .{ .active = true, .snapshot = &gk };
+
+    var gk_80 = try draw(gk_proj, 80, 40);
+    defer gk_80.deinit();
+    try testing.expectEqualStrings(
+        "Usage 2                                            grok (xAI) · updated just now",
+        gk_80.row(0),
+    );
+
+    var gk_50 = try draw(gk_proj, 50, 40);
+    defer gk_50.deinit();
+    try testing.expectEqualStrings(
+        "Usage 2              grok (xAI) · updated just now",
+        gk_50.row(0),
+    );
+
+    var gk_30 = try draw(gk_proj, 30, 40);
+    defer gk_30.deinit();
+    try testing.expectEqualStrings("Usage 2       updated just now", gk_30.row(0));
+
+    // Long Codex profile name cuts at the end so the start stays readable and freshness stays whole.
+    var long_codex_usage = test_business;
+    var long_profile = test_profile;
+    long_profile.name = "Alexandria Quintessa Vandermeer-Okonkwo";
+    long_codex_usage.profile = long_profile;
+    var long_cx = try codexSnapshot(.ready, long_codex_usage);
+    defer long_cx.deinit();
+    long_cx.codex_at_ms = test_now;
+    var long_cx_80 = try draw(.{ .active = true, .snapshot = &long_cx }, 80, 40);
+    defer long_cx_80.deinit();
+    try testing.expectEqualStrings(
+        "Usage 9  today  7d  [month]  codex (ChatGPT), Alexandria Qui… · updated just now",
+        long_cx_80.row(0),
+    );
+
+    // Non-list Codex view (no breakdown) also cuts long account names at the end.
+    const plan_only_usage: usage.codex.Usage = .{ .plan = "pro", .profile = long_profile };
+    var plan_only = try codexSnapshot(.ready, plan_only_usage);
+    defer plan_only.deinit();
+    plan_only.codex_at_ms = test_now;
+    var plan_only_50 = try draw(.{ .active = true, .snapshot = &plan_only }, 50, 40);
+    defer plan_only_50.deinit();
+    try testing.expectEqualStrings(
+        "Usage: codex (ChatGPT), Alexand…  updated just now",
+        plan_only_50.row(0),
+    );
 }

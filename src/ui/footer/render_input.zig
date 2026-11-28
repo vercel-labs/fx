@@ -301,6 +301,7 @@ pub const usageCodexHasPeriods = usage_presentation.codexHasPeriods;
 
 pub fn usageMenuProjection(
     menu: *const usage_menu.State,
+    query: []const u8,
 ) UsageMenuProjection {
     return .{
         .active = menu.active,
@@ -308,6 +309,7 @@ pub fn usageMenuProjection(
         .selected_model = menu.selected_model,
         .model_window_start = menu.model_window_start,
         .detail = menu.detail,
+        .query = query,
         .snapshot = if (menu.snapshot) |*snapshot| snapshot else null,
     };
 }
@@ -358,7 +360,6 @@ pub fn infoPanelProjection(panel: *const info_panel.State, cols: u16, terminal_r
 pub const CompactCommandMenuProjection = union(enum) {
     statusline: StatuslineMenuProjection,
     info_panel: InfoPanelProjection,
-    usage: UsageMenuProjection,
     workspace: WorkspaceMenuProjection,
 };
 
@@ -536,7 +537,6 @@ pub inline fn shownTrustPrompt(ctx: anytype) ?*const workspace_trust.prompt.Prom
 pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjection {
     if (ctx.statusline_menu.active) return .{ .statusline = ctx.statusline_menu };
     if (ctx.info_panel.active) return .{ .info_panel = ctx.info_panel };
-    if (ctx.usage_menu.active) return .{ .usage = ctx.usage_menu };
     if (ctx.workspace_menu.active) return .{ .workspace = ctx.workspace_menu };
     return null;
 }

@@ -65,6 +65,9 @@ pub const Runtime = struct {
     /// subagent, which borrows the composer as its query box. Holds the
     /// person's draft until the pick or the picker's close gives it back.
     card_model_picker_draft: ?composer_stash.State = null,
+    /// Set while `/usage` opens over an existing composer draft (e.g. via a
+    /// personal shortcut) and borrows the composer as its search box.
+    usage_draft: ?composer_stash.State = null,
     /// The draft the composer held when the `/effort` menu opened. The menu
     /// borrows the composer as its query box and gives the draft back when
     /// it closes, as the model picker shortcut does.
@@ -93,6 +96,7 @@ pub const Runtime = struct {
         self.edit_history.deinit(alloc);
         if (self.model_picker_draft) |*draft| draft.deinit(alloc);
         if (self.card_model_picker_draft) |*draft| draft.deinit(alloc);
+        if (self.usage_draft) |*draft| draft.deinit(alloc);
         if (self.effort_menu_draft) |*draft| draft.deinit(alloc);
     }
 
@@ -152,6 +156,21 @@ pub const Runtime = struct {
         return true;
     }
 
+    pub fn stashUsageDraft(self: *Runtime) void {
+        if (self.usage_draft != null) return;
+        if (self.edit_state.input.items.len == 0 and
+            self.entities.pasted_blocks.items.len == 0 and
+            self.entities.image_tokens.items.len == 0) return;
+        self.usage_draft = composer_stash.State.capture(self.composerStashView());
+    }
+
+    pub fn restoreUsageDraft(self: *Runtime, alloc: Allocator) bool {
+        var draft = self.usage_draft orelse return false;
+        self.usage_draft = null;
+        draft.restore(alloc, self.composerStashView());
+        return true;
+    }
+
     pub fn hasActiveMenu(self: *const Runtime) bool {
         return self.help_menu.active or
             self.settings_menu.active or
@@ -167,6 +186,12 @@ pub const Runtime = struct {
             if (draft.hasDraft()) return true;
         }
         if (self.card_model_picker_draft) |*draft| {
+            if (draft.hasDraft()) return true;
+        }
+        if (self.usage_draft) |*draft| {
+            if (draft.hasDraft()) return true;
+        }
+        if (self.effort_menu_draft) |*draft| {
             if (draft.hasDraft()) return true;
         }
         return false;

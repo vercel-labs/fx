@@ -6,7 +6,7 @@ const std = @import("std");
 const report = @import("report.zig");
 
 /// The least time before opening `/usage` or the timer fetches again, after a
-/// fetch starts or fails. `r` is never held by it.
+/// fetch starts or fails. `Ctrl+R` is never held by it.
 pub const floor_ms: i64 = 60 * std.time.ms_per_s;
 /// The refresh period while the dashboard stays open.
 pub const timer_ms: i64 = 15 * std.time.ms_per_min;
@@ -14,7 +14,7 @@ pub const timer_ms: i64 = 15 * std.time.ms_per_min;
 pub const Trigger = enum {
     /// Enter on `/usage`.
     open,
-    /// `r` with the dashboard open: fetches whenever none is in flight.
+    /// `Ctrl+R` with the dashboard open: fetches whenever none is in flight.
     manual,
     /// The periodic refresh with the dashboard open.
     timer,

@@ -319,7 +319,7 @@ pub const Dashboard = struct {
         self.is_open = false;
     }
 
-    /// `r`. Returns whether a fetch started.
+    /// `Ctrl+R`. Returns whether a fetch started.
     pub fn refresh(self: *Dashboard) bool {
         self.mutex.lockUncancelable(self.io());
         defer self.mutex.unlock(self.io());
@@ -1157,7 +1157,7 @@ test "without a worker thread, tick runs the fetch open started, outside the loc
     try testing.expect(snap.status == .ready);
     try testing.expectApproxEqAbs(@as(f64, 2.5), snap.of(.today).totals.total_cost, 1e-9);
 
-    // `r` queues the next fetch, and `fx usage` runs one by waiting for it.
+    // `Ctrl+R` queues the next fetch, and `fx usage` runs one by waiting for it.
     try testing.expect(dashboard.refresh());
     try testing.expectEqual(@as(usize, 3), gateway.count);
     dashboard.waitForFetch();
