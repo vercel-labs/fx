@@ -239,6 +239,121 @@ class TransformedUnitTestsTests(unittest.TestCase):
             unit_tests.transformed_unit_tests(toolchain, self.root, self.root / "output")
         self.assertFalse((self.root / "output").exists())
 
+    def test_the_outliner_runs_on_four_parts_and_never_on_the_whole_test_module(self) -> None:
+        crt = self.root / "rcrt1.o"
+        crt.write_bytes(b"crt")
+        record = {
+            "argv": ["ld.lld", "-static", "-pie", str(crt), "/cache/test_zcu.o", "-o", "/cache/test"],
+            "zig_object": "/cache/test_zcu.o",
+            "inputs": {str(crt): linux.sha256_file(crt)},
+        }
+        (self.paths.logs / "control-link.json").write_text(json.dumps(record), encoding="utf-8")
+
+        actions = self.root / "actions"
+        opt = self.write_executable(
+            "opt",
+            f"""import pathlib, sys
+with pathlib.Path({str(actions)!r}).open("a") as stream:
+    stream.write("opt " + " ".join(sys.argv[1:]) + "\\n")
+pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_bytes(b"BC\\xc0\\xdeopt")""",
+        )
+        llvm_split = self.write_executable(
+            "llvm-split",
+            f"""import pathlib, sys
+with pathlib.Path({str(actions)!r}).open("a") as stream:
+    stream.write("llvm-split " + " ".join(sys.argv[1:]) + "\\n")
+count = int(sys.argv[sys.argv.index("-j") + 1])
+prefix = sys.argv[sys.argv.index("-o") + 1]
+for index in range(count):
+    pathlib.Path(f"{{prefix}}{{index}}").write_bytes(f"BC\\xc0\\xdepart{{index}}".encode())""",
+        )
+        llvm_link = self.write_executable(
+            "llvm-link",
+            f"""import pathlib, sys
+with pathlib.Path({str(actions)!r}).open("a") as stream:
+    stream.write("llvm-link " + " ".join(sys.argv[1:]) + "\\n")
+pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_bytes(b"BC\\xc0\\xdelinked")""",
+        )
+        llvm_nm = self.write_executable(
+            "llvm-nm",
+            f"""import pathlib, sys
+with pathlib.Path({str(actions)!r}).open("a") as stream:
+    stream.write("llvm-nm\\n")
+sys.stdout.write("main T 0 10\\n")""",
+        )
+        ir_size = self.write_executable(
+            "ir_size.py",
+            f"""import json, pathlib, sys
+args = sys.argv[3:]
+with pathlib.Path({str(actions)!r}).open("a") as stream:
+    stream.write("ir_size " + " ".join(args) + "\\n")
+if args[0] == "dropped-outputs":
+    print(json.dumps({{"callers": [], "instances": [], "outlined_functions": 3}}))
+elif args[0] == "check-outlined":
+    print("{{}}")
+else:
+    pathlib.Path(args[-1]).write_bytes(b"BC\\xc0\\xdeir")
+    print(json.dumps({{"pass": args[0]}}))""",
+        )
+        llc = self.write_executable(
+            "llc",
+            f"""import pathlib, sys
+with pathlib.Path({str(actions)!r}).open("a") as stream:
+    stream.write("llc " + " ".join(sys.argv[1:]) + "\\n")
+pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_bytes(b"obj")""",
+        )
+        ld_lld = self.write_executable(
+            "ld.lld",
+            f"""import pathlib, sys
+with pathlib.Path({str(actions)!r}).open("a") as stream:
+    stream.write("ld.lld " + " ".join(sys.argv[1:]) + "\\n")
+pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_bytes(b"exe")""",
+        )
+        libllvm = self.root / "libLLVM.so"
+        libllvm.write_bytes(b"libllvm")
+        toolchain = types.SimpleNamespace(
+            opt=opt,
+            llc=llc,
+            llvm_split=llvm_split,
+            llvm_link=llvm_link,
+            llvm_nm=llvm_nm,
+            ir_size=ir_size,
+            libllvm=libllvm,
+            tools=linux.Tools(ld_lld=ld_lld, readelf=self.root / "llvm-readelf"),
+            platform=linux.ARM64,
+            target=linux.ARM64.TARGET,
+        )
+        self.paths.bitcode.write_bytes(b"BC\xc0\xdeunit-tests")
+
+        passes = unit_tests.build_transformed(toolchain, self.paths)
+
+        self.assertEqual({"pass": "zero-fill-globals"}, passes["zero-fill-globals"])
+        self.assertEqual({"pass": "compact-error-names"}, passes["compact-error-names"])
+        lines = actions.read_text().splitlines()
+        outlines = [line for line in lines if line.startswith("opt -passes=iroutliner ")]
+        self.assertEqual(4, len(outlines), lines)
+        base = self.paths.profile_use_base_bitcode
+        widened = base.with_name(base.name + ".widened.bc")
+        self.assertFalse(any(f"-passes=iroutliner {widened} " in line for line in outlines), outlines)
+        split_parts = [base.with_name(f"{self.paths.binary_name}.split.{i}") for i in range(4)]
+        outlined_parts = [base.with_name(f"{self.paths.binary_name}.outlined.{i}.bc") for i in range(4)]
+        self.assertEqual(
+            [f"opt -passes=iroutliner {part} -o {out}" for part, out in zip(split_parts, outlined_parts)],
+            outlines,
+        )
+        splits = [line for line in lines if line.startswith("llvm-split ")]
+        split_prefix = base.with_name(f"{self.paths.binary_name}.split.")
+        self.assertEqual([f"llvm-split -j 4 -o {split_prefix} {widened}"], splits)
+        checks = [line for line in lines if line.startswith("ir_size check-outlined ")]
+        self.assertEqual([f"ir_size check-outlined {part}" for part in outlined_parts], checks)
+        links = [line for line in lines if line.startswith("llvm-link ")]
+        expected_link = "llvm-link " + " ".join(str(part) for part in outlined_parts) + f" -o {self.paths.outlined_bitcode}"
+        self.assertEqual([expected_link], links)
+        self.assertEqual(
+            [True, True, True, True],
+            [(self.paths.logs / f"outline-rounds-unit-tests-part-{i}.json").is_file() for i in range(4)],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

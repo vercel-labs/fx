@@ -5,6 +5,7 @@ const types = @import("../shared/types.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const context_limits = @import("../config/context_limits.zig");
 const elicitation = @import("../mcp/elicitation.zig");
+const mrtr = @import("../mcp/mrtr.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const access_policy = @import("../mcp/access_policy.zig");
 
@@ -13,6 +14,9 @@ const Allocator = std.mem.Allocator;
 pub const HasToolFn = *const fn (*anyopaque, []const u8, Access) bool;
 /// Whether `access` is a subagent's view of servers that have changed since it was given, which allows nothing now.
 pub const AccessChangedFn = *const fn (*anyopaque, Access) bool;
+/// What a search of MCP says when there is no MCP to search.
+pub const unavailable_search_output = "{\"tools\":[],\"count\":0,\"state\":\"unavailable\"}";
+
 /// Why a subagent's lookup of an MCP tool, server or search finds nothing after
 /// the session's servers changed under it, in the words every such answer ends with.
 pub const servers_changed_reason = "the session's MCP servers changed after it began. Work that starts later sees the current servers.";
@@ -71,6 +75,10 @@ pub const CallOptions = struct {
 };
 
 pub const InputRequired = struct {
+    /// A 2026 round as the engine read it: the question's requests, in order, as slices of the server's own bytes
+    /// that stay valid while the question is asked. Empty for a 2025 question and a test, which give the text form.
+    requests: []const mrtr.RawRequest = &.{},
+    /// `{key: request, ...}` as text, read when `requests` is empty.
     input_requests_json: []const u8,
     request_state_json: ?[]const u8 = null,
     legacy_retry_without_responses: bool = false,
@@ -218,13 +226,11 @@ pub const CallStatus = enum {
     success,
     tool_failure,
     protocol_failure,
-    input_required,
 
     pub fn observed(self: CallStatus) observation.McpStatus {
         return switch (self) {
             .success => .success,
             .tool_failure, .protocol_failure => .failure,
-            .input_required => .input_required,
         };
     }
 };
@@ -233,19 +239,16 @@ test "MCP hook statuses normalize tool and protocol failures" {
     try std.testing.expectEqual(observation.McpStatus.success, CallStatus.success.observed());
     try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.tool_failure.observed());
     try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.protocol_failure.observed());
-    try std.testing.expectEqual(observation.McpStatus.input_required, CallStatus.input_required.observed());
 }
 
 pub const CallResult = struct {
     model_output: []const u8,
     images: []types.ToolImage = &.{},
     status: CallStatus = .success,
-    input_required: ?InputRequired = null,
 
     pub fn deinit(self: *CallResult, alloc: Allocator) void {
         alloc.free(self.model_output);
         types.freeToolImages(alloc, self.images);
-        self.deinitInputRequired(alloc);
         self.* = undefined;
     }
 
@@ -258,16 +261,8 @@ pub const CallResult = struct {
     pub fn takeModelOutput(self: *CallResult, alloc: Allocator) []const u8 {
         const model_output = self.model_output;
         types.freeToolImages(alloc, self.images);
-        self.deinitInputRequired(alloc);
         self.* = undefined;
         return model_output;
-    }
-
-    fn deinitInputRequired(self: *CallResult, alloc: Allocator) void {
-        if (self.input_required) |required| {
-            alloc.free(required.input_requests_json);
-            if (required.request_state_json) |state| alloc.free(state);
-        }
     }
 };
 
