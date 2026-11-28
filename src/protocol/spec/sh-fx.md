@@ -283,6 +283,8 @@ Each entry gives a client's id and the `clientInfo` that the client sent at `ini
 
 `tests/tla/acp/AcpSharedSession.tla` models these rules, and TLC checks that a permission is decided once, that every other client loses the request it can no longer answer, that a client that has read everything fx sent holds every prompt the others sent while it had the session open, and that its list of clients is current. Its `Today` configs show where fx breaks them now.
 
+The model leaves out these parts of this section: the content and `_meta` of the prompt chunks; steer chunks, which `AcpPromptDelivery.tla` covers; the order of a request or a list of clients against a replay and the response to a load or resume; the `-32002` answer to a client that doesn't have the session open; client ids, `sh.fx/clientId`, and `clientInfo`, since a list in the model is a set of connections; and capability gating for `sh.fx/sessionClients`, since every client in the model reads the list.
+
 ### Session status and list changes
 
 This extension tells clients what each session is doing, which ACP v1 can't, and when the list of sessions changes. It follows ACP v2's [session states](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle), ACP's unstable [`session/status`](https://agentclientprotocol.com/rfds/session-status), and the [session list extensions](https://github.com/agentclientprotocol/agent-client-protocol/pull/2323) draft.
