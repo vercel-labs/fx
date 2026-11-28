@@ -8,6 +8,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +22,7 @@ import {
   fakeGatewayToolCall as toolCall,
   type FakeGatewayResponse,
   isVolatileTokenStatusRow,
+  startDynamicFakeGateway,
   startFakeGateway as startGateway,
   TmuxSession,
   tmuxAvailable,
@@ -346,6 +348,121 @@ test("volatile token status rows normalize before file transcript comparison", (
 async function decide(session: TmuxSession, choice: 1 | 2 | 3) {
   await session.sendKeys(String(choice));
 }
+
+const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
+
+function shellRunTurn(id: string, command: string) {
+  return fakeGatewaySse([
+    { type: "tool-call", toolCallId: id, toolName: "shell", input: { action: "run", command } },
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+  ]);
+}
+
+function replyTurn(id: string, delta: string) {
+  return fakeGatewaySse([
+    { type: "text-delta", id, delta },
+    { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+  ]);
+}
+
+// The text of the request's last user message, and whether the request ends
+// with a tool result, so a turn can answer its own tool call.
+function lastUserMessage(body: string): { text: string; endsWithToolResult: boolean } {
+  const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
+  const prompt = request.prompt ?? [];
+  const user = prompt.findLast((message) => message.role === "user");
+  return {
+    text: JSON.stringify(user?.content ?? ""),
+    endsWithToolResult: prompt.at(-1)?.role === "tool",
+  };
+}
+
+function approvalPromptCount(pane: string): number {
+  return pane.split(COMMAND_APPROVAL_PROMPT).length - 1;
+}
+
+describe.skipIf(!tmuxAvailable())("shell approval epoch while the prompt is open", () => {
+  test(
+    "a shell refresh while the approval prompt is open never runs the command under the refreshed startup files",
+    async () => {
+      const root = createIsolatedRoot();
+      const bashrc = join(root.home, ".bashrc");
+      writeFileSync(bashrc, "export FX_REVIEW_VER=v1\n");
+      writeFileSync(join(root.home, ".bash_profile"), 'source "$HOME/.bashrc"\n');
+      writeFileSync(join(root.home, ".profile"), 'source "$HOME/.bashrc"\n');
+      const gateway = startDynamicFakeGateway((body) => {
+        const { text, endsWithToolResult } = lastUserMessage(body);
+        if (text.includes("STEP_WARM")) {
+          return endsWithToolResult
+            ? replyTurn("warm_done", "DONE_WARM")
+            : shellRunTurn("warm_call", "printf '%s' \"$FX_REVIEW_VER\" > warm.txt");
+        }
+        if (text.includes("STEP_CHECK")) {
+          return endsWithToolResult
+            ? replyTurn("check_done", "DONE_CHECK")
+            : shellRunTurn("check_call", "printf '%s' \"$FX_REVIEW_VER\" > ver.txt");
+        }
+        return replyTurn("other", "OTHER");
+      });
+      gateways.push(gateway);
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          SHELL: "/bin/bash",
+          AI_GATEWAY_API_KEY: "fake-file-approval-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_PERMISSION_MODE: "ask",
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          NO_COLOR: "1",
+        },
+        width: 120,
+        height: 40,
+      });
+      const session = activeSession;
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("STEP_WARM");
+      await session.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
+      await session.sendKeys("1");
+      await session.sendKeys("Enter");
+      await session.waitForReplyAndTurnEnd("DONE_WARM", TIMEOUT);
+      expect(readFileSync(join(root.workspace, "warm.txt"), "utf8")).toBe("v1");
+
+      await session.sendText("STEP_CHECK");
+      await session.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
+      const promptsBeforeAnswer = approvalPromptCount(await session.capturePane());
+      writeFileSync(bashrc, "export FX_REVIEW_VER=v2\n");
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(bashrc, later, later);
+
+      await session.sendKeys("1");
+      await session.sendKeys("Enter");
+      // fx either refuses the command or asks again. A second prompt is
+      // denied, so that the turn can finish.
+      const settled = await session.waitForPane(
+        (pane) => pane.includes("DONE_CHECK") || approvalPromptCount(pane) > promptsBeforeAnswer,
+        TIMEOUT,
+      );
+      if (!settled.includes("DONE_CHECK")) {
+        await session.sendKeys("3");
+        await session.sendKeys("Enter");
+      }
+      await session.waitForReplyAndTurnEnd("DONE_CHECK", TIMEOUT);
+
+      const checked = existsSync(join(root.workspace, "ver.txt"))
+        ? readFileSync(join(root.workspace, "ver.txt"), "utf8")
+        : null;
+      expect(checked).not.toBe("v2");
+    },
+    TIMEOUT * 3,
+  );
+});
 
 describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 

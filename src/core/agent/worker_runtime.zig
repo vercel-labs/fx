@@ -4290,7 +4290,7 @@ fn dupePendingBatchSnapshot(alloc: std.mem.Allocator, pending: OwnedQuestionBatc
 fn appendGrantToQueuedPrompt(alloc: std.mem.Allocator, prompt: *QueuedPrompt, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
     for (prompt.grants) |*grant| {
         if (!std.mem.eql(u8, grant.tool_name, tool_name) or !std.mem.eql(u8, grant.target_path, target_path)) continue;
-        if (!permissions.grantAppliesInShellEpoch(grant.*, shell_epoch)) grant.shell_epoch = shell_epoch;
+        permissions.advanceGrantShellEpoch(grant, shell_epoch);
         return;
     }
     const tool_name_dup = try alloc.dupe(u8, tool_name);
@@ -11910,6 +11910,18 @@ test "a bash approval made again after a shell refresh keeps one queued grant at
 
     try appendGrantToQueuedPrompt(alloc, &prompt, "bash", "git status", 0);
     try appendGrantToQueuedPrompt(alloc, &prompt, "bash", "git status", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), prompt.grants.len);
+    try std.testing.expectEqual(@as(u64, 1), prompt.grants[0].shell_epoch);
+}
+
+test "a late bash approval from an older shell epoch leaves a queued grant at its epoch" {
+    const alloc = std.testing.allocator;
+    var prompt = try makePrompt(alloc, "grant", "model");
+    defer freeQueuedPrompt(alloc, prompt);
+
+    try appendGrantToQueuedPrompt(alloc, &prompt, "bash", "git status", 1);
+    try appendGrantToQueuedPrompt(alloc, &prompt, "bash", "git status", 0);
 
     try std.testing.expectEqual(@as(usize, 1), prompt.grants.len);
     try std.testing.expectEqual(@as(u64, 1), prompt.grants[0].shell_epoch);

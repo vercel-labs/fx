@@ -49,6 +49,7 @@ ShellSnapshot ShellSnapshot-one_session-use_partial RunsCompleteSnapshot -deadlo
 ShellSnapshot ShellSnapshot-one_session-stale_grant GrantMatchesEpoch -deadlock
 ShellSnapshot ShellSnapshot-one_session-recheck_restamps ApprovalMatchesAnswer -deadlock
 ShellSnapshot ShellSnapshot-one_session-store_stamps_current StoredGrantMatchesAnswer -deadlock
+ShellSnapshot ShellSnapshot-one_session-record_older_epoch GrantNeverMovesBack -deadlock
 ShellSnapshot ShellSnapshot-one_session-notice_repeat NoticeOncePerEpisode -deadlock
 ShellSnapshot ShellSnapshot-one_session-clear_dirty_late FreshWhenClean -deadlock
 ShellSnapshot ShellSnapshot-one_session-keep_broken NoReuseOfBroken -deadlock

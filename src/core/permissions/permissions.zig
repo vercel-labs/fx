@@ -136,7 +136,7 @@ pub fn allowToolForSession(
     for (grants.items) |*entry| {
         if (!std.mem.eql(u8, entry.tool_name, permission_name) or
             !std.mem.eql(u8, entry.target_path, pattern)) continue;
-        if (!grantAppliesInShellEpoch(entry.*, shell_epoch)) entry.shell_epoch = shell_epoch;
+        advanceGrantShellEpoch(entry, shell_epoch);
         return;
     }
     try appendOwnedGrant(alloc, grants, permission_name, pattern, shell_epoch);
@@ -1162,6 +1162,14 @@ pub fn sessionGrantAllowed(grants: []const types.PermissionGrant, tool_name: []c
 pub fn grantAppliesInShellEpoch(grant: types.PermissionGrant, shell_epoch: u64) bool {
     if (!std.mem.eql(u8, permissionNameForTool(grant.tool_name), "bash")) return true;
     return grant.shell_epoch == shell_epoch;
+}
+
+/// Moves a bash grant to a newer shell approval epoch. A record from an older
+/// epoch never moves a live grant back, so a late write cannot revive a retired
+/// approval. Other grants apply in every epoch and keep theirs.
+pub fn advanceGrantShellEpoch(grant: *types.PermissionGrant, shell_epoch: u64) void {
+    if (!std.mem.eql(u8, permissionNameForTool(grant.tool_name), "bash")) return;
+    if (shell_epoch > grant.shell_epoch) grant.shell_epoch = shell_epoch;
 }
 
 /// The remembered grant that authorizes `target_path`, or null. A bash grant
@@ -3635,6 +3643,20 @@ test "an approval is recorded once per shell epoch" {
     try std.testing.expectEqual(@as(usize, 1), grants.items.len);
 
     try allowToolForSession(alloc, &grants, "bash", "echo x", 1);
+    try std.testing.expectEqual(@as(usize, 1), grants.items.len);
+    try std.testing.expectEqual(@as(u64, 1), grants.items[0].shell_epoch);
+}
+
+test "a late bash approval from an older shell epoch leaves a newer row at its epoch" {
+    const alloc = std.testing.allocator;
+    var grants: std.ArrayList(types.PermissionGrant) = .empty;
+    defer {
+        clearAllowedTools(alloc, &grants);
+        grants.deinit(alloc);
+    }
+
+    try allowToolForSession(alloc, &grants, "bash", "echo x", 1);
+    try allowToolForSession(alloc, &grants, "bash", "echo x", 0);
     try std.testing.expectEqual(@as(usize, 1), grants.items.len);
     try std.testing.expectEqual(@as(u64, 1), grants.items[0].shell_epoch);
 }

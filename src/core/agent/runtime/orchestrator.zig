@@ -13336,7 +13336,7 @@ fn processQueuedPromptLoop(
                     return;
                 }
                 permission_result = maybe_revalidated.?;
-                if (exact_human_approval.kind != .once) {
+                if (permission_result.human_approval.kind != .none) {
                     exact_human_approval = permission_result.human_approval;
                 }
             }

@@ -759,6 +759,45 @@ async function waitShows(session: TmuxSession, what: string, test: (pane: string
 
 const countLines = (path: string) => (existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).length : 0);
 
+async function reloadShell(session: TmuxSession) {
+  await session.waitForComposer(15_000);
+  await session.sendText("/shell reload");
+  await waitShows(session, "the reload notice", (pane) => pane.includes("Remembered command approvals were reset"), 15_000);
+}
+
+describe.skipIf(!tmuxAvailable())("shell approval grants across instances", () => {
+  test(
+    "a shell refresh retires the grant for every instance: another instance's later grant does not revive the first's",
+    async () => {
+      await withHost(runThenAnswer, { instances: 2, env: { FX_PERMISSION_MODE: "ask" } }, async ({ workspace, session }) => {
+        const marker = join(workspace, "m1");
+        expect(await runTurn(session, 1, "touch m1")).toBe("asked");
+        await approve(session, 1, "2");
+        expect(existsSync(marker)).toBe(true);
+        rmSync(marker);
+        // Before a refresh the session grant still matches.
+        expect(await runTurn(session, 2, "touch m1")).toBe("done");
+        expect(existsSync(marker)).toBe(true);
+        rmSync(marker);
+        await reloadShell(session);
+        await switchAgent(session, "next");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        expect(await runTurn(session, 3, "touch m1")).toBe("asked");
+        await approve(session, 3, "2");
+        expect(existsSync(marker)).toBe(true);
+        rmSync(marker);
+        await switchAgent(session, "previous");
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        expect(await runTurn(session, 4, "touch m1")).toBe("asked");
+        expect(existsSync(marker)).toBe(false);
+        await approve(session, 4, "1");
+        expect(existsSync(marker)).toBe(true);
+      });
+    },
+    TIMEOUT,
+  );
+});
+
 describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   test(
     "three instances started together each keep their own conversation",

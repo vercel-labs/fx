@@ -308,7 +308,7 @@ pub const ActiveSessionState = struct {
         for (self.session_grants) |*grant| {
             if (!std.mem.eql(u8, grant.tool_name, tool_name) or
                 !std.mem.eql(u8, grant.target_path, target_path)) continue;
-            if (!permissions.grantAppliesInShellEpoch(grant.*, shell_epoch)) grant.shell_epoch = shell_epoch;
+            permissions.advanceGrantShellEpoch(grant, shell_epoch);
             return;
         }
 
@@ -5707,6 +5707,19 @@ test "a bash approval made again after a shell refresh keeps one row at the new 
 
     try active.retainGrant(alloc, "bash", "git status", 0);
     try active.retainGrant(alloc, "bash", "git status", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), active.session_grants.len);
+    try std.testing.expectEqual(@as(u64, 1), active.session_grants[0].shell_epoch);
+}
+
+test "a late bash approval from an older shell epoch leaves a retained row at its epoch" {
+    const alloc = std.testing.allocator;
+    var active: ActiveSessionState = undefined;
+    active.session_grants = &.{};
+    defer types.freePermissionGrantSlice(alloc, active.session_grants);
+
+    try active.retainGrant(alloc, "bash", "git status", 1);
+    try active.retainGrant(alloc, "bash", "git status", 0);
 
     try std.testing.expectEqual(@as(usize, 1), active.session_grants.len);
     try std.testing.expectEqual(@as(u64, 1), active.session_grants[0].shell_epoch);
