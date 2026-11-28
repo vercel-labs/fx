@@ -14,6 +14,12 @@
 #   mutation-whole-forgets-task    the whole-turn compaction drops its message   TaskKept
 #   mutation-keeps-foreign-reasoning  another model's steps keep their reasoning
 #                                  after a block                                 NoDroppedReasoning
+#   mutation-summary-keeps-bound   fx's summary on a model with no bound reasoning
+#                                  keeps another model's bound turns raw          NoDroppedReasoning
+#
+# provider-compaction-unbound.cfg adds such a model, u1, to the design: its
+# summaries keep the newest turns only when none holds m1's reasoning. It
+# must pass.
 #
 # Usage: ./check.sh [config ...]
 set -eu
@@ -28,4 +34,6 @@ ProviderCompaction provider-compaction-mutation-fallback-keeps NoDroppedReasonin
 ProviderCompaction provider-compaction-mutation-switch-sends-block Readable -deadlock
 ProviderCompaction provider-compaction-mutation-whole-forgets-task TaskKept -deadlock
 ProviderCompaction provider-compaction-mutation-keeps-foreign-reasoning NoDroppedReasoning -deadlock
+ProviderCompaction provider-compaction-unbound - -deadlock
+ProviderCompaction provider-compaction-mutation-summary-keeps-bound NoDroppedReasoning -deadlock
 VERDICTS

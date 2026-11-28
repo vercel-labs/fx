@@ -23,6 +23,13 @@
 (* follow a prefix it was never written after. A crash before the commit   *)
 (* saves nothing, so the resumed session sends what it sent before.        *)
 (*                                                                         *)
+(* A model in Unbound, such as Gemini, keeps no reasoning bound to what    *)
+(* came before it and writes no block: its compactions are fx's summary,   *)
+(* which keeps the newest turns raw after it, unless one of them holds a   *)
+(* reply of a model outside Unbound. Then it keeps no turn, as a binding   *)
+(* model's fallback does (`src/core/compactor/compactor.zig`               *)
+(* boundReasoningModel).                                                   *)
+(*                                                                         *)
 (* NoDroppedReasoning: every step the current model reads with its         *)
 (* reasoning sits after exactly what that model read before it when it     *)
 (* wrote the reasoning, so no provider drops it.                           *)
@@ -35,6 +42,7 @@ CONSTANTS
   Keep,            \* newest turns a compaction keeps after the provider's block
   MaxCompactions,
   Models,          \* models the session can switch between
+  Unbound,         \* models whose reasoning is not bound and that write no block
   Provider,        \* TRUE: fx asks the provider for its block; FALSE: today
   Bug              \* "none" or a planted defect, see check.sh
 
@@ -44,6 +52,11 @@ Step(s, m) == Item("step", s, m, <<>>)
 FxSummary(c) == Item("fx", c, "none", <<>>)
 Block(c, m, cov) == Item("block", c, m, cov)
 Note == Item("note", 0, "none", <<>>)
+
+\* A saved reply of a model outside Unbound, with its reasoning or as the
+\* text a block left: the saved turn still holds that reasoning.
+Bound(item) == item.k \in {"step", "text"} /\ item.m \notin Unbound /\ item.m # "none"
+HoldsBound(s) == \E i \in 1..Len(s) : Bound(s[i])
 
 \* The kept items after model m's block: another model's steps lose their
 \* reasoning and stay as their text.
@@ -169,7 +182,7 @@ WholeCompaction ==
 \* provider path every compaction is fx's.
 Reply ==
   /\ pending.state = "asked"
-  /\ \E s \in (IF Provider THEN {"block", "failed"} ELSE {"failed"}) :
+  /\ \E s \in (IF Provider /\ model \notin Unbound THEN {"block", "failed"} ELSE {"failed"}) :
        pending' = [pending EXCEPT !.state = s]
   /\ last' = "Reply"
   /\ UNCHANGED <<ctx, model, bound, nextTurn, nextStep, open, steps, compactions>>
@@ -183,6 +196,12 @@ OpenMessage == IF open = 0 THEN <<>> ELSE << User(open) >>
 
 \* One commit replaces the older items: with the provider's block and the kept
 \* items unchanged, or with fx's summary and only the running turn's message.
+\* fx's summary written by a model in Unbound keeps the kept items when none
+\* of them is bound.
+FxKeeps ==
+  /\ pending.mode = "keep" /\ model \in Unbound
+  /\ (Bug = "summary_keeps_bound" \/ ~HoldsBound(pending.kept))
+
 Commit ==
   /\ pending.state \in {"block", "failed"}
   /\ ctx' =
@@ -193,6 +212,7 @@ Commit ==
          << FxSummary(compactions + 1) >> \o
          (IF Bug = "fallback_keeps" THEN
             (IF pending.mode = "whole" THEN SubSeq(ctx, OpenFrom, Len(ctx)) ELSE pending.kept)
+          ELSE IF FxKeeps THEN pending.kept
           ELSE OpenMessage)
   /\ pending' = None
   /\ compactions' = compactions + 1
@@ -235,6 +255,7 @@ DriveSpec == Init /\ [][DriveNext]_vars
 
 TypeOK ==
   /\ model \in Models
+  /\ Unbound \subseteq Models
   /\ nextTurn \in 1..(MaxTurns + 1)
   /\ nextStep \in 1..(MaxTurns * MaxSteps + 1)
   /\ open \in 0..MaxTurns
@@ -243,7 +264,7 @@ TypeOK ==
 
 NoDroppedReasoning ==
   \A i \in 1..Len(ctx) :
-    (ctx[i].k = "step" /\ ctx[i].m = model) =>
+    (ctx[i].k = "step" /\ ctx[i].m = model /\ model \notin Unbound) =>
       Canon(SubSeq(ctx, 1, i - 1), model) = bound[ctx[i].n]
 
 \* No request sends a block to a model that did not write it.

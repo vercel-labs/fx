@@ -317,6 +317,7 @@ pub const CompactorCaller = struct {
             // summary on Token Pass.
             .fallback_model = if (self.provider == .gateway) token_pass_team.compactionFallback(self.model) else null,
             .provider_compaction = if (self.provider == .gateway) self.stream_provider.providerCompaction(self.model) else null,
+            .provider_compaction_of = if (self.provider == .gateway) self.stream_provider.provider_compaction_fn else null,
         };
     }
 

@@ -138,6 +138,70 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
+/** Turn 4 runs a shell call; every turn answers "Turn N done.". */
+function terminalStep(request: { body: Body }) {
+  const turn = Number(lastUserText(request.body).match(/TURN (\d+)/)?.[1] ?? 0);
+  if (turn === 4 && request.body.prompt.at(-1)?.role !== "tool") return { kind: "tool" as const };
+  return { kind: "final" as const, text: `Turn ${turn} done.` };
+}
+
+/**
+ * fx's terminal on `model` through the fake gateway, one terminal for the
+ * whole session: the terminal's instructions differ from fx ask's. The
+ * gateway's evidence is kept when `body` fails.
+ */
+async function withTerminal(model: string, options: Partial<ProviderGatewayOptions>, body: (terminal: InstanceType<typeof TmuxSession>, gateway: Gateway) => Promise<void>) {
+  const { root, home, cwd } = fixture(model);
+  const started = startProviderGateway({
+    models: [{ id: model, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }],
+    defaultModel: model,
+    step: terminalStep,
+    compaction: () => ({ kind: "block" }),
+    ...options,
+  });
+  const { gateway, edits, observed, counts } = started;
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+    AI_GATEWAY_API_KEY: "synthetic-provider-compaction", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+    FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model, FX_TRACE_LOG: join(root, "trace.log"),
+    FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_WORKSPACE_TRUST: "1",
+    ...sanitizerOptions(),
+    FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  const command = `/usr/bin/env -i ${Object.entries(env).map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)} --full-access`;
+  const terminal = await TmuxSession.create({ cmd: command, cwd, env: { HOME: home, FX_SOUND: "0" }, isolated: true, stderrPath: join(root, "tui.stderr"), width: 100, height: 32, startupWaitMs: 0 });
+  let passed = false;
+  try {
+    await terminal.waitForStableComposer(20_000);
+    await body(terminal, started);
+    passed = true;
+  } finally {
+    await terminal.kill();
+    gateway.stop();
+    if (passed) rmSync(root, { recursive: true, force: true });
+    else {
+      writeFileSync(join(root, "requests.json"), JSON.stringify(observed.map((request) => request.body), null, 1));
+      console.error(`provider compaction evidence retained: ${root} edits=${JSON.stringify(edits)} counts=${JSON.stringify(counts)}`);
+    }
+  }
+}
+
+async function runTurns(terminal: InstanceType<typeof TmuxSession>, from: number, to: number) {
+  for (let turn = from; turn <= to; turn += 1) {
+    await terminal.sendText(`TURN ${turn} Continue.`);
+    await terminal.waitForText(`Turn ${turn} done.`, 30_000);
+    await terminal.waitForStableComposer(10_000);
+  }
+}
+
+async function switchModel(terminal: InstanceType<typeof TmuxSession>, model: string) {
+  await terminal.sendText(`/model ${model}`);
+  await terminal.waitForText(`Switched to ${model}`, 15_000);
+  await terminal.waitForStableComposer(10_000);
+}
+
 function trace(root: string): string {
   return existsSync(join(root, "trace.log")) ? readFileSync(join(root, "trace.log"), "utf8") : "";
 }
@@ -358,6 +422,45 @@ describe("provider compaction", () => {
         console.error(`provider compaction evidence retained: ${root} edits=${JSON.stringify(edits)} counts=${JSON.stringify(counts)}`);
       }
     }
+  }, 240_000);
+
+  test("a Claude turn after fx's summary on a model without provider compaction sends the kept Claude turns as Claude accepts them", async () => {
+    // Claude turns 1 to 6, then Gemini, which has no provider compaction,
+    // writes fx's own summary. Back on Claude, no reasoning Claude signed
+    // before the summary may follow it: the summary replaced what that
+    // reasoning was written after.
+    const claude = FAMILIES.anthropic.model, gemini = "google/gemini-3-pro";
+    const models = [claude, gemini].map((id) => ({ id, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }));
+    await withSession(claude, { models }, async (session, { observed, counts, edits }) => {
+      const { root, cwd, env, sessionId, before } = session;
+      const seventh = await ask({ ...env, FX_MODEL: gemini, FX_AUTO_COMPACT_PERCENT: "10" }, cwd, root, "t7", ["--resume", sessionId, "--model", gemini], "TURN 7 Continue.");
+      expect(seventh.code).toBe(0);
+      expect(counts.provider).toBe(0);
+      expect(isFxSummary(conversationOf(agentRequestFor(observed, before, 7)!)[0]!)).toBe(true);
+      const eighth = await ask({ ...env, FX_MODEL: claude }, cwd, root, "t8", ["--resume", sessionId, "--model", claude], "TURN 8 Continue.");
+      expect(edits).toEqual([]);
+      expect(eighth.code).toBe(0);
+    });
+  }, 240_000);
+
+  test.skipIf(!tmuxAvailable())("a manual /compact on a model without provider compaction, then Claude, sends the kept Claude turns as Claude accepts them", async () => {
+    const claude = FAMILIES.anthropic.model, gemini = "google/gemini-3-pro";
+    const models = [claude, gemini].map((id) => ({ id, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }));
+    await withTerminal(claude, { models }, async (terminal, { observed, counts, edits }) => {
+      await runTurns(terminal, 1, 6);
+      await switchModel(terminal, gemini);
+      const before = observed.length;
+      await terminal.sendText("/compact");
+      await terminal.waitForText("Context compacted", 30_000);
+      await terminal.waitForStableComposer(15_000);
+      await switchModel(terminal, claude);
+      await terminal.sendText("TURN 7 Continue.");
+      const pane = await terminal.waitForPane((text) => text.includes("Turn 7 done.") || /HTTP 400|invalid_request_error|Request failed|Invalid `signature`|rejected this request/.test(text), 30_000);
+      expect(counts.provider).toBe(0);
+      expect(isFxSummary(conversationOf(agentRequestFor(observed, before, 7)!)[0]!)).toBe(true);
+      expect(edits).toEqual([]);
+      expect(pane).toContain("Turn 7 done.");
+    });
   }, 240_000);
 
   test("a model without provider compaction keeps fx's own compactor, with the newest turns after its summary", async () => {
