@@ -644,15 +644,32 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         step_header, step_script = publish_step.split("        run: |\n", 1)
 
         header_lines = step_header.splitlines()
+        key_pattern = re.compile(r"""^(\s*)["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*:\s*(.*?)\s*$""")
+        step_keys = [
+            (match.group(2), match.group(3))
+            for match in map(key_pattern.match, header_lines)
+            if match and len(match.group(1)) == 8
+        ]
+        self.assertEqual(1, sum(key == "env" for key, _ in step_keys), step_keys)
+        env_start = next(
+            i
+            for i, line in enumerate(header_lines)
+            if (match := key_pattern.match(line)) and len(match.group(1)) == 8 and match.group(2) == "env"
+        )
+        env_block = []
+        for line in header_lines[env_start + 1 :]:
+            if line.strip() and len(line) - len(line.lstrip()) <= 8:
+                break
+            env_block.append(line)
+        env_keys = [
+            (match.group(2), match.group(3)) for match in map(key_pattern.match, env_block) if match
+        ]
         for name, value in (
             ("NPM_TAG", "${{ needs.metadata.outputs.npm_tag }}"),
             ("CHANNEL", "${{ needs.metadata.outputs.channel }}"),
         ):
             with self.subTest(env=name):
-                self.assertIn(f"          {name}: {value}", header_lines)
-                self.assertEqual(
-                    1, sum(line.strip().startswith(f"{name}:") for line in header_lines)
-                )
+                self.assertEqual([value], [v for key, v in env_keys if key == name], env_keys)
 
         script_lines = [line.strip() for line in step_script.splitlines()]
         # The guard must run before anything else in the step, so nothing can
