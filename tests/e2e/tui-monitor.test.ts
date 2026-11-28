@@ -276,6 +276,33 @@ scenario("a blocked agent gets the newest twenty events, a count of the rest, an
   process.kill(pid, "SIGKILL");
 });
 
+scenario("a stream that spans several event windows leaves every line in the file", async (profile) => {
+  // Thirty kilobytes a second for fourteen seconds, past the ten second gap
+  // between events. The entry keeps only 64 KiB of output not yet read, so a
+  // file written once per event would lose most of the second window.
+  const stream = "echo $$ > pid.txt; for i in $(seq 1 14); do printf 'burst-%02d ' $i; head -c 30000 /dev/zero | tr '\\0' x; echo; sleep 1; done";
+  profile.script("Watch the stream.", [
+    () => fakeGatewayToolCall("m1", "monitor", { action: "start", command: stream, label: "stream" }),
+    () => fakeGatewayFinalText("STREAM_STARTED"),
+    () => fakeGatewayFinalText("SAW_FIRST_WINDOW"),
+    () => fakeGatewayFinalText("SAW_SECOND_WINDOW"),
+    () => fakeGatewayFinalText("SAW_STREAM_END"),
+    () => fakeGatewayFinalText("SAW_STREAM_EXTRA"),
+  ]);
+  const shell = await profile.launch({ env: TRACED });
+  await shell.session.sendText("Watch the stream.");
+  await shell.session.waitForText("STREAM_STARTED", 30_000);
+  await waitFor(() => monitorTrace(profile, "event=stop id=shell-1 reason=command_ended").length === 1, "the stream to end and its last event to post", 60_000);
+  const body = monitorRequests(profile)[0]!;
+  const file = /output_file\\":\\"([^"\\]+\.log)/.exec(body)![1]!;
+  const logged = readFileSync(file, "utf8");
+  for (let index = 1; index <= 14; index++) expect(logged).toContain(`burst-${String(index).padStart(2, "0")} `);
+  expect(logged).not.toContain("bytes truncated");
+  expect(statSync(file).size).toBeGreaterThanOrEqual(14 * 30_000);
+  // Nothing rolled over: the whole stream is under the 4 MiB the file keeps.
+  expect(existsSync(`${file}.1`)).toBe(false);
+});
+
 scenario("the shell tool refuses to read or stop a monitor's command", async (profile) => {
   profile.script("Watch the quiet job.", [
     () => fakeGatewayToolCall("m1", "monitor", { action: "start", command: QUIET, label: "quiet" }),

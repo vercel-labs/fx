@@ -25,6 +25,11 @@ pub const max_monitors: usize = 16;
 /// agent never has a queue of them to read later.
 pub const max_queued_events: usize = 1;
 
+/// What a monitor keeps of its command's output between two events. The file
+/// holds all of it (`output_log`), so what does not fit here only misses the
+/// next event's words.
+pub const max_pending_bytes: usize = 64 * 1024;
+
 /// The least time between two events of one monitor. `FX_TEST_MONITOR_GAP_MS`
 /// shortens it, to 100 ms at least, so a test need not wait ten seconds.
 pub fn gapMs() i64 {
@@ -53,6 +58,9 @@ pub const Item = struct {
     held: std.ArrayList(event_mod.Held) = .empty,
     /// Events dropped from `held` to make room for newer ones.
     dropped: u64 = 0,
+    /// Output read since the last event, up to `max_pending_bytes`, for the
+    /// next event to carry.
+    pending: std.ArrayList(u8) = .empty,
     /// The command ended and its last event is in `held` or was posted.
     ended: bool = false,
 };
@@ -220,6 +228,57 @@ pub const Registry = struct {
             return item.dropped;
         }
         return null;
+    }
+
+    /// Keeps `bytes` the command printed since the last event, up to
+    /// `max_pending_bytes`. Returns false when `id` is not listed.
+    pub fn appendPending(self: *Registry, id: []const u8, bytes: []const u8) Allocator.Error!bool {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.items.items) |*item| {
+            if (!std.mem.eql(u8, item.id, id)) continue;
+            const room = max_pending_bytes -| item.pending.items.len;
+            try item.pending.appendSlice(self.alloc, bytes[0..@min(bytes.len, room)]);
+            return true;
+        }
+        return false;
+    }
+
+    /// Whether `id` keeps output for its next event.
+    pub fn hasPending(self: *Registry, id: []const u8) bool {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.items.items) |item| {
+            if (std.mem.eql(u8, item.id, id)) return item.pending.items.len > 0;
+        }
+        return false;
+    }
+
+    /// A copy of `id`'s pending output, or null when it has none. Caller
+    /// frees it. The output stays until `clearPending`, so an event that
+    /// fails to form loses none of it.
+    pub fn copyPending(self: *Registry, alloc: Allocator, id: []const u8) Allocator.Error!?[]u8 {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.items.items) |item| {
+            if (!std.mem.eql(u8, item.id, id)) continue;
+            if (item.pending.items.len == 0) return null;
+            return try alloc.dupe(u8, item.pending.items);
+        }
+        return null;
+    }
+
+    /// Forgets `id`'s pending output, once an event has carried it.
+    pub fn clearPending(self: *Registry, id: []const u8) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.items.items) |*item| {
+            if (std.mem.eql(u8, item.id, id)) return item.pending.clearRetainingCapacity();
+        }
     }
 
     /// Whether `id` holds events.
@@ -457,6 +516,8 @@ fn freeItem(alloc: Allocator, item: Item) void {
     var held = item.held;
     for (held.items) |entry| alloc.free(entry.text);
     held.deinit(alloc);
+    var pending = item.pending;
+    pending.deinit(alloc);
 }
 
 /// Events a monitor held, moved out for one post.
@@ -580,6 +641,33 @@ test "a switch to another session hands back the monitors of the old one" {
     try std.testing.expectEqual(@as(usize, 0), registry.count());
     // With none listed, a switch hands back nothing.
     try std.testing.expect((try registry.followSession("three")) == null);
+}
+
+test "a monitor keeps the output between two events, up to its cap" {
+    var registry: Registry = .{ .alloc = std.testing.allocator };
+    defer registry.deinit();
+    try registry.add("shell-1", "ci", "true");
+    try std.testing.expect(!registry.hasPending("shell-1"));
+    try std.testing.expect((try registry.copyPending(std.testing.allocator, "shell-1")) == null);
+    try std.testing.expect(!(try registry.appendPending("shell-9", "x")));
+    try std.testing.expect(try registry.appendPending("shell-1", "one\n"));
+    try std.testing.expect(try registry.appendPending("shell-1", "two\n"));
+    const copied = (try registry.copyPending(std.testing.allocator, "shell-1")).?;
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings("one\ntwo\n", copied);
+    // A copy leaves the output in place until it is cleared.
+    try std.testing.expect(registry.hasPending("shell-1"));
+    registry.clearPending("shell-1");
+    try std.testing.expect(!registry.hasPending("shell-1"));
+    // Past the cap the rest is left out, and the first words stay.
+    const big = try std.testing.allocator.alloc(u8, max_pending_bytes + 100);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    try std.testing.expect(try registry.appendPending("shell-1", big));
+    try std.testing.expect(try registry.appendPending("shell-1", "tail"));
+    const capped = (try registry.copyPending(std.testing.allocator, "shell-1")).?;
+    defer std.testing.allocator.free(capped);
+    try std.testing.expectEqual(max_pending_bytes, capped.len);
 }
 
 test "events a monitor cannot post are held, the newest twenty, and the older ones counted" {

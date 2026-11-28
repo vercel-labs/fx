@@ -158,17 +158,23 @@ pub fn Runtime(comptime App: type) type {
                 };
                 const ended = state != .running;
                 const waiting = runtime.pendingOutputBytesFor(item.id) orelse 0;
-                if ((ended or waiting > 0) and event.due(now_ms, item.last_event_ms, ended, monitor.gapMs())) {
-                    read(app, agent, registry, item, now_ms);
+                const due = event.due(now_ms, item.last_event_ms, ended, monitor.gapMs());
+                // Output is read each second, so the file keeps all of it and
+                // the entry's bounded buffer never drops any between events.
+                // The words of an event wait for its turn.
+                if (ended or waiting > 0 or (due and registry.hasPending(item.id))) {
+                    read(app, agent, registry, item, now_ms, due);
                 }
             }
             flush(app, agent, registry, item.id, now_ms);
         }
 
-        /// Reads what the command printed, keeps all of it in the monitor's
-        /// file, and holds the event it makes. The agent gets held events in
-        /// `flush`, when it can take them.
-        fn read(app: *App, agent: anytype, registry: *monitor.Registry, item: monitor.Seen, now_ms: i64) void {
+        /// Reads what the command printed and keeps all of it in the
+        /// monitor's file. When the monitor's pace allows an event, holds the
+        /// event made of the output since the last one; before that, keeps
+        /// the words for it. The agent gets held events in `flush`, when it
+        /// can take them.
+        fn read(app: *App, agent: anytype, registry: *monitor.Registry, item: monitor.Seen, now_ms: i64, due: bool) void {
             const runtime = &agent.managed_executions;
             // The agent may have stopped it since the loop listed it: its stop
             // is the answer, so no end event follows.
@@ -181,18 +187,50 @@ pub fn Runtime(comptime App: type) type {
             defer prepared.deinit(app.alloc);
             const snapshot = prepared.snapshot;
             const running = snapshot.state == .running;
-            const text = eventText(app, snapshot) catch |err| {
+            if (running and !due) {
+                const listed = registry.appendPending(item.id, snapshot.output_delta) catch |err| {
+                    cancelRead(runtime, item.id, prepared.reservation_id);
+                    debug_trace.logf("monitor", "event=read_deferred id={s} reason={s}", .{ item.id, @errorName(err) });
+                    return;
+                };
+                if (!listed) {
+                    cancelRead(runtime, item.id, prepared.reservation_id);
+                    return;
+                }
+                finishRead(app, runtime, item.id, prepared.reservation_id, snapshot.output_delta);
+                return;
+            }
+            const pending = registry.copyPending(app.alloc, item.id) catch |err| {
+                cancelRead(runtime, item.id, prepared.reservation_id);
+                debug_trace.logf("monitor", "event=read_deferred id={s} reason={s}", .{ item.id, @errorName(err) });
+                return;
+            };
+            defer if (pending) |bytes| app.alloc.free(bytes);
+            // The event's words: what was kept since the last event, then
+            // what this read took.
+            var words = snapshot;
+            var joined: ?[]u8 = null;
+            defer if (joined) |bytes| app.alloc.free(bytes);
+            if (pending) |bytes| {
+                joined = std.mem.concat(app.alloc, u8, &.{ bytes, snapshot.output_delta }) catch |err| {
+                    cancelRead(runtime, item.id, prepared.reservation_id);
+                    debug_trace.logf("monitor", "event=read_deferred id={s} reason={s}", .{ item.id, @errorName(err) });
+                    return;
+                };
+                words.output_delta = joined.?;
+            }
+            const text = eventText(app, words) catch |err| {
                 cancelRead(runtime, item.id, prepared.reservation_id);
                 debug_trace.logf("monitor", "event=read_deferred id={s} reason={s}", .{ item.id, @errorName(err) });
                 return;
             };
             defer app.alloc.free(text.body);
-            logOutput(app, item.id, snapshot.output_delta);
             const hash = event.textHash(text.body);
             // The same words again are no news: the output is taken, the
             // agent is not woken, and the monitor waits out the gap.
             if (running and item.last_hash == hash) {
-                commitRead(runtime, item.id, prepared.reservation_id);
+                registry.clearPending(item.id);
+                finishRead(app, runtime, item.id, prepared.reservation_id, snapshot.output_delta);
                 registry.markEvent(item.id, now_ms, hash);
                 debug_trace.logf("monitor", "event=dropped id={s} reason=repeat bytes={d}", .{ item.id, text.body.len });
                 return;
@@ -200,7 +238,8 @@ pub fn Runtime(comptime App: type) type {
             // Blank lines only: nothing to say, so take them off the entry
             // instead of reading them again each second.
             if (running and text.body.len == 0) {
-                commitRead(runtime, item.id, prepared.reservation_id);
+                registry.clearPending(item.id);
+                finishRead(app, runtime, item.id, prepared.reservation_id, snapshot.output_delta);
                 return;
             }
             const dropped = registry.pushHeld(item.id, text.body, now_ms, !running) catch |err| {
@@ -208,7 +247,8 @@ pub fn Runtime(comptime App: type) type {
                 debug_trace.logf("monitor", "event=read_deferred id={s} reason={s}", .{ item.id, @errorName(err) });
                 return;
             };
-            commitRead(runtime, item.id, prepared.reservation_id);
+            registry.clearPending(item.id);
+            finishRead(app, runtime, item.id, prepared.reservation_id, snapshot.output_delta);
             registry.markEvent(item.id, now_ms, hash);
             debug_trace.logf("monitor", "event=held id={s} bytes={d} more_lines={d} dropped_before={d} ended={}", .{ item.id, text.body.len, text.more_lines, dropped orelse 0, !running });
         }
@@ -293,6 +333,14 @@ pub fn Runtime(comptime App: type) type {
         fn cancelRead(runtime: *managed_execution.Runtime, id: []const u8, reservation_id: u64) void {
             runtime.cancelDelivery(id, reservation_id) catch |err|
                 debug_trace.logf("monitor", "event=cancel_failed id={s} err={s}", .{ id, @errorName(err) });
+        }
+
+        /// Writes a read's output to the monitor's file, then takes it off
+        /// the entry. Only a read that is kept gets here, so the file never
+        /// holds a read twice.
+        fn finishRead(app: *App, runtime: *managed_execution.Runtime, id: []const u8, reservation_id: u64, output: []const u8) void {
+            logOutput(app, id, output);
+            commitRead(runtime, id, reservation_id);
         }
 
         /// Takes a read's output off the entry once the agent has it.
