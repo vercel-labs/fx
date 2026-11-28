@@ -14,6 +14,9 @@ const text_utils = @import("../../core/shared/text_utils.zig");
 const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
 
+pub const no_matching_models_text = "No matching models";
+const no_matching_products_text = "No matching products";
+
 const Allocator = std.mem.Allocator;
 const ModelRow = usage.report.ModelRow;
 const Period = usage.Period;
@@ -318,7 +321,7 @@ pub fn composeRow(alloc: Allocator, p: Projection, row_index: u16, visible_rows:
         .more_row => |first| composeMoreRow(alloc, p, first, limit),
         .no_models => row_text.composeTextRow(
             alloc,
-            if (rawModels(p).len > 0) "No matching models" else noModelsText(p.period),
+            if (rawModels(p).len > 0) no_matching_models_text else noModelsText(p.period),
             width,
             ui_render.dim_style,
             2,
@@ -348,7 +351,7 @@ pub fn composeRow(alloc: Allocator, p: Projection, row_index: u16, visible_rows:
         .grok_limit_row => composeGrokLimitRow(alloc, p, limit),
         .grok_product_header => composeGrokProductHeader(alloc, p, limit),
         .grok_product_row => |index| composeGrokProductRow(alloc, p, index, limit),
-        .grok_no_products => row_text.composeTextRow(alloc, "No matching models", width, ui_render.dim_style, 2),
+        .grok_no_products => row_text.composeTextRow(alloc, no_matching_products_text, width, ui_render.dim_style, 2),
         .grok_plan_header => composeGrokPlanHeader(alloc, p, limit),
         .grok_plan_row => composeGrokPlanRow(alloc, p, limit),
     };
@@ -594,7 +597,11 @@ fn composeHeading(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(
 
     try row.print(alloc, "{s}Usage:{s} ", .{ ui_render.selected_completion_style, ui_render.reset_style });
     const left_start = row.items.len;
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, left, left_room);
+    if (p.detail) {
+        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, left, left_room);
+    } else {
+        try row_text.appendSingleLineEllipsized(alloc, &row, left, left_room);
+    }
     if (show_status) {
         const used = prefix_width + display_width.visibleWidth(row.items[left_start..]);
         try row.appendNTimes(alloc, ' ', limit - used - status_width);
@@ -1534,7 +1541,7 @@ fn composeCodexModelLine(alloc: Allocator, p: Projection, slot: usize, visible_r
         if (slot == 0) {
             var raw_buf: [max_shares]Share = undefined;
             const has_raw = rawModelShares(p, &raw_buf).len > 0;
-            const text = if (has_raw) "No matching models" else codexEmptyText(p.period);
+            const text = if (has_raw) no_matching_models_text else codexEmptyText(p.period);
             return row_text.composeTextRow(alloc, text, @intCast(@min(limit, std.math.maxInt(u16))), ui_render.dim_style, 2);
         }
         return .empty;
@@ -2798,7 +2805,7 @@ test "the usage dashboard matches the catalog header, period tabs, selection sty
     var grok_empty = try draw(.{ .active = true, .query = "zzz", .snapshot = &grok_snap }, 80, 40);
     defer grok_empty.deinit();
     try testing.expect(std.mem.startsWith(u8, grok_empty.row(0), "Usage 0 "));
-    try testing.expect(grok_empty.find("  No matching models") != null);
+    try testing.expect(grok_empty.find("  No matching products") != null);
 }
 
 test "header shows account before freshness at 80 cols, ellipsizes or drops it before collapsing tabs, at 80, 50, and 30 columns" {
@@ -2908,5 +2915,17 @@ test "header shows account before freshness at 80 cols, ellipsizes or drops it b
     try testing.expectEqualStrings(
         "Usage 9  today  7d  [month]  codex (ChatGPT), Alexandria Qui… · updated just now",
         long_cx_80.row(0),
+    );
+
+    // Non-list Codex view (no breakdown) also cuts long account names at the end.
+    const plan_only_usage: usage.codex.Usage = .{ .plan = "pro", .profile = long_profile };
+    var plan_only = try codexSnapshot(.ready, plan_only_usage);
+    defer plan_only.deinit();
+    plan_only.codex_at_ms = test_now;
+    var plan_only_50 = try draw(.{ .active = true, .snapshot = &plan_only }, 50, 40);
+    defer plan_only_50.deinit();
+    try testing.expectEqualStrings(
+        "Usage: codex (ChatGPT), Alexand…  updated just now",
+        plan_only_50.row(0),
     );
 }

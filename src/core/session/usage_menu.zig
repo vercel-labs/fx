@@ -279,6 +279,17 @@ test "a refresh keeps the selected model by name" {
     state.replace(try testSnapshot(&.{"z"}), 3, "");
     try std.testing.expectEqual(@as(usize, 0), state.selected_model);
     try std.testing.expect(!state.detail);
+
+    // Filtered refresh keeps the selected model by name under query "op" and drops detail when it leaves.
+    state.open(try testSnapshot(&.{ "anthropic/claude-opus-4-6", "openai/gpt-5", "anthropic/claude-sonnet-4-5" }), 4);
+    try std.testing.expect(state.moveModel(1, 5, "op"));
+    try std.testing.expect(state.openDetail("op"));
+    state.replace(try testSnapshot(&.{ "anthropic/claude-opus-4-6", "anthropic/claude-sonnet-4-5", "openai/gpt-5" }), 5, "op");
+    try std.testing.expectEqual(@as(usize, 2), state.selected_model);
+    try std.testing.expect(state.detail);
+    state.replace(try testSnapshot(&.{ "anthropic/claude-opus-4-6", "anthropic/claude-sonnet-4-5" }), 6, "op");
+    try std.testing.expectEqual(@as(usize, 1), state.selected_model);
+    try std.testing.expect(!state.detail);
 }
 
 test "Tab changes the listed period only from the table" {

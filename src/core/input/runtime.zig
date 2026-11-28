@@ -61,6 +61,9 @@ pub const Runtime = struct {
     /// subagent, which borrows the composer as its query box. Holds the
     /// person's draft until the pick or the picker's close gives it back.
     card_model_picker_draft: ?composer_stash.State = null,
+    /// Set while `/usage` opens over an existing composer draft (e.g. via a
+    /// personal shortcut) and borrows the composer as its search box.
+    usage_draft: ?composer_stash.State = null,
 
     pub fn initInto(self: *Runtime) void {
         const runtime_info = @typeInfo(Runtime).@"struct";
@@ -85,6 +88,7 @@ pub const Runtime = struct {
         self.edit_history.deinit(alloc);
         if (self.model_picker_draft) |*draft| draft.deinit(alloc);
         if (self.card_model_picker_draft) |*draft| draft.deinit(alloc);
+        if (self.usage_draft) |*draft| draft.deinit(alloc);
     }
 
     /// Sets the person's draft aside so the model picker a card's "Change
@@ -100,6 +104,21 @@ pub const Runtime = struct {
     pub fn restoreModelPickerDraft(self: *Runtime, alloc: Allocator) bool {
         var draft = self.card_model_picker_draft orelse return false;
         self.card_model_picker_draft = null;
+        draft.restore(alloc, self.composerStashView());
+        return true;
+    }
+
+    pub fn stashUsageDraft(self: *Runtime) void {
+        if (self.usage_draft != null) return;
+        if (self.edit_state.input.items.len == 0 and
+            self.entities.pasted_blocks.items.len == 0 and
+            self.entities.image_tokens.items.len == 0) return;
+        self.usage_draft = composer_stash.State.capture(self.composerStashView());
+    }
+
+    pub fn restoreUsageDraft(self: *Runtime, alloc: Allocator) bool {
+        var draft = self.usage_draft orelse return false;
+        self.usage_draft = null;
         draft.restore(alloc, self.composerStashView());
         return true;
     }

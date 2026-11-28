@@ -2,7 +2,7 @@
 // and the Grok CLI proxy. The clock is pinned so day ranges are exact.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
@@ -295,5 +295,45 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       await session.waitForPane((pane) => !pane.includes("Usage 14"), TIMEOUT);
     },
     TIMEOUT * 2,
+  );
+
+  test(
+    "personal shortcut opening /usage preserves an existing composer draft across Esc",
+    async () => {
+      const { home, env } = start("fx-tui-usage-shortcut-", { report: (from) => rows(from) });
+      const fxDir = join(home, ".fx");
+      mkdirSync(fxDir, { recursive: true });
+      writeFileSync(
+        join(fxDir, "settings.json"),
+        JSON.stringify({ session_titles: false, shortcuts: { "ctrl+f": "/usage" } }),
+      );
+      session = await TmuxSession.create({
+        env: { ...env, AI_GATEWAY_API_KEY: "e2e-usage-key" },
+      });
+      await session.waitForComposer(TIMEOUT);
+
+      const draft = "please fix the login bug";
+      await session.sendLiteralText(draft);
+      await session.waitForText(draft, TIMEOUT);
+
+      // Ctrl+F (0x06) opens /usage with an empty search box instead of filtering on the draft.
+      await session.sendHexBytes(["06"]);
+      const opened = await session.waitForText("tab period", TIMEOUT);
+      expect(opened).toContain("Usage 2  today  7d  [month]");
+      expect(opened).not.toContain(draft);
+      expect(opened).not.toContain("No matching models");
+
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab period") && pane.includes(draft), TIMEOUT);
+
+      // Typed /usage with an empty composer still closes cleanly to an empty composer.
+      await session.sendKeys("C-u");
+      await session.waitForPane((pane) => !pane.includes(draft), TIMEOUT);
+      await session.sendText("/usage");
+      await session.waitForText("Usage 2  today  7d  [month]", TIMEOUT);
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab period") && !pane.includes(draft), TIMEOUT);
+    },
+    TIMEOUT,
   );
 });

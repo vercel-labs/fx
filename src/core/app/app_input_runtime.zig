@@ -1604,10 +1604,8 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 ctrl_r_byte => {
-                    if (usageMenuActive(app)) {
-                        if (comptime runtime_profile.allows(App, .profile_usage)) {
-                            try reloadUsageMenu(app, app.input_runtime.usage_menu.period);
-                        }
+                    if ((comptime runtime_profile.allows(App, .profile_usage)) and usageMenuActive(app)) {
+                        try reloadUsageMenu(app, app.input_runtime.usage_menu.period);
                     }
                 },
                 22 => {
@@ -8583,7 +8581,7 @@ test "app_input_runtime usage dashboard accepts search typing, refreshes on ctrl
     try std.testing.expectEqual(@as(usize, 0), app.usage_reload_count);
 
     app.input_runtime.usage_menu.detail = true;
-    try Runtime(RoutingFakeApp).handleByte(&app, 18, 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_r_byte, 4096, 100);
     try std.testing.expectEqual(@as(usize, 1), app.usage_reload_count);
     try std.testing.expect(app.input_runtime.usage_menu.active);
     try std.testing.expect(!app.agent().session_persistence.session_picker.active);
@@ -8603,6 +8601,31 @@ test "app_input_runtime usage dashboard accepts search typing, refreshes on ctrl
 
     try feedRoutingBytes(&app, "\x1b[27;1:1u");
     try std.testing.expect(!app.input_runtime.usage_menu.active);
+}
+
+test "app_input_runtime usage dashboard preserves a stashed draft across search and clears search on Ctrl+C" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    try feedRoutingBytes(&app, "keep my prompt");
+    try std.testing.expectEqualStrings("keep my prompt", app.input_runtime.edit_state.input.items);
+
+    app.input_runtime.stashUsageDraft();
+    app.input_runtime.usage_menu.active = true;
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+
+    try feedRoutingBytes(&app, "op");
+    try std.testing.expectEqualStrings("op", app.input_runtime.edit_state.input.items);
+
+    // Ctrl+C clears the active search without touching the stashed prompt or closing /usage.
+    try Runtime(RoutingFakeApp).handleByte(&app, 3, 4096, 100);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.usage_menu.active);
+
+    try feedRoutingBytes(&app, "\x1b[27;1:1u");
+    try std.testing.expect(!app.input_runtime.usage_menu.active);
+    try std.testing.expectEqualStrings("keep my prompt", app.input_runtime.edit_state.input.items);
 }
 
 test "app_input_runtime decoded kitty Backspace edits the draft without cancelling" {

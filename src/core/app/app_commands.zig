@@ -859,6 +859,17 @@ pub fn Handlers(comptime App: type) type {
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
+            const had_active_usage = app.input_runtime.usage_menu.active;
+            if (!had_active_usage) {
+                if (comptime @hasDecl(@TypeOf(app.input_runtime), "stashUsageDraft")) {
+                    app.input_runtime.stashUsageDraft();
+                }
+            }
+            errdefer if (!had_active_usage) {
+                if (comptime @hasDecl(@TypeOf(app.input_runtime), "restoreUsageDraft")) {
+                    _ = app.input_runtime.restoreUsageDraft(app.alloc);
+                }
+            };
             var label_buf: usage_host.LabelBuffer = undefined;
             if (usage_host.credential(&app.auth, &label_buf)) |credential| {
                 app.usage_dashboard.open(credential);
@@ -901,6 +912,11 @@ pub fn Handlers(comptime App: type) type {
         pub fn closeUsageMenu(app: *App) void {
             app.input_runtime.usage_menu.close();
             if (comptime @hasField(App, "usage_dashboard")) app.usage_dashboard.close();
+            if (comptime @hasDecl(@TypeOf(app.input_runtime), "restoreUsageDraft")) {
+                if (app.input_runtime.restoreUsageDraft(app.alloc)) {
+                    app.shell.render_requests.request(.footer);
+                }
+            }
         }
 
         fn installUsageSnapshot(app: *App) !void {
