@@ -1720,19 +1720,39 @@ fn exactFileMutationGrants(
     arena: Allocator,
     tool_name: []const u8,
     policy_targets: file_mutation_contract.PolicyEvaluatedFileTargets,
+    offer: ?file_mutation_contract.FileGrantOffer,
 ) ![]const PermissionGrant {
-    const permission_name = permissions.permissionNameForTool(tool_name);
-    const grants = try arena.alloc(PermissionGrant, policy_targets.items.len);
-    for (policy_targets.items, grants) |item, *grant| {
-        grant.* = .{
-            .tool_name = try arena.dupe(u8, permission_name),
-            .target_path = try arena.dupe(
-                u8,
-                policy_targets.permissionPath(item),
-            ),
-        };
+    var grants: std.ArrayList(PermissionGrant) = .empty;
+    const offer_grants = if (offer) |value| value.grants else &.{};
+    if (offer_grants.len == 0) {
+        const permission_name = permissions.permissionNameForTool(tool_name);
+        for (policy_targets.items) |item| {
+            try grants.append(arena, .{
+                .tool_name = try arena.dupe(u8, permission_name),
+                .target_path = try arena.dupe(
+                    u8,
+                    policy_targets.permissionPath(item),
+                ),
+            });
+        }
+        return grants.toOwnedSlice(arena);
     }
-    return grants;
+    for (offer_grants, 0..) |offer_grant, idx| {
+        const seen = for (offer_grants[0..idx]) |prev| {
+            if (std.mem.eql(u8, prev.tool_name, offer_grant.tool_name)) break true;
+        } else false;
+        if (seen) continue;
+        for (policy_targets.items) |item| {
+            try grants.append(arena, .{
+                .tool_name = try arena.dupe(u8, offer_grant.tool_name),
+                .target_path = try arena.dupe(
+                    u8,
+                    policy_targets.permissionPath(item),
+                ),
+            });
+        }
+    }
+    return grants.toOwnedSlice(arena);
 }
 
 fn exactApprovalLocalGrants(
@@ -2087,6 +2107,7 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
                     arena,
                     call.name,
                     authorization.policy_targets,
+                    authorization.grant_offer,
                 );
             }
             var outcome: command_admission.PermissionOutcome = .{
@@ -7109,4 +7130,51 @@ test "gate 2582: a once approval of a/ never covers b/ after a looser-policy rec
     _ = second;
     // The person approved only workspace/a/note.txt; b/note.txt in ask mode must ask again.
     try std.testing.expectEqual(@as(usize, 2), recording.calls);
+}
+
+test "gate 2582: no-op write under a read ask rule keeps once approval across one recheck" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var f = try tmp.dir.createFile(std.testing.io, "secret.txt", .{});
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io, "same\n");
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{ .decision = .once };
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("read_file"),
+        .pattern = @constCast("*"),
+        .action = .ask,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const call: ToolCall = .{
+        .id = "noop-read-ask",
+        .name = "write_file",
+        .arguments_json = try arena.print("{{\"path\":\"{s}/secret.txt\",\"content\":\"same\\n\"}}", .{workspace}),
+    };
+    const initial = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    const first = try revalidateLiveActionPermissionOutcome(
+        input,
+        arena,
+        call,
+        .ask,
+        &.{},
+        initial.execution_authority.?,
+        .once,
+    );
+    try std.testing.expect(!first.decision.isDenied());
+    try std.testing.expectEqual(ToolPermissionDecision.once, first.decision);
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
 }
