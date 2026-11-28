@@ -319,10 +319,10 @@ pub const Manager = struct {
             error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.OutOfMemory => |e| e,
             else => |io_err| storage.ioFault(io_err),
         };
-        const session: Session = .{ .manager = m, .inner = inner };
+        const session: Session = .{ .manager = m, .inner = inner, .resumed_by = options.host };
         // The repair may have moved the workspace or interrupted a turn, so
         // the whole entry is written, not only the open time (D42).
-        session.updateIndexAs(.{ .resumed = options.host });
+        session.updateIndex();
         return session;
     }
 
@@ -359,7 +359,7 @@ pub const Manager = struct {
         // index lists it as its parent's child.
         for (forked.copies) |copy| (Session{ .manager = m, .inner = copy }).release();
         const session: Session = .{ .manager = m, .inner = forked.session };
-        session.updateIndexAs(.published);
+        session.updateIndex();
         return session;
     }
 
@@ -555,6 +555,8 @@ pub const Session = struct {
     manager: *Manager,
     inner: *session_mod.Session,
     import: bool = false,
+    /// The host that resumed the session; null when this handle created it.
+    resumed_by: ?Host = null,
 
     pub fn id(s: Session) []const u8 {
         return s.inner.id();
@@ -581,7 +583,7 @@ pub const Session = struct {
         if (!s.import) return error.InvalidArgument;
         try s.manager.ready();
         try s.inner.publishImport();
-        s.updateIndexAs(.published);
+        s.updateIndex();
     }
 
     fn appendChecked(s: Session, events: []const Event, ts_ms: ?u64) AppendError!u64 {
@@ -591,7 +593,7 @@ pub const Session = struct {
         // that stays held in memory does no disk I/O at all (D2).
         if (!s.inner.staysHeld(events)) try s.manager.ready();
         const result = try s.inner.appendReport(events, ts_ms);
-        if (result.published) s.updateIndexAs(.published) else if (result.listing_changed) s.updateIndex();
+        if (result.published or result.listing_changed) s.updateIndex();
         return result.last_seq;
     }
 
@@ -652,23 +654,15 @@ pub const Session = struct {
         s.inner.destroy();
     }
 
+    /// Writes the session's entry. The host using the session gets the
+    /// session's activity time as its open time, so `-c` finds the session
+    /// that host last worked in, not the one it last opened (D104).
     fn updateIndex(s: Session) void {
-        s.updateIndexAs(.changed);
-    }
-
-    /// A new session counts as opened by the host that created it, and a
-    /// resumed one by the host that resumed it, so `-c` finds it; other
-    /// updates leave the open times alone.
-    fn updateIndexAs(s: Session, why: union(enum) { published, changed, resumed: Host }) void {
         const m = s.manager;
         var arena = std.heap.ArenaAllocator.init(m.gpa);
         defer arena.deinit();
         var summary = s.indexSummary(arena.allocator()) catch return m.indexStale(s.id());
-        switch (why) {
-            .published => summary.opened_ms[@backingInt(summary.host)] = summary.updated_ms,
-            .resumed => |host| summary.opened_ms[@backingInt(host)] = m.nowMs(),
-            .changed => {},
-        }
+        summary.opened_ms[@backingInt(s.resumed_by orelse summary.host)] = summary.updated_ms;
         m.catalog().put(summary) catch m.indexStale(s.id());
     }
 
@@ -684,7 +678,7 @@ pub const Session = struct {
             .title = st.title,
             .language = st.language,
             .parent = identity.parent,
-            // The newest line's time, as a rebuild computes it (D20).
+            // The newest activity's time, as a rebuild computes it (D20, D104).
             .created_ms = if (st.created_ms != 0) st.created_ms else s.manager.nowMs(),
             .updated_ms = if (st.updated_ms != 0) st.updated_ms else s.manager.nowMs(),
             .turns = st.committed + st.interrupted,
@@ -1597,16 +1591,17 @@ const api_tests = struct {
         s.release();
 
         // Resume reads both back from the log; the list shows the same times.
+        // The newest line is now `closed`, which is not activity (D104).
         const r = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
         var st = try r.state(gpa);
         defer st.deinit(gpa);
         try testing.expectEqual(first.created_ms, st.created_ms);
-        try testing.expectEqual(try newestTs(m, id), st.updated_ms);
+        try testing.expectEqual(first.updated_ms, st.updated_ms);
         r.release();
         var listed = try m.list(gpa, .all, null, 10);
         defer listed.deinit();
         try testing.expectEqual(first.created_ms, listed.items[0].created_ms);
-        try testing.expectEqual(try newestTs(m, id), listed.items[0].updated_ms);
+        try testing.expectEqual(first.updated_ms, listed.items[0].updated_ms);
 
         // A fork is created now; its copied lines keep older times.
         const fk = try m.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
@@ -1615,6 +1610,53 @@ const api_tests = struct {
         defer forked.deinit(gpa);
         try testing.expect(forked.created_ms >= st.updated_ms);
         try testing.expectEqual(forked.created_ms, forked.updated_ms);
+    }
+
+    test "opening a session and leaving it without a turn keeps its time, its place in the list, and -c (D104)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        // Two sessions the app worked in long ago; the import keeps their times.
+        const older = "1786460757753-older";
+        const newer = "1786460757753-newer";
+        for ([_]struct { []const u8, u64 }{ .{ older, 2000 }, .{ newer, 5000 } }) |saved| {
+            const s = try m.openImport(.{ .id = saved[0], .workspace = "/w", .host = .app, .created_ms = saved[1] - 500 });
+            _ = try s.appendAt(&.{ .turn_started, piece, .turn_committed }, saved[1]);
+            try s.publishImport();
+            s.release();
+        }
+
+        // The app opens the newer one, then the older one, and leaves each.
+        (try m.openResume(.{ .target = .{ .id = newer }, .workspace = "/w", .host = .app })).release();
+        (try m.openResume(.{ .target = .{ .id = older }, .workspace = "/w", .host = .app })).release();
+        for (0..2) |pass| {
+            // The second pass reads the times back from the logs alone.
+            if (pass == 1) _ = try m.rebuild();
+            var listed = try m.list(gpa, .all, null, 10);
+            defer listed.deinit();
+            try testing.expectEqualStrings(newer, listed.items[0].id);
+            try testing.expectEqual(@as(u64, 5000), listed.items[0].updated_ms);
+            try testing.expectEqualStrings(older, listed.items[1].id);
+            try testing.expectEqual(@as(u64, 2000), listed.items[1].updated_ms);
+        }
+        const continued = (try m.lastOpened(gpa, "/w", .app)).?;
+        defer gpa.free(continued);
+        try testing.expectEqualStrings(newer, continued);
+
+        // A turn in the older one is new activity: it leads the list and -c.
+        {
+            const r = try m.openResume(.{ .target = .{ .id = older }, .workspace = "/w", .host = .app });
+            defer r.release();
+            _ = try r.append(&.{ .turn_started, piece, .turn_committed });
+        }
+        var listed = try m.list(gpa, .all, null, 10);
+        defer listed.deinit();
+        try testing.expectEqualStrings(older, listed.items[0].id);
+        try testing.expect(listed.items[0].updated_ms > 5000);
+        const after_turn = (try m.lastOpened(gpa, "/w", .app)).?;
+        defer gpa.free(after_turn);
+        try testing.expectEqualStrings(older, after_turn);
     }
 
     test "hosts end turns as cancel or failed; closed and crash stay the manager's (D21)" {

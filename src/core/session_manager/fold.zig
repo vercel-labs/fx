@@ -85,8 +85,8 @@ pub const State = struct {
     /// The last line is `closed`.
     clean_exit: bool = false,
     last_seq: u64 = 0,
-    /// `ts` of line 1 and of the newest line; 0 before the first turn
-    /// (D20). The session fills both in the copies it hands out, from the
+    /// `ts` of line 1 and of the newest turn or item line; 0 before the first
+    /// turn (D20, D104). The session fills both in the copies it hands out, from the
     /// log it reads and writes; the fold and snapshots leave them alone.
     created_ms: u64 = 0,
     updated_ms: u64 = 0,

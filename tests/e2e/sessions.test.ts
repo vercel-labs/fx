@@ -42,7 +42,7 @@ import {
   hasEmptyComposer,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
-import { childLines, childWork, committedRootTurns, compactionRecordPath, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, savedText, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, copyV1Fixture, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, savedText, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -2017,6 +2017,86 @@ test.skipIf(!tmuxAvailable())("the picker shows a session open in another fx as 
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 4);
+
+const DAY_MS = 86_400_000;
+
+/// The rows of the `fx -r` picker on screen, top to bottom, as title and age.
+function pickerRows(pane: string, titles: readonly string[]): { title: string; age: string }[] {
+  const rows: { title: string; age: string }[] = [];
+  for (const line of pane.split("\n")) {
+    const title = titles.find((candidate) => new RegExp(`(^|\\s)${candidate}\\s`).test(line));
+    const age = / · (now|\d+[mhd]) · /.exec(line)?.[1];
+    if (title && age) rows.push({ title, age });
+  }
+  return rows;
+}
+
+test.skipIf(!tmuxAvailable())("opening a session from the picker and quitting without a turn keeps its age and place (D104)", async () => {
+  const fixture = createFixture("fx-v2-picker-activity-");
+  const gateway = replyToLatest([]);
+  let picker: TmuxSession | null = null;
+  try {
+    // Three sessions an older fx saved weeks ago, converted with their own
+    // times, and a newer one it saved that stays in the old format.
+    copyV1Fixture(fixture.home, "plain", 3, fixture.workspace);
+    expect((await command(fixture, gateway, ["sessions", "convert", "--json"])).code).toBe(0);
+    copyV1Fixture(fixture.home, "remembered", 1, fixture.workspace);
+    const titles = ["CONV_FIRST remembered", "CONV_FIRST 3", "CONV_FIRST 2", "CONV_FIRST 1"];
+    const listed = async () => {
+      const result = await command(fixture, gateway, ["sessions", "--json"]);
+      expect(result.code).toBe(0);
+      return JSON.parse(result.stdout).sessions.map((entry: any) => ({ title: entry.title, updated: entry.updated_at_ms }));
+    };
+    const before = await listed();
+    expect(before.map((entry: any) => entry.title)).toEqual(titles);
+    const ages = before.map((entry: any) => ({ title: entry.title, age: `${Math.floor((Date.now() - entry.updated) / DAY_MS)}d` }));
+    const showsTheList = (pane: string) => JSON.stringify(pickerRows(pane, titles)) === JSON.stringify(ages);
+
+    const stderrPath = join(fixture.root, "picker-stderr.log");
+    const openPicker = async () => {
+      writeFileSync(stderrPath, "");
+      picker = await TmuxSession.create({
+        cmd: `${FX_BIN} -r`,
+        cwd: fixture.workspace,
+        env: { ...env(fixture, gateway), NO_COLOR: "1" },
+        stderrPath,
+        width: 120,
+        height: 30,
+      });
+      return picker;
+    };
+
+    // The oldest, converted one, then the one still in the old format.
+    for (const title of ["CONV_FIRST 1", "CONV_FIRST remembered"]) {
+      const session = await openPicker();
+      await session.waitForPane(showsTheList, TIMEOUT);
+      await session.sendLiteralText(title);
+      await session.waitForPane((pane) => pickerRows(pane, titles).map((row) => row.title).join() === title, TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForComposer(TIMEOUT);
+      await session.sendKeys("C-c");
+      await session.waitForText("press ctrl+c again to exit", TIMEOUT);
+      await session.sendKeys("C-c");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await session.kill();
+      picker = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    }
+
+    // Each keeps the age of its last turn and its place below newer ones.
+    const again = await openPicker();
+    await again.waitForPane(showsTheList, TIMEOUT);
+    const after = await listed();
+    expect(after.map((entry: any) => entry.title)).toEqual(titles);
+    for (const [index, entry] of after.entries()) expect(Date.now() - entry.updated).toBeGreaterThan(DAY_MS * Number.parseInt(ages[index]!.age));
+    expect(after.find((entry: any) => entry.title === "CONV_FIRST 1").updated).toBe(before.find((entry: any) => entry.title === "CONV_FIRST 1").updated);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    if (picker) await (picker as TmuxSession).kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
 
 /// The env that traces one launch's session wiring to `trace`.
 function wiringTrace(trace: string) {
