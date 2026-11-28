@@ -514,22 +514,29 @@ pub const Task = struct {
             self.status = .unavailable;
             self.failure_detail = @errorName(err);
             self.finished_at_ms = io_mod.milliTimestamp();
+            self.done.store(true, .release);
             debug_trace.logf("session", "event=title_generation result=unavailable session={s} err={s}", .{ self.session_id, @errorName(err) });
+            debug_trace.logf("session", "event=title_generation_done status=unavailable session={s}", .{self.session_id});
             return;
         };
         switch (outcome) {
             .generated => |title| {
                 self.title = title;
                 self.status = .generated;
+                self.finished_at_ms = io_mod.milliTimestamp();
+                self.done.store(true, .release);
                 debug_trace.logf("session", "event=title_generation result=generated session={s}", .{self.session_id});
+                debug_trace.logf("session", "event=title_generation_done status=generated session={s}", .{self.session_id});
             },
             .unavailable => |failure| {
                 self.status = .unavailable;
                 self.failure_reason = failure.reason;
                 self.failure_detail = failure.detail;
+                self.finished_at_ms = io_mod.milliTimestamp();
+                self.done.store(true, .release);
+                debug_trace.logf("session", "event=title_generation_done status=unavailable session={s}", .{self.session_id});
             },
         }
-        self.finished_at_ms = io_mod.milliTimestamp();
     }
 };
 
@@ -1007,6 +1014,22 @@ test "joinOrCancel with zero grace drops a pending title without waiting and kee
     try std.testing.expectEqual(Task.Status.unavailable, pending.status);
     try std.testing.expectEqual(FailureReason.cancelled, pending.failure_reason.?);
 
+    const cancelled_task = try Task.create(.{
+        .session_id = "session-zero-cancelled",
+        .model = "test/title",
+        .prompt_excerpt = "fix the renderer",
+        .api_key = "key",
+        .stream_provider = .{ .stream_fn = HeadWaitProvider.stream },
+    });
+    defer cancelled_task.destroy();
+    try cancelled_task.spawn();
+    var cancelled_flag = std.atomic.Value(bool).init(true);
+    const cancelled_started = io_mod.milliTimestamp();
+    cancelled_task.joinOrCancel(&cancelled_flag, 0);
+    try std.testing.expect(io_mod.milliTimestamp() - cancelled_started < 1_000);
+    try std.testing.expectEqual(Task.Status.unavailable, cancelled_task.status);
+    try std.testing.expectEqual(FailureReason.cancelled, cancelled_task.failure_reason.?);
+
     const Fast = struct {
         fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
             try request.admission.admit();
@@ -1038,4 +1061,11 @@ test "joinOrCancel with zero grace drops a pending title without waiting and kee
     const trace = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "event=title_generation_dropped reason=exit_no_wait session=session-zero-pending") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=title_generation_dropped reason=turn_cancelled session=session-zero-cancelled") != null);
+    var lines = std.mem.splitScalar(u8, trace, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.find(u8, line, "session=session-zero-ready") != null) {
+            try std.testing.expect(std.mem.find(u8, line, "event=title_generation_dropped") == null);
+        }
+    }
 }

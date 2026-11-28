@@ -42,10 +42,22 @@ function createFixtureRoot(label: string, settings: string = "{}"): FixtureRoot 
   return { root, home, workspace: realpathSync(workspace) };
 }
 
-function startTitleAwareGateway() {
-  return startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
+function startTitleAwareGateway(waitForTracePath?: string) {
+  let titleSent = false;
+  return startDynamicFakeGateway(async () => {
+    if (waitForTracePath) {
+      await waitUntil(
+        () => titleSent && traceHas(waitForTracePath, "event=title_generation_done"),
+        "the title task to finish before the main answer",
+      );
+    }
+    return fakeGatewayFinalText("MAIN_ANSWER_OK");
+  }, {
     models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
-    titleResponses: [fakeGatewayFinalText(GENERATED_TITLE)],
+    titleResponses: [() => {
+      titleSent = true;
+      return fakeGatewayFinalText(GENERATED_TITLE);
+    }],
   });
 }
 
@@ -84,11 +96,12 @@ function titleRequests(gateway: ReturnType<typeof startTitleAwareGateway>) {
 
 test("fx ask generates a model title for a fresh session", async () => {
   const root = createFixtureRoot("ask");
-  const gateway = startTitleAwareGateway();
+  const tracePath = join(root.root, "trace.log");
+  const gateway = startTitleAwareGateway(tracePath);
   try {
     const result = await runFx(["ask", "refactor the renderer loop to fix the crash"], {
       cwd: root.workspace,
-      env: baseEnv(root, gateway),
+      env: { ...baseEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session" },
       timeoutMs: 30_000,
     });
     expect(result.code).toBe(0);
@@ -147,6 +160,7 @@ test("fx ask keeps the derived title when the title model output is unusable", a
     expect(result.stdout).toContain("MAIN_ANSWER_OK");
     const titles = sessionTitles(root);
     expect(titles.length).toBe(1);
+    expect(titles[0]).toContain("refactor the renderer loop");
     expect(titles[0]).not.toBe(GENERATED_TITLE);
     expect(titles[0].length).toBeGreaterThan(0);
   } finally {
@@ -247,7 +261,7 @@ test("fx ask keeps a generated title that finishes before the answer without wai
   const root = createFixtureRoot("title-fast-ready");
   const tracePath = join(root.root, "trace.log");
   const gateway = startDynamicFakeGateway(async () => {
-    await waitUntil(() => traceHas(tracePath, "event=title_generation result=generated"), "the title task to finish before the main answer");
+    await waitUntil(() => traceHas(tracePath, "event=title_generation_done status=generated"), "the title task to finish before the main answer");
     return fakeGatewayFinalText("MAIN_ANSWER_OK");
   }, {
     models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
@@ -508,8 +522,13 @@ function lastTitle(root: FixtureRoot): string | undefined {
   return sessionTitles(root).at(-1);
 }
 
-function startLoginGateway(titles: Array<(body: string, headers: Headers) => Response>) {
-  return startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
+function startLoginGateway(titles: Array<(body: string, headers: Headers) => Response>, waitForTracePath?: string) {
+  return startDynamicFakeGateway(async () => {
+    if (waitForTracePath) {
+      await waitUntil(() => traceHas(waitForTracePath, "event=title_generation_done"), "the title task to finish before the main answer");
+    }
+    return fakeGatewayFinalText("MAIN_ANSWER_OK");
+  }, {
     models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
     titleResponses: titles,
   });
@@ -517,11 +536,16 @@ function startLoginGateway(titles: Array<(body: string, headers: Headers) => Res
 
 async function askWithLogin(label: string, titles: (home: string) => Array<(body: string, headers: Headers) => Response>) {
   const root = createFixtureRoot(label);
+  const tracePath = join(root.root, "trace.log");
   const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
   writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
-  const gateway = startLoginGateway(titles(root.home));
+  const gateway = startLoginGateway(titles(root.home), tracePath);
   try {
-    const result = await runFx(["ask", FIRST_PROMPT], { cwd: root.workspace, env: loginEnv(root, gateway, issuer), timeoutMs: 30_000 });
+    const result = await runFx(["ask", FIRST_PROMPT], {
+      cwd: root.workspace,
+      env: { ...loginEnv(root, gateway, issuer), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session" },
+      timeoutMs: 30_000,
+    });
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain("MAIN_ANSWER_OK");
     // A title request never refreshes the login all fx processes share.
@@ -586,10 +610,15 @@ test("fx ask does not send the title again when the gateway refuses it with 403"
 
 test("fx ask sends a static key's rejected title once", async () => {
   const root = createFixtureRoot("static-key-401");
+  const tracePath = join(root.root, "trace.log");
   const rejected = titleFor(() => false);
-  const gateway = startLoginGateway([rejected, rejected]);
+  const gateway = startLoginGateway([rejected, rejected], tracePath);
   try {
-    const result = await runFx(["ask", FIRST_PROMPT], { cwd: root.workspace, env: baseEnv(root, gateway), timeoutMs: 30_000 });
+    const result = await runFx(["ask", FIRST_PROMPT], {
+      cwd: root.workspace,
+      env: { ...baseEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session" },
+      timeoutMs: 30_000,
+    });
     expect(result.code, result.stderr).toBe(0);
     expect(titleTokens(gateway)).toEqual(["synthetic-title"]);
     expect(lastTitle(root)).toContain("refactor the renderer loop");

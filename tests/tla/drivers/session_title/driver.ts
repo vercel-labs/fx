@@ -342,8 +342,14 @@ function readTrace(path: string): string {
   return existsSync(path) ? readFileSync(path, "utf8") : "";
 }
 
-function titleOutcome(world: World, installed: boolean, trace: string): string {
+function titleOutcome(world: World, installed: boolean, trace: string, keptFirstPrompt = true): string {
   const sends = world.events.filter((event) => event.kind === "title_send");
+  const droppedAtExit = world.schedule.surface === "ask" && trace.includes("event=title_generation_dropped reason=exit_no_wait");
+  if (droppedAtExit) {
+    if (installed || !keptFirstPrompt) return "lost";
+    return "dropped";
+  }
+  if (!installed && !keptFirstPrompt) return "lost";
   if (sends.length === 0) return "none";
   // A title the gateway answered must reach the session; one that did not is
   // an outcome the model has no name for.
@@ -427,10 +433,10 @@ async function runSchedule(helpers: any, fakes: any, saved: any, s: Schedule, sc
     FX_TRACE_SCOPES: "session,auth,catalog",
     ...(s.refreshable ? {} : { AI_GATEWAY_API_KEY: world.stored }),
   });
-  const end = (installed: boolean) => {
+  const end = (installed: boolean, keptFirstPrompt = true) => {
     world.events.push({
       kind: "end",
-      title: titleOutcome(world, installed, readTrace(tracePath)),
+      title: titleOutcome(world, installed, readTrace(tracePath), keptFirstPrompt),
       catalog: catalogOutcome(world),
       starts: starts(readTrace(tracePath)),
     });
@@ -447,7 +453,8 @@ async function runSchedule(helpers: any, fakes: any, saved: any, s: Schedule, sc
         throw new Error("fx ask did not exit");
       }
       if (exit !== 0) throw new Error(`fx ask exited ${exit}: ${await new Response(proc.stderr).text()}`);
-      end(sessionTitles(saved, home).includes(GENERATED_TITLE));
+      const titles = sessionTitles(saved, home);
+      end(titles.includes(GENERATED_TITLE), titles.includes(PROMPTS[0]!));
     } else if (s.surface === "acp") {
       const installed = await runAcp(env, workspace, world, s);
       end(installed || sessionTitles(saved, home).includes(GENERATED_TITLE));
