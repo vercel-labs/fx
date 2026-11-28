@@ -29,6 +29,9 @@ pub const CurrentBuild = struct {
     channel: Channel,
     version: []const u8,
     revision: []const u8,
+    /// The build's number on main (`build.zig` `readBuildNumber`), or 0 when
+    /// unknown, such as a build from a shallow checkout.
+    build: u32 = 0,
 
     pub fn writeVersionLabel(self: CurrentBuild, out: []u8) ![]const u8 {
         if (self.channel != .dev) return std.mem.print(out, "{s}", .{self.version});
@@ -52,6 +55,8 @@ pub const Target = union(Channel) {
         version: []u8,
         revision: []u8,
         artifact_ref: []u8,
+        /// The manifest's `build`, or 0 when it has none.
+        build: u32 = 0,
     };
 
     pub fn initStable(alloc: Allocator, raw_version: []const u8) !Target {
@@ -96,6 +101,7 @@ pub const Target = union(Channel) {
         errdefer alloc.free(owned_revision);
         const artifact_ref = try alloc.print("dev/{s}", .{manifest_revision});
         return .{ .dev = .{
+            .build = manifestBuildNumber(parsed.value.object.get("build")),
             .version = owned_version,
             .revision = owned_revision,
             .artifact_ref = artifact_ref,
@@ -142,11 +148,26 @@ pub const Target = union(Channel) {
         };
     }
 
+    /// The dev build's number, or 0 for a stable release or a manifest
+    /// without one.
+    pub fn build(self: Target) u32 {
+        return switch (self) {
+            .stable => 0,
+            .dev => |dev| dev.build,
+        };
+    }
+
+    /// A dev build installs only when it is newer: by build number when both
+    /// builds carry one, so a stale manifest never downgrades fx, and
+    /// otherwise when its commit differs.
     pub fn shouldInstall(self: Target, current: CurrentBuild) bool {
         if (self.channel() != current.channel) return true;
         return switch (self) {
             .stable => |stable| compareVersions(stable.version, current.version) == .gt,
-            .dev => |dev| !revisionsEqual(dev.revision, current.revision),
+            .dev => |dev| if (dev.build > 0 and current.build > 0)
+                dev.build > current.build
+            else
+                !revisionsEqual(dev.revision, current.revision),
         };
     }
 
@@ -188,6 +209,14 @@ pub fn isValidRevision(raw: []const u8) bool {
     if (raw.len < min_revision_bytes or raw.len > max_revision_bytes) return false;
     for (raw) |byte| if (!std.ascii.isHex(byte)) return false;
     return true;
+}
+
+/// A manifest's `build` as a positive whole number that fits a `u32`, or 0.
+fn manifestBuildNumber(value: ?std.json.Value) u32 {
+    const raw = value orelse return 0;
+    if (raw != .integer) return 0;
+    if (raw.integer <= 0 or raw.integer > std.math.maxInt(u32)) return 0;
+    return @intCast(raw.integer);
 }
 
 pub fn displayRevision(revision: []const u8) ?[]const u8 {
@@ -322,4 +351,54 @@ test "target freshness uses version for stable and revision for dev" {
         .version = "0.3.62",
         .revision = "abcdef012345",
     }));
+}
+
+test "a dev manifest installs only a higher build number when both builds carry one" {
+    const alloc = std.testing.allocator;
+    const current: CurrentBuild = .{
+        .channel = .dev,
+        .version = "0.0.18",
+        .revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .build = 100,
+    };
+    var older = try Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"1111111111111111111111111111111111111111\",\"build\":99}");
+    defer older.deinit(alloc);
+    var newer = try Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"2222222222222222222222222222222222222222\",\"build\":101}");
+    defer newer.deinit(alloc);
+    var same = try Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"3333333333333333333333333333333333333333\",\"build\":100}");
+    defer same.deinit(alloc);
+
+    // An older or equal build never replaces the running one, even with a
+    // different commit: a stale manifest cannot downgrade fx.
+    try std.testing.expect(!older.shouldInstall(current));
+    try std.testing.expect(!same.shouldInstall(current));
+    try std.testing.expect(newer.shouldInstall(current));
+    try std.testing.expectEqual(@as(u32, 101), newer.build());
+}
+
+test "a dev manifest without a build number, or a build that has none, keeps the commit rule" {
+    const alloc = std.testing.allocator;
+    var unnumbered = try Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"1111111111111111111111111111111111111111\"}");
+    defer unnumbered.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), unnumbered.build());
+    const numbered_build: CurrentBuild = .{ .channel = .dev, .version = "0.0.18", .revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .build = 100 };
+    try std.testing.expect(unnumbered.shouldInstall(numbered_build));
+
+    var numbered = try Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"1111111111111111111111111111111111111111\",\"build\":7}");
+    defer numbered.deinit(alloc);
+    const unnumbered_build: CurrentBuild = .{ .channel = .dev, .version = "0.0.18", .revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+    try std.testing.expect(numbered.shouldInstall(unnumbered_build));
+    const same_commit: CurrentBuild = .{ .channel = .dev, .version = "0.0.18", .revision = "1111111111111111111111111111111111111111" };
+    try std.testing.expect(!numbered.shouldInstall(same_commit));
+}
+
+test "a dev manifest ignores a build number that is not a positive whole number" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "\"12\"", "0", "-3", "1.5", "4294967296", "null" }) |raw| {
+        const bytes = try std.mem.concat(alloc, u8, &.{ "{\"version\":\"0.0.18\",\"commit\":\"1111111111111111111111111111111111111111\",\"build\":", raw, "}" });
+        defer alloc.free(bytes);
+        var target = try Target.parseDevManifest(alloc, bytes);
+        defer target.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 0), target.build());
+    }
 }

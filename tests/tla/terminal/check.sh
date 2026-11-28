@@ -27,6 +27,7 @@ cd "$(dirname "$0")"
 
 tlc_verdicts "$@" <<'EOF'
 ShellSnapshot ShellSnapshot -
+ShellSnapshot ShellSnapshot-one_session -
 TerminalLifecycle TerminalLifecycle -
 TerminalLifecycle TerminalLifecycle-full -
 ShellSnapshot ShellSnapshot-reload_per_command DotfilesPaidOnce -deadlock
@@ -34,9 +35,23 @@ ShellSnapshot ShellSnapshot-no_single_flight SingleFlight -deadlock
 ShellSnapshot ShellSnapshot-free_while_leased NoUseAfterFree -deadlock
 ShellSnapshot ShellSnapshot-use_partial RunsCompleteSnapshot -deadlock
 ShellSnapshot ShellSnapshot-stale_grant GrantMatchesEpoch -deadlock
+ShellSnapshot ShellSnapshot-recheck_restamps ApprovalMatchesAnswer -deadlock
+ShellSnapshot ShellSnapshot-stamp_at_answer ApprovalMatchesAnswer -deadlock
+ShellSnapshot ShellSnapshot-store_stamps_current StoredGrantMatchesAnswer -deadlock
+ShellSnapshot ShellSnapshot-shared_command_epoch AdmissionUsesCurrentEpoch -deadlock
 ShellSnapshot ShellSnapshot-notice_repeat NoticeOncePerEpisode -deadlock
 ShellSnapshot ShellSnapshot-clear_dirty_late FreshWhenClean -deadlock
 ShellSnapshot ShellSnapshot-keep_broken NoReuseOfBroken -deadlock
+ShellSnapshot ShellSnapshot-one_session-reload_per_command DotfilesPaidOnce -deadlock
+ShellSnapshot ShellSnapshot-one_session-no_single_flight SingleFlight -deadlock
+ShellSnapshot ShellSnapshot-one_session-free_while_leased NoUseAfterFree -deadlock
+ShellSnapshot ShellSnapshot-one_session-use_partial RunsCompleteSnapshot -deadlock
+ShellSnapshot ShellSnapshot-one_session-stale_grant GrantMatchesEpoch -deadlock
+ShellSnapshot ShellSnapshot-one_session-recheck_restamps ApprovalMatchesAnswer -deadlock
+ShellSnapshot ShellSnapshot-one_session-store_stamps_current StoredGrantMatchesAnswer -deadlock
+ShellSnapshot ShellSnapshot-one_session-notice_repeat NoticeOncePerEpisode -deadlock
+ShellSnapshot ShellSnapshot-one_session-clear_dirty_late FreshWhenClean -deadlock
+ShellSnapshot ShellSnapshot-one_session-keep_broken NoReuseOfBroken -deadlock
 TerminalLifecycle TerminalLifecycle-daemon_survives OrphansOnlyAfterCrash -deadlock
 TerminalLifecycle TerminalLifecycle-exit_skips_close OrphansOnlyAfterCrash -deadlock
 TerminalLifecycle TerminalLifecycle-profile_wide_recover NoWrongEnd -deadlock

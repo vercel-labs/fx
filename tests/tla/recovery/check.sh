@@ -65,6 +65,7 @@
 #   cancel-while-releasing  a cancel after the release strands a turn   NoStopWhileCancellable
 #   release-early       the release closes the cancel while a turn runs    NoUncancellableWait
 #   cancel-skips-subagents  a cancel leaves a held subagent held         HeldOnlyWhileRestartWaits
+#   auto-ignores-draft  the automatic restart fires with a draft open      AutoRestartOnlyWhenIdle
 #
 # The two restart-wait-simulate-*.cfg run random behaviors with and
 # without faults.
@@ -148,6 +149,7 @@ RestartWait restart-wait-mutation-hold-ignores-flag HeldOnlyWhileRestartWaits
 RestartWait restart-wait-mutation-cancel-while-releasing NoStopWhileCancellable
 RestartWait restart-wait-mutation-release-early NoUncancellableWait
 RestartWait restart-wait-mutation-cancel-skips-subagents HeldOnlyWhileRestartWaits
+RestartWait restart-wait-mutation-auto-ignores-draft AutoRestartOnlyWhenIdle
 RestartWait restart-wait-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
 RestartWait restart-wait-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 ChildResume childresume -
