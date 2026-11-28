@@ -1889,6 +1889,25 @@ test "a 70,000-byte stdout then a stderr line: the result ends with the stderr l
     try std.testing.expect(std.mem.endsWith(u8, try outcomeText(run, true), "\nERR\n"));
 }
 
+test "a program's EXIT trap writes into the one stream, in write order, with no session line" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+
+    // The trap writes stderr first, so two pipes that reach the reader together would show it after stdout.
+    const command = "trap 'echo TRAP_ERR >&2; echo trap_out' EXIT; printf body_out; printf 'BODY_ERR\\n' >&2";
+    try bash.authorize(&ctx, command);
+    const run = try callRun(ctx, command, program_yield_ms);
+    defer run.deinit(alloc);
+    try std.testing.expectEqualStrings("body_outBODY_ERR\nTRAP_ERR\ntrap_out\n", try bodyText(run, true));
+}
+
 test "stdout and stderr lines written in turn are saved in turn" {
     const alloc = std.testing.allocator;
     var bash = try TestBash.init(alloc);

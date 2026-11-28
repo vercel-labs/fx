@@ -2437,7 +2437,7 @@ fn shellCommandLines(arena: std.mem.Allocator, configured: ?[]const u8) !ShellCo
     return .{
         .path = path,
         .full = try invocationBeforeCommand(arena, try shell_resolver.capturedInvocation(arena, environment, "", "")),
-        .replay = try invocationBeforeCommand(arena, try shell_resolver.snapshotInvocation(arena, path, "")),
+        .replay = try invocationBeforeCommand(arena, try shell_resolver.snapshotInvocation(arena, path, "", false)),
     };
 }
 
