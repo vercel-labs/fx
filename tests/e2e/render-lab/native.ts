@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../../evals/eval-helpers";
-import { analyzeRun } from "./analyzer";
+import { analyzeRun, PROMPT_TEXT } from "./analyzer";
 import {
   attachFrameEvidence,
   runtimeEvidenceDefaults,
@@ -72,7 +72,6 @@ type NativeController = {
   height: number;
 };
 
-const PROMPT_TEXT = "FX_RENDER_LAB%";
 const TRACE_SCOPES =
   "render,paint,resize,scroll,footer.clean,input";
 
@@ -741,6 +740,8 @@ function startShellCommand(
     "AI_GATEWAY_API_KEY",
     "-u",
     "VERCEL_OIDC_TOKEN",
+    "-u",
+    "VERCEL_TOKEN",
     `HOME=${shQuote(fixture.home)}`,
     `ZDOTDIR=${shQuote(fixture.zdotdir)}`,
     `HISTFILE=${shQuote(fixture.histfile)}`,

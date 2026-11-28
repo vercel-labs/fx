@@ -48,9 +48,11 @@ const tmuxTest = test.skipIf(!tmuxAvailable());
 const ISOLATED_KEYS = [
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
+  "VERCEL_TOKEN",
   "FX_TEST_GATEWAY_CHAT_URL",
   "FX_TEST_GATEWAY_MODELS_URL",
   "FX_TEST_GATEWAY_CREDITS_URL",
+  "FX_PROVIDER",
   // A developer's terminal recording and the bridge of the fx session that
   // started their tmux server must not reach a test's fx.
   "FX_DEBUG_RECORD",
@@ -68,6 +70,8 @@ const ISOLATED_KEYS = [
   "FX_TEST_SESSION_WRITE_RELEASE",
   "FX_TEST_SHELL_YIELD_HELD",
   "FX_TEST_SHELL_YIELD_RELEASE",
+  "FX_TEST_SHUTDOWN_RELEASE_HELD",
+  "FX_TEST_SHUTDOWN_RELEASE_RELEASE",
   "FX_TEST_SUBAGENT_CLOSE_HELD",
   "FX_TEST_SUBAGENT_CLOSE_RELEASE",
   "FX_TEST_SUBAGENT_END_HELD",
@@ -218,6 +222,45 @@ tmuxTest("reading the remain-on-exit format throws when tmux has no such pane or
     } catch {}
   }
 });
+
+tmuxTest("a test that times out does not leave its tmux server or pane process after Bun exits", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fx-tmux-timeout-"));
+  const socketName = `fx-timeout-${process.pid}-${Date.now().toString(36)}`;
+  const report = join(dir, "report.json");
+  const helperUrl = pathToFileURL(join(import.meta.dir, "tmux-helpers.ts")).href;
+  writeFileSync(
+    join(dir, "timed-out.test.ts"),
+    [
+      `import { writeFileSync } from "node:fs";`,
+      `import { test } from "bun:test";`,
+      `import { TmuxSession } from ${JSON.stringify(helperUrl)};`,
+      `test("body keeps waiting after its timeout", async () => {`,
+      `  const session = await TmuxSession.create({ cmd: "sleep 60", startupWaitMs: 300, socketName: ${JSON.stringify(socketName)} });`,
+      `  writeFileSync(${JSON.stringify(report)}, JSON.stringify({ name: session.name, pane: session.processPid() }));`,
+      `  await session.waitForPane(() => false, 30_000);`,
+      `}, 3_000);`,
+      `test("a later test ends the file", () => {});`,
+    ].join("\n"),
+  );
+  try {
+    // The child fails by design: its first test times out. Only its leftovers matter.
+    spawnSync(process.execPath, ["test", join(dir, "timed-out.test.ts")], {
+      cwd: import.meta.dir,
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const { name, pane } = JSON.parse(readFileSync(report, "utf8")) as { name: string; pane: number };
+    const hasSession = spawnSync("tmux", ["-L", socketName, "has-session", "-t", name], { stdio: "pipe" });
+    expect(hasSession.status).not.toBe(0);
+    const paneState = spawnSync("ps", ["-o", "stat=", "-p", String(pane)], { encoding: "utf8" }).stdout.trim();
+    expect(paneState === "" || paneState.startsWith("Z")).toBe(true);
+  } finally {
+    try {
+      execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" });
+    } catch {}
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 60_000);
 
 test("held gateway response disposes before it is requested", async () => {
   const held = heldFakeGatewayFinalText();
@@ -619,6 +662,67 @@ tmuxTest("pane environment does not poison a shared tmux server", async () => {
   }
 });
 
+test("waitForReplyAndTurnEnd without a timeout waits as long as waitForText does", async () => {
+  const timeouts: Array<number | undefined> = [];
+  const stub = { waitForPane: async (_predicate: (pane: string) => boolean, timeoutMs?: number) => {
+    timeouts.push(timeoutMs);
+    return "";
+  } };
+  await TmuxSession.prototype.waitForReplyAndTurnEnd.call(stub as unknown as TmuxSession, "REPLY");
+  await TmuxSession.prototype.waitForText.call(stub as unknown as TmuxSession, "REPLY");
+  expect(timeouts[0]).toBeDefined();
+  expect(timeouts[0]).toBe(timeouts[1]);
+});
+
+tmuxTest("waitForReplyAndTurnEnd waits for the turn's end, not only the reply's text", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fx-tmux-reply-turn-end-"));
+  const releasePath = join(root, "release");
+  const scriptPath = join(root, "pane.sh");
+  writeFileSync(scriptPath, [
+    "printf 'REPLY_TEXT_DONE\\nGenerating (1s)\\n'",
+    `while [ ! -e '${releasePath}' ]; do sleep 0.05; done`,
+    "clear",
+    "printf 'REPLY_TEXT_DONE\\n'",
+    "sleep 60",
+    "",
+  ].join("\n"));
+  let session: TmuxSession | undefined;
+  try {
+    session = await TmuxSession.create({ cmd: `/bin/sh ${scriptPath}`, startupWaitMs: 0 });
+    await session.waitForPane(
+      (pane) => pane.includes("REPLY_TEXT_DONE") && pane.includes("Generating ("),
+      10_000,
+    );
+    // The pane now shows the text and a live turn until the release file exists. A second
+    // capture means the helper's first check of that pane did not return, while a helper that
+    // checked only the text would return at the first one.
+    const capture = session.capturePane.bind(session);
+    let captures = 0;
+    let secondCapture!: () => void;
+    const sawSecondCapture = new Promise<void>((resolve) => { secondCapture = resolve; });
+    session.capturePane = async (...args: Parameters<TmuxSession["capturePane"]>) => {
+      const pane = await capture(...args);
+      captures += 1;
+      if (captures === 2) secondCapture();
+      return pane;
+    };
+    let settledPane: string | undefined;
+    const settled = session.waitForReplyAndTurnEnd("REPLY_TEXT_DONE", 10_000).then((pane) => {
+      settledPane = pane;
+    });
+    await Promise.race([sawSecondCapture, settled]);
+    expect(settledPane).toBeUndefined();
+
+    writeFileSync(releasePath, "");
+    await settled;
+    expect(settledPane).toContain("REPLY_TEXT_DONE");
+    expect(settledPane).not.toContain("Generating (");
+  } finally {
+    await session?.kill();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 tmuxTest("minimum history lines survive a fresh tmux server restart", async () => {
   const socketName = `fx-history-limit-${process.pid}-${Date.now()}`;
   let first: TmuxSession | undefined;
@@ -763,7 +867,10 @@ test("fxChildEnv drops every name on the unset list and keeps the caller's own",
     PATH: "/usr/bin",
     AI_GATEWAY_API_KEY: "stale-ai_gateway_api_key",
     VERCEL_OIDC_TOKEN: "stale-vercel_oidc_token",
+    VERCEL_TOKEN: "stale-vercel_token",
   });
+  expect(DEFAULT_UNSET_ENV_KEYS).toContain("FX_TEST_RECOVERY_RETRY_BUDGET_MS");
+  expect(fxChildEnv({ FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500" }, { inherited }).FX_TEST_RECOVERY_RETRY_BUDGET_MS).toBe("1500");
   expect(inherited.FX_TEST_SHELL_YIELD_HELD).toBe("stale-fx_test_shell_yield_held");
 });
 

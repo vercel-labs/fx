@@ -257,7 +257,10 @@ pub fn ApprovalRuntime(comptime App: type) type {
             // A subagent's approval main's screen shows is answered here, on
             // main's screen, and its answer goes to that subagent's worker.
             const lent = if (comptime @hasDecl(App, "lentApproval")) app.lentApproval() else null;
-            const worker = if (lent) |subagent| subagent.worker else &agent.worker;
+            const worker = if (comptime @hasDecl(App, "approvalWorker"))
+                app.approvalWorker(agent)
+            else
+                &agent.worker;
             const result = worker.submitPermissionResponse(request_id, response);
             response_submitted = true;
             switch (result) {

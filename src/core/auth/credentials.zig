@@ -14,6 +14,7 @@ const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("secret.zig");
+const sign_in_trace = @import("sign_in_trace.zig");
 const types = @import("../shared/types.zig");
 
 pub const Source = types.CredentialSource;
@@ -813,22 +814,63 @@ fn refreshFxLoginCredentialLocked(
     transport: oauth_transport.Provider,
     mode: FxLoginRefreshMode,
 ) !?Credential {
+    const started = io_mod.awakeMilliTimestamp();
+    var step: FxLoginRefreshStep = .storage;
+    return refreshFxLoginCredentialSteps(alloc, transport, mode, started, &step) catch |err| {
+        sign_in_trace.record(.refresh, true, "mode={t} outcome=failed step={t} err={s} ms={d}", .{
+            mode,
+            step,
+            @errorName(err),
+            io_mod.awakeMilliTimestamp() - started,
+        });
+        return err;
+    };
+}
+
+/// `refreshFxLoginCredentialLocked`'s work, which keeps `step` at the step
+/// it reached so a failure's record names it.
+fn refreshFxLoginCredentialSteps(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: FxLoginRefreshMode,
+    started: i64,
+    step: *FxLoginRefreshStep,
+) !?Credential {
     try requireSourceStorage(.fx_login);
-    var mutation = (try oauth_session.beginExistingMutation()) orelse return null;
+    step.* = .lock;
+    var mutation = (try oauth_session.beginExistingMutation()) orelse {
+        sign_in_trace.record(.refresh, true, "mode={t} outcome=no_saved_login step=lock", .{mode});
+        return null;
+    };
     defer mutation.deinit();
 
-    var session = (try mutation.load(alloc)) orelse return null;
+    step.* = .load;
+    var session = (try mutation.load(alloc)) orelse {
+        sign_in_trace.record(.refresh, true, "mode={t} outcome=no_saved_login step=load", .{mode});
+        return null;
+    };
     defer session.deinit(alloc);
 
     var refreshed_at_ms: ?i64 = null;
-    if (fxLoginNeedsRotation(mode, session.access_token, session.expired(io_mod.milliTimestamp()))) {
+    const saved_expired = session.expired(io_mod.milliTimestamp());
+    if (fxLoginNeedsRotation(mode, session.access_token, saved_expired)) {
+        step.* = .issuer;
         try refreshFxSession(alloc, transport, &mutation, &session);
         refreshed_at_ms = io_mod.milliTimestamp();
     } else if (mode == .replace_rejected) {
         debug_trace.logf("auth", "fx login refresh skipped reason=saved_login_replaced", .{});
     }
+    sign_in_trace.record(.refresh, false, "mode={t} outcome={s} saved_expired={} ms={d}", .{
+        mode,
+        if (refreshed_at_ms != null) "rotated" else "saved_login_used",
+        saved_expired,
+        io_mod.awakeMilliTimestamp() - started,
+    });
     return takeCredentialFromSession(&session, refreshed_at_ms);
 }
+
+/// How far a refresh of the saved fx login got, for its `/trace` record.
+const FxLoginRefreshStep = enum { storage, lock, load, issuer };
 
 /// Whether a refresh in `mode` rotates the saved login, which holds
 /// `saved_access_token` and is `saved_expired` when past its refresh deadline.
@@ -847,6 +889,29 @@ pub fn refreshFxSession(
     session: *oauth_session.Session,
 ) !void {
     try mutation.requireWritable();
+    const started = io_mod.awakeMilliTimestamp();
+    var progress: IssuerProgress = .{};
+    refreshFxSessionSteps(alloc, transport, mutation, session, &progress) catch |err| {
+        sign_in_trace.record(.issuer, true, "outcome=failed step={t} err={s} ms={d} login_deleted={}", .{
+            progress.step,
+            @errorName(err),
+            io_mod.awakeMilliTimestamp() - started,
+            progress.login_deleted,
+        });
+        return err;
+    };
+    sign_in_trace.record(.issuer, false, "outcome=rotated ms={d}", .{io_mod.awakeMilliTimestamp() - started});
+}
+
+/// `refreshFxSession`'s work, which keeps `progress` at the step it reached
+/// and notes when it deleted the saved login.
+fn refreshFxSessionSteps(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mutation: *oauth_session.Mutation,
+    session: *oauth_session.Session,
+    progress: *IssuerProgress,
+) !void {
     const issuer_url = session.issuer;
     // Each request to the issuer has its whole budget from a fresh stamp, so
     // another fx waits for this one however slowly the issuer answers.
@@ -855,6 +920,7 @@ pub fn refreshFxSession(
     defer metadata.deinit(alloc);
     try oauth_session.validateE2EEndpoint(issuer_url, metadata.token_endpoint);
 
+    progress.step = .token;
     mutation.restamp();
     var refreshed = oauth.refreshToken(
         alloc,
@@ -866,19 +932,23 @@ pub fn refreshFxSession(
         if (err == error.InvalidOAuthResponse) {
             debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
             try retire_fx_session(alloc, mutation, session);
+            progress.login_deleted = true;
             return error.NoRefreshToken;
         }
         if (refresh_rejection_requires_sign_in(err)) {
             debug_trace.logf("auth", "retiring terminal fx login session reason={s}", .{@errorName(err)});
             try retire_fx_session(alloc, mutation, session);
+            progress.login_deleted = true;
         }
         return err;
     };
     defer refreshed.deinit(alloc);
+    progress.step = .save;
 
     const rotated_refresh_token = refreshed.refresh_token orelse {
         debug_trace.logf("auth", "retiring fx login session reason=NoRefreshToken", .{});
         try retire_fx_session(alloc, mutation, session);
+        progress.login_deleted = true;
         return error.NoRefreshToken;
     };
     const expires_at_ms = oauth.expiryTimestampMs(
@@ -887,6 +957,7 @@ pub fn refreshFxSession(
     ) catch |err| {
         debug_trace.logf("auth", "retiring fx login session reason={s}", .{@errorName(err)});
         try retire_fx_session(alloc, mutation, session);
+        progress.login_deleted = true;
         return error.NoRefreshToken;
     };
 
@@ -903,9 +974,11 @@ pub fn refreshFxSession(
     };
     mutation.save(alloc, replacement) catch |err| {
         debug_trace.logf("auth", "retiring fx login session after refresh save failed err={s}", .{@errorName(err)});
-        retire_fx_session(alloc, mutation, session) catch |cleanup_err| {
+        if (retire_fx_session(alloc, mutation, session)) |_| {
+            progress.login_deleted = true;
+        } else |cleanup_err| {
             debug_trace.logf("auth", "fx login session retirement failed err={s}", .{@errorName(cleanup_err)});
-        };
+        }
         return error.OAuthSessionCleanupUncertain;
     };
 
@@ -927,6 +1000,12 @@ pub fn refreshFxSession(
 
     session.expires_at_ms = expires_at_ms;
 }
+
+/// How far a request to the issuer got, for its `/trace` record.
+const IssuerProgress = struct {
+    step: enum { discover, token, save } = .discover,
+    login_deleted: bool = false,
+};
 
 fn refresh_rejection_requires_sign_in(err: anyerror) bool {
     return switch (err) {
@@ -1553,6 +1632,9 @@ const FxLoginRefreshProbe = struct {
     token_disposition: oauth_transport.Disposition,
     token_body: []const u8,
     auth_path_to_make_read_only: ?[]const u8 = null,
+    /// Replaced by a folder during the token request, so neither saving the
+    /// rotated login nor deleting it can work.
+    auth_path_to_make_folder: ?[]const u8 = null,
     calls: usize = 0,
 
     fn provider(self: *FxLoginRefreshProbe) oauth_transport.Provider {
@@ -1579,6 +1661,13 @@ const FxLoginRefreshProbe = struct {
                         io_mod.getIo(),
                         std.Io.File.Permissions.fromMode(0o400),
                     );
+                }
+                if (self.auth_path_to_make_folder) |auth_path| {
+                    try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), auth_path);
+                    try std.Io.Dir.createDirAbsolute(io_mod.getIo(), auth_path, .default_dir);
+                    var inside = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), auth_path, .{});
+                    defer inside.close(io_mod.getIo());
+                    try inside.writeFile(io_mod.getIo(), .{ .sub_path = "keep", .data = "x" });
                 }
                 break :blk self.token_body;
             },
@@ -1992,6 +2081,8 @@ test "an fx login refresh retires the consumed token when durable replacement fa
         .auth_path_to_make_read_only = fixture.auth_path,
     };
 
+    sign_in_trace.reset();
+    defer sign_in_trace.reset();
     try std.testing.expectError(
         error.OAuthSessionCleanupUncertain,
         refreshFxLoginCredential(alloc, refresh.provider(), null),
@@ -2001,6 +2092,43 @@ test "an fx login refresh retires the consumed token when durable replacement fa
     var persisted = try oauth_session.load(alloc);
     defer if (persisted) |*session| session.deinit(alloc);
     try std.testing.expect(persisted == null);
+    try expectIssuerFailure("step=save err=OAuthSessionCleanupUncertain", "login_deleted=true");
+}
+
+test "an fx login refresh whose save and delete both fail says the login was not deleted" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    var refresh = FxLoginRefreshProbe{
+        .token_disposition = .accepted,
+        .token_body = "{\"access_token\":\"new-access\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
+        .auth_path_to_make_folder = fixture.auth_path,
+    };
+
+    sign_in_trace.reset();
+    defer sign_in_trace.reset();
+    try std.testing.expectError(
+        error.OAuthSessionCleanupUncertain,
+        refreshFxLoginCredential(alloc, refresh.provider(), null),
+    );
+    try std.testing.expectEqual(@as(usize, 2), refresh.calls);
+    try expectIssuerFailure("step=save err=OAuthSessionCleanupUncertain", "login_deleted=false");
+}
+
+/// The one failed `issuer` record holds both parts, and no record holds a token.
+fn expectIssuerFailure(step_and_error: []const u8, deleted: []const u8) !void {
+    var events: [sign_in_trace.ring_capacity]sign_in_trace.Event = undefined;
+    const count = sign_in_trace.snapshot(&events);
+    var issuer_failures: usize = 0;
+    for (events[0..count]) |*event| {
+        try std.testing.expect(std.mem.find(u8, event.detail(), "rotated-refresh") == null);
+        try std.testing.expect(std.mem.find(u8, event.detail(), "new-access") == null);
+        if (event.kind != .issuer or !event.failed) continue;
+        issuer_failures += 1;
+        try std.testing.expect(std.mem.find(u8, event.detail(), step_and_error) != null);
+        try std.testing.expect(std.mem.find(u8, event.detail(), deleted) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), issuer_failures);
 }
 
 test "a disabled store still reports why the fx login was silent" {
