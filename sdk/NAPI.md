@@ -324,11 +324,18 @@ when qualification fails, and report success only after cleanup succeeds.
 
 npm trusted publishing cannot create a package. Before the workflow can
 publish a new platform package, an owner of the `@libfx` scope publishes a
-placeholder version of it by hand, then adds a trusted publisher on npmjs.com
-for `vercel-labs/fx`, workflow `publish-libfx.yml`, and environment `npm`, with
-`npm publish` allowed. npm expires the trusted publisher if the workflow does
-not publish within two days. Until every pinned package can be published, the
-workflow stops before libfx.
+placeholder version of it by hand, then adds two trusted publishers on
+npmjs.com for `vercel-labs/fx` and workflow `publish-libfx.yml`, one for
+environment `npm` and one for environment `npm-dev`, each with `npm publish`
+allowed. A dev publish that a passing CI run on `main` starts runs in
+`npm-dev`, which has no reviewer. Stable publishes and every manual run, dev
+included, run in `npm`, which needs an approval. Both environments accept only
+`main`.
+npm does not limit the tag a trusted publisher may set, so a guard in the
+workflow stops any run that is not stable from publishing a tag other than
+`dev`. npm expires a trusted publisher if the workflow does not publish within
+two days.
+Until every pinned package can be published, the workflow stops before libfx.
 
 Live Vercel qualification is a separate release check. Run
 `node sdk/tests/test-vercel-package.mjs <tarball>` before publication, then run

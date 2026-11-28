@@ -41,6 +41,7 @@ const auto_classifier_context = @import("../../../permissions/auto_classifier_co
 
 const test_support = @import("support.zig");
 const text_utils = @import("../../../shared/text_utils.zig");
+const compactor = @import("../../../compactor/compactor.zig");
 
 const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
@@ -3783,6 +3784,102 @@ test "a session keeps its first runtime context ahead of the history and notes a
     const third_saved = third_hooks.history_turns.items[0].assistant.execution;
     try std.testing.expect(third_saved.runtime_context == null);
     try std.testing.expectEqual(@as(usize, 0), third_saved.context_notes.len);
+}
+
+fn countInstruction(instructions: []const []const u8, text: []const u8) usize {
+    var count: usize = 0;
+    for (instructions) |instruction| {
+        if (std.mem.eql(u8, instruction, text)) count += 1;
+    }
+    return count;
+}
+
+test "fx's own summary in a turn that sent an earlier turn's runtime context captures the current one for the rest of the session (D94)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const before = "<fx-turn-context>\nmodel: openai/gpt-6.1-sol\n</fx-turn-context>";
+    const after = "<fx-turn-context>\nmodel: anthropic/claude-fable-5.2\n</fx-turn-context>";
+    const answer = [_]FakeCompletion{.{ .content = "Final" }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The first turn captures the runtime context with model A and saves it.
+    var first_gateway = FakeGateway.init(alloc, &answer);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.runtime_context_text = before;
+    var first = fixture.job();
+    first.prompt = @constCast("First.");
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first);
+    try std.testing.expectEqualStrings(before, first_hooks.history_turns.items[0].assistant.execution.runtime_context.?[0]);
+
+    // The second turn runs on model B. It sends the first turn's copy, then a
+    // large tool result makes fx write its own summary in the turn.
+    var second_gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{toolCall("large-read", "read_file", "{\"path\":\"large.txt\"}")} },
+        .{ .content = "Turn in progress\nIn between: The read completed." },
+        .{ .content = "Completed after the summary." },
+    });
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.runtime_context_text = after;
+    const small_model = "provider/small-window";
+    const capabilities = [_]test_support.ModelCapabilityOverride{.{ .model = small_model, .capabilities = .{ .context_window = 3_000 } }};
+    second_hooks.available_capability_overrides = &capabilities;
+    second_hooks.permission_decisions = &.{.once};
+    second_hooks.exec_plans = &.{.{ .result = .{ .model_output = "LARGE\n" ++ text_utils.repeat("r", 10_000) } }};
+    var second = fixture.job();
+    second.model = @constCast(small_model);
+    second.prompt = @constCast("Second.");
+    second.history = first_hooks.history_turns.items[0..1];
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), second);
+    try std.testing.expectEqual(@as(usize, 3), second_gateway.request_bodies.items.len);
+    try expectBodyContains(&second_gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&second_gateway, 2, "compacted_conversation");
+    const before_summary = try leadingSystemContents(arena, second_gateway.request_bodies.items[0]);
+    try std.testing.expect(countInstruction(before_summary.items, before) == 1);
+
+    // The summary starts a new prefix: the rest of the turn sends model B,
+    // with no update note for a change it already shows.
+    const after_summary_body = second_gateway.request_bodies.items[2];
+    const after_summary = try leadingSystemContents(arena, after_summary_body);
+    try std.testing.expectEqual(@as(usize, 1), countInstruction(after_summary.items, after));
+    try std.testing.expectEqual(@as(usize, 0), countInstruction(after_summary.items, before));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, after_summary_body, "fx-context-update>"));
+    for ((try userMessageTexts(arena, after_summary_body)).items) |text| try std.testing.expect(!std.mem.eql(u8, text, "First."));
+
+    // The summary saves the copy sent after it, and the turn adds none, so
+    // nothing the turn saved before the summary is written again (D87).
+    const turns = second_hooks.history_turns.items;
+    try std.testing.expectEqual(@as(usize, 2), turns.len);
+    const kept = try compactor.savedRuntimeContext(arena, turns[0].compacted_summary.summary);
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqualStrings(after, kept[0]);
+    try std.testing.expect(turns[1].assistant.execution.runtime_context == null);
+
+    // The next turn restores the saved history, as a resume does, and sends
+    // that copy unchanged with no update.
+    var third_gateway = FakeGateway.init(alloc, &answer);
+    defer third_gateway.deinit();
+    var third_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer third_hooks.deinit();
+    third_hooks.runtime_context_text = after;
+    var third = fixture.job();
+    third.prompt = @constCast("Third.");
+    third.history = turns;
+    try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), third);
+    const third_body = third_gateway.request_bodies.items[0];
+    try expectSameInstructions(alloc, after_summary_body, third_body);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, third_body, "fx-context-update>"));
+    try std.testing.expect(third_hooks.history_turns.items[0].assistant.execution.runtime_context == null);
 }
 
 test "a named skill's text rides on its turn's message and the turn saves it as sent (D95)" {
@@ -7988,6 +8085,54 @@ test "a question's result is the user's answer, also when toolbox ran it" {
         const message = suffix.items[suffix.items.len - 1];
         try std.testing.expectEqualStrings(case.call.calledName(), message.tool_name.?);
         try std.testing.expectEqual(case.user_answer, message.user_answer);
+    }
+}
+
+test "a question's answers stored behind a preview are marked for the review only when they are answers" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var batch = runtime_tool_batch.StepBatchState{};
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const direct: ToolCall = .{ .id = "direct", .name = "ask_user_question", .arguments_json = "{}" };
+    const carried: ToolCall = .{ .id = "carried", .name = "ask_user_question", .arguments_json = "{}", .carried_by = "toolbox" };
+    const read: ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{}" };
+    const preview = "[{\"question\":\"Batch decision 01?\",\"answer\":\"Yes\"}";
+    const answered = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    const invalid = "(ask_user_question: invalid arguments; provide {questions})";
+    const stored: types.ToolResultMemory = .{
+        .output_handle = "answers-1",
+        .output_bytes = result_store.large_result_threshold_bytes + 128,
+        .stored_output_bytes = result_store.large_result_threshold_bytes + 128,
+        .truncated = true,
+    };
+    // Fx keeps a short result whole but still saves it with a handle.
+    const kept_whole: types.ToolResultMemory = .{
+        .output_handle = "answers-2",
+        .output_bytes = answered.len,
+        .stored_output_bytes = answered.len,
+    };
+    const cases = [_]struct {
+        call: ToolCall,
+        output: []const u8,
+        memory: ?types.ToolResultMemory = null,
+        status: ?types.PersistedToolStatus = null,
+        stored_answer: bool,
+    }{
+        .{ .call = direct, .output = preview, .memory = stored, .stored_answer = true },
+        .{ .call = carried, .output = preview, .memory = stored, .stored_answer = true },
+        .{ .call = direct, .output = preview, .memory = stored, .status = .failure, .stored_answer = false },
+        .{ .call = read, .output = preview, .memory = stored, .stored_answer = false },
+        .{ .call = direct, .output = answered, .memory = kept_whole, .stored_answer = false },
+        .{ .call = direct, .output = answered, .stored_answer = false },
+        .{ .call = direct, .output = ask_user_question.cancel_sentinel, .stored_answer = false },
+        .{ .call = carried, .output = invalid, .stored_answer = false },
+    };
+    for (cases) |case| {
+        try runtime_tool_batch.appendToolResultContent(arena, &suffix, &completed_tool_names, &batch, case.call, case.output, case.memory, .{ .status = case.status });
+        const message = suffix.items[suffix.items.len - 1];
+        try std.testing.expectEqual(case.stored_answer, message.stored_user_answer);
     }
 }
 

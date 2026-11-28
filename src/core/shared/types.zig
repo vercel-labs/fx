@@ -1721,6 +1721,23 @@ pub const FileEvidence = struct {
     stale: bool = false,
 };
 
+/// The toolbox menu a conversation sends on every request (D103).
+pub const SavedToolboxMenu = struct {
+    /// The lead and the menu, as the requests send them.
+    text: []u8,
+    /// `toolbox.entriesHash` of what the menu lists.
+    entries_hash: u64,
+};
+
+/// What a toolbox change note told the conversation the toolbox holds (D103).
+pub const ToolboxNoted = struct {
+    /// `toolbox.entriesHash` of what the toolbox held.
+    entries_hash: u64,
+    /// How many compactions the conversation had when the note was added. A
+    /// later compaction's summary replaces the note.
+    compaction_count: usize,
+};
+
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
@@ -1734,6 +1751,11 @@ pub const ExecutionMemory = struct {
     /// that captured it saves it; later turns send the newest saved copy
     /// unchanged (D94).
     runtime_context: ?[][]u8 = null,
+    /// The toolbox menu this turn sent first for the conversation. Later
+    /// turns, resumed ones included, send these bytes unchanged (D103).
+    toolbox_menu: ?SavedToolboxMenu = null,
+    /// What this turn's toolbox change note told the conversation (D103).
+    toolbox_noted: ?ToolboxNoted = null,
     turn_summary: ?TurnSummary = null,
     /// The turn's settled model calls, in order, for Ctrl+O. Display data:
     /// never part of what the model is sent.
@@ -2090,23 +2112,34 @@ pub const ChatMessage = struct {
     /// counts too and fx's note for a cancelled question never does. Never
     /// saved or sent to a provider.
     user_answer: bool = false,
+    /// A question's result that fx stored outside the session behind a
+    /// preview (`ToolResultMemory.output_handle`), so its answers are not in
+    /// `content`. The security review reads them by handle before it takes
+    /// them as the user's words (`isStoredUserAnswer`). Never saved or sent
+    /// to a provider.
+    stored_user_answer: bool = false,
 };
 
 /// The tool that asks the user questions.
 pub const user_question_tool_name = "ask_user_question";
 
-/// The user's answers in a question tool's result, which lists each answered
-/// question. Null for any other text, such as fx's note that the user
-/// cancelled the question or that no one could answer it. The answers borrow
-/// `arena`.
-pub fn questionAnswers(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const []const u8 {
-    const Answered = struct { answer: []const u8 };
-    const answered = json_decode.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+/// The answered questions in a question tool's result, in its order. Null for
+/// any other text, such as fx's note that the user cancelled the question or
+/// that no one could answer it. Only the answers must be there; a missing
+/// question reads as empty. The strings borrow `output` or `arena`.
+pub fn answeredQuestions(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const QuestionAnswer {
+    return json_decode.parseFromSliceLeaky([]const QuestionAnswer, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    const answers = try arena.alloc([]const u8, answered.len);
-    for (answers, answered) |*answer, item| answer.* = item.answer;
+}
+
+/// The user's answers in a question tool's result (`answeredQuestions`). The
+/// answers borrow `output` or `arena`.
+pub fn questionAnswers(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const []const u8 {
+    const pairs = try answeredQuestions(arena, output) orelse return null;
+    const answers = try arena.alloc([]const u8, pairs.len);
+    for (answers, pairs) |*answer, pair| answer.* = pair.answer;
     return answers;
 }
 
@@ -2118,7 +2151,18 @@ pub fn isUserAnswer(alloc: std.mem.Allocator, ran_tool: []const u8, status: ?Per
     if (!std.mem.eql(u8, ran_tool, user_question_tool_name) or status == .failure) return false;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
-    return try questionAnswers(scratch.allocator(), output) != null;
+    return try answeredQuestions(scratch.allocator(), output) != null;
+}
+
+/// Whether a result is a question's answers that fx stored behind a preview:
+/// the question tool ran (`ran_tool`, as for `isUserAnswer`), it did not
+/// fail, the model saw only a preview (`truncated`), and the whole output has
+/// a stored handle. fx saves a short result under a handle too, but the model
+/// sees all of it, so that result is not one.
+pub fn isStoredUserAnswer(ran_tool: []const u8, status: ?PersistedToolStatus, memory: ?ToolResultMemory) bool {
+    if (!std.mem.eql(u8, ran_tool, user_question_tool_name) or status == .failure) return false;
+    const stored = memory orelse return false;
+    return stored.truncated and stored.output_handle != null;
 }
 
 test "only a question's listed answers are the user's answer" {
@@ -2136,6 +2180,34 @@ test "only a question's listed answers are the user's answer" {
         "(ask_user_question: invalid arguments; provide {questions})",
         "[{\"question\":\"Choose next step?\"}]",
     }) |note| try std.testing.expect(!try isUserAnswer(alloc, "ask_user_question", .success, note));
+}
+
+test "a question's result gives each question with its answer, in order" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pairs = (try answeredQuestions(arena, "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"},{\"question\":\"When may I push?\",\"answer\":\"only after CI is green\"}]")).?;
+    try std.testing.expectEqual(@as(usize, 2), pairs.len);
+    try std.testing.expectEqualStrings("Choose next step?", pairs[0].question);
+    try std.testing.expectEqualStrings("Run tests", pairs[0].answer);
+    try std.testing.expectEqualStrings("When may I push?", pairs[1].question);
+    try std.testing.expectEqualStrings("only after CI is green", pairs[1].answer);
+    const unasked = (try answeredQuestions(arena, "[{\"answer\":\"Run tests\"}]")).?;
+    try std.testing.expectEqualStrings("", unasked[0].question);
+    try std.testing.expect(try answeredQuestions(arena, "(user cancelled the question)") == null);
+    // A question that is not a string makes the text no answer list.
+    try std.testing.expect(try answeredQuestions(arena, "[{\"question\":5,\"answer\":\"Run tests\"}]") == null);
+    // An empty list is a list of no answers.
+    try std.testing.expectEqual(@as(usize, 0), (try answeredQuestions(arena, "[]")).?.len);
+    // A full batch of 20 reads whole, in order.
+    var full: std.Io.Writer.Allocating = .init(arena);
+    try full.writer.writeByte('[');
+    for (0..20) |n| try full.writer.print("{s}{{\"question\":\"Q{d}?\",\"answer\":\"A{d}\"}}", .{ if (n == 0) "" else ",", n, n });
+    try full.writer.writeByte(']');
+    const batch = (try answeredQuestions(arena, full.written())).?;
+    try std.testing.expectEqual(@as(usize, 20), batch.len);
+    try std.testing.expectEqualStrings("Q19?", batch[19].question);
+    try std.testing.expectEqualStrings("A19", batch[19].answer);
 }
 
 /// Returns a caller-owned shallow projection only when incompatible replay exists.
@@ -3290,7 +3362,9 @@ pub const QuestionBatchEntry = struct {
 /// One persisted answer from an interactive question batch. The strings are
 /// borrowed from the short-lived arena that decodes the completed tool result.
 pub const QuestionAnswer = struct {
-    question: []const u8,
+    /// Empty when a saved answer list leaves the question out
+    /// (`answeredQuestions`).
+    question: []const u8 = "",
     answer: []const u8,
 };
 
@@ -3558,6 +3632,11 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     errdefer freePersistedContextNotes(alloc, context_notes);
     const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
     errdefer if (runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    const toolbox_menu: ?SavedToolboxMenu = if (memory.toolbox_menu) |menu|
+        .{ .text = try alloc.dupe(u8, menu.text), .entries_hash = menu.entries_hash }
+    else
+        null;
+    errdefer if (toolbox_menu) |menu| alloc.free(menu.text);
     const model_calls = try dupeModelCallRecords(alloc, memory.model_calls);
     errdefer freeModelCallRecords(alloc, model_calls);
     const bridge_calls = try dupeBridgeCallRecords(alloc, memory.bridge_calls);
@@ -3567,6 +3646,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        .toolbox_menu = toolbox_menu,
+        .toolbox_noted = memory.toolbox_noted,
         .turn_summary = memory.turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,
@@ -3581,6 +3662,7 @@ pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) vo
     freePersistedSteering(alloc, memory.steering);
     freePersistedContextNotes(alloc, memory.context_notes);
     if (memory.runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    if (memory.toolbox_menu) |menu| alloc.free(menu.text);
 }
 
 /// Caller owns the result; free it with `freeRuntimeContext`.
