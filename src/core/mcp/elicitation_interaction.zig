@@ -270,6 +270,18 @@ const SingleAnswer = union(enum) {
     answer: []u8,
 };
 
+const compact_max_choices: usize = 3;
+
+/// A form is compact when it is one single-select field with at most `compact_max_choices` choices.
+/// A host form is always compact, so fx's own question has no review on any surface. An MCP
+/// server's form is compact only when the responder asks for it.
+fn formIsCompact(speaker: Speaker, compact_forms: bool, form: elicitation.FormSchema) bool {
+    if (form.fields.len != 1) return false;
+    const field = form.fields[0];
+    if (field.kind != .single_select or field.choices.len > compact_max_choices) return false;
+    return compact_forms or speaker.kind == .host;
+}
+
 fn answerForm(
     alloc: Allocator,
     speaker: Speaker,
@@ -290,8 +302,7 @@ fn answerForm(
         .{},
     );
     defer form.deinit(alloc);
-    const compact = options.compact_forms and form.fields.len == 1 and
-        form.fields[0].kind == .single_select and form.fields[0].choices.len <= 3;
+    const compact = formIsCompact(speaker, options.compact_forms, form);
 
     const values = try alloc.alloc(FieldValue, form.fields.len);
     for (form.fields, values) |field, *value| {
@@ -2330,6 +2341,65 @@ test "compact form keeps review for four choices" {
     }, .{ .questioner = fixture.questioner(), .browser = fixture.browser(), .capabilities = .{ .form = true }, .compact_forms = true });
     defer alloc.free(response);
     try std.testing.expectEqualStrings("{\"form\":{\"action\":\"accept\",\"content\":{\"name\":\"a\"}}}", response);
+    try std.testing.expect(fixture.review_contained_values);
+}
+
+const yes_no_form_json =
+    \\{"form":{"method":"elicitation/create","params":{"message":"Set up the sandbox?","requestedSchema":{"type":"object","properties":{"sandbox":{"type":"string","enum":["Yes","No"]}},"required":["sandbox"]}}}}
+;
+
+const two_field_form_json =
+    \\{"form":{"method":"elicitation/create","params":{"message":"Set up the sandbox?","requestedSchema":{"type":"object","properties":{"sandbox":{"type":"string","enum":["Yes","No"]},"mode":{"type":"string","enum":["Yes","No"]}},"required":["sandbox","mode"]}}}}
+;
+
+test "a host yes or no form is compact with compact_forms off, so it has no review step" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{ .answers = &.{"{\"option\":0}"} };
+    const response = try respond(alloc, originFor(.host, "Shadow"), .{
+        .input_requests_json = yes_no_form_json,
+    }, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+        .compact_forms = false,
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings("{\"form\":{\"action\":\"accept\",\"content\":{\"sandbox\":\"Yes\"}}}", response);
+    try std.testing.expectEqual(@as(usize, 1), fixture.answer_index);
+    try std.testing.expect(!fixture.review_contained_values);
+}
+
+test "an MCP server's yes or no form keeps its review with compact_forms off" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{ .answers = &.{ "{\"option\":0}", "Submit" } };
+    const response = try respond(alloc, originFor(.mcp_server, "Profile"), .{
+        .input_requests_json = yes_no_form_json,
+    }, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+        .compact_forms = false,
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings("{\"form\":{\"action\":\"accept\",\"content\":{\"sandbox\":\"Yes\"}}}", response);
+    try std.testing.expectEqual(@as(usize, 2), fixture.answer_index);
+    try std.testing.expect(fixture.review_contained_values);
+}
+
+test "a host form with two fields keeps its review with compact_forms off" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{ .answers = &.{ "{\"option\":0}", "{\"option\":1}", "Submit" } };
+    const response = try respond(alloc, originFor(.host, "Shadow"), .{
+        .input_requests_json = two_field_form_json,
+    }, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+        .compact_forms = false,
+    });
+    defer alloc.free(response);
+    try std.testing.expect(std.mem.startsWith(u8, response, "{\"form\":{\"action\":\"accept\""));
+    try std.testing.expectEqual(@as(usize, 3), fixture.answer_index);
     try std.testing.expect(fixture.review_contained_values);
 }
 
