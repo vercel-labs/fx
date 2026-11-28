@@ -87,13 +87,12 @@ fn call(
         return .{ .failure = try ctx.allocator.dupe(u8, "") };
     } orelse return unsupported(ctx);
     const status = output.status;
-    if (ctx.mcp_call_status_sink) |sink| sink.* = status;
     const images = output.takeImages();
     const body = @constCast(output.takeModelOutput(ctx.allocator));
     if (images.len > 0) return .{ .rich = .{ .text = body, .images = images, .is_error = status != .success } };
     return switch (status) {
         .success => .{ .success = body },
-        .tool_failure, .protocol_failure, .input_required => .{ .failure = body },
+        .tool_failure, .protocol_failure => .{ .failure = body },
     };
 }
 

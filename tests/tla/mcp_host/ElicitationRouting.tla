@@ -8,7 +8,9 @@
 \*     (req.question == null), and offers it Pending{reply = .elicit = slot};
 \*     with none, fx answers it cancel at once. `.elicit_withdrawn`: endUrl only.
 \*   - onEvent `.input` (2026): the call's input requests, offered as
-\*     Pending{reply = .input = {call handle, keys}}.
+\*     Pending{reply = .input = {call handle, requests}}: the engine's own
+\*     slices of the round, kept as read, and the answer's values come back in
+\*     their order (inputValues).
 \*   - askWaiting, on the caller's thread: takes the offered question
 \*     (req.question = null), asks the user, and posts the answer with the
 \*     Pending it took. `.answer` on the owner: engine.answerElicitation

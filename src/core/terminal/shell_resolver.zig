@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -24,15 +25,68 @@ pub fn shellKind(path: []const u8) ?ShellKind {
     return null;
 }
 
+/// Candidates for the shell that runs when the login shell is neither Bash nor
+/// Zsh, in the order fx tries them. Only fixed system paths belong here: the
+/// login shell's directory and `PATH` are never searched (`RULES.md` R4.4).
+/// The last entry covers NixOS hosts without `/bin/bash`.
+const bash_fallbacks = [_][]const u8{
+    "/bin/bash",
+    "/usr/bin/bash",
+    "/run/current-system/sw/bin/bash",
+};
+const zsh_fallbacks = [_][]const u8{
+    "/bin/zsh",
+    "/usr/bin/zsh",
+    "/run/current-system/sw/bin/zsh",
+};
+
+fn fallbackCandidates() []const []const u8 {
+    return if (builtin.target.os.tag == .macos) &zsh_fallbacks else &bash_fallbacks;
+}
+
+/// Reports whether `path` names a file that fx can run as a shell.
+const FallbackProbe = *const fn (path: []const u8) bool;
+
+/// Returns the first candidate that `is_executable` accepts. When none does,
+/// returns the first candidate, so the failure is the same as before. Windows
+/// and WASI never probe the filesystem.
+fn fallbackLoginShellFrom(candidates: []const []const u8, is_executable: FallbackProbe) []const u8 {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return candidates[0];
+    for (candidates) |candidate| {
+        if (is_executable(candidate)) return candidate;
+    }
+    return candidates[0];
+}
+
+/// A usable candidate is a regular file, following symlinks, that the current
+/// user may execute. Any stat or access error means it is not usable.
+fn isExecutableRegularFile(path: []const u8) bool {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return false;
+    const io = io_mod.getIo();
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    if (stat.kind != .file) return false;
+    std.Io.Dir.accessAbsolute(io, path, .{ .execute = true }) catch return false;
+    return true;
+}
+
+/// The fallback shell on this host.
 fn fallbackLoginShell() []const u8 {
-    return if (builtin.target.os.tag == .macos) "/bin/zsh" else "/bin/bash";
+    return fallbackLoginShellFrom(fallbackCandidates(), isExecutableRegularFile);
 }
 
 fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const u8 {
+    return supportedLoginShellWithProbe(configured_login_shell, fallbackCandidates(), isExecutableRegularFile);
+}
+
+fn supportedLoginShellWithProbe(
+    configured_login_shell: ?[]const u8,
+    candidates: []const []const u8,
+    is_executable: FallbackProbe,
+) ResolveError![]const u8 {
     const path = configured_login_shell orelse return error.MissingLoginShell;
     if (!std.Io.Dir.path.isAbsolute(path)) return error.RelativeShellPath;
     if (shellKind(path) != null) return path;
-    return fallbackLoginShell();
+    return fallbackLoginShellFrom(candidates, is_executable);
 }
 
 pub const Invocation = struct {
@@ -545,6 +599,181 @@ fn appendShellWord(
     try output.append(alloc, '\'');
 }
 
+fn skipWithoutProbing() !void {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
+}
+
+fn isOneOf(path: []const u8, candidates: []const []const u8) bool {
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, candidate, path)) return true;
+    }
+    return false;
+}
+
+/// Test double for a `FallbackProbe`: `executable` lists the paths it accepts,
+/// and `asked` records each path it was asked about, in order. Tests run one
+/// at a time, so the state is reset at the start of each test.
+const FakeProbe = struct {
+    var executable: []const []const u8 = &.{};
+    var asked: [8][]const u8 = undefined;
+    var asked_count: usize = 0;
+
+    fn reset(executable_paths: []const []const u8) void {
+        executable = executable_paths;
+        asked_count = 0;
+    }
+
+    fn probe(path: []const u8) bool {
+        if (asked_count < asked.len) asked[asked_count] = path;
+        asked_count += 1;
+        return isOneOf(path, executable);
+    }
+
+    fn askedPaths() []const []const u8 {
+        return asked[0..@min(asked_count, asked.len)];
+    }
+};
+
+fn expectOnlyFixedCandidates(candidates: []const []const u8, asked_paths: []const []const u8) !void {
+    for (asked_paths) |asked_path| {
+        try std.testing.expect(isOneOf(asked_path, candidates));
+    }
+}
+
+fn writeTestFile(dir: std.Io.Dir, io: std.Io, name: []const u8, mode: std.posix.mode_t) !void {
+    const file = try dir.createFile(io, name, .{});
+    defer file.close(io);
+    try file.setPermissions(io, std.Io.File.Permissions.fromMode(mode));
+}
+
+test "shell fallback keeps the platform default when it is executable" {
+    try skipWithoutProbing();
+    const platform_default = fallbackCandidates()[0];
+    const executable = [_][]const u8{platform_default};
+    FakeProbe.reset(&executable);
+    try std.testing.expectEqualStrings(platform_default, fallbackLoginShellFrom(fallbackCandidates(), FakeProbe.probe));
+    try std.testing.expectEqual(@as(usize, 1), FakeProbe.asked_count);
+    try std.testing.expectEqualStrings(platform_default, FakeProbe.askedPaths()[0]);
+}
+
+test "shell fallback picks the next executable when the default is missing" {
+    try skipWithoutProbing();
+    const executable = [_][]const u8{"/usr/bin/bash"};
+    FakeProbe.reset(&executable);
+    try std.testing.expectEqualStrings("/usr/bin/bash", fallbackLoginShellFrom(&bash_fallbacks, FakeProbe.probe));
+    try std.testing.expectEqual(@as(usize, 2), FakeProbe.asked_count);
+    try std.testing.expectEqualStrings("/bin/bash", FakeProbe.askedPaths()[0]);
+}
+
+test "shell fallback finds NixOS system bash for store and profile nushell" {
+    try skipWithoutProbing();
+    const executable = [_][]const u8{"/run/current-system/sw/bin/bash"};
+    const logins = [_][]const u8{
+        "/run/current-system/sw/bin/nu",
+        "/nix/store/abc123-nushell-0.1/bin/nu",
+    };
+    for (logins) |login| {
+        FakeProbe.reset(&executable);
+        const picked = try supportedLoginShellWithProbe(login, &bash_fallbacks, FakeProbe.probe);
+        try std.testing.expectEqualStrings("/run/current-system/sw/bin/bash", picked);
+        try expectOnlyFixedCandidates(&bash_fallbacks, FakeProbe.askedPaths());
+    }
+}
+
+test "shell fallback skips candidates that are not executable" {
+    try skipWithoutProbing();
+    const executable = [_][]const u8{"/run/current-system/sw/bin/bash"};
+    FakeProbe.reset(&executable);
+    try std.testing.expectEqualStrings(
+        "/run/current-system/sw/bin/bash",
+        fallbackLoginShellFrom(&bash_fallbacks, FakeProbe.probe),
+    );
+    try std.testing.expectEqual(@as(usize, 3), FakeProbe.asked_count);
+}
+
+test "shell fallback returns the default when no candidate is executable" {
+    try skipWithoutProbing();
+    FakeProbe.reset(&.{});
+    try std.testing.expectEqualStrings("/bin/bash", fallbackLoginShellFrom(&bash_fallbacks, FakeProbe.probe));
+    try std.testing.expectEqual(bash_fallbacks.len, FakeProbe.asked_count);
+}
+
+test "shell fallback never probes for bash, zsh, or relative login shells" {
+    try skipWithoutProbing();
+    FakeProbe.reset(&.{});
+    try std.testing.expectEqualStrings(
+        "/bin/bash",
+        try supportedLoginShellWithProbe("/bin/bash", &bash_fallbacks, FakeProbe.probe),
+    );
+    try std.testing.expectEqualStrings(
+        "/run/current-system/sw/bin/bash",
+        try supportedLoginShellWithProbe("/run/current-system/sw/bin/bash", &bash_fallbacks, FakeProbe.probe),
+    );
+    try std.testing.expectEqualStrings(
+        "/nix/profile/bin/zsh",
+        try supportedLoginShellWithProbe("/nix/profile/bin/zsh", &bash_fallbacks, FakeProbe.probe),
+    );
+    try std.testing.expectError(
+        error.RelativeShellPath,
+        supportedLoginShellWithProbe("nu", &bash_fallbacks, FakeProbe.probe),
+    );
+    try std.testing.expectError(
+        error.MissingLoginShell,
+        supportedLoginShellWithProbe(null, &bash_fallbacks, FakeProbe.probe),
+    );
+    try std.testing.expectEqual(@as(usize, 0), FakeProbe.asked_count);
+}
+
+test "shell fallback orders macOS zsh candidates" {
+    try skipWithoutProbing();
+    const system_zsh = [_][]const u8{ "/usr/bin/zsh", "/run/current-system/sw/bin/zsh" };
+    FakeProbe.reset(&system_zsh);
+    try std.testing.expectEqualStrings("/usr/bin/zsh", fallbackLoginShellFrom(&zsh_fallbacks, FakeProbe.probe));
+
+    const nixos_zsh = [_][]const u8{"/run/current-system/sw/bin/zsh"};
+    FakeProbe.reset(&nixos_zsh);
+    try std.testing.expectEqualStrings(
+        "/run/current-system/sw/bin/zsh",
+        fallbackLoginShellFrom(&zsh_fallbacks, FakeProbe.probe),
+    );
+
+    FakeProbe.reset(&.{});
+    try std.testing.expectEqualStrings("/bin/zsh", fallbackLoginShellFrom(&zsh_fallbacks, FakeProbe.probe));
+}
+
+test "isExecutableRegularFile accepts only executable regular files" {
+    try skipWithoutProbing();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const io = std.testing.io;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+
+    try tmp.dir.createDirPath(io, "dir");
+    try writeTestFile(tmp.dir, io, "plain", 0o644);
+    try writeTestFile(tmp.dir, io, "exec", 0o755);
+    try tmp.dir.symLink(io, "exec", "link", .{});
+    try tmp.dir.symLink(io, "missing", "dangling", .{});
+    try tmp.dir.symLink(io, "loop_b", "loop_a", .{});
+    try tmp.dir.symLink(io, "loop_a", "loop_b", .{});
+
+    const expectations = [_]struct { name: []const u8, usable: bool }{
+        .{ .name = "missing", .usable = false },
+        .{ .name = "dir", .usable = false },
+        .{ .name = "plain", .usable = false },
+        .{ .name = "exec", .usable = true },
+        .{ .name = "link", .usable = true },
+        .{ .name = "dangling", .usable = false },
+        .{ .name = "loop_a", .usable = false },
+    };
+    for (expectations) |expectation| {
+        const path = try alloc.print("{s}/{s}", .{ root, expectation.name });
+        try std.testing.expectEqual(expectation.usable, isExecutableRegularFile(path));
+    }
+}
+
 test "resolver builds Bash and zsh interactive argv" {
     const bash = try resolve("/bin/bash", .user_login);
     try std.testing.expectEqualSlices(
@@ -639,7 +868,7 @@ test "login shell resolution falls back without accepting explicit unsupported s
     } else {
         try std.testing.expectEqualSlices(
             []const u8,
-            &.{ "/bin/bash", "--login", "-i" },
+            &.{ fallbackLoginShell(), "--login", "-i" },
             fallback.argv(),
         );
     }
