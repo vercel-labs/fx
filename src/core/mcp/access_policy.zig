@@ -28,20 +28,26 @@ pub const ServerIdentity = struct {
     name: []u8,
     source: mcp_contract.ConfigSource,
     scope: mcp_contract.ConfigScope,
+    mod_name: ?[]u8 = null,
     connection_generation: u64,
     catalog_generation: u64,
     auth_generation: u64,
 
     pub fn deinit(self: *ServerIdentity, alloc: Allocator) void {
         alloc.free(self.name);
+        if (self.mod_name) |mod_name| alloc.free(mod_name);
         self.* = undefined;
     }
 
     fn clone(self: ServerIdentity, alloc: Allocator) !ServerIdentity {
+        const name = try alloc.dupe(u8, self.name);
+        errdefer alloc.free(name);
+        const mod_name = if (self.mod_name) |m| try alloc.dupe(u8, m) else null;
         return .{
-            .name = try alloc.dupe(u8, self.name),
+            .name = name,
             .source = self.source,
             .scope = self.scope,
+            .mod_name = mod_name,
             .connection_generation = self.connection_generation,
             .catalog_generation = self.catalog_generation,
             .auth_generation = self.auth_generation,
@@ -135,8 +141,9 @@ fn checkViewCloneAllocationFailures(alloc: Allocator) !void {
     };
     source.servers[0] = .{
         .name = try std.testing.allocator.dupe(u8, "server"),
-        .source = .profile,
+        .source = .mod,
         .scope = .profile,
+        .mod_name = try std.testing.allocator.dupe(u8, "alpha"),
         .connection_generation = 1,
         .catalog_generation = 2,
         .auth_generation = 3,

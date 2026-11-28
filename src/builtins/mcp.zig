@@ -145,7 +145,9 @@ fn skipUnprintableNames(alloc: Allocator, loaded: *NativeConfigs) Allocator.Erro
         }
         try loaded.diagnostics.ensureUnusedCapacity(alloc, 1);
         const name = try alloc.dupe(u8, c.name);
-        loaded.diagnostics.appendAssumeCapacity(.{ .profile = c.source != .workspace, .server_name = name, .cause = .invalid_entry, .problem = .name });
+        errdefer alloc.free(name);
+        const mod_name = if (c.mod_name) |m| try alloc.dupe(u8, m) else null;
+        loaded.diagnostics.appendAssumeCapacity(.{ .profile = c.source != .workspace, .mod_name = mod_name, .server_name = name, .cause = .invalid_entry, .problem = .name });
         var removed = loaded.configs.orderedRemove(i);
         removed.deinit(alloc);
     }
@@ -368,10 +370,13 @@ fn localInspectionFromConfigs(
     }
     for (configs, 0..) |config, index| {
         var encoded_name = try text_utils.encodeTerminalSafe(alloc, config.name, 256);
+        errdefer encoded_name.deinit(alloc);
+        const mod_name = if (config.mod_name) |m| try alloc.dupe(u8, m) else null;
         servers[index] = .{
             .configured_name = encoded_name.bytes,
             .source = config.source,
             .scope = config.scope,
+            .mod_name = mod_name,
             .workspace_admission = config.workspace_admission,
             .required = config.required,
             .transport = config.transport,
@@ -387,9 +392,13 @@ fn localInspectionFromConfigs(
         alloc.free(issues);
     }
     for (diagnostics, 0..) |diagnostic, index| {
+        const message = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
+        errdefer alloc.free(message);
+        const mod_name = if (diagnostic.mod_name) |m| try alloc.dupe(u8, m) else null;
         issues[index] = .{
-            .message = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic),
+            .message = message,
             .profile = diagnostic.profile,
+            .mod_name = mod_name,
         };
         issues_initialized += 1;
     }

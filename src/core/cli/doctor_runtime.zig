@@ -963,8 +963,15 @@ fn appendMcpConfigCheck(
 /// does, so one bad entry never fails the file (`appendMcpConfigCheck`).
 fn appendMcpIssueChecks(checks: *std.ArrayList(Check), alloc: Allocator, issues: []const mcp_health.ConfigurationIssue) !void {
     for (issues) |issue| {
-        const fix = if (issue.profile) profile_paths.displayText("fix ~/.fx/mcp.json, then run fx doctor again") else "fix .mcp.json, then run fx doctor again";
-        try appendCheckOwnedStaticFix(checks, alloc, "mcp_config", .fail, try alloc.dupe(u8, issue.message), fix);
+        if (issue.mod_name) |mod_name| {
+            const detail = try alloc.dupe(u8, issue.message);
+            errdefer alloc.free(detail);
+            const fix = try alloc.print("fix {s}/mods/{s}/mod.json, then run fx doctor again", .{ profile_paths.displayRoot(), mod_name });
+            try appendCheckOwnedFix(checks, alloc, "mcp_config", .fail, detail, fix);
+        } else {
+            const fix = if (issue.profile) profile_paths.displayText("fix ~/.fx/mcp.json, then run fx doctor again") else "fix .mcp.json, then run fx doctor again";
+            try appendCheckOwnedStaticFix(checks, alloc, "mcp_config", .fail, try alloc.dupe(u8, issue.message), fix);
+        }
     }
 }
 
@@ -1268,6 +1275,18 @@ test "each MCP config issue is a failure with a fix" {
         try std.testing.expectEqualStrings(issue.message, check.detail);
         try std.testing.expectEqualStrings("fix .mcp.json, then run fx doctor again", check.fix.?);
     }
+
+    var mod_checks: std.ArrayList(Check) = .empty;
+    defer {
+        for (mod_checks.items) |*entry| entry.deinit(alloc);
+        mod_checks.deinit(alloc);
+    }
+    const mod_issues = [_]mcp_health.ConfigurationIssue{
+        .{ .message = @constCast("~/.fx/mods/alpha/mod.json server 'web' was skipped: fx won't send its Authorization header."), .profile = true, .mod_name = @constCast("alpha") },
+    };
+    try appendMcpIssueChecks(&mod_checks, alloc, &mod_issues);
+    try std.testing.expectEqual(@as(usize, 1), mod_checks.items.len);
+    try std.testing.expectEqualStrings("fix ~/.fx/mods/alpha/mod.json, then run fx doctor again", mod_checks.items[0].fix.?);
 }
 
 test "doctor reports command auth program resolution without running it" {

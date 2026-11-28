@@ -500,6 +500,10 @@ noinline fn runAdd(c: Context, arena: Allocator, root: []const u8, arg: []const 
             try writeBadProviders(c, "add", bad.path, bad.err);
             return 1;
         },
+        .bad_mcp => |bad| {
+            try writeBadMcp(c, "add", bad.server, bad.reason);
+            return 1;
+        },
     };
     defer prep.discard(arena);
 
@@ -554,6 +558,15 @@ noinline fn writeBadProviders(c: Context, verb_name: []const u8, path: []const u
         try c.err.print("providers.{f}: {s}.\n", .{ text_utils.terminalSafe(path), advice });
     } else {
         try c.err.print("providers: {s}.\n", .{advice});
+    }
+}
+
+noinline fn writeBadMcp(c: Context, verb_name: []const u8, server: []const u8, reason: []const u8) !void {
+    try writeErrPrefix(c, verb_name);
+    if (server.len > 0) {
+        try c.err.print("mcp.{f}: {s}.\n", .{ text_utils.terminalSafe(server), reason });
+    } else {
+        try c.err.print("mcp: {s}.\n", .{reason});
     }
 }
 
@@ -711,6 +724,10 @@ noinline fn runSingleUpdate(
         },
         .bad_providers => |bad| {
             try writeBadProviders(c, "update", bad.path, bad.err);
+            return .failed;
+        },
+        .bad_mcp => |bad| {
+            try writeBadMcp(c, "update", bad.server, bad.reason);
             return .failed;
         },
     }
@@ -1590,4 +1607,51 @@ test "scanModAssets ignores linked profile.json and links to named pipes without
     try std.testing.expect(!assets.profiles[1].permission_mode_ignored);
     try std.testing.expectEqualStrings("real", assets.profiles[2].name);
     try std.testing.expect(assets.profiles[2].permission_mode_ignored);
+}
+
+test "add and update print bad_mcp server path and reason on invalid mod mcp entries" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, ".fx");
+    try tmp.dir.createDirPath(io, "alpha");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "alpha");
+    defer alloc.free(src);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var err: std.ArrayList(u8) = .empty;
+    defer err.deinit(alloc);
+    var prompt: TestPrompt = .{ .answer = true };
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "alpha/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"web\":{\"type\":\"http\",\"url\":\"http://example.com/mcp\"}}}",
+    });
+    try std.testing.expectEqual(@as(u8, 1), try runTestVerbs(alloc, .cli, home, &.{ "add", src, "--yes" }, &prompt, &out, &err));
+    try std.testing.expect(std.mem.find(u8, err.items, "fx mod add: mcp.web:") != null);
+    try std.testing.expect(std.mem.find(u8, err.items, "https") != null);
+
+    // Install valid v1, then fail update on bad mcp.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "alpha/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"web\":{\"type\":\"http\",\"url\":\"https://example.com/mcp\"}}}",
+    });
+    out.clearRetainingCapacity();
+    err.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try runTestVerbs(alloc, .cli, home, &.{ "add", src, "--yes" }, &prompt, &out, &err));
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "alpha/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"2.0.0\",\"mcp\":{\"web\":{\"type\":\"http\",\"url\":\"https://example.com/mcp\",\"headers\":{\"Authorization\":\"Bearer tok\"}}}}",
+    });
+    out.clearRetainingCapacity();
+    err.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 1), try runTestVerbs(alloc, .cli, home, &.{ "update", "alpha", "--yes" }, &prompt, &out, &err));
+    try std.testing.expect(std.mem.find(u8, err.items, "fx mod update: mcp.web:") != null);
+    try std.testing.expect(std.mem.find(u8, err.items, "Authorization header") != null);
 }

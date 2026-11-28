@@ -79,8 +79,10 @@ pub fn choices(row: Row, out: *[max_choices]Choice) []const Choice {
         out[n] = .reject;
         n += 1;
     }
-    out[n] = .remove;
-    n += 1;
+    if (s.source != .mod) {
+        out[n] = .remove;
+        n += 1;
+    }
     return out[0..n];
 }
 
@@ -649,6 +651,7 @@ test "the status line keeps names inert and never ends inside a character" {
 
 fn testRow(name: []const u8, state: runtime.State, extra: struct {
     source: @FieldType(runtime.Status, "source") = .profile,
+    mod_name: ?[]const u8 = null,
     transport: @FieldType(runtime.Status, "transport") = .http,
     needs_login: bool = false,
     signed_in: bool = false,
@@ -656,6 +659,7 @@ fn testRow(name: []const u8, state: runtime.State, extra: struct {
     return .{ .status = .{
         .name = name,
         .source = extra.source,
+        .mod_name = extra.mod_name,
         .transport = extra.transport,
         .state = state,
         .needs_login = extra.needs_login,
@@ -676,6 +680,9 @@ test "a server's choices start with its next step and end with Remove" {
     try testing.expectEqualSlices(Choice, &.{ .approve, .remove }, choiceList(testRow("a", .rejected, .{ .source = .workspace }), &b));
     try testing.expectEqualSlices(Choice, &.{ .reject, .remove }, choiceList(testRow("a", .idle, .{ .source = .workspace, .transport = .stdio }), &b));
     try testing.expectEqualSlices(Choice, &.{ .login, .logout, .reject, .remove }, choiceList(testRow("a", .retrying, .{ .source = .workspace, .needs_login = true, .signed_in = true }), &b));
+    try testing.expectEqualSlices(Choice, &.{}, choiceList(testRow("a", .idle, .{ .source = .mod, .mod_name = "alpha", .transport = .stdio }), &b));
+    try testing.expectEqualSlices(Choice, &.{.login}, choiceList(testRow("a", .failed, .{ .source = .mod, .mod_name = "alpha", .needs_login = true }), &b));
+    try testing.expectEqualSlices(Choice, &.{.logout}, choiceList(testRow("a", .ready, .{ .source = .mod, .mod_name = "alpha", .signed_in = true }), &b));
     try testing.expect(Choice.remove.asks() and Choice.approve.asks() and Choice.reject.asks());
     try testing.expect(!Choice.login.asks() and !Choice.logout.asks());
 }

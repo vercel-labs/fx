@@ -11,6 +11,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 pub const manifest = @import("manifest.zig");
+pub const mcp_config = @import("mcp_config.zig");
 pub const mod_pins = @import("mod_pins.zig");
 pub const pins = @import("pins.zig");
 pub const source = @import("source.zig");
@@ -193,6 +194,10 @@ pub const PrepareUpdateResult = union(enum) {
         path: []const u8,
         err: anyerror,
     },
+    bad_mcp: struct {
+        server: []const u8,
+        reason: []const u8,
+    },
     refused: store.Outcome,
 };
 
@@ -225,6 +230,10 @@ pub const PrepareResult = union(enum) {
     bad_providers: struct {
         path: []const u8,
         err: anyerror,
+    },
+    bad_mcp: struct {
+        server: []const u8,
+        reason: []const u8,
     },
 };
 
@@ -291,6 +300,7 @@ pub fn install(
         .bad_providers => |bad| .{ .refused = .{ .invalid = switch (bad.err) {
             else => .bad_manifest,
         } } },
+        .bad_mcp => .{ .refused = .{ .invalid = .bad_manifest } },
     };
 }
 
@@ -386,6 +396,7 @@ pub fn prepareUpdate(
         .no_manifest => return .no_manifest,
         .bad_manifest => |err| return .{ .bad_manifest = err },
         .bad_providers => |bad| return .{ .bad_providers = .{ .path = bad.path, .err = bad.err } },
+        .bad_mcp => |bad| return .{ .bad_mcp = .{ .server = bad.server, .reason = bad.reason } },
     }
 }
 
@@ -477,6 +488,7 @@ pub fn refresh(
         .no_manifest => .{ .refused = .{ .invalid = .no_manifest } },
         .bad_manifest => .{ .refused = .{ .invalid = .bad_manifest } },
         .bad_providers => .{ .refused = .{ .invalid = .bad_manifest } },
+        .bad_mcp => .{ .refused = .{ .invalid = .bad_manifest } },
         .refused => |outcome| .{ .refused = outcome },
     };
 }
@@ -567,8 +579,8 @@ fn prepareFrom(
 
     var providers_reg: ?configured_provider.Registry = null;
     errdefer if (providers_reg) |*reg| reg.deinit(alloc);
+    const link_path = try std.Io.Dir.path.join(owned, &.{ root_path, decoded.name });
     if (decoded.providers) |providers_val| {
-        const link_path = try std.Io.Dir.path.join(owned, &.{ root_path, decoded.name });
         var at: configured_provider.FailurePath = .{};
         providers_reg = configured_provider.Registry.parse_located_for_mod(
             alloc,
@@ -585,6 +597,25 @@ fn prepareFrom(
                 return .{ .bad_providers = .{ .path = bad_path, .err = err } };
             },
         };
+    }
+
+    if (decoded.mcp) |mcp_val| {
+        switch (try mcp_config.parse(alloc, mcp_val, .{ .name = decoded.name, .dir = link_path })) {
+            .ok => |configs| {
+                var mut = configs;
+                mcp_config.deinitConfigs(alloc, &mut);
+            },
+            .invalid => |bad| {
+                if (temp_to_discard) |temp| source.discard(io_mod.getIo(), temp);
+                if (providers_reg) |*reg| {
+                    reg.deinit(alloc);
+                    providers_reg = null;
+                }
+                arena.deinit();
+                alloc.destroy(arena);
+                return .{ .bad_mcp = .{ .server = bad.server, .reason = bad.reason } };
+            },
+        }
     }
 
     return .{ .prepared = .{
@@ -1390,4 +1421,53 @@ test "prepareInstall parses providers before prompt and cleans up on discard" {
     var after_load = try load(alloc, root, "glm");
     defer after_load.deinit(alloc);
     try std.testing.expect(after_load == .mod);
+}
+
+test "prepareInstall and prepareUpdate strictly refuse invalid mod mcp servers" {
+    _ = mcp_config;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "mods");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "mods");
+    defer alloc.free(root);
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "src");
+    const src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src");
+    defer alloc.free(src);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Authorization header is refused on add.
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"web\":{\"type\":\"http\",\"url\":\"https://example.com/mcp\",\"headers\":{\"Authorization\":\"Bearer x\"}}}}",
+    });
+    const bad_add = try prepareInstall(arena, root, src, null);
+    try std.testing.expect(bad_add == .bad_mcp);
+    try std.testing.expectEqualStrings("web", bad_add.bad_mcp.server);
+    try std.testing.expect(std.mem.find(u8, bad_add.bad_mcp.reason, "Authorization header") != null);
+
+    // Valid mod installs, then an update with `..` in stdio command is refused.
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"fs\":{\"command\":\"bin/fs\"}}}",
+    });
+    const good_add = try prepareInstall(arena, root, src, null);
+    try std.testing.expect(good_add == .prepared);
+    var prep = good_add.prepared;
+    defer prep.discard(arena);
+    try std.testing.expect((try commitInstall(arena, root, &prep)) == .installed);
+
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"2.0.0\",\"mcp\":{\"fs\":{\"command\":\"../outside\"}}}",
+    });
+    const bad_upd = try prepareUpdate(arena, root, "alpha", null);
+    try std.testing.expect(bad_upd == .bad_mcp);
+    try std.testing.expectEqualStrings("fs", bad_upd.bad_mcp.server);
+    try std.testing.expect(std.mem.find(u8, bad_upd.bad_mcp.reason, "must stay inside the mod") != null);
 }

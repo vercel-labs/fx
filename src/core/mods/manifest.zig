@@ -10,7 +10,7 @@ pub const max_name_bytes: usize = 64;
 pub const max_version_bytes: usize = 64;
 pub const max_description_bytes: usize = 512;
 
-const known_fields = [_][]const u8{ "name", "version", "description", "providers" };
+const known_fields = [_][]const u8{ "name", "version", "description", "providers", "mcp" };
 
 pub const Manifest = struct {
     name: []const u8,
@@ -20,6 +20,9 @@ pub const Manifest = struct {
     /// The `providers` object, or null when the file has none. Its connections
     /// are decoded later by the configured provider registry.
     providers: ?std.json.Value,
+    /// The `mcp` object, or null when the file has none. Its servers are
+    /// decoded later by the mod MCP parser.
+    mcp: ?std.json.Value,
 };
 
 pub const DecodeError = error{
@@ -33,6 +36,7 @@ pub const DecodeError = error{
     BadVersion,
     BadDescription,
     BadProviders,
+    BadMcp,
 } || std.mem.Allocator.Error;
 
 /// Decodes one `mod.json`. Every slice and the providers tree live in `arena`.
@@ -52,6 +56,7 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) DecodeError!Manifest 
         .version = try requiredVersion(fields),
         .description = try optionalDescription(fields),
         .providers = try optionalProviders(fields),
+        .mcp = try optionalMcp(fields),
     };
 }
 
@@ -90,6 +95,7 @@ pub fn message(err: DecodeError) []const u8 {
             .{max_description_bytes},
         ),
         error.BadProviders => std.fmt.comptimePrint("The mod providers must be an object with at most {d} entries.", .{max_mods}),
+        error.BadMcp => std.fmt.comptimePrint("The mod mcp servers must be an object with at most {d} entries.", .{max_mods}),
         error.OutOfMemory => "fx ran out of memory while it read mod.json.",
     };
 }
@@ -168,6 +174,12 @@ fn optionalProviders(fields: std.json.ObjectMap) DecodeError!?std.json.Value {
     return value;
 }
 
+fn optionalMcp(fields: std.json.ObjectMap) DecodeError!?std.json.Value {
+    const value = fields.get("mcp") orelse return null;
+    if (value != .object or value.object.count() > max_mods) return error.BadMcp;
+    return value;
+}
+
 fn stringField(fields: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = fields.get(key) orelse return null;
     return if (value == .string) value.string else null;
@@ -188,6 +200,15 @@ fn providersText(arena: std.mem.Allocator, count: usize) ![]const u8 {
     return arena.print("{s}}}}}", .{text});
 }
 
+fn mcpText(arena: std.mem.Allocator, count: usize) ![]const u8 {
+    var text: []const u8 = "{\"name\":\"glm\",\"version\":\"1\",\"mcp\":{";
+    for (0..count) |i| {
+        const separator = if (i == 0) "" else ",";
+        text = try arena.print("{s}{s}\"m{d}\":{{}}", .{ text, separator, i });
+    }
+    return arena.print("{s}}}}}", .{text});
+}
+
 test "a minimal manifest decodes" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -196,18 +217,21 @@ test "a minimal manifest decodes" {
     try std.testing.expectEqualStrings("1.0.0", manifest.version);
     try std.testing.expectEqualStrings("", manifest.description);
     try std.testing.expect(manifest.providers == null);
+    try std.testing.expect(manifest.mcp == null);
 }
 
-test "a full manifest decodes with its description and providers" {
+test "a full manifest decodes with its description, providers, and mcp" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const manifest = try decode(arena_state.allocator(),
         \\{"name":"glm","version":"1.0.0-rc.1+build","description":"GLM coding plan",
-        \\ "providers":{"glm":{"protocol":"openai","base_url":"https://example.com/v1"}}}
+        \\ "providers":{"glm":{"protocol":"openai","base_url":"https://example.com/v1"}},
+        \\ "mcp":{"fs":{"command":"bin/fs"}}}
     );
     try std.testing.expectEqualStrings("1.0.0-rc.1+build", manifest.version);
     try std.testing.expectEqualStrings("GLM coding plan", manifest.description);
     try std.testing.expectEqual(@as(usize, 1), manifest.providers.?.object.count());
+    try std.testing.expectEqual(@as(usize, 1), manifest.mcp.?.object.count());
 }
 
 test "bytes over the size limit are refused before any parsing" {
@@ -341,6 +365,21 @@ test "providers hold at most max_mods entries" {
     try std.testing.expectError(error.BadProviders, decode(alloc, try providersText(alloc, max_mods + 1)));
 }
 
+test "mcp must be an object" {
+    try expectRefused(error.BadMcp, "{\"name\":\"glm\",\"version\":\"1\",\"mcp\":[]}");
+    try expectRefused(error.BadMcp, "{\"name\":\"glm\",\"version\":\"1\",\"mcp\":null}");
+    try expectRefused(error.BadMcp, "{\"name\":\"glm\",\"version\":\"1\",\"mcp\":\"fs\"}");
+}
+
+test "mcp holds at most max_mods entries" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const full = try decode(alloc, try mcpText(alloc, max_mods));
+    try std.testing.expectEqual(max_mods, full.mcp.?.object.count());
+    try std.testing.expectError(error.BadMcp, decode(alloc, try mcpText(alloc, max_mods + 1)));
+}
+
 test "every refusal has a plain sentence for the person" {
     const refusals = [_]DecodeError{
         error.TooLarge,
@@ -353,6 +392,7 @@ test "every refusal has a plain sentence for the person" {
         error.BadVersion,
         error.BadDescription,
         error.BadProviders,
+        error.BadMcp,
         error.OutOfMemory,
     };
     for (refusals) |err| {
@@ -369,6 +409,7 @@ test "mod.json decodes or is refused on fuzzed bytes" {
         .corpus = &(@import("fuzz_seed").slices(.{
             "{\"name\":\"glm\",\"version\":\"1.0.0\"}",
             "{\"name\":\"glm\",\"version\":\"1\",\"description\":\"GLM coding plan\",\"providers\":{}}",
+            "{\"name\":\"glm\",\"version\":\"1.0.0\",\"mcp\":{\"fs\":{\"command\":\"bin/fs\",\"args\":[\"--stdio\"]}}}",
             "{\"name\":\"-glm\",\"version\":\"1\"}",
             "{\"name\":\"glm\",\"version\":\"1\",\"description\":\"\\u001b[31m\"}",
             "{\"name\":\"glm\",\"name\":\"glm\",\"version\":\"1\"}",

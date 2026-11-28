@@ -585,12 +585,13 @@ fn isProfileConfigError(err: anyerror) bool {
     return std.mem.startsWith(u8, @errorName(err), "McpConfig");
 }
 
-const Paths = struct { profile: []const u8, project: []const u8 };
+const Paths = struct { profile: []const u8, project: []const u8, mods_dir: []const u8 = "" };
 
 fn paths(c: Context, arena: Allocator) !Paths {
     return .{
         .profile = try profile_paths.mcpConfigPath(arena, c.home),
         .project = try std.Io.Dir.path.join(arena, &.{ c.workspace_root, ".mcp.json" }),
+        .mods_dir = try profile_paths.modsDir(arena, c.home),
     };
 }
 
@@ -601,8 +602,28 @@ fn fileLabel(file: config_file.File) []const u8 {
     };
 }
 
-fn sourceFile(status: Status) config_file.File {
-    return if (status.source == .workspace) .project else .profile;
+fn sourceLabel(arena: Allocator, status: Status) Allocator.Error![]const u8 {
+    return switch (status.source) {
+        .workspace => ".mcp.json",
+        .profile, .acp => profile_paths.displayText("~/.fx/mcp.json"),
+        .mod => arena.print("mod {s}", .{try safe(arena, status.mod_name orelse "unknown")}),
+    };
+}
+
+fn sourceToken(status: Status) []const u8 {
+    return switch (status.source) {
+        .workspace => "project",
+        .mod => "mod",
+        .profile, .acp => "profile",
+    };
+}
+
+fn sourceFilePath(arena: Allocator, status: Status, p: Paths) Allocator.Error![]const u8 {
+    return switch (status.source) {
+        .workspace => p.project,
+        .profile, .acp => p.profile,
+        .mod => std.Io.Dir.path.join(arena, &.{ p.mods_dir, status.mod_name orelse "unknown", "mod.json" }),
+    };
 }
 
 fn list(c: Context, arena: Allocator, json: bool) !u8 {
@@ -614,7 +635,7 @@ fn list(c: Context, arena: Allocator, json: bool) !u8 {
     if (host) |h| try writeNotes(c, h);
     const p = try paths(c, arena);
     if (json) {
-        try writeListJson(c.out, statuses, p);
+        try writeListJson(c.out, arena, statuses, p);
         return 0;
     }
     if (statuses.len == 0) {
@@ -751,7 +772,7 @@ fn writeList(w: *Writer, arena: Allocator, statuses: []const Status) !void {
     const rows = try arena.alloc([4][]const u8, statuses.len);
     var widths: [3]usize = .{ headers[0].len, headers[1].len, headers[2].len };
     for (statuses, rows) |s, *row| {
-        row.* = .{ try safe(arena, s.name), fileLabel(sourceFile(s)), @tagName(s.transport), try statusText(arena, s) };
+        row.* = .{ try safe(arena, s.name), try sourceLabel(arena, s), @tagName(s.transport), try statusText(arena, s) };
         for (0..3) |k| widths[k] = @max(widths[k], text_utils.terminalSafeVisibleWidth(row[k]));
     }
     try writeRow(w, headers, widths);
@@ -766,14 +787,14 @@ fn writeRow(w: *Writer, row: [4][]const u8, widths: [3]usize) !void {
     try w.print("{s}\n", .{row[3]});
 }
 
-fn writeListJson(w: *Writer, statuses: []const Status, p: Paths) !void {
+fn writeListJson(w: *Writer, arena: Allocator, statuses: []const Status, p: Paths) !void {
     var jw: std.json.Stringify = .{ .writer = w };
     try jw.beginObject();
     try jw.objectField("servers");
     try jw.beginArray();
     for (statuses) |s| {
         try jw.beginObject();
-        try writeStatusFields(&jw, s, p);
+        try writeStatusFields(&jw, arena, s, p);
         try jw.objectField("tools");
         try jw.write(if (s.state == .ready) @as(?usize, s.tools) else null);
         try jw.endObject();
@@ -783,14 +804,17 @@ fn writeListJson(w: *Writer, statuses: []const Status, p: Paths) !void {
     try w.writeByte('\n');
 }
 
-fn writeStatusFields(jw: *std.json.Stringify, s: Status, p: Paths) !void {
-    const file = sourceFile(s);
+fn writeStatusFields(jw: *std.json.Stringify, arena: Allocator, s: Status, p: Paths) !void {
     try jw.objectField("name");
     try jw.write(s.name);
     try jw.objectField("source");
-    try jw.write(@tagName(file));
+    try jw.write(sourceToken(s));
+    if (s.source == .mod) {
+        try jw.objectField("mod");
+        try jw.write(s.mod_name);
+    }
     try jw.objectField("file");
-    try jw.write(if (file == .project) p.project else p.profile);
+    try jw.write(try sourceFilePath(arena, s, p));
     try jw.objectField("transport");
     try jw.write(@tagName(s.transport));
     try jw.objectField("status");
@@ -860,7 +884,7 @@ fn show(c: Context, arena: Allocator, name: []const u8, json: bool) !u8 {
     if (json) {
         var jw: std.json.Stringify = .{ .writer = c.out };
         try jw.beginObject();
-        try writeStatusFields(&jw, status, p);
+        try writeStatusFields(&jw, arena, status, p);
         try jw.objectField("version");
         try jw.write(status.version);
         try jw.objectField("url");
@@ -890,7 +914,7 @@ fn show(c: Context, arena: Allocator, name: []const u8, json: bool) !u8 {
         try w.print("  transport  {s}\n", .{@tagName(status.transport)});
         if (server.url) |u| try w.print("  url        {s}\n", .{try safe(arena, u)});
         if (server.command) |cmd| try w.print("  command    {s}\n", .{try safe(arena, cmd)});
-        try w.print("  source     {s}\n", .{fileLabel(sourceFile(status))});
+        try w.print("  source     {s}\n", .{try sourceLabel(arena, status)});
         if (status.last_error) |e| try w.print("  error      {s}\n", .{try safe(arena, e)});
         if (status.needs_login) try w.print("  next       {s} login {s}\n", .{ c.surface.prog(), try safe(arena, name) });
         if (status.state == .waiting_for_approval) try w.print("  next       {s} approve {s}\n", .{ c.surface.prog(), try safe(arena, name) });
@@ -1609,7 +1633,7 @@ test "list lines up its columns and keeps hostile names inert" {
     , out.written());
 
     var json: Writer.Allocating = .init(a);
-    try writeListJson(&json.writer, statuses[0..1], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
+    try writeListJson(&json.writer, a, statuses[0..1], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
     try testing.expectEqualStrings(
         \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools_error":null,"tools_left_out":null,"tools":2}]}
         \\
@@ -1638,7 +1662,7 @@ test "a refused tool list shows in the status, the JSON and a line of show, and 
 
     // `error` still says a server is down, and this one is not; `status` and `tools` keep their meaning.
     var json: Writer.Allocating = .init(a);
-    try writeListJson(&json.writer, statuses[0..2], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
+    try writeListJson(&json.writer, a, statuses[0..2], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
     try testing.expectEqualStrings(
         \\{"servers":[{"name":"none","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools_left_out":null,"tools":0},{"name":"older","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools_left_out":null,"tools":3}]}
         \\
@@ -1856,7 +1880,7 @@ test "tools fx left out are said once, in the same words, by show's line and the
     mixed.name = "mixed";
     const statuses = [_]Status{ kept, one, mixed };
     var json: Writer.Allocating = .init(a);
-    try writeListJson(&json.writer, &statuses, .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
+    try writeListJson(&json.writer, a, &statuses, .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, json.written(), .{});
     const servers = parsed.object.get("servers").?.array.items;
     try testing.expect(servers[0].object.get("tools_left_out").? == .null);
@@ -1866,4 +1890,27 @@ test "tools fx left out are said once, in the same words, by show's line and the
     const left_mixed = servers[2].object.get("tools_left_out").?.object;
     try testing.expectEqual(@as(i64, 3), left_mixed.get("count").?.integer);
     try testing.expectEqualStrings("more than one reason", left_mixed.get("reason").?.string);
+}
+
+test "list and show format mod servers with mod <name> text and source/mod/file JSON" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const statuses = [_]Status{
+        .{ .name = "fs", .source = .mod, .mod_name = "alpha", .transport = .stdio, .state = .ready, .tools = 2 },
+        .{ .name = "evil", .source = .mod, .mod_name = "a\x1b[31mb", .transport = .http, .state = .idle },
+    };
+    var text: Writer.Allocating = .init(a);
+    try writeList(&text.writer, a, &statuses);
+    try testing.expect(std.mem.find(u8, text.written(), "mod alpha") != null);
+    try testing.expect(std.mem.findScalar(u8, text.written(), 0x1b) == null);
+    try testing.expectEqualStrings("mod alpha", try sourceLabel(a, statuses[0]));
+
+    var json: Writer.Allocating = .init(a);
+    try writeListJson(&json.writer, a, statuses[0..1], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json", .mods_dir = "/h/.fx/mods" });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, json.written(), .{});
+    const entry = parsed.object.get("servers").?.array.items[0].object;
+    try testing.expectEqualStrings("mod", entry.get("source").?.string);
+    try testing.expectEqualStrings("alpha", entry.get("mod").?.string);
+    try testing.expectEqualStrings("/h/.fx/mods/alpha/mod.json", entry.get("file").?.string);
 }

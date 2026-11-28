@@ -103,6 +103,7 @@ pub const State = enum {
 pub const Status = struct {
     name: []const u8,
     source: mcp_contract.ConfigSource,
+    mod_name: ?[]const u8 = null,
     transport: mcp_contract.McpTransport,
     state: State,
     version: ?[]const u8 = null,
@@ -746,6 +747,7 @@ pub const Runtime = struct {
         for (r.snapshot, out) |s, *o| {
             o.* = s;
             o.name = try alloc.dupe(u8, s.name);
+            if (s.mod_name) |m| o.mod_name = try alloc.dupe(u8, m);
             if (s.version) |v| o.version = try alloc.dupe(u8, v);
             if (s.last_error) |e| o.last_error = try alloc.dupe(u8, e);
             if (s.tools_error) |t| o.tools_error = try alloc.dupe(u8, t);
@@ -2121,7 +2123,7 @@ pub const Runtime = struct {
                 if (!next.shared[j]) continue;
                 const key = sh.keyOf(server.name) orelse continue;
                 const c = kept_next_engine[std.mem.findScalar(usize, next.engine_server, j) orelse continue];
-                if (std.mem.eql(u8, &key, &share_key.of(c))) kept_shared[j] = true;
+                if (std.mem.eql(u8, &key, &share_key.ofMod(c, server.mod_name))) kept_shared[j] = true;
             }
             // Any other slot goes: its key changed, it was removed, or it is
             // no longer shared. Its calls end as cancelled through the
@@ -2408,7 +2410,7 @@ pub const Runtime = struct {
         const a = next_arena.allocator();
         const out = try a.alloc(Status, r.resolved.servers.len);
         for (r.resolved.servers, out, 0..) |s, *o, i| {
-            o.* = .{ .name = s.name, .source = s.source, .transport = s.transport, .state = .idle, .missing = s.missing };
+            o.* = .{ .name = s.name, .source = s.source, .mod_name = s.mod_name, .transport = s.transport, .state = .idle, .missing = s.missing };
             if (s.held) |h| {
                 o.state = switch (h) {
                     .disabled => .disabled,

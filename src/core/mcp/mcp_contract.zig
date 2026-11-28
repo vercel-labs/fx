@@ -112,6 +112,7 @@ pub const ConfigSource = enum {
     profile,
     acp,
     workspace,
+    mod,
 };
 
 pub const ConfigScope = enum {
@@ -122,7 +123,7 @@ pub const ConfigScope = enum {
 
 pub fn sourceAllowsScope(source: ConfigSource, scope: ConfigScope) bool {
     return switch (source) {
-        .profile => scope == .profile,
+        .profile, .mod => scope == .profile,
         .acp => scope == .acp_session,
         .workspace => scope == .workspace,
     };
@@ -140,7 +141,7 @@ pub fn sourceAllowsWorkspaceAdmission(
 ) bool {
     return switch (source) {
         .workspace => admission != null,
-        .profile, .acp => admission == null,
+        .profile, .acp, .mod => admission == null,
     };
 }
 
@@ -161,6 +162,7 @@ pub const McpServerConfig = struct {
     name: []const u8,
     source: ConfigSource = .profile,
     scope: ConfigScope = .profile,
+    mod_name: ?[]const u8 = null,
     required: bool = false,
     /// Advertise this server's tool schemas on every model turn instead of
     /// offering them through toolbox.
@@ -207,6 +209,7 @@ pub const McpServerConfig = struct {
 
     pub fn deinit(self: *McpServerConfig, alloc: Allocator) void {
         alloc.free(self.name);
+        if (self.mod_name) |mod_name| alloc.free(mod_name);
         if (self.command) |command| alloc.free(command);
         freeOwnedStrings(alloc, self.args);
         if (self.cwd) |cwd| alloc.free(cwd);
@@ -264,6 +267,7 @@ test "MCP server configuration deinit owns present empty targets" {
     const alloc = std.testing.allocator;
     var config: McpServerConfig = .{
         .name = try alloc.dupe(u8, "empty-owned-targets"),
+        .mod_name = try alloc.dupe(u8, "alpha"),
         .command = try alloc.dupe(u8, ""),
         .url = try alloc.dupe(u8, ""),
     };
@@ -271,10 +275,10 @@ test "MCP server configuration deinit owns present empty targets" {
 }
 
 test "MCP configuration sources admit only their product scope" {
-    for ([_]ConfigSource{ .profile, .acp, .workspace }) |source| {
+    for ([_]ConfigSource{ .profile, .acp, .workspace, .mod }) |source| {
         for ([_]ConfigScope{ .profile, .acp_session, .workspace }) |scope| {
             const expected = switch (source) {
-                .profile => scope == .profile,
+                .profile, .mod => scope == .profile,
                 .acp => scope == .acp_session,
                 .workspace => scope == .workspace,
             };
@@ -284,7 +288,7 @@ test "MCP configuration sources admit only their product scope" {
 }
 
 test "workspace admission is present exactly for workspace source" {
-    for ([_]ConfigSource{ .profile, .acp, .workspace }) |source| {
+    for ([_]ConfigSource{ .profile, .acp, .workspace, .mod }) |source| {
         for ([_]?WorkspaceAdmission{ null, .pending, .approved, .rejected }) |admission| {
             const expected = if (source == .workspace) admission != null else admission == null;
             try std.testing.expectEqual(
