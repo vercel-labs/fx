@@ -2,6 +2,7 @@
 //! or once the lookup is cancelled.
 const std = @import("std");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const io_mod = @import("../shared/io.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 
 pub const HeldCredits = struct {
@@ -19,6 +20,16 @@ pub const HeldCredits = struct {
 
     pub fn release(self: *HeldCredits) void {
         self.released.store(true, .seq_cst);
+    }
+
+    /// Releases the reply once a waiter sleeps on the lookup (`sleepers`,
+    /// its task's count), or after `give_up_ms` when none does. For a thread
+    /// of its own.
+    pub fn releaseOnceWaiting(self: *HeldCredits, sleepers: *const std.atomic.Value(u32), give_up_ms: i64) void {
+        const deadline_ms = io_mod.awakeMilliTimestamp() + give_up_ms;
+        // A failed yield only spins once more.
+        while (sleepers.load(.acquire) == 0 and io_mod.awakeMilliTimestamp() < deadline_ms) std.Thread.yield() catch {};
+        self.release();
     }
 
     fn fetch(

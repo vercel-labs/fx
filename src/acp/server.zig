@@ -1241,11 +1241,16 @@ pub fn runWithTransport(
         };
         if (state.terminate_connection) break;
     }
+    endOfInput(&state);
+}
+
+/// The reader's last step, once the client's input ends.
+fn endOfInput(state: *ServerState) void {
     // Close outbound admission before cancelling existing waiters so a prompt
     // entering `beginOutboundRequest` after the sweep cannot block forever
     // (`tests/tla/acp_eof/AcpEof.tla` NoWaitAfterEof).
-    closeOutboundOnEof(&state);
-    handleCancel(&state, false);
+    closeOutboundOnEof(state);
+    handleCancel(state, false);
 }
 
 fn shouldRespondToMessage(msg: *const jsonrpc.Message) bool {
@@ -3291,18 +3296,19 @@ const FakeAwakeClock = @import("../core/shared/awake_clock_testing.zig").FakeAwa
 const HeldCredits = @import("../core/app/credits_lookup_testing.zig").HeldCredits;
 
 /// A server signed in with an AI Gateway key whose team has no saved Token
-/// Pass answer, on the built-in default model and the fake awake clock. Its
-/// credits endpoint says the team has Token Pass once the test releases it.
-/// The state points into the fixture, so it stays where `init` put it.
+/// Pass answer, on the built-in default model and, unless `clock` is
+/// `.real`, the fake awake clock. Its credits endpoint says the team has
+/// Token Pass once the test releases it. The state points into the fixture,
+/// so it stays where `init` put it.
 const TokenPassFixture = struct {
     home: std.testing.TmpDir,
     home_path: []u8,
     api_key: [11]u8,
     credits: HeldCredits,
-    clock: FakeAwakeClock,
+    clock: ?FakeAwakeClock,
     state: ServerState,
 
-    fn init(self: *TokenPassFixture, alloc: Allocator) !void {
+    fn init(self: *TokenPassFixture, alloc: Allocator, clock: enum { fake, real }) !void {
         self.home = std.testing.tmpDir(.{});
         errdefer self.home.cleanup();
         self.home_path = try io_mod.dirRealpathAlloc(alloc, self.home.dir, ".");
@@ -3321,14 +3327,14 @@ const TokenPassFixture = struct {
         self.state.configured_model = try alloc.dupe(u8, "example/built-in-default");
         errdefer alloc.free(self.state.configured_model);
         self.state.selected_model = try alloc.dupe(u8, self.state.configured_model);
-        self.clock = FakeAwakeClock.install();
+        self.clock = if (clock == .fake) FakeAwakeClock.install() else null;
     }
 
     fn deinit(self: *TokenPassFixture) void {
         const alloc = self.state.alloc;
         self.credits.release();
         if (self.state.token_pass_run) |*started| started.finish(alloc, "test_finished");
-        self.clock.deinit();
+        if (self.clock) |*fake| fake.deinit();
         alloc.free(self.state.selected_model);
         alloc.free(self.state.configured_model);
         alloc.free(self.home_path);
@@ -3345,14 +3351,63 @@ const TokenPassFixture = struct {
         self.credits.release();
         const task = self.check().lookup.task.?;
         // A failed yield only spins once more.
-        while (!task.done.load(.acquire)) std.Thread.yield() catch {};
+        while (!task.done.isSet()) std.Thread.yield() catch {};
+    }
+
+    /// The event the lookup sets once the credits reply is in.
+    fn lookupDone(self: *TokenPassFixture) *std.Io.Event {
+        return &self.check().lookup.task.?.done;
+    }
+
+    /// How many threads sleep on the lookup.
+    fn lookupSleepers(self: *TokenPassFixture) *std.atomic.Value(u32) {
+        return &self.check().lookup.task.?.sleepers;
+    }
+
+    /// Gives the server an active session, as a prompt has, with its cancel
+    /// flags clear.
+    fn openSession(self: *TokenPassFixture) *ActiveSessionState {
+        self.state.cfg.minimal_kernel = false;
+        var active: ActiveSessionState = undefined;
+        active.cancel_flag = .init(false);
+        active.turn_cancel = .init(false);
+        self.state.active_session = active;
+        return &self.state.active_session.?;
+    }
+};
+
+/// The reader's side of a prompt's Token Pass wait: once the fake clock
+/// reaches the time `FakeAwakeClock.releaseAt` set inside the wait, it reads
+/// `session/cancel` or the end of the client's input on its own thread, as
+/// the reader does.
+const ReaderDuringWait = struct {
+    state: *ServerState,
+    input: enum { session_cancel, end_of_input },
+    due: std.atomic.Value(bool) = .init(false),
+
+    /// How long, in real time, the reader waits for the release before it
+    /// gives up, for a wait that never reaches the release time.
+    const give_up_ms: i64 = 10_000;
+
+    fn run(self: *ReaderDuringWait) void {
+        // The real clock, which the fake awake clock leaves alone.
+        const deadline_ms = io_mod.milliTimestamp() + give_up_ms;
+        while (!self.due.load(.seq_cst)) {
+            if (io_mod.milliTimestamp() > deadline_ms) return;
+            // A failed yield only spins once more.
+            std.Thread.yield() catch {};
+        }
+        switch (self.input) {
+            .session_cancel => handleCancel(self.state, true),
+            .end_of_input => endOfInput(self.state),
+        }
     }
 };
 
 test "ACP initialize starts the Token Pass check without waiting for its answer" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: TokenPassFixture = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .fake);
     defer fixture.deinit();
     const state = &fixture.state;
 
@@ -3368,7 +3423,7 @@ test "ACP initialize starts the Token Pass check without waiting for its answer"
 test "ACP's reader waits for an unanswered Token Pass check only in a new session nothing chose a model for" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: TokenPassFixture = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .fake);
     defer fixture.deinit();
     const state = &fixture.state;
     startTokenPassCheck(state, state.alloc, .compiled_default);
@@ -3388,7 +3443,7 @@ test "ACP's reader waits for an unanswered Token Pass check only in a new sessio
 test "ACP session/new waits for an unanswered Token Pass check until the wait from the check's start runs out" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: TokenPassFixture = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .fake);
     defer fixture.deinit();
     const state = &fixture.state;
     startTokenPassCheck(state, state.alloc, .compiled_default);
@@ -3410,7 +3465,7 @@ test "ACP session/new waits for an unanswered Token Pass check until the wait fr
 test "ACP session/new takes a Token Pass answer that arrived after initialize and starts on the Token Pass default" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: TokenPassFixture = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .fake);
     defer fixture.deinit();
     const state = &fixture.state;
     state.fast_mode = true;
@@ -3429,7 +3484,7 @@ test "ACP session/new takes a Token Pass answer that arrived after initialize an
 test "ACP session/new takes the catalog's Token Pass marks without waiting for the check" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: TokenPassFixture = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .fake);
     defer fixture.deinit();
     const state = &fixture.state;
     startTokenPassCheck(state, state.alloc, .compiled_default);
@@ -3450,7 +3505,7 @@ test "ACP session/new takes the catalog's Token Pass marks without waiting for t
 test "ACP prompt's Token Pass wait ends at once when the prompt is cancelled" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: TokenPassFixture = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .fake);
     defer fixture.deinit();
     const state = &fixture.state;
     startTokenPassCheck(state, state.alloc, .compiled_default);
@@ -3466,10 +3521,50 @@ test "ACP prompt's Token Pass wait ends at once when the prompt is cancelled" {
     try std.testing.expectEqual(token_pass_check.first_prompt_wait_ms, FakeAwakeClock.elapsedMs());
 }
 
+test "ACP prompt's Token Pass wait ends as soon as session/cancel arrives, not when it next looks at its cancel flag" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: TokenPassFixture = undefined;
+    try fixture.init(std.testing.allocator, .fake);
+    defer fixture.deinit();
+    const state = &fixture.state;
+    startTokenPassCheck(state, state.alloc, .compiled_default);
+    const session = fixture.openSession();
+
+    // The client cancels 3 ms into the prompt's wait.
+    var reader: ReaderDuringWait = .{ .state = state, .input = .session_cancel };
+    FakeAwakeClock.releaseAt(3, &reader.due);
+    const thread = try std.Thread.spawn(.{}, ReaderDuringWait.run, .{&reader});
+    awaitTokenPassForPrompt(state, &session.cancel_flag);
+    thread.join();
+
+    try std.testing.expectEqual(@as(i64, 3), FakeAwakeClock.elapsedMs());
+    try std.testing.expect(fixture.check().lookup.task != null);
+}
+
+test "ACP prompt's Token Pass wait ends as soon as the client's input ends, not when it next looks at its cancel flag" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: TokenPassFixture = undefined;
+    try fixture.init(std.testing.allocator, .fake);
+    defer fixture.deinit();
+    const state = &fixture.state;
+    startTokenPassCheck(state, state.alloc, .compiled_default);
+    const session = fixture.openSession();
+
+    // The client closes its input 3 ms into the prompt's wait.
+    var reader: ReaderDuringWait = .{ .state = state, .input = .end_of_input };
+    FakeAwakeClock.releaseAt(3, &reader.due);
+    const thread = try std.Thread.spawn(.{}, ReaderDuringWait.run, .{&reader});
+    awaitTokenPassForPrompt(state, &session.cancel_flag);
+    thread.join();
+
+    try std.testing.expectEqual(@as(i64, 3), FakeAwakeClock.elapsedMs());
+    try std.testing.expect(fixture.check().lookup.task != null);
+}
+
 test "ACP's reader moves new sessions to the Token Pass default when a prompt's thread took the answer" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: TokenPassFixture = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .fake);
     defer fixture.deinit();
     const state = &fixture.state;
     startTokenPassCheck(state, state.alloc, .compiled_default);
@@ -3488,7 +3583,7 @@ test "ACP's reader moves new sessions to the Token Pass default when a prompt's 
 test "ACP's reader and a prompt's thread take the Token Pass answer at the same time" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: TokenPassFixture = undefined;
-    try fixture.init(std.testing.allocator);
+    try fixture.init(std.testing.allocator, .fake);
     defer fixture.deinit();
     const state = &fixture.state;
     startTokenPassCheck(state, state.alloc, .compiled_default);
@@ -3511,6 +3606,62 @@ test "ACP's reader and a prompt's thread take the Token Pass answer at the same 
     prompt.join();
     takeTokenPassAnswer(state);
 
+    try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
+}
+
+test "ACP session/new wakes as soon as the Token Pass answer arrives, not at its next poll" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: TokenPassFixture = undefined;
+    try fixture.init(std.testing.allocator, .fake);
+    defer fixture.deinit();
+    const state = &fixture.state;
+    startTokenPassCheck(state, state.alloc, .compiled_default);
+
+    // The credits reply comes 3 ms into the new session's wait.
+    FakeAwakeClock.deliverAt(3, &fixture.credits.released, fixture.lookupDone());
+    awaitTokenPassForNewSession(state);
+
+    try std.testing.expectEqual(@as(i64, 3), FakeAwakeClock.elapsedMs());
+    try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
+}
+
+test "ACP prompt's Token Pass wait wakes as soon as the answer arrives, not when it next looks at its cancel flag" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: TokenPassFixture = undefined;
+    try fixture.init(std.testing.allocator, .fake);
+    defer fixture.deinit();
+    const state = &fixture.state;
+    startTokenPassCheck(state, state.alloc, .compiled_default);
+
+    // The credits reply comes 3 ms into the prompt's wait.
+    FakeAwakeClock.deliverAt(3, &fixture.credits.released, fixture.lookupDone());
+    var not_cancelled = std.atomic.Value(bool).init(false);
+    awaitTokenPassForPrompt(state, &not_cancelled);
+
+    try std.testing.expectEqual(@as(i64, 3), FakeAwakeClock.elapsedMs());
+    try std.testing.expect(fixture.check().hasPass());
+}
+
+test "ACP session/new wakes on the Token Pass answer with the real clock" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: TokenPassFixture = undefined;
+    try fixture.init(std.testing.allocator, .real);
+    defer fixture.deinit();
+    const state = &fixture.state;
+    startTokenPassCheck(state, state.alloc, .compiled_default);
+
+    const releaser = try std.Thread.spawn(.{}, HeldCredits.releaseOnceWaiting, .{ &fixture.credits, fixture.lookupSleepers(), 2 * token_pass_check.first_prompt_wait_ms });
+    const started_ms = io_mod.awakeMilliTimestamp();
+    awaitTokenPassForNewSession(state);
+    const waited_ms = io_mod.awakeMilliTimestamp() - started_ms;
+    releaser.join();
+
+    // The reply goes out once the new session waits on the lookup, which
+    // then wakes it long before the 2 s limit.
+    if (waited_ms >= @divTrunc(token_pass_check.first_prompt_wait_ms, 2)) {
+        std.debug.print("session/new waited {d} ms for an answer sent once it waited\n", .{waited_ms});
+        return error.TestUnexpectedResult;
+    }
     try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
 }
 
@@ -4201,6 +4352,8 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
         session.cancel_flag.store(true, .seq_cst);
         // A prompt waiting for its subagents' reports stops waiting.
         state.worker.nudgeWaiter();
+        // So does a prompt waiting for the Token Pass answer.
+        if (state.token_pass_run) |*check| check.wakeWaiter();
         // A libfx turn keeps its queued steering until it ends, which hands
         // back what never reached the model.
         if (state.cfg.minimal_kernel) session.steering.cancelForUser(&session.cancel_flag);
