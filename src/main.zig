@@ -1004,10 +1004,6 @@ const App = struct {
         return AgentsAppRuntime.anyTurnRunning(self);
     }
 
-    pub fn anySubagentWorking(self: *App) bool {
-        return AgentsAppRuntime.anySubagentWorking(self);
-    }
-
     pub fn screenSubagentsWorking(self: *App) bool {
         return AgentsAppRuntime.screenSubagentsWorking(self);
     }
@@ -1083,8 +1079,10 @@ const App = struct {
         var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
         // Failed startups (no TTY, too small) never earn a shutdown report.
         const was_interactive = self.terminal.raw_enabled or self.terminal.signal_handler_installed;
-        // Hand the terminal back first; nothing below renders.
-        self.releaseTerminal();
+        // Hand the terminal back first; nothing below renders. Keep close
+        // handlers installed until persistence finishes (`TuiClose.tla` CloseSavesRequest).
+        self.releaseTerminalForProcessExit();
+        defer app_lifecycle.uninstallAbnormalExitHandlers();
         shutdown_trace.mark("terminal_released");
 
         // Exit never waits, not even for a sign-in refresh, which is never cut
@@ -1269,6 +1267,16 @@ const App = struct {
     pub fn releaseTerminal(self: *App) void {
         if (!self.terminal.raw_enabled and !self.terminal.signal_handler_installed) return;
         app_lifecycle.shutdownInteractiveShell(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+            self.terminalTitle(),
+        );
+    }
+
+    pub fn releaseTerminalForProcessExit(self: *App) void {
+        if (!self.terminal.raw_enabled and !self.terminal.signal_handler_installed) return;
+        app_lifecycle.shutdownInteractiveShellForProcessExit(
             &self.terminal,
             &self.shell,
             &self.metrics,
@@ -2278,6 +2286,11 @@ const App = struct {
         cancel: *std.atomic.Value(bool),
     ) subagent_execution.ServiceError!void {
         return AgentAppRuntime.bindSubagentWorker(raw, turn, cancel);
+    }
+
+    pub fn subagentRestarting(raw: ?*anyopaque, child_id: []const u8) bool {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        return AgentsAppRuntime.childRestarting(self, child_id);
     }
 
     pub fn runSubagentChild(
@@ -3868,6 +3881,12 @@ const App = struct {
     pub fn lentApproval(self: *App) ?struct { worker: *WorkerRuntime, id: []const u8 } {
         const child = AgentsAppRuntime.lentApproval(self, self.screenAgent()) orelse return null;
         return .{ .worker = &child.agent.worker, .id = child.id };
+    }
+
+    /// The worker that owns the approval on screen: the subagent's while its
+    /// request is lent to that screen, else the screen agent's own.
+    pub fn approvalWorker(self: *App, agent: *agents.Agent) *WorkerRuntime {
+        return AgentsAppRuntime.approvalWorker(self, agent);
     }
 
     /// Runs a cancel of the approval on main's screen in the context of the
@@ -6111,7 +6130,7 @@ test "the screen's subagents count as working until their host is quiet" {
     try std.testing.expect(!app.screenSubagentsWorking());
 }
 
-test "an upgrade waits for agents that need the user, stops instances between steps, and lets subagents finish" {
+test "an upgrade waits for agents that need the user and stops instances and subagents between steps" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
     defer app.shell.deinit(alloc);
@@ -6134,11 +6153,9 @@ test "an upgrade waits for agents that need the user, stops instances between st
     try std.testing.expect(runtime.anyTurnRunning(&app));
     app.main_agent.worker.worker_processing = false;
     reviewer.agent.worker.worker_processing = true;
-    try std.testing.expect(runtime.anySubagentWorking(&app));
     try std.testing.expect(runtime.needsUserElsewhere(&app, &buf) == null);
     try std.testing.expect(runtime.anyTurnRunning(&app));
     reviewer.agent.worker.worker_processing = false;
-    try std.testing.expect(!runtime.anySubagentWorking(&app));
     try std.testing.expect(!runtime.anyTurnRunning(&app));
 
     // A turn held at its step boundary for the restart counts as stopped
@@ -6150,9 +6167,12 @@ test "an upgrade waits for agents that need the user, stops instances between st
     second.agent.worker.yield_held = true;
     try std.testing.expect(!runtime.anyTurnUnheld(&app));
     try std.testing.expect(runtime.anyTurnRunning(&app));
-    // A subagent is never held, so its work keeps the release waiting.
+    // A subagent that runs and is not held yet keeps the release waiting.
     reviewer.agent.worker.worker_processing = true;
     try std.testing.expect(runtime.anyTurnUnheld(&app));
+    reviewer.agent.worker.yield_held = true;
+    try std.testing.expect(!runtime.anyTurnUnheld(&app));
+    reviewer.agent.worker.yield_held = false;
     reviewer.agent.worker.worker_processing = false;
     app.main_agent.worker.yield_held = false;
     second.agent.worker.yield_held = false;
@@ -6180,17 +6200,18 @@ test "an upgrade waits for agents that need the user, stops instances between st
     app.main_agent.approval_prompt.clear(alloc);
     app.agent_on_screen = null;
 
-    // A yield reaches main and the other instances, never a subagent.
+    // A yield reaches main, the other instances, and subagents.
     runtime.requestYields(&app);
     try std.testing.expect(app.main_agent.worker.yield_requested.load(.seq_cst));
     try std.testing.expect(second.agent.worker.yield_requested.load(.seq_cst));
-    try std.testing.expect(!reviewer.agent.worker.yield_requested.load(.seq_cst));
+    try std.testing.expect(reviewer.agent.worker.yield_requested.load(.seq_cst));
     runtime.cancelYields(&app);
     try std.testing.expect(!app.main_agent.worker.yield_requested.load(.seq_cst));
     try std.testing.expect(!second.agent.worker.yield_requested.load(.seq_cst));
+    try std.testing.expect(!reviewer.agent.worker.yield_requested.load(.seq_cst));
 }
 
-test "an upgrade refuses for queued work of main or another instance, not of a subagent" {
+test "an upgrade refuses for queued work of main, another instance, or a subagent" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
     defer app.shell.deinit(alloc);
@@ -6205,9 +6226,9 @@ test "an upgrade refuses for queued work of main or another instance, not of a s
     second.agent.role = .instance;
     try std.testing.expect(runtime.queuedWorkElsewhere(&app, &buf) == null);
 
-    // A subagent's queue runs, and the restart waits for it.
+    // A subagent holds its queue while it yields too, so it is named.
     try queueTestPrompt(&reviewer.agent, "subagent work");
-    try std.testing.expect(runtime.queuedWorkElsewhere(&app, &buf) == null);
+    try std.testing.expectEqualStrings("reviewer", runtime.queuedWorkElsewhere(&app, &buf).?);
     reviewer.agent.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
 
     // Another instance holds its queue while it yields, so it is named.
@@ -6224,6 +6245,21 @@ test "an upgrade refuses for queued work of main or another instance, not of a s
     try queueTestPrompt(&app.main_agent, "main prompt");
     try std.testing.expectEqualStrings("fx 1", runtime.queuedWorkElsewhere(&app, &buf).?);
     app.main_agent.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
+}
+
+test "a held subagent's queued report does not keep the restart from exiting" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const reviewer = try addTestChildAgent(&app, "reviewer");
+    try queueTestPrompt(&reviewer.agent, "report");
+    try std.testing.expect(!runtime.anyTurnRunning(&app));
+    reviewer.agent.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
 }
 
 /// How many session approvals `agent` has, read as a thread other than the

@@ -115,6 +115,16 @@
 (* Mutation "overlay_rebuilt" is fx before that: the turn context and      *)
 (* runtime block follow the current values on every request. Mutation      *)
 (* "overlay_not_saved" freezes them but recaptures them when fx restarts.  *)
+(* Event "summary" is fx's own summary written inside a turn: it replaces  *)
+(* the history, and fx sends it as a user message. A turn that sent an     *)
+(* earlier turn's copy of the turn context and runtime block captures the  *)
+(* current values there and saves them with the summary, so the rest of    *)
+(* the turn and every later turn send the same bytes; a turn that captured *)
+(* its own copy keeps it (src/core/agent/runtime/runtime_context.zig       *)
+(* restartAfterSummary, src/core/compactor/checkpoint.zig runtime_context). *)
+(* Mutation "summary_stale" is fx before that: the turn keeps the earlier  *)
+(* copy and saves none, so the next turn captures the current values ahead *)
+(* of what the turn sent after its summary.                                *)
 (*                                                                         *)
 (* Abstraction: a block is a [k, v] record; equal v means equal bytes.     *)
 (* Tokens, cache lifetime, eviction and the provider's 20-block lookback   *)
@@ -133,7 +143,7 @@ CONSTANTS
   Limit,        \* blocks per request that may carry a cache marker
   PathScoped,   \* toolbox menu and project rules embed the worktree path
   Family,       \* "anthropic" | "openai": the provider's cache rules
-  Events,       \* mid-session events: a subset of {"switch", "deliver", "skill", "remind", "resume", "outside", "attach"}
+  Events,       \* mid-session events: a subset of {"switch", "deliver", "skill", "remind", "resume", "outside", "attach", "summary"}
   Notes,        \* mid-session changes join the conversation, not the instructions
   Carrier       \* "message" | "note": where such a change goes
 
@@ -142,11 +152,11 @@ ASSUME Family \in {"anthropic", "openai"}
 ASSUME Mutation \in {"none", "mark_every_system", "fence_after_context", "no_auto",
                      "note_not_saved", "contract_late", "remind_old_result",
                      "stale_in_instructions", "overlay_rebuilt", "overlay_not_saved",
-                     "skill_swapped", "attach_in_instructions"}
+                     "skill_swapped", "attach_in_instructions", "summary_stale"}
 ASSUME Carrier \in {"message", "note"}
 ASSUME MaxSessions \in Nat /\ MaxSteps \in Nat /\ Limit \in Nat
 ASSUME PathScoped \in BOOLEAN
-ASSUME Events \subseteq {"switch", "deliver", "skill", "remind", "resume", "outside", "attach"} /\ Notes \in BOOLEAN
+ASSUME Events \subseteq {"switch", "deliver", "skill", "remind", "resume", "outside", "attach", "summary"} /\ Notes \in BOOLEAN
 ASSUME "attach" \in Events => Notes
 
 Block(k, v) == [k |-> k, v |-> v]
@@ -255,7 +265,8 @@ NoSession == [on |-> FALSE, w |-> "none", s |-> 0, n |-> 0, br |-> "b1", br0 |->
               skill |-> FALSE, skillText |-> 0,
               carrierAt |-> 0, remindable |-> FALSE, reminded |-> FALSE,
               resumed |-> FALSE, stale |-> FALSE, out |-> FALSE, out0 |-> FALSE,
-              attached |-> FALSE, attach |-> FALSE]
+              attached |-> FALSE, attach |-> FALSE,
+              own |-> FALSE, pending |-> FALSE, summarized |-> FALSE]
 
 (* Whether the request's turn context and runtime block show the outside  *)
 (* change, and which branch they show.                                    *)
@@ -313,13 +324,14 @@ Send(w, s, req, first, prev, changed, keep) ==
                             worktreeSeen |-> \E i \in 1..Len(log) : log[i].w = w,
                             anySeen |-> Len(log) > 0])
 
-(* A session starts on the branch its worktree was left on.                 *)
+(* A session starts on the branch its worktree was left on. Its first turn  *)
+(* captures the turn context and runtime block: own.                       *)
 Start(w) ==
   LET s == sessions + 1
       br == branchOf[w]
       hist == << Block("user", ToString(s) \o ".0") >>
       a == [NoSession EXCEPT !.on = TRUE, !.w = w, !.s = s, !.br = br, !.br0 = br,
-                             !.hist = hist]
+                             !.hist = hist, !.own = TRUE]
       req == Lead(a) \o hist
   IN /\ ~active.on
      /\ sessions < MaxSessions
@@ -335,8 +347,8 @@ Uncarried(b) ==
     [] OTHER -> b
 
 (* The next request of the session. "step" is a tool step and "turn" a new *)
-(* user turn; "switch", "deliver", "skill", "remind", "resume", "outside"  *)
-(* and "attach" are the events in Events, described above. Each event happens *)
+(* user turn; "switch", "deliver", "skill", "remind", "resume", "outside", *)
+(* "attach" and "summary" are the events in Events, described above. Each event happens *)
 (* at most once per session, and "remind" only after a user turn that      *)
 (* followed the delivery. Before P6 (Notes = FALSE) the rules sit in the   *)
 (* instructions and "remind" is a plain step; there, as with mutation      *)
@@ -351,9 +363,13 @@ Continue(kind) ==
       \* The change shows up ahead of the history instead of on a message.
       inLead == staleInLead \/ (kind \in {"switch", "outside"} /\ (~Notes \/ Mutation = "overlay_rebuilt"))
                 \/ (kind = "attach" /\ Mutation = "attach_in_instructions")
-      event == kind \in {"switch", "deliver", "skill", "resume", "outside", "attach"} \/ (kind = "remind" /\ Notes)
+      summarizing == kind = "summary"
+      event == kind \in {"switch", "deliver", "skill", "resume", "outside", "attach", "summary"} \/ (kind = "remind" /\ Notes)
       carried == Notes /\ Carrier = "message"
-      recapture == kind = "resume" /\ Mutation = "overlay_not_saved"
+      \* fx's summary in a turn that sent an earlier turn's copy captures the
+      \* current values; with "summary_stale" the next turn does instead.
+      restart == summarizing /\ ~a.own /\ Mutation # "summary_stale"
+      recapture == (kind = "resume" /\ Mutation = "overlay_not_saved") \/ restart \/ (isTurn /\ a.pending)
       misplaced == kind = "remind" /\ carried /\ Mutation = "remind_old_result"
       br == IF kind = "switch" THEN "b2" ELSE a.br
       swapped == IF isTurn /\ Notes /\ a.skillText > 0 /\ Mutation = "skill_swapped"
@@ -373,7 +389,8 @@ Continue(kind) ==
                    [] carried /\ event /\ ~misplaced /\ ~inLead -> "asstc"
                    [] OTHER -> "asst"
       withMsg == Append(reminded, Block(msgKind, ToString(a.s) \o "." \o ToString(n)))
-      hist == CASE ~Notes \/ carried -> withMsg
+      hist == CASE summarizing -> << Block("user", "sum" \o ToString(a.s) \o "." \o ToString(n)) >>
+                [] ~Notes \/ carried -> withMsg
                 [] kind = "switch" /\ ~inLead -> Append(withMsg, Block("note", "branch"))
                 [] kind = "deliver" -> Append(withMsg, Block("note", "scoped"))
                 [] kind = "skill" -> Append(withMsg, Block("skilltext", "k"))
@@ -390,9 +407,9 @@ Continue(kind) ==
                                         ELSE a.scopedTurn \/ (~Notes /\ kind = "deliver")),
                         !.skill = (IF isTurn THEN ~Notes /\ kind = "skill" ELSE a.skill),
                         !.skillText = (IF Notes /\ kind = "skill" THEN Len(hist)
-                                       ELSE IF isTurn THEN 0 ELSE a.skillText),
+                                       ELSE IF isTurn \/ summarizing THEN 0 ELSE a.skillText),
                         !.carrierAt = (IF kind = "deliver" /\ carried THEN Len(withMsg)
-                                       ELSE a.carrierAt),
+                                       ELSE IF summarizing THEN 0 ELSE a.carrierAt),
                         !.remindable = a.remindable \/ (isTurn /\ a.delivered),
                         !.reminded = a.reminded \/ kind = "remind",
                         !.resumed = a.resumed \/ kind = "resume",
@@ -402,12 +419,17 @@ Continue(kind) ==
                         !.attach = (IF isTurn THEN kind = "attach" /\ Mutation = "attach_in_instructions"
                                     ELSE a.attach),
                         !.br0 = IF recapture THEN a.br ELSE a.br0,
-                        !.out0 = IF recapture THEN a.out ELSE a.out0]
+                        !.out0 = IF recapture THEN a.out ELSE a.out0,
+                        !.own = IF isTurn THEN a.pending ELSE a.own \/ restart,
+                        !.pending = IF isTurn THEN FALSE
+                                    ELSE a.pending \/ (summarizing /\ ~a.own /\ Mutation = "summary_stale"),
+                        !.summarized = a.summarized \/ summarizing]
       req == Lead(next) \o hist
-      keep == LastKept(a.last)
+      \* A summary replaces the history: only the stable instructions stay.
+      keep == IF summarizing THEN PosStable ELSE LastKept(a.last)
   IN /\ a.on
      /\ a.n < MaxSteps
-     /\ kind \in {"switch", "deliver", "skill", "remind", "resume", "outside", "attach"} => kind \in Events
+     /\ kind \in {"switch", "deliver", "skill", "remind", "resume", "outside", "attach", "summary"} => kind \in Events
      /\ kind = "switch" => ~a.switched
      /\ kind = "deliver" => ~a.delivered
      /\ kind = "skill" => ~a.skilled
@@ -415,6 +437,7 @@ Continue(kind) ==
      /\ kind = "resume" => ~a.resumed
      /\ kind = "outside" => ~a.out
      /\ kind = "attach" => ~a.attached
+     /\ kind = "summary" => ~a.summarized
      /\ active' = [next EXCEPT !.last = req]
      /\ Send(a.w, a.s, req, FALSE, a.last, event, keep)
      /\ branchOf' = [branchOf EXCEPT ![a.w] = br]
@@ -435,7 +458,7 @@ ExternalSwitch(w) ==
 
 Next ==
   \/ \E w \in Worktrees : Start(w)
-  \/ \E kind \in {"step", "turn", "switch", "deliver", "skill", "remind", "resume", "outside", "attach"} : Continue(kind)
+  \/ \E kind \in {"step", "turn", "switch", "deliver", "skill", "remind", "resume", "outside", "attach", "summary"} : Continue(kind)
   \/ End
   \/ \E w \in Worktrees : ExternalSwitch(w)
 

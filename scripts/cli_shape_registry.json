@@ -141,6 +141,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_APPROVAL_SCREEN_FAIL": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_AUTH_LOCK_CONTENTION": {
       "job": "test",
       "stability": "internal"
@@ -274,6 +278,14 @@
       "stability": "internal"
     },
     "FX_TEST_SHELL_YIELD_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SHUTDOWN_RELEASE_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SHUTDOWN_RELEASE_RELEASE": {
       "job": "test",
       "stability": "internal"
     },
