@@ -178,31 +178,35 @@ A `user_message_chunk` update for a host steer carries a `requestId` of `null` i
 A session can be open on several connections at once, which ACP v2's [session setup](https://agentclientprotocol.com/protocol/v2/session-setup) allows an Agent to do. A client joins a session that another client runs with ACP's own methods, on a connection to the fx process that runs the session:
 
 - `session/load` replays the whole session, then the updates that the running turn has sent so far, then live updates.
-- `session/resume` sends live updates from that point on.
+- `session/resume` sends live updates from that point on. It serves only a client that has every saved turn. Any other client uses `session/load` with its position, as under "Catching up".
 
 Joining needs no capability, so a client that knows only ACP can follow a session.
 
-While the session is open on another connection, fx keeps the session's `cwd`, `additionalDirectories`, and `mcpServers`, and doesn't use the ones in the joining client's request. The response's `_meta` gives the session's folder as `sh.fx/cwd`. A `systemPrompt` in the request applies as on any load or resume: a prompt that differs from the session's replaces it from the next turn, for every client.
+While the session is open on another connection, fx keeps the session's `cwd`, `additionalDirectories`, and `mcpServers`, and doesn't use the ones in the joining client's request. The response's `_meta` gives the session's folder as `sh.fx/cwd`. A `systemPrompt` in a `session/load` or `session/resume` request that differs from the session's prompt replaces it from the next turn, for every client. Today fx reads `systemPrompt` only on `session/new`.
 
 Every client of a session may send prompts. A prompt that arrives while a turn runs follows "Steering and queued prompts", and fx keeps one order for the input of all clients.
 
-`session/close` closes the session on the calling connection only. While the session is open on another connection, it stays open there, and a running turn goes on. A connection that closes acts the same way.
+`session/close` closes the session on the calling connection only. While the session is open on another connection, it stays open there, and a running turn goes on. A connection that closes acts the same way. When the last connection with the session open closes during a turn, fx stops the turn and saves it, as fx does today.
+
+A compaction changes only what fx sends the model. The saved turns, their positions, and what a load replays stay as they are, so a compaction can happen while connections have the session open. fx sends ACP's `compaction_update` to each open connection that lists the `session.compaction` capability, and gives each other open connection one short text line when a compaction completes. fx never sends the summary text, so it sends no `compaction_summary_chunk`.
 
 #### Catching up
 
-A client that lists `sh.fx/logPosition` learns its place in the session's log, so that after a reconnect it receives only what it misses.
+A client that lists `sh.fx/logPosition` learns its place in the session's log, so that after a reconnect it receives only what it misses. A client keeps the messages it holds together with its position. A client that loses its messages sends no position, so its next `session/load` replays the whole session.
 
 fx's session log saves whole turns. A position names the last turn saved, as an opaque string that the client stores and sends back unchanged. fx gives the current position in these places:
 
 - the `_meta` of the response to `session/load` and `session/resume`, as `sh.fx/position`;
 - the `_meta` of a `session_info_update` that fx sends to every client of the session when it saves a turn, with `updatedAt` set to the time of the save.
 
-To catch up, the client sends the position in the `_meta` of `session/load` as `sh.fx/replayFrom`. fx replays only the turns saved after that position, then the updates of the running turn so far, then live updates. When fx doesn't know the position, for example after a compaction rewrote the log, it replays the whole session. The response's `sh.fx/replay` says which one happened:
+To catch up, the client sends the position in the `_meta` of `session/load` as `sh.fx/replayFrom`. fx replays only the turns saved after that position, then the updates of the running turn so far, then live updates. When fx doesn't know the position, for example one that it never gave the client, it replays the whole session. The response's `sh.fx/replay` says which one happened:
 
 | `sh.fx/replay` | Meaning |
 | --- | --- |
 | `"after_position"` | fx replayed the turns saved after the position |
 | `"full"` | fx didn't know the position and replayed the whole session |
+
+The client keeps the messages it holds when the answer's `sh.fx/replay` is `"after_position"`, and drops them when it is `"full"`. So the value must match what fx sent: after a `"full"` replay, a kept copy gives the client every turn twice, and after an `"after_position"` replay, a dropped copy misses the turns before the position. A `sh.fx/replayFrom` that is not an object with a `position` string fails with `-32602`.
 
 For example, a client that comes back after a lost connection sends:
 
@@ -236,7 +240,9 @@ After the replay, fx answers:
 }
 ```
 
-`tests/tla/acp/AcpFollow.tla` models these rules, with stable message ids (a replayed message keeps the id it had when it was live), and TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
+`tests/tla/acp/AcpFollow.tla` models the joins, the folder, the position and replay rules, the close rule, a client's copy and its loss, compactions while connections have the session open, and stable message ids (a replayed message keeps the id it had when it was live). TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
+
+The model leaves out these parts of this section: the `systemPrompt` rule; `additionalDirectories` and `mcpServers`, since the model has only the folder; one input order for all clients; the running turn's partial updates; `updatedAt` in `session_info_update`; and capability gating for `sh.fx/logPosition`, since every client in the model catches up.
 
 ### Session status and list changes
 
