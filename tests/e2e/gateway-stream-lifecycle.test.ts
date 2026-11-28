@@ -12504,16 +12504,32 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
         !latestUserIsReport(request.body))!;
       const resumedChild = gateway.requests.find((request) =>
         !request.body.includes('"name":"subagent"') && promptText(request.body).includes(secondMessage))!;
-      const parentCatalog = taggedBlock(resumedParent.body, "toolbox");
-      const childCatalog = taggedBlock(resumedChild.body, "toolbox");
+      const firstParent = gateway.requests.find((request) =>
+        promptText(request.body).includes("RESUME_PERSISTENT_FIRST") &&
+        !promptText(request.body).includes("RESUME_PERSISTENT_SECOND") &&
+        !hasCurrentToolResult(request.body, "persistent_resume_one") &&
+        !latestUserIsReport(request.body))!;
+      const firstChild = gateway.requests.find((request) =>
+        !request.body.includes('"name":"subagent"') &&
+        promptText(request.body).includes(firstMessage) &&
+        !promptText(request.body).includes(secondMessage))!;
       expect(resumedParent.headers.get("ai-language-model-id")).toBe(smallModel);
       expect(resumedChild.headers.get("ai-language-model-id")).toBe(MODEL);
-      for (const catalog of [parentCatalog, childCatalog]) {
-        expect(catalog).not.toContain("original-workspace-only");
-        for (const name of skillNames) expect(catalog).toContain(`- ${name}:`);
+      // A resume, here in another workspace with a smaller model, sends the
+      // menu each conversation sent first, byte for byte, and the toolbox it
+      // holds now arrives as a change note at the end of the new turn
+      // (tests/tla/toolbox/Toolbox.tla MenuFixed and Informed, D103). The
+      // persistent child resumes its own saved conversation the same way.
+      for (const [first, resumed] of [[firstParent, resumedParent], [firstChild, resumedChild]] as const) {
+        const firstMenu = taggedBlock(first.body, "toolbox");
+        expect(firstMenu).toContain("- original-workspace-only:");
+        for (const name of skillNames) expect(firstMenu).not.toContain(name);
+        expect(taggedBlock(resumed.body, "toolbox")).toBe(firstMenu);
+        const turnEnd = contentText(gatewayRequest(resumed.body).prompt.at(-1)!.content);
+        expect(turnEnd).toContain("The toolbox now holds something other than the toolbox menu above lists.");
+        for (const name of skillNames) expect(turnEnd).toContain(name);
+        expect(turnEnd).not.toContain("original-workspace-only");
       }
-      // Each menu gives a skill one short line, so the two models' windows
-      // change it only when the budget forces a cut.
 
       const directChildResume = await runFx(
         [

@@ -400,7 +400,7 @@ test.skipIf(!tmuxAvailable())(
     const tapePath = join(root, "resume.fxtape");
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ startup_scrollback: false }));
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
     const labels = Array.from({ length: 67 }, (_, i) => `RESUME_ROW_${String(i).padStart(3, "0")}`);
     const gateway = startFakeGateway([
       fakeGatewayFinalText(labels.join("\n\n")),
@@ -1214,6 +1214,91 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 2,
+);
+
+// How a toolbox change note opens (src/core/tooling/toolbox.zig renderChangeNote).
+const TOOLBOX_CHANGE_NOTE = "The toolbox now holds something other than the toolbox menu above lists.";
+
+function writeProfileSkill(home: string, name: string): void {
+  const dir = join(home, ".fx", "skills", name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: The ${name} steps.\n---\n\n# ${name}\n`);
+}
+
+// Cache markers move to the newest message on purpose; everything else a
+// request sent must start the next one.
+function withoutProviderOptions(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutProviderOptions);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "providerOptions").map(([key, item]) => [key, withoutProviderOptions(item)]));
+  }
+  return value;
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a TUI resume sends the toolbox menu the session sent first and notes a skill added since",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-toolbox-menu-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }));
+    writeProfileSkill(home, "menu-first");
+    const answers = ["TUI_MENU_FIRST", "TUI_MENU_SECOND", "TUI_MENU_THIRD"];
+    let turn = 0;
+    const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText(answers[turn]!));
+    let active: TmuxSession | null = null;
+    try {
+      let sessionId = "";
+      for (const [index, prompt] of ["First question.", "Second question.", "Third question."].entries()) {
+        turn = index;
+        if (index === 1) {
+          sessionId = sessionIdFromHome(home);
+          writeProfileSkill(home, "menu-added");
+        }
+        const stderrPath = join(root, `turn-${turn}.stderr`);
+        writeFileSync(stderrPath, "");
+        active = await TmuxSession.create({
+          cmd: index === 0 ? FX_BIN : `${FX_BIN} --resume ${sessionId}`,
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, gateway),
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+        await active.waitForComposer(TIMEOUT);
+        await active.sendText(prompt);
+        await active.waitForText(answers[turn]!, TIMEOUT);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+        await active.kill();
+        active = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      }
+
+      const requests = gateway.requests
+        .map((request) => JSON.parse(request.body))
+        .filter((request) => (request.tools ?? []).length > 0);
+      expect(requests.length).toBe(3);
+      for (let i = 1; i < requests.length; i++) {
+        expect(JSON.stringify(requests[i].tools)).toBe(JSON.stringify(requests[i - 1].tools));
+        const earlier = requests[i - 1].prompt.map((message: unknown) => JSON.stringify(withoutProviderOptions(message)));
+        const later = requests[i].prompt.slice(0, earlier.length).map((message: unknown) => JSON.stringify(withoutProviderOptions(message)));
+        expect(later).toEqual(earlier);
+      }
+      expect(JSON.stringify(requests[0].prompt)).not.toContain("menu-added");
+      const noted = JSON.stringify(requests[1].prompt.at(-1));
+      expect(noted).toContain(TOOLBOX_CHANGE_NOTE);
+      expect(noted).toContain("menu-added");
+      expect(JSON.stringify(requests[2].prompt).split(TOOLBOX_CHANGE_NOTE).length - 1).toBe(1);
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
 );
 
 function expectAltExitToPreserveNormalViewport(tapePath: string): void {
@@ -7543,7 +7628,6 @@ type CtrlGScreens = {
 async function captureCtrlGRelaunch(options: {
   label: string;
   reply: string | null;
-  startupScrollback?: boolean;
   prefillShellLines?: number;
   cols?: number;
   rows?: number;
@@ -7560,14 +7644,6 @@ async function captureCtrlGRelaunch(options: {
   mkdirSync(home);
   mkdirSync(workspace);
   mkdirSync(installDir);
-  if (options.startupScrollback !== undefined) {
-    mkdirSync(join(home, ".fx"), { mode: 0o700 });
-    writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ startup_scrollback: options.startupScrollback }) + "\n",
-      { mode: 0o600 },
-    );
-  }
   const workspaceRoot = realpathSync(workspace);
   const installedFx = join(installDir, "fx");
   copyFileSync(FX_BIN, installedFx);
@@ -7681,44 +7757,36 @@ const CTRL_G_SCREEN_REPLY = [
   "CTRL_G_SCREEN_LAST_LINE",
 ].join("\n\n");
 
-for (const startupScrollback of [undefined, false] as const) {
-  const setting = startupScrollback === undefined ? "startup_scrollback on by default" : "startup_scrollback off";
-  test.skipIf(!tmuxAvailable())(
-    `upgrade ctrl-g keeps the old screen in place until the new build redraws it (${setting})`,
-    async () => {
-      const screens = await captureCtrlGRelaunch({
-        label: startupScrollback === undefined ? "default" : "no-scrollback",
-        reply: CTRL_G_SCREEN_REPLY,
-        startupScrollback,
-      });
-      expectGapKeepsScreen(screens, "CTRL_G_SCREEN_LAST_LINE");
-      expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_FIRST_LINE")).toBe(1);
-      expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_LAST_LINE")).toBe(1);
-    },
-    UPGRADE_TIMEOUT * 2,
-  );
-}
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g keeps the old screen in place until the new build redraws it",
+  async () => {
+    const screens = await captureCtrlGRelaunch({
+      label: "default",
+      reply: CTRL_G_SCREEN_REPLY,
+    });
+    expectGapKeepsScreen(screens, "CTRL_G_SCREEN_LAST_LINE");
+    expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_FIRST_LINE")).toBe(1);
+    expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_LAST_LINE")).toBe(1);
+  },
+  UPGRADE_TIMEOUT * 2,
+);
 
-for (const startupScrollback of [undefined, false] as const) {
-  const setting = startupScrollback === undefined ? "startup_scrollback on by default" : "startup_scrollback off";
-  test.skipIf(!tmuxAvailable())(
-    `upgrade ctrl-g without a saved turn keeps the old screen in place until the new build redraws it (${setting})`,
-    async () => {
-      // The session saved nothing, so the new build starts twice: once for
-      // the session it cannot find and once for a fresh one (D81). With
-      // startup scrollback off, the short screen leaves the cursor above the
-      // rows a launch keeps free, so no launch moves it.
-      const screens = await captureCtrlGRelaunch({
-        label: startupScrollback === undefined ? "fresh-default" : "fresh-no-scrollback",
-        reply: null,
-        startupScrollback,
-      });
-      expectGapKeepsScreen(screens, "Run /help for commands");
-      expect(countOccurrences(screens.redrawn, "Run /help for commands")).toBe(1);
-    },
-    UPGRADE_TIMEOUT * 2,
-  );
-}
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g without a saved turn keeps the old screen in place until the new build redraws it",
+  async () => {
+    // The session saved nothing, so the new build starts twice: once for
+    // the session it cannot find and once for a fresh one (D81). The short
+    // screen leaves the cursor above the rows a launch keeps free, so no
+    // launch moves it.
+    const screens = await captureCtrlGRelaunch({
+      label: "fresh",
+      reply: null,
+    });
+    expectGapKeepsScreen(screens, "Run /help for commands");
+    expect(countOccurrences(screens.redrawn, "Run /help for commands")).toBe(1);
+  },
+  UPGRADE_TIMEOUT * 2,
+);
 
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g without a saved turn on a filled screen keeps the old screen in place until the new build redraws it",
@@ -7727,9 +7795,8 @@ test.skipIf(!tmuxAvailable())(
     // SessionNotFound teardown (D81) must not wipe rows above the footer
     // before the retry clears and redraws the screen.
     const screens = await captureCtrlGRelaunch({
-      label: "fresh-filled-no-scrollback",
+      label: "fresh-filled",
       reply: null,
-      startupScrollback: false,
       prefillShellLines: 25,
     });
     expectGapKeepsScreen(screens, "Run /help for commands");
@@ -7739,7 +7806,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "startup_scrollback off does not push ten blank lines when resuming at the bottom of the terminal",
+  "resuming at the bottom of the terminal does not push ten blank lines",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-no-blank-block-")));
     const home = join(root, "home");
@@ -7749,12 +7816,6 @@ test.skipIf(!tmuxAvailable())(
     const launchGate = join(root, "launch-gate");
     mkdirSync(home);
     mkdirSync(workspace);
-    mkdirSync(join(home, ".fx"), { mode: 0o700 });
-    writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ startup_scrollback: false }) + "\n",
-      { mode: 0o600 },
-    );
     const workspaceRoot = realpathSync(workspace);
     const gateway = startFakeGateway([fakeGatewayFinalText("RESUME_NO_BLANK_REPLY")]);
     let first: TmuxSession | null = null;
@@ -13079,7 +13140,7 @@ async function resumeLongHistory(options: DrainCase) {
   mkdirSync(workspace);
   writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
   writeFileSync(join(workspace, "a.txt"), "alpha\n");
-  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false }));
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false }));
   const history = Array.from({ length: options.lines }, (_, i) => `history line ${String(i + 1).padStart(5, "0")} alpha beta gamma`);
   const hold = heldFakeGatewayFinalText();
   let seeding = true;
@@ -13273,7 +13334,7 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
-    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false }));
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false }));
     const mcpFixture = startModernMcpHttpFixture("stall_call");
     writeStalledMcpConfig(home, mcpFixture.url);
     const history = Array.from({ length: lines }, (_, i) => `history line ${String(i + 1).padStart(5, "0")} alpha beta gamma`);

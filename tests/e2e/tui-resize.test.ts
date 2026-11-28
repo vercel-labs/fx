@@ -4704,52 +4704,88 @@ describe.skipIf(SKIP)("tui: resize", () => {
   );
 
   test(
-    "settled resize clears pre-fx scrollback in both startup modes",
+    "launch keeps the shell's rows on screen and out of scrollback, even with an old startup_scrollback setting",
     async () => {
-      for (const startupScrollback of [true, false]) {
-        const root = mkdtempSync(join(tmpdir(), "fx-resize-history-reset-"));
-        const home = join(root, "home");
-        const workspace = join(root, "workspace");
-        const marker = `PRE_FX_MARKER_${startupScrollback ? "ON" : "OFF"}_6179`;
-        mkdirSync(join(home, ".fx"), { recursive: true });
-        mkdirSync(workspace, { recursive: true });
-        writeFileSync(
-          join(home, ".fx", "settings.json"),
-          JSON.stringify({ startup_scrollback: startupScrollback }),
-        );
-        tempDirs.push(root);
-        session = await createResizeSession({
-          cmd: `sh -c ${quoteShellPath(`printf '${marker}\\n'; exec ${quoteShellPath(FX_BIN)}`)}`,
-          cwd: workspace,
-          env: { HOME: home },
-          width: 120,
-          height: 40,
-        });
-        await session.waitForComposer(10_000);
-        expect(await session.captureFullScrollback()).toContain(marker);
+      const root = mkdtempSync(join(tmpdir(), "fx-launch-keeps-shell-rows-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const shellRows = ["SHELL_ROW_ONE_4410", "SHELL_ROW_TWO_4410", "SHELL_ROW_THREE_4410"];
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ startup_scrollback: true }));
+      writeFileSync(stderrPath, "");
+      tempDirs.push(root);
+      session = await createResizeSession({
+        cmd: `sh -c ${quoteShellPath(`printf '${shellRows.join("\\n")}\\n'; exec ${quoteShellPath(FX_BIN)}`)}`,
+        cwd: workspace,
+        env: { HOME: home },
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      await session.waitForText("Run /help for commands", 10_000);
 
-        await session.sendText("/help");
-        await session.waitForText("Commands 40", 5_000);
-        await session.resizeWindow(84, 28, 500);
+      const grid = await session.capturePaneGrid();
+      expect(grid.slice(0, shellRows.length), grid.join("\n")).toEqual(shellRows);
+      const headerRow = grid.findIndex((row) => row.includes("Run /help for commands"));
+      expect(headerRow, grid.join("\n")).toBeGreaterThanOrEqual(shellRows.length);
 
-        const catalog = await session.capturePaneGrid();
-        expect(catalog.join("\n")).not.toContain(marker);
-        expect(findInlineHelpPicker(catalog)).not.toBeNull();
-
-        await session.sendKeys("Escape");
-        await session.waitForPane(
-          (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
-          5_000,
-        );
-        const scrollback = await session.captureFullScrollback();
-        expect(scrollback).not.toContain(marker);
-        expect(scrollback).not.toContain("Commands 40");
-        const finalGrid = await session.capturePaneGrid();
-        expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
-
-        await session.kill();
-        session = null;
+      // Nothing moved into tmux's history, so the full capture begins with the
+      // shell's first row, the same as the screen.
+      const scrollback = (await session.captureFullScrollback()).split("\n");
+      expect(scrollback[0], scrollback.join("\n")).toBe(shellRows[0]);
+      for (const row of shellRows) {
+        expect(scrollback.filter((line) => line === row)).toHaveLength(1);
       }
+      expectEmptyStderr(stderrPath);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "settled resize clears pre-fx scrollback",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-resize-history-reset-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const marker = "PRE_FX_MARKER_6179";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
+      tempDirs.push(root);
+      session = await createResizeSession({
+        cmd: `sh -c ${quoteShellPath(`printf '${marker}\\n'; exec ${quoteShellPath(FX_BIN)}`)}`,
+        cwd: workspace,
+        env: { HOME: home },
+        width: 120,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      expect(await session.captureFullScrollback()).toContain(marker);
+
+      await session.sendText("/help");
+      await session.waitForText("Commands 40", 5_000);
+      await session.resizeWindow(84, 28, 500);
+
+      const catalog = await session.capturePaneGrid();
+      expect(catalog.join("\n")).not.toContain(marker);
+      expect(findInlineHelpPicker(catalog)).not.toBeNull();
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
+        5_000,
+      );
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).not.toContain(marker);
+      expect(scrollback).not.toContain("Commands 40");
+      const finalGrid = await session.capturePaneGrid();
+      expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
+
+      await session.kill();
+      session = null;
     },
     TIMEOUT,
   );
