@@ -13,6 +13,11 @@
 # reused): the contract and implementation configs must pass, and each
 # *-mutation-* config plants one bug that its named invariant must catch.
 #
+# SkipNote (the note glob_files and grep_files give for entries skipped by
+# name, across snapshot saves and reuse): skip-note.cfg must pass,
+# skip-note-today.cfg, fx before the note, must violate NothingSilent, and
+# each skip-note-mutation-* config must violate NoteHonest.
+#
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
 # Usage:
@@ -43,4 +48,11 @@ SnapshotSources snapshot-implementation - -deadlock
 SnapshotSources snapshot-mutation-ancestors NoStaleReuse -deadlock
 SnapshotSources snapshot-mutation-follow NoStaleReuse -deadlock
 SnapshotSources snapshot-mutation-key NoStaleReuse -deadlock
+SkipNote skip-note - -deadlock
+SkipNote skip-note-today NothingSilent -deadlock
+SkipNote skip-note-mutation-flag NoteHonest -deadlock
+SkipNote skip-note-mutation-unsaved NoteHonest -deadlock
+SkipNote skip-note-mutation-whole-tree NoteHonest -deadlock
+SkipNote skip-note-mutation-hidden NoteHonest -deadlock
+SkipNote skip-note-mutation-old-format NoteHonest -deadlock
 EOF

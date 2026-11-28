@@ -29,6 +29,7 @@ import {
   findFooters,
   readQuiescence,
   TERMINAL_TOOL_MARKER,
+  PROMPT_TEXT,
   traceCountersFromTrace,
 } from "./analyzer";
 import type {
@@ -126,8 +127,7 @@ function permissionDecisionResponse(): Response {
 
 const SCENARIO = "same-shell-relaunch";
 const BUFFER_SYSTEM_FRAME_BENCH = "buffer-system-frame-bench";
-const STARTUP_SCROLLBACK_DISABLED_OVERFLOW = "startup-scrollback-disabled-overflow";
-const STARTUP_SCROLLBACK_ENABLED_OVERFLOW = "startup-scrollback-enabled-overflow";
+const STARTUP_OVERFLOW = "startup-overflow";
 const ACTIVE_TOOL_PLACEMENT = "active-tool-placement";
 const USER_CARD_RESIZE_REPLAY_SCROLLBACK = "user-card-resize-replay-scrollback";
 const TUI_OBSERVABILITY_GAUNTLET = "tui-observability-gauntlet";
@@ -147,7 +147,6 @@ const DEFAULT_BENCH_SIZES: RenderLabTerminalSize[] = [
 ];
 const BENCHMARK_COMBINED_P95_LIMIT_MS = 8;
 const BENCHMARK_P95_MIN_RUNS = 20;
-const PROMPT_TEXT = "FX_RENDER_LAB%";
 const TRACE_SCOPES =
   "render,paint,resize,scroll,footer.clean,input,permission,frame_layout,frame_plan,frame_diff,frame_commit,frame_owner_violation,frame_schedule,ui_activity";
 const QUIESCENCE_INTERVAL_MS = 300;
@@ -192,17 +191,8 @@ export async function runRenderLab(rawOptions: Partial<Options> = {}): Promise<R
       results.push(await runUserCardResizeReplayScrollback(options.out, i + 1));
     } else if (options.scenario === TUI_OBSERVABILITY_GAUNTLET) {
       results.push(await runTuiObservabilityGauntlet(options.out, i + 1));
-    } else if (
-      options.scenario === STARTUP_SCROLLBACK_DISABLED_OVERFLOW ||
-      options.scenario === STARTUP_SCROLLBACK_ENABLED_OVERFLOW
-    ) {
-      results.push(
-        await runStartupScrollbackOverflow(
-          options.out,
-          i + 1,
-          options.scenario === STARTUP_SCROLLBACK_ENABLED_OVERFLOW,
-        ),
-      );
+    } else if (options.scenario === STARTUP_OVERFLOW) {
+      results.push(await runStartupOverflow(options.out, i + 1));
     } else if (isNativeScenario(options.scenario)) {
       results.push(await runNativeRenderLab(options.scenario, options.out, i + 1));
     } else {
@@ -213,8 +203,7 @@ export async function runRenderLab(rawOptions: Partial<Options> = {}): Promise<R
           ACTIVE_TOOL_PLACEMENT,
           USER_CARD_RESIZE_REPLAY_SCROLLBACK,
           TUI_OBSERVABILITY_GAUNTLET,
-          STARTUP_SCROLLBACK_DISABLED_OVERFLOW,
-          STARTUP_SCROLLBACK_ENABLED_OVERFLOW,
+          STARTUP_OVERFLOW,
           ...nativeScenarioNames(),
         ].join(", ")}`,
       );
@@ -1035,16 +1024,10 @@ function activeToolPlacement(
   return markerRows[0] === footer.topDivider - 1 ? "transient" : "transcript";
 }
 
-async function runStartupScrollbackOverflow(
-  outRoot: string,
-  runNumber: number,
-  startupScrollback: boolean,
-): Promise<RenderLabManifest> {
+async function runStartupOverflow(outRoot: string, runNumber: number): Promise<RenderLabManifest> {
   preflight();
 
-  const scenario = startupScrollback
-    ? STARTUP_SCROLLBACK_ENABLED_OVERFLOW
-    : STARTUP_SCROLLBACK_DISABLED_OVERFLOW;
+  const scenario = STARTUP_OVERFLOW;
   const startedAt = new Date();
   const markerSuffix = randomBytes(4).toString("hex");
   const runId = `${scenario}-${timestampForPath(startedAt)}-${runNumber}-${markerSuffix}`;
@@ -1092,7 +1075,7 @@ async function runStartupScrollbackOverflow(
   mkdirSync(join(fixture.home, ".fx"), { recursive: true });
   writeFileSync(
     join(fixture.home, ".fx", "settings.json"),
-    `${JSON.stringify({ startup_scrollback: startupScrollback })}\n`,
+    `${JSON.stringify({})}\n`,
   );
   const gateway = startLocalGatewayFixture(promptTail);
   let session: RenderLabTmux | null = null;
@@ -2496,9 +2479,8 @@ function printHelp(): void {
       "benchmark scenarios:",
       `  ${BUFFER_SYSTEM_FRAME_BENCH}`,
       "",
-      "startup scrollback scenarios:",
-      `  ${STARTUP_SCROLLBACK_DISABLED_OVERFLOW}`,
-      `  ${STARTUP_SCROLLBACK_ENABLED_OVERFLOW}`,
+      "startup scenarios:",
+      `  ${STARTUP_OVERFLOW}`,
       "",
       "activity scenarios:",
       `  ${ACTIVE_TOOL_PLACEMENT}`,
@@ -2523,9 +2505,8 @@ function printScenarioList(): void {
       "benchmark scenarios:",
       `  ${BUFFER_SYSTEM_FRAME_BENCH}`,
       "",
-      "startup scrollback scenarios:",
-      `  ${STARTUP_SCROLLBACK_DISABLED_OVERFLOW}`,
-      `  ${STARTUP_SCROLLBACK_ENABLED_OVERFLOW}`,
+      "startup scenarios:",
+      `  ${STARTUP_OVERFLOW}`,
       "",
       "activity scenarios:",
       `  ${ACTIVE_TOOL_PLACEMENT}`,
