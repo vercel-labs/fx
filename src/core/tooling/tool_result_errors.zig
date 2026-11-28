@@ -266,12 +266,23 @@ fn heldByMalformedResponse(
         if (review_cause) |cause| cause.is_malformed_completion() else false;
 }
 
+/// Whether a review cleared the action but did not read the user's full stored
+/// answers, so fx holds it as unavailable.
+fn heldByUnreadStoredAnswers(
+    reason: types.ToolPermissionDenialReason,
+    review_cause: ?auto_classifier.InvalidReason,
+) bool {
+    return reason == .review_unavailable and
+        if (review_cause) |cause| cause == .stored_answers_unread else false;
+}
+
 fn heldMessage(
     tool_name: []const u8,
     reason: types.ToolPermissionDenialReason,
     review_cause: ?auto_classifier.InvalidReason,
 ) []const u8 {
     if (heldByMalformedResponse(reason, review_cause)) return "Safety reviewer returned an invalid response; action held";
+    if (heldByUnreadStoredAnswers(reason, review_cause)) return "Held: the review could not read the user's full answers to the earlier question.";
     return permissionDeniedMessage(tool_name, reason);
 }
 
@@ -281,6 +292,8 @@ fn heldSuggestion(
 ) []const u8 {
     if (heldByMalformedResponse(reason, review_cause))
         return "The action did not run because the reviewer did not return a valid decision. Continue with a different safe action or retry in a later turn.";
+    if (heldByUnreadStoredAnswers(reason, review_cause))
+        return "The action did not run because the review could not read all of the user's answers to the earlier question. Ask again with fewer or shorter questions, or continue with a different safe action.";
     return permissionDeniedSuggestion(reason);
 }
 
@@ -625,6 +638,23 @@ test "review response errors distinguish invalid decisions from unavailable tran
     const caution = try toolReviewHeldJson(alloc, "edit_file", .review_caution, "Concrete injection", null);
     defer alloc.free(caution);
     try std.testing.expect(std.mem.find(u8, caution, "Action held after safety review") != null);
+}
+
+test "a review that cleared without reading stored answers is held as unavailable" {
+    const alloc = std.testing.allocator;
+    const output = try toolReviewHeldJson(alloc, "shell", .review_unavailable, null, .stored_answers_unread);
+    defer alloc.free(output);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{});
+    defer parsed.deinit();
+    const detail = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("Held: the review could not read the user's full answers to the earlier question.", detail.get("message").?.string);
+    try std.testing.expectEqualStrings("stored_answers_unread", detail.get("review_cause").?.string);
+    try std.testing.expectEqualStrings("review_unavailable", detail.get("reason").?.string);
+    try std.testing.expect(detail.get("held").?.bool);
+    try std.testing.expectEqualStrings(
+        "The action did not run because the review could not read all of the user's answers to the earlier question. Ask again with fewer or shorter questions, or continue with a different safe action.",
+        detail.get("suggestion").?.string,
+    );
 }
 
 test "review hold JSON preserves typed reasons apart from permission denial" {

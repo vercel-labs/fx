@@ -1081,8 +1081,10 @@ const App = struct {
         var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
         // Failed startups (no TTY, too small) never earn a shutdown report.
         const was_interactive = self.terminal.raw_enabled or self.terminal.signal_handler_installed;
-        // Hand the terminal back first; nothing below renders.
-        self.releaseTerminal();
+        // Hand the terminal back first; nothing below renders. Keep close
+        // handlers installed until persistence finishes (`TuiClose.tla` CloseSavesRequest).
+        self.releaseTerminalForProcessExit();
+        defer app_lifecycle.uninstallAbnormalExitHandlers();
         shutdown_trace.mark("terminal_released");
 
         // Exit never waits, not even for a sign-in refresh, which is never cut
@@ -1265,6 +1267,16 @@ const App = struct {
     pub fn releaseTerminal(self: *App) void {
         if (!self.terminal.raw_enabled and !self.terminal.signal_handler_installed) return;
         app_lifecycle.shutdownInteractiveShell(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+            self.terminalTitle(),
+        );
+    }
+
+    pub fn releaseTerminalForProcessExit(self: *App) void {
+        if (!self.terminal.raw_enabled and !self.terminal.signal_handler_installed) return;
+        app_lifecycle.shutdownInteractiveShellForProcessExit(
             &self.terminal,
             &self.shell,
             &self.metrics,
