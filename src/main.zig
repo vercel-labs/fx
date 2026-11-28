@@ -2089,6 +2089,11 @@ const App = struct {
         return self.mods.takeNotices();
     }
 
+    pub fn takeModSkillsRefresh(self: *App) bool {
+        if (comptime build_options.libfx or !host_profile.mods) return false;
+        return self.mods.takeSkillsRefresh();
+    }
+
     pub fn refreshMcpCompletion(self: *App) void {
         self.mcp.refreshCompletion();
     }

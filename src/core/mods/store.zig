@@ -748,6 +748,139 @@ fn copyAndValidateSource(
     return null;
 }
 
+fn isSkippedSourceEntry(depth: usize, name: []const u8) bool {
+    return depth == 0 and std.mem.eql(u8, name, source_git_dir_name);
+}
+
+fn isStoreAddedEntry(depth: usize, name: []const u8) bool {
+    return depth == 0 and std.mem.eql(u8, name, record_file_name);
+}
+
+/// SHA-256 over the mod's regular files in sorted relative-path order.
+/// Hashes each file's relative path, NUL, executable bit, size, and bytes,
+/// sharing the store's skip rules (`isSkippedSourceEntry`, `isStoreAddedEntry`)
+/// and never following links inside `dir_path`. Returns null on links, special
+/// files, read errors, or copy limits.
+pub fn treeDigest(alloc: std.mem.Allocator, io: std.Io, dir_path: []const u8) ?[std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    return treeDigestInner(alloc, io, dir_path) catch null;
+}
+
+fn treeDigestInner(alloc: std.mem.Allocator, io: std.Io, dir_path: []const u8) !?[std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var root_dir = std.Io.Dir.cwd().openDir(io, dir_path, .{
+        .iterate = true,
+        .follow_symlinks = true,
+    }) catch return null;
+    defer root_dir.close(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var files: std.ArrayList([]const u8) = .empty;
+    var file_count: usize = 0;
+    if (!(try collectDigestFiles(arena, io, root_dir, "", &files, &file_count, 0))) return null;
+
+    std.sort.insertion([]const u8, files.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var total_bytes: u64 = 0;
+    var read_buf: [8192]u8 = undefined;
+    var transfer_buf: [copy_chunk_bytes]u8 = undefined;
+
+    for (files.items) |rel| {
+        var file = (openRelFileNoFollow(root_dir, io, rel) catch return null) orelse return null;
+        defer file.close(io);
+
+        const st = file.stat(io) catch return null;
+        if (st.kind != .file) return null;
+
+        const exec_bit: u8 = if ((st.permissions.toMode() & 0o111) != 0) 1 else 0;
+        const size_u64: u64 = @intCast(st.size);
+        hasher.update(rel);
+        hasher.update(&.{ 0, exec_bit });
+        hasher.update(std.mem.asBytes(&size_u64));
+
+        var reader = file.readerStreaming(io, &read_buf);
+        var file_bytes: u64 = 0;
+        while (true) {
+            const n = reader.interface.readSliceShort(&transfer_buf) catch return null;
+            if (n == 0) break;
+            total_bytes += n;
+            if (total_bytes > max_copy_bytes) return null;
+            file_bytes += n;
+            hasher.update(transfer_buf[0..n]);
+        }
+        if (file_bytes != size_u64) return null;
+    }
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn collectDigestFiles(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    prefix: []const u8,
+    files: *std.ArrayList([]const u8),
+    file_count: *usize,
+    depth: usize,
+) !bool {
+    if (depth >= max_copy_depth) return false;
+    var it = dir.iterate();
+    while (it.next(io) catch return false) |entry| {
+        if (isSkippedSourceEntry(depth, entry.name) or isStoreAddedEntry(depth, entry.name)) continue;
+        const kind = resolveEntryKind(dir, io, entry.name, entry.kind) catch return false;
+        const rel = if (prefix.len == 0)
+            try arena.dupe(u8, entry.name)
+        else
+            try arena.print("{s}/{s}", .{ prefix, entry.name });
+        switch (kind) {
+            .sym_link => return false,
+            .directory => {
+                var child = dir.openDir(io, entry.name, .{
+                    .iterate = true,
+                    .follow_symlinks = false,
+                }) catch return false;
+                defer child.close(io);
+                if (!(try collectDigestFiles(arena, io, child, rel, files, file_count, depth + 1))) return false;
+            },
+            .file => {
+                file_count.* += 1;
+                if (file_count.* > max_copy_files) return false;
+                try files.append(arena, rel);
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn openRelFileNoFollow(root_dir: std.Io.Dir, io: std.Io, rel: []const u8) !?std.Io.File {
+    var cur = root_dir;
+    var close_cur = false;
+    defer if (close_cur) cur.close(io);
+
+    var parts = std.mem.splitScalar(u8, rel, '/');
+    var seg = parts.next() orelse return null;
+    while (parts.next()) |next_seg| {
+        const next_dir = cur.openDir(io, seg, .{ .follow_symlinks = false }) catch return null;
+        if (close_cur) cur.close(io);
+        cur = next_dir;
+        close_cur = true;
+        seg = next_seg;
+    }
+    return cur.openFile(io, seg, .{
+        .mode = .read_only,
+        .follow_symlinks = false,
+    }) catch null;
+}
+
 fn copyDirTree(
     io: std.Io,
     src_dir: std.Io.Dir,
@@ -759,9 +892,9 @@ fn copyDirTree(
 
     var it = src_dir.iterate();
     while (try it.next(io)) |entry| {
-        if (depth == 0 and std.mem.eql(u8, entry.name, source_git_dir_name)) continue;
+        if (isSkippedSourceEntry(depth, entry.name)) continue;
         const kind = try resolveEntryKind(src_dir, io, entry.name, entry.kind);
-        if (depth == 0 and std.mem.eql(u8, entry.name, record_file_name)) return .reserved_source_record;
+        if (isStoreAddedEntry(depth, entry.name)) return .reserved_source_record;
         switch (kind) {
             .sym_link => return .symlink,
             .directory => {
@@ -1729,4 +1862,62 @@ test "cleanup sweeps stray pin files and keeps versions held by a second open of
     try std.testing.expectError(error.FileNotFound, pins_dir.statFile(std.testing.io, v1_folder, .{}));
     try std.testing.expectError(error.FileNotFound, pins_dir.statFile(std.testing.io, stray_busy, .{}));
     _ = try pins_dir.statFile(std.testing.io, other_stray, .{});
+}
+
+test "treeDigest hashes regular files in sorted path order, ignores .git and source record, and matches a store copy" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const src = try writeModSource(alloc, &tmp, "src", "glm", "1.0.0");
+    defer alloc.free(src);
+    var src_dir = try std.Io.Dir.cwd().openDir(io, src, .{});
+    defer src_dir.close(io);
+    try writeFileRel(src_dir, "bin/auth", "#!/bin/sh\necho ok\n");
+
+    const base = treeDigest(alloc, io, src).?;
+    // Same tree gives the same digest.
+    try std.testing.expectEqualSlices(u8, &base, &treeDigest(alloc, io, src).?);
+
+    // Skipped `.git` and store-added `.fx-mod-source.json` do not change the digest.
+    try writeFileRel(src_dir, ".git/HEAD", "ref: refs/heads/main\n");
+    try std.testing.expectEqualSlices(u8, &base, &treeDigest(alloc, io, src).?);
+
+    // A fresh store copy (including its `.fx-mod-source.json` and stripped `.git`) hashes equal to its source.
+    const root = try makeTempDirPath(alloc, &tmp, "root");
+    defer alloc.free(root);
+    var state: TestLockState = .{};
+    defer state.steps.deinit(alloc);
+    const s = testStore(root, &state);
+    try std.testing.expectEqual(Outcome.ok, try add(alloc, s, "glm", src, "{\"source\":\"/tmp/src\",\"pinned\":false}"));
+    const link_path = try std.Io.Dir.path.join(alloc, &.{ root, "glm" });
+    defer alloc.free(link_path);
+    const installed_digest = treeDigest(alloc, io, link_path).?;
+    try std.testing.expectEqualSlices(u8, &base, &installed_digest);
+
+    // Adding `.fx-mod-source.json` directly in a tree does not change its digest either.
+    try writeFileRel(src_dir, record_file_name, "{\"source\":\"other\"}");
+    try std.testing.expectEqualSlices(u8, &base, &treeDigest(alloc, io, src).?);
+
+    // Changing the executable bit gives a new digest.
+    var auth_file = try src_dir.openFile(io, "bin/auth", .{ .mode = .read_write });
+    try auth_file.setPermissions(io, std.Io.File.Permissions.fromMode(0o755));
+    auth_file.close(io);
+    const after_exec = treeDigest(alloc, io, src).?;
+    try std.testing.expect(!std.mem.eql(u8, &base, &after_exec));
+
+    // Changing a byte gives a new digest.
+    try writeFileRel(src_dir, "bin/auth", "#!/bin/sh\necho hi\n");
+    const after_byte = treeDigest(alloc, io, src).?;
+    try std.testing.expect(!std.mem.eql(u8, &after_exec, &after_byte));
+
+    // Renaming a file gives a new digest.
+    try src_dir.rename("bin/auth", src_dir, "bin/auth2", io);
+    const after_rename = treeDigest(alloc, io, src).?;
+    try std.testing.expect(!std.mem.eql(u8, &after_byte, &after_rename));
+
+    // A symlink inside the tree returns null.
+    try src_dir.symLink(io, "mod.json", "link.json", .{});
+    try std.testing.expect(treeDigest(alloc, io, src) == null);
 }

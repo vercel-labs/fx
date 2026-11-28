@@ -195,7 +195,7 @@ pub const mcp_approve_options = [_]command_specs.OptionDoc{
 };
 
 pub const mod_add_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--yes", .description = "Skip the install confirmation prompt" },
+    .{ .flag = "--yes", .description = "Skip the install or update confirmation prompt" },
 };
 pub const mod_list_options = [_]command_specs.OptionDoc{json_option};
 pub const mod_show_options = [_]command_specs.OptionDoc{json_option};
@@ -207,7 +207,7 @@ const mod_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "list", .description = "List installed mods", .options = &mod_list_options },
     .{ .usage = "show NAME", .description = "Show details for an installed mod", .options = &mod_show_options },
     .{ .usage = "add SOURCE", .description = "Install a mod from a folder or git URL[@ref]", .options = &mod_add_options },
-    .{ .usage = "update [NAME]", .description = "Update one mod, or every installed mod" },
+    .{ .usage = "update [NAME]", .description = "Update one mod, or every installed mod", .options = &mod_add_options },
     .{ .usage = "enable NAME", .description = "Enable an installed mod (alias: on)" },
     .{ .usage = "disable NAME", .description = "Disable an installed mod (alias: off)" },
     .{ .usage = "remove NAME", .description = "Remove an installed mod" },

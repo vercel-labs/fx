@@ -1166,3 +1166,158 @@ describe("mod threats in the installed store", () => {
     }
   }, 90000);
 });
+
+describe("mod preview, update confirmation, and live TUI refresh", () => {
+  test("update refuses a sign-in command change without a terminal, keeps old version, updates with --yes, and skips prompt on version-only change", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    try {
+      const folder = makeModFolder(
+        f,
+        "glm",
+        glmManifest("http://127.0.0.1:1/v1", ["bin/auth-v1"], "1.0.0"),
+        { "bin/auth-v1": "#!/bin/sh\necho tok-1\n", "bin/auth-v2": "#!/bin/sh\necho tok-2\n" },
+        ["bin/auth-v1", "bin/auth-v2"],
+      );
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+
+      // Version-only update needs no question when there is no command.
+      // With a command, any file change (including mod.json's version) asks;
+      // an unchanged folder with a command installs without a question.
+      const unchanged = await fxMod(f, ["update", "glm"]);
+      expect(unchanged.code, unchanged.stderr).toBe(0);
+      expect(unchanged.stdout).toContain("Updated glm from folder.");
+
+      // Replacing only bin/sign-in bytes (same argv) without TTY or --yes is refused and keeps 1.0.0.
+      writeFile(folder, "bin/auth-v1", "#!/bin/sh\necho tok-1-tampered\n", true);
+      const tampered = await fxMod(f, ["update", "glm"]);
+      expect(tampered.code).toBe(1);
+      expect(tampered.stderr).toContain("This update changes the files of a mod that runs a sign-in command.");
+      expect(tampered.stderr).toContain("--yes");
+      expect((await listJson(f)).mods[0]).toMatchObject({ version: "1.0.0" });
+
+      // Changing sign-in command without TTY or --yes is refused and keeps 1.0.0.
+      writeFile(folder, "mod.json", JSON.stringify(glmManifest("http://127.0.0.1:1/v1", ["bin/auth-v2"], "2.0.0")));
+      const refused = await fxMod(f, ["update", "glm"]);
+      expect(refused.code).toBe(1);
+      expect(refused.stderr).toContain("This update adds or changes a sign-in command.");
+      expect(refused.stderr).toContain("This update changes the files of a mod that runs a sign-in command.");
+      expect(refused.stderr).toContain("--yes");
+      expect((await listJson(f)).mods[0]).toMatchObject({ version: "1.0.0" });
+
+      // `--yes` updates to 2.0.0.
+      const forced = await fxMod(f, ["update", "glm", "--yes"]);
+      expect(forced.code, forced.stderr).toBe(0);
+      expect(forced.stdout).toContain("Updated glm from folder.");
+      expect((await listJson(f)).mods[0]).toMatchObject({ version: "2.0.0" });
+
+      // Version-only update of a commandless mod needs no question.
+      const plain = makeModFolder(f, "plain", { name: "plain", version: "1.0.0", description: "Plain" });
+      expect((await fxMod(f, ["add", "--yes", plain])).code).toBe(0);
+      writeFile(plain, "mod.json", JSON.stringify({ name: "plain", version: "1.1.0", description: "Plain" }));
+      const plainUpdate = await fxMod(f, ["update", "plain"]);
+      expect(plainUpdate.code, plainUpdate.stderr).toBe(0);
+      expect(plainUpdate.stdout).toContain("Updated plain from folder.");
+      expect((await listJson(f)).mods.find(m => m.name === "plain")).toMatchObject({ version: "1.1.0" });
+    } finally {
+      f.close();
+    }
+  }, 60000);
+
+  test("the install screen and fx mod show --json list skills, profiles (with ignored permission_mode note), and themes", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    try {
+      const folder = makeModFolder(
+        f,
+        "pack",
+        { name: "pack", version: "1.0.0", description: "Asset pack" },
+        {
+          "skills/review/SKILL.md": skillMd("review", "Review skill"),
+          "agents/auditor/profile.json": JSON.stringify({ description: "Auditor", permission_mode: "yolo" }),
+          "agents/helper/profile.json": JSON.stringify({ description: "Helper" }),
+          "themes/nord.json": themeFile("#112233"),
+        },
+      );
+
+      // Install screen (shown even when refused without a terminal).
+      const preview = await fxMod(f, ["add", folder]);
+      expect(preview.code).toBe(1);
+      expect(preview.stderr).toContain("skills       1");
+      expect(preview.stderr).toContain("    review");
+      expect(preview.stderr).toContain("profiles     2");
+      expect(preview.stderr).toContain("    auditor  (fx ignores its permission_mode)");
+      expect(preview.stderr).toContain("    helper\n");
+      expect(preview.stderr).toContain("themes       1");
+      expect(preview.stderr).toContain("    nord");
+
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+
+      const shown = await fxMod(f, ["show", "pack", "--json"]);
+      expect(shown.code, shown.stderr).toBe(0);
+      expect(JSON.parse(shown.stdout)).toMatchObject({
+        kind: "mod_show",
+        name: "pack",
+        skills: ["review"],
+        profiles: [
+          { name: "auditor", permission_mode_ignored: true },
+          { name: "helper", permission_mode_ignored: false },
+        ],
+        themes: ["nord"],
+      });
+    } finally {
+      f.close();
+    }
+  }, 60000);
+
+  test.skipIf(!tmuxAvailable())("/mods update with a command change shows the screen and --yes hint in tmux", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    let session: TmuxSession | null = null;
+    try {
+      const folder = makeModFolder(
+        f,
+        "glm",
+        glmManifest("http://127.0.0.1:1/v1", ["bin/auth-v1"], "1.0.0"),
+        { "bin/auth-v1": "#!/bin/sh\necho tok-1\n", "bin/auth-v2": "#!/bin/sh\necho tok-2\n" },
+        ["bin/auth-v1", "bin/auth-v2"],
+      );
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+      writeFile(folder, "mod.json", JSON.stringify(glmManifest("http://127.0.0.1:1/v1", ["bin/auth-v2"], "2.0.0")));
+
+      session = await openTui(f);
+      await session.waitForComposer(TIMEOUT_MS);
+      await session.sendText("/mods update glm");
+      await session.waitForText("Run /mods update glm --yes to update.", TIMEOUT_MS);
+      const pane = await session.capturePane();
+      expect(pane).toContain("Mod: glm (2.0.0)");
+      expect(pane).toContain("sign-in command");
+      expect((await listJson(f)).mods[0]).toMatchObject({ version: "1.0.0" });
+    } finally {
+      if (session) await session.kill();
+      f.close();
+    }
+  }, 90000);
+
+  test.skipIf(!tmuxAvailable())("/mods add --yes of a mod with a skill makes /skills list show it without a new message", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    let session: TmuxSession | null = null;
+    try {
+      const folder = makeModFolder(
+        f,
+        "instant",
+        { name: "instant", version: "1.0.0", description: "Instant skill mod" },
+        { "skills/instant-skill/SKILL.md": skillMd("instant-skill", "Instant skill") },
+      );
+
+      session = await openTui(f);
+      await session.waitForComposer(TIMEOUT_MS);
+      await session.sendText(`/mods add ${folder} --yes`);
+      await session.waitForText("Installed instant (1.0.0).", TIMEOUT_MS);
+
+      await session.sendText("/skills list");
+      const pane = await waitForPane(session, p => p.includes("instant-skill"));
+      expect(pane).toContain("mod instant");
+    } finally {
+      if (session) await session.kill();
+      f.close();
+    }
+  }, 90000);
+});

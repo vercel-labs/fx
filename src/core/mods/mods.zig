@@ -161,6 +161,41 @@ pub const RefreshResult = union(enum) {
     refused: store.Outcome,
 };
 
+pub const PreparedUpdate = struct {
+    name: []const u8,
+    is_git: bool,
+    old_commit: ?[]const u8 = null,
+    new_commit: ?[]const u8 = null,
+    files_changed: bool = true,
+    old_providers: ?configured_provider.Registry = null,
+    install: PreparedInstall,
+
+    pub fn discard(self: *PreparedUpdate, alloc: std.mem.Allocator) void {
+        if (self.old_providers) |*reg| reg.deinit(alloc);
+        self.install.discard(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PrepareUpdateResult = union(enum) {
+    prepared: PreparedUpdate,
+    not_installed,
+    bad_mod,
+    no_record,
+    bad_record,
+    pinned: []const u8,
+    up_to_date: []const u8,
+    source_missing: []const u8,
+    fetch_failed: source.Failed,
+    no_manifest,
+    bad_manifest: manifest.DecodeError,
+    bad_providers: struct {
+        path: []const u8,
+        err: anyerror,
+    },
+    refused: store.Outcome,
+};
+
 pub const PreparedInstall = struct {
     manifest: manifest.Manifest,
     providers: ?configured_provider.Registry = null,
@@ -259,22 +294,26 @@ pub fn install(
     };
 }
 
-/// A pinned mod is left alone. A git mod fetches its default branch: the same
-/// commit is up to date, and a new one replaces the mod. A folder mod copies
-/// the folder again when it still exists.
-pub fn refresh(
+/// Prepares an update for installed mod `name` without modifying the store:
+/// reads the currently installed providers (under a short pin when enabled),
+/// fetches the new version, decodes `mod.json`, and parses any new providers.
+/// On `.prepared`, caller must call `prepared.discard(alloc)` afterward.
+pub fn prepareUpdate(
     alloc: std.mem.Allocator,
     root_path: []const u8,
     name: []const u8,
     cancel: ?*const std.atomic.Value(bool),
-) !RefreshResult {
+) !PrepareUpdateResult {
     var loaded = try store.load(alloc, realStore(root_path), name);
     defer loaded.deinit(alloc);
-    switch (loaded) {
+    const old_mod = switch (loaded) {
         .none => return .not_installed,
         .bad => return .bad_mod,
-        .mod => {},
-    }
+        .mod => |m| m,
+    };
+    const old_on = old_mod.on;
+    const old_path_copy = try alloc.dupe(u8, old_mod.path);
+    defer alloc.free(old_path_copy);
 
     const maybe_bytes = store.readRecord(alloc, realStore(root_path), name) catch |err| switch (err) {
         error.RecordTooLarge => return .bad_record,
@@ -286,10 +325,159 @@ pub fn refresh(
         error.BadRecord => return .bad_record,
     };
     if (record.pinned) return .{ .pinned = record.ref orelse "" };
-    return switch (source.parse(record.source)) {
-        .git => |git| refreshGit(alloc, root_path, name, record, git, cancel),
-        .local => |path| refreshFolder(alloc, root_path, name, path),
-        .invalid => .bad_record,
+
+    var is_git = false;
+    var prep_res: PrepareResult = undefined;
+    switch (source.parse(record.source)) {
+        .git => |git| {
+            is_git = true;
+            const scratch = try std.Io.Dir.path.join(alloc, &.{ root_path, scratch_dir_name });
+            defer alloc.free(scratch);
+            const fetched = switch (try source.fetch(alloc, gitOps(), git, scratch, cancel)) {
+                .ok => |ok| ok,
+                .failed => |failed| return .{ .fetch_failed = failed },
+            };
+            if (record.commit) |old_commit| {
+                if (std.mem.eql(u8, old_commit, fetched.commit)) {
+                    source.discard(io_mod.getIo(), fetched.temp);
+                    return .{ .up_to_date = fetched.commit };
+                }
+            }
+            prep_res = try prepareFrom(alloc, root_path, fetched.dir, git.url, fetched.commit, fetched.record, fetched.temp);
+        },
+        .local => |path| {
+            const folder = (try resolveFolder(alloc, io_mod.getIo(), path)) orelse return .{ .source_missing = path };
+            defer alloc.free(folder);
+            const new_record = try source.folderRecord(alloc, folder);
+            defer alloc.free(new_record);
+            prep_res = try prepareFrom(alloc, root_path, folder, folder, null, new_record, null);
+        },
+        .invalid => return .bad_record,
+    }
+
+    switch (prep_res) {
+        .prepared => |p| {
+            var p_mut = p;
+            if (!std.mem.eql(u8, p.manifest.name, name)) {
+                p_mut.discard(alloc);
+                return .{ .refused = .{ .invalid = .name_mismatch } };
+            }
+            const owned = p.arena.allocator();
+            const old_commit_copy = if (record.commit) |c| try owned.dupe(u8, c) else null;
+            const old_state = readInstalledState(alloc, root_path, name, old_on, old_path_copy);
+            const new_digest = store.treeDigest(alloc, io_mod.getIo(), p.dir);
+            const files_changed = if (old_state.digest != null and new_digest != null)
+                !std.mem.eql(u8, &old_state.digest.?, &new_digest.?)
+            else
+                true;
+            return .{ .prepared = .{
+                .name = try owned.dupe(u8, name),
+                .is_git = is_git,
+                .old_commit = old_commit_copy,
+                .new_commit = p.commit,
+                .files_changed = files_changed,
+                .old_providers = old_state.providers,
+                .install = p,
+            } };
+        },
+        .not_a_folder => |path| return .{ .source_missing = path },
+        .source_invalid => return .bad_record,
+        .fetch_failed => |failed| return .{ .fetch_failed = failed },
+        .no_manifest => return .no_manifest,
+        .bad_manifest => |err| return .{ .bad_manifest = err },
+        .bad_providers => |bad| return .{ .bad_providers = .{ .path = bad.path, .err = bad.err } },
+    }
+}
+
+const InstalledState = struct {
+    providers: ?configured_provider.Registry = null,
+    digest: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
+};
+
+fn readInstalledState(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+    name: []const u8,
+    old_on: bool,
+    old_link_path: []const u8,
+) InstalledState {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    var pinned_opt: ?Pin = null;
+    defer if (pinned_opt) |*p| p.release(alloc, io_mod.getIo());
+
+    const read_dir: []const u8 = if (old_on) blk: {
+        switch (pin(alloc, root_path, name) catch return .{}) {
+            .pinned => |p| {
+                pinned_opt = p;
+                break :blk p.path;
+            },
+            .not_installed, .bad_link, .busy => return .{},
+        }
+    } else old_link_path;
+
+    const digest = store.treeDigest(alloc, io_mod.getIo(), read_dir);
+    const decoded = switch (readManifest(scratch, io_mod.getIo(), read_dir) catch return .{ .digest = digest }) {
+        .ok => |m| m,
+        .missing, .bad => return .{ .digest = digest },
+    };
+    const providers_val = decoded.providers orelse return .{ .digest = digest };
+    const canonical_link = std.Io.Dir.path.join(scratch, &.{ root_path, name }) catch return .{ .digest = digest };
+    var at: configured_provider.FailurePath = .{};
+    const reg = configured_provider.Registry.parse_located_for_mod(
+        alloc,
+        providers_val,
+        &at,
+        .{ .name = name, .dir = canonical_link },
+    ) catch null;
+    return .{ .providers = reg, .digest = digest };
+}
+
+/// Commits a prepared update into the store under its lock.
+pub fn commitUpdate(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+    prepared: *const PreparedUpdate,
+) !RefreshResult {
+    const outcome = try store.update(alloc, realStore(root_path), prepared.name, prepared.install.dir, prepared.install.record);
+    return switch (outcome) {
+        .ok => if (prepared.is_git)
+            .{ .updated = .{ .old_commit = prepared.old_commit, .new_commit = prepared.new_commit orelse "" } }
+        else
+            .folder_copied,
+        else => .{ .refused = outcome },
+    };
+}
+
+/// A pinned mod is left alone. A git mod fetches its default branch: the same
+/// commit is up to date, and a new one replaces the mod. A folder mod copies
+/// the folder again when it still exists.
+pub fn refresh(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+    name: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+) !RefreshResult {
+    return switch (try prepareUpdate(alloc, root_path, name, cancel)) {
+        .prepared => |prep_const| blk: {
+            var prep = prep_const;
+            defer prep.discard(alloc);
+            break :blk commitUpdate(alloc, root_path, &prep);
+        },
+        .not_installed => .not_installed,
+        .bad_mod => .bad_mod,
+        .no_record => .no_record,
+        .bad_record => .bad_record,
+        .pinned => |ref| .{ .pinned = ref },
+        .up_to_date => |commit| .{ .up_to_date = commit },
+        .source_missing => |path| .{ .source_missing = path },
+        .fetch_failed => |failed| .{ .fetch_failed = failed },
+        .no_manifest => .{ .refused = .{ .invalid = .no_manifest } },
+        .bad_manifest => .{ .refused = .{ .invalid = .bad_manifest } },
+        .bad_providers => .{ .refused = .{ .invalid = .bad_manifest } },
+        .refused => |outcome| .{ .refused = outcome },
     };
 }
 
@@ -409,39 +597,6 @@ fn prepareFrom(
         .temp_to_discard = if (temp_to_discard) |t| try owned.dupe(u8, t) else null,
         .arena = arena,
     } };
-}
-
-fn refreshGit(
-    alloc: std.mem.Allocator,
-    root_path: []const u8,
-    name: []const u8,
-    old: source.Record,
-    git: source.Git,
-    cancel: ?*const std.atomic.Value(bool),
-) !RefreshResult {
-    const scratch = try std.Io.Dir.path.join(alloc, &.{ root_path, scratch_dir_name });
-    const fetched = switch (try source.fetch(alloc, gitOps(), git, scratch, cancel)) {
-        .ok => |ok| ok,
-        .failed => |failed| return .{ .fetch_failed = failed },
-    };
-    defer source.discard(io_mod.getIo(), fetched.temp);
-    if (old.commit) |old_commit| {
-        if (std.mem.eql(u8, old_commit, fetched.commit)) return .{ .up_to_date = fetched.commit };
-    }
-    const outcome = try store.update(alloc, realStore(root_path), name, fetched.dir, fetched.record);
-    return switch (outcome) {
-        .ok => .{ .updated = .{ .old_commit = old.commit, .new_commit = fetched.commit } },
-        else => .{ .refused = outcome },
-    };
-}
-
-fn refreshFolder(alloc: std.mem.Allocator, root_path: []const u8, name: []const u8, path: []const u8) !RefreshResult {
-    const folder = (try resolveFolder(alloc, io_mod.getIo(), path)) orelse return .{ .source_missing = path };
-    const record = try source.folderRecord(alloc, folder);
-    return switch (try store.update(alloc, realStore(root_path), name, folder, record)) {
-        .ok => .folder_copied,
-        else => |outcome| .{ .refused = outcome },
-    };
 }
 
 /// The real path of `path` when it is a folder, null when it is not one.

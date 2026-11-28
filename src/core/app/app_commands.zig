@@ -375,6 +375,13 @@ pub fn Handlers(comptime App: type) type {
                 std.heap.c_allocator.free(notices);
             }
             for (notices) |n| try app.writeDomainNotice(.{ .topic = "mods", .tone = if (n.warning) .warning else .neutral, .body = n.text }, true);
+            if (comptime @hasDecl(App, "takeModSkillsRefresh") and @hasDecl(App, "requestSkillsRefresh")) {
+                if (app.takeModSkillsRefresh()) {
+                    _ = app.requestSkillsRefresh() catch |err| {
+                        debug_trace.logf("mods", "skills_refresh_failed err={s}", .{@errorName(err)});
+                    };
+                }
+            }
         }
 
         pub fn collectShellSnapshotFacts(app: *App) !void {
