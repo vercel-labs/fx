@@ -35,6 +35,37 @@ describe("eval helpers", () => {
     }
   });
 
+  test("strips inherited FX_TEST_* switches while keeping credentials and explicit overrides", () => {
+    const previous = {
+      FX_HOME: process.env.FX_HOME,
+      FX_TEST_RECOVERY_RETRY_BUDGET_MS: process.env.FX_TEST_RECOVERY_RETRY_BUDGET_MS,
+      FX_TEST_MCP_IDLE_MS: process.env.FX_TEST_MCP_IDLE_MS,
+      AI_GATEWAY_API_KEY: process.env.AI_GATEWAY_API_KEY,
+    };
+    process.env.FX_HOME = "/Users/example/profile";
+    process.env.FX_TEST_RECOVERY_RETRY_BUDGET_MS = "100";
+    process.env.FX_TEST_MCP_IDLE_MS = "50";
+    process.env.AI_GATEWAY_API_KEY = "eval-key-sentinel";
+
+    try {
+      const env = buildEvalProcessEnv("/tmp/fx-eval-home-test", "selected/model");
+      expect(env).not.toHaveProperty("FX_HOME");
+      expect(env).not.toHaveProperty("FX_TEST_RECOVERY_RETRY_BUDGET_MS");
+      expect(env).not.toHaveProperty("FX_TEST_MCP_IDLE_MS");
+      expect(env.AI_GATEWAY_API_KEY).toBe("eval-key-sentinel");
+
+      const explicit = buildEvalProcessEnv("/tmp/fx-eval-home-test", "selected/model", {
+        FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+      });
+      expect(explicit.FX_TEST_RECOVERY_RETRY_BUDGET_MS).toBe("1500");
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   test("passes the eval budget to fx --timeout in seconds", () => {
     const args = buildEvalArgs("hello", 150);
     const flag = args.indexOf("--timeout");

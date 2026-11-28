@@ -161,14 +161,18 @@ function cleanupEvalHome(home: string): void {
 export function buildEvalProcessEnv(
   home: string,
   model: string,
+  own: Record<string, string | undefined> = {},
 ): Record<string, string | undefined> {
-  return {
-    ...envWithoutFxHome({ ...dotEnvVars, ...process.env }),
-    NO_COLOR: "1",
-    HOME: home,
-    PATH: process.env.PATH ?? "",
-    FX_MODEL: model,
-  };
+  return fxChildEnv(
+    {
+      NO_COLOR: "1",
+      HOME: home,
+      PATH: process.env.PATH ?? "",
+      FX_MODEL: model,
+      ...own,
+    },
+    { keepCredentials: true, inherited: { ...dotEnvVars, ...process.env } },
+  );
 }
 
 export function buildEvalArgs(prompt: string, timeoutSec: number): string[] {
@@ -525,6 +529,23 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   "FX_TEST_GATEWAY_CREDITS_URL",
   "FX_TEST_UPGRADE_BASE_URL",
   "FX_TEST_VERCEL_API_URL",
+  "FX_TEST_OAUTH_ISSUER_URL",
+  "FX_TEST_CHATGPT_ISSUER_URL",
+  "FX_TEST_CHATGPT_ORIGIN",
+  "FX_TEST_CHATGPT_REVOKE_URL",
+  "FX_TEST_CHATGPT_TOKEN_URL",
+  "FX_TEST_GROK_ISSUER_URL",
+  "FX_TEST_GROK_ORIGIN",
+  "FX_TEST_GROK_REVOKE_URL",
+  "FX_TEST_GROK_TOKEN_URL",
+  "FX_TEST_GROK_USERINFO_URL",
+  "FX_TEST_OPENAI_CODEX_MODELS_URL",
+  "FX_TEST_OPENAI_CODEX_RESPONSES_URL",
+  "FX_TEST_XAI_GROK_MODALITIES_URL",
+  "FX_TEST_XAI_GROK_MODELS_URL",
+  "FX_TEST_XAI_GROK_RESPONSES_URL",
+  "FX_TEST_SLACK_ORIGIN",
+  "FX_TEST_USAGE_CLOCK_FILE",
   "FX_PERMISSION_MODE",
   // A developer's provider choice would send a test to a login it did not set up.
   "FX_PROVIDER",
@@ -541,20 +562,32 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   // A terminal that supports program resume, such as Rex, gives each shell a
   // token, and every test's fx would then send resume reports with it.
   "OSC7577_TOKEN",
-  // fx reads its test holds in release builds, so a hold left there would
-  // stop every test's fx at it. A test that sets one passes it itself.
-  // A forced approval-screen failure left there would deny the next approval
-  // of every test's fx.
+  // fx reads its test holds, fault injections, and timing overrides in release
+  // builds, so a switch left in the outer shell would change every test's fx.
+  // A test that sets one passes it explicitly.
   "FX_TEST_APPROVAL_SCREEN_FAIL",
+  "FX_TEST_AUTH_LOCK_CONTENTION",
+  "FX_TEST_CACHE_WARMING_TTL_MS",
+  "FX_TEST_COMMAND_INDETERMINATE_AFTER_EXIT",
+  "FX_TEST_COMMAND_OUTPUT_INCOMPLETE_AFTER_EXIT",
+  "FX_TEST_DOCTOR_DEADLINE_MS",
+  "FX_TEST_FAIL_ON_DURABLE_MUTATION",
+  "FX_TEST_INPUT_LOOP_NETWORK_GUARD",
+  "FX_TEST_INSTANCES",
+  "FX_TEST_MCP_IDLE_MS",
   "FX_TEST_RECOVERY_RETRY_BUDGET_MS",
   "FX_TEST_REPORT_DELIVERY_HELD",
   "FX_TEST_REPORT_DELIVERY_RELEASE",
   "FX_TEST_SESSION_WRITE_HELD",
   "FX_TEST_SESSION_WRITE_RELEASE",
+  "FX_TEST_SHELL_QUIET_NOTICE_MS",
   "FX_TEST_SHELL_YIELD_HELD",
   "FX_TEST_SHELL_YIELD_RELEASE",
   "FX_TEST_SHUTDOWN_RELEASE_HELD",
   "FX_TEST_SHUTDOWN_RELEASE_RELEASE",
+  "FX_TEST_SKIP_ONBOARDING",
+  "FX_TEST_SKIP_WORKSPACE_TRUST",
+  "FX_TEST_STEER_YIELD_GRACE_MS",
   "FX_TEST_SUBAGENT_CLOSE_HELD",
   "FX_TEST_SUBAGENT_CLOSE_RELEASE",
   "FX_TEST_SUBAGENT_END_HELD",
@@ -563,8 +596,17 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   "FX_TEST_SUBAGENT_PUBLISH_RELEASE",
   "FX_TEST_SUBAGENT_SETTLE_HELD",
   "FX_TEST_SUBAGENT_SETTLE_RELEASE",
+  "FX_TEST_SUBAGENT_START_FAIL",
   "FX_TEST_SUBAGENT_START_HELD",
   "FX_TEST_SUBAGENT_START_RELEASE",
+  "FX_TEST_SUBAGENT_START_WAIT_MS",
+  "FX_TEST_TERMINAL_BACKEND_CLEANUP_DELAY_MS",
+  "FX_TEST_TERMINAL_COMMAND_BOUNDARY_DELAY_MS",
+  "FX_TEST_TERMINAL_FAIL_CANCELLATION_OPEN",
+  "FX_TEST_TERMINAL_FAIL_SIGNAL_STAGE",
+  "FX_TEST_TERMINAL_WRITE_BARRIER_PATH",
+  "FX_TEST_TERMINAL_WRITE_DELAY_MS",
+  "FX_TEST_UPGRADE_CHECK_INTERVAL_MS",
   "FX_TEST_WORKSPACE_CAPTURE_START_HELD",
   "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE",
   "FX_TEST_WEB_FETCH_DNS_READY",
