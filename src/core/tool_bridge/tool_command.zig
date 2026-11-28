@@ -553,12 +553,20 @@ fn callFailure(err: *Writer, command: Command, call_err: anyerror) !u8 {
     }
 }
 
-/// Shows the bridge's reply: the data on `out` for a reply that worked, with
-/// its notice on `err` after the data, and anything else on `err`, after the
-/// command's name. Returns the exit code.
+/// Shows the bridge's reply: for a reply that worked, its notice on `err`
+/// first, flushed, then the data on `out`, flushed. Anything else goes on `err`,
+/// after the command's name. Returns the exit code.
 fn printReply(arena: Allocator, out: *Writer, err: *Writer, command: Command, reply: client.Reply) !u8 {
     switch (reply.header.status) {
         .ok => {
+            // The notice is written first and flushed on its own. stdout and stderr
+            // are separate pipes that the bash tool's capture reads in the order it
+            // reaches them, which need not be the write order: the bash result has
+            // shown the data before the notice (FXC-1582).
+            if (reply.header.notice) |notice| {
+                try client.writeSafeLine(arena, err, notice);
+                try err.flush();
+            }
             try out.writeAll(reply.bytes);
             // edit and write always end with a newline, as they did before the
             // skill and agent words; those words add one only when it is missing.
@@ -566,13 +574,7 @@ fn printReply(arena: Allocator, out: *Writer, err: *Writer, command: Command, re
                 .edit, .write => try out.writeByte('\n'),
                 else => if (reply.bytes.len > 0 and reply.bytes[reply.bytes.len - 1] != '\n') try out.writeByte('\n'),
             }
-            if (reply.header.notice) |notice| {
-                // The data reaches stdout before the notice is written, so the notice
-                // never lands inside the data when both streams share a terminal.
-                try out.flush();
-                try client.writeSafeLine(arena, err, notice);
-                try err.flush();
-            }
+            try out.flush();
             return client.exit.ok;
         },
         .tool_error => return refusal(arena, err, command, reply.bytes, client.exit.tool_error),
@@ -1045,7 +1047,7 @@ const LogWriter = struct {
     }
 };
 
-test "fx tool writes the notice after all of the data when stdout and stderr are both buffered" {
+test "fx tool writes the notice before all of the data when stdout and stderr are both buffered" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -1063,7 +1065,7 @@ test "fx tool writes the notice after all of the data when stdout and stderr are
     try out.interface.flush();
     try err.interface.flush();
     try std.testing.expectEqual(client.exit.ok, code);
-    try std.testing.expectEqualStrings(page ++ "\nthe notice, which is longer than the buffer\n", log.items);
+    try std.testing.expectEqualStrings("the notice, which is longer than the buffer\n" ++ page ++ "\n", log.items);
 }
 
 test "parse reads skill and agent verbs with options, and rejects bad usage" {
