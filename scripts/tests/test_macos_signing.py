@@ -621,7 +621,15 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         npm_publish_job = publish_libfx.split("  publish:\n", 1)[1]
 
         self.assertIn("environment: release", release_job)
-        self.assertIn("environment: npm", npm_publish_job)
+        self.assertIn(
+            "environment: ${{ github.event_name == 'workflow_run' && "
+            "needs.metadata.outputs.channel == 'dev' && 'npm-dev' || 'npm' }}",
+            npm_publish_job,
+        )
+        self.assertIn(
+            'if [ "$CHANNEL" != stable ] && [ "$NPM_TAG" != dev ]; then',
+            npm_publish_job,
+        )
 
     def test_stable_release_is_the_only_workflow_with_signing_secrets(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")

@@ -75,6 +75,7 @@ pub const modelText = checkpoint.modelText;
 pub const replacesPriorContext = checkpoint.replacesPriorContext;
 pub const ProviderBlock = checkpoint.ProviderBlock;
 pub const providerBlock = checkpoint.providerBlock;
+pub const savedRuntimeContext = checkpoint.savedRuntimeContext;
 pub const ToolboxMenu = checkpoint.ToolboxMenu;
 pub const toolboxMenu = checkpoint.toolboxMenu;
 
@@ -153,6 +154,11 @@ pub const Request = struct {
     /// message text each. A provider block keeps it, so the turns after the
     /// block go on after the same instructions.
     runtime_context: []const []const u8 = &.{},
+    /// The runtime context the requests after fx's own summary send, when
+    /// the summary starts a new copy: the summary saves it, so later turns
+    /// and resumes send it unchanged (D94). Empty when the copy stays where
+    /// it is. A provider block keeps `runtime_context` instead.
+    summary_runtime_context: []const []const u8 = &.{},
     /// The toolbox menu the conversation sends. The checkpoint keeps it, so
     /// a resume after the compaction sends it too (D103).
     toolbox_menu: ?ToolboxMenu = null,
@@ -274,6 +280,7 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
     trace.info(trace_ctx, .provider_completed, "model={s} summaries={d} shown_turns={d} turns={d} tools={d} entries={d} used={d} text_bytes={d} fallback={s}", .{ caller.model, summarizer.summaries, summary.compacted.turns.len, summary.compacted.turn_count, summary.compacted.tool_count, summary.compacted.entries.len, summary.compacted.used.len, summary.text.len, summarizer.fallback_used orelse "none" });
     var payload = summary.compacted;
     payload.toolbox_menu = request.toolbox_menu;
+    payload.runtime_context = request.summary_runtime_context;
 
     return .{
         .arena = arena,
@@ -611,6 +618,7 @@ test "a checkpoint's provider block survives a round trip on fuzzed bytes" {
             "fx-compactor-v1\n{\"entries\":[],\"used\":[],\"earlier\":\"\",\"turns\":[],\"provider\":{\"provider\":\"gateway\",\"model\":\"anthropic/claude-fable-5.2\",\"text\":\"sum\",\"parts_json\":\"[]\",\"kept_turns\":3,\"runtime_context\":[\"ctx\"]}}",
             "fx-compactor-v1\n{\"earlier\":\"e\",\"provider\":{\"provider\":\"gateway\",\"model\":\"openai/gpt-6.1-sol\",\"parts_json\":\"[{}]\"}}",
             "fx-compactor-v1\n{\"provider\":null}",
+            "fx-compactor-v1\n{\"earlier\":\"e\",\"runtime_context\":[\"ctx\",\"rt\"]}",
             "fx-compactor-v1\n{",
             "plain summary",
         }) ++ @import("fuzz_corpus").checkpoint_provider_block.*),
@@ -618,7 +626,8 @@ test "a checkpoint's provider block survives a round trip on fuzzed bytes" {
 }
 
 /// A provider block a saved checkpoint holds reads back unchanged after fx
-/// writes it again, and another model still gets fx's text for it.
+/// writes it again, and another model still gets fx's text for it. So does
+/// the runtime context the checkpoint keeps.
 fn fuzzProviderBlock(_: void, smith: *std.testing.Smith) anyerror!void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -626,8 +635,12 @@ fn fuzzProviderBlock(_: void, smith: *std.testing.Smith) anyerror!void {
     var buffer: [4096]u8 = undefined;
     const bytes = buffer[0..@intCast(smith.slice(&buffer))];
     const payload = try checkpoint.parse(arena, bytes) orelse return;
-    const block = payload.provider orelse return;
     const encoded = try checkpoint.encode(arena, payload);
+    const copy = if (payload.provider) |block| block.runtime_context else payload.runtime_context;
+    const kept_copy = try checkpoint.savedRuntimeContext(arena, encoded);
+    try std.testing.expectEqual(copy.len, kept_copy.len);
+    for (copy, kept_copy) |a, b| try std.testing.expectEqualStrings(a, b);
+    const block = payload.provider orelse return;
     const kept = (try checkpoint.providerBlock(arena, encoded)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(block.provider, kept.provider);
     try std.testing.expectEqualStrings(block.model, kept.model);

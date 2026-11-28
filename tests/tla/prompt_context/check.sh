@@ -35,6 +35,10 @@
 # right before that turn's message (D104). p6-mutant-effort-follows-current.cfg
 # lets the request's own effort follow the turn, as fx did, which
 # MidSessionKeepsHistory catches.
+# p6-summary.cfg and p6-openai-summary.cfg add fx's own summary inside a turn: a
+# turn that sent an earlier turn's turn context captures the current one there,
+# so the next turn sends the same bytes. p6-mutant-summary-stale.cfg keeps the
+# earlier copy and saves none, as fx did, which MidSessionKeepsHistory catches.
 #
 # p6-attach.cfg and p6-openai-attach.cfg add a user turn that attaches a file from a
 # folder with its own AGENTS.md, as an ACP client does: its rules ride on that turn's
@@ -105,4 +109,7 @@ MCPromptCache p6-mutant-overlay-not-saved MidSessionKeepsHistory -deadlock
 MCPromptCache p6-mutant-skill-swapped MidSessionKeepsHistory -deadlock
 MCPromptCache p6-openai-effort - -deadlock
 MCPromptCache p6-mutant-effort-follows-current MidSessionKeepsHistory -deadlock
+MCPromptCache p6-summary - -deadlock
+MCPromptCache p6-openai-summary - -deadlock
+MCPromptCache p6-mutant-summary-stale MidSessionKeepsHistory -deadlock
 EOT
