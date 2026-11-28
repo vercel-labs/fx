@@ -3351,7 +3351,8 @@ const dead_peer_probe = struct {
     const interval_s: c_int = 5;
     /// Unanswered probes before the read fails: 15 s + 6 x 5 s = 45 s.
     const count: c_int = 6;
-    /// Sent data unacknowledged this long drops the connection.
+    /// Sent data unacknowledged this long drops the connection. Linux also
+    /// counts data that a peer's full receive window holds back.
     const unacked_s: c_int = idle_s + interval_s * count;
 };
 

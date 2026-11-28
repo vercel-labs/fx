@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync, spawnSync } from "node:child_process";
 import { processAlive as isProcessAlive } from "./process-alive";
 import { createServer, type AddressInfo, type Socket } from "node:net";
 import {
@@ -10300,6 +10301,154 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
     }
   }, 60_000);
+
+  const canDropLoopbackPackets = spawnSync("sudo", ["-n", "iptables", "-S", "INPUT"]).status === 0;
+
+  test.skipIf(!canDropLoopbackPackets)(
+    "default fx ask resends on a new connection when the pooled one stops acknowledging the request",
+    async () => {
+      const expectedOutput = "Answered on a new connection.";
+      const toolCallBody = await fakeGatewayToolCall("read_notes", "read_file", {
+        path: "notes.txt",
+      }).text();
+      const finalBody = await fakeGatewayFinalText(expectedOutput).text();
+
+      const root = createFixtureRoot("unacked-pooled-connection");
+      const tracePath = join(root.root, "trace.log");
+      writeFileSync(join(root.workspace, "notes.txt"), "pooled connection fixture\n");
+      const sockets = new Set<Socket>();
+      const requestSockets = new Set<Socket>();
+      let connections = 0;
+      let requests = 0;
+      let socketFailure: Error | undefined;
+      let serverPort = 0;
+      let iptablesRuleArgs: string[] | undefined;
+
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("error", (error) => {
+          socketFailure ??= error;
+        });
+        connections += 1;
+
+        let request = Buffer.alloc(0);
+        let requestHandled = false;
+        socket.on("data", (chunk) => {
+          requestSockets.add(socket);
+          if (requestHandled) return;
+          if (request.length + chunk.length > 1024 * 1024) {
+            socketFailure ??= new Error("pooled connection fixture request exceeded 1 MiB");
+            socket.destroy();
+            return;
+          }
+          request = Buffer.concat([request, chunk]);
+          const headerEnd = request.indexOf("\r\n\r\n");
+          if (headerEnd < 0) return;
+          const headers = request.subarray(0, headerEnd).toString("utf8");
+          const lengthMatch = /\r\ncontent-length:\s*(\d+)/i.exec(`\r\n${headers}`);
+          const contentLength = lengthMatch ? Number.parseInt(lengthMatch[1]!, 10) : 0;
+          if (request.length < headerEnd + 4 + contentLength) return;
+
+          requestHandled = true;
+          requests += 1;
+          if (requests === 1) {
+            const clientPort = socket.remotePort;
+            if (clientPort === undefined) {
+              socketFailure ??= new Error("missing socket.remotePort");
+              return;
+            }
+            // Drop only fx's packets on this connection: the reply still arrives, but fx's next request is never acknowledged.
+            const args = [
+              "INPUT",
+              "-i",
+              "lo",
+              "-p",
+              "tcp",
+              "--sport",
+              String(clientPort),
+              "--dport",
+              String(serverPort),
+              "-j",
+              "DROP",
+            ];
+            execFileSync("sudo", ["iptables", "-I", ...args]);
+            iptablesRuleArgs = args;
+            socket.write(
+              "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: text/event-stream\r\n" +
+                `Content-Length: ${Buffer.byteLength(toolCallBody)}\r\n\r\n` +
+                toolCallBody,
+            );
+            return;
+          }
+          socket.end(
+            "HTTP/1.1 200 OK\r\n" +
+              "Content-Type: text/event-stream\r\n" +
+              `Content-Length: ${Buffer.byteLength(finalBody)}\r\n` +
+              "Connection: close\r\n\r\n" +
+              finalBody,
+          );
+        });
+      });
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(0, "127.0.0.1", resolve);
+        });
+        const address = server.address();
+        if (address === null || typeof address === "string") {
+          throw new Error("missing pooled connection fixture address");
+        }
+        serverPort = address.port;
+
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Read notes.txt, then answer."],
+          {
+            cwd: root.workspace,
+            env: {
+              FX_SOUND: "0",
+              HOME: root.home,
+              AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_TEST_GATEWAY_CHAT_URL:
+                `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
+              FX_MODEL: MODEL,
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "agent,core,gateway,stream",
+            },
+            timeoutMs: 120_000,
+          },
+        );
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+        expect(socketFailure).toBeUndefined();
+        expect(result.timedOut).toBe(false);
+        expect(result.code).toBe(0);
+        const json = parseAskJson(result.stdout);
+
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toContain(expectedOutput);
+        expect(json.recovery).toEqual({ state: "recovered", attempt: 2, cause: "dropped" });
+        expect(result.elapsedMs).toBeGreaterThanOrEqual(40_000);
+        expect(result.elapsedMs).toBeLessThan(90_000);
+        expect(connections).toBeGreaterThanOrEqual(2);
+        expect(requests).toBe(2);
+        expect(requestSockets.size).toBe(2);
+        expect(trace).toContain("socket_err=ConnectionTimedOut");
+      } finally {
+        if (iptablesRuleArgs) {
+          spawnSync("sudo", ["iptables", "-D", ...iptablesRuleArgs]);
+        }
+        for (const socket of sockets) socket.destroy();
+        if (server.listening) {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    150_000,
+  );
 
   test("default fx ask starts fresh network pacing after explicitly timed provider retries", async () => {
     const root = createFixtureRoot("mixed-provider-network-pacing");
