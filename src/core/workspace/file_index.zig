@@ -19,6 +19,7 @@ const unicode_simple_fold = @import("unicode_simple_fold.zig");
 const pathing = @import("pathing.zig");
 const workspace_access = @import("workspace_access.zig");
 const indexer = @import("../indexer/indexer.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -863,7 +864,8 @@ fn loadGeneration(
     return .ready;
 }
 
-/// `<home>/.fx/file-index/<sha256>.idx`, or null without an absolute home
+/// `<fx folder>/file-index/<sha256>.idx`, where the fx folder is `$FX_HOME`
+/// when set and `<home>/.fx` otherwise, or null without an absolute home
 /// directory. The digest covers the roots and every variable that locates git
 /// config, so a listing built under one config is never reused under another.
 pub fn snapshotPath(alloc: Allocator, roots: []const []const u8) Allocator.Error!?[]const u8 {
@@ -891,7 +893,9 @@ fn snapshotPathIn(
     var sum: [sha256_digest_len]u8 = undefined;
     digest.final(&sum);
     const hex = std.fmt.bytesToHex(sum, .lower);
-    return alloc.print("{s}/.fx/file-index/{s}.idx", .{ home, &hex });
+    const dir = try profile_paths.fileIndexDir(alloc, home);
+    defer alloc.free(dir);
+    return alloc.print("{s}/{s}.idx", .{ dir, &hex });
 }
 
 /// The trees for the available roots of a scope, in root order. Trees reused
@@ -4339,4 +4343,32 @@ test "snapshot path changes with where git config is located" {
     defer alloc.free(again);
     try std.testing.expectEqualStrings(paths[1], again);
     try std.testing.expect(std.mem.startsWith(u8, again, "/home/u/.fx/file-index/"));
+}
+
+test "snapshot path lives in the home folder when FX_HOME is unset" {
+    const alloc = std.testing.allocator;
+    profile_paths.resetFxHomeForTest();
+    const roots = [_][]const u8{"/work"};
+    const env: [indexer.config_environment_names.len]?[]const u8 = @splat(null);
+    const path = try snapshotPathIn(alloc, "/home/u", &roots, &env);
+    defer alloc.free(path);
+    try std.testing.expect(std.mem.startsWith(u8, path, "/home/u/.fx/file-index/"));
+    try std.testing.expect(std.mem.endsWith(u8, path, ".idx"));
+    try std.testing.expectEqual("/home/u/.fx/file-index/".len + 64 + ".idx".len, path.len);
+}
+
+test "snapshot path lives in FX_HOME when FX_HOME is set" {
+    const alloc = std.testing.allocator;
+    defer profile_paths.resetFxHomeForTest();
+    const roots = [_][]const u8{"/work"};
+    const env: [indexer.config_environment_names.len]?[]const u8 = @splat(null);
+    profile_paths.resetFxHomeForTest();
+    const default_path = try snapshotPathIn(alloc, "/home/u", &roots, &env);
+    defer alloc.free(default_path);
+    try profile_paths.useFxHome("/tmp/fx-profile", "/home/u");
+    const moved = try snapshotPathIn(alloc, "/home/u", &roots, &env);
+    defer alloc.free(moved);
+    try std.testing.expect(std.mem.startsWith(u8, moved, "/tmp/fx-profile/file-index/"));
+    try std.testing.expect(!std.mem.startsWith(u8, moved, "/home/u/.fx/"));
+    try std.testing.expectEqualStrings(default_path[default_path.len - 68 ..], moved[moved.len - 68 ..]);
 }
