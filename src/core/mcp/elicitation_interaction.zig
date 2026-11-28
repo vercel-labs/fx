@@ -92,8 +92,9 @@ pub fn respond(
     required: tool_mcp_runtime.InputRequired,
     options: Options,
 ) Error![]u8 {
-    const requests = try mrtr.parseRequestJsonForWire(
+    const requests = try mrtr.readRequests(
         alloc,
+        required.requests,
         required.input_requests_json,
         origin.wire,
         .{},
@@ -161,7 +162,7 @@ pub fn respond(
     try out.writer.writeByte('{');
     for (requests, responses, 0..) |request, response, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(request.key, .{}, &out.writer);
+        try out.writer.writeAll(request.key);
         try out.writer.writeByte(':');
         try out.writer.writeAll(response);
     }
@@ -1081,7 +1082,7 @@ fn renderUniformResponses(
     try out.writer.writeByte('{');
     for (requests, 0..) |request, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(request.key, .{}, &out.writer);
+        try out.writer.writeAll(request.key);
         try out.writer.writeAll(switch (action) {
             .accept => ":{\"action\":\"accept\"}",
             .cancel => ":{\"action\":\"cancel\"}",
