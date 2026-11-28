@@ -119,7 +119,7 @@ jobs:
         run: python3 -m scripts.check_cli_shape
 
       - name: Test CI and release scripts
-        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_dev_channel_forward scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape scripts.tests.test_check_provider_versions
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_dev_channel_forward scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape scripts.tests.test_check_provider_versions scripts.tests.test_publish_libfx
 
       - name: Test benchmark scripts
         run: python3 -m unittest benchmarks.shell_command_overhead_test
@@ -557,6 +557,8 @@ jobs:
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 4 --hooks
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 6 --backend wasm
           bun tests/tla/drivers/drive-steer.mjs faults --walks 8 --seed 8 --stream-lag 400
+          TLA2TOOLS_JAR="$jar" bun tests/tla/drivers/sdk/ui-order.ts
+          TLA2TOOLS_JAR="$jar" bun tests/tla/drivers/sdk/ui-order.ts --fuzz 20 --seed 3
 
       - name: Test libfx on a World
         run: |

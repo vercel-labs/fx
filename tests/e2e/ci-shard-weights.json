@@ -67,7 +67,7 @@
   { "file": "tui-host-switch.test.ts", "weight": 10 },
   { "file": "tui-mcp-http-many-servers.test.ts", "weight": 5 },
   { "file": "tui-resume.test.ts", "weight": 289 },
-  { "file": "tui-program-resume.test.ts", "weight": 15 },
+  { "file": "tui-program-resume.test.ts", "weight": 61 },
   { "file": "tui-slash-commands.test.ts", "weight": 5 },
   { "file": "tui-slash-extra.test.ts", "weight": 4 },
   { "file": "tui-slash-menu.test.ts", "weight": 88 },
@@ -84,5 +84,7 @@
   { "file": "web-search-fake-gateway.test.ts", "weight": 5 },
   { "file": "web-search-live.test.ts", "weight": 1 },
   { "file": "web-search-permission-progress.test.ts", "weight": 11 },
-  { "file": "yolo-permission-mode.test.ts", "weight": 29 }
+  { "file": "yolo-permission-mode.test.ts", "weight": 29 },
+  { "file": "sandbox-provider.test.ts", "weight": 2 },
+  { "file": "runner.test.ts", "weight": 2 }
 ]

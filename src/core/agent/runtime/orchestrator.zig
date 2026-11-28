@@ -23,7 +23,6 @@ const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const diagnostics = @import("../../workspace/diagnostics.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
-const model_context_encoding = @import("../../shared/model_context_encoding.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
 const quiesce = @import("../../quiesce/quiesce.zig");
@@ -3210,15 +3209,13 @@ fn prepareDeferredDynamicCandidate(
 
 fn preparedTerminalModelOutput(
     alloc: Allocator,
+    tool_registry: tool_dispatch.Registry,
     call: ToolCall,
     terminal: tool_preparation.Terminal,
 ) Allocator.Error![]const u8 {
     if (terminal.model_output) |model_output| return model_output;
     return switch (terminal.kind) {
-        .unsupported => try alloc.print(
-            "Unsupported tool: {f}",
-            .{model_context_encoding.scalar(call.name)},
-        ),
+        .unsupported => try tool_dispatch.unsupportedToolOutput(alloc, tool_registry, call.name),
         else => unreachable,
     };
 }
@@ -3227,6 +3224,7 @@ test "a prepared call of a tool fx does not know names it as visible text" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    const empty_registry = tool_dispatch.Registry{};
 
     const cases = [_]struct { name: []const u8, shown: []const u8 }{
         .{ .name = "missing_tool", .shown = "Unsupported tool: missing_tool" },
@@ -3237,6 +3235,7 @@ test "a prepared call of a tool fx does not know names it as visible text" {
     for (cases) |case| {
         const shown = try preparedTerminalModelOutput(
             arena,
+            empty_registry,
             .{ .id = "odd-tool", .name = case.name, .arguments_json = "{}" },
             .{ .kind = .unsupported },
         );
@@ -3246,6 +3245,7 @@ test "a prepared call of a tool fx does not know names it as visible text" {
     const kept = try arena.dupe(u8, "Tool arguments are invalid.");
     try std.testing.expectEqualStrings("Tool arguments are invalid.", try preparedTerminalModelOutput(
         arena,
+        empty_registry,
         .{ .id = "x", .name = "read_file", .arguments_json = "{}" },
         .{ .kind = .validation_failure, .model_output = kept },
     ));
@@ -4103,6 +4103,7 @@ fn finishPreparedCallsOnCancellation(
                             },
                             .model_output = try preparedTerminalModelOutput(
                                 arena,
+                                deps.tool_registry,
                                 call,
                                 terminal,
                             ),
@@ -9468,6 +9469,14 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
                             .runtime_context = try runtimeContextTexts(arena, runtime_context.messages()),
+                            // fx's summary starts a new prefix; a turn that sent
+                            // an earlier turn's copy sends the current one after
+                            // it, saved with the summary, unless a kept turn
+                            // holds its own copy (D94).
+                            .summary_runtime_context = if (runtime_context.captured == null)
+                                try runtimeContextTexts(arena, current_runtime_context.items)
+                            else
+                                &.{},
                             .toolbox_menu = try agent.compactionToolboxMenu(arena, compaction_history),
                         },
                     });
@@ -9529,6 +9538,15 @@ fn processQueuedPromptLoop(
                         trace_count_after_compaction = true;
                         active_compaction_history_tail = compacted_messages.items[1..];
                         compaction_history = next_history;
+                        if (try runtime_context.restartAfterSummary(arena, overlay_arena, next_history, within_turn_suffix.items[compacted_suffix_len..], current_runtime_context.items)) |restart| {
+                            ephemeral_overlay.clearRetainingCapacity();
+                            try ephemeral_overlay.appendSlice(overlay_arena, runtime_context.messages());
+                            if (restart.update) |note| {
+                                const update = [_]ChatMessage{.{ .role = .system, .content = note, .context_note = true }};
+                                try insertBoundaryNotes(arena, &within_turn_suffix, compacted_suffix_len, &update);
+                            }
+                            debug_trace.logf("context", "runtime context from summary step={d} messages={d} update={}", .{ current_step_index, runtime_context.messages().len, restart.update != null });
+                        }
                         finalization.compacted_execution = .{
                             .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
                             .steering = finalization.compacted_execution.steering + active_cut.steering,
@@ -12046,6 +12064,7 @@ fn processQueuedPromptLoop(
                             .terminal => |terminal| {
                                 const model_output = try preparedTerminalModelOutput(
                                     arena,
+                                    deps.tool_registry,
                                     parallel_call,
                                     terminal,
                                 );
@@ -12573,6 +12592,7 @@ fn processQueuedPromptLoop(
                     .terminal => |terminal| {
                         const model_output = try preparedTerminalModelOutput(
                             arena,
+                            deps.tool_registry,
                             tool_call,
                             terminal,
                         );
@@ -13058,6 +13078,9 @@ fn processQueuedPromptLoop(
                 resolved.authority.grants
             else
                 local_grants.items;
+            if (deps.resolve_command_placement) |resolve| {
+                tool_call.command_placement = try resolve(deps.ctx, arena, tool_call);
+            }
             var status_started = false;
             const defer_auto_command_lifecycle = try runtime_tool_admission.deferCapturedCommandLifecycleForAutoPermissionNotice(
                 deps.tool_registry,
@@ -13081,7 +13104,7 @@ fn processQueuedPromptLoop(
                 file_call_arena_state.allocator()
             else
                 arena;
-            const execution_call = if (is_file_mutation)
+            var execution_call = if (is_file_mutation)
                 try types.dupeToolCall(call_allocator, tool_call)
             else
                 tool_call;
@@ -13307,6 +13330,7 @@ fn processQueuedPromptLoop(
             }
             if (permission_result.tool_failure) |failure_output| {
                 if (!status_started) {
+                    execution_call.command_placement = null;
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                         deps,
                         call_allocator,
@@ -13496,6 +13520,9 @@ fn processQueuedPromptLoop(
             );
             if (file_display_path) |display_path| {
                 tool_display_target = display_path;
+            }
+            if (runtime_tool_presentation.commandPlacementFromAuthority(execution_authority)) |approved_placement| {
+                execution_call.command_placement = approved_placement;
             }
 
             if (!status_started) {
