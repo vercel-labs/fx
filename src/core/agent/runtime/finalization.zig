@@ -51,6 +51,11 @@ pub const TurnFinalizationGuard = struct {
     /// them (D103). Borrowed from the turn's arena.
     saved_toolbox_menu: ?types.SavedToolboxMenu = null,
     toolbox_noted: ?types.ToolboxNoted = null,
+    /// The effort this turn asked for, for a model that takes effort changes
+    /// as messages, and the update it sends before its message. Every save of
+    /// the turn carries them, from the first (D104).
+    turn_effort: ?types.ReasoningEffort = null,
+    effort_update: ?types.ReasoningEffort = null,
     lease_allocator: Allocator = std.heap.c_allocator,
     agent_terminal_leases: std.ArrayList([]u8) = .empty,
     /// The turn's settled model calls, in the order they settled, for
@@ -76,7 +81,8 @@ pub const TurnFinalizationGuard = struct {
 
     /// The execution memory fx's history and the recovery checkpoint keep of
     /// this turn: the part after any in-turn compaction cut, with the runtime
-    /// context the turn captured and the model calls it made. `execution`
+    /// context the turn captured, the effort it asked for and the model calls
+    /// it made. `execution`
     /// holds the whole turn; a call settled since the last save is placed
     /// after the steps it holds. Borrows `execution`, the captured texts and
     /// the call records.
@@ -105,6 +111,8 @@ pub const TurnFinalizationGuard = struct {
         with_records.runtime_context = self.captured_runtime_context;
         with_records.toolbox_menu = self.saved_toolbox_menu;
         with_records.toolbox_noted = self.toolbox_noted;
+        with_records.turn_effort = self.turn_effort;
+        with_records.effort_update = self.effort_update;
         return with_records;
     }
 

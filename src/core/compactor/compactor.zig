@@ -162,6 +162,9 @@ pub const Request = struct {
     /// The toolbox menu the conversation sends. The checkpoint keeps it, so
     /// a resume after the compaction sends it too (D103).
     toolbox_menu: ?ToolboxMenu = null,
+    /// The effort the conversation's requests named, for a model that takes
+    /// effort changes as messages. A provider block keeps it (D104).
+    reasoning_anchor: ?[]const u8 = null,
 };
 
 /// Owns everything it points to except the turns it shares with
@@ -354,6 +357,7 @@ fn compactWithProvider(
         .parts_json = block.parts_json,
         .kept_turns = chosen.retained_history.len,
         .runtime_context = request.runtime_context,
+        .reasoning_anchor = request.reasoning_anchor,
     };
     payload.toolbox_menu = request.toolbox_menu;
     trace.info(trace_ctx, .provider_completed, "model={s} path=provider_block text_bytes={d} parts_bytes={d} turns={d} tools={d}", .{ caller.model, block.text.len, block.parts_json.len, exact.compacted.turn_count, exact.compacted.tool_count });

@@ -62,6 +62,36 @@ pub const ConversationRuntimeContext = struct {
     messages: []const []const u8,
 };
 
+/// A turn effort's item data (D104), `{"effort":"low","update":"low"}`: the
+/// reasoning effort the turn asked for, and the update it sent before its
+/// message, left out for none. Saved for a model that takes effort changes as
+/// messages.
+pub const ConversationTurnEffort = struct {
+    effort: types.ReasoningEffort,
+    update: ?types.ReasoningEffort = null,
+
+    pub fn jsonStringify(self: ConversationTurnEffort, writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("effort");
+        try writer.write(self.effort.label());
+        if (self.update) |*update| {
+            try writer.objectField("update");
+            try writer.write(update.label());
+        }
+        try writer.endObject();
+    }
+
+    pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !ConversationTurnEffort {
+        const Wire = struct { effort: []const u8, update: ?[]const u8 = null };
+        const wire = try json_decode.innerParse(Wire, alloc, source, options);
+        const update: ?types.ReasoningEffort = if (wire.update) |label|
+            types.ReasoningEffort.parse(label) orelse return error.UnexpectedToken
+        else
+            null;
+        return .{ .effort = types.ReasoningEffort.parse(wire.effort) orelse return error.UnexpectedToken, .update = update };
+    }
+};
+
 /// A toolbox menu's item data (D103): the bytes the turn kept for the
 /// conversation, and the hash of what they list.
 pub const ConversationToolboxMenu = struct {
@@ -265,6 +295,10 @@ pub const ConversationEvent = union(enum) {
     /// saves them, as its `toolbox_menu` and `toolbox_noted` items (D103).
     toolbox_menu: ConversationToolboxMenu,
     toolbox_noted: types.ToolboxNoted,
+    /// The effort a turn asked for, right after its user message. Only a v2
+    /// session saves one, as its `turn_effort` item, which an older fx leaves
+    /// out (D17, D104).
+    turn_effort: ConversationTurnEffort,
     /// A settled model call, for Ctrl+O and never for the model. Only a v2
     /// session saves one, as its `model_call` item, which an older fx leaves
     /// out (D17).
@@ -352,6 +386,7 @@ pub fn validateConversationTransition(
         .context_note => return rejectInvalidConversationEvent("context-note-v1"),
         .runtime_context => return rejectInvalidConversationEvent("runtime-context-v1"),
         .toolbox_menu, .toolbox_noted => return rejectInvalidConversationEvent("toolbox-v1"),
+        .turn_effort => return rejectInvalidConversationEvent("turn-effort-v1"),
         .model_call => return rejectInvalidConversationEvent("model-call-v1"),
     }
 }
@@ -424,6 +459,8 @@ pub fn validateConversationEventShape(event: ConversationEvent, schema_version: 
         .toolbox_menu => |value| try validateOptionalConversationText(value.text),
         .toolbox_noted => {},
         .model_call => |value| try validateModelCallRecord(value),
+        // Its decoder accepts only an effort label.
+        .turn_effort => {},
         .tool_call => |call| {
             try validateConversationIdentity(call.call_id);
             try validateConversationIdentity(call.tool_name);
@@ -618,10 +655,10 @@ pub fn decodeConversationFrameLeaky(
     validateConversationEventShape(value.event, value.schema_version) catch
         return error.InvalidConversationFrame;
     // Every caller reads a v1 log, which never holds a context note, runtime
-    // context or toolbox record; only a v2 session saves them (D93, D94,
-    // D103).
+    // context, toolbox record or turn effort; only a v2 session saves them
+    // (D93, D94, D103, D104).
     switch (value.event) {
-        .context_note, .runtime_context, .toolbox_menu, .toolbox_noted, .model_call => return error.InvalidConversationFrame,
+        .context_note, .runtime_context, .toolbox_menu, .toolbox_noted, .turn_effort, .model_call => return error.InvalidConversationFrame,
         else => {},
     }
     return value;
@@ -748,9 +785,11 @@ pub fn appendExecutionConversationEvents(
     execution: types.ExecutionMemory,
 ) !void {
     // Right after the user message, where every save of the turn has them,
-    // so a streamed turn keeps the same prefix (D94, D103). The toolbox
-    // records come first: the turn has them before its first step captures
-    // the runtime context.
+    // so a streamed turn keeps the same prefix (D94, D103, D104). The effort
+    // comes first: the save before the first request has it, but no runtime
+    // context yet. The toolbox records follow: the turn has them before its
+    // first step captures the runtime context.
+    if (execution.turn_effort) |effort| try events.append(alloc, .{ .turn_effort = .{ .effort = effort, .update = execution.effort_update } });
     if (execution.toolbox_menu) |menu| try events.append(alloc, .{ .toolbox_menu = .{ .text = menu.text, .entries_hash = menu.entries_hash } });
     if (execution.toolbox_noted) |noted| try events.append(alloc, .{ .toolbox_noted = noted });
     if (execution.runtime_context) |texts| try events.append(alloc, .{ .runtime_context = .{ .messages = texts } });

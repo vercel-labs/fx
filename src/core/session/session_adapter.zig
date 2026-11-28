@@ -3917,8 +3917,11 @@ pub const Session = struct {
     }
 
     /// How many of `encoded` the open turn already holds. A streamed piece
-    /// that differs from the final turn is a bug; the stale turn is closed
-    /// as superseded and the whole turn is written afresh, never mixed.
+    /// that differs from the final turn is a bug, except one case: a turn
+    /// that decided its effort again after a compaction inside it changes
+    /// its saved `turn_effort` piece (D104). Either way the stale turn is
+    /// closed as superseded and the whole turn is written afresh, never
+    /// mixed, so the trace line names it a mismatch.
     /// `phase` and `results`, the rebuild's tool result count, only name
     /// the decision in the session trace, which the driver of
     /// `tests/tla/session/TurnStreamTrace.tla` replays.
@@ -6643,6 +6646,9 @@ fn mergeContinued(alloc: Allocator, earlier: types.HistoryTurn, later: types.His
         .runtime_context = runtime_context,
         .toolbox_menu = toolbox_menu,
         .toolbox_noted = toolbox_noted,
+        // The effort and update of the turn that started the chain, as its first request sent them.
+        .turn_effort = head.execution.turn_effort orelse tail.turn_effort,
+        .effort_update = if (head.execution.turn_effort != null) head.execution.effort_update else tail.effort_update,
         .turn_summary = turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,
@@ -6881,6 +6887,7 @@ noinline fn replay(
                         .steering => |value| try builder.appendSteering(value.text),
                         .context_note => |value| try builder.appendContextNote(value.text, value.sources),
                         .runtime_context => |value| try builder.setRuntimeContext(value.messages),
+                        .turn_effort => |value| try builder.setTurnEffort(value.effort, value.update),
                         .toolbox_menu => |value| try builder.setToolboxMenu(value.text, value.entries_hash),
                         .toolbox_noted => |value| try builder.setToolboxNoted(value),
                         .turn_completed => |value| {
@@ -7802,11 +7809,12 @@ fn itemType(kind: PieceKind) ?[]const u8 {
         .interrupted => "interruption",
         .context_checkpoint => null,
         // An older fx leaves out an item type it does not know (D17, D93, D94,
-        // D103).
+        // D103, D104).
         .context_note => "context_note",
         .runtime_context => "runtime_context",
         .toolbox_menu => "toolbox_menu",
         .toolbox_noted => "toolbox_noted",
+        .turn_effort => "turn_effort",
         .model_call => "model_call",
     };
 }
@@ -12651,6 +12659,69 @@ test "a turn's toolbox menu and noted hash come back on resume and in a fork, sa
     try testing.expectEqual(@as(?types.ToolboxNoted, noted), forked.history[1].assistant.execution.toolbox_noted);
 }
 
+test "a turn's effort and update come back on resume, saved once right after its user message and ahead of its toolbox menu (D104)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var captured = [_][]u8{@constCast("Runtime context: permission mode is ask.")};
+    const low = types.ReasoningEffort.literal("low");
+    const menu: types.SavedToolboxMenu = .{ .text = @constCast("TOOLBOX_MENU_BYTES"), .entries_hash = 3 };
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    // The prompt is saved before the runtime context is captured, so the
+    // effort comes first, the toolbox menu after it, and every later save
+    // keeps the same prefix.
+    try s.appendProgress(user, .{ .turn_effort = low, .effort_update = low, .toolbox_menu = menu }, .{});
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..1], .runtime_context = &captured, .turn_effort = low, .effort_update = low, .toolbox_menu = menu }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .runtime_context = &captured, .turn_effort = low, .effort_update = low, .toolbox_menu = menu },
+    } }, types.ConversationLanguage.default());
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("on auto") },
+        .assistant = @constCast("ok"),
+        .execution = .{ .turn_effort = .auto },
+    } }, types.ConversationLanguage.default());
+    try s.commitTurn(assistantTurn("plain", "turn"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\"type\":\"turn_effort\""));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"update\":\"low\""));
+    const user_at = std.mem.find(u8, bytes, "two steps").?;
+    const effort_at = std.mem.find(u8, bytes, "\"type\":\"turn_effort\"").?;
+    const menu_at = std.mem.find(u8, bytes, "\"type\":\"toolbox_menu\"").?;
+    const runtime_at = std.mem.find(u8, bytes, "permission mode is ask").?;
+    try testing.expect(user_at < effort_at and effort_at < menu_at and menu_at < runtime_at);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "TOOLBOX_MENU_BYTES"));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
+    const execution = restored.history[0].assistant.execution;
+    try testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try testing.expect(execution.turn_effort.?.eql(low));
+    try testing.expect(execution.effort_update.?.eql(low));
+    try testing.expectEqualStrings(menu.text, execution.toolbox_menu.?.text);
+    try testing.expect(execution.runtime_context != null);
+    try testing.expect(restored.history[1].assistant.execution.turn_effort.? == .auto);
+    try testing.expect(restored.history[1].assistant.execution.effort_update == null);
+    // A turn on a model without effort updates saves none.
+    try testing.expect(restored.history[2].assistant.execution.turn_effort == null);
+}
 test "a turn stopped right after fx's summary cut it comes back with its runtime context, and the summary with the copy it saved (D94)" {
     var t: TestHome = undefined;
     try t.init();

@@ -310,7 +310,7 @@ manager:
   `context_note` (D93), `runtime_context` (D94), `toolbox_menu` and
   `toolbox_noted` (D103), `model_call` (D96),
   `mcp_bridge_call` (D99), `cancelled_command` (D100), `subagent_started`
-  (D101), `cancelled_wait` (D102), `turn_end` (files
+  (D101), `cancelled_wait` (D102), `turn_effort` (D104), `turn_end` (files
   and turn summary), `interruption` (reason detail, partial text, command
   refs, origin), `recovery`, `model_recovery` (a model request's recovery
   status, for reading the log), `workspace_capture` (D98) and `continues`.
@@ -2290,6 +2290,88 @@ cached prompt prefix):
   **Alternative:** keep the menu only in memory, which every resume, `fx ask
   --resume` and ACP `session/load` rebuild; or derive what a change note told
   from its text, which the note does not hold in full.
+
+Settled for reasoning effort on GPT-6 (2026-11-27, so a changed effort does
+not drop the cached prompt):
+- **D104 Decision:** for a model that takes an effort change as a message
+  (GPT-6 and later, `src/gateway/vercel_model_policy.zig` effortUpdates),
+  every request names the session's first effort as its own `reasoning`, and
+  a later change goes as an update message right before that turn's user
+  message: an empty system message with
+  `providerOptions.openai.reasoningEffortUpdate`, `medium` for a turn on
+  the default.
+  - **Saved:** each turn saves the effort it asked for, `auto` included,
+    and the update it decided to send, in every save from the prompt's
+    first. A v2 session writes a `turn_effort` item,
+    `{"effort":"low","update":"low"}` (no `update` for none), right after
+    the user item, ahead of any toolbox item (D103) and any
+    `runtime_context` item: the save before the first request has it. In
+    the execution JSON it needs schema version 14, written only for such a
+    turn, which names every key version 13 names (`runtime_context`,
+    `toolbox_menu` and `toolbox_noted`, null when the turn has none) and
+    adds `turn_effort` and `effort_update`; a turn with toolbox records and
+    no effort keeps version 13. libfx versions the journal, checkpoint, and
+    snapshot that hold it as D93 does.
+  - **Anchor:** the first effort a retained turn saved. A provider's
+    compaction block saves the effort its request named
+    (`reasoning_anchor`) and stands in for the turns it replaced; fx's own
+    summary, or a block without one, starts again. With none, the current
+    turn's effort is the anchor.
+  - **Decision:** a turn decides once, when it starts, and every request
+    sends each saved update as it is, so a kept turn keeps its bytes after
+    any block (`tests/tla/compaction/ProviderCompaction.tla`
+    NoDroppedReasoning, provider-compaction-mutation-kept-redecide.cfg).
+    The model runs at the request's own effort and the updates sent after
+    the newest block or summary: measured live on 2026-11-27, a block does
+    not keep the effort the turns it replaced had set. So the turn sends
+    an update when the effort it asks for differs from the last saved
+    update after the newest checkpoint, or from the anchor when there is
+    none (RunsAsAsked, provider-compaction-mutation-ignores-block.cfg).
+    The decision and the writer check the same listed efforts: an update
+    the model does not list is never sent and never counts. A resume that a
+    later one replaced is never sent, so it never counts either.
+  - **Compaction inside a turn:** fx compacts at a turn's first request,
+    after the turn decided, or at a later request of the turn. A turn with
+    none of its own steps after the new block or summary decides again
+    against the new history. Its saved `turn_effort` item then no longer
+    matches the one the prompt's save streamed, so its next save closes
+    the open turn as superseded and writes it whole again; the session
+    trace names that a stream mismatch (`session_adapter.zig`
+    streamedPrefix).
+  - **Known gap, accepted (FXC-1610):** a turn whose steps the block kept
+    keeps its bytes and does not decide again. When the update that set
+    its effort was in a turn the block removed, the rest of that turn runs
+    at the anchor's effort, not the one it asked for (the model's `stale`
+    case; `tests/e2e/provider-compaction.test.ts` "a GPT-6 block that keeps
+    the running turn's steps leaves the rest of that turn at the anchor,
+    and the next turn decides again (D104)"). The next turn decides
+    against the block and the kept turns and runs as asked. FXC-1610
+    tracks sending the update after the kept steps, which needs a live
+    provider check.
+  - **Recovery:** a recovered turn keeps the effort and update its first
+    attempt saved.
+  - **Not covered:** the one resend at a lower effort after a reply cut
+    while it reasoned names its own effort with no updates, as before; the
+    next step names the anchor again. fx's own summary request keeps its
+    least effort. Other models name the turn's effort, as before, and so
+    does each request a turn sends to another model: a subagent's request
+    that goes on on Claude after a wait gets its own effort and no update.
+  - **Older fx:** an fx from before D104 leaves the `turn_effort` item out
+    (D17) and names each turn's effort, as it did. It rejects execution
+    JSON at schema version 14 (`session_codec.zig`
+    parseExecutionMemoryWith), as an fx from before D93, D94 or D103
+    rejects version 11, 12 or 13: it refuses that saved state and neither
+    rewrites nor migrates it.
+
+  **Why:** a changed `reasoning` made GPT-6 read none of the prompt from
+  its cache and drop its earlier reasoning; the update kept the cache and
+  lowered the reasoning as a real lower effort does
+  (`tests/tla/prompt_context/PromptCache.tla` "effort",
+  p6-mutant-effort-follows-current.cfg).
+  **Alternative:** the current effort on every request, which rewrites the
+  cache key; the update in the messages lane, which every other provider
+  would get; or a field on the `user` piece, which an older fx's strict
+  reader rejects with the whole session.
 
 ## Design Risks And Failure Behavior
 

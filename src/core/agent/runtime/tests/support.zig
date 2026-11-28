@@ -652,6 +652,9 @@ pub const FakeAgentRuntimeDeps = struct {
     out_of_credits_choices: []const runtime_deps.OutOfCreditsChoice = &.{},
     out_of_credits_index: usize = 0,
     out_of_credits_count: usize = 0,
+    /// The Gateway model a subagent's waiting request continues on, as the
+    /// view's picker chose it; taken once. Null: the request keeps its model.
+    continue_model: ?[]const u8 = null,
     default_model_capabilities: model_capabilities.Capabilities = .{
         .image_input_support = .non_native,
         .context_window = 1_000_000,
@@ -891,6 +894,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_http_error = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
             .ask_out_of_credits = askOutOfCredits,
+            .continue_selection = if (self.continue_model != null) continueSelection else null,
             .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
             .mark_turn_yielded = if (self.enable_turn_yield_marks) markTurnYielded else null,
             .hold_for_restart = if (self.restart_hold_end != null) holdForRestart else null,
@@ -1141,6 +1145,13 @@ pub const FakeAgentRuntimeDeps = struct {
         const end = self.restart_hold_end.?;
         if (end == .go_on) if (self.restart_yield_flag) |flag| flag.store(false, .seq_cst);
         return end;
+    }
+
+    fn continueSelection(raw: *anyopaque, alloc: Allocator) !?runtime_deps.CurrentSelection {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const model = self.continue_model orelse return null;
+        self.continue_model = null;
+        return .{ .provider = .gateway, .model = try alloc.dupe(u8, model) };
     }
 
     fn askOutOfCredits(raw: *anyopaque) !runtime_deps.OutOfCreditsChoice {
