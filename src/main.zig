@@ -404,6 +404,7 @@ fn currentBuild() update_target.CurrentBuild {
         .channel = compiled_update_channel,
         .version = version,
         .revision = build_options.git_commit,
+        .build = build_options.build_number,
     };
 }
 
@@ -4934,6 +4935,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -4971,6 +4973,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -5008,6 +5011,7 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
