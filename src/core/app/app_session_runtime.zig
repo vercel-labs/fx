@@ -3389,6 +3389,46 @@ pub fn Runtime(comptime App: type) type {
             agent.session_title.clearRetainingCapacity();
             try appendTitleWithoutControlBytes(app, agent, title);
             syncTerminalTitle(app, agent);
+            renameRexSession(app, agent);
+        }
+
+        /// In a Rex tab, asks Rex to name its session after the main chat's
+        /// title. A subagent's title never reaches Rex. The rename runs in the
+        /// background and decides there whether Rex lets agents rename.
+        fn renameRexSession(app: *App, agent: *AppAgent) void {
+            if (comptime !@hasField(App, "rex_rename") or !@hasField(App, "main_agent")) return;
+            if (agent != &app.main_agent) return;
+            if (firstFramePending(app)) return app.rex_rename.deferUntilFirstFrame();
+            requestRexRename(app, agent);
+        }
+
+        /// Sends the rename that a resumed title asked for before the first
+        /// frame, once the frame is on screen.
+        pub fn renameRexSessionAfterFirstFrame(app: *App) void {
+            if (comptime !@hasField(App, "rex_rename") or !@hasField(App, "main_agent")) return;
+            if (firstFramePending(app)) return;
+            if (!app.rex_rename.takeDeferred()) return;
+            requestRexRename(app, &app.main_agent);
+        }
+
+        fn firstFramePending(app: *App) bool {
+            if (comptime !@hasField(App, "shell")) return false;
+            if (comptime !@hasField(@TypeOf(app.shell), "render_requests")) return false;
+            return app.shell.render_requests.hasReason(.first_frame);
+        }
+
+        fn requestRexRename(app: *App, agent: *AppAgent) void {
+            const title = cachedSessionTitle(agent) orelse return;
+            app.rex_rename.request(app.alloc, .{
+                .env = .{
+                    .rex_bin_dir = io_mod.getenv("REX_BIN_DIR"),
+                    .rex_block = io_mod.getenv("REX_BLOCK"),
+                    .rex_server = io_mod.getenv("REX_SERVER"),
+                },
+                .workspace_root = app.workspace_root,
+                .setting_on = app.rex_session_rename_enabled,
+                .title = title,
+            });
         }
 
         pub fn clearCachedSessionTitle(app: *App, agent: *AppAgent) void {

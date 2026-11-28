@@ -136,6 +136,7 @@ const Writable = enum {
     max_tool_result_bytes,
     @"prompt_history.enabled",
     provider_strict,
+    rex_session_rename,
     session_titles,
     slash_menu_categories,
     @"sound.attention_required",
@@ -239,6 +240,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .fast_mode => patch.fast_mode = enabled,
         .@"prompt_history.enabled" => patch.prompt_history_enabled = enabled,
         .provider_strict => patch.provider_strict = enabled,
+        .rex_session_rename => patch.rex_session_rename = enabled,
         .session_titles => patch.session_titles = enabled,
         .slash_menu_categories => patch.slash_menu_categories = enabled,
         .@"sound.attention_required" => patch.notification_attention_required = enabled,
@@ -563,10 +565,10 @@ pub const resolved_keys = [_][]const u8{
     "first_call_tool_choice",         "max_agent_steps",                "max_tool_result_bytes",
     "permission_mode",                "prompt_history.enabled",         "provider",
     "provider_order",                 "provider_strict",                "review_model",
-    "session_titles",                 "slash_menu_categories",          "sound.attention_required",
-    "sound.max",                      "sound.turn_end",                 "status_line.context",
-    "status_line.session",            "status_line.workspace",          "theme",
-    "ultrafast_mode",                 "update_channel",
+    "rex_session_rename",             "session_titles",                 "slash_menu_categories",
+    "sound.attention_required",       "sound.max",                      "sound.turn_end",
+    "status_line.context",            "status_line.session",            "status_line.workspace",
+    "theme",                          "ultrafast_mode",                 "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -615,6 +617,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "review_model")) return if (state.review_model.len == 0) .none else string(state.review_model);
     if (eql(u8, key, "session_titles")) return boolean(state.session_title_generation);
     if (eql(u8, key, "cache_warming")) return boolean(state.cache_warming);
+    if (eql(u8, key, "rex_session_rename")) return boolean(state.rex_session_rename);
     if (eql(u8, key, "slash_menu_categories")) return boolean(state.slash_menu_categories);
     if (eql(u8, key, "sound.attention_required")) return boolean(state.notification_attention_required);
     if (eql(u8, key, "sound.max")) return boolean(state.notification_max);

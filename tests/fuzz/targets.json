@@ -4,6 +4,7 @@
     {"name": "acp_mcp_servers", "module": "fx", "test": "ACP MCP parser handles fuzzed request bytes", "iterations": 1500000},
     {"name": "vision_json", "module": "fx", "test": "Vision JSON parsers tolerate arbitrary bounded bytes", "iterations": 1200000},
     {"name": "doctor_child_status", "module": "fx", "test": "doctor child status parser tolerates arbitrary bytes", "iterations": 1500000},
+    {"name": "rex_rename_answers", "module": "fx", "test": "Rex answer readers tolerate arbitrary bytes", "iterations": 1000000},
     {"name": "token_pass_memory", "module": "fx", "test": "token pass memory: a saved-answers file reads and rewrites on fuzzed bytes", "iterations": 1000000},
     {"name": "worktree_links", "module": "fx", "test": "a worktree link's commondir and gitdir files never break the main root lookup on fuzzed bytes", "iterations": 20000},
     {"name": "host_record_decode", "module": "fx", "test": "a host record file decodes or is refused on fuzzed bytes", "iterations": 1500000},

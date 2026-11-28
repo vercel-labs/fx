@@ -631,6 +631,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "session_title_generation")) {
                 app.session_title_generation = startup.session_title_generation;
                 if (comptime @hasField(App, "cache_warming")) app.cache_warming = startup.cache_warming;
+                if (comptime @hasField(App, "rex_session_rename_enabled")) app.rex_session_rename_enabled = startup.rex_session_rename;
             }
             if (comptime @hasField(App, "workspace_identity")) {
                 app.workspace_identity.enabled = startup.statusline_workspace;

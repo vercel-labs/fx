@@ -37,6 +37,7 @@ pub const SettingId = enum {
     permission_mode,
     sound_level,
     prompt_history,
+    rex_session_rename,
 };
 
 pub const Spec = struct {
@@ -62,6 +63,7 @@ pub const Snapshot = struct {
     collapse_tool_calls: bool = false,
     session_titles: bool = true,
     prompt_history: bool = true,
+    rex_session_rename: bool = true,
     sound_level: []const u8 = "on",
 
     pub fn value(self: Snapshot, id: SettingId) []const u8 {
@@ -78,6 +80,7 @@ pub const Snapshot = struct {
             .collapse_tool_calls => onOff(self.collapse_tool_calls),
             .session_titles => onOff(self.session_titles),
             .prompt_history => onOff(self.prompt_history),
+            .rex_session_rename => onOff(self.rex_session_rename),
             .sound_level => self.sound_level,
         };
     }
@@ -265,6 +268,7 @@ const specs = [_]Spec{
     .{ .id = .session_titles, .category = .agent, .label = "Session titles", .description = "Generate a short session title from the first prompt" },
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max sounds and terminal bells" },
     .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts and slash commands for composer history" },
+    .{ .id = .rex_session_rename, .category = .advanced, .label = "Rex session names", .description = "In a Rex tab, name the Rex session after the chat title when Rex lets agents rename sessions" },
 };
 
 const on_off_options = [_][]const u8{ "off", "on" };
@@ -350,6 +354,7 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         .collapse_tool_calls,
         .session_titles,
         .prompt_history,
+        .rex_session_rename,
         => &on_off_options,
         .sound_level => &sound_level_options,
         .permission_mode => &permission_options,
@@ -410,11 +415,11 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 13), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 14), filteredCount(snapshot, .all, ""));
     try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
     try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
-    try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .advanced, ""));
+    try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
 
     const current_model = itemAt(snapshot, .all, "glm 5.2", 0).?;
     try std.testing.expectEqual(SettingId.model, current_model.id);
@@ -423,6 +428,9 @@ test "settings catalog projects grouped searchable preferences" {
     const history = itemAt(snapshot, .advanced, "", 0).?;
     try std.testing.expectEqual(SettingId.prompt_history, history.id);
     try std.testing.expectEqualStrings("on", history.value);
+    const rex = itemAt(snapshot, .advanced, "", 1).?;
+    try std.testing.expectEqual(SettingId.rex_session_rename, rex.id);
+    try std.testing.expectEqualStrings("on", rex.value);
     try std.testing.expect(itemAt(snapshot, .all, "missing preference", 0) == null);
 }
 
