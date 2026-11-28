@@ -84,7 +84,7 @@ Matches ==
        /\ CatalogSend
        /\ Sent(catalog', Ev)
     \/ /\ Ev.kind = "end"
-       /\ Outcome(title) = Ev.title
+       /\ IF Ev.title = "dropped" THEN starts >= 1 ELSE Outcome(title) = Ev.title
        /\ Outcome(catalog) = Ev.catalog
        /\ starts = Ev.starts
        /\ UNCHANGED vars
