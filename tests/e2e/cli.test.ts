@@ -8442,6 +8442,14 @@ describe("fx login Token Pass status", () => {
         expect(unknownLines).toHaveLength(1);
         expect(unknownLines[0]).toMatchObject({ type: "result", exit_code: 2, error: "InvalidAskArgs" });
 
+        // Output mode conflict (--stream-events --quiet) exits 2 with stderr diagnostic and stream result line.
+        const quietConflict = await runFx(["ask", "--stream-events", "--quiet", "hi"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(quietConflict.code).toBe(2);
+        expect(quietConflict.stderr).toContain("--stream-events");
+        const quietLines = quietConflict.stdout.trim().split("\n").map((l) => JSON.parse(l));
+        expect(quietLines).toHaveLength(1);
+        expect(quietLines[0]).toMatchObject({ type: "result", exit_code: 2, error: "InvalidAskArgs" });
+
         // Missing prompt exits 2 with stderr diagnostic and stream result line.
         const missingPrompt = await runFx(["ask", "--stream-events"], { cwd: workspace, env, timeoutMs: TIMEOUT });
         expect(missingPrompt.code).toBe(2);

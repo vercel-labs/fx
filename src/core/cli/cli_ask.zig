@@ -1255,6 +1255,12 @@ fn interruptStreamResultExitCode(stream_events: bool) u8 {
     return code;
 }
 
+fn traceDroppedStreamResult(stream_events: bool, err: anyerror) void {
+    if (stream_events) {
+        debug_trace.logf("cli_ask", "stream result dropped reason={s}", .{@errorName(err)});
+    }
+}
+
 fn writeErrorResultOutput(
     alloc: Allocator,
     deps: RunDeps,
@@ -1345,6 +1351,9 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
                 }
                 try deps.write_stderr(deps.stderr_ctx, "fx ask: --stream-events cannot be used with --json or --quiet\n");
                 try writeAskUsage(deps, cfg.command_usage);
+                if (hasFlagBeforeSeparator(args, "--stream-events")) {
+                    try writeErrorResultOutput(alloc, deps, true, "InvalidAskArgs", output_contracts.usage_exit_code);
+                }
                 return output_contracts.usage_exit_code;
             },
             error.PromptResourceLimitExceeded => {
@@ -1384,7 +1393,10 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
                 }
                 return 1;
             },
-            else => return err,
+            else => {
+                traceDroppedStreamResult(hasFlagBeforeSeparator(args, "--stream-events") and !emit_json, err);
+                return err;
+            },
         }
     };
     defer options.deinit(alloc);
@@ -1435,6 +1447,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
             err == error.TerminalInputClosed or
             err == error.OutputReaderGone)
         {
+            traceDroppedStreamResult(options.stream_events, err);
             return err;
         }
         // The reason is on stderr already; JSON keeps the code it always had.
@@ -1496,8 +1509,14 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         return interruptStreamResultExitCode(options.stream_events);
     }
     // The answer is in the saved session, but the reader never got it.
-    if (result.output_reader_gone) return error.OutputReaderGone;
-    if (result.output_write_failed) return error.OutputWriteFailed;
+    if (result.output_reader_gone) {
+        traceDroppedStreamResult(options.stream_events, error.OutputReaderGone);
+        return error.OutputReaderGone;
+    }
+    if (result.output_write_failed) {
+        traceDroppedStreamResult(options.stream_events, error.OutputWriteFailed);
+        return error.OutputWriteFailed;
+    }
 
     if (options.json_output or options.stream_events) {
         const encoded = try renderResultObject(alloc, result, options.stream_events);
@@ -10126,7 +10145,18 @@ test "parse options accepts --stream-events and rejects conflicts with --json, -
         try runWithDeps(alloc, &.{ "--stream-events", "--quiet", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup)),
     );
     try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "--stream-events") != null);
-    try std.testing.expectEqual(@as(usize, 0), stdout_capture.bytes.items.len);
+    {
+        var parsed_conflict = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            std.mem.trimEnd(u8, stdout_capture.bytes.items, "\n"),
+            .{},
+        );
+        defer parsed_conflict.deinit();
+        try std.testing.expectEqualStrings("result", parsed_conflict.value.object.get("type").?.string);
+        try std.testing.expectEqual(@as(i64, output_contracts.usage_exit_code), parsed_conflict.value.object.get("exit_code").?.integer);
+        try std.testing.expectEqualStrings("InvalidAskArgs", parsed_conflict.value.object.get("error").?.string);
+    }
 
     stdout_capture.bytes.clearRetainingCapacity();
     stderr_capture.bytes.clearRetainingCapacity();
@@ -10257,6 +10287,30 @@ fn testFailStartupAccessDenied(
     return error.AccessDenied;
 }
 
+fn testFailStartupTerminalHungUp(
+    _: Allocator,
+    _: oauth_transport.Provider,
+    _: host.SecretStore,
+    _: []const u8,
+    _: usize,
+    _: ?model_provider.ProviderId,
+    _: ?[]const u8,
+    _: []const config_runtime.SettingOverride,
+) !app_lifecycle.StartupState {
+    return error.TerminalHungUp;
+}
+
+fn testProcessQueuedPromptOutputReaderGone(
+    _: *agent_runtime.Agent,
+    _: *const agent_runtime.AgentRuntimeDeps,
+    _: ?agent_runtime.SemanticPresentationSink,
+    _: agent_runtime.LifecycleContext,
+    _: agent_runtime.Config,
+    _: worker_runtime.QueuedPrompt,
+) !void {
+    return error.OutputReaderGone;
+}
+
 test "stream-events error exits emit result line on stdout with stderr diagnostics, while interrupts drop result" {
     const alloc = std.testing.allocator;
     var stdout_capture = TestCapture{};
@@ -10316,6 +10370,19 @@ test "stream-events error exits emit result line on stdout with stderr diagnosti
     try std.testing.expectEqualStrings("result", parsed_startup.value.object.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 1), parsed_startup.value.object.get("exit_code").?.integer);
     try std.testing.expectEqualStrings("AccessDenied", parsed_startup.value.object.get("error").?.string);
+
+    // TerminalHungUp and OutputReaderGone propagate like --json without writing a result line.
+    stdout_capture.bytes.clearRetainingCapacity();
+    stderr_capture.bytes.clearRetainingCapacity();
+    const hung_deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testFailStartupTerminalHungUp);
+    try std.testing.expectError(error.TerminalHungUp, runWithDeps(alloc, &.{ "--stream-events", "hello" }, testConfig(), hung_deps));
+    try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
+
+    stdout_capture.bytes.clearRetainingCapacity();
+    stderr_capture.bytes.clearRetainingCapacity();
+    const reader_gone_deps = testPromptRunDepsWithProcess(&stdout_capture, &stderr_capture, testProcessQueuedPromptOutputReaderGone);
+    try std.testing.expectError(error.OutputReaderGone, runWithDeps(alloc, &.{ "--stream-events", "hello" }, testConfig(), reader_gone_deps));
+    try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"result\"") == null);
 
     if (comptime supports_headless_interrupt) {
         const previous_action: std.posix.Sigaction = .{
