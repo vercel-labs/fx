@@ -645,9 +645,14 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         script_lines = [
             line.strip() for line in publish_step.split("        run: |\n", 1)[1].splitlines()
         ]
-        guard_start = next(
-            i for i, line in enumerate(script_lines) if line.startswith('if [ "$CHANNEL" != stable ]')
+        # The guard must run before anything else in the step, so nothing can
+        # publish or change CHANNEL or NPM_TAG before it decides.
+        self.assertEqual("set -euo pipefail", script_lines[0])
+        self.assertTrue(
+            script_lines[1].startswith('if [ "$CHANNEL" != stable ]'),
+            f"the dev-tag guard is not the first command of the publish step: {script_lines[1]!r}",
         )
+        guard_start = 1
         guard_end = script_lines.index("fi", guard_start) + 1
         guard = "\n".join(script_lines[guard_start:guard_end]) + "\n"
 
