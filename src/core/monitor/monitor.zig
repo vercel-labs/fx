@@ -15,9 +15,29 @@ const Allocator = std.mem.Allocator;
 
 pub const event = event_mod;
 pub const saved = @import("saved.zig");
+pub const output_log = @import("output_log.zig");
 
 /// The most monitors one agent runs at once.
 pub const max_monitors: usize = 16;
+
+/// Messages from monitors the agent's queue holds at once. A monitor whose
+/// agent has more waiting keeps its events itself (`pushHeld`), so a blocked
+/// agent never has a queue of them to read later.
+pub const max_queued_events: usize = 1;
+
+/// The least time between two events of one monitor. `FX_TEST_MONITOR_GAP_MS`
+/// shortens it, to 100 ms at least, so a test need not wait ten seconds.
+pub fn gapMs() i64 {
+    const text = io_mod.getenv("FX_TEST_MONITOR_GAP_MS") orelse return event_mod.min_gap_ms;
+    const ms = std.fmt.parseInt(i64, text, 10) catch return event_mod.min_gap_ms;
+    return if (ms < 100) event_mod.min_gap_ms else ms;
+}
+
+/// How often the loop looks at its monitors: once a second, or as often as
+/// the shortened event gap when a test shortens it.
+pub fn pollGapMs() i64 {
+    return @min(event_mod.poll_gap_ms, gapMs());
+}
 
 /// One running monitor. Strings are owned by the registry.
 pub const Item = struct {
@@ -28,6 +48,13 @@ pub const Item = struct {
     command: []u8,
     last_event_ms: ?i64 = null,
     last_hash: ?u64 = null,
+    /// Events the agent has not taken yet, oldest first, at most
+    /// `event.max_held`.
+    held: std.ArrayList(event_mod.Held) = .empty,
+    /// Events dropped from `held` to make room for newer ones.
+    dropped: u64 = 0,
+    /// The command ended and its last event is in `held` or was posted.
+    ended: bool = false,
 };
 
 /// A copy of what the loop needs about one monitor.
@@ -36,6 +63,7 @@ pub const Seen = struct {
     label: []u8,
     last_event_ms: ?i64,
     last_hash: ?u64,
+    ended: bool,
 
     pub fn deinit(self: Seen, alloc: Allocator) void {
         alloc.free(self.id);
@@ -166,9 +194,95 @@ pub const Registry = struct {
             errdefer alloc.free(id);
             const label = try alloc.dupe(u8, item.label);
             errdefer alloc.free(label);
-            try out.append(alloc, .{ .id = id, .label = label, .last_event_ms = item.last_event_ms, .last_hash = item.last_hash });
+            try out.append(alloc, .{ .id = id, .label = label, .last_event_ms = item.last_event_ms, .last_hash = item.last_hash, .ended = item.ended });
         }
         return out.toOwnedSlice(alloc);
+    }
+
+    /// Keeps an event `id` could not post. Past `event.max_held` the oldest
+    /// goes and is counted. Returns how many events are dropped since the
+    /// last post, or null when `id` is not listed.
+    pub fn pushHeld(self: *Registry, id: []const u8, text: []const u8, at_ms: i64, command_ended: bool) Allocator.Error!?u64 {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.items.items) |*item| {
+            if (!std.mem.eql(u8, item.id, id)) continue;
+            const owned = try self.alloc.dupe(u8, text);
+            errdefer self.alloc.free(owned);
+            try item.held.append(self.alloc, .{ .text = owned, .at_ms = at_ms });
+            if (item.held.items.len > event_mod.max_held) {
+                self.alloc.free(item.held.items[0].text);
+                _ = item.held.orderedRemove(0);
+                item.dropped += 1;
+            }
+            if (command_ended) item.ended = true;
+            return item.dropped;
+        }
+        return null;
+    }
+
+    /// Whether `id` holds events.
+    pub fn hasHeld(self: *Registry, id: []const u8) bool {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.items.items) |item| {
+            if (std.mem.eql(u8, item.id, id)) return item.held.items.len > 0;
+        }
+        return false;
+    }
+
+    /// Moves `id`'s held events out. Free with `freeBatch`, or give back with
+    /// `restoreHeld` when the post fails.
+    pub fn takeHeld(self: *Registry, id: []const u8) Allocator.Error!?Batch {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.items.items) |*item| {
+            if (!std.mem.eql(u8, item.id, id)) continue;
+            if (item.held.items.len == 0) return null;
+            const events = try item.held.toOwnedSlice(self.alloc);
+            const batch: Batch = .{ .events = events, .dropped = item.dropped, .ended = item.ended };
+            item.dropped = 0;
+            return batch;
+        }
+        return null;
+    }
+
+    /// Puts a batch a failed post did not deliver back in front of what was
+    /// held since. The oldest events past the cap are dropped and counted.
+    pub fn restoreHeld(self: *Registry, id: []const u8, batch: Batch) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.items.items) |*item| {
+            if (!std.mem.eql(u8, item.id, id)) continue;
+            var merged: std.ArrayList(event_mod.Held) = .empty;
+            merged.appendSlice(self.alloc, batch.events) catch return self.dropBatch(batch, item);
+            merged.appendSlice(self.alloc, item.held.items) catch {
+                merged.deinit(self.alloc);
+                return self.dropBatch(batch, item);
+            };
+            self.alloc.free(batch.events);
+            item.held.deinit(self.alloc);
+            item.held = merged;
+            item.dropped += batch.dropped;
+            while (item.held.items.len > event_mod.max_held) {
+                self.alloc.free(item.held.items[0].text);
+                _ = item.held.orderedRemove(0);
+                item.dropped += 1;
+            }
+            return;
+        }
+        freeBatch(self.alloc, batch);
+    }
+
+    /// Out of memory while giving a batch back: its events are dropped, and
+    /// the count says so.
+    fn dropBatch(self: *Registry, batch: Batch, item: *Item) void {
+        item.dropped += batch.dropped + batch.events.len;
+        freeBatch(self.alloc, batch);
     }
 
     /// Records that `id` told the agent something at `now_ms`.
@@ -232,7 +346,7 @@ pub const Registry = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const text = self.restart_note orelse return null;
-        if (!event_mod.pollDue(now_ms, self.last_note_ms)) return null;
+        if (!event_mod.pollDue(now_ms, self.last_note_ms, event_mod.poll_gap_ms)) return null;
         self.last_note_ms = now_ms;
         self.restart_note = null;
         return text;
@@ -244,7 +358,7 @@ pub const Registry = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (!event_mod.pollDue(now_ms, self.last_save_ms)) return false;
+        if (!event_mod.pollDue(now_ms, self.last_save_ms, event_mod.poll_gap_ms)) return false;
         self.last_save_ms = now_ms;
         return true;
     }
@@ -307,7 +421,7 @@ pub const Registry = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.items.items.len == 0) return false;
-        if (!event_mod.pollDue(now_ms, self.last_poll_ms)) return false;
+        if (!event_mod.pollDue(now_ms, self.last_poll_ms, pollGapMs())) return false;
         self.last_poll_ms = now_ms;
         return true;
     }
@@ -340,6 +454,22 @@ fn freeItem(alloc: Allocator, item: Item) void {
     alloc.free(item.id);
     alloc.free(item.label);
     alloc.free(item.command);
+    var held = item.held;
+    for (held.items) |entry| alloc.free(entry.text);
+    held.deinit(alloc);
+}
+
+/// Events a monitor held, moved out for one post.
+pub const Batch = struct {
+    events: []event_mod.Held,
+    dropped: u64,
+    /// The command ended, so this batch holds its last event.
+    ended: bool,
+};
+
+pub fn freeBatch(alloc: Allocator, batch: Batch) void {
+    for (batch.events) |entry| alloc.free(entry.text);
+    alloc.free(batch.events);
 }
 
 test "a registry adds, finds, marks, and removes a monitor" {
@@ -452,6 +582,53 @@ test "a switch to another session hands back the monitors of the old one" {
     try std.testing.expect((try registry.followSession("three")) == null);
 }
 
+test "events a monitor cannot post are held, the newest twenty, and the older ones counted" {
+    var registry: Registry = .{ .alloc = std.testing.allocator };
+    defer registry.deinit();
+    try registry.add("shell-1", "ci", "true");
+    try std.testing.expect(!registry.hasHeld("shell-1"));
+    var buffer: [16]u8 = undefined;
+    for (0..25) |index| {
+        const text = try std.mem.print(&buffer, "event {d}", .{index});
+        _ = try registry.pushHeld("shell-1", text, @intCast(index), false);
+    }
+    try std.testing.expect((try registry.pushHeld("shell-9", "x", 0, false)) == null);
+    const batch = (try registry.takeHeld("shell-1")).?;
+    defer freeBatch(std.testing.allocator, batch);
+    try std.testing.expectEqual(@as(usize, 20), batch.events.len);
+    try std.testing.expectEqual(@as(u64, 5), batch.dropped);
+    try std.testing.expectEqualStrings("event 5", batch.events[0].text);
+    try std.testing.expectEqualStrings("event 24", batch.events[19].text);
+    try std.testing.expect(!batch.ended);
+    try std.testing.expect((try registry.takeHeld("shell-1")) == null);
+}
+
+test "a batch a post did not take goes back in front of what came since" {
+    var registry: Registry = .{ .alloc = std.testing.allocator };
+    defer registry.deinit();
+    try registry.add("shell-1", "ci", "true");
+    _ = try registry.pushHeld("shell-1", "old", 1, false);
+    const batch = (try registry.takeHeld("shell-1")).?;
+    _ = try registry.pushHeld("shell-1", "new", 2, true);
+    registry.restoreHeld("shell-1", batch);
+    const again = (try registry.takeHeld("shell-1")).?;
+    defer freeBatch(std.testing.allocator, again);
+    try std.testing.expectEqual(@as(usize, 2), again.events.len);
+    try std.testing.expectEqualStrings("old", again.events[0].text);
+    try std.testing.expectEqualStrings("new", again.events[1].text);
+    try std.testing.expect(again.ended);
+}
+
+test "a batch for a monitor that is gone is freed" {
+    var registry: Registry = .{ .alloc = std.testing.allocator };
+    defer registry.deinit();
+    try registry.add("shell-1", "ci", "true");
+    _ = try registry.pushHeld("shell-1", "old", 1, false);
+    const batch = (try registry.takeHeld("shell-1")).?;
+    try std.testing.expect(registry.remove("shell-1"));
+    registry.restoreHeld("shell-1", batch);
+}
+
 test "a registry refuses monitors past the cap" {
     var registry: Registry = .{ .alloc = std.testing.allocator };
     defer registry.deinit();
@@ -488,4 +665,5 @@ test "the list names each monitor, and says so when none run" {
 test {
     _ = event_mod;
     _ = saved;
+    _ = output_log;
 }

@@ -5,11 +5,13 @@
 # current.cfg is the design and must pass. Each mutant-*.cfg plants one
 # defect, and the rule it names must catch it:
 #
-#   lose-on-fail     a failed post commits the lines            NoLoss
-#   ignore-gap       an event goes at any time                  GapKept
-#   wake-quiet       a quiet command wakes the agent            NoQuietWake
+#   ignore-gap       an event is made at any time               GapKept
+#   wake-quiet       a quiet command makes an event             NoQuietWake
 #   no-dedupe        an event repeats the last one              NoRepeatWake
-#   event-after-end  the loop posts after the end event         EndIsLast
+#   event-after-end  an event follows the end event             EndIsLast
+#   unbounded-held   the list keeps every event                 HeldBounded
+#   post-when-full   a message goes into a full queue           OneQueued
+#   lose-count       a dropped event is not counted             DropCounted
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -24,9 +26,11 @@ cd "$(dirname "$0")"
 
 tlc_verdicts "$@" <<'VERDICTS'
 Monitor current -
-Monitor mutant-lose-on-fail NoLoss
 Monitor mutant-ignore-gap GapKept
 Monitor mutant-wake-quiet NoQuietWake
 Monitor mutant-no-dedupe NoRepeatWake
 Monitor mutant-event-after-end EndIsLast
+Monitor mutant-unbounded-held HeldBounded
+Monitor mutant-post-when-full OneQueued
+Monitor mutant-lose-count DropCounted
 VERDICTS

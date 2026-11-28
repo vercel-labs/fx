@@ -2,7 +2,7 @@
 // output reaches it as messages from the command, with no model call while the
 // command is quiet. The fake gateway scripts the model; the commands are real.
 import { expect, test } from "bun:test";
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
@@ -57,7 +57,10 @@ scenario("a monitor's output wakes an idle agent, at most once every ten seconds
   expect(monitorTrace(profile, "event=event")).toHaveLength(1);
   expect(monitorTrace(profile, "event=start id=shell-1")).toHaveLength(1);
   expect(monitorRequests(profile)[0]).toContain("tick-1");
-  // The screen shows the message like a subagent's: from the monitor's label.
+  // The model reads it as a monitor's event, not a subagent's message, and the
+  // screen shows it like a subagent's: from the monitor's label.
+  expect(monitorRequests(profile)[0]).toContain("Monitor event (untrusted command output");
+  expect(monitorRequests(profile)[0]).not.toContain("Subagent message");
   expect(await shell.session.capturePane()).toContain("from poll");
   // The next event waits out the gap and holds what came meanwhile.
   await shell.session.waitForText("SAW_SECOND_EVENT", 40_000);
@@ -228,6 +231,72 @@ scenario("a new conversation stops the monitors of the old one and removes their
   await waitFor(() => !processAlive(pid), "the command to end");
   await waitFor(() => !existsSync(recordPath(profile, id)), "the record to go");
   expect(await shell.session.capturePane()).toContain("monitors of the earlier conversation were stopped");
+});
+
+scenario("a blocked agent gets the newest twenty events, a count of the rest, and a file with everything", async (profile) => {
+  const fast = "echo $$ > pid.txt; i=0; while true; do i=$((i+1)); echo tick-$i; sleep 0.1; done";
+  profile.script("Watch the fast poller.", [
+    () => fakeGatewayToolCall("m1", "monitor", { action: "start", command: fast, label: "fast" }),
+    () => fakeGatewayFinalText("FAST_STARTED"),
+    () => fakeGatewayFinalText("SAW_FIRST_FAST"),
+  ]);
+  profile.script("Now block on a prompt.", [
+    () => fakeGatewayToolCall("b1", "shell", { action: "run", command: "echo unblocked" }),
+    () => fakeGatewayFinalText("BLOCK_DONE"),
+    () => fakeGatewayFinalText("SAW_DIGEST"),
+  ]);
+  const shell = await profile.launch({ env: { ...TRACED, FX_PERMISSION_MODE: "ask", FX_TEST_MONITOR_GAP_MS: "200" } });
+  await shell.session.sendText("Watch the fast poller.");
+  await shell.session.waitForText("Would you like to run the following command?", 30_000);
+  await shell.session.sendKeys("1");
+  await shell.session.waitForText("SAW_FIRST_FAST", 30_000);
+  const pid = pidOf(profile);
+
+  // The agent blocks on an approval, and the monitor keeps printing.
+  await shell.session.sendText("Now block on a prompt.");
+  await shell.session.waitForText("Would you like to run the following command?", 30_000);
+  await waitFor(() => monitorTrace(profile, "event=held").length >= 30, "thirty events to be made while the agent is blocked", 40_000);
+  const dropped = monitorTrace(profile, "event=held").map((line) => Number(/dropped_before=(\d+)/.exec(line)![1]));
+  // Only the newest twenty wait, and the older ones are counted.
+  expect(Math.max(...dropped)).toBeGreaterThanOrEqual(5);
+
+  await shell.session.sendKeys("1");
+  await shell.session.waitForText("SAW_DIGEST", 40_000);
+  const digest = monitorTrace(profile, "event=event").find((line) => /events=\d+ dropped=[1-9]/.test(line))!;
+  expect(digest).toBeDefined();
+  const body = profile.gateway.requests.map((request) => request.body).find((text) => text.includes("earlier events dropped"))!;
+  const count = Number(/\+(\d+) earlier events dropped/.exec(body)![1]);
+  expect(count).toBeGreaterThanOrEqual(5);
+  // The message names the file, and the file holds what the events dropped.
+  const file = /output_file\\":\\"([^"\\]+\.log)/.exec(body)![1]!;
+  const logged = readFileSync(file, "utf8").split("\n").filter(Boolean);
+  expect(logged[0]).toBe("tick-1");
+  expect(logged.length).toBeGreaterThan(count + 20);
+  expect(statSync(file).mode & 0o077).toBe(0);
+  process.kill(pid, "SIGKILL");
+});
+
+scenario("the shell tool refuses to read or stop a monitor's command", async (profile) => {
+  profile.script("Watch the quiet job.", [
+    () => fakeGatewayToolCall("m1", "monitor", { action: "start", command: QUIET, label: "quiet" }),
+    () => fakeGatewayFinalText("QUIET_STARTED"),
+  ]);
+  profile.script("Poke the monitor with the shell.", [
+    () => fakeGatewayToolCall("p1", "shell", { action: "interact", session_id: "shell-1", yield_time_ms: 1000 }),
+    () => fakeGatewayToolCall("p2", "shell", { action: "stop", session_id: "shell-1" }),
+    () => fakeGatewayFinalText("POKED"),
+  ]);
+  const shell = await profile.launch({ env: TRACED });
+  await shell.session.sendText("Watch the quiet job.");
+  await shell.session.waitForText("QUIET_STARTED", 30_000);
+  const pid = pidOf(profile);
+  await shell.session.sendText("Poke the monitor with the shell.");
+  await shell.session.waitForText("POKED", 30_000);
+  const last = profile.gateway.requests.at(-1)!.body;
+  expect(last.match(/is a monitor/g)?.length).toBe(2);
+  // Neither call touched the command, and the monitor is still listed.
+  expect(processAlive(pid)).toBe(true);
+  expect(monitorTrace(profile, "event=stop")).toHaveLength(0);
 });
 
 const UPGRADE_TIMEOUT = 120_000;

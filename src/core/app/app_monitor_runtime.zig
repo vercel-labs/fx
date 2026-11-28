@@ -15,6 +15,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 
 const event = monitor.event;
 const saved = monitor.saved;
+const output_log = monitor.output_log;
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -43,6 +44,7 @@ pub fn Runtime(comptime App: type) type {
             const home = io_mod.homeDir() orelse return;
             const id = Session.activeSessionId(&app.main_agent) orelse return;
             saved.clear(app.alloc, home, id);
+            output_log.removeSession(app.alloc, home, id);
         }
 
         /// Saves the record when the monitors changed, and posts the restart
@@ -72,7 +74,10 @@ pub fn Runtime(comptime App: type) type {
         fn stopDeparted(app: *App, registry: *monitor.Registry) void {
             const departed = (registry.followSession(Session.activeSessionId(&app.main_agent)) catch return) orelse return;
             debug_trace.logf("monitor", "event=session_changed count={d}", .{departed.ids.len});
-            if (io_mod.homeDir()) |home| saved.clear(app.alloc, home, departed.session);
+            if (io_mod.homeDir()) |home| {
+                saved.clear(app.alloc, home, departed.session);
+                output_log.removeSession(app.alloc, home, departed.session);
+            }
             const runtime = &app.main_agent.managed_executions;
             const ids = departed.ids;
             registry.alloc.free(departed.session);
@@ -124,7 +129,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn postRestartNote(app: *App, agent: anytype, registry: *monitor.Registry, now_ms: i64) void {
             const text = registry.takeRestartNote(now_ms) orelse return;
-            const framed = event.frame(app.alloc, "fx", "restart", text) catch {
+            const framed = event.frame(app.alloc, "fx", "restart", text, null) catch {
                 registry.setRestartNote(text);
                 return;
             };
@@ -144,27 +149,30 @@ pub fn Runtime(comptime App: type) type {
 
         fn poll(app: *App, agent: anytype, registry: *monitor.Registry, item: monitor.Seen, now_ms: i64) void {
             const runtime = &agent.managed_executions;
-            const state = runtime.stateFor(item.id) orelse {
-                // Its entry is gone, so nothing is left to read or stop.
-                _ = registry.remove(item.id);
-                debug_trace.logf("monitor", "event=stop id={s} reason=entry_gone", .{item.id});
-                return;
-            };
-            const ended = state != .running;
-            const waiting = runtime.pendingOutputBytesFor(item.id) orelse 0;
-            if (!ended and waiting == 0) return;
-            if (!event.due(now_ms, item.last_event_ms, ended)) return;
-            post(app, agent, registry, item, now_ms);
+            if (!item.ended) {
+                const state = runtime.stateFor(item.id) orelse {
+                    // Its entry is gone, so nothing is left to read or stop.
+                    _ = registry.remove(item.id);
+                    debug_trace.logf("monitor", "event=stop id={s} reason=entry_gone", .{item.id});
+                    return;
+                };
+                const ended = state != .running;
+                const waiting = runtime.pendingOutputBytesFor(item.id) orelse 0;
+                if ((ended or waiting > 0) and event.due(now_ms, item.last_event_ms, ended, monitor.gapMs())) {
+                    read(app, agent, registry, item, now_ms);
+                }
+            }
+            flush(app, agent, registry, item.id, now_ms);
         }
 
-        fn post(app: *App, agent: anytype, registry: *monitor.Registry, item: monitor.Seen, now_ms: i64) void {
+        /// Reads what the command printed, keeps all of it in the monitor's
+        /// file, and holds the event it makes. The agent gets held events in
+        /// `flush`, when it can take them.
+        fn read(app: *App, agent: anytype, registry: *monitor.Registry, item: monitor.Seen, now_ms: i64) void {
             const runtime = &agent.managed_executions;
             // The agent may have stopped it since the loop listed it: its stop
             // is the answer, so no end event follows.
             if (!registry.contains(item.id)) return;
-            // An agent that stops for fx's restart takes no more mail: the
-            // output waits in the entry.
-            if (agent.worker.yield_requested.load(.seq_cst)) return;
             // A busy or stopping command is looked at again next second.
             var prepared = runtime.wait(app.alloc, item.id, 0, null) catch |err| {
                 debug_trace.logf("monitor", "event=read_deferred id={s} reason={s}", .{ item.id, @errorName(err) });
@@ -179,6 +187,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer app.alloc.free(text.body);
+            logOutput(app, item.id, snapshot.output_delta);
             const hash = event.textHash(text.body);
             // The same words again are no news: the output is taken, the
             // agent is not woken, and the monitor waits out the gap.
@@ -194,23 +203,90 @@ pub fn Runtime(comptime App: type) type {
                 commitRead(runtime, item.id, prepared.reservation_id);
                 return;
             }
-            const framed = event.frame(app.alloc, item.label, item.id, text.body) catch {
+            const dropped = registry.pushHeld(item.id, text.body, now_ms, !running) catch |err| {
                 cancelRead(runtime, item.id, prepared.reservation_id);
-                return;
-            };
-            defer app.alloc.free(framed);
-            app.postAgentMessage(agent, framed, .child, .report) catch |err| {
-                cancelRead(runtime, item.id, prepared.reservation_id);
-                debug_trace.logf("monitor", "event=post_deferred id={s} reason={s}", .{ item.id, @errorName(err) });
+                debug_trace.logf("monitor", "event=read_deferred id={s} reason={s}", .{ item.id, @errorName(err) });
                 return;
             };
             commitRead(runtime, item.id, prepared.reservation_id);
             registry.markEvent(item.id, now_ms, hash);
-            debug_trace.logf("monitor", "event=event id={s} bytes={d} more_lines={d} ended={}", .{ item.id, text.body.len, text.more_lines, !running });
-            if (!running) {
-                _ = registry.remove(item.id);
-                debug_trace.logf("monitor", "event=stop id={s} reason=command_ended", .{item.id});
+            debug_trace.logf("monitor", "event=held id={s} bytes={d} more_lines={d} dropped_before={d} ended={}", .{ item.id, text.body.len, text.more_lines, dropped orelse 0, !running });
+        }
+
+        /// Posts the events a monitor holds as one message, when the agent can
+        /// take it: nothing of this monitor's waits in its queue, and it is not
+        /// stopping for fx's restart. Otherwise they stay held, the newest
+        /// twenty, and the file keeps everything.
+        fn flush(app: *App, agent: anytype, registry: *monitor.Registry, id: []const u8, now_ms: i64) void {
+            if (!registry.hasHeld(id)) return;
+            if (agent.worker.yield_requested.load(.seq_cst)) return;
+            if (agent.worker.agentMessageCount() >= monitor.max_queued_events) return;
+            if (!agent.worker.reserveAgentMessage()) return;
+            const batch = (registry.takeHeld(id) catch {
+                agent.worker.releaseAgentMessage();
+                return;
+            }) orelse {
+                agent.worker.releaseAgentMessage();
+                return;
+            };
+            const label = labelOf(app, registry, id);
+            defer if (label) |text| app.alloc.free(text);
+            const body = event.digest(app.alloc, batch.events, batch.dropped, now_ms) catch {
+                agent.worker.releaseAgentMessage();
+                registry.restoreHeld(id, batch);
+                return;
+            };
+            defer app.alloc.free(body);
+            const file = outputFile(app, id);
+            defer if (file) |path| app.alloc.free(path);
+            const framed = event.frame(app.alloc, label orelse id, id, body, file) catch {
+                agent.worker.releaseAgentMessage();
+                registry.restoreHeld(id, batch);
+                return;
+            };
+            defer app.alloc.free(framed);
+            // The place held above is spent by the post, whatever happens.
+            app.postAgentMessage(agent, framed, .child, .message) catch |err| {
+                debug_trace.logf("monitor", "event=post_deferred id={s} reason={s}", .{ id, @errorName(err) });
+                registry.restoreHeld(id, batch);
+                return;
+            };
+            debug_trace.logf("monitor", "event=event id={s} events={d} dropped={d} bytes={d} ended={}", .{ id, batch.events.len, batch.dropped, body.len, batch.ended });
+            const ended = batch.ended;
+            monitor.freeBatch(app.alloc, batch);
+            if (ended) {
+                _ = registry.remove(id);
+                debug_trace.logf("monitor", "event=stop id={s} reason=command_ended", .{id});
             }
+        }
+
+        /// The monitor's label, copied. Caller frees it.
+        fn labelOf(app: *App, registry: *monitor.Registry, id: []const u8) ?[]u8 {
+            const seen = registry.seen(app.alloc) catch return null;
+            defer {
+                for (seen) |item| item.deinit(app.alloc);
+                app.alloc.free(seen);
+            }
+            for (seen) |item| {
+                if (std.mem.eql(u8, item.id, id)) return app.alloc.dupe(u8, item.label) catch null;
+            }
+            return null;
+        }
+
+        /// The path of the file that holds everything monitor `id` printed, or
+        /// null when the session or the profile folder is unknown.
+        fn outputFile(app: *App, id: []const u8) ?[]u8 {
+            const home = io_mod.homeDir() orelse return null;
+            const session = Session.activeSessionId(&app.main_agent) orelse return null;
+            return output_log.filePath(app.alloc, home, session, id) catch null;
+        }
+
+        fn logOutput(app: *App, id: []const u8, output: []const u8) void {
+            if (output.len == 0) return;
+            const home = io_mod.homeDir() orelse return;
+            const session = Session.activeSessionId(&app.main_agent) orelse return;
+            output_log.append(app.alloc, home, session, id, output) catch |err|
+                debug_trace.logf("monitor", "event=log_failed id={s} err={s}", .{ id, @errorName(err) });
         }
 
         /// Gives a read's output back to the entry, so a later event carries it.

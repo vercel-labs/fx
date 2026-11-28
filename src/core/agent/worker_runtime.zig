@@ -1425,6 +1425,14 @@ pub const WorkerRuntime = struct {
         return prompt.delivery.activeTurnId() == self.active_turn_id;
     }
 
+    /// How many messages from other agents wait in this queue, places held
+    /// for them included.
+    pub fn agentMessageCount(self: *WorkerRuntime) usize {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.agentMessageCountLocked();
+    }
+
     /// Holds a place in this queue for another agent's message that is on
     /// its way, so the sender can be told at once.
     /// False when the queue already holds `agent_frame.queue_cap` of them,

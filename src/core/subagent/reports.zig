@@ -341,8 +341,10 @@ pub const Row = struct {
 pub fn row(alloc: Allocator, user: types.UserTurn) error{OutOfMemory}!?Row {
     if (user.author != .child) return null;
     const is_report = std.mem.startsWith(u8, user.text, header);
-    if (!is_report and !std.mem.startsWith(u8, user.text, message_header)) return null;
-    const header_len: usize = if (is_report) header.len else message_header.len;
+    // A monitor's event draws as a message from the monitor.
+    const is_monitor = std.mem.startsWith(u8, user.text, agent_frame.monitor_header);
+    if (!is_report and !is_monitor and !std.mem.startsWith(u8, user.text, message_header)) return null;
+    const header_len: usize = if (is_report) header.len else if (is_monitor) agent_frame.monitor_header.len else message_header.len;
     const json_line = std.mem.trimEnd(u8, user.text[header_len..], "\n");
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
@@ -371,6 +373,18 @@ pub fn row(alloc: Allocator, user: types.UserTurn) error{OutOfMemory}!?Row {
         .failed, .interrupted, .lost => true,
     } else false;
     return .{ .outcome = if (failed) .failed else .completed, .status = status, .text = try alloc.dupe(u8, body) };
+}
+
+test "a monitor's event draws as a message from the monitor" {
+    const alloc = std.testing.allocator;
+    const frame = agent_frame.monitor_header ++ "{\"agent\":\"ci\",\"child_id\":\"shell-1\",\"source\":\"monitor\",\"message\":\"build ok\\nlint ok\"}\n";
+    var shown = (try row(alloc, .{ .text = @constCast(frame), .author = .child })).?;
+    defer shown.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, shown.status, "from ci"));
+    try std.testing.expectEqualStrings("build ok\nlint ok", shown.text);
+    try std.testing.expect(shown.outcome == .completed);
+    // Typed by the user, the same words are no frame.
+    try std.testing.expect((try row(alloc, .{ .text = @constCast(frame), .author = .user })) == null);
 }
 
 test "a completed work the user closed names the close beside the count" {

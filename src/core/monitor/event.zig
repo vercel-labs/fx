@@ -11,6 +11,14 @@ const Allocator = std.mem.Allocator;
 /// sooner waits and goes in the next event.
 pub const min_gap_ms: i64 = 10_000;
 
+/// Most events one monitor holds while the agent cannot take them. Older
+/// ones are dropped and counted.
+pub const max_held: usize = 20;
+
+/// Most bytes of events one message carries. Older events that do not fit
+/// are dropped and counted.
+pub const max_digest_bytes: usize = 16 * 1024;
+
 /// How often the main loop looks at its monitors.
 pub const poll_gap_ms: i64 = 1_000;
 
@@ -23,16 +31,16 @@ pub const max_bytes: usize = 2048;
 /// Whether a monitor with output waiting may send an event now. A monitor
 /// whose command ended always may, so the end is never held back. A clock
 /// that moved back counts as due, so a jump never silences a monitor.
-pub fn due(now_ms: i64, last_event_ms: ?i64, ended: bool) bool {
+pub fn due(now_ms: i64, last_event_ms: ?i64, ended: bool, gap_ms: i64) bool {
     if (ended) return true;
     const last = last_event_ms orelse return true;
     if (now_ms < last) return true;
-    return now_ms - last >= min_gap_ms;
+    return now_ms - last >= gap_ms;
 }
 
 /// Whether the main loop looks at its monitors now.
-pub fn pollDue(now_ms: i64, last_poll_ms: i64) bool {
-    return now_ms < last_poll_ms or now_ms - last_poll_ms >= poll_gap_ms;
+pub fn pollDue(now_ms: i64, last_poll_ms: i64, gap_ms: i64) bool {
+    return now_ms < last_poll_ms or now_ms - last_poll_ms >= gap_ms;
 }
 
 pub const Composed = struct {
@@ -112,6 +120,47 @@ fn characterBoundary(line: []const u8, limit: usize) usize {
     return end;
 }
 
+/// One event a monitor held while the agent could not take it.
+pub const Held = struct {
+    /// Owned by whoever holds the event.
+    text: []u8,
+    at_ms: i64,
+};
+
+fn writeAgo(writer: *std.Io.Writer, seconds: i64) std.Io.Writer.Error!void {
+    if (seconds < 120) return writer.print("{d}s", .{@max(seconds, 0)});
+    return writer.print("{d}m", .{@divFloor(seconds, 60)});
+}
+
+/// The one message that carries the events a monitor held: a first line that
+/// counts the events dropped before them, then the newest events that fit
+/// `max_digest_bytes`, oldest first, each marked with its age. A single event
+/// and nothing dropped goes as it is. Caller owns the result.
+pub fn digest(alloc: Allocator, held: []const Held, dropped: u64, now_ms: i64) Allocator.Error![]u8 {
+    var first: usize = held.len;
+    var used: usize = 0;
+    while (first > 0) {
+        const next = used + held[first - 1].text.len + 32;
+        if (next > max_digest_bytes and first < held.len) break;
+        used = next;
+        first -= 1;
+    }
+    const total_dropped = dropped + first;
+    const shown = held[first..];
+    if (total_dropped == 0 and shown.len == 1) return alloc.dupe(u8, shown[0].text);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    if (total_dropped > 0) writer.print("+{d} earlier {s} dropped\n", .{ total_dropped, if (total_dropped == 1) "event" else "events" }) catch return error.OutOfMemory;
+    for (shown, 0..) |event, index| {
+        if (index > 0 or total_dropped > 0) writer.writeByte('\n') catch return error.OutOfMemory;
+        writer.writeByte('[') catch return error.OutOfMemory;
+        writeAgo(writer, @divFloor(now_ms - event.at_ms, 1000)) catch return error.OutOfMemory;
+        writer.print(" ago]\n{s}\n", .{event.text}) catch return error.OutOfMemory;
+    }
+    return out.toOwnedSlice();
+}
+
 /// A hash of an event's text, to drop an event that repeats the last one.
 pub fn textHash(text: []const u8) u64 {
     return std.hash.Wyhash.hash(0, text);
@@ -132,37 +181,40 @@ pub const Ended = union(enum) {
     unknown,
 };
 
-/// The message the agent receives: the frame a subagent's message has, so a
-/// screen and a saved session show it the same way, with `"source":"monitor"`
-/// naming what it is. The command's output sits in one JSON string, so it
+/// The message the agent receives: a frame of its own (`agent_frame`), drawn
+/// like a subagent's message, with `"source":"monitor"` naming what it is
+/// and `output_file` naming the file that holds everything the command printed. The command's output sits in one JSON string, so it
 /// can never pass as the frame or as the user's words. Caller owns the
 /// result.
-pub fn frame(alloc: Allocator, label: []const u8, id: []const u8, body: []const u8) Allocator.Error![]u8 {
+pub fn frame(alloc: Allocator, label: []const u8, id: []const u8, body: []const u8, output_file: ?[]const u8) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    out.writer.writeAll(agent_frame.message_header) catch return error.OutOfMemory;
+    out.writer.writeAll(agent_frame.monitor_header) catch return error.OutOfMemory;
     std.json.Stringify.value(.{
         .agent = label,
         .child_id = id,
         .source = "monitor",
+        .output_file = output_file,
         .message = body,
-    }, .{}, &out.writer) catch return error.OutOfMemory;
+    }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
     out.writer.writeByte('\n') catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
 test "an event may go when nothing went yet, when the gap passed, or when the command ended" {
-    try std.testing.expect(due(1_000, null, false));
-    try std.testing.expect(!due(1_000 + min_gap_ms - 1, 1_000, false));
-    try std.testing.expect(due(1_000 + min_gap_ms, 1_000, false));
-    try std.testing.expect(due(1_001, 1_000, true));
-    try std.testing.expect(due(500, 1_000, false));
+    try std.testing.expect(due(1_000, null, false, min_gap_ms));
+    try std.testing.expect(!due(1_000 + min_gap_ms - 1, 1_000, false, min_gap_ms));
+    try std.testing.expect(due(1_000 + min_gap_ms, 1_000, false, min_gap_ms));
+    try std.testing.expect(due(1_001, 1_000, true, min_gap_ms));
+    try std.testing.expect(due(500, 1_000, false, min_gap_ms));
+    try std.testing.expect(due(1_200, 1_000, false, 200));
 }
 
 test "the loop polls once a second and a clock that moved back polls at once" {
-    try std.testing.expect(!pollDue(1_999, 1_000));
-    try std.testing.expect(pollDue(2_000, 1_000));
-    try std.testing.expect(pollDue(10, 1_000));
+    try std.testing.expect(!pollDue(1_999, 1_000, poll_gap_ms));
+    try std.testing.expect(pollDue(2_000, 1_000, poll_gap_ms));
+    try std.testing.expect(pollDue(10, 1_000, poll_gap_ms));
+    try std.testing.expect(pollDue(1_150, 1_000, 100));
 }
 
 test "a short output goes whole" {
@@ -237,14 +289,61 @@ test "escape bytes in output never reach the event" {
     try std.testing.expect(std.mem.findScalar(u8, composed.text, 0x1b) == null);
 }
 
-test "the frame is a subagent message that names its source" {
-    const text = try frame(std.testing.allocator, "ci", "shell-3", "check failed\nline \"two\"");
+test "the frame is a monitor event that names its source and its output file" {
+    const text = try frame(std.testing.allocator, "ci", "shell-3", "check failed\nline \"two\"", "/Users/example/.fx/monitors/s/shell-3.log");
     defer std.testing.allocator.free(text);
     try std.testing.expect(agent_frame.isFrame(text));
+    try std.testing.expect(std.mem.startsWith(u8, text, agent_frame.monitor_header));
     try std.testing.expect(std.mem.find(u8, text, "\"source\":\"monitor\"") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\"output_file\":\"/Users/example/.fx/monitors/s/shell-3.log\"") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "\"}\n"));
     // The output stays inside one JSON line.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\n"));
+}
+
+test "a frame with no output file leaves the field out" {
+    const text = try frame(std.testing.allocator, "ci", "shell-3", "ok", null);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "output_file") == null);
+}
+
+test "a single held event goes as it is" {
+    var text = "build ok".*;
+    const held = [_]Held{.{ .text = &text, .at_ms = 5_000 }};
+    const body = try digest(std.testing.allocator, &held, 0, 9_000);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("build ok", body);
+}
+
+test "held events go together with their ages and the count dropped before them" {
+    var a = "first".*;
+    var b = "second".*;
+    const held = [_]Held{ .{ .text = &a, .at_ms = 1_000 }, .{ .text = &b, .at_ms = 61_000 } };
+    const body = try digest(std.testing.allocator, &held, 340, 121_000);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("+340 earlier events dropped\n\n[2m ago]\nfirst\n\n[60s ago]\nsecond\n", body);
+    const one = try digest(std.testing.allocator, held[1..], 1, 66_000);
+    defer std.testing.allocator.free(one);
+    try std.testing.expectEqualStrings("+1 earlier event dropped\n\n[5s ago]\nsecond\n", one);
+}
+
+test "events past the byte cap are dropped oldest first and counted" {
+    var big: [4096]u8 = undefined;
+    @memset(&big, 'x');
+    var held: [8]Held = undefined;
+    for (&held, 0..) |*slot, index| slot.* = .{ .text = &big, .at_ms = @intCast(index * 1000) };
+    const body = try digest(std.testing.allocator, &held, 0, 10_000);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(body.len <= max_digest_bytes + 256);
+    // Three of the eight events fit, so five were dropped.
+    try std.testing.expect(std.mem.startsWith(u8, body, "+5 earlier events dropped\n"));
+    // The newest event always goes, even when it alone is over the cap.
+    var huge: [max_digest_bytes + 100]u8 = undefined;
+    @memset(&huge, 'y');
+    const only = [_]Held{.{ .text = &huge, .at_ms = 0 }};
+    const kept = try digest(std.testing.allocator, &only, 0, 0);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqual(huge.len, kept.len);
 }
 
 test "equal text hashes equal and different text differs" {

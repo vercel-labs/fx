@@ -118,8 +118,8 @@ fn callStart(ctx: tool_dispatch.DispatchContext, registry: *monitor.Registry, in
             };
             debug_trace.logf("monitor", "event=start id={s} command_bytes={d}", .{ id, input.command.len });
             return .{ .success = try ctx.allocator.print(
-                "Monitor {s} ({s}) started. Its output arrives as messages from it, at most one every {d} seconds. Stop it with action=stop and id={s}.",
-                .{ id, input.label, @divTrunc(monitor.event.min_gap_ms, 1000), id },
+                "Monitor {s} ({s}) started. Its output arrives as messages from it, at most one every {d} seconds. While you are busy or blocked on a prompt, the newest {d} wait and older ones are dropped, so read the file each message names with read_file for everything it printed: the newest 4 to 8 MiB. Stop it with action=stop and id={s}.",
+                .{ id, input.label, @divTrunc(monitor.event.min_gap_ms, 1000), monitor.event.max_held, id },
             ) };
         },
     }
