@@ -29,7 +29,7 @@
 # quiet wait, a wait that ended on mail, and a wait refused after the first
 # call yielded.
 #
-# AskWait models `fx tool ask`, the slice-8 design; its code has not landed. A
+# AskWait models `fx tool ask`, the slice-8 design, built in src/core/tool_bridge/bridge.zig and src/core/tooling/tool_runtime.zig. A
 # question holds the bridge's prompt lock until it ends, so one prompt shows at a
 # time, and a watch withdraws a question whose program is gone. ask-design must
 # pass. ask-mutant-watch-off removes the watch, so a gone program's bash call

@@ -110,6 +110,20 @@ pub fn toolCall(
             try out.writer.writeByte('}');
             return .{ .id = request_id, .name = "subagent", .arguments_json = out.written() };
         },
+        .ask => |req| {
+            // One question, whose options are the labels, as the ask_user_question tool takes them.
+            try out.writer.writeAll("{\"questions\":[{\"question\":");
+            try std.json.Stringify.value(req.question, .{}, &out.writer);
+            try out.writer.writeAll(",\"options\":[");
+            for (req.options, 0..) |option, index| {
+                if (index > 0) try out.writer.writeByte(',');
+                try out.writer.writeAll("{\"label\":");
+                try std.json.Stringify.value(option, .{}, &out.writer);
+                try out.writer.writeByte('}');
+            }
+            try out.writer.writeAll("]}]}");
+            return .{ .id = request_id, .name = "ask_user_question", .arguments_json = out.written() };
+        },
         .view => |req| {
             try out.writer.writeAll("{\"path\":");
             try std.json.Stringify.value(req.path, .{}, &out.writer);
@@ -217,6 +231,19 @@ test "a web request runs as the web tool's own call, with its url, query, and do
     const blocked = [_][]const u8{"spam.example"};
     const blocked_call = try toolCall(arena, "req-4", .{ .web_search = .{ .query = "zig", .blocked_domains = &blocked } }, "");
     try std.testing.expectEqualStrings("{\"query\":\"zig\",\"blocked_domains\":[\"spam.example\"]}", blocked_call.arguments_json);
+}
+
+test "an ask request runs as ask_user_question with one question and its options as labels" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const options = [_][]const u8{ "A", "B" };
+    const asked = try toolCall(arena, "req-7", .{ .ask = .{ .question = "Pick?", .options = &options } }, "");
+    try std.testing.expectEqualStrings("ask_user_question", asked.name);
+    try std.testing.expectEqualStrings(
+        "{\"questions\":[{\"question\":\"Pick?\",\"options\":[{\"label\":\"A\"},{\"label\":\"B\"}]}]}",
+        asked.arguments_json,
+    );
 }
 
 test "a view request runs as the read_file call with its path" {

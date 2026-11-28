@@ -720,15 +720,15 @@ fn sessionEnvScript(alloc: std.mem.Allocator, dir: []const u8, fx_variables: []c
     return out.toOwnedSlice(alloc);
 }
 
-/// Appends the seven functions a program calls: `edit PATH` and `write PATH`
-/// change files, `view PATH` attaches an image file, `skill` and `agent` run `fx tool skill` and `fx tool agent`, and
+/// Appends the eight functions a program calls: `edit PATH` and `write PATH`
+/// change files, `view PATH` attaches an image file, `ask QUESTION` asks the person, `skill` and `agent` run `fx tool skill` and `fx tool agent`, and
 /// `web URL` and `search QUERY` run `fx tool web` and `fx tool search`.
-/// Each runs as `'<fx>' tool <verb> "$@"`, and all seven are exported to child
-/// bash processes (`export -f edit write view skill agent web search`). They come after the saved
+/// Each runs as `'<fx>' tool <verb> "$@"`, and all eight are exported to child
+/// bash processes (`export -f edit write view ask skill agent web search`). They come after the saved
 /// state loads, so they win over a saved definition with the same name, and the
 /// save skips them (`body_after_skip`), so they never reach the state.
 fn appendFxFunctions(alloc: std.mem.Allocator, out: *std.ArrayList(u8), fx_binary: []const u8) !void {
-    for ([_][]const u8{ "edit", "write", "view", "skill", "agent", "web", "search" }) |verb| {
+    for ([_][]const u8{ "edit", "write", "view", "ask", "skill", "agent", "web", "search" }) |verb| {
         try out.appendSlice(alloc, verb);
         try out.appendSlice(alloc, "() { ");
         try appendQuotedWord(alloc, out, &.{fx_binary});
@@ -736,7 +736,7 @@ fn appendFxFunctions(alloc: std.mem.Allocator, out: *std.ArrayList(u8), fx_binar
         try out.appendSlice(alloc, verb);
         try out.appendSlice(alloc, " \"$@\"; }\n");
     }
-    try out.appendSlice(alloc, "builtin export -f edit write view skill agent web search\n");
+    try out.appendSlice(alloc, "builtin export -f edit write view ask skill agent web search\n");
 }
 
 /// The kind of the entry `name` in `folder`, without following a link, or null
@@ -960,7 +960,7 @@ const body_after_skip =
     \\      {
     \\        for __fx_name in $(\builtin compgen -A function); do
     \\          case $__fx_name in
-    \\            __fx_*|alias|builtin|cd|command|declare|eval|exec|exit|printf|set|shopt|source|trap|unalias|unset|edit|write|view|skill|agent|web|search|.) builtin continue ;;
+    \\            __fx_*|alias|builtin|cd|command|declare|eval|exec|exit|printf|set|shopt|source|trap|unalias|unset|edit|write|view|ask|skill|agent|web|search|.) builtin continue ;;
     \\          esac
     \\          builtin declare -f "$__fx_name"
     \\        done
@@ -1094,8 +1094,8 @@ test "the bash script defines view as the other fx tool functions are defined, a
     defer std.testing.allocator.free(script);
     try std.testing.expect(std.mem.find(u8, script, "view() { ") != null);
     try std.testing.expect(std.mem.find(u8, script, "tool view \"$@\"; }") != null);
-    try std.testing.expect(std.mem.find(u8, script, "builtin export -f edit write view skill agent web search\n") != null);
-    try std.testing.expect(std.mem.find(u8, script, "unset|edit|write|view|skill|agent|web|search|.) builtin continue") != null);
+    try std.testing.expect(std.mem.find(u8, script, "builtin export -f edit write view ask skill agent web search\n") != null);
+    try std.testing.expect(std.mem.find(u8, script, "unset|edit|write|view|ask|skill|agent|web|search|.) builtin continue") != null);
 }
 
 test "the bash script keeps the reviewed bytes" {
@@ -1104,7 +1104,7 @@ test "the bash script keeps the reviewed bytes" {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    try std.testing.expectEqualStrings("97c5adc8ce2320770ec86eadf6823f4ded1fc583a83b0afd94825200cd7b03f9", &hex);
+    try std.testing.expectEqualStrings("5c5c4f93c76ad06ab15efe386c3675fa0c70c78a64ed363b8bafa68c52e4d5a4", &hex);
 }
 
 /// Writes an executable shell script at `path` that prints its arguments, standing

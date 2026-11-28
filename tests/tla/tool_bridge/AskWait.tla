@@ -1,15 +1,20 @@
 ------------------------------ MODULE AskWait ------------------------------
 (***************************************************************************)
 (* `fx tool ask`, sent by a bash program through the tool bridge. This is  *)
-(* the design for slice 8; the code has not landed.                        *)
+(* the design for slice 8, built in src/core/tool_bridge/bridge.zig (the   *)
+(* prompt lock) and src/core/tooling/tool_runtime.zig (runBridgeAsk and    *)
+(* QuestionWatch). Its Bun driver lands in block 8.2b.                     *)
 (*                                                                         *)
 (* A question opens in the session's one question slot                     *)
 (* (`worker_runtime.zig` `requestQuestionBatchAnswerBlockingWithSource`,   *)
 (* which asserts that the slot is free). So a bridged question takes the   *)
 (* bridge's prompt lock and holds it until the question ends: permission   *)
 (* prompts and questions show one at a time, and a second `ask` from the   *)
-(* same program waits in line. A request that waits for the lock gives up  *)
-(* when its program is gone, as permission requests already do.            *)
+(* same program waits in line. A request that waits for the lock waits     *)
+(* without a cancel, as a permission check does (`lockUncancelable`): once *)
+(* it gets the lock, it gives up if its program is gone. The model has one *)
+(* program; a request of another program, such as a subagent's, also waits *)
+(* for this program's open question, as permission requests already do.    *)
 (*                                                                         *)
 (* The program can exit or be killed at any step; its socket then closes.  *)
 (* A question whose program is gone is withdrawn at once, by a watch on    *)
@@ -138,10 +143,12 @@ Show(r) ==
     /\ asked' = asked + 1
     /\ UNCHANGED <<prog, programs, ui, bash, told>>
 
-\* A queued request whose program is gone gives up without a prompt.
+\* A queued request whose program is gone gives up without a prompt. Its wait
+\* for the lock has no cancel, so it gives up only once the lock is free.
 GiveUp(r) ==
     /\ req[r] = "queued"
     /\ prog = "gone"
+    /\ lock = NoReq
     /\ End(r, "gave-up")
     /\ UNCHANGED <<prog, programs, ui, bash, crashed, asked>>
 

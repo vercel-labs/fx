@@ -23,6 +23,7 @@ pub const Command = union(enum) {
     edit: []const u8,
     write: []const u8,
     view: []const u8,
+    ask: AskCommand,
     skill_list,
     skill_open: capability.SkillOpenRequest,
     agent_message: capability.AgentMessageRequest,
@@ -38,6 +39,7 @@ pub const Command = union(enum) {
             .edit => "edit",
             .write => "write",
             .view => "view",
+            .ask => "ask",
             .skill_list => "skill list",
             .skill_open => "skill open",
             .agent_message => "agent message",
@@ -53,7 +55,7 @@ pub const Command = union(enum) {
     fn readsStdin(self: Command) bool {
         return switch (self) {
             .edit, .write => true,
-            .view, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => false,
+            .view, .ask, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => false,
         };
     }
 };
@@ -73,6 +75,28 @@ const DomainList = struct {
     fn slice(self: *const DomainList) []const []const u8 {
         return self.items[0..self.len];
     }
+};
+
+/// The options of `fx tool ask`: at most `capability.max_ask_options`, each a slice of the arguments.
+const AskOptions = struct {
+    items: [capability.max_ask_options][]const u8 = @splat(""),
+    len: usize = 0,
+
+    fn push(self: *AskOptions, label: []const u8) ParseError!void {
+        if (self.len == capability.max_ask_options) return error.InvalidOptionCount;
+        self.items[self.len] = label;
+        self.len += 1;
+    }
+
+    fn slice(self: *const AskOptions) []const []const u8 {
+        return self.items[0..self.len];
+    }
+};
+
+/// `fx tool ask QUESTION` with its options, before the bridge request copies them.
+const AskCommand = struct {
+    question: []const u8,
+    options: AskOptions,
 };
 
 /// `fx tool search QUERY` with its domain filters, before the bridge request copies them.
@@ -95,6 +119,7 @@ pub const ParseError = error{
     InvalidQuery,
     BothDomainKinds,
     TooManyDomains,
+    InvalidOptionCount,
 };
 
 /// Reads `args`, the words after `fx tool`.
@@ -162,9 +187,39 @@ pub fn parse(args: []const []const u8) ParseError!Command {
         return error.UnknownCommand;
     }
     if (std.mem.eql(u8, verb, "view")) return parseView(args);
+    if (std.mem.eql(u8, verb, "ask")) return parseAsk(args);
     if (std.mem.eql(u8, verb, "web")) return parseWeb(args);
     if (std.mem.eql(u8, verb, "search")) return parseSearch(args);
     return error.UnknownCommand;
+}
+
+/// `fx tool ask QUESTION --option=LABEL --option=LABEL...`: one question and its options, in
+/// either option form. A `--` ends the options, so a question may start with a dash. The
+/// question needs 2 to 6 options, which the question tool takes.
+fn parseAsk(args: []const []const u8) ParseError!Command {
+    var question: ?[]const u8 = null;
+    var command: AskCommand = .{ .question = "", .options = .{} };
+    var positional_only = false;
+    var index: usize = 1;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (!positional_only and std.mem.eql(u8, arg, "--")) {
+            positional_only = true;
+            continue;
+        }
+        if (!positional_only and arg.len > 0 and arg[0] == '-') {
+            const label = (try matchOptionValue(args, &index, "--option")) orelse return error.UnknownOption;
+            try command.options.push(label);
+            continue;
+        }
+        if (question != null) return error.TooManyArguments;
+        question = arg;
+    }
+    const text = question orelse return error.MissingArgument;
+    if (text.len == 0) return error.MissingArgument;
+    if (command.options.len < capability.min_ask_options) return error.InvalidOptionCount;
+    command.question = text;
+    return .{ .ask = command };
 }
 
 /// `fx tool view PATH`: one image path. A `--` ends the options, so a path may start with a dash.
@@ -312,7 +367,7 @@ fn matchOptionValue(args: []const []const u8, index: *usize, comptime flag: []co
 
 /// The words `fx tool` runs, in the order its usage lists them. The unknown-command
 /// text is built from this list, so a new word appears there without an edit.
-const verbs = [_][]const u8{ "edit", "write", "view", "skill", "agent", "web", "search" };
+const verbs = [_][]const u8{ "edit", "write", "view", "ask", "skill", "agent", "web", "search" };
 
 /// The verbs as a sentence's list: "a, b, or c".
 const verbs_text: []const u8 = blk: {
@@ -329,6 +384,7 @@ pub fn writeUsage(w: *Writer, err: ParseError, args: []const []const u8) Writer.
     const verb = if (args.len > 0) args[0] else "";
     const sub = if (args.len > 1) args[1] else "";
     if (std.mem.eql(u8, verb, "view")) return writeViewUsage(w, err);
+    if (std.mem.eql(u8, verb, "ask")) return writeAskUsage(w, err);
     if (std.mem.eql(u8, verb, "web")) return writeWebUsage(w, err);
     if (std.mem.eql(u8, verb, "search")) return writeSearchUsage(w, err);
     if (std.mem.eql(u8, verb, "skill")) {
@@ -365,6 +421,7 @@ pub fn writeUsage(w: *Writer, err: ParseError, args: []const []const u8) Writer.
             error.UnknownOption, error.PathIsOption => try w.print("fx tool agent {s}: unknown or misplaced option.\n{s}", .{ sub, usage_line }),
             error.InvalidReport => try w.print("fx tool agent message: --report must be final, every_turn, or never.\n{s}", .{usage_line}),
             error.TooManyArguments => try w.print("fx tool agent {s}: too many arguments.\n{s}", .{ sub, usage_line }),
+            error.InvalidOptionCount => try w.print("fx tool agent {s}: invalid usage.\n{s}", .{ sub, usage_line }),
             error.UnknownCommand => try w.print("fx tool agent: unknown subcommand {f}.\n{s}", .{ text_utils.terminalSafe(sub), usage_line }),
             error.QueryTooShort, error.InvalidQuery, error.BothDomainKinds, error.TooManyDomains => try w.print("fx tool agent {s}: invalid usage.\n{s}", .{ sub, usage_line }),
         }
@@ -376,7 +433,17 @@ pub fn writeUsage(w: *Writer, err: ParseError, args: []const []const u8) Writer.
         error.PathIsOption, error.UnknownOption => try w.print("fx tool {s}: the file must be a path, not an option.\n", .{verb}),
         error.UnknownCommand => try w.print("fx tool: unknown command {f}. Use {s}.\n", .{ text_utils.terminalSafe(verb), verbs_text }),
         error.MissingOptionValue, error.InvalidReport => try w.print("fx tool {s}: invalid usage.\n", .{verb}),
-        error.QueryTooShort, error.InvalidQuery, error.BothDomainKinds, error.TooManyDomains => try w.print("fx tool {s}: invalid usage.\n", .{verb}),
+        error.QueryTooShort, error.InvalidQuery, error.BothDomainKinds, error.TooManyDomains, error.InvalidOptionCount => try w.print("fx tool {s}: invalid usage.\n", .{verb}),
+    }
+}
+
+fn writeAskUsage(w: *Writer, err: ParseError) Writer.Error!void {
+    switch (err) {
+        error.MissingArgument => try w.writeAll("fx tool ask: give the question, as in fx tool ask QUESTION --option=LABEL --option=LABEL.\n"),
+        error.InvalidOptionCount => try w.writeAll("fx tool ask: give 2 to 6 options, as in fx tool ask QUESTION --option=LABEL --option=LABEL.\n"),
+        error.MissingOptionValue => try w.writeAll("fx tool ask: give a label after --option, as in --option=LABEL.\n"),
+        error.TooManyArguments => try w.writeAll("fx tool ask: quote the question as one argument, as in fx tool ask \"Which one?\" --option=A --option=B.\n"),
+        else => try w.writeAll("fx tool ask: invalid usage.\n"),
     }
 }
 
@@ -468,7 +535,7 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
         .edit => |path| .{ .edit = try resolveCommandPath(arena, cwd, path) },
         .view => |path| .{ .view = try resolveCommandPath(arena, cwd, path) },
         .write => |path| .{ .write = try resolveCommandPath(arena, cwd, path) },
-        .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => command,
+        .ask, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => command,
     };
     return send(arena, io, out, err, resolved_command, input, bridge, socket_caller);
 }
@@ -553,6 +620,7 @@ pub fn send(
             break :blk .{ .write = .{ .path = path, .content = input } };
         },
         .view => |path| .{ .view = .{ .path = path } },
+        .ask => |req| .{ .ask = .{ .question = req.question, .options = try arena.dupe([]const u8, req.options.slice()) } },
         .skill_list => .skill_list,
         .skill_open => |req| .{ .skill_open = req },
         .agent_message => |req| .{ .agent_message = req },
@@ -673,7 +741,7 @@ const FakeBridge = struct {
             .write => |write| self.written = write.content,
             .web_fetch => |value| self.fetched = value,
             .web_search => |value| self.searched = value,
-            .call, .list, .search, .help, .view, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => {},
+            .call, .list, .search, .help, .view, .ask, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => {},
         }
         return self.reply;
     }
@@ -1067,12 +1135,13 @@ test "the unknown-command text names every word fx tool runs, and each named wor
     const arena = arena_state.allocator();
     var out: std.Io.Writer.Allocating = .init(arena);
     try writeUsage(&out.writer, error.UnknownCommand, &.{"nope"});
-    try std.testing.expect(std.mem.find(u8, out.written(), "Use edit, write, view, skill, agent, web, or search.") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "Use edit, write, view, ask, skill, agent, web, or search.") != null);
 
     const words = [_][]const []const u8{
         &.{ "edit", "x" },
         &.{ "write", "x" },
         &.{ "view", "img.png" },
+        &.{ "ask", "Pick?", "--option=A", "--option=B" },
         &.{ "skill", "list" },
         &.{ "agent", "wait" },
         &.{ "web", "https://a.example" },
@@ -1137,6 +1206,34 @@ test "fx tool writes the notice before all of the data when stdout and stderr ar
     try err.interface.flush();
     try std.testing.expectEqual(client.exit.ok, code);
     try std.testing.expectEqualStrings("the notice, which is longer than the buffer\n" ++ page ++ "\n", log.items);
+}
+
+test "parse reads ask's question and its options, in either option form, and -- ends its options" {
+    const asked = (try parse(&.{ "ask", "Pick?", "--option=A", "--option", "B" })).ask;
+    try std.testing.expectEqualStrings("Pick?", asked.question);
+    try std.testing.expectEqual(@as(usize, 2), asked.options.len);
+    try std.testing.expectEqualStrings("A", asked.options.items[0]);
+    try std.testing.expectEqualStrings("B", asked.options.items[1]);
+    const dashed = (try parse(&.{ "ask", "--option=-A", "--option=B", "--", "-Q?" })).ask;
+    try std.testing.expectEqualStrings("-Q?", dashed.question);
+    try std.testing.expectEqualStrings("-A", dashed.options.items[0]);
+}
+
+test "parse refuses ask with a question missing, one option, seven options, or a missing option value" {
+    try std.testing.expectError(error.MissingArgument, parse(&.{"ask"}));
+    try std.testing.expectError(error.InvalidOptionCount, parse(&.{ "ask", "Q?" }));
+    try std.testing.expectError(error.InvalidOptionCount, parse(&.{ "ask", "Q?", "--option=A" }));
+    try std.testing.expectError(error.InvalidOptionCount, parse(&.{ "ask", "Q?", "--option=A", "--option=B", "--option=C", "--option=D", "--option=E", "--option=F", "--option=G" }));
+    try std.testing.expectError(error.MissingOptionValue, parse(&.{ "ask", "Q?", "--option" }));
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "ask", "Q?", "--raw=A" }));
+}
+
+test "ask's usage error names the option count, and the exit code is usage" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var out: std.Io.Writer.Allocating = .init(arena_state.allocator());
+    try writeUsage(&out.writer, error.InvalidOptionCount, &.{ "ask", "Q?" });
+    try std.testing.expect(std.mem.find(u8, out.written(), "give 2 to 6 options, as in fx tool ask QUESTION --option=LABEL --option=LABEL") != null);
 }
 
 test "parse reads view's one path, and -- ends its options" {

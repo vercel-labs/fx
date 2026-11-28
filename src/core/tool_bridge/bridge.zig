@@ -563,11 +563,18 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
     // are denied as the core's deny, and the client is told why.
     const file_refused = switch (request.operation) {
         .edit, .write => registration.capability.authorize_file_fn == null,
-        .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search, .view => registration.capability.authorize_bash_tool_fn == null,
+        .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search, .view, .ask => registration.capability.authorize_bash_tool_fn == null,
         .call, .list, .search, .help => false,
     };
+    // A question holds the prompt lock from its admission until its request ends, so the
+    // question and any permission prompt show one at a time, and the session's one question
+    // slot is never filled twice (tests/tla/tool_bridge/AskWait.tla Show). Every other
+    // request holds the lock only for its permission check, inside authorizeGated.
+    const holds_prompt = std.meta.activeTag(request.operation) == .ask;
+    if (holds_prompt) bridge.prompt.lockUncancelable(io);
+    defer if (holds_prompt) bridge.prompt.unlock(io);
     const authorization: capability_mod.Authorization = if (file_refused) .{ .deny = refusalMessage(.file_tool_unavailable) } else switch (request.operation) {
-        .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search, .view => authorizeGated(io, registration, work.id, arena, request_id, request.operation),
+        .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search, .view, .ask => authorizeGated(io, registration, work.id, arena, request_id, request.operation, holds_prompt),
         .list, .search, .help => .{ .allow = .{} },
     };
     bridge.mutex.lockUncancelable(io);
@@ -622,9 +629,11 @@ fn authorizeGated(
     arena: Allocator,
     request_id: []const u8,
     operation: wire.Operation,
+    /// True when the worker loop already holds the prompt lock, as a question does.
+    prompt_held: bool,
 ) capability_mod.Authorization {
-    bridge.prompt.lockUncancelable(io);
-    defer bridge.prompt.unlock(io);
+    if (!prompt_held) bridge.prompt.lockUncancelable(io);
+    defer if (!prompt_held) bridge.prompt.unlock(io);
     // The client may have left while this request waited for the lock. Then
     // no prompt opens for it, and the core frees its slot with the answer.
     bridge.mutex.lockUncancelable(io);
@@ -645,6 +654,7 @@ fn authorizeGated(
         .web_fetch => |value| registration.capability.authorizeBashTool(arena, request_id, .{ .web_fetch = value }),
         .web_search => |value| registration.capability.authorizeBashTool(arena, request_id, .{ .web_search = value }),
         .view => |value| registration.capability.authorizeBashTool(arena, request_id, .{ .view = value }),
+        .ask => |value| registration.capability.authorizeBashTool(arena, request_id, .{ .ask = value }),
         .list, .search, .help => unreachable, // lookups have no permission check
     };
     return checked catch |err| .{ .deny = arena.print("The permission check for {f} failed: {s}", .{ text_utils.terminalSafe(operation.subject()), @errorName(err) }) catch "The permission check failed." };
@@ -663,7 +673,7 @@ fn runOperation(
     return switch (operation) {
         .call => |value| capability.call(arena, request_id, value.tool, value.arguments_json, allowed, cancel),
         // A gated bash-tool operation's authority holds its call, so tool and arguments are empty.
-        .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search, .view => capability.call(arena, request_id, operation.subject(), "", allowed, cancel),
+        .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search, .view, .ask => capability.call(arena, request_id, operation.subject(), "", allowed, cancel),
         .list, .search, .help => unreachable, // answered by the lookup above
     };
 }
@@ -681,6 +691,8 @@ const FakeTool = struct {
     /// File permission checks begun. Guarded by the bridge mutex, like `authorize_calls`.
     file_authorize_calls: u32 = 0,
     bash_tool_authorize_calls: u32 = 0,
+    /// The `file_calls` count when the last bash-tool check began, to order requests on the prompt lock.
+    calls_at_last_bash_check: u32 = 0,
     calls: std.atomic.Value(u32) = .init(0),
     /// The notice each ordinary call's reply carries.
     notice: ?[]const u8 = null,
@@ -707,6 +719,7 @@ const FakeTool = struct {
         const io = io_mod.getIo();
         bridge.mutex.lockUncancelable(io);
         self.bash_tool_authorize_calls += 1;
+        self.calls_at_last_bash_check = self.file_calls.load(.acquire);
         bridge.changed.broadcast(io);
         bridge.mutex.unlock(io);
         while (self.gate.load(.acquire)) io_mod.sleep(5 * std.time.ns_per_ms);
@@ -974,6 +987,51 @@ test "a request that leaves while it waits for the prompt lock opens no prompt" 
     try std.testing.expectEqual(wire.Status.ok, header.status);
     const bytes = try reader.interface.readAllocAll(arena, @intCast(header.bytes));
     try std.testing.expectEqualStrings("mcp_s_first {}\n", bytes);
+}
+
+test "two bridged asks queue on the prompt lock, and the second is checked only after the first request ends" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    _ = arena_state.allocator();
+    var tool: FakeTool = .{};
+    tool.gate.store(true, .release);
+    const registration = try register(tool.capability());
+    var unregistered = false;
+    defer if (!unregistered) unregister(registration);
+    defer tool.gate.store(false, .release);
+    const variables = registration.environment();
+    const address = try std.Io.net.UnixAddress.init(variables[0].value);
+    const token = wire.parseToken(variables[1].value).?;
+    const options = [_][]const u8{ "A", "B" };
+
+    // The first ask's check waits on the gate while its request holds the prompt lock.
+    const first = try address.connect(io);
+    defer first.close(io);
+    var first_buffer: [512]u8 = undefined;
+    var first_writer = first.writer(io, &first_buffer);
+    try wire.writeRequest(&first_writer.interface, token, .{ .ask = .{ .question = "First?", .options = &options } });
+    try first_writer.interface.flush();
+    try waitAtLeast(io, &tool.bash_tool_authorize_calls, 1);
+
+    // The second ask is admitted, then waits for that lock; its check cannot start before the first ends.
+    const second = try address.connect(io);
+    defer second.close(io);
+    var second_buffer: [512]u8 = undefined;
+    var second_writer = second.writer(io, &second_buffer);
+    try wire.writeRequest(&second_writer.interface, token, .{ .ask = .{ .question = "Second?", .options = &options } });
+    try second_writer.interface.flush();
+    try waitAtLeast(io, &bridge.admitted, 2);
+
+    tool.gate.store(false, .release);
+    try waitAtMost(io, &registration.in_use, 0);
+    unregister(registration);
+    unregistered = true;
+    try std.testing.expectEqual(@as(u32, 2), tool.bash_tool_authorize_calls);
+    // The second check began after the first call had run: the lock was held across it.
+    try std.testing.expectEqual(@as(u32, 1), tool.calls_at_last_bash_check);
+    try std.testing.expectEqual(@as(u32, 2), tool.file_calls.load(.acquire));
 }
 
 test "an edit and a write go through their permission check, then their call" {

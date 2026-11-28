@@ -3674,6 +3674,30 @@ describe("slice 8: fx tool view", () => {
     expect(gateway.requests[1]!.body).toContain("this model receives image input through the vision tool");
     expect(gateway.requests[1]!.body).not.toContain(readFileSync(PNG).toString("base64"));
   }, TIMEOUT);
+  test("fx tool ask on a host with no question UI exits 6 and tells the model to ask in its reply", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("b_ask_no_ui", "bash", {
+          command: `${JSON.stringify(FX_BIN)} tool ask "Which one?" --option=A --option=B; echo "exit=$?"`,
+        }),
+        fakeGatewayFinalText("Asked.\n"),
+      ],
+      { models: IMAGE_MODELS },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Ask me a question."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "b_ask_no_ui")) as { value: string }).value;
+    expect(out).toContain("exit=6");
+    expect(out).toContain("Ask in your reply instead");
+  }, TIMEOUT);
 });
 
 function walkAllFiles(dir: string): string[] {

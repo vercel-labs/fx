@@ -11808,6 +11808,50 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP bash runs fx tool ask, which has no question UI there, and exits 6 with the next step",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-bash-ask-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { bash_tool: true } }));
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes('"toolCallId":"acp_ask"')) return finalText("ACP_ASK_DONE");
+        if (body.includes("Ask a question through ACP.")) {
+          return fakeGatewayToolCall("acp_ask", "bash", {
+            command: `${JSON.stringify(FX_BIN)} tool ask "Which one?" --option=A --option=B; echo "exit=$?"`,
+          });
+        }
+        return finalText("ACP_OTHER");
+      });
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine(); // consume session/update notification
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const run = await runPrompt(client, "Ask a question through ACP.", 60_000);
+        expect(run.promptResult.result.stopReason).toBe("end_turn");
+
+        const request = gateway.requests.find((entry) => entry.body.includes('"toolCallId":"acp_ask"'));
+        expect(request).toBeDefined();
+        const output = acpToolResultText(request!.body, "acp_ask");
+        expect(output).toContain("exit=6");
+        expect(output).toContain("Ask in your reply instead");
+
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  test(
     "ACP bash runs fx tool view, and the next model request carries the image",
     async () => {
       const root = createIsolatedRoot("fx-acp-bash-view-");

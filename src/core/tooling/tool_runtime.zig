@@ -67,6 +67,7 @@ const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
 const image_data = @import("../images/image_data.zig");
 const read_file_impl = @import("../../tools/filesystem/read_file.zig");
+const ask_user_question_tool = @import("../../tools/agent/ask_user_question.zig");
 const mcp_call_capability = tool_bridge.capability;
 const bash_tool_requests = @import("bash_tool_requests.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
@@ -1267,6 +1268,18 @@ fn bridgeRequestRefusal(
             if (try web_search_impl.validate(dispatch_ctx, tool_input)) |reason| return reason;
             return null;
         },
+        .ask => {
+            // The same host rule the direct question tool applies: no question context, no question.
+            if (dispatch_ctx.ask_question_batch == null) return ask_no_question_ui_text;
+            const decoded = try ask_user_question_tool.decode(dispatch_ctx, call.arguments_json);
+            var tool_input = switch (decoded) {
+                .failure => |reason| return reason,
+                .input => |value| value,
+            };
+            defer tool_input.deinit(arena);
+            if (try ask_user_question_tool.validate(dispatch_ctx, tool_input)) |reason| return reason;
+            return ask_user_question_tool.invalidArgsText(arena, call.arguments_json);
+        },
         .view => {
             const decoded = try read_file_impl.decode(dispatch_ctx, call.arguments_json);
             var tool_input = switch (decoded) {
@@ -1728,6 +1741,10 @@ fn bashToolRowInfo(arena: Allocator, specs: tool_dispatch.Registry, operation: m
                 .target = try rowPath(arena, agent),
             },
         },
+        .ask => |req| .{
+            .tool = "ask_user_question",
+            .action = try toolSpecRowAction(arena, specs, "ask_user_question", try rowPath(arena, req.question)),
+        },
         .view => |req| .{
             .tool = "read_file",
             .action = try toolSpecRowAction(arena, specs, "read_file", try rowPath(arena, req.path)),
@@ -1762,10 +1779,64 @@ fn executeBridgeBashToolOperation(
         .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => runBridgeAgentCall(ctx, arena, tool_call, cancel),
         .web_fetch => runBridgeWebFetch(ctx, arena, tool_call, cancel),
         .web_search => runBridgeWebSearch(ctx, arena, tool_call, usage, cancel),
+        .ask => if (comptime tool_bridge.supported)
+            runBridgeAsk(ctx, arena, tool_call, cancel)
+        else
+            .{ .status = .failed, .bytes = mcp_call_capability.file_tool_unavailable_text },
         .view => |req| if (comptime tool_bridge.supported)
             runBridgeView(ctx, arena, tool_call, req.path, images, cancel)
         else
             .{ .status = .failed, .bytes = mcp_call_capability.file_tool_unavailable_text },
+    };
+}
+
+const ask_no_question_ui_text = "this host has no question UI, so fx cannot ask the person here. Ask in your reply instead.";
+
+/// Withdraws the question a bridged ask shows once its request is canceled (AskWait.tla
+/// QuestionEndsWhenGone). It polls the request's cancel flag until `done` is set; the
+/// handler joins it on every path, so no watch outlives its question.
+const QuestionWatch = struct {
+    worker: *WorkerRuntime,
+    cancel: *std.atomic.Value(bool),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *QuestionWatch) void {
+        while (!self.done.load(.acquire)) {
+            if (self.cancel.load(.acquire) and self.worker.cancelPendingQuestionBatch()) {
+                debug_trace.logf("mcp-call", "a question shown for a canceled bash call was withdrawn", .{});
+                return;
+            }
+            io_mod.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+};
+
+/// Runs a bridged `ask` request as the direct question tool runs it: the question goes to the
+/// session's question slot through the worker, and the first answer is the call's output. A
+/// canceled or withdrawn question ends the call with error.Cancelled, whose text is "Cancelled.".
+fn runBridgeAsk(
+    ctx: Context,
+    arena: Allocator,
+    tool_call: ToolCall,
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
+    const dispatch_ctx = typedDispatchContextForCall(ctx, arena, tool_call);
+    const request = dispatch_ctx.ask_question_batch orelse return .{ .status = .tool_error, .bytes = ask_no_question_ui_text };
+    var watch = QuestionWatch{ .worker = ctx.worker, .cancel = cancel };
+    const watcher = try std.Thread.spawn(.{}, QuestionWatch.run, .{&watch});
+    defer {
+        watch.done.store(true, .release);
+        watcher.join();
+    }
+    const answer = try ask_user_question_tool.requestPlainAnswer(arena, tool_call.arguments_json, .{
+        .ctx = dispatch_ctx.ask_question_ctx,
+        .response_alloc = arena,
+        .request = request,
+    });
+    return switch (answer) {
+        .answered => |text| .{ .status = .ok, .bytes = text },
+        .cancelled => error.Cancelled,
+        .invalid => |text| .{ .status = .tool_error, .bytes = text },
     };
 }
 
@@ -3057,6 +3128,145 @@ test "a finished bash call attaches the images its views read, and a canceled on
     const trace = try io_mod.readFileToEnd(alloc, &trace_file, 8192);
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "dropped 1 viewed images of a canceled bash call") != null);
+}
+
+/// Waits, with a deadline, until the worker shows a question. A test thread answers or cancels it then.
+fn waitUntilQuestionShown(worker: *WorkerRuntime) void {
+    var waited: usize = 0;
+    while (!worker.hasPendingQuestionBatch() and waited < 5000) : (waited += 1) {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+/// Answers the shown question with `label`. The answer is allocated with the allocator the
+/// requester frees it with (c_allocator, as requestQuestionBatchWithWorker uses).
+fn answerShownQuestion(worker: *WorkerRuntime, label: []const u8) void {
+    waitUntilQuestionShown(worker);
+    const answers = [_][]const u8{label};
+    worker.submitQuestionBatchAnswer(std.heap.c_allocator, &answers, null) catch unreachable;
+}
+
+fn cancelShownQuestion(worker: *WorkerRuntime, cancel: *std.atomic.Value(bool)) void {
+    waitUntilQuestionShown(worker);
+    cancel.store(true, .release);
+}
+
+test "a bridged ask on a host with no question UI is refused before its permission check, with the next step" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .interactive = false, .cancel_flag = &cancel, .nested_tool_registry = test_builtin_tools.registry };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    const options = [_][]const u8{ "A", "B" };
+
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-81", .{ .ask = .{ .question = "Pick?", .options = &options } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedRefusalBeforeCheck,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-81", "ask_user_question", "", allowed, &cancel);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "Ask in your reply instead") != null);
+}
+
+test "a bridged ask with a duplicate option label is refused with the question tool's own text" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .interactive = true, .cancel_flag = &cancel, .nested_tool_registry = test_builtin_tools.registry };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    const options = [_][]const u8{ "A", "A" };
+
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-82", .{ .ask = .{ .question = "Pick?", .options = &options } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedRefusalBeforeCheck,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-82", "ask_user_question", "", allowed, &cancel);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "ask_user_question") != null);
+}
+
+test "a bridged ask under an ask_user_question deny rule is refused by the check" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var deny_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("ask_user_question"),
+        .pattern = @constCast("**"),
+        .action = .deny,
+    }};
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{
+        .workspace_root = "/unused",
+        .permission_mode = .ask,
+        .interactive = true,
+        .cancel_flag = &cancel,
+        .permission_rules = .{ .rules = &deny_rules },
+        .nested_tool_registry = test_builtin_tools.registry,
+    };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    const options = [_][]const u8{ "A", "B" };
+
+    const authorization = try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-83", .{ .ask = .{ .question = "Pick?", .options = &options } });
+    try std.testing.expect(authorization == .deny);
+}
+
+test "a bridged ask answers with the person's choice as plain text" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .interactive = true, .cancel_flag = &cancel, .nested_tool_registry = test_builtin_tools.registry };
+    // The worker's events are allocated by c_allocator, as requestQuestionBatchWithWorker does.
+    defer rt.worker.deinit(std.heap.c_allocator);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    const options = [_][]const u8{ "A", "B" };
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-84", .{ .ask = .{ .question = "Pick?", .options = &options } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+
+    const answerer = try std.Thread.spawn(.{}, answerShownQuestion, .{ &rt.worker, "B" });
+    defer answerer.join();
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-84", "ask_user_question", "", allowed, &cancel);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+    try std.testing.expectEqualStrings("B", outcome.bytes);
+}
+
+test "a bridged ask whose cancel flag is set is withdrawn, and the bash call gets Cancelled" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .interactive = true, .cancel_flag = &cancel, .nested_tool_registry = test_builtin_tools.registry };
+    // The worker's events are allocated by c_allocator, as requestQuestionBatchWithWorker does.
+    defer rt.worker.deinit(std.heap.c_allocator);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    const options = [_][]const u8{ "A", "B" };
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-85", .{ .ask = .{ .question = "Pick?", .options = &options } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+
+    const canceller = try std.Thread.spawn(.{}, cancelShownQuestion, .{ &rt.worker, &cancel });
+    defer canceller.join();
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-85", "ask_user_question", "", allowed, &cancel);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, outcome.status);
+    try std.testing.expectEqualStrings("Cancelled.", outcome.bytes);
+    try std.testing.expect(!rt.worker.hasPendingQuestionBatch());
 }
 
 test "a bridge edit that a configured deny rule covers writes nothing" {
