@@ -31,7 +31,7 @@ type Answer = object | Response;
 
 export type UsageFakeOptions = {
   /** Rows for one `/v1/report` range, by its UTC start and end dates. */
-  report?: (start: string, end: string) => ReportRow[] | Response;
+  report?: (start: string, end: string) => ReportRow[] | Response | Promise<ReportRow[] | Response>;
   budget?: Answer;
   codex?: { usage?: Answer; profile?: Answer; breakdown?: Answer };
   grok?: { billing?: Answer; settings?: Answer };
@@ -45,13 +45,13 @@ export function usageFake(options: UsageFakeOptions = {}) {
       : value instanceof Response
       ? value.clone()
       : Response.json(value);
-  const handler = (url: URL, request: Request): Response | null => {
-    const routes: Record<string, () => Response> = {
-      "/v1/report": () => {
-        const rows = options.report?.(
+  const handler = async (url: URL, request: Request): Promise<Response | null> => {
+    const routes: Record<string, () => Response | Promise<Response>> = {
+      "/v1/report": async () => {
+        const rows = (await options.report?.(
           url.searchParams.get("start_date") ?? "",
           url.searchParams.get("end_date") ?? "",
-        ) ?? [];
+        )) ?? [];
         return rows instanceof Response ? rows : Response.json({ results: rows });
       },
       "/ai-gateway/usage-report": () => reply(options.budget ?? { users: [] }),
