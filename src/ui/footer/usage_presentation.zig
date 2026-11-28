@@ -8,7 +8,6 @@ const std = @import("std");
 const usage = @import("../../usage/usage.zig");
 const usage_menu = @import("../../core/session/usage_menu.zig");
 const display_width = @import("../../core/shared/display_width.zig");
-const fuzzy_match = @import("../../core/shared/fuzzy_match.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const row_text = @import("row_text.zig");
@@ -92,21 +91,12 @@ fn rawModels(p: Projection) []const ModelRow {
     return s.of(p.period).models;
 }
 
-fn modelFilter(p: Projection) fuzzy_match.Filter(usage_menu.ModelMatches) {
+fn modelFilter(p: Projection) usage_menu.NameFilter {
     return usage_menu.modelFilter(rawModels(p), p.query);
 }
 
 fn listedModelCount(p: Projection) usize {
-    return modelFilter(p).count();
-}
-
-fn listedModelAt(p: Projection, display_index: usize) ?ModelRow {
-    // Borrows `p.snapshot` for lookup without taking ownership.
-    const state: usage_menu.State = .{
-        .period = p.period,
-        .snapshot = if (p.snapshot) |s| s.* else null,
-    };
-    return state.filteredModelAt(p.query, display_index);
+    return usage_menu.filterCount(modelFilter(p));
 }
 
 fn clampedSelectedModel(p: Projection, count: usize) usize {
@@ -439,28 +429,26 @@ fn headingListCount(p: Projection) ?usize {
     if (messageOnly(p) or p.detail) return null;
     if (isCodex(p)) {
         if (!codexHasPeriods(p)) return null;
-        var buf: [max_shares]Share = undefined;
-        return modelShares(p, &buf).len;
+        return usage_menu.codexModelCount(p.snapshot.?, p.period, p.query);
     }
     if (isGrok(p)) {
         const u = grokUsage(p) orelse return null;
         if (grokTeamUrl(u) != null or !u.hasBilling() or u.products.len == 0) return null;
-        return usage_menu.grokProductFilter(u.products, p.query).count();
+        return usage_menu.filterCount(usage_menu.grokProductFilter(u.products, p.query));
     }
     return listedModelCount(p);
 }
 
+fn appendStyled(alloc: Allocator, row: *std.ArrayList(u8), style: []const u8, text: []const u8) !void {
+    try row.appendSlice(alloc, style);
+    try row.appendSlice(alloc, text);
+    try row.appendSlice(alloc, ui_render.reset_style);
+}
+
 fn appendHeadingTabs(alloc: Allocator, row: *std.ArrayList(u8), active_period: Period, compact_only: bool) !void {
-    if (compact_only) {
-        try row.print(alloc, "  {s}[{s}]{s}", .{
-            ui_render.selected_completion_style,
-            active_period.label(),
-            ui_render.reset_style,
-        });
-        return;
-    }
     for (Period.all) |period| {
         const active = period == active_period;
+        if (compact_only and !active) continue;
         const style = if (active) ui_render.selected_completion_style else ui_render.dim_style;
         try row.appendSlice(alloc, "  ");
         try row.appendSlice(alloc, style);
@@ -476,7 +464,7 @@ fn appendHeadingStatus(alloc: Allocator, row: *std.ArrayList(u8), p: Projection,
     if (failed) {
         try row.appendSlice(alloc, status);
     } else {
-        try row.print(alloc, "{s}{s}{s}", .{ ui_render.dim_style, status, ui_render.reset_style });
+        try appendStyled(alloc, row, ui_render.dim_style, status);
     }
 }
 
@@ -487,35 +475,41 @@ const HeadingRightPlan = struct {
 
 fn tryFitHeadingRight(left_width: usize, account_width: usize, status_width: usize, limit: usize) ?HeadingRightPlan {
     if (left_width > limit) return null;
-    if (status_width == 0) {
-        if (account_width > 0) {
-            if (left_width + 2 + account_width <= limit) {
-                return .{ .account_room = account_width, .show_status = false };
-            }
-            const room = limit -| (left_width + 2);
-            if (room >= @min(account_width, 8)) {
-                return .{ .account_room = room, .show_status = false };
-            }
-        }
-        return .{};
-    }
-
+    const show_status = status_width > 0;
+    const status_gap: usize = if (show_status) 3 + status_width else 0;
     if (account_width > 0) {
-        if (left_width + 2 + account_width + 3 + status_width <= limit) {
-            return .{ .account_room = account_width, .show_status = true };
+        const full_needed = left_width + 2 + account_width + status_gap;
+        if (full_needed <= limit) {
+            return .{ .account_room = account_width, .show_status = show_status };
         }
-        const needed_without_account = left_width + 2 + 3 + status_width;
-        if (limit > needed_without_account) {
-            const room = limit - needed_without_account;
+        const min_needed = left_width + 2 + status_gap;
+        if (limit > min_needed) {
+            const room = limit - min_needed;
             if (room >= @min(account_width, 8)) {
-                return .{ .account_room = room, .show_status = true };
+                return .{ .account_room = room, .show_status = show_status };
             }
         }
     }
-    if (left_width + 2 + status_width <= limit) {
-        return .{ .account_room = 0, .show_status = true };
+    if (left_width + (if (show_status) 2 + status_width else 0) <= limit) {
+        return .{ .show_status = show_status };
     }
     return null;
+}
+
+fn appendHeadingLeft(alloc: Allocator, out: *std.ArrayList(u8), title: []const u8, show_tabs: bool, period: Period, compact_only: bool) !void {
+    try appendStyled(alloc, out, ui_render.selected_completion_style, title);
+    if (show_tabs) try appendHeadingTabs(alloc, out, period, compact_only);
+}
+
+fn headingLeftWidth(title: []const u8, show_tabs: bool, active_period: Period, compact_only: bool) usize {
+    var width = title.len;
+    if (!show_tabs) return width;
+    for (Period.all) |period| {
+        const active = period == active_period;
+        if (compact_only and !active) continue;
+        width += 2 + period.label().len + if (active) @as(usize, 2) else 0;
+    }
+    return width;
 }
 
 /// `Usage <count>` with period tabs on the left and `<account> · <status>`
@@ -534,54 +528,42 @@ fn composeHeading(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(
         const account = headingSourceText(&account_buf, p);
         const account_width = display_width.visibleWidth(account);
 
-        var wide_left: std.ArrayList(u8) = .empty;
-        defer wide_left.deinit(alloc);
         var title_buf: [32]u8 = undefined;
         const title = std.mem.print(&title_buf, "Usage {d}", .{count}) catch "Usage";
-        try wide_left.print(alloc, "{s}{s}{s}", .{ ui_render.selected_completion_style, title, ui_render.reset_style });
-        if (show_tabs) try appendHeadingTabs(alloc, &wide_left, p.period, false);
-        const wide_width = display_width.visibleWidthIgnoringAnsi(wide_left.items);
 
-        var compact_left: std.ArrayList(u8) = .empty;
-        defer compact_left.deinit(alloc);
-        var chosen: *const std.ArrayList(u8) = &wide_left;
-        var chosen_width = wide_width;
-        var right_plan: ?HeadingRightPlan = tryFitHeadingRight(wide_width, account_width, status_width, limit);
+        var chosen_compact = false;
+        var left_width: usize = 0;
+        var right_plan: ?HeadingRightPlan = null;
 
-        if (right_plan == null and show_tabs) {
-            try compact_left.print(alloc, "{s}{s}{s}", .{ ui_render.selected_completion_style, title, ui_render.reset_style });
-            try appendHeadingTabs(alloc, &compact_left, p.period, true);
-            const compact_width = display_width.visibleWidthIgnoringAnsi(compact_left.items);
-            if (tryFitHeadingRight(compact_width, account_width, status_width, limit)) |plan| {
-                chosen = &compact_left;
-                chosen_width = compact_width;
+        for ([_]bool{ false, true }) |compact_only| {
+            if (compact_only and !show_tabs) break;
+            chosen_compact = compact_only;
+            left_width = headingLeftWidth(title, show_tabs, p.period, compact_only);
+            if (tryFitHeadingRight(left_width, account_width, status_width, limit)) |plan| {
                 right_plan = plan;
-            } else if (compact_width <= limit) {
-                chosen = &compact_left;
-                chosen_width = compact_width;
-                right_plan = .{};
+                break;
             }
-        } else if (right_plan == null and wide_width <= limit) {
+        }
+        if (right_plan == null and left_width <= limit) {
             right_plan = .{};
         }
 
         if (right_plan) |plan| {
-            var right: std.ArrayList(u8) = .empty;
-            defer right.deinit(alloc);
-            if (plan.account_room > 0) {
-                try right.appendSlice(alloc, ui_render.dim_style);
-                try row_text.appendSingleLineEllipsized(alloc, &right, account, plan.account_room);
-                if (plan.show_status) try right.appendSlice(alloc, " · ");
-                try right.appendSlice(alloc, ui_render.reset_style);
-            }
-            if (plan.show_status) {
-                try appendHeadingStatus(alloc, &right, p, status);
-            }
-            try row.appendSlice(alloc, chosen.items);
-            const right_width = display_width.visibleWidthIgnoringAnsi(right.items);
+            try appendHeadingLeft(alloc, &row, title, show_tabs, p.period, chosen_compact);
+            const shown_account = if (plan.account_room > 0) @min(account_width, plan.account_room) else 0;
+            const sep_width: usize = if (plan.account_room > 0 and plan.show_status) 3 else 0;
+            const right_width = shown_account + sep_width + (if (plan.show_status) status_width else 0);
             if (right_width > 0) {
-                try row.appendNTimes(alloc, ' ', limit - chosen_width - right_width);
-                try row.appendSlice(alloc, right.items);
+                try row.appendNTimes(alloc, ' ', limit - left_width - right_width);
+                if (plan.account_room > 0) {
+                    try row.appendSlice(alloc, ui_render.dim_style);
+                    try row_text.appendSingleLineEllipsized(alloc, &row, account, plan.account_room);
+                    if (plan.show_status) try row.appendSlice(alloc, " · ");
+                    try row.appendSlice(alloc, ui_render.reset_style);
+                }
+                if (plan.show_status) {
+                    try appendHeadingStatus(alloc, &row, p, status);
+                }
             }
             return row;
         }
@@ -595,7 +577,8 @@ fn composeHeading(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(
     const show_status = status_width > 0 and prefix_width + min_left + 2 + status_width <= limit;
     const left_room = if (show_status) limit - prefix_width - 2 - status_width else limit -| prefix_width;
 
-    try row.print(alloc, "{s}Usage:{s} ", .{ ui_render.selected_completion_style, ui_render.reset_style });
+    try appendStyled(alloc, &row, ui_render.selected_completion_style, "Usage:");
+    try row.append(alloc, ' ');
     const left_start = row.items.len;
     if (p.detail) {
         try row_text.appendSingleLineMiddleEllipsized(alloc, &row, left, left_room);
@@ -632,11 +615,13 @@ fn headingLeft(buf: []u8, p: Projection) []const u8 {
         .refresh_needed => "the sign-in needs a refresh",
     };
     if (p.detail) {
-        const count = listedModelCount(p);
+        const models = rawModels(p);
+        const filter = modelFilter(p);
+        const count = usage_menu.filterCount(filter);
         const selected = clampedSelectedModel(p, count);
-        if (listedModelAt(p, selected)) |model| {
+        if (usage_menu.filterAt(filter, selected)) |raw_index| {
             var name_buf: [256]u8 = undefined;
-            const name = safeText(&name_buf, model.model);
+            const name = safeText(&name_buf, models[raw_index].model);
             return std.mem.print(buf, "{s}, model {d} of {d}", .{ name, selected + 1, count }) catch name;
         }
     }
@@ -870,8 +855,9 @@ fn composeModelHeader(alloc: Allocator, p: Projection, limit: usize) !std.ArrayL
 }
 
 fn composeModelRow(alloc: Allocator, p: Projection, index: usize, limit: usize) !std.ArrayList(u8) {
-    const count = listedModelCount(p);
-    const model = listedModelAt(p, index) orelse return .empty;
+    const models = rawModels(p);
+    const info = usage_menu.filterAtWithCount(modelFilter(p), index);
+    const model = models[info.raw_index orelse return .empty];
     const total = p.snapshot.?.of(p.period).totals.total_cost;
     const l = modelLayout(p, limit);
     var spent: [32]u8 = undefined;
@@ -887,7 +873,7 @@ fn composeModelRow(alloc: Allocator, p: Projection, index: usize, limit: usize) 
         compact(&tokens, model.totals.totalTokens()),
         &rest,
     );
-    const selected = index == clampedSelectedModel(p, count);
+    const selected = index == clampedSelectedModel(p, info.count);
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
     try row.appendNTimes(alloc, ' ', gutter);
@@ -914,7 +900,7 @@ fn composeMoreRow(alloc: Allocator, p: Projection, first: usize, limit: usize) !
     var count: usize = 0;
     var display_index: usize = 0;
     for (models, 0..) |model, raw_index| {
-        if (!filter.keeps(raw_index)) continue;
+        if (!usage_menu.filterKeeps(filter, raw_index)) continue;
         if (display_index >= first) sum.add(model.totals);
         display_index += 1;
         count += 1;
@@ -948,9 +934,11 @@ fn composeMoreRow(alloc: Allocator, p: Projection, first: usize, limit: usize) !
 // ----------------------------------------------------------------- detail
 
 fn selectedName(p: Projection) ?[]const u8 {
-    const count = listedModelCount(p);
-    const model = listedModelAt(p, clampedSelectedModel(p, count)) orelse return null;
-    return model.model;
+    const models = rawModels(p);
+    const filter = modelFilter(p);
+    const count = usage_menu.filterCount(filter);
+    const raw_index = usage_menu.filterAt(filter, clampedSelectedModel(p, count)) orelse return null;
+    return models[raw_index].model;
 }
 
 /// The selected model's row for `period`, or null when it had no usage then.
@@ -1207,7 +1195,7 @@ fn grokRows(sections: GrokSections) usize {
 fn grokSections(p: Projection, visible_rows: usize) GrokSections {
     const u = grokUsage(p) orelse return .{};
     if (grokTeamUrl(u) != null or !u.hasBilling()) return .{ .note = true };
-    const matched = if (u.products.len > 0) usage_menu.grokProductFilter(u.products, p.query).count() else 0;
+    const matched = if (u.products.len > 0) usage_menu.filterCount(usage_menu.grokProductFilter(u.products, p.query)) else 0;
     var sections: GrokSections = .{
         .limit = u.used_percent != null,
         .products = matched,
@@ -1279,7 +1267,7 @@ fn composeGrokProductHeader(alloc: Allocator, p: Projection, limit: usize) !std.
 
 fn composeGrokProductRow(alloc: Allocator, p: Projection, index: usize, limit: usize) !std.ArrayList(u8) {
     const u = grokUsage(p).?;
-    const raw_index = usage_menu.grokProductFilter(u.products, p.query).at(index) orelse return .empty;
+    const raw_index = usage_menu.filterAt(usage_menu.grokProductFilter(u.products, p.query), index) orelse return .empty;
     const product = u.products[raw_index];
     const name_width = grokProductNameWidth(u);
     var name_buf: [64]u8 = undefined;
@@ -1480,8 +1468,8 @@ const ModelWindow = struct {
 };
 
 fn codexModelWindow(p: Projection, visible_rows: usize) ModelWindow {
-    var buf: [max_shares]Share = undefined;
-    const count = modelShares(p, &buf).len;
+    const s = p.snapshot orelse return .{};
+    const count = usage_menu.codexModelCount(s, p.period, p.query);
     const rows = codexSections(p, visible_rows).model_rows;
     if (count <= rows) return .{ .items = count };
     const items = @max(rows -| 1, 1);

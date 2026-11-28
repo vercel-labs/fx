@@ -7,43 +7,69 @@ const usage = @import("../../usage/usage.zig");
 const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const list_window = @import("../shared/list_window.zig");
 
-pub const ModelMatches = struct {
-    models: []const usage.report.ModelRow,
+pub const NameMatches = struct {
+    source: union(enum) {
+        models: []const usage.report.ModelRow,
+        shares: []const usage.codex.Share,
+        products: []const usage.grok.Product,
+    },
     query: []const u8,
 
-    pub fn matchAt(self: ModelMatches, position: usize) ?fuzzy_match.Match {
-        return fuzzy_match.match(self.query, &.{.{ .text = self.models[position].model }});
+    pub fn matchAt(self: NameMatches, position: usize) ?fuzzy_match.Match {
+        const text = switch (self.source) {
+            .models => |items| items[position].model,
+            .shares => |items| items[position].name,
+            .products => |items| items[position].name,
+        };
+        return fuzzy_match.match(self.query, &.{.{ .text = text }});
     }
 };
 
-pub fn modelFilter(models: []const usage.report.ModelRow, query: []const u8) fuzzy_match.Filter(ModelMatches) {
-    return .init(.{ .models = models, .query = query }, models.len);
+pub const NameFilter = fuzzy_match.Filter(NameMatches);
+
+pub fn modelFilter(models: []const usage.report.ModelRow, query: []const u8) NameFilter {
+    return .init(.{ .source = .{ .models = models }, .query = query }, models.len);
 }
 
-const ShareMatches = struct {
-    shares: []const usage.codex.Share,
-    query: []const u8,
-
-    pub fn matchAt(self: ShareMatches, position: usize) ?fuzzy_match.Match {
-        return fuzzy_match.match(self.query, &.{.{ .text = self.shares[position].name }});
-    }
-};
-
-fn codexModelFilter(shares: []const usage.codex.Share, query: []const u8) fuzzy_match.Filter(ShareMatches) {
-    return .init(.{ .shares = shares, .query = query }, shares.len);
+fn codexModelFilter(shares: []const usage.codex.Share, query: []const u8) NameFilter {
+    return .init(.{ .source = .{ .shares = shares }, .query = query }, shares.len);
 }
 
-const ProductMatches = struct {
-    products: []const usage.grok.Product,
-    query: []const u8,
+pub fn grokProductFilter(products: []const usage.grok.Product, query: []const u8) NameFilter {
+    return .init(.{ .source = .{ .products = products }, .query = query }, products.len);
+}
 
-    pub fn matchAt(self: ProductMatches, position: usize) ?fuzzy_match.Match {
-        return fuzzy_match.match(self.query, &.{.{ .text = self.products[position].name }});
+pub fn filterCount(filter: NameFilter) usize {
+    return filter.count();
+}
+
+pub fn filterAtWithCount(filter: NameFilter, display_index: usize) struct { count: usize, raw_index: ?usize } {
+    var count: usize = 0;
+    var raw_index: ?usize = null;
+    for (0..filter.len) |position| {
+        if (!filter.keeps(position)) continue;
+        if (count == display_index) raw_index = position;
+        count += 1;
     }
-};
+    return .{ .count = count, .raw_index = raw_index };
+}
 
-pub fn grokProductFilter(products: []const usage.grok.Product, query: []const u8) fuzzy_match.Filter(ProductMatches) {
-    return .init(.{ .products = products, .query = query }, products.len);
+pub fn filterAt(filter: NameFilter, display_index: usize) ?usize {
+    return filter.at(display_index);
+}
+
+pub fn filterKeeps(filter: NameFilter, raw_index: usize) bool {
+    return filter.keeps(raw_index);
+}
+
+pub fn codexModelCount(
+    snapshot: *const usage.Snapshot,
+    period: usage.Period,
+    query: []const u8,
+) usize {
+    var raw_buf: [usage.codex.max_shares]usage.codex.Share = undefined;
+    const raw = snapshot.codexModelShares(period, &raw_buf);
+    return filterCount(codexModelFilter(raw, query));
 }
 
 pub fn filteredCodexShares(
@@ -57,7 +83,7 @@ pub fn filteredCodexShares(
     const filter = codexModelFilter(raw, query);
     var count: usize = 0;
     for (0..raw.len) |i| {
-        if (!filter.keeps(i)) continue;
+        if (!filterKeeps(filter, i)) continue;
         buf[count] = raw[i];
         count += 1;
     }
@@ -93,7 +119,7 @@ pub const State = struct {
         const old_selected = self.selectedModelName(query);
         const models = snapshot.of(self.period).models;
         const filter = modelFilter(models, query);
-        const count = filter.count();
+        const count = filterCount(filter);
         const found = findFilteredModel(models, filter, old_selected);
         const selected = found orelse @min(self.selected_model, count -| 1);
         // Codex has no selection; its list keeps its scroll position.
@@ -160,8 +186,9 @@ pub const State = struct {
 
     /// Enter: the selected model's detail screen.
     pub fn openDetail(self: *State, query: []const u8) bool {
-        if (!self.active or self.detail or self.filteredModelCount(query) == 0) return false;
+        if (!self.active or self.detail) return false;
         const count = self.filteredModelCount(query);
+        if (count == 0) return false;
         self.selected_model = @min(self.selected_model, count - 1);
         self.detail = true;
         return true;
@@ -179,20 +206,23 @@ pub const State = struct {
     }
 
     fn filteredModelCount(self: *const State, query: []const u8) usize {
-        return modelFilter(self.listedModels(), query).count();
+        return filterCount(modelFilter(self.listedModels(), query));
     }
 
     pub fn filteredModelAt(self: *const State, query: []const u8, display_index: usize) ?usage.report.ModelRow {
         const models = self.listedModels();
-        const raw_index = modelFilter(models, query).at(display_index) orelse return null;
+        const raw_index = filterAt(modelFilter(models, query), display_index) orelse return null;
         return models[raw_index];
     }
 
     pub fn selectedModelName(self: *const State, query: []const u8) ?[]const u8 {
-        const count = self.filteredModelCount(query);
-        if (count == 0) return null;
-        const model = self.filteredModelAt(query, @min(self.selected_model, count - 1)) orelse return null;
-        return model.model;
+        const models = self.listedModels();
+        if (models.len == 0) return null;
+        const filter = modelFilter(models, query);
+        const info = filterAtWithCount(filter, self.selected_model);
+        if (info.count == 0) return null;
+        const raw_index = info.raw_index orelse filter.at(info.count - 1) orelse return null;
+        return models[raw_index].model;
     }
 
     fn scrollCodex(self: *State, snapshot: *const usage.Snapshot, delta: i32, visible_model_rows: usize, query: []const u8) bool {
@@ -222,13 +252,13 @@ fn findModel(models: []const usage.report.ModelRow, target: ?[]const u8) ?usize 
 
 fn findFilteredModel(
     models: []const usage.report.ModelRow,
-    filter: fuzzy_match.Filter(ModelMatches),
+    filter: NameFilter,
     target: ?[]const u8,
 ) ?usize {
     const name = target orelse return null;
     var display_index: usize = 0;
     for (models, 0..) |model, raw_index| {
-        if (!filter.keeps(raw_index)) continue;
+        if (!filterKeeps(filter, raw_index)) continue;
         if (std.mem.eql(u8, model.model, name)) return display_index;
         display_index += 1;
     }
