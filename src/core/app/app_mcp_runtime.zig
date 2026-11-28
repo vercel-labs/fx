@@ -142,6 +142,10 @@ pub const State = struct {
     /// ends them on quit.
     host_verbs: std.atomic.Value(usize) = .init(0),
     toggle_group: std.Io.Group = .init,
+    toggle_active: std.atomic.Value(usize) = .init(0),
+    toggle_name_mutex: std.Io.Mutex = .init,
+    toggle_name_buf: [mcp_menu.name_capacity]u8 = undefined,
+    toggle_name_len: usize = 0,
     host_closing: std.atomic.Value(bool) = .init(false),
     /// Set by process-exit teardown before it joins a pending reload, so the
     /// reload discards its candidate runtime without grace or session DELETEs.
@@ -381,15 +385,34 @@ pub const State = struct {
         if (unused) old.?.stop();
     }
 
+    fn activeToggleServer(self: *State, buf: *[mcp_menu.name_capacity]u8) ?[]const u8 {
+        self.toggle_name_mutex.lockUncancelable(io_mod.getIo());
+        defer self.toggle_name_mutex.unlock(io_mod.getIo());
+        if (self.toggle_name_len == 0) return null;
+        @memcpy(buf[0..self.toggle_name_len], self.toggle_name_buf[0..self.toggle_name_len]);
+        return buf[0..self.toggle_name_len];
+    }
+
     fn destroyHost(self: *State) void {
-        self.host_closing.store(true, .release);
         if (self.process_exiting.load(.acquire)) {
-            // Nothing is waited for: the servers get
-            // SIGTERM, and the host and `/mcp` threads are left to the
-            // exiting process.
+            // Wait for any in-flight `/mcp` menu toggle to finish saving (bounded
+            // by the 2 s mcp.lock wait) so a user's Turn on or Turn off before
+            // quitting is saved; servers still get SIGTERM and other threads
+            // end with the exiting process.
+            const active = self.toggle_active.load(.acquire);
+            if (active > 0) {
+                var name_buf: [mcp_menu.name_capacity]u8 = undefined;
+                const server = self.activeToggleServer(&name_buf);
+                debug_trace.logf("mcp", "MCP exit waiting for toggle server={s} count={d}", .{ server orelse "unknown", active });
+            }
+            self.toggle_group.await(io_mod.getIo()) catch |err| {
+                debug_trace.logf("mcp", "MCP toggle await at exit failed err={s}", .{@errorName(err)});
+            };
+            self.host_closing.store(true, .release);
             mcp_host.signalServersForExit();
             return;
         }
+        self.host_closing.store(true, .release);
         // `/mcp` commands still running end first, so none outlives the state.
         self.closeHostMenu();
         self.toggle_group.cancel(io_mod.getIo());
@@ -444,6 +467,7 @@ pub const State = struct {
             if (sink.sign_in) |waiting| std.heap.c_allocator.free(waiting);
             if (sink.sign_in_when_loaded) |name| std.heap.c_allocator.free(name);
             if (sink.menu_error) |err| {
+                debug_trace.logf("mcp", "MCP menu error dropped server={s} reason=host closed before menu showed it", .{err.server});
                 std.heap.c_allocator.free(err.server);
                 std.heap.c_allocator.free(err.text);
             }
@@ -464,6 +488,7 @@ pub const State = struct {
             sink.mutex.lockUncancelable(io_mod.getIo());
             defer sink.mutex.unlock(io_mod.getIo());
             if (sink.menu_error) |old| {
+                debug_trace.logf("mcp", "MCP menu error replaced server={s} reason=newer toggle error", .{old.server});
                 a.free(old.server);
                 a.free(old.text);
             }
@@ -976,6 +1001,15 @@ pub const State = struct {
         job.home = try a.dupe(u8, home);
         job.workspace_root = try a.dupe(u8, workspace_root);
         job.name = try a.dupe(u8, name);
+        {
+            self.toggle_name_mutex.lockUncancelable(io_mod.getIo());
+            defer self.toggle_name_mutex.unlock(io_mod.getIo());
+            const n = @min(name.len, self.toggle_name_buf.len);
+            @memcpy(self.toggle_name_buf[0..n], name[0..n]);
+            self.toggle_name_len = n;
+        }
+        _ = self.toggle_active.fetchAdd(1, .acq_rel);
+        errdefer _ = self.toggle_active.fetchSub(1, .acq_rel);
         _ = self.host_verbs.fetchAdd(1, .acq_rel);
         errdefer _ = self.host_verbs.fetchSub(1, .acq_rel);
         try self.toggle_group.concurrent(io_mod.getIo(), ToggleJob.run, .{job});
@@ -1001,6 +1035,11 @@ pub const State = struct {
             defer {
                 job.free();
                 a.destroy(job);
+                if (self.toggle_active.fetchSub(1, .acq_rel) == 1) {
+                    self.toggle_name_mutex.lockUncancelable(io_mod.getIo());
+                    defer self.toggle_name_mutex.unlock(io_mod.getIo());
+                    self.toggle_name_len = 0;
+                }
                 _ = self.host_verbs.fetchSub(1, .acq_rel);
             }
             if (self.host_closing.load(.acquire)) {
@@ -1086,6 +1125,7 @@ pub const State = struct {
     }
 
     fn recordToggleError(self: *State, arena: Allocator, name: []const u8, action_word: []const u8, reason: []const u8) void {
+        debug_trace.logf("mcp", "MCP toggle failed server={s} action={s} reason={s}", .{ name, action_word, reason });
         const sink = self.host_sink orelse return;
         const msg = arena.print("Couldn't {s} {s}: {s}.", .{ action_word, name, reason }) catch return;
         sink.setMenuError(name, msg);
@@ -1844,4 +1884,102 @@ test "ToggleJob logs dropped user toggle at exit and recordStartToggleError surf
     const trace_bytes = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
     defer alloc.free(trace_bytes);
     try std.testing.expect(std.mem.find(u8, trace_bytes, "MCP toggle dropped at exit server=user_srv enable=true") != null);
+}
+
+test "deinitForProcessExit waits for an in-flight toggle to save mcp.json" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    try writeTestFile(&tmp, "home/.fx/mcp.json",
+        \\{"mcpServers":{"user_srv":{"type":"http","url":"https://user.example/mcp"}}}
+    );
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ home, "exit-trace.log" });
+    defer alloc.free(trace_path);
+    try debug_trace.configure(.{ .file_path = trace_path });
+    defer debug_trace.shutdown();
+
+    const profile_path = try profile_paths.mcpConfigPath(alloc, home);
+    defer alloc.free(profile_path);
+    var lock = try config_file.lockProfile(profile_path);
+    var lock_held = true;
+    defer if (lock_held) lock.release();
+
+    ToggleTestLoader.home_path = home;
+    const registry: tool_dispatch.Registry = .{ .tools = &.{} };
+    var state: State = .{};
+    defer {
+        state.toggle_group.await(io_mod.getIo()) catch {};
+        state.process_exiting.store(false, .release);
+        state.deinit();
+    }
+    try state.loadHost(ToggleTestLoader.load, alloc, home, root, registry, .{});
+
+    try state.startToggle(home, root, "user_srv", false);
+
+    const Releaser = struct {
+        fn run(l: *io_mod.TimedAdvisoryLock, held: *bool) void {
+            io_mod.sleep(150 * std.time.ns_per_ms);
+            l.release();
+            held.* = false;
+        }
+    };
+    const releaser = try std.Thread.spawn(.{}, Releaser.run, .{ &lock, &lock_held });
+    defer releaser.join();
+
+    state.deinitForProcessExit();
+
+    const after = (try readProfileConfig(alloc, home)).?;
+    defer alloc.free(after);
+    try std.testing.expect(std.mem.find(u8, after, "\"enabled\": false") != null);
+
+    var exit_trace = try tmp.dir.openFile(io_mod.getIo(), "home/exit-trace.log", .{});
+    defer exit_trace.close(io_mod.getIo());
+    const exit_bytes = try io_mod.readFileToEnd(alloc, &exit_trace, 64 * 1024);
+    defer alloc.free(exit_bytes);
+    try std.testing.expect(std.mem.find(u8, exit_bytes, "MCP exit waiting for toggle server=user_srv count=1") != null);
+}
+
+test "LockBusy toggle failure shows try-again wording and recordToggleError/setMenuError trace" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir_path);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ dir_path, "toggle-err-trace.log" });
+    defer alloc.free(trace_path);
+
+    try debug_trace.configure(.{ .file_path = trace_path });
+    defer debug_trace.shutdown();
+
+    try std.testing.expectEqualStrings(
+        "another fx is changing the MCP config; try again",
+        mcp_verbs.describe(error.LockBusy),
+    );
+
+    var state: State = .{};
+    defer state.deinit();
+    state.host_sink = try std.heap.c_allocator.create(State.HostSink);
+    state.host_sink.?.* = .{};
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    state.recordToggleError(arena.allocator(), "user_srv", "turn off", mcp_verbs.describe(error.LockBusy));
+    state.recordToggleError(arena.allocator(), "proj_srv", "turn on", "permission denied");
+    // Destroy state while proj_srv's unseen error is still parked in HostSink.
+    state.deinit();
+
+    var trace_file = try tmp.dir.openFile(io_mod.getIo(), "toggle-err-trace.log", .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace_bytes = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+    defer alloc.free(trace_bytes);
+    try std.testing.expect(std.mem.find(u8, trace_bytes, "MCP toggle failed server=user_srv action=turn off reason=another fx is changing the MCP config; try again") != null);
+    try std.testing.expect(std.mem.find(u8, trace_bytes, "MCP menu error replaced server=user_srv reason=newer toggle error") != null);
+    try std.testing.expect(std.mem.find(u8, trace_bytes, "MCP menu error dropped server=proj_srv reason=host closed before menu showed it") != null);
 }

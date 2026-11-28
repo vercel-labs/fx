@@ -565,7 +565,7 @@ pub fn describe(err: anyerror) []const u8 {
         error.DurablePathUnsafe => "an MCP config file " ++ not_plain_words,
         error.SymLinkLoop => "an MCP config file " ++ link_loop_words,
         error.StreamTooLong => "an MCP config file " ++ too_large_words,
-        error.Timeout, error.LockTimeout => "another fx is changing the MCP config; try again",
+        error.Timeout, error.LockTimeout, error.LockBusy => "another fx is changing the MCP config; try again",
         error.McpConfigInvalidJson => profile_paths.displayText("~/.fx/mcp.json isn't valid JSON"),
         error.McpConfigNotPlainFile => profile_paths.displayText("~/.fx/mcp.json " ++ not_plain_words),
         error.McpConfigLinkLoop => profile_paths.displayText("~/.fx/mcp.json " ++ link_loop_words),

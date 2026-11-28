@@ -213,7 +213,7 @@ pub fn toolsFor(row: Row, tools: Tools) Tools {
 }
 
 /// A server's screen with `filter` typed, which narrows its tools.
-pub fn serverLayout(row: Row, tools: Tools, filter: []const u8, window: usize) Layout {
+fn serverLayout(row: Row, tools: Tools, filter: []const u8, window: usize) Layout {
     return serverLayoutWithError(row, tools, filter, window, false);
 }
 
