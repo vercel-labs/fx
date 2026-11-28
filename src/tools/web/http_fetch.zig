@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -345,7 +346,19 @@ fn resolveDefault(_: *anyopaque, alloc: Allocator, host: []const u8, port: u16, 
     return collectLookup(alloc, host_name, port, options);
 }
 
+/// How often a lookup's waiter checks cancel, its hop deadline, and walk-away
+/// while the lookup runs. A finished lookup wakes the wait at once.
 const resolve_poll_ms: i64 = 2;
+var test_resolve_poll_ms: ?i64 = null;
+/// Waits `resolveWithDeadlineUsing` began while its lookup still ran.
+var test_resolve_waits_while_running: std.atomic.Value(u32) = .init(0);
+
+fn resolvePollMs() i64 {
+    if (builtin.is_test) {
+        if (test_resolve_poll_ms) |ms| return ms;
+    }
+    return resolve_poll_ms;
+}
 
 const LookupFn = *const fn (?*anyopaque, Allocator, std.Io.net.HostName, u16) anyerror![]IpAddress;
 
@@ -356,6 +369,8 @@ const ResolveJob = struct {
     lookup_fn: LookupFn,
     lookup_ctx: ?*anyopaque,
     on_destroy: ?*std.Io.Event = null,
+    /// Set by `publishOrFree` before its publish, to wake `resolveWithDeadlineUsing`.
+    finished: std.Io.Event = .unset,
     result: anyerror![]IpAddress = error.Timeout,
 
     fn start(
@@ -397,7 +412,8 @@ const ResolveJob = struct {
 
     fn publishOrFree(self: *ResolveJob) void {
         // After `.hand_over`, the caller may free `self` at any moment, so the
-        // job must not touch `self` again.
+        // job sets `finished` first and does not touch `self` again.
+        self.finished.set(io_mod.getIo());
         switch (self.handoff.publish()) {
             .hand_over => {},
             .close_late => self.destroy(),
@@ -453,7 +469,11 @@ fn resolveWithDeadlineUsing(
                 return try alloc.dupe(IpAddress, addrs);
             },
             .wait => {
-                zio.sleep(.fromMilliseconds(resolve_poll_ms), .awake) catch |err| switch (err) {
+                if (builtin.is_test and !job.finished.isSet()) _ = test_resolve_waits_while_running.fetchAdd(1, .monotonic);
+                // Once `publishOrFree` set the event, this wait returns at once
+                // until publish lands: a short spin.
+                job.finished.waitTimeout(zio, .{ .duration = .{ .raw = .fromMilliseconds(resolvePollMs()), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => {},
                     error.Canceled => task_cancelled = true,
                 };
             },
@@ -4301,6 +4321,50 @@ test "web_fetch ResolveJob walks away on cancel and late lookup frees its own re
 
     fake.release.set(io_mod.getIo());
     destroyed.waitUncancelable(io_mod.getIo());
+}
+
+test "web_fetch resolve returns when the lookup ends, not at the next poll" {
+    const HeldLookup = struct {
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+
+        fn run(raw: ?*anyopaque, alloc: Allocator, _: std.Io.net.HostName, port: u16) anyerror![]IpAddress {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.started.set(io_mod.getIo());
+            self.release.waitUncancelable(io_mod.getIo());
+            const out = try alloc.alloc(IpAddress, 1);
+            out[0] = .{ .ip4 = .loopback(port) };
+            return out;
+        }
+    };
+    const Releaser = struct {
+        fn run(held: *HeldLookup) void {
+            held.started.waitUncancelable(io_mod.getIo());
+            // Holds the lookup 50 ms. A loop that sleeps the old fixed 2 ms wakes
+            // about 25 times in it; a wait the finished lookup wakes begins once.
+            io_mod.sleep(50 * std.time.ns_per_ms);
+            held.release.set(io_mod.getIo());
+        }
+    };
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    test_resolve_poll_ms = 60_000;
+    defer test_resolve_poll_ms = null;
+    test_resolve_waits_while_running.store(0, .monotonic);
+    var held = HeldLookup{};
+    const releaser = try std.Thread.spawn(.{}, Releaser.run, .{&held});
+    defer releaser.join();
+
+    const host_name = try std.Io.net.HostName.init("example.com");
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    const addresses = try resolveWithDeadlineUsing(alloc, host_name, 443, .{ .deadline_ms = monotonicMillis() + 30_000 }, .{}, HeldLookup.run, &held, null);
+    defer alloc.free(addresses);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+    // Fails a wait that sleeps out the whole 60 s poll.
+    try std.testing.expect(elapsed_ms < 5_000);
+    // Fails the old loop, which slept a fixed 2 ms and never read the poll hook.
+    try std.testing.expect(test_resolve_waits_while_running.load(.monotonic) <= 3);
+    try std.testing.expectEqual(@as(usize, 1), addresses.len);
 }
 
 test "web_fetch ResolveJob frees result when lookup finishes just as cancel arrives" {

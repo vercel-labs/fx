@@ -377,9 +377,9 @@ pub const CapabilityResolver = struct {
         try self.adopt(alloc, provider, requested, started_ms, load.finish(alloc));
     }
 
-    /// Waits up to one load poll for `load` to finish. While the task stays
-    /// cancelled, every wait can return `Canceled` at once, so that case sleeps
-    /// the poll as before instead of spinning.
+    /// Waits up to one load poll for `load` to finish. A cancelled task gets
+    /// `Canceled` at once, so that case sleeps the poll as before instead of
+    /// looping without a wait.
     fn waitLoadPoll(load: *CatalogLoad) void {
         const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(@intCast(loadPollNs())), .clock = .awake } };
         load.done.waitTimeout(io_mod.getIo(), timeout) catch |err| switch (err) {
@@ -1195,6 +1195,42 @@ test "loadWithin returns when the catalog load finishes, not at the next poll" {
     try std.testing.expect(test_load_waits_while_running.load(.monotonic) <= 3);
     try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
     try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
+}
+
+test "loadWithin in a cancelled task sleeps one poll, then adopts the load" {
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    const poll_ms = 300;
+    test_load_poll_ns = poll_ms * std.time.ns_per_ms;
+    defer test_load_poll_ns = null;
+    test_load_waits_while_running.store(0, .monotonic);
+    var gated: GatedCatalog = .{ .connects = true };
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+
+    const Task = struct {
+        fn run(task_resolver: *CapabilityResolver, task_alloc: Allocator, catalog: *GatedCatalog) model_capabilities.ResolveError!model_capabilities.Capabilities {
+            return task_resolver.resolveWithin(task_alloc, catalog.provider(), .{ .endpoint = "/v1/models" }, "provider/model", .{}, 60_000);
+        }
+    };
+    var task = try zio.concurrent(Task.run, .{ &resolver, alloc, &gated });
+    while (gated.calls.load(.seq_cst) == 0) try std.Thread.yield();
+    const releaser = try gated.releaseAfter(50);
+    defer releaser.join();
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    // std.Io answers only the task's first wait with `Canceled`, at once; the
+    // branch then sleeps the whole poll, and the load finishes inside it.
+    const capabilities = try task.cancel(zio);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+    // Fails a branch that loops again without sleeping: it waits a second
+    // round, which the finished load wakes after about 50 ms.
+    try std.testing.expectEqual(@as(u32, 1), test_load_waits_while_running.load(.monotonic));
+    // Half a poll: the sleep runs on another clock than this measure.
+    try std.testing.expect(elapsed_ms >= poll_ms / 2);
+    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
+    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
+    try std.testing.expect(resolver.pending_load == null);
+    try std.testing.expect(resolver.abandoned_loads == null);
 }
 
 /// Loads `gated`'s catalog once through a provider with a refresh interval,
