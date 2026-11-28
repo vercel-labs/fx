@@ -5524,10 +5524,14 @@ test "a release wait that ends with the shell is not a failed start when the mar
     const path = try std.mem.print(&path_buffer, "/tmp/fx-launcher-ack-{d}.sock", .{std.c.getpid()});
     var command_buffer: [96]u8 = undefined;
     const command_path = try std.mem.print(&command_buffer, "/tmp/fx-launcher-ack-{d}.command", .{std.c.getpid()});
+    // Clears a socket that an earlier crashed run left behind. It is absent
+    // in a normal run, and then there is nothing to clear.
     std.Io.Dir.deleteFileAbsolute(io, path) catch {};
     const address = try std.Io.net.UnixAddress.init(path);
     var server = try address.listen(io, .{});
     defer server.deinit(io);
+    // The launcher removes the socket's path once the start has finished, so
+    // it may be gone already.
     defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
     var report: [2]c_int = undefined;
     if (std.c.pipe(&report) != 0) return error.PipeFailed;
