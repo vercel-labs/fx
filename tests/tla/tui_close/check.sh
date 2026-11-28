@@ -22,6 +22,8 @@ TuiClose current-int-save CloseSavesRequest
 TuiClose design-a -
 TuiClose design-b -
 TuiClose mutant-a-no-tty TtyRestored
+TuiClose mutant-a-early-uninstall TtyRestored
+TuiClose mutant-a-minimal-handler CloseSavesRequest
 TuiClose mutant-a-int-uninstall ShutdownNotCut
 TuiClose mutant-a-no-once OneCloser
 TuiClose mutant-b-cancel CloseSavesRequest

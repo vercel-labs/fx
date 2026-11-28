@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
@@ -267,7 +268,6 @@ pub const StartupState = struct {
     collapse_tool_calls: bool = false,
     auto_upgrade: bool = true,
     update_channel: update_target.Channel = .stable,
-    startup_scrollback: bool = true,
     prompt_history_enabled: bool = true,
     prompt_history_store_allowed: bool = true,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
@@ -946,7 +946,6 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.collapse_tool_calls = settings.collapse_tool_calls orelse false;
     state.auto_upgrade = settings.auto_upgrade orelse true;
     state.update_channel = settings.update_channel orelse .stable;
-    state.startup_scrollback = settings.startup_scrollback orelse true;
     state.theme = if (settings.theme) |value| try alloc.dupe(u8, value) else null;
     state.effort = settings.effort orelse .auto;
     state.review_model = try alloc.dupe(u8, settings.review_model orelse "");
@@ -1127,7 +1126,6 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.metrics,
         &launch_start_row,
         cfg.startup_min_body_rows,
-        state.startup_scrollback,
     );
     // Enable keyboard/paste protocol modes and disable autowrap for the
     // interactive session. Shutdown restores each mode.
@@ -1142,12 +1140,8 @@ fn prepareStartupViewport(
     metrics: *Metrics,
     launch_start_row: *u16,
     startup_min_body_rows: u16,
-    startup_scrollback: bool,
 ) !u16 {
-    if (startup_scrollback and launch_start_row.* > 1) {
-        try pushLaunchRowsIntoScrollback(shell, metrics, launch_start_row.* - 1);
-        launch_start_row.* = 1;
-    } else if (shell.layout.content_bottom > 0) {
+    if (shell.layout.content_bottom > 0) {
         const reserve_rows = @min(startup_min_body_rows, shell.layout.content_bottom);
         const max_start_row = if (reserve_rows > 0)
             shell.layout.content_bottom - reserve_rows + 1
@@ -1186,19 +1180,93 @@ fn pushLaunchRowsIntoScrollback(
     }
 }
 
+const shutdown_hold_timeout_ms: i64 = 15_000;
+const shutdown_hold_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+
+const ShutdownReleaseControls = struct {
+    held_path: []const u8,
+    release_path: []const u8,
+};
+
+fn shutdownReleaseControls(
+    held_path: ?[]const u8,
+    release_path: ?[]const u8,
+) ?ShutdownReleaseControls {
+    return .{
+        .held_path = held_path orelse return null,
+        .release_path = release_path orelse return null,
+    };
+}
+
+fn writeShutdownMarker(path: []const u8) !void {
+    var marker = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
+        .truncate = true,
+        .permissions = shutdown_hold_file_permissions,
+    });
+    defer marker.close(io_mod.getIo());
+    try marker.writeStreamingAll(io_mod.getIo(), "shutdown_release_held");
+    try marker.sync(io_mod.getIo());
+}
+
+// Test-only barrier holding `shutdownInteractiveShell` before `disableRawMode`
+// (`tests/e2e/tui-resume.test.ts`); compiled out of libfx and returns after one
+// getenv when unset. Move onto `test_markers.zig` after PR #2295 merges.
+var before_disable_raw_test_hook: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
+
+fn holdBeforeDisableRawMode() void {
+    if (builtin.is_test) {
+        if (before_disable_raw_test_hook) |hook| hook();
+    }
+    if (comptime build_options.libfx) return;
+    const controls = shutdownReleaseControls(
+        io_mod.getenvAbsolutePath("FX_TEST_SHUTDOWN_RELEASE_HELD"),
+        io_mod.getenvAbsolutePath("FX_TEST_SHUTDOWN_RELEASE_RELEASE"),
+    ) orelse return;
+    writeShutdownMarker(controls.held_path) catch return;
+
+    const deadline = io_mod.milliTimestamp() + shutdown_hold_timeout_ms;
+    while (io_mod.milliTimestamp() < deadline) {
+        if (std.Io.Dir.accessAbsolute(io_mod.getIo(), controls.release_path, .{})) |_| break else |_| {}
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
 pub fn shutdownInteractiveShell(
     terminal: *TerminalState,
     shell: *TranscriptRuntime,
     metrics: *Metrics,
     terminal_title: host.TerminalTitle,
 ) void {
+    shutdownInteractiveShellWithOptions(terminal, shell, metrics, terminal_title, true);
+}
+
+/// Restores the terminal without removing TERM/HUP close handlers yet, so
+/// `App.shutdownForProcessExit` keeps saving any active request until
+/// persistence finishes (`tests/tla/tui_close/TuiClose.tla` `CloseSavesRequest`).
+pub fn shutdownInteractiveShellForProcessExit(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    terminal_title: host.TerminalTitle,
+) void {
+    shutdownInteractiveShellWithOptions(terminal, shell, metrics, terminal_title, false);
+}
+
+fn shutdownInteractiveShellWithOptions(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    terminal_title: host.TerminalTitle,
+    uninstall_close_handlers: bool,
+) void {
     leaveAlternateScreens(terminal, shell, metrics);
-    terminal.uninstallResizeSignal();
-    uninstallAbnormalExitHandlers();
     _ = writeLifecycleTerminalBytes(shell, metrics, normalExitRestoreSequence(io_mod.getenv("TMUX"))) catch {};
     terminal_title.clear();
     record_tape.shutdown();
+    holdBeforeDisableRawMode();
     finishLeavingInteractiveMode(terminal, shell, metrics);
+    terminal.uninstallResizeSignal();
+    if (uninstall_close_handlers) uninstallAbnormalExitHandlers();
 }
 
 /// Stage timing for interactive shutdown. Each mark logs the delta since the
@@ -2587,6 +2655,145 @@ test "the close path puts back the tty mode fx found at startup" {
     try std.testing.expectEqual(found.lflag.ISIG, after.lflag.ISIG);
 }
 
+test "shutdown release test controls require both absolute paths" {
+    try std.testing.expect(shutdownReleaseControls("/tmp/held", null) == null);
+    try std.testing.expect(shutdownReleaseControls(null, "/tmp/release") == null);
+    try std.testing.expect(shutdownReleaseControls("/tmp/held", "/tmp/release") != null);
+}
+
+test "shutdownInteractiveShell keeps TERM and HUP close handlers until after disableRawMode" {
+    if (!shell_runtime.supports_resize_signal or !shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const pty = try shell_runtime.TestPty.open();
+    defer _ = std.c.close(pty.master);
+    defer _ = std.c.close(pty.slave);
+
+    var saved_int: std.posix.Sigaction = undefined;
+    var saved_term: std.posix.Sigaction = undefined;
+    var saved_hup: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.INT, null, &saved_int);
+    std.posix.sigaction(std.posix.SIG.TERM, null, &saved_term);
+    std.posix.sigaction(std.posix.SIG.HUP, null, &saved_hup);
+    defer std.posix.sigaction(std.posix.SIG.INT, &saved_int, null);
+    defer std.posix.sigaction(std.posix.SIG.TERM, &saved_term, null);
+    defer std.posix.sigaction(std.posix.SIG.HUP, &saved_hup, null);
+
+    const found = try io_mod.tcgetattr(pty.slave);
+    installAbnormalExitHandlers(null, found);
+    defer uninstallAbnormalExitHandlers();
+    defer found_termios = null;
+
+    var raw = found;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.lflag.ISIG = false;
+    try io_mod.tcsetattr(pty.slave, .NOW, raw);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), "shut.out", .{ .truncate = true });
+    var shell = TranscriptRuntime{ .stdout_file = out_file };
+    defer shell.deinit(alloc);
+    var metrics = Metrics{};
+    var terminal = TerminalState{
+        .stdin_fd = pty.slave,
+        .original_termios = found,
+        .raw_enabled = true,
+    };
+
+    const Probe = struct {
+        var saw_term_during_raw: bool = false;
+        var saw_hup_during_raw: bool = false;
+        fn check() void {
+            var act_term: std.posix.Sigaction = undefined;
+            var act_hup: std.posix.Sigaction = undefined;
+            std.posix.sigaction(std.posix.SIG.TERM, null, &act_term);
+            std.posix.sigaction(std.posix.SIG.HUP, null, &act_hup);
+            saw_term_during_raw = act_term.handler.handler == closeSignalHandler;
+            saw_hup_during_raw = act_hup.handler.handler == closeSignalHandler;
+        }
+    };
+    Probe.saw_term_during_raw = false;
+    Probe.saw_hup_during_raw = false;
+    before_disable_raw_test_hook = Probe.check;
+    defer before_disable_raw_test_hook = null;
+
+    shutdownInteractiveShell(&terminal, &shell, &metrics, host.unavailable_terminal_title);
+    shell.stdout_file.close(io_mod.getIo());
+
+    try std.testing.expect(Probe.saw_term_during_raw);
+    try std.testing.expect(Probe.saw_hup_during_raw);
+    try std.testing.expect(!terminal.raw_enabled);
+    const after_tty = try io_mod.tcgetattr(pty.slave);
+    try std.testing.expectEqual(found.lflag.ICANON, after_tty.lflag.ICANON);
+    try std.testing.expectEqual(found.lflag.ECHO, after_tty.lflag.ECHO);
+    try std.testing.expectEqual(found.lflag.ISIG, after_tty.lflag.ISIG);
+
+    var term_after: std.posix.Sigaction = undefined;
+    var hup_after: std.posix.Sigaction = undefined;
+    var int_after: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.TERM, null, &term_after);
+    std.posix.sigaction(std.posix.SIG.HUP, null, &hup_after);
+    std.posix.sigaction(std.posix.SIG.INT, null, &int_after);
+    try std.testing.expectEqual(saved_term.handler.handler, term_after.handler.handler);
+    try std.testing.expectEqual(saved_hup.handler.handler, hup_after.handler.handler);
+    try std.testing.expectEqual(@as(?std.posix.Sigaction.handler_fn, closeSignalHandler), int_after.handler.handler);
+}
+
+test "shutdownInteractiveShellForProcessExit keeps TERM and HUP close handlers until uninstall" {
+    if (!shell_runtime.supports_resize_signal or !shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const pty = try shell_runtime.TestPty.open();
+    defer _ = std.c.close(pty.master);
+    defer _ = std.c.close(pty.slave);
+
+    var saved_int: std.posix.Sigaction = undefined;
+    var saved_term: std.posix.Sigaction = undefined;
+    var saved_hup: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.INT, null, &saved_int);
+    std.posix.sigaction(std.posix.SIG.TERM, null, &saved_term);
+    std.posix.sigaction(std.posix.SIG.HUP, null, &saved_hup);
+    defer std.posix.sigaction(std.posix.SIG.INT, &saved_int, null);
+    defer std.posix.sigaction(std.posix.SIG.TERM, &saved_term, null);
+    defer std.posix.sigaction(std.posix.SIG.HUP, &saved_hup, null);
+
+    const found = try io_mod.tcgetattr(pty.slave);
+    installAbnormalExitHandlers(null, found);
+    defer uninstallAbnormalExitHandlers();
+    defer found_termios = null;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), "shut-pe.out", .{ .truncate = true });
+    var shell = TranscriptRuntime{ .stdout_file = out_file };
+    defer shell.deinit(alloc);
+    var metrics = Metrics{};
+    var terminal = TerminalState{
+        .stdin_fd = pty.slave,
+        .original_termios = found,
+        .raw_enabled = true,
+    };
+
+    shutdownInteractiveShellForProcessExit(&terminal, &shell, &metrics, host.unavailable_terminal_title);
+    shell.stdout_file.close(io_mod.getIo());
+    try std.testing.expect(!terminal.raw_enabled);
+
+    var term_mid: std.posix.Sigaction = undefined;
+    var hup_mid: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.TERM, null, &term_mid);
+    std.posix.sigaction(std.posix.SIG.HUP, null, &hup_mid);
+    try std.testing.expectEqual(@as(?std.posix.Sigaction.handler_fn, closeSignalHandler), term_mid.handler.handler);
+    try std.testing.expectEqual(@as(?std.posix.Sigaction.handler_fn, closeSignalHandler), hup_mid.handler.handler);
+
+    uninstallAbnormalExitHandlers();
+    var term_end: std.posix.Sigaction = undefined;
+    var hup_end: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.TERM, null, &term_end);
+    std.posix.sigaction(std.posix.SIG.HUP, null, &hup_end);
+    try std.testing.expectEqual(saved_term.handler.handler, term_end.handler.handler);
+    try std.testing.expectEqual(saved_hup.handler.handler, hup_end.handler.handler);
+}
+
 test "exit and suspend restoration clear the program status record" {
     for ([_][]const u8{
         normal_exit_restore,
@@ -2642,15 +2849,15 @@ test "launch scrollback push creates top-of-viewport space" {
     try std.testing.expectEqualStrings("\x1b[24;1H\n\n\n", bytes);
 }
 
-test "prepare startup viewport uses scrollback setting for launch push only" {
+test "prepare startup viewport scrolls only the rows that do not fit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const enabled_path = "enabled.out";
-    const enabled_file = try tmp.dir.createFile(io_mod.getIo(), enabled_path, .{ .truncate = true });
-    var enabled_shell = TranscriptRuntime{
-        .stdout_file = enabled_file,
+    const fits_path = "fits.out";
+    const fits_file = try tmp.dir.createFile(io_mod.getIo(), fits_path, .{ .truncate = true });
+    var fits_shell = TranscriptRuntime{
+        .stdout_file = fits_file,
         .layout = .{
             .rows = 24,
             .cols = 80,
@@ -2661,42 +2868,42 @@ test "prepare startup viewport uses scrollback setting for launch push only" {
             .hint_row = 24,
         },
     };
-    defer enabled_shell.deinit(alloc);
+    defer fits_shell.deinit(alloc);
 
     var metrics = Metrics{};
-    var enabled_launch_row: u16 = 6;
-    const enabled_reservation = try prepareStartupViewport(&enabled_shell, &metrics, &enabled_launch_row, 11, true);
-    enabled_shell.stdout_file.close(io_mod.getIo());
+    var fits_launch_row: u16 = 6;
+    const fits_reservation = try prepareStartupViewport(&fits_shell, &metrics, &fits_launch_row, 11);
+    fits_shell.stdout_file.close(io_mod.getIo());
 
-    var enabled_read = try tmp.dir.openFile(io_mod.getIo(), enabled_path, .{});
-    defer enabled_read.close(io_mod.getIo());
-    const enabled_bytes = try io_mod.readFileToEnd(alloc, &enabled_read, 1024);
-    defer alloc.free(enabled_bytes);
+    var fits_read = try tmp.dir.openFile(io_mod.getIo(), fits_path, .{});
+    defer fits_read.close(io_mod.getIo());
+    const fits_bytes = try io_mod.readFileToEnd(alloc, &fits_read, 1024);
+    defer alloc.free(fits_bytes);
 
-    try std.testing.expectEqual(@as(u16, 1), enabled_launch_row);
-    try std.testing.expectEqual(@as(u16, 11), enabled_reservation);
-    try std.testing.expectEqualStrings("\x1b[24;1H\n\n\n\n\n", enabled_bytes);
+    try std.testing.expectEqual(@as(u16, 6), fits_launch_row);
+    try std.testing.expectEqual(@as(u16, 11), fits_reservation);
+    try std.testing.expectEqualStrings("", fits_bytes);
 
-    const disabled_path = "disabled.out";
-    const disabled_file = try tmp.dir.createFile(io_mod.getIo(), disabled_path, .{ .truncate = true });
-    var disabled_shell = TranscriptRuntime{
-        .stdout_file = disabled_file,
-        .layout = enabled_shell.layout,
+    const low_path = "low.out";
+    const low_file = try tmp.dir.createFile(io_mod.getIo(), low_path, .{ .truncate = true });
+    var low_shell = TranscriptRuntime{
+        .stdout_file = low_file,
+        .layout = fits_shell.layout,
     };
-    defer disabled_shell.deinit(alloc);
+    defer low_shell.deinit(alloc);
 
-    var disabled_launch_row: u16 = 6;
-    const disabled_reservation = try prepareStartupViewport(&disabled_shell, &metrics, &disabled_launch_row, 11, false);
-    disabled_shell.stdout_file.close(io_mod.getIo());
+    var low_launch_row: u16 = 15;
+    const low_reservation = try prepareStartupViewport(&low_shell, &metrics, &low_launch_row, 11);
+    low_shell.stdout_file.close(io_mod.getIo());
 
-    var disabled_read = try tmp.dir.openFile(io_mod.getIo(), disabled_path, .{});
-    defer disabled_read.close(io_mod.getIo());
-    const disabled_bytes = try io_mod.readFileToEnd(alloc, &disabled_read, 1024);
-    defer alloc.free(disabled_bytes);
+    var low_read = try tmp.dir.openFile(io_mod.getIo(), low_path, .{});
+    defer low_read.close(io_mod.getIo());
+    const low_bytes = try io_mod.readFileToEnd(alloc, &low_read, 1024);
+    defer alloc.free(low_bytes);
 
-    try std.testing.expectEqual(@as(u16, 6), disabled_launch_row);
-    try std.testing.expectEqual(@as(u16, 11), disabled_reservation);
-    try std.testing.expectEqualStrings("", disabled_bytes);
+    try std.testing.expectEqual(@as(u16, 10), low_launch_row);
+    try std.testing.expectEqual(@as(u16, 11), low_reservation);
+    try std.testing.expectEqualStrings("\x1b[24;1H\n\n\n\n\n", low_bytes);
 }
 
 test "prepare startup viewport with welcome reservation does not push ten blank lines" {
@@ -2722,7 +2929,7 @@ test "prepare startup viewport with welcome reservation does not push ten blank 
 
     var metrics = Metrics{};
     var launch_row: u16 = 45;
-    _ = try prepareStartupViewport(&shell, &metrics, &launch_row, ui_render.welcome_message_reserved_rows, false);
+    _ = try prepareStartupViewport(&shell, &metrics, &launch_row, ui_render.welcome_message_reserved_rows);
     shell.stdout_file.close(io_mod.getIo());
 
     var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
@@ -2997,40 +3204,6 @@ test "loadStartupState defaults fast mode off and requires bound explicit prefer
     try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
     try std.testing.expectEqualStrings("gpt-5.4-mini", codex.selected_model);
     try std.testing.expect(!codex.fast_mode);
-}
-
-test "loadStartupState resolves startup scrollback default and explicit false" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "absent");
-    try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
-
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const absent_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "absent");
-    defer std.testing.allocator.free(absent_root);
-    const disabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "disabled");
-    defer std.testing.allocator.free(disabled_root);
-
-    const fixture = try std.testing.allocator.print(
-        "{{\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n",
-        .{disabled_root},
-    );
-    defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
-
-    var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
-    defer env.deinit();
-
-    var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "default-model", 25);
-    defer absent.deinit(std.testing.allocator);
-    try std.testing.expect(absent.startup_scrollback);
-
-    var disabled = try loadStartupStateForWorkspace(std.testing.allocator, disabled_root, "default-model", 25);
-    defer disabled.deinit(std.testing.allocator);
-    try std.testing.expect(!disabled.startup_scrollback);
 }
 
 test "loadStartupState resolves slash menu categories default and explicit false" {
