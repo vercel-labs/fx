@@ -301,11 +301,6 @@ fn nextImageIdForResume(alloc: Allocator, history: []const types.HistoryTurn) !u
     return (try image_attachments.calculate_next_image_id(restored_catalog)).next_id;
 }
 
-pub const HistoryAppendOutcome = enum {
-    uncommitted,
-    committed,
-};
-
 const UpgradeNotice = struct {
     version: []const u8,
     channel: update_target.Channel,
@@ -2825,7 +2820,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn appendHistoryTurn(app: *App, agent: *AppAgent, turn: types.HistoryTurn) !void {
-            _ = try appendHistoryTurnWithPendingPresentation(app, agent, turn, .strict, null, 0);
+            _ = try appendHistoryTurnWithPendingPresentation(app, agent, turn, .strict, null, 0, false);
         }
 
         /// Tells the agent's worker that a finished turn is committed, or
@@ -2860,64 +2855,75 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !void {
+            _ = try appendFinishedPromptWithNoticeMode(app, agent, finished, false);
+        }
+
+        pub fn appendFinishedPromptDeferringNotice(
+            app: *App,
+            agent: *AppAgent,
+            finished: types.FinishedPrompt,
+        ) !?anyerror {
+            return appendFinishedPromptWithNoticeMode(app, agent, finished, true);
+        }
+
+        fn appendFinishedPromptWithNoticeMode(
+            app: *App,
+            agent: *AppAgent,
+            finished: types.FinishedPrompt,
+            defer_save_notice: bool,
+        ) !?anyerror {
             var committed: ?types.HistoryTurn = null;
             defer acknowledgeFinishCommitted(agent, committed, finished.snapshot_file_ownership);
             var turn = finished.turn;
             if (finished.summary) |summary| {
                 types.setHistoryTurnSummary(&turn, summary);
             }
-            if (try appendHistoryTurnWithPendingPresentation(
+            const save_failure = try appendHistoryTurnWithPendingPresentation(
                 app,
                 agent,
                 turn,
                 .finished_prompt,
                 finished.snapshot_file_ownership,
                 finished.capture_turn,
-            ) == .committed) committed = turn;
+                defer_save_notice,
+            );
+            committed = turn;
             if (comptime agents.hasAgentField(App, "child_run")) {
                 @import("app_agents_runtime.zig").Runtime(App).commitChildTurn(app, agent, finished);
             }
+            return save_failure;
         }
 
-        pub fn appendHistoryTurnForVisualEpoch(
-            app: *App,
-            agent: *AppAgent,
-            turn: types.HistoryTurn,
-        ) !HistoryAppendOutcome {
-            return appendHistoryTurnWithPendingPresentation(
-                app,
-                agent,
-                turn,
-                .visual_epoch,
-                null,
-                0,
-            );
-        }
-
-        pub fn appendFinishedPromptForVisualEpoch(
-            app: *App,
-            agent: *AppAgent,
-            finished: types.FinishedPrompt,
-        ) !HistoryAppendOutcome {
-            const outcome = try appendHistoryTurnWithPendingPresentation(
-                app,
-                agent,
-                finished.turn,
-                .visual_epoch,
-                finished.snapshot_file_ownership,
-                finished.capture_turn,
-            );
-            // An uncommitted turn stays with the pacer, which commits it later
-            // through `appendFinishedPrompt`.
-            if (outcome == .committed) {
-                acknowledgeFinishCommitted(agent, finished.turn, finished.snapshot_file_ownership);
+        pub fn writeSaveFailureNotice(app: *App, failure: anyerror) !void {
+            if (comptime @hasDecl(App, "writeDomainNotice")) {
+                var plain_buf: [96]u8 = undefined;
+                const body = try app.alloc.print(
+                    "Couldn't save this turn: {s}. It may be missing when you reopen this session.",
+                    .{types.plainErrorText(@errorName(failure), &plain_buf)},
+                );
+                defer app.alloc.free(body);
+                app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "save failure notice dropped kind=semantic_notice size=1 reason=write_failed err={s} save_err={s}",
+                        .{ @errorName(err), @errorName(failure) },
+                    );
+                };
             }
-            return outcome;
+        }
+
+        pub fn writeDroppedSaveFailureNotice(app: *App, failure: anyerror, reason: []const u8) void {
+            writeSaveFailureNotice(app, failure) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "save failure notice dropped kind=semantic_notice size=1 reason={s} err={s} save_err={s}",
+                    .{ reason, @errorName(err), @errorName(failure) },
+                );
+            };
         }
 
         const AppendHistoryMode = enum {
             strict,
-            visual_epoch,
             /// A rendered, user-visible finished turn. A validation or commit
             /// failure must not take the session down: commit in memory, warn,
             /// and keep the process alive.
@@ -2933,21 +2939,22 @@ pub fn Runtime(comptime App: type) type {
             /// The turn's workspace capture token from its finished prompt
             /// (`types.FinishedPrompt.capture_turn`); 0 commits no captures.
             capture_turn: u64,
-        ) !HistoryAppendOutcome {
+            defer_save_notice: bool,
+        ) !?anyerror {
             if (comptime !agents.hasAgentField(App, "session_persistence")) {
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn, defer_save_notice);
             }
             const interrupted = switch (turn) {
                 .interrupted => |entry| entry,
-                else => return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn),
+                else => return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn, defer_save_notice),
             };
             var pending = agent.session_persistence.pending_cancelled_command orelse {
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn, defer_save_notice);
             };
             agent.session_persistence.pending_cancelled_command = null;
             const call = interrupted.tool_call orelse {
                 pending.discard(app.alloc);
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn, defer_save_notice);
             };
             const is_command = try captured_command.isToolCall(
                 app.alloc,
@@ -2958,7 +2965,7 @@ pub fn Runtime(comptime App: type) type {
                 !std.mem.eql(u8, call.id, pending.lifecycle_id.call_id))
             {
                 pending.discard(app.alloc);
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn, defer_save_notice);
             }
             defer pending.discard(app.alloc);
 
@@ -2977,6 +2984,7 @@ pub fn Runtime(comptime App: type) type {
                     mode,
                     snapshot_file_ownership,
                     capture_turn,
+                    defer_save_notice,
                 );
             }
 
@@ -2985,7 +2993,7 @@ pub fn Runtime(comptime App: type) type {
                 .command_artifact_handle = pending.command_artifact_handle,
             };
             const enriched: types.HistoryTurn = .{ .interrupted = enriched_interrupted };
-            return appendHistoryTurnWithOutcome(app, agent, enriched, mode, snapshot_file_ownership, capture_turn);
+            return appendHistoryTurnWithOutcome(app, agent, enriched, mode, snapshot_file_ownership, capture_turn, defer_save_notice);
         }
 
         fn ensurePendingCancelledCommand(
@@ -3050,18 +3058,12 @@ pub fn Runtime(comptime App: type) type {
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
             capture_turn: u64,
-        ) !HistoryAppendOutcome {
-            var prepared = (if (comptime @hasDecl(@TypeOf(agent.session), "prepareHistoryEntry"))
+            defer_save_notice: bool,
+        ) !?anyerror {
+            var prepared = try (if (comptime @hasDecl(@TypeOf(agent.session), "prepareHistoryEntry"))
                 agent.session.prepareHistoryEntry(app.alloc, turn)
             else
-                types.dupeHistoryTurn(app.alloc, turn)) catch |err| {
-                return switch (mode) {
-                    // In-memory preparation failure (out of memory) cannot be
-                    // degraded: the in-memory commit needs the prepared copy.
-                    .strict, .finished_prompt => err,
-                    .visual_epoch => .uncommitted,
-                };
-            };
+                types.dupeHistoryTurn(app.alloc, turn));
             var prepared_owned = true;
             defer if (prepared_owned) types.freeHistoryTurn(app.alloc, prepared);
             if (comptime !agents.hasAgentField(App, "session_persistence")) {
@@ -3074,7 +3076,7 @@ pub fn Runtime(comptime App: type) type {
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
                 ensureCachedSessionTitle(app, agent) catch {};
                 commitJsHostSnapshot(app, agent, "history_turn", .clear);
-                return .committed;
+                return null;
             }
             // The turn's end capture was taken on its worker as the turn
             // finished (`endWorkspaceCapture`); this commit, which may run on
@@ -3082,7 +3084,7 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             if (agent.session_persistence.v2) |v2| {
                 defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
-                if (try commitV2HistoryTurn(app, agent, v2, &prepared, mode, capture_turn)) |outcome| return outcome;
+                const save_failure = try commitV2HistoryTurn(app, agent, v2, &prepared, mode, capture_turn, defer_save_notice);
                 if (comptime @hasDecl(@TypeOf(agent.session), "commitPreparedHistoryEntry")) {
                     agent.session.commitPreparedHistoryEntry(app.alloc, prepared);
                     prepared_owned = false;
@@ -3091,7 +3093,7 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
                 ensureCachedSessionTitle(app, agent) catch {};
-                return .committed;
+                return save_failure;
             }
             agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             if (comptime @hasDecl(@TypeOf(agent.session), "commitPreparedHistoryEntry")) {
@@ -3103,12 +3105,12 @@ pub fn Runtime(comptime App: type) type {
             if (snapshot_file_ownership) |ownership| ownership.transfer();
             ensureCachedSessionTitle(app, agent) catch {};
             commitJsHostSnapshot(app, agent, "history_turn", .clear);
-            return .committed;
+            return null;
         }
 
-        /// Saves a finished turn to v2 with v1's failure modes. Null means the
-        /// caller commits the turn in memory: it was saved, or its failure
-        /// was recorded and shown.
+        /// Saves a finished turn to v2 with v1's failure modes. Returning
+        /// cleanly means the caller commits the turn in memory: it was saved,
+        /// or its failure was recorded and shown.
         fn commitV2HistoryTurn(
             app: *App,
             agent: *AppAgent,
@@ -3116,7 +3118,8 @@ pub fn Runtime(comptime App: type) type {
             prepared: *types.HistoryTurn,
             mode: AppendHistoryMode,
             capture_turn: u64,
-        ) !?HistoryAppendOutcome {
+            defer_save_notice: bool,
+        ) !?anyerror {
             const failure: anyerror = saved: {
                 v2.prepareTurn(prepared) catch |err| break :saved err;
                 const captures = &agent.session_persistence.turn_capture;
@@ -3138,22 +3141,12 @@ pub fn Runtime(comptime App: type) type {
             };
             switch (mode) {
                 .strict => return failure,
-                .visual_epoch => {
-                    debug_trace.logf("session", "visual epoch history not committed err={s}", .{@errorName(failure)});
-                    return .uncommitted;
-                },
                 .finished_prompt => {
                     recordShutdownFailure(agent, failure);
-                    if (comptime @hasDecl(App, "writeDomainNotice")) {
-                        var plain_buf: [96]u8 = undefined;
-                        const body = try app.alloc.print(
-                            "Couldn't save this turn: {s}. It may be missing when you reopen this session.",
-                            .{types.plainErrorText(@errorName(failure), &plain_buf)},
-                        );
-                        defer app.alloc.free(body);
-                        app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
+                    if (!defer_save_notice) {
+                        try writeSaveFailureNotice(app, failure);
                     }
-                    return null;
+                    return @as(?anyerror, failure);
                 },
             }
         }
@@ -6643,6 +6636,9 @@ test "session transition retires queued and running compaction only after worker
         } = .{},
         pacer: struct {
             pub fn clear(_: *@This(), _: Allocator) void {}
+            pub fn takeDeferredSaveFailure(_: *@This()) ?anyerror {
+                return null;
+            }
         } = .{},
 
         pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
@@ -11619,29 +11615,6 @@ test "appendFinishedPrompt acknowledges a turn it could not commit without the t
     try std.testing.expectEqual(@as(usize, 1), worker.acknowledgements_without_turn);
 }
 
-test "a visual epoch commit acknowledges with its turn, and one that did not commit acknowledges nothing" {
-    const alloc = testing_allocator.no_resize;
-    var app = try TestApp.init(alloc, "/tmp/workspace");
-    defer app.deinit();
-    const finished: types.FinishedPrompt = .{ .turn = .{ .assistant = .{
-        .user = .{ .text = @constCast("inspect") },
-        .assistant = @constCast("done"),
-    } } };
-
-    try std.testing.expectEqual(HistoryAppendOutcome.committed, try Runtime(TestApp).appendFinishedPromptForVisualEpoch(&app, (&app).agent(), finished));
-    const worker = &app.agent().worker;
-    try std.testing.expectEqual(@as(usize, 1), worker.acknowledgements_with_turn);
-    try std.testing.expectEqualStrings("done", worker.acknowledged_answer.?);
-
-    // The pacer keeps a turn that did not commit, and commits it later.
-    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
-    app.alloc = failing.allocator();
-    defer app.alloc = alloc;
-    try std.testing.expectEqual(HistoryAppendOutcome.uncommitted, try Runtime(TestApp).appendFinishedPromptForVisualEpoch(&app, (&app).agent(), finished));
-    try std.testing.expectEqual(@as(usize, 1), worker.acknowledgements_with_turn);
-    try std.testing.expectEqual(@as(usize, 0), worker.acknowledgements_without_turn);
-}
-
 test "appendFinishedPrompt does not transfer snapshot ownership when history insertion fails" {
     const alloc = testing_allocator.no_resize;
     var app = try TestApp.init(alloc, "/tmp/workspace");
@@ -11850,25 +11823,6 @@ test "an app agent's captures stop for its cancel, not for a steer that interrup
     worker.requestInteractiveCancel();
     try std.testing.expect(flag.load(.seq_cst));
     worker.finishProcessing();
-}
-
-test "visual epoch history append reports committed without persistence" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-
-    var app = try TestApp.init(alloc, workspace);
-    defer app.deinit();
-    const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
-    defer session_runtime.freeHistoryTurn(alloc, turn);
-
-    try std.testing.expectEqual(
-        HistoryAppendOutcome.committed,
-        try Runtime(TestApp).appendHistoryTurnForVisualEpoch(&app, (&app).agent(), turn),
-    );
-    try std.testing.expectEqual(@as(usize, 1), app.agent().session.historyLen());
 }
 
 test "appendHistoryTurn preserves canonical turns above the context limit" {
@@ -13347,20 +13301,23 @@ test "a live session switch drops the finishes it holds, so a later report is no
     const worker = &app.agent().worker;
     worker.enableCommitGate();
 
-    // Turn A's finish is in the pacer, and turn B's finish is still queued.
+    // Turn A's finish was committed and acknowledged at drain while its
+    // presentation stayed in the pacer; turn B's finish is still queued.
     const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
     try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
     var taken = worker.takeEvents();
     for (taken.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
     taken.deinit(alloc);
+    worker.acknowledgeFinishCommitted();
     try app.pacer.enqueue(app.alloc, "still showing");
-    try std.testing.expect(try app.pacer.deferFinish(app.alloc, .{ .turn = turn }));
+    try std.testing.expect(app.pacer.deferFinish(@import("../../ui/assistant/pacer.zig").DeferredPresentation.fromFinishedPrompt(.{ .turn = turn })));
     try worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
-    try std.testing.expectEqual(@as(u32, 2), worker.unacknowledged_finishes);
+    try std.testing.expectEqual(@as(u32, 1), worker.unacknowledged_finishes);
 
-    // The switch cancels (and clears the pacer), then drops the queued events.
+    // The switch cancels and clears the pacer's presentation without touching the
+    // commit gate, then drops only the queued events.
     Runtime(App).beginLiveSessionCancellation(&app, (&app).agent());
-    try std.testing.expect(app.pacer.deferred_turn == null);
+    try std.testing.expect(app.pacer.deferred_presentation == null);
     try std.testing.expectEqual(@as(u32, 1), worker.unacknowledged_finishes);
     worker.discardEvents(alloc);
     try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);

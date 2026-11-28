@@ -1597,6 +1597,97 @@ test "full transcript page boundaries preserve monotonic navigation" {
     try std.testing.expect(after_page_down > before_page_down);
 }
 
+test "page down on tail full transcript keeps following tail when entries grow before rebuild" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+        .full_transcript = .{ .depth = .full, .follow_tail = true },
+    };
+    defer runtime.deinit(alloc);
+
+    for (0..5) |_| {
+        _ = try runtime.appendRawTranscriptEntryClassified(alloc, "row\n", .unknown_raw);
+    }
+
+    const visible_rows = runtime.fullTranscriptPageBottom();
+    const initial_rows: u32 = 40;
+    const initial_max = initial_rows - visible_rows;
+    const installPage = struct {
+        fn call(
+            current: *TranscriptRuntime,
+            range: full_transcript_page.SourceRange,
+            total_rows: u32,
+        ) !void {
+            const request = full_transcript_page.Request{
+                .content_revision = current.notebook.full_transcript_content_revision,
+                .cols = current.layout.cols,
+                .anchor = current.full_transcript_page_anchor,
+            };
+            if (current.full_transcript_installed_page == null) {
+                current.full_transcript_installed_page = .{
+                    .source = .{ .request = request, .range = range },
+                    .projection = .{ .styles = .{} },
+                };
+            }
+            const page = &current.full_transcript_installed_page.?;
+            page.source.request = request;
+            page.source.range = range;
+            page.projection.measured_item_rows.clearRetainingCapacity();
+            const rows_per_entry = total_rows / @as(u32, @intCast(range.len()));
+            for (range.start..range.end) |entry_index| {
+                try page.projection.measured_item_rows.append(std.heap.c_allocator, .{
+                    .entry_id = current.notebook.entries.items[entry_index].id(),
+                    .row = @as(u32, @intCast(entry_index - range.start)) * rows_per_entry,
+                });
+            }
+            page.projection.measured_total_rows = total_rows;
+        }
+    }.call;
+
+    try installPage(&runtime, .{ .start = 0, .end = 5 }, initial_rows);
+    runtime.full_transcript.scroll_rows = initial_max;
+
+    // Pacer appends entries while the older .tail snapshot (0..5) is still installed.
+    for (0..2) |_| {
+        _ = try runtime.appendRawTranscriptEntryClassified(alloc, "row\n", .unknown_raw);
+    }
+
+    for (0..5) |_| {
+        runtime.scrollFullTranscript(.down, .page);
+    }
+
+    try std.testing.expect(runtime.full_transcript_page_anchor == .tail);
+    try std.testing.expect(runtime.full_transcript.follow_tail);
+    try std.testing.expect(!runtime.full_transcript.bookmark_pending);
+
+    // A rebuild completing right after PageDown from below the bottom must also
+    // keep follow_tail instead of pinning a reading-position bookmark to the old page.
+    runtime.full_transcript.scroll_rows = initial_max -| 5;
+    runtime.full_transcript.follow_tail = false;
+    runtime.scrollFullTranscript(.down, .page);
+    try std.testing.expect(runtime.full_transcript.follow_tail);
+
+    runtime.full_transcript = runtime.presentationForRebuiltPage();
+    try installPage(&runtime, .{ .start = 0, .end = 7 }, 80);
+    const installed = &runtime.full_transcript_installed_page.?;
+    const selected = runtime.full_transcript.select_visual_offset(
+        installed.projection.measured_total_rows,
+        visible_rows,
+        installed.projection.measured_item_rows.items,
+    );
+    try std.testing.expect(selected.state.follow_tail);
+    try std.testing.expectEqual(@as(u32, 80 - visible_rows), selected.offset);
+}
+
 test "rebuilt full transcript page keeps the entry the viewer was reading" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -5087,7 +5178,8 @@ pub const TranscriptNotebook = struct {
 /// painted and committed. Each agent keeps one set, and the screen holds the
 /// set of the agent on it (`TranscriptRuntime.swapSlot`).
 const transcript_slot_fields = [_][:0]const u8{
-    "staged_assistant_tail",
+    "staged_assistant_tails",
+    "staged_assistant_tails_alloc",
     "staged_assistant_tail_id",
     "assistant_tail",
     "notebook",
@@ -5222,6 +5314,8 @@ pub const TranscriptSlot = blk: {
     break :blk @Struct(.auto, null, &transcript_slot_fields, &slot_types, &slot_attrs);
 };
 
+pub const max_staged_assistant_tails: usize = 4096;
+
 /// The assistant tail the pacer has not reached yet. The runtime owns `events`.
 pub const StagedAssistantTail = struct {
     id: u64,
@@ -5230,7 +5324,8 @@ pub const StagedAssistantTail = struct {
 };
 
 pub const TranscriptRuntime = struct {
-    staged_assistant_tail: ?StagedAssistantTail = null,
+    staged_assistant_tails: std.ArrayList(StagedAssistantTail) = .empty,
+    staged_assistant_tails_alloc: ?Allocator = null,
     staged_assistant_tail_id: u64 = 0,
     /// The unfinished assistant text and blocks, drawn after the committed rows.
     assistant_tail: std.ArrayList(render_engine.transcript_blocks.TranscriptEntry) = .empty,
@@ -5502,6 +5597,14 @@ pub const TranscriptRuntime = struct {
         holder.deinit(alloc);
     }
 
+    /// Stages an assistant tail on an off-screen `TranscriptSlot`.
+    pub fn stageSlotAssistantTail(slot: *TranscriptSlot, alloc: Allocator, events: []assistant_presentation.Event) u64 {
+        var holder: TranscriptRuntime = .{};
+        holder.swapSlot(slot);
+        defer holder.swapSlot(slot);
+        return holder.stageAssistantTail(alloc, events);
+    }
+
     pub fn deinit(self: *TranscriptRuntime, alloc: Allocator) void {
         self.disableShadowVt();
         self.full_transcript_window_load.deinit();
@@ -5526,31 +5629,118 @@ pub const TranscriptRuntime = struct {
         self.footer_viewport.deinit(alloc);
         self.ui_observer.deinit(alloc);
         const shown_entries = self.assistant_tail.items.len;
-        const staged_events = if (self.staged_assistant_tail) |staged| staged.events.len else 0;
+        var staged_events: usize = 0;
+        for (self.staged_assistant_tails.items) |staged| staged_events += staged.events.len;
         if (shown_entries > 0 or staged_events > 0) {
-            debug_trace.logf("transcript", "assistant tail dropped at deinit shown_entries={d} staged_events={d}", .{ shown_entries, staged_events });
+            debug_trace.logf(
+                "transcript",
+                "assistant tail dropped kind=assistant_tail size={d} staged_events={d} reason=deinit",
+                .{ shown_entries, staged_events },
+            );
         }
         self.discardStagedAssistantTail();
+        if (self.staged_assistant_tails_alloc) |list_alloc| {
+            self.staged_assistant_tails.deinit(list_alloc);
+            self.staged_assistant_tails_alloc = null;
+        }
         transcript_store.freeAssistantTail(self, alloc);
     }
 
     /// Holds the assistant tail until the pacer reaches it, and returns its id.
-    /// Takes ownership of `events`. A tail staged before is freed.
+    /// Takes ownership of `events`. Appends to a bounded FIFO, dropping the oldest on overflow.
     pub fn stageAssistantTail(self: *TranscriptRuntime, alloc: Allocator, events: []assistant_presentation.Event) u64 {
-        self.discardStagedAssistantTail();
         self.staged_assistant_tail_id += 1;
-        self.staged_assistant_tail = .{ .id = self.staged_assistant_tail_id, .events = events, .alloc = alloc };
-        return self.staged_assistant_tail_id;
+        const id = self.staged_assistant_tail_id;
+        if (self.staged_assistant_tails.items.len >= max_staged_assistant_tails) {
+            const oldest = self.staged_assistant_tails.orderedRemove(0);
+            const oldest_len = oldest.events.len;
+            assistant_presentation.freeEventSlice(oldest.alloc, oldest.events);
+            debug_trace.logf(
+                "transcript",
+                "staged assistant tail dropped kind=staged_assistant_tail size={d} reason=queue_full tail_id={d} cap={d}",
+                .{ oldest_len, oldest.id, max_staged_assistant_tails },
+            );
+        }
+        const list_alloc = self.staged_assistant_tails_alloc orelse alloc;
+        self.staged_assistant_tails.append(list_alloc, .{
+            .id = id,
+            .events = events,
+            .alloc = alloc,
+        }) catch |err| {
+            const events_len = events.len;
+            assistant_presentation.freeEventSlice(alloc, events);
+            debug_trace.logf(
+                "transcript",
+                "staged assistant tail dropped kind=staged_assistant_tail size={d} reason=append_failed err={s} tail_id={d}",
+                .{ events_len, @errorName(err), id },
+            );
+            return id;
+        };
+        if (self.staged_assistant_tails_alloc == null) self.staged_assistant_tails_alloc = list_alloc;
+        return id;
     }
 
-    /// The pacer reports a due tail: its events become the transcript's tail.
+    /// The pacer reports a due tail: its events become the transcript's tail,
+    /// and any staged entries with a smaller id are freed.
     pub fn applyStagedAssistantTail(self: *TranscriptRuntime, alloc: Allocator, id: u64) void {
-        const staged = self.staged_assistant_tail orelse return;
-        if (staged.id != id) return;
-        self.staged_assistant_tail = null;
-        defer assistant_presentation.freeEventSlice(staged.alloc, staged.events);
-        const entries = transcript_store.tailEntriesFromEvents(alloc, staged.events) catch |err| {
-            debug_trace.logf("transcript", "assistant tail not applied err={s}", .{@errorName(err)});
+        var match_idx: ?usize = null;
+        var drop_count: usize = 0;
+        for (self.staged_assistant_tails.items, 0..) |entry, idx| {
+            if (entry.id < id) {
+                drop_count = idx + 1;
+            } else if (entry.id == id) {
+                match_idx = idx;
+                break;
+            } else {
+                break;
+            }
+        }
+
+        if (match_idx) |idx| {
+            const matched = self.staged_assistant_tails.items[idx];
+            for (self.staged_assistant_tails.items[0..idx]) |older| {
+                assistant_presentation.freeEventSlice(older.alloc, older.events);
+            }
+            const remaining = self.staged_assistant_tails.items.len - (idx + 1);
+            if (remaining > 0) {
+                @memmove(
+                    self.staged_assistant_tails.items[0..remaining],
+                    self.staged_assistant_tails.items[idx + 1 ..],
+                );
+            }
+            self.staged_assistant_tails.items.len = remaining;
+            defer assistant_presentation.freeEventSlice(matched.alloc, matched.events);
+            self.applyStagedEvents(alloc, matched.events);
+            return;
+        }
+
+        if (drop_count > 0) {
+            for (self.staged_assistant_tails.items[0..drop_count]) |older| {
+                assistant_presentation.freeEventSlice(older.alloc, older.events);
+            }
+            const remaining = self.staged_assistant_tails.items.len - drop_count;
+            if (remaining > 0) {
+                @memmove(
+                    self.staged_assistant_tails.items[0..remaining],
+                    self.staged_assistant_tails.items[drop_count..],
+                );
+            }
+            self.staged_assistant_tails.items.len = remaining;
+            debug_trace.logf(
+                "transcript",
+                "staged assistant tail dropped kind=staged_assistant_tail size={d} reason=stale_id target_id={d}",
+                .{ drop_count, id },
+            );
+        }
+    }
+
+    fn applyStagedEvents(self: *TranscriptRuntime, alloc: Allocator, events: []const assistant_presentation.Event) void {
+        const entries = transcript_store.tailEntriesFromEvents(alloc, events) catch |err| {
+            debug_trace.logf(
+                "transcript",
+                "staged assistant tail dropped kind=staged_assistant_tail size={d} reason=apply_failed err={s}",
+                .{ events.len, @errorName(err) },
+            );
             transcript_store.clearAssistantTail(self, alloc);
             return;
         };
@@ -5569,9 +5759,10 @@ pub const TranscriptRuntime = struct {
     }
 
     fn discardStagedAssistantTail(self: *TranscriptRuntime) void {
-        const staged = self.staged_assistant_tail orelse return;
-        self.staged_assistant_tail = null;
-        assistant_presentation.freeEventSlice(staged.alloc, staged.events);
+        for (self.staged_assistant_tails.items) |staged| {
+            assistant_presentation.freeEventSlice(staged.alloc, staged.events);
+        }
+        self.staged_assistant_tails.clearRetainingCapacity();
     }
 
     fn releasePendingResumeSource(self: *TranscriptRuntime, alloc: Allocator) usize {
@@ -6641,7 +6832,9 @@ pub const TranscriptRuntime = struct {
         finished: types.TurnFinished,
         preserve_normal_buffer_anchor: bool,
     ) !?types.ToolActivityKind {
-        self.clearAssistantTail(alloc);
+        if (finished.outcome == .interrupted or self.staged_assistant_tails.items.len == 0) {
+            self.clearAssistantTail(alloc);
+        }
         if (finished.turn_id == 0) return error.InvalidTurnId;
         if (!self.notebook.lifecycle_state.shouldApplyTurnFinished(finished.turn_id)) return null;
 
@@ -8405,6 +8598,7 @@ pub const TranscriptRuntime = struct {
     /// The page below the one at `anchor` over `range`: the next page of the
     /// same entries, else the next newer cycle, else the held entries.
     pub fn newerPageAnchor(self: *const TranscriptRuntime, anchor: full_transcript_page.Anchor, range: full_transcript_page.SourceRange) ?full_transcript_page.Anchor {
+        if (anchor == .tail) return null;
         const total = self.pageStoreLen(anchor) orelse return null;
         if (full_transcript_page.nextAnchor(range, total)) |next| return pageAnchorInStore(anchor, next.entry_index);
         return switch (anchor) {
@@ -8727,6 +8921,12 @@ pub const TranscriptRuntime = struct {
         };
         if (adjacent_anchor) |anchor| {
             self.moveToFullTranscriptPage(anchor, if (direction == .up) .last else .first);
+        } else if (direction == .down and
+            self.full_transcript_installed_page != null and
+            self.full_transcript.scroll_rows >= local_max_offset)
+        {
+            self.full_transcript.scroll_rows = local_max_offset;
+            self.full_transcript.follow_tail = true;
         }
         debug_trace.logf(
             "full_transcript_cache",
@@ -9932,6 +10132,7 @@ pub const TranscriptRuntime = struct {
         // history replay can write them; rows already on screen scroll out
         // as they are.
         const history_behind_viewport = committed_projection_offset > anchor.history_visual_offset;
+        const history_beyond_screen = releasable_offset > anchor.total_visual_rows;
         const geometry_history_rows: u32 = if (geometry_rebase and
             ((source_compatible and source_visual_growth) or
                 displaced_history_replay != null))
@@ -9969,7 +10170,7 @@ pub const TranscriptRuntime = struct {
                 // the floor clamps that range, so the budget is measured
                 // from the committed viewport, not from history.
                 releasable_offset -| anchor.visual_offset
-        else if ((!history_behind_viewport or
+        else if (((!history_behind_viewport and !history_beyond_screen) or
             stableHistoryReplayWanted(anchor, false, releasable_offset)) and
             self.compatibleCommittedHistoryReplayRange(
                 prepared,
@@ -10013,7 +10214,7 @@ pub const TranscriptRuntime = struct {
             semantic_rows,
             .paced,
         );
-        if (history_behind_viewport and !geometry_rebase and
+        if ((history_behind_viewport or history_beyond_screen) and !geometry_rebase and
             semantic_rows == 0 and releasable_advance > 0 and
             (recovery_rebase or anchor.history_catchup_pending))
         {
@@ -16896,18 +17097,30 @@ test "staged assistant tail applies only the id it was staged under" {
 
     const first = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "one"));
     const second = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "two"));
-    try std.testing.expect(first != second);
-    runtime.applyStagedAssistantTail(alloc, first);
-    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
-    try std.testing.expect(runtime.staged_assistant_tail != null);
+    const third = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "three"));
+    try std.testing.expect(first < second and second < third);
 
     runtime.applyStagedAssistantTail(alloc, second);
     try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
     try std.testing.expectEqualStrings("two", runtime.assistant_tail.items[0].assistant_turn.segments.text.items);
-    try std.testing.expect(runtime.staged_assistant_tail == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.staged_assistant_tails.items.len);
+    try std.testing.expectEqual(third, runtime.staged_assistant_tails.items[0].id);
 
+    // Applying a stale (already freed) id changes nothing.
+    runtime.applyStagedAssistantTail(alloc, first);
     runtime.applyStagedAssistantTail(alloc, second);
     try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+    try std.testing.expectEqualStrings("two", runtime.assistant_tail.items[0].assistant_turn.segments.text.items);
+    try std.testing.expectEqual(@as(usize, 1), runtime.staged_assistant_tails.items.len);
+
+    runtime.applyStagedAssistantTail(alloc, third);
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+    try std.testing.expectEqualStrings("three", runtime.assistant_tail.items[0].assistant_turn.segments.text.items);
+    try std.testing.expectEqual(@as(usize, 0), runtime.staged_assistant_tails.items.len);
+
+    runtime.applyStagedAssistantTail(alloc, third);
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+    try std.testing.expectEqualStrings("three", runtime.assistant_tail.items[0].assistant_turn.segments.text.items);
 }
 
 test "staged assistant tail is freed when a newer tail replaces it and when the runtime deinits" {
@@ -16932,6 +17145,26 @@ test "a non-assistant append and a finished turn each clear the assistant tail" 
     transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
     // The tail is cleared before the turn's own checks, so their failure does not matter here.
     _ = runtime.applyTurnFinishedLifecycle(alloc, .{ .turn_id = 7, .outcome = .interrupted }, false) catch {};
+    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
+}
+
+test "turn_finished keeps shown assistant tail while staged tails wait for the pacer" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    var events = [_]assistant_presentation.Event{.{ .text = @constCast("GATED_RESIZE_FINAL_CHUNK") }};
+
+    transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+
+    // Pacer holds an upcoming tail slot while text is still revealing.
+    const empty_tail = try alloc.alloc(assistant_presentation.Event, 0);
+    _ = runtime.stageAssistantTail(alloc, empty_tail);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{ .turn_id = 1, .outcome = .completed } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{ .turn_id = 2, .outcome = .interrupted } });
     try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
 }
 
@@ -16993,4 +17226,25 @@ test "an assistant block append clears the shown tail through the committed muta
     transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
     _ = try runtime.appendAssistantThematicRule(alloc);
     try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
+}
+
+test "staged assistant tail FIFO applies matching id and frees older staged entries" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+
+    const first = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "one"));
+    const second = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "two"));
+    const third = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "three"));
+    try std.testing.expect(first < second and second < third);
+    try std.testing.expectEqual(@as(usize, 3), runtime.staged_assistant_tails.items.len);
+
+    runtime.applyStagedAssistantTail(alloc, second);
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+    try std.testing.expectEqualStrings("two", runtime.assistant_tail.items[0].assistant_turn.segments.text.items);
+    try std.testing.expectEqual(@as(usize, 1), runtime.staged_assistant_tails.items.len);
+    try std.testing.expectEqual(third, runtime.staged_assistant_tails.items[0].id);
+
+    runtime.discardStagedAssistantTail();
+    try std.testing.expectEqual(@as(usize, 0), runtime.staged_assistant_tails.items.len);
 }

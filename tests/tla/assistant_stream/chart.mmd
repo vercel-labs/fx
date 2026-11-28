@@ -1,31 +1,66 @@
-%% One row of a streamed reply, in design_a (the design in StreamTail.tla).
-%% The tail shows the Open and Waiting rows, below the committed rows.
-%% design_a breaks no rule: check.sh finds every invariant and VisibleNeverShrinks true.
+%% Streamed assistant reply lifecycle in design_paced (StreamTail.tla).
+%% Combines row presentation (committed rows + repaired provisional tail) with
+%% word-paced reveal across frames and the language-gate preview.
+%% design_paced breaks no rule: check.sh finds every invariant true.
 stateDiagram-v2
-    state "Open line, shown in the tail" as Open
-    state "Ended line, waiting for a possible underline, shown in the tail" as Waiting
-    state "Committed row, on screen for good" as Committed
-    state "In scrollback, out of the screen" as History
+    state "Staging text in tail only (language check pending)" as Staging
+    state "Backlog revealing smoothly across frames" as Pacing
+    state "Screen caught up (no queued steps)" as CaughtUp
+    state "Turn finished, every word committed" as Finished
+    state "Language rejected, tail cleared" as Rejected
+    state "Turn cancelled, queue dropped" as Cancelled
 
-    [*] --> Open : the first token of a line arrives
-    Open --> Open : a word or a mark arrives
-    Open --> Waiting : the line's newline arrives
-    Open --> Committed : the reply ends
-    Waiting --> Committed : the next token arrives (text, a newline, or an underline), or the reply ends
-    Committed --> History : the screen is full, so the top row scrolls up
+    [*] --> Staging : reply starts under language check
+    [*] --> Pacing : first chunk arrives without language check
+    Staging --> Staging : chunk arrives, or paced slice reveals into tail
+    Staging --> CaughtUp : language check accepts with queue empty
+    Staging --> Pacing : language check accepts while steps remain queued
+    Staging --> Rejected : language check rejects (nothing committed)
+    Staging --> Cancelled : you cancel (staged tail cleared)
+    Pacing --> Pacing : chunk arrives, or paced slice reveals part of queue
+    Pacing --> CaughtUp : final queued slice reveals (queue empty)
+    CaughtUp --> Pacing : next chunk arrives
+    CaughtUp --> CaughtUp : block boundary passes, or old row scrolls up
+    CaughtUp --> Finished : reply ends and final rows commit
+    Pacing --> Cancelled : you cancel (unrevealed steps dropped)
+    CaughtUp --> Cancelled : you cancel
+    Finished --> [*]
+    Rejected --> [*]
+    Cancelled --> [*]
 
-    note right of Committed : Plain or bold, or a heading when an underline was under it
-    note right of Waiting : Shown with its final cells until the next token decides it
+    note right of Pacing : Each reveal takes max(ceil(backlog / window), expired steps) and applies only the k-th step's tail
+    note right of CaughtUp : Block boundaries and turn Finish wait until the queue is empty
 
-%% Rule breaks in the other variants (check.sh shows each one fails):
-%% mutant_drop_waiting breaks VisibleNeverShrinks. Shortest path: a word arrives (Open),
-%%   then the newline arrives (Open to Waiting). The row leaves the screen until it is committed.
-%% mutant_never_commit breaks EndCommitsAll. Shortest path TLC reports: one token (a lone close mark),
-%%   then the reply ends. The tail still holds a row at the end, and nothing is committed.
+%% Rule breaks in the failing variants (check.sh proves each fails on its named rule):
+%% current-paced breaks SmoothReveal. Shortest path (3 states):
+%%   start -> chunk of 2 tokens arrives -> reveal drains all 2 steps at once (exceeds ceil(2/2) = 1).
+%% current-gate breaks SmoothReveal. Shortest path (3 states):
+%%   start under language check -> 2 tokens arrive (shown stays empty) -> gate accepts and reveals all 2 at once.
+%% mutant-finish-ignores-tail breaks NoLossAtFinish. Shortest path (3 states):
+%%   start -> 1 word arrives into queue (tail-only step) -> Finish runs with queue non-empty and word unshown.
+%% mutant-boundary-flush breaks BoundaryAfterQueue. Shortest path (3 states):
+%%   start -> 1 word arrives into queue -> Boundary runs and flushes queue without waiting.
+%% mutant-reject-commits breaks NoRejectedCommit. Shortest path (3 states):
+%%   start under language check -> 1 word arrives -> gate rejects and commits the staged word.
+%% mutant-no-age-cap breaks BoundedStall. Shortest path (5 states):
+%%   start -> 8 tokens arrive -> reveals take 4, 2, 1 without draining expired tail steps, leaving stalled = 3 > 2.
+%% current-lag breaks EveryWordVisible. Shortest path (2 states):
+%%   one word arrives on an open line and is held out of the screen.
+%% design-b breaks CommittedIsPrefixOfFinal. Shortest path (2 states):
+%%   an open mark and word commit speculatively before a closing mark or underline decides them.
+%% mutant-no-repair breaks NoUnfinalMark. Shortest path (2 states):
+%%   an unclosed open mark shows as a raw mark cell on the open line.
+%% mutant-tail-history breaks HistoryOnlyCommitted. Shortest path (8 states):
+%%   rows overflow ScreenRows and scrolling pushes a tail row into scrollback.
+%% mutant-commit-early breaks CommittedIsPrefixOfFinal. Shortest path (3 states):
+%%   a word and newline commit before an underline line turns it into a heading.
+%% mutant-never-commit breaks EndCommitsAll. Shortest path (2 states):
+%%   a lone token arrives at end of stream and remains in the tail uncommitted.
+%% mutant-drop-waiting breaks VisibleNeverShrinks. Shortest path (3 states):
+%%   a word arrives on the open line, then a newline moves it to waiting and drops it from screen.
 %%
 %% Events this chart leaves out:
-%%   an underline line on its own (it commits nothing; it only makes the row above a heading),
-%%   a pause between tokens (the model has no clock),
-%%   ScrollLag 1 (the same states; the scroll to History comes one row later),
-%%   the current and design_b variants (no tail),
-%%   nested marks, line wrapping at the terminal width, and a resize.
+%%   row transitions inside Pacing/CaughtUp (open line -> waiting for underline -> committed -> scrollback),
+%%   setext underline lines (no row added; promotes the line above to a heading),
+%%   wall-clock frame timers (modeled as Reveal actions and the stalled reveal counter),
+%%   line wrapping at terminal width and terminal resize.

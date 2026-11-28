@@ -12,7 +12,7 @@
 \* its source token: every mark cell on screen is a mark of the final output on the same
 \* row, with the same token.
 \*
-\* Variant selects the design:
+\* Unpaced variants (original StreamTail model, 1 token per Receive, immediate reveal):
 \*   "current"              today: held text is not shown, the tail is empty.
 \*   "design_a"             held text is shown in the tail. A line whose nl has come shows
 \*                          its final cells, as it will commit. The open line is repaired:
@@ -30,22 +30,72 @@
 \*   "mutant_drop_waiting"  design_a, but the tail shows only the open line, not a line
 \*                          that waits for a possible "u".
 \*
+\* Paced and language-gated variants (worker queues 1 presentation step per token in Q;
+\* UI reveals k steps per Reveal, applying only the k-th step's tail; Boundary and Finish
+\* wait until Q is empty; language gate stages text in the tail only until Accept or Reject):
+\*   "design_paced"               new design: smooth reveal within window W, gate preview, safe finish/boundary.
+\*   "current_paced"              today's unpaced reveal: Reveal drains all of Q at once (breaks SmoothReveal).
+\*   "current_gate"               today's gate: shows nothing while staging, then reveals all at once on Accept (breaks SmoothReveal).
+\*   "mutant_finish_ignores_tail" Finish allowed while Q holds tail-only steps (breaks NoLossAtFinish).
+\*   "mutant_boundary_flush"      Boundary flushes Q at once without waiting (breaks BoundaryAfterQueue).
+\*   "mutant_reject_commits"      GateReject commits staged text instead of clearing it (breaks NoRejectedCommit).
+\*   "mutant_no_age_cap"          Reveal ignores the age >= W - 1 cap (breaks BoundedStall).
+\*
 \* ScrollLag 0: the terminal scrolls as soon as rows overflow. 1: one row later.
+\* ChunkMax: maximum tokens per received chunk. W: reveal smoothing window in frames.
 EXTENDS Naturals, Sequences
 
-CONSTANTS MaxLen, Variant, ScreenRows, ScrollLag
+CONSTANTS MaxLen, Variant, ScreenRows, ScrollLag, ChunkMax, W
 
 VARIABLES
-    fullSrc,    \* the whole token sequence, chosen at Init
-    src,        \* the tokens received so far
-    committed,  \* finished rows, append only
-    tail,       \* rows below committed, replaced on every Receive
-    history,    \* rows moved into terminal scrollback
-    spec        \* design_b only: a word after an open mark is written as bold
+    fullSrc,           \* the whole token sequence, chosen at Init
+    src,               \* the tokens received so far
+    committed,         \* finished rows, append only
+    tail,              \* rows below committed
+    history,           \* rows moved into terminal scrollback
+    spec,              \* design_b only: a word after an open mark is written as bold
+    Q,                 \* FIFO queue of presentation steps awaiting reveal
+    shown,             \* revealed screen record: [rows |-> ..., len |-> ...]
+    stalled,           \* Reveal actions since the oldest queued step arrived
+    gate,              \* language gate state: "none", "staging", "accepted", "rejected"
+    finished,          \* flag: TRUE once Finish has committed the reply
+    cancelled,         \* flag: TRUE once Cancel has stopped the turn
+    stagedIds,         \* token indices received while gate = "staging"
+    lastRevealCount,   \* steps shown by the immediately preceding Reveal (or flush)
+    lastRevealQueue,   \* Len(Q) before that Reveal (or flush)
+    lastRevealExpired, \* queued steps with age >= W - 1 before that Reveal
+    lastBoundaryQueue, \* Len(Q) when Boundary ran (must be 0)
+    lastBoundaryLen    \* Len(src) at the last Boundary, to avoid redundant boundary stutters
 
-vars == << fullSrc, src, committed, tail, history, spec >>
+vars == << fullSrc, src, committed, tail, history, spec, Q, shown, stalled, gate,
+           finished, cancelled, stagedIds, lastRevealCount, lastRevealQueue,
+           lastRevealExpired, lastBoundaryQueue, lastBoundaryLen >>
 
 Toks == {"w", "o", "c", "nl", "u"}
+
+PacedVariants == {
+    "current_paced",
+    "current_gate",
+    "design_paced",
+    "mutant_finish_ignores_tail",
+    "mutant_boundary_flush",
+    "mutant_reject_commits",
+    "mutant_no_age_cap"
+}
+IsPaced(V) == V \in PacedVariants
+
+Min(a, b) == IF a <= b THEN a ELSE b
+Max(a, b) == IF a >= b THEN a ELSE b
+CeilDiv(a, b) == (a + b - 1) \div b
+PaceCap(q) == Max(1, CeilDiv(q, W))
+
+\* Number of oldest queued steps whose age has reached W - 1 (must drain on this Reveal).
+RECURSIVE ExpiredPrefixLen(_, _)
+ExpiredPrefixLen(q, w) ==
+    IF q = <<>> THEN 0
+    ELSE IF Head(q).age >= w - 1
+    THEN 1 + ExpiredPrefixLen(Tail(q), w)
+    ELSE 0
 
 \* A line of only "o" and "c" tokens, from a line start to the next nl or the end.
 MarkOnlyLine(s) ==
@@ -166,8 +216,8 @@ CollectHeld(inf, V) ==
 \* Rows that are final, in order: what committed should hold.
 Rendered(s, e, V) == CollectFinal(Info(s, e, V))
 
-\* mutant_never_commit: every row is shown in the tail, final or not, except an underline
-\* line or the empty open line.
+\* mutant_never_commit and staging tail: every row is shown in the tail, final or not,
+\* except an underline line or the empty open line.
 RECURSIVE CollectAllTail(_)
 CollectAllTail(inf) ==
     IF inf = <<>> THEN <<>>
@@ -190,7 +240,20 @@ Held(s, e, V) ==
 \* Reference rendering of a finished sequence.
 Batch(s) == Rendered(s, TRUE, "design_a")
 
-Screen == committed \o tail
+\* Presentation of prefix s under end-flag e and gate state g.
+Presentation(s, e, g, V) ==
+    IF s = <<>> THEN <<>>
+    ELSE IF g = "staging" THEN CollectAllTail(Info(s, FALSE, V))
+    ELSE Rendered(s, e, V) \o Held(s, e, V)
+
+\* Worker presentation step for token prefix s.
+StepFor(s, g, V) ==
+    [committed |-> IF g = "staging" THEN <<>> ELSE Rendered(s, FALSE, V),
+     tail      |-> IF g = "staging" THEN CollectAllTail(Info(s, FALSE, V)) ELSE Held(s, FALSE, V),
+     len       |-> Len(s),
+     age       |-> 0]
+
+Screen == IF IsPaced(Variant) THEN shown.rows ELSE committed \o tail
 
 \* Word indexes on screen. A word is any cell that is not a "mark".
 ScreenWords(scr) ==
@@ -225,36 +288,239 @@ Init ==
     /\ tail = <<>>
     /\ history = 0
     /\ spec = FALSE
+    /\ Q = <<>>
+    /\ shown = [rows |-> <<>>, len |-> 0]
+    /\ stalled = 0
+    /\ gate \in (IF ~IsPaced(Variant) THEN {"none"}
+                 ELSE IF Variant \in {"current_gate", "mutant_reject_commits"} THEN {"staging"}
+                 ELSE IF Variant = "mutant_no_age_cap" THEN {"none"}
+                 ELSE {"none", "staging"})
+    /\ finished = FALSE
+    /\ cancelled = FALSE
+    /\ stagedIds = {}
+    /\ lastRevealCount = 0
+    /\ lastRevealQueue = 0
+    /\ lastRevealExpired = 0
+    /\ lastBoundaryQueue = 0
+    /\ lastBoundaryLen = 0
 
-Receive ==
+\* Unpaced Receive (original StreamTail variants).
+ReceiveUnpaced ==
     /\ Len(src) < Len(fullSrc)
     /\ LET tok == fullSrc[Len(src) + 1]
            s2 == Append(src, tok)
            e2 == Len(s2) = Len(fullSrc)
            step == DBStep(committed, src, tok, spec)
            rows == Rendered(s2, e2, Variant)
+           comm2 == IF Variant = "design_b"
+                    THEN step.c
+                    ELSE IF Variant = "mutant_never_commit"
+                    THEN committed
+                    ELSE committed \o SubSeq(rows, Len(committed) + 1, Len(rows))
+           tail2 == Held(s2, e2, Variant)
        IN /\ src' = s2
-          /\ committed' = IF Variant = "design_b"
-                          THEN step.c
-                          ELSE IF Variant = "mutant_never_commit"
-                          THEN committed
-                          ELSE committed \o SubSeq(rows, Len(committed) + 1, Len(rows))
-          /\ tail' = Held(s2, e2, Variant)
+          /\ committed' = comm2
+          /\ tail' = tail2
+          /\ shown' = [rows |-> comm2 \o tail2, len |-> Len(s2)]
           /\ spec' = IF Variant = "design_b" THEN step.sp ELSE FALSE
-    /\ UNCHANGED << fullSrc, history >>
+    /\ UNCHANGED << fullSrc, history, Q, stalled, gate, finished, cancelled, stagedIds,
+                  lastRevealCount, lastRevealQueue, lastRevealExpired, lastBoundaryQueue, lastBoundaryLen >>
+
+\* Paced Receive: one chunk of 1..ChunkMax tokens arrives; worker produces 1 step per token.
+ReceivePaced ==
+    /\ ~finished /\ ~cancelled /\ gate /= "rejected"
+    /\ Len(src) < Len(fullSrc)
+    /\ \E c \in 1..Min(ChunkMax, Len(fullSrc) - Len(src)) :
+        LET s2 == SubSeq(fullSrc, 1, Len(src) + c)
+        IN /\ src' = s2
+           /\ stagedIds' = IF gate = "staging"
+                           THEN stagedIds \cup ((Len(src) + 1)..Len(s2))
+                           ELSE stagedIds
+           /\ IF Variant = "current_gate" /\ gate = "staging"
+              THEN /\ Q' = Q
+                   /\ UNCHANGED << lastRevealCount, lastRevealQueue, lastRevealExpired, lastBoundaryQueue >>
+              ELSE /\ Q' = Q \o [j \in 1..c |-> StepFor(SubSeq(fullSrc, 1, Len(src) + j), gate, Variant)]
+                   /\ lastRevealCount' = 0
+                   /\ lastRevealQueue' = 0
+                   /\ lastRevealExpired' = 0
+                   /\ lastBoundaryQueue' = 0
+    /\ UNCHANGED << fullSrc, committed, tail, history, spec, shown, stalled, gate,
+                  finished, cancelled, lastBoundaryLen >>
+
+Receive == IF IsPaced(Variant) THEN ReceivePaced ELSE ReceiveUnpaced
+
+\* UI reveals the oldest k steps from Q, applying only the k-th step's tail.
+\* Requiring k >= ceil(Len(Q) / W) matches the implementation's window_steps floor;
+\* requiring k >= ExpiredPrefixLen(Q, W) (steps with age >= W - 1) enforces the
+\* drain-window age cap so shrinking ceil(Len(Q)/W) cannot leave a slot stalled > W.
+Reveal ==
+    /\ IsPaced(Variant)
+    /\ ~finished /\ ~cancelled /\ gate /= "rejected"
+    /\ Q /= <<>>
+    /\ LET expired == ExpiredPrefixLen(Q, W)
+           minK == IF Variant = "mutant_no_age_cap" THEN CeilDiv(Len(Q), W)
+                   ELSE Max(CeilDiv(Len(Q), W), expired)
+           maxK == IF Variant = "mutant_no_age_cap" THEN PaceCap(Len(Q))
+                   ELSE Max(PaceCap(Len(Q)), expired)
+       IN \E k \in (IF Variant = "current_paced" THEN {Len(Q)} ELSE minK..maxK) :
+            LET chosen == Q[k]
+                rem == [i \in 1..(Len(Q) - k) |-> [Q[k + i] EXCEPT !.age = @ + 1]]
+            IN /\ committed' = chosen.committed
+               /\ tail' = chosen.tail
+               /\ shown' = [rows |-> chosen.committed \o chosen.tail, len |-> chosen.len]
+               /\ Q' = rem
+               /\ stalled' = IF rem = <<>> THEN 0 ELSE rem[1].age
+               /\ lastRevealCount' = k
+               /\ lastRevealQueue' = Len(Q)
+               /\ lastRevealExpired' = IF Variant = "mutant_no_age_cap" THEN 0 ELSE expired
+               /\ lastBoundaryQueue' = 0
+    /\ UNCHANGED << fullSrc, src, history, spec, gate, finished, cancelled, stagedIds, lastBoundaryLen >>
+
+\* Block boundary (closed code block, table, or rule): must wait until Q is empty.
+Boundary ==
+    /\ IsPaced(Variant)
+    /\ ~finished /\ ~cancelled
+    /\ gate \in {"none", "accepted"}
+    /\ Len(src) > 0
+    /\ lastBoundaryLen < Len(src)
+    /\ (Variant = "mutant_boundary_flush" \/ Q = <<>>)
+    /\ IF Variant = "mutant_boundary_flush" /\ Q /= <<>>
+       THEN LET last == Q[Len(Q)]
+            IN /\ committed' = last.committed
+               /\ tail' = last.tail
+               /\ shown' = [rows |-> last.committed \o last.tail, len |-> last.len]
+               /\ Q' = <<>>
+               /\ stalled' = 0
+               /\ lastRevealCount' = Len(Q)
+               /\ lastRevealQueue' = Len(Q)
+               /\ lastRevealExpired' = 0
+               /\ lastBoundaryQueue' = Len(Q)
+               /\ lastBoundaryLen' = Len(src)
+       ELSE /\ lastRevealCount' = 0
+            /\ lastRevealQueue' = 0
+            /\ lastRevealExpired' = 0
+            /\ lastBoundaryQueue' = 0
+            /\ lastBoundaryLen' = Len(src)
+            /\ UNCHANGED << committed, tail, shown, Q, stalled >>
+    /\ UNCHANGED << fullSrc, src, history, spec, gate, finished, cancelled, stagedIds >>
+
+\* Turn Finish / commit: must wait until Q is empty and gate is not staging/rejected.
+Finish ==
+    /\ IsPaced(Variant)
+    /\ ~finished /\ ~cancelled
+    /\ gate \in {"none", "accepted"}
+    /\ Len(src) = Len(fullSrc)
+    /\ IF Variant = "mutant_finish_ignores_tail"
+       THEN (Q = <<>> \/ \A i \in 1..Len(Q) : Q[i].committed = committed)
+       ELSE Q = <<>>
+    /\ LET comm2 == IF Variant = "mutant_finish_ignores_tail" /\ Q /= <<>>
+                    THEN IF shown.len = 0 THEN <<>>
+                         ELSE Rendered(SubSeq(src, 1, shown.len), TRUE, Variant)
+                    ELSE Rendered(src, TRUE, Variant)
+           len2 == IF Variant = "mutant_finish_ignores_tail" /\ Q /= <<>>
+                   THEN shown.len
+                   ELSE Len(src)
+       IN /\ committed' = comm2
+          /\ tail' = <<>>
+          /\ shown' = [rows |-> comm2, len |-> len2]
+    /\ finished' = TRUE
+    /\ lastRevealCount' = 0
+    /\ lastRevealQueue' = 0
+    /\ lastRevealExpired' = 0
+    /\ lastBoundaryQueue' = 0
+    /\ UNCHANGED << fullSrc, src, history, spec, Q, stalled, gate, cancelled, stagedIds, lastBoundaryLen >>
+
+\* Language gate accepts the staged candidate text.
+GateAccept ==
+    /\ IsPaced(Variant)
+    /\ ~finished /\ ~cancelled
+    /\ gate = "staging"
+    /\ Len(src) > 0
+    /\ gate' = "accepted"
+    /\ IF Variant = "current_gate"
+       THEN LET comm2 == Rendered(src, FALSE, Variant)
+                tail2 == Held(src, FALSE, Variant)
+            IN /\ committed' = comm2
+               /\ tail' = tail2
+               /\ shown' = [rows |-> comm2 \o tail2, len |-> Len(src)]
+               /\ lastRevealCount' = Len(src)
+               /\ lastRevealQueue' = Len(src)
+               /\ lastRevealExpired' = 0
+               /\ lastBoundaryQueue' = 0
+               /\ UNCHANGED << Q >>
+       ELSE LET comm2 == IF shown.len = 0 THEN <<>> ELSE Rendered(SubSeq(src, 1, shown.len), FALSE, Variant)
+                tail2 == IF shown.len = 0 THEN <<>> ELSE Held(SubSeq(src, 1, shown.len), FALSE, Variant)
+            IN /\ committed' = comm2
+               /\ tail' = tail2
+               /\ shown' = [rows |-> comm2 \o tail2, len |-> shown.len]
+               /\ Q' = [i \in 1..Len(Q) |->
+                        [StepFor(SubSeq(src, 1, Q[i].len), "accepted", Variant) EXCEPT !.age = Q[i].age]]
+               /\ lastRevealCount' = 0
+               /\ lastRevealQueue' = 0
+               /\ lastRevealExpired' = 0
+               /\ lastBoundaryQueue' = 0
+    /\ UNCHANGED << fullSrc, src, history, spec, stalled, finished, cancelled, stagedIds, lastBoundaryLen >>
+
+\* Language gate rejects the staged candidate text: clears tail and commits nothing.
+GateReject ==
+    /\ IsPaced(Variant)
+    /\ ~finished /\ ~cancelled
+    /\ gate = "staging"
+    /\ Len(src) > 0
+    /\ gate' = "rejected"
+    /\ IF Variant = "mutant_reject_commits"
+       THEN LET comm2 == Rendered(src, TRUE, Variant)
+            IN /\ committed' = comm2
+               /\ tail' = <<>>
+               /\ shown' = [rows |-> comm2, len |-> Len(src)]
+       ELSE /\ committed' = <<>>
+            /\ tail' = <<>>
+            /\ shown' = [rows |-> <<>>, len |-> 0]
+    /\ Q' = <<>>
+    /\ stalled' = 0
+    /\ lastRevealCount' = 0
+    /\ lastRevealQueue' = 0
+    /\ lastRevealExpired' = 0
+    /\ lastBoundaryQueue' = 0
+    /\ UNCHANGED << fullSrc, src, history, spec, finished, cancelled, stagedIds, lastBoundaryLen >>
+
+\* Cancel stops the turn fast at any active step.
+Cancel ==
+    /\ IsPaced(Variant)
+    /\ ~finished /\ ~cancelled /\ gate /= "rejected"
+    /\ cancelled' = TRUE
+    /\ Q' = <<>>
+    /\ stalled' = 0
+    /\ IF gate = "staging"
+       THEN /\ committed' = <<>>
+            /\ tail' = <<>>
+            /\ shown' = [rows |-> <<>>, len |-> 0]
+       ELSE UNCHANGED << committed, tail, shown >>
+    /\ lastRevealCount' = 0
+    /\ lastRevealQueue' = 0
+    /\ lastRevealExpired' = 0
+    /\ lastBoundaryQueue' = 0
+    /\ UNCHANGED << fullSrc, src, history, spec, gate, finished, stagedIds, lastBoundaryLen >>
 
 \* The terminal moves a row into scrollback. Only committed rows may go there.
 ScrollToHistory ==
     /\ Len(Screen) > ScreenRows + ScrollLag
     /\ history < (IF Variant = "mutant_tail_history" THEN Len(Screen) ELSE Len(committed))
     /\ history' = history + 1
-    /\ UNCHANGED << fullSrc, src, committed, tail, spec >>
+    /\ UNCHANGED << fullSrc, src, committed, tail, spec, Q, shown, stalled, gate,
+                  finished, cancelled, stagedIds, lastRevealCount, lastRevealQueue,
+                  lastRevealExpired, lastBoundaryQueue, lastBoundaryLen >>
 
 Done ==
-    /\ Len(src) = Len(fullSrc)
+    /\ IF IsPaced(Variant)
+       THEN (finished \/ cancelled \/ gate = "rejected")
+       ELSE Len(src) = Len(fullSrc)
     /\ UNCHANGED vars
 
-Next == Receive \/ ScrollToHistory \/ Done
+Next ==
+    IF IsPaced(Variant)
+    THEN Receive \/ Reveal \/ Boundary \/ Finish \/ GateAccept \/ GateReject \/ Cancel \/ ScrollToHistory \/ Done
+    ELSE Receive \/ ScrollToHistory \/ Done
 
 Spec == Init /\ [][Next]_vars
 
@@ -262,6 +528,18 @@ TypeOK ==
     /\ \A i \in 1..Len(src) : src[i] \in Toks
     /\ history \in Nat
     /\ spec \in BOOLEAN
+    /\ stalled \in Nat
+    /\ gate \in {"none", "staging", "accepted", "rejected"}
+    /\ finished \in BOOLEAN
+    /\ cancelled \in BOOLEAN
+    /\ shown.len \in 0..Len(src)
+    /\ Len(Q) <= MaxLen
+    /\ \A i \in 1..Len(Q) : Q[i].len \in 1..Len(src) /\ Q[i].age \in Nat
+    /\ lastRevealCount \in Nat
+    /\ lastRevealQueue \in Nat
+    /\ lastRevealExpired \in Nat
+    /\ lastBoundaryQueue \in Nat
+    /\ lastBoundaryLen \in 0..Len(src)
 
 \* 1. Committed rows are never different from the rows the final output has.
 CommittedIsPrefixOfFinal ==
@@ -295,5 +573,32 @@ EveryWordVisible ==
 \* A word that is on screen stays on screen.
 VisibleNeverShrinks ==
     [][ ScreenWords(committed \o tail) \subseteq ScreenWords(committed' \o tail') ]_vars
+
+\* 6. The revealed screen is always the presentation of a prefix of the received tokens, in order.
+ShownIsPrefix ==
+    /\ shown.len \in 0..Len(src)
+    /\ shown.rows = Presentation(SubSeq(src, 1, shown.len), finished, gate, Variant)
+
+\* 7. One Reveal shows at most max(1, ceil(Len(Q) / W)) steps, unless draining expired steps (age >= W - 1).
+SmoothReveal ==
+    lastRevealCount > 0 => lastRevealCount <= Max(PaceCap(lastRevealQueue), lastRevealExpired)
+
+\* 8. While Q is non-empty, stalled <= W (the backlog clears within W reveals).
+BoundedStall ==
+    Q /= <<>> => stalled <= W
+
+\* 9. When Finish happens, Q is empty and the screen shows every received token.
+NoLossAtFinish ==
+    finished => (Q = <<>> /\ shown.len = Len(src) /\ committed = Batch(src) /\ tail = <<>>)
+
+\* 10. Boundary happens only when Q is empty.
+BoundaryAfterQueue ==
+    lastBoundaryQueue = 0
+
+\* 11. No token received while staging ever reaches committed rows after GateReject.
+NoRejectedCommit ==
+    (gate = "rejected") =>
+        \A l \in 1..Len(committed) : \A j \in 1..Len(committed[l]) :
+            committed[l][j].n \notin stagedIds
 
 =============================================================================

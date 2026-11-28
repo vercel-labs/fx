@@ -1403,7 +1403,14 @@ printf '${trailingMarker}   '
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
       expect(readFileSync(tracePath, "utf8")).toContain("route=approved_shell");
 
-      await active.waitForReplyAndTurnEnd(doneMarker, TIMEOUT);
+      await active.waitForPane(
+        (pane) =>
+          pane.includes(doneMarker) &&
+          pane.includes("Ran 1 command · ") &&
+          turnSettled(pane) &&
+          hasEmptyComposer(pane),
+        TIMEOUT,
+      );
       const compactGrid = await active.capturePaneGrid();
       await active.resizeWindow(48, 24);
       const narrow = await active.waitForText(doneMarker, TIMEOUT);

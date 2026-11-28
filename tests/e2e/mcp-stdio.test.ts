@@ -4026,7 +4026,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
             expectRawRetry(lines[1], [RAW_KEYS[0]], [RAW_ANSWER.accept("f1")], RAW_STATE);
             return;
           }
-          await session.waitForText(`${surface} raw limit complete.`, 30_000);
+          // The tool row shows the error when the turn ends, which can be after the reply's words show.
+          if (surface === "TUI") await session.waitForReplyAndTurnEnd(`${surface} raw limit complete.`, 30_000);
+          else await session.waitForText(`${surface} raw limit complete.`, 30_000);
           const screen = await session.captureFullScrollback();
           // The longer answer wraps on the screen, so the words are compared with the line breaks taken out.
           expect(screen.replace(/\s+/g, " ").split(limit.answer).length - 1, screen).toBe(1);

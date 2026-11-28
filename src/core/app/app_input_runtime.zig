@@ -3626,6 +3626,10 @@ const FakeApprovalPacer = struct {
         _ = alloc;
         self.cleared = true;
     }
+
+    pub fn takeDeferredSaveFailure(_: *FakeApprovalPacer) ?anyerror {
+        return null;
+    }
 };
 
 const FakeInactiveSubagents = struct {
@@ -4029,6 +4033,10 @@ const RoutingWorker = struct {
 
 const RoutingPacer = struct {
     pub fn clear(_: *RoutingPacer, _: std.mem.Allocator) void {}
+
+    pub fn takeDeferredSaveFailure(_: *RoutingPacer) ?anyerror {
+        return null;
+    }
 };
 
 fn routingFullTranscriptStyles() transcript_runtime.Styles {
