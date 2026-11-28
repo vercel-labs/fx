@@ -404,6 +404,7 @@ pub const Reader = struct {
     outcome: ?Outcome = null,
     text_outcome: ?TextOutcome = null,
     paste_event_outcome: ?PasteEventOutcome = null,
+    queued_busy_paste_event: bool = false,
 
     pub fn deinit(self: *Reader, alloc: Allocator) void {
         if (self.payload.items.len > 0) {
@@ -426,6 +427,10 @@ pub const Reader = struct {
     /// Whether a request is outstanding, an outcome is unread, or the rest of
     /// a failed transfer is still arriving.
     pub fn pending(self: *const Reader) bool {
+        return self.requestOrListingActive() or self.queued_busy_paste_event;
+    }
+
+    fn requestOrListingActive(self: *const Reader) bool {
         return self.phase != .idle or
             self.outcome != null or
             self.text_outcome != null or
@@ -435,7 +440,7 @@ pub const Reader = struct {
 
     /// Starts an image read request. The caller then writes `image_read_request`.
     pub fn begin(self: *Reader, now_ms: i64, max_image_bytes: usize) error{RequestPending}!void {
-        if (self.pending()) return error.RequestPending;
+        if (self.requestOrListingActive()) return error.RequestPending;
         self.request_kind = .image;
         self.request_mime = .png;
         self.max_payload_bytes = max_image_bytes;
@@ -446,7 +451,7 @@ pub const Reader = struct {
     /// Starts an image read request for a paste-event follow-up read, skipping
     /// the DECRQM mode query because the listing already proved mode 5522 is on.
     pub fn beginPasteImage(self: *Reader, now_ms: i64, max_image_bytes: usize) error{RequestPending}!void {
-        if (self.pending()) return error.RequestPending;
+        if (self.requestOrListingActive()) return error.RequestPending;
         self.request_kind = .image;
         self.request_mime = .png;
         self.max_payload_bytes = max_image_bytes;
@@ -458,7 +463,7 @@ pub const Reader = struct {
     /// skips the DECRQM mode query and waits directly for the reply).
     pub fn beginText(self: *Reader, now_ms: i64, max_text_bytes: usize, mime: PasteMime) error{RequestPending}!void {
         std.debug.assert(mime != .png);
-        if (self.pending()) return error.RequestPending;
+        if (self.requestOrListingActive()) return error.RequestPending;
         self.request_kind = .text;
         self.request_mime = mime;
         self.max_payload_bytes = max_text_bytes;
@@ -612,9 +617,15 @@ pub const Reader = struct {
     }
 
     pub fn takePasteEventOutcome(self: *Reader) ?PasteEventOutcome {
-        const outcome = self.paste_event_outcome orelse return null;
-        self.paste_event_outcome = null;
-        return outcome;
+        if (self.paste_event_outcome) |outcome| {
+            self.paste_event_outcome = null;
+            return outcome;
+        }
+        if (self.queued_busy_paste_event) {
+            self.queued_busy_paste_event = false;
+            return .busy;
+        }
+        return null;
     }
 
     /// Takes one byte of the current packet. BEL or `ESC \` ends it.
@@ -1045,10 +1056,19 @@ pub const Reader = struct {
     }
 
     fn finishPasteEvent(self: *Reader, alloc: Allocator, outcome: PasteEventOutcome) void {
-        if (self.paste_event_outcome != null) {
+        if (self.paste_event_outcome) |*existing| {
+            // Keep the first real listing when a busy notice already landed
+            // first, and always surface the second listing as `.busy` (RULES R3.8).
+            if (existing.* == .busy and outcome == .paste_event) {
+                existing.* = outcome;
+                self.queued_busy_paste_event = true;
+                debug_trace.logf("clipboard", "paste event queued as busy reason=outcome_pending", .{});
+                return;
+            }
             var dropped = outcome;
             dropped.deinit(alloc);
-            debug_trace.logf("clipboard", "paste event outcome dropped reason=outcome_pending", .{});
+            self.queued_busy_paste_event = true;
+            debug_trace.logf("clipboard", "paste event queued as busy reason=outcome_pending", .{});
             return;
         }
         self.paste_event_outcome = outcome;
@@ -1733,7 +1753,7 @@ const FuzzDrive = struct {
             }
             self.text_outcomes += 1;
         }
-        if (self.reader.takePasteEventOutcome()) |taken| {
+        while (self.reader.takePasteEventOutcome()) |taken| {
             var outcome = taken;
             defer outcome.deinit(testing.allocator);
             if (outcome == .paste_event) {
@@ -2273,4 +2293,26 @@ test "reader beginPasteImage skips mode query and reads png or denial" {
         reader.cancel();
         try testing.expect(!reader.pending());
     }
+}
+
+test "reader queues busy outcome when two paste-event listings arrive back to back" {
+    var reader: Reader = .{};
+    defer reader.deinit(testing.allocator);
+
+    deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+    try deliverMimeData(&reader, "Lg==", "text/plain", "", "\x1b\\", 1);
+    deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+
+    deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0NDU2", "\x1b\\", 3);
+    try deliverMimeData(&reader, "Lg==", "text/plain", "", "\x1b\\", 4);
+    deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 5);
+
+    var first = reader.takePasteEventOutcome().?;
+    defer first.deinit(testing.allocator);
+    try testing.expectEqual(PasteEventOutcome.paste_event, std.meta.activeTag(first));
+    try testing.expectEqualStrings("secret123", first.paste_event.password.items);
+
+    try expectPasteEventOutcome(&reader, .busy);
+    try testing.expect(reader.takePasteEventOutcome() == null);
+    try testing.expect(!reader.pending());
 }

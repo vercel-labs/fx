@@ -1138,14 +1138,17 @@ test "attachClipboard asks the terminal where fx cannot read the clipboard" {
 }
 
 test "attachClipboard is silent on unsupported platforms" {
-    if (!image_attachments.nativeClipboardImageReadable()) return error.SkipZigTest;
-
     const alloc = std.testing.allocator;
     var app = FakeApp{ .alloc = alloc, .clipboard_unsupported = true };
     defer app.deinit();
 
     try Commands(FakeApp).attachClipboard(&app);
 
+    if (image_attachments.nativeClipboardImageReadable()) {
+        try std.testing.expectEqual(@as(usize, 0), app.terminal_clipboard_requests);
+    } else {
+        try std.testing.expectEqual(@as(usize, 1), app.terminal_clipboard_requests);
+    }
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
 }

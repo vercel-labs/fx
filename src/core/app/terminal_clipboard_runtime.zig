@@ -111,7 +111,18 @@ pub fn Runtime(comptime App: type) type {
 
             const kept = switch (origin) {
                 .paste_event_text => |target| target,
-                else => return,
+                else => {
+                    const dropped_bytes: usize = switch (outcome) {
+                        .text => |bytes| bytes.items.len,
+                        else => 0,
+                    };
+                    debug_trace.logf(
+                        "clipboard",
+                        "clipboard text dropped bytes={d} origin={s} reason=unexpected_origin",
+                        .{ dropped_bytes, @tagName(origin) },
+                    );
+                    return;
+                },
             };
             const capture: input_paste_runtime.PasteCaptureTarget = .{
                 .owner = kept.owner,
@@ -171,30 +182,39 @@ pub fn Runtime(comptime App: type) type {
                 .composer => .composer,
                 .question_freeform => .question_freeform,
                 .approval_amendment => .approval_amendment,
-                .none, .decision_prompt, .auth_code => return,
+                .none, .decision_prompt, .auth_code => {
+                    debug_trace.logf(
+                        "clipboard",
+                        "clipboard text dropped bytes={d} owner={s} reason=unsupported_too_large_owner",
+                        .{ kept.buffer_limit +| 1, @tagName(kept.owner) },
+                    );
+                    return;
+                },
             };
             try input_limit_feedback.report(App, app, scalar_owner, kept.buffer_limit +| 1);
         }
 
         fn handlePasteEventOutcome(app: *App, now_ms: i64) !void {
             const reader = &app.terminal_input_runtime.terminal_clipboard_reader;
-            var outcome = reader.takePasteEventOutcome() orelse return;
-            defer outcome.deinit(app.alloc);
-            debug_trace.logf("clipboard", "paste event outcome={s}", .{@tagName(outcome)});
+            while (reader.takePasteEventOutcome()) |taken| {
+                var outcome = taken;
+                defer outcome.deinit(app.alloc);
+                debug_trace.logf("clipboard", "paste event outcome={s}", .{@tagName(outcome)});
 
-            switch (outcome) {
-                .busy => try writeClipboardBusyNotice(app),
-                .timed_out => try app.writeDomainNotice(.{
-                    .topic = "input",
-                    .tone = .@"error",
-                    .body = "terminal didn't send the clipboard paste; paste again",
-                }, true),
-                .malformed => try app.writeDomainNotice(.{
-                    .topic = "input",
-                    .tone = .@"error",
-                    .body = "terminal sent an unreadable clipboard paste; paste again",
-                }, true),
-                .paste_event => |*event| try startPasteEventRead(app, event, now_ms),
+                switch (outcome) {
+                    .busy => try writeClipboardBusyNotice(app),
+                    .timed_out => try app.writeDomainNotice(.{
+                        .topic = "input",
+                        .tone = .@"error",
+                        .body = "terminal didn't send the clipboard paste; paste again",
+                    }, true),
+                    .malformed => try app.writeDomainNotice(.{
+                        .topic = "input",
+                        .tone = .@"error",
+                        .body = "terminal sent an unreadable clipboard paste; paste again",
+                    }, true),
+                    .paste_event => |*event| try startPasteEventRead(app, event, now_ms),
+                }
             }
         }
 
@@ -283,7 +303,7 @@ pub fn Runtime(comptime App: type) type {
                 reader.cancel();
                 app.terminal_input_runtime.pending_clipboard_read = .none;
                 debug_trace.logf("clipboard", "paste event read write failed err={s}", .{@errorName(err)});
-                const line = try app.alloc.print("failed to read clipboard paste: {s}", .{@errorName(err)});
+                const line = try app.alloc.print("failed to read clipboard paste: {s}; paste again", .{@errorName(err)});
                 defer app.alloc.free(line);
                 try app.writeDomainNotice(.{ .topic = "input", .tone = .@"error", .body = line }, true);
                 return;
@@ -309,7 +329,9 @@ pub fn Runtime(comptime App: type) type {
 
         fn disablePasteEventsAfterDenial(app: *App) !void {
             app.terminal_input_runtime.paste_events_enabled = false;
+            var disable_failed = false;
             app.terminal.disablePasteEvents() catch |err| {
+                disable_failed = true;
                 debug_trace.logf("clipboard", "paste_events_disable_failed err={s}", .{@errorName(err)});
             };
             try app.writeDomainNotice(.{
@@ -317,6 +339,13 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .@"error",
                 .body = paste_event_denied_notice,
             }, true);
+            if (disable_failed) {
+                try app.writeDomainNotice(.{
+                    .topic = "input",
+                    .tone = .@"error",
+                    .body = "couldn't turn off paste events; restart fx if pastes stop working",
+                }, true);
+            }
         }
     };
 }
@@ -824,4 +853,70 @@ test "terminal clipboard text over target limit triggers input limit feedback" {
         "That edit exceeds the local prompt safety limit and was not applied.",
         app.notice_body.items,
     );
+}
+
+test "terminal clipboard read write failure notice includes retry instruction" {
+    const alloc = TestStd.testing.allocator;
+    var app = ClipboardTestFakeApp{ .alloc = alloc };
+    defer app.deinit();
+    var empty_buf: [0]u8 = .{};
+    app.write_sink = .fixed(&empty_buf);
+    app.terminal.test_write_sink = &app.write_sink;
+
+    try deliverTestListing(&app, ":pw=c2VjcmV0MTIz", "text/plain");
+    try Runtime(ClipboardTestFakeApp).collectFacts(&app);
+
+    try TestStd.testing.expect(!app.terminal_input_runtime.terminal_clipboard_reader.pending());
+    try TestStd.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try TestStd.testing.expect(TestStd.mem.endsWith(u8, app.notice_body.items, "; paste again"));
+}
+
+test "terminal clipboard disable failure after denial writes warning notice" {
+    const alloc = TestStd.testing.allocator;
+    var app = ClipboardTestFakeApp{ .alloc = alloc };
+    defer app.deinit();
+    app.attachWriteSink();
+
+    try deliverTestListing(&app, ":pw=c2VjcmV0MTIz", "text/plain");
+    try Runtime(ClipboardTestFakeApp).collectFacts(&app);
+
+    var empty_buf: [0]u8 = .{};
+    app.write_sink = .fixed(&empty_buf);
+    app.terminal.test_write_sink = &app.write_sink;
+
+    deliverTestClipboardPacket(&app, "type=read:status=EPERM");
+    try Runtime(ClipboardTestFakeApp).collectFacts(&app);
+
+    try TestStd.testing.expect(!app.terminal_input_runtime.paste_events_enabled);
+    try TestStd.testing.expectEqual(@as(usize, 2), app.notice_count);
+    try TestStd.testing.expectEqualStrings(
+        "couldn't turn off paste events; restart fx if pastes stop working",
+        app.notice_body.items,
+    );
+}
+
+test "terminal clipboard back-to-back listings start first read and write busy notice for second" {
+    const alloc = TestStd.testing.allocator;
+    var app = ClipboardTestFakeApp{ .alloc = alloc };
+    defer app.deinit();
+    app.attachWriteSink();
+
+    try deliverTestListing(&app, ":pw=c2VjcmV0MTIz", "text/plain");
+    try deliverTestListing(&app, ":pw=c2VjcmV0NDU2", "text/plain");
+    try Runtime(ClipboardTestFakeApp).collectFacts(&app);
+
+    try TestStd.testing.expectEqualStrings(
+        "\x1b]5522;type=read:pw=c2VjcmV0MTIz:name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbg==\x1b\\",
+        app.writtenBytes(),
+    );
+    try TestStd.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try TestStd.testing.expectEqualStrings(image_commands.terminal_clipboard_busy_notice, app.notice_body.items);
+
+    deliverTestClipboardPacket(&app, "type=read:status=OK");
+    try deliverTestDataChunk(&app, "dGV4dC9wbGFpbg==", "first paste");
+    deliverTestClipboardPacket(&app, "type=read:status=DONE");
+    try Runtime(ClipboardTestFakeApp).collectFacts(&app);
+
+    try TestStd.testing.expectEqualStrings("first paste", app.input_runtime.edit_state.input.items);
+    try TestStd.testing.expect(!app.terminal_input_runtime.terminal_clipboard_reader.pending());
 }
