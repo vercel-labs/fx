@@ -15,6 +15,11 @@ const std = @import("std");
 /// (`tests/tla/agent_runtime/OutputLimit.tla` EndsAfterThird).
 pub const max_notes_in_a_row: usize = 2;
 
+/// The end of fx's note after a reply cut while it wrote text, so the model
+/// goes on and the parts make one answer. A saved turn's parts are found by
+/// it (`src/core/session/session.zig` `wholeAnswer`).
+pub const continue_text = "Its text is above. Continue exactly where it stopped, without repeating it. If you planned to use tools, call them now, one small step at a time.";
+
 pub const Reply = struct {
     /// Cut replies in a row before this one. A step that ends without a cut
     /// starts the count again.

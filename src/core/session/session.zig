@@ -3,6 +3,7 @@ const agent_frame = @import("../shared/agent_frame.zig");
 const recovery_prompt = @import("../shared/recovery_prompt.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
+const output_limit = @import("../agent/runtime/output_limit.zig");
 const cache_warmer = @import("../agent/runtime/cache_warmer.zig");
 const host_target = @import("../hosts/target.zig");
 const core_types = @import("../shared/types.zig");
@@ -1913,13 +1914,35 @@ pub const SessionRuntime = struct {
         return mutable.conversation_language;
     }
 
-    pub fn lastAssistantReply(self: *const SessionRuntime) ?[]const u8 {
+    /// The whole answer of a saved turn. A reply cut off at its output limit
+    /// that the model went on with is saved as the turn sent it: each cut part is
+    /// the `assistant_prefix` of fx's note to go on, at the turn's last step
+    /// boundary, and the final message is only the last part. Caller owns.
+    pub fn wholeAnswer(alloc: Allocator, entry: core_types.AssistantHistoryTurn) Allocator.Error![]u8 {
+        var answer: std.ArrayList(u8) = .empty;
+        errdefer answer.deinit(alloc);
+        const last_boundary = entry.execution.tool_steps.len;
+        for (entry.execution.steering) |item| {
+            if (item.after_tool_step_count != last_boundary) continue;
+            const prefix = item.assistant_prefix orelse continue;
+            const note = recovery_prompt.fromSaved(item.text) orelse continue;
+            if (std.mem.find(u8, note, output_limit.continue_text) == null) continue;
+            try answer.appendSlice(alloc, prefix);
+        }
+        try answer.appendSlice(alloc, entry.assistant);
+        return answer.toOwnedSlice(alloc);
+    }
+
+    /// The whole answer of the newest saved turn that has one. Caller owns.
+    pub fn lastAssistantAnswer(self: *const SessionRuntime, alloc: Allocator) Allocator.Error!?[]u8 {
         var i = self.agent.history.items.len;
         while (i > 0) {
             i -= 1;
             switch (self.agent.history.items[i]) {
                 .assistant => |entry| {
-                    if (entry.assistant.len > 0) return entry.assistant;
+                    const answer = try wholeAnswer(alloc, entry);
+                    if (answer.len > 0) return answer;
+                    alloc.free(answer);
                 },
                 else => {},
             }
@@ -4070,6 +4093,83 @@ test "SessionRuntime history keeps a cut turn as the model sees it, without the 
     try std.testing.expect(entry.saved_execution == null);
 }
 
+test "wholeAnswer joins each part a cut reply left at the last step boundary" {
+    const alloc = std.testing.allocator;
+    var steps = [_]core_types.ToolExecutionStep{.{}};
+    const note = try recovery_prompt.saved(alloc, "Your last reply reached its output limit and was cut off. " ++ output_limit.continue_text);
+    defer alloc.free(note);
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = note, .assistant_prefix = @constCast("first part, "), .after_tool_step_count = steps.len },
+        .{ .text = note, .assistant_prefix = @constCast("second part, "), .after_tool_step_count = steps.len },
+    };
+    const whole = try SessionRuntime.wholeAnswer(alloc, .{
+        .user = .{ .text = @constCast("long answer") },
+        .assistant = @constCast("third."),
+        .execution = .{ .tool_steps = &steps, .steering = &steering },
+    });
+    defer alloc.free(whole);
+    try std.testing.expectEqualStrings("first part, second part, third.", whole);
+}
+
+test "wholeAnswer is the saved message when no reply was continued" {
+    const alloc = std.testing.allocator;
+    const whole = try SessionRuntime.wholeAnswer(alloc, .{
+        .user = .{ .text = @constCast("prompt") },
+        .assistant = @constCast("only answer."),
+    });
+    defer alloc.free(whole);
+    try std.testing.expectEqualStrings("only answer.", whole);
+}
+
+test "wholeAnswer does not join fx's empty-reply nudge at the last boundary" {
+    const alloc = std.testing.allocator;
+    var steps = [_]core_types.ToolExecutionStep{.{}};
+    const nudge = try recovery_prompt.saved(alloc, "Your last reply had no text and no tool call. Continue the task: call the next tool you need, or give your final answer.");
+    defer alloc.free(nudge);
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = nudge, .assistant_prefix = @constCast("prefix, "), .after_tool_step_count = steps.len },
+    };
+    const whole = try SessionRuntime.wholeAnswer(alloc, .{
+        .user = .{ .text = @constCast("prompt") },
+        .assistant = @constCast("done."),
+        .execution = .{ .tool_steps = &steps, .steering = &steering },
+    });
+    defer alloc.free(whole);
+    try std.testing.expectEqualStrings("done.", whole);
+}
+
+test "wholeAnswer does not join a message the user typed at the last boundary" {
+    const alloc = std.testing.allocator;
+    var steps = [_]core_types.ToolExecutionStep{.{}};
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = @constCast("Also check the tests."), .assistant_prefix = @constCast("prefix, "), .after_tool_step_count = steps.len },
+    };
+    const whole = try SessionRuntime.wholeAnswer(alloc, .{
+        .user = .{ .text = @constCast("prompt") },
+        .assistant = @constCast("done."),
+        .execution = .{ .tool_steps = &steps, .steering = &steering },
+    });
+    defer alloc.free(whole);
+    try std.testing.expectEqualStrings("done.", whole);
+}
+
+test "wholeAnswer does not join a continue note that a later tool step follows" {
+    const alloc = std.testing.allocator;
+    var steps = [_]core_types.ToolExecutionStep{.{}};
+    const note = try recovery_prompt.saved(alloc, "Your last reply reached its output limit and was cut off. " ++ output_limit.continue_text);
+    defer alloc.free(note);
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = note, .assistant_prefix = @constCast("earlier part, "), .after_tool_step_count = 0 },
+    };
+    const whole = try SessionRuntime.wholeAnswer(alloc, .{
+        .user = .{ .text = @constCast("prompt") },
+        .assistant = @constCast("done."),
+        .execution = .{ .tool_steps = &steps, .steering = &steering },
+    });
+    defer alloc.free(whole);
+    try std.testing.expectEqualStrings("done.", whole);
+}
+
 test "SessionRuntime.reset clears history and restores default language" {
     const alloc = std.testing.allocator;
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
@@ -4111,7 +4211,9 @@ test "SessionRuntime.clearHistory empties owned turns and keeps runtime reusable
 
     try runtime.appendAssistantHistoryTurn(alloc, "third", "three");
     try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
-    try std.testing.expectEqualStrings("three", runtime.lastAssistantReply().?);
+    const answer = (try runtime.lastAssistantAnswer(alloc)).?;
+    defer alloc.free(answer);
+    try std.testing.expectEqualStrings("three", answer);
 }
 
 test "SessionRuntime appends every canonical history turn without compaction" {
@@ -4176,7 +4278,9 @@ test "SessionRuntime context snapshot preserves the active history exactly" {
     try std.testing.expectEqual(@as(usize, 5), runtime.historyLen());
     try std.testing.expectEqualStrings("one", runtime.agent.history.items[0].assistant.user.text);
     try std.testing.expectEqualStrings("five", runtime.agent.history.items[4].assistant.user.text);
-    try std.testing.expectEqualStrings("reply five", runtime.lastAssistantReply().?);
+    const last_answer = (try runtime.lastAssistantAnswer(alloc)).?;
+    defer alloc.free(last_answer);
+    try std.testing.expectEqualStrings("reply five", last_answer);
 
     const context = try runtime.snapshotContextHistory(alloc);
     defer freeHistoryTurnSlice(alloc, context);
@@ -5014,12 +5118,12 @@ test "SessionRuntime.languageSnapshot reads restored language through mutex path
     try std.testing.expectEqual(ConversationLanguage.literal("und-Grek"), runtime.languageSnapshot());
 }
 
-test "SessionRuntime.lastAssistantReply and lastSummary return borrowed stored slices" {
+test "SessionRuntime.lastAssistantAnswer returns an owned answer and lastSummary a borrowed summary" {
     const alloc = std.testing.allocator;
     var runtime: SessionRuntime = .{ .max_history_turns = 0 };
     defer runtime.deinit(alloc);
 
-    try std.testing.expect(runtime.lastAssistantReply() == null);
+    try std.testing.expect((try runtime.lastAssistantAnswer(alloc)) == null);
     try std.testing.expect(runtime.lastSummary() == null);
 
     try runtime.appendHistoryEntry(alloc, .{ .compacted_summary = .{
@@ -5036,11 +5140,12 @@ test "SessionRuntime.lastAssistantReply and lastSummary return borrowed stored s
     try runtime.appendAssistantHistoryTurn(alloc, "second", "two");
     try runtime.appendAssistantHistoryTurn(alloc, "execution only", "");
 
-    const reply = runtime.lastAssistantReply().?;
+    const reply = (try runtime.lastAssistantAnswer(alloc)).?;
+    defer alloc.free(reply);
     const summary = runtime.lastSummary().?;
     try std.testing.expectEqualStrings("two", reply);
     try std.testing.expectEqualStrings("second summary", summary);
-    try std.testing.expect(reply.ptr == runtime.agent.history.items[3].assistant.assistant.ptr);
+    try std.testing.expect(reply.ptr != runtime.agent.history.items[3].assistant.assistant.ptr);
     try std.testing.expect(summary.ptr == runtime.agent.history.items[2].compacted_summary.summary.ptr);
 }
 

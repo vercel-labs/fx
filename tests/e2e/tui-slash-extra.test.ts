@@ -19,8 +19,10 @@ import { readTrace } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   hasEmptyComposer,
   startDynamicFakeGateway,
+  startFakeGateway,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -289,6 +291,69 @@ describe.skipIf(!tmuxAvailable() || CLIPBOARD_PROGRAM === null)("tui: clipboard 
         await session.sendText("/copy");
         await session.waitForText("Failed to copy to clipboard.", 5_000);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(workDir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/copy after an answer cut at its output limit copies the whole answer",
+    async () => {
+      if (CLIPBOARD_PROGRAM === null) throw new Error("unsupported clipboard platform");
+
+      const workDir = mkdtempSync(join(tmpdir(), "fx-clipboard-continued-"));
+      const homeDir = join(workDir, "home");
+      const binDir = join(workDir, "bin");
+      const capturePath = join(workDir, "clipboard.txt");
+      const stderrPath = join(workDir, "stderr.log");
+      const clipboardPath = join(binDir, CLIPBOARD_PROGRAM);
+      mkdirSync(homeDir);
+      mkdirSync(binDir);
+      writeFileSync(clipboardPath, "#!/bin/sh\ncat > \"$FX_TEST_CLIPBOARD_CAPTURE\"\n");
+      chmodSync(clipboardPath, 0o755);
+
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          { type: "text-start", id: "cut_text" },
+          { type: "text-delta", id: "cut_text", delta: "The first half of the copied answer" },
+          { type: "text-end", id: "cut_text" },
+          { type: "finish", finishReason: { unified: "length", raw: "length" } },
+        ]),
+        fakeGatewayFinalText(", and its second half."),
+      ]);
+      try {
+        session = await TmuxSession.create({
+          cwd: workDir,
+          stderrPath,
+          env: {
+            HOME: homeDir,
+            AI_GATEWAY_API_KEY: "clipboard-fake-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_TEST_CLIPBOARD_CAPTURE: capturePath,
+            PATH: `${binDir}:${process.env.PATH ?? ""}`,
+          },
+        });
+        await session.waitForComposer(10_000);
+
+        await session.sendText("Answer in two parts.");
+        await session.waitForText("its second half.", 10_000);
+        await session.waitForComposer(10_000);
+        expect(gateway.requests).toHaveLength(2);
+
+        await session.sendText("/copy");
+        await session.waitForText("Copied to clipboard.", 5_000);
+        expect(readFileSync(capturePath, "utf8")).toBe("The first half of the copied answer, and its second half.");
       } finally {
         if (session) {
           await session.kill();

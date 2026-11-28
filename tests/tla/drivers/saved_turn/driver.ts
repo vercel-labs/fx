@@ -3,12 +3,13 @@
 //
 // Each scenario is one turn of fx against a local fake gateway that serves a
 // script of replies: tool calls, an empty reply that stops for `other` (which
-// fx answers with its nudge), a blank reply after silent tool steps (which fx
-// answers with "Summarize what you just did."), and a final answer. Some replies
-// switch the git branch of the workspace while fx handles them, as another
-// process would, so the runtime context changes between two steps and fx adds a
-// note at the next one. Then a second turn follows: `fx ask --resume`, or a
-// second ACP prompt in the same session.
+// fx answers with its nudge), a reply cut off at its output limit while it
+// writes text (which fx asks to go on), a blank reply after silent tool steps
+// (which fx answers with "Summarize what you just did."), and a final answer.
+// Some replies switch the git branch of the workspace while fx handles them,
+// as another process would, so the runtime context changes between two steps
+// and fx adds a note at the next one. Then a second turn follows:
+// `fx ask --resume`, or a second ACP prompt in the same session.
 //
 // The driver maps every request of the first turn, and the part of the second
 // turn's first request that holds the first turn, to the model's atoms (C, R,
@@ -37,7 +38,7 @@ import { join } from "node:path";
 import { binary, targetHelpers, testEnvironment } from "../lib/context";
 import { TLA_ROOT, outDir, tlcToolchain, writeJson } from "../lib/tlc";
 
-type Kind = "tool" | "tool_silent" | "empty" | "blank" | "final";
+type Kind = "tool" | "tool_silent" | "empty" | "blank" | "final" | "cut_text";
 type Reply = { kind: Kind; switchBranch?: boolean };
 type Scenario = {
   name: string;
@@ -54,6 +55,7 @@ const FIRST_PROMPT = "Answer briefly.";
 const SECOND_PROMPT = "And once more.";
 const NUDGE = "Your last reply had no text and no tool call.";
 const SUMMARIZE = "Summarize what you just did.";
+const CUT_NOTE = "and was cut off.";
 const NOTE_BLOCK = "\n\n<fx-context-update>";
 const NOTE_OPEN = "<fx-context-update>";
 const BRANCH = "feature/saved-order";
@@ -87,7 +89,9 @@ const scenarios: Scenario[] = [
       { kind: "final" },
     ],
   },
+  { name: "cut-text", via: "ask", orderSensitive: false, replies: [{ kind: "cut_text" }, { kind: "final" }] },
   { name: "acp-nudge-note", via: "acp", orderSensitive: true, replies: [{ kind: "empty", switchBranch: true }, { kind: "final" }] },
+  { name: "acp-cut-text", via: "acp", orderSensitive: false, replies: [{ kind: "cut_text" }, { kind: "final" }] },
 ];
 
 function reply(helpers: any, reply: Reply, n: number): Response {
@@ -110,6 +114,11 @@ function reply(helpers: any, reply: Reply, n: number): Response {
       return fakeGatewaySse([
         { type: "text-delta", id: `t${n}`, delta: " \n" },
         { type: "finish", finishReason: { unified: "stop", raw: "STOP" } },
+      ]);
+    case "cut_text":
+      return fakeGatewaySse([
+        { type: "text-delta", id: `t${n}`, delta: `The first part of answer ${n}.` },
+        { type: "finish", finishReason: { unified: "length", raw: "length" } },
       ]);
     case "final":
       return fakeGatewaySse([
@@ -137,7 +146,7 @@ function promptOf(body: string): PromptMessage[] {
 
 // The atom of a user message fx wrote or the user typed, without a carried note.
 function userAtom(own: string): string {
-  if (own.includes(NUDGE) || own.includes(SUMMARIZE)) return "K";
+  if (own.includes(NUDGE) || own.includes(SUMMARIZE) || own.includes(CUT_NOTE)) return "K";
   throw new Error(`a user message the driver cannot map: ${JSON.stringify(own.slice(0, 120))}`);
 }
 

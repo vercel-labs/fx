@@ -257,10 +257,21 @@ pub fn stopTerminalText(
     candidate: ?[]const u8,
     current: ?[]const u8,
 ) Allocator.Error!TerminalText {
-    const presentation = try hooks.prompt.joinVisibleSegments(alloc, candidate, current);
+    return shownTerminalText(alloc, candidate, current orelse "", current);
+}
+
+/// A turn's text when what fx shows is not what it saves: history borrows
+/// `history`, and the presentation joins the retained candidate with `shown`.
+/// The caller owns the presentation.
+pub fn shownTerminalText(
+    alloc: std.mem.Allocator,
+    candidate: ?[]const u8,
+    history: []const u8,
+    shown: ?[]const u8,
+) Allocator.Error!TerminalText {
     return .{
-        .history = current orelse "",
-        .presentation = presentation,
+        .history = history,
+        .presentation = try hooks.prompt.joinVisibleSegments(alloc, candidate, shown),
     };
 }
 
