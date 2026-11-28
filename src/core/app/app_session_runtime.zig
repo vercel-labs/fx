@@ -14568,6 +14568,7 @@ const ArchiveTestApp = struct {
     fn deinit(self: *ArchiveTestApp) void {
         self.shell.deinit(self.alloc);
         Runtime(ArchiveTestApp).deinitPersistence(self, self.agent());
+        self.agent().session_title.deinit(self.alloc);
         self.agent().session.deinit(self.alloc);
         self.agent().worker.deinit(std.heap.c_allocator);
         self.permission_engine.deinit(self.alloc);
@@ -14755,6 +14756,10 @@ test "failed strict or visual_epoch history write marks turn_piece_save_failed s
         try Runtime(ArchiveTestApp).beginFresh(&app, app.agent(), .later, null);
         defer Runtime(ArchiveTestApp).closeWritableSession(&app, app.agent());
 
+        try Runtime(ArchiveTestApp).appendHistoryTurn(&app, app.agent(), .{ .assistant = .{
+            .user = .{ .text = @constCast("FIRST_VE_PROMPT") },
+            .assistant = @constCast("FIRST_VE_ANSWER"),
+        } });
         try app.shell.enableTranscriptWindow(alloc, true);
         var metrics: types.Metrics = .{};
         const prompt = try alloc.dupe(u8, "VE_FAIL_PROMPT");
@@ -14774,10 +14779,14 @@ test "failed strict or visual_epoch history write marks turn_piece_save_failed s
         try std.testing.expectEqual(HistoryAppendOutcome.uncommitted, outcome);
         try std.testing.expect(app.agent().session_persistence.turn_piece_save_failed);
 
-        const pre_compaction_saved = app.agent().session_persistence.v2 != null and !app.agent().session_persistence.turn_piece_save_failed;
-        try std.testing.expect(!pre_compaction_saved);
-        try app.shell.transcriptWindowCompacted(alloc, pre_compaction_saved);
-        try std.testing.expect(app.shell.notebook.entries.items.len > 0);
+        try Runtime(ArchiveTestApp).commitContextCompaction(
+            &app,
+            app.agent(),
+            .{ .summary = @constCast("mid-turn summary"), .removed_turn_count = 1, .compaction_count = 1 },
+            null,
+            .{ .turns = 1 },
+        );
+        try std.testing.expect(holdsPromptText(app.shell.notebook.entries.items, "VE_FAIL_PROMPT"));
     }
 
     // 2. .strict commit failure marks turn_piece_save_failed = true and prevents mid-turn drop.
@@ -14789,6 +14798,10 @@ test "failed strict or visual_epoch history write marks turn_piece_save_failed s
         try Runtime(ArchiveTestApp).beginFresh(&app, app.agent(), .later, null);
         defer Runtime(ArchiveTestApp).closeWritableSession(&app, app.agent());
 
+        try Runtime(ArchiveTestApp).appendHistoryTurn(&app, app.agent(), .{ .assistant = .{
+            .user = .{ .text = @constCast("FIRST_STRICT_PROMPT") },
+            .assistant = @constCast("FIRST_STRICT_ANSWER"),
+        } });
         try app.shell.enableTranscriptWindow(alloc, true);
         var metrics: types.Metrics = .{};
         const prompt = try alloc.dupe(u8, "STRICT_FAIL_PROMPT");
@@ -14796,7 +14809,7 @@ test "failed strict or visual_epoch history write marks turn_piece_save_failed s
         _ = try app.shell.writeUserPromptCard(alloc, &metrics, .{ .text = prompt }, false, &.{});
         try app.shell.syncTranscriptWindow(alloc);
 
-        // A compacted_summary turn cannot commit via v2.commitTurn (`InvalidConversationFrame`),
+        // A compacted_summary turn cannot commit via v2.commitTurn (`ConversationCheckpointRequiresSequence`),
         // exercising the `.strict` error path in `commitV2HistoryTurn`.
         try std.testing.expectError(
             error.ConversationCheckpointRequiresSequence,
@@ -14805,9 +14818,21 @@ test "failed strict or visual_epoch history write marks turn_piece_save_failed s
             }),
         );
         try std.testing.expect(app.agent().session_persistence.turn_piece_save_failed);
-        const pre_compaction_saved = app.agent().session_persistence.v2 != null and !app.agent().session_persistence.turn_piece_save_failed;
-        try std.testing.expect(!pre_compaction_saved);
-        try app.shell.transcriptWindowCompacted(alloc, pre_compaction_saved);
-        try std.testing.expect(app.shell.notebook.entries.items.len > 0);
+        try Runtime(ArchiveTestApp).commitContextCompaction(
+            &app,
+            app.agent(),
+            .{ .summary = @constCast("mid-turn summary"), .removed_turn_count = 1, .compaction_count = 1 },
+            null,
+            .{ .turns = 1 },
+        );
+        try std.testing.expect(holdsPromptText(app.shell.notebook.entries.items, "STRICT_FAIL_PROMPT"));
     }
+}
+
+fn holdsPromptText(entries: []const transcript_runtime.TranscriptEntry, needle: []const u8) bool {
+    for (entries) |entry| switch (entry) {
+        .user_turn => |u| if (std.mem.find(u8, u.turn.text, needle) != null) return true,
+        else => {},
+    };
+    return false;
 }
