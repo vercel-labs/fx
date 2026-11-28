@@ -26,9 +26,14 @@ const Op = struct {
     op: []const u8,
     @"resume": bool = false,
     continues: bool = false,
+    budgeted: bool = false,
     name: []const u8 = "",
     kind: []const u8 = "",
 };
+
+/// Budget for budgeted hosts in the lab: one wait (<= 1 s) fits, the second
+/// failure passes it (`Recovery.tla` Budget == 2).
+const lab_budget_ms: u64 = 1_500;
 
 const SendOut = struct { compact: bool, no_fast: bool };
 const StatusOut = struct { kind: []const u8, need: ?[]const u8 };
@@ -188,7 +193,8 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         lab.* = .{};
     } else if (is(op.op, "start")) {
         const resume_from = if (op.@"resume") lab.disk else null;
-        result.plan = planOut(lab.step(.{ .start = .{ .resume_from = resume_from, .continues = op.continues } }));
+        const budget: ?u64 = if (op.budgeted) lab_budget_ms else null;
+        result.plan = planOut(lab.step(.{ .start = .{ .resume_from = resume_from, .continues = op.continues, .retry_budget_ms = budget } }));
     } else if (is(op.op, "event")) {
         const event = eventNamed(op.name) orelse {
             result.@"error" = "unknown event";
