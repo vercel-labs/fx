@@ -5712,6 +5712,19 @@ test "a bash approval made again after a shell refresh keeps one row at the new 
     try std.testing.expectEqual(@as(u64, 1), active.session_grants[0].shell_epoch);
 }
 
+test "a late bash approval from an older shell epoch leaves a retained row at its epoch" {
+    const alloc = std.testing.allocator;
+    var active: ActiveSessionState = undefined;
+    active.session_grants = &.{};
+    defer types.freePermissionGrantSlice(alloc, active.session_grants);
+
+    try active.retainGrant(alloc, "bash", "git status", 1);
+    try active.retainGrant(alloc, "bash", "git status", 0);
+
+    try std.testing.expectEqual(@as(usize, 1), active.session_grants.len);
+    try std.testing.expectEqual(@as(u64, 1), active.session_grants[0].shell_epoch);
+}
+
 test "eb03: ACP steering records input_accepted unless session journal declares inputs_durable" {
     if (comptime host_target.is_wasm) return error.SkipZigTest;
     const alloc = std.testing.allocator;

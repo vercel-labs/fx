@@ -11915,6 +11915,18 @@ test "a bash approval made again after a shell refresh keeps one queued grant at
     try std.testing.expectEqual(@as(u64, 1), prompt.grants[0].shell_epoch);
 }
 
+test "a late bash approval from an older shell epoch leaves a queued grant at its epoch" {
+    const alloc = std.testing.allocator;
+    var prompt = try makePrompt(alloc, "grant", "model");
+    defer freeQueuedPrompt(alloc, prompt);
+
+    try appendGrantToQueuedPrompt(alloc, &prompt, "bash", "git status", 1);
+    try appendGrantToQueuedPrompt(alloc, &prompt, "bash", "git status", 0);
+
+    try std.testing.expectEqual(@as(usize, 1), prompt.grants.len);
+    try std.testing.expectEqual(@as(u64, 1), prompt.grants[0].shell_epoch);
+}
+
 test "eb03: record_accepted runs unlocked before prompt enters queue snapshot and carries input_id" {
     const alloc = std.testing.allocator;
     const HookState = struct {

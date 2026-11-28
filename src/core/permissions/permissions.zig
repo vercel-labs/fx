@@ -3639,6 +3639,20 @@ test "an approval is recorded once per shell epoch" {
     try std.testing.expectEqual(@as(u64, 1), grants.items[0].shell_epoch);
 }
 
+test "a late bash approval from an older shell epoch leaves a newer row at its epoch" {
+    const alloc = std.testing.allocator;
+    var grants: std.ArrayList(types.PermissionGrant) = .empty;
+    defer {
+        clearAllowedTools(alloc, &grants);
+        grants.deinit(alloc);
+    }
+
+    try allowToolForSession(alloc, &grants, "bash", "echo x", 1);
+    try allowToolForSession(alloc, &grants, "bash", "echo x", 0);
+    try std.testing.expectEqual(@as(usize, 1), grants.items.len);
+    try std.testing.expectEqual(@as(u64, 1), grants.items[0].shell_epoch);
+}
+
 test "a non-bash approval made again after a shell refresh adds no second row" {
     shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);

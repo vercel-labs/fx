@@ -4843,6 +4843,96 @@ test "an always shell answer given after a refresh while the question was open i
     try std.testing.expectEqual(false, permissions.sessionGrantAllowed(stored, "run_command", target));
 }
 
+test "a shell answer keeps the epoch the question was shown under" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.permission_prompter = recording.prompter();
+    const call: ToolCall = .{
+        .id = "once-answer-keeps-epoch",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf approved > marker.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    const authority = outcome.execution_authority orelse return error.TestExpectedAuthority;
+    try std.testing.expectEqual(
+        @as(?u64, shell_snapshot.processOwner().approvalEpoch()),
+        authority.run_command.shell_allowed.grant_epoch,
+    );
+}
+
+test "a fresh always answer after a refresh is kept, not replaced by the old once answer" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var asked = RefreshWhileAsked{ .decision = .once, .later = .always };
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.permission_prompter = asked.prompter();
+    const call: ToolCall = .{
+        .id = "always-after-once-refresh",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf approved > marker.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    const rechecked = try revalidateLiveActionPermissionOutcome(input, arena, call, .ask, &.{}, .ordinary, outcome.human_approval);
+    try std.testing.expectEqual(@as(usize, 2), asked.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.always, rechecked.decision);
+    try std.testing.expect(rechecked.human_approval.kind == .always);
+    try std.testing.expectEqual(shell_snapshot.processOwner().approvalEpoch(), rechecked.human_approval.shell_epoch);
+}
+
+test "a fresh once answer after a refresh is kept, not replaced by the old always answer" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var asked = RefreshWhileAsked{ .decision = .always, .later = .once };
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.permission_prompter = asked.prompter();
+    const call: ToolCall = .{
+        .id = "once-after-always-refresh",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf approved > marker.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.always, outcome.decision);
+    const rechecked = try revalidateLiveActionPermissionOutcome(input, arena, call, .ask, &.{}, .ordinary, outcome.human_approval);
+    try std.testing.expectEqual(@as(usize, 2), asked.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, rechecked.decision);
+    try std.testing.expect(rechecked.human_approval.kind == .once);
+    try std.testing.expectEqual(shell_snapshot.processOwner().approvalEpoch(), rechecked.human_approval.shell_epoch);
+}
+
 const test_review_tool_calls = [_]ToolCall{
     .{ .id = "test-review", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"printf test\"}" },
 };
