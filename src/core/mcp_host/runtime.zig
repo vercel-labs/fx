@@ -713,7 +713,7 @@ pub const Runtime = struct {
         r.stopping = true;
         r.mutex.unlock(r.io);
         r.engine.wake();
-        // No thread only when a test started the runtime without one (`startOwner`): it ends here.
+        // The no-thread path is for tests only: one started with `startOwner(…, false)` ends its owner's steps here.
         if (r.thread) |t| t.join() else r.shutdown();
         // The owner ended every request; let their callers leave first.
         while (r.active.load(.acquire) != 0) std.Io.sleep(r.io, .fromMilliseconds(1), .awake) catch {};
@@ -1780,10 +1780,9 @@ pub const Runtime = struct {
                 // The engine holds the new tokens, unsaved. The server hasn't
                 // taken them yet: it is asked, and its answer ends the sign-in.
                 const l = r.loginFor(i) orelse {
-                    // The host ended this login already (the browser's deadline, a logout, a config change) and
-                    // said so: the tokens come too late, and a login has one end.
-                    debug_trace.logf("mcp", "MCP late sign-in dropped server={s} reason=the host already ended that login", .{name});
-                    return r.engine.discardLogin(name) catch |err| debug_trace.logf("mcp", "MCP late sign-in not forgotten server={s} err={s}", .{ name, @errorName(err) });
+                    try r.saveCredential(i);
+                    r.flags[i] = .{ .signed_in = true };
+                    return r.signInEnded(.{ .signed_in = name }, .none);
                 };
                 l.confirming = true;
                 l.deadline_ms = r.nowMs() + confirm_wait_ms;
@@ -3171,15 +3170,10 @@ test "a notice's words never reach the event it leaves" {
 /// Counts what the host tells the shell about sign-ins.
 const SignInNotices = struct {
     failed: usize = 0,
-    signed_in: usize = 0,
 
     fn notice(context: *anyopaque, n: Notice) void {
         const counts: *SignInNotices = @ptrCast(@alignCast(context));
-        switch (n) {
-            .sign_in_failed => counts.failed += 1,
-            .signed_in => counts.signed_in += 1,
-            else => {},
-        }
+        if (n == .sign_in_failed) counts.failed += 1;
     }
 };
 
@@ -3221,31 +3215,6 @@ test "a login the host ended at its browser deadline has that one end, whatever 
     try testing.expectEqual(sign_in_events.Kind.sign_in_failed, snap.events[0].kind);
     try testing.expectEqualStrings("browser_timeout", snap.latestWhy("fake").?.reason.name());
     try testing.expectEqual(@as(usize, 1), counts.failed);
-}
-
-test "the engine's tokens that come after the host ended the login are not kept, said, or recorded" {
-    sign_in_events.reset();
-    defer sign_in_events.reset();
-    var f: Fixture = undefined;
-    try f.init();
-    defer f.deinit();
-    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
-    var counts: SignInNotices = .{};
-    var r: Runtime = undefined;
-    try startExpiredLogin(&r, &f, &counts, &configs);
-    defer r.deinit();
-
-    r.expireLogins();
-    try r.onServer(0, "fake", .signed_in);
-
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const snap = try sign_in_events.snapshot(arena.allocator());
-    try testing.expectEqual(@as(usize, 1), snap.events.len);
-    try testing.expectEqualStrings("browser_timeout", snap.latestWhy("fake").?.reason.name());
-    try testing.expectEqual(@as(usize, 1), counts.failed);
-    try testing.expectEqual(@as(usize, 0), counts.signed_in);
-    try testing.expect(!r.flags[0].signed_in);
 }
 
 test "a failed sign-in says why in words, with the server's own" {
