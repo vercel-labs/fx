@@ -182,13 +182,13 @@ A session can be open on several connections at once, which ACP v2's [session se
 
 Joining needs no capability, so a client that knows only ACP can follow a session.
 
-While the session is open on another connection, fx keeps the session's `cwd`, `additionalDirectories`, and `mcpServers`, and doesn't use the ones in the joining client's request. The response's `_meta` gives the session's folder as `sh.fx/cwd`. A `systemPrompt` in the request applies as on any load or resume: a prompt that differs from the session's replaces it from the next turn, for every client.
+While the session is open on another connection, fx keeps the session's `cwd`, `additionalDirectories`, and `mcpServers`, and doesn't use the ones in the joining client's request. The response's `_meta` gives the session's folder as `sh.fx/cwd`. A `systemPrompt` in a `session/load` or `session/resume` request that differs from the session's prompt replaces it from the next turn, for every client. Today fx reads `systemPrompt` only on `session/new`.
 
 Every client of a session may send prompts. A prompt that arrives while a turn runs follows "Steering and queued prompts", and fx keeps one order for the input of all clients.
 
 `session/close` closes the session on the calling connection only. While the session is open on another connection, it stays open there, and a running turn goes on. A connection that closes acts the same way. When the last connection with the session open closes during a turn, fx stops the turn and saves it, as fx does today.
 
-A compaction changes only what fx sends the model. The saved turns, their positions, and what a load replays stay as they are, so a compaction can happen while connections have the session open. fx sends the compaction updates that ACP defines, `compaction_update` and `compaction_summary_chunk`, to each open connection that advertised the `session.compaction` capability.
+A compaction changes only what fx sends the model. The saved turns, their positions, and what a load replays stay as they are, so a compaction can happen while connections have the session open. fx sends ACP's `compaction_update` to each open connection that lists the `session.compaction` capability, and gives each other open connection one short text line when a compaction completes. fx never sends the summary text, so it sends no `compaction_summary_chunk`.
 
 #### Catching up
 
