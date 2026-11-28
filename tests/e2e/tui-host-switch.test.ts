@@ -5704,15 +5704,20 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
   // The approval screen for a lent copy can fail before it opens. The deny
   // still has to reach the subagent whose request waits, not main's worker,
   // which usually has nothing to take it (`.no_pending`) and, with a request
-  // of its own numbered the same, would deny that one instead.
+  // of its own numbered the same, would deny that one instead. The subagent's
+  // next request is then answered on main's screen normally, and a later
+  // answer from main's model finds no request for the denied one.
   test(
     "a failed approval screen on the lent copy denies the subagent, not main",
     async () => {
       const arrival = held();
       let childCalls = 0;
       let childSawReason = false;
+      let mainAnswer = "";
+      const bodies: string[] = [];
       await withFx(
         (body) => {
+          bodies.push(body);
           if (!SPIKE_MAIN(body)) {
             childCalls += 1;
             if (childCalls === 1) return text("child_e6_ready", "SPIKE_E6_READY");
@@ -5721,15 +5726,23 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
                 toolCall("child_e6_write", "write_file", { path: "spike-e6.txt", content: "SPIKE_WROTE\n" })
               );
             }
-            childSawReason = body.includes("could not show this request, so it was refused");
-            return text("child_e6_denied", "SPIKE_E6_DENIED");
+            if (childCalls === 3) {
+              childSawReason = body.includes("could not show this request, so it was refused");
+              return toolCall("child_e6_write_again", "write_file", { path: "spike-e6b.txt", content: "SPIKE_WROTE\n" });
+            }
+            return text("child_e6_second", "SPIKE_E6_SECOND_DONE");
           }
           if (!body.includes('"main_e6_start"')) {
             return toolCall("main_e6_start", "subagent", {
               request: { action: "message", agent: "writer", message: "SPIKE_E6_FIRST", profile: "writer" },
             });
           }
-          return text("main_e6_tail", "SPIKE_E6_MAIN_DONE");
+          if (body.includes('"main_e6_answer"')) {
+            mainAnswer = body.includes("has no approval request waiting") ? "no_request" : "other";
+            return text("main_e6_said", "SPIKE_E6_MAIN_ANSWERED");
+          }
+          if (!body.includes("SPIKE_USER_e6b")) return text("main_e6_tail", "SPIKE_E6_MAIN_DONE");
+          return toolCall("main_e6_answer", "subagent", { action: "approve", agent: "writer" });
         },
         async (session, { workspace, stderrPath }) => {
           await session.sendText("SPIKE_USER_e6");
@@ -5744,17 +5757,27 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
           await showAgent(session, "main");
           arrival.release();
           await session.waitForText("The approval screen could not open", 30_000);
-          // A screen that keeps failing does not print the notice again.
+          // The hook fails one screen, and the notice appears once.
           const scrollback = await session.captureFullScrollback();
           expect(scrollback.split("The approval screen could not open").length - 1).toBe(1);
-          // The subagent reads the reason and goes on; the refused write never
-          // touched the file, and its row no longer says it needs permission.
-          await showAgent(session, "writer");
-          await session.waitForText("SPIKE_E6_DENIED", 30_000);
+          // The subagent reads the reason and asks again. The person answers
+          // that second request with the key, and it is answered normally.
+          await session.waitForPane((pane) => pane.includes("spike-e6b.txt"), 30_000);
+          await session.sendKeys("1");
+          await until("the second write", () => existsSync(join(workspace, "spike-e6b.txt")));
+          expect(readFileSync(join(workspace, "spike-e6b.txt"), "utf8")).toBe("SPIKE_WROTE\n");
           expect(childSawReason).toBe(true);
+          expect(existsSync(join(workspace, "spike-e6.txt"))).toBe(false);
+          // A later answer from main's model for the denied request finds
+          // nothing, so nothing reports a request it no longer waits on.
+          await session.sendText("SPIKE_USER_e6b");
+          await session.waitForText("SPIKE_E6_MAIN_ANSWERED", 30_000);
+          expect(mainAnswer).toBe("no_request");
+          for (const body of bodies) expect(body).not.toContain("is no longer waiting");
+          await showAgent(session, "writer");
+          await session.waitForText("SPIKE_E6_SECOND_DONE", 30_000);
           await showAgent(session, "main");
           expect(await session.capturePane()).not.toContain("needs permission");
-          expect(existsSync(join(workspace, "spike-e6.txt"))).toBe(false);
           expect(stderrPath).toBeDefined();
           expect(readFileSync(stderrPath!, "utf8")).toBe("");
         },

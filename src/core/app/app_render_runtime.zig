@@ -2094,6 +2094,14 @@ pub fn Runtime(comptime App: type) type {
                 .accepted => {
                     agent.approval_prompt.clearWithReason(app.alloc, "screen_failure");
                     app.approval_screen.clear();
+                    // The answered request's registry binding goes with it, as
+                    // the key path's does (R1.8), so main's later answer reads
+                    // that it no longer waits instead of answering a binding
+                    // whose worker is gone (`tests/tla/subagent/TuiParentApproval.tla`
+                    // AnswerOnce).
+                    if (comptime @hasDecl(App, "withdrawAnsweredApproval")) {
+                        app.withdrawAnsweredApproval(agent);
+                    }
                     // An accepted answer clears the prompt, so no frame retries
                     // this screen and the notice shows once.
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
@@ -4141,12 +4149,14 @@ const CoordinatorTestApp = struct {
 // an answer for any other id is `.stale`, and one with nothing waiting is
 // `.no_pending` (`permissionSubmissionBlockedLocked` in
 // `src/core/agent/worker_runtime.zig`).
+const approval_screen_failure_feedback_capacity_bytes: usize = 128;
+
 const ApprovalScreenFailureWorker = struct {
     waiting_id: ?u64 = null,
     accepted: usize = 0,
     request_id: ?u64 = null,
     decision: ?types.ToolPermissionDecision = null,
-    feedback_buf: [128]u8 = undefined,
+    feedback_buf: [approval_screen_failure_feedback_capacity_bytes]u8 = undefined,
     feedback_len: usize = 0,
 
     pub fn submitPermissionResponse(
@@ -4191,6 +4201,7 @@ const ApprovalScreenFailureTestApp = struct {
     notice_count: usize = 0,
     notice_buf: [128]u8 = undefined,
     notice_len: usize = 0,
+    withdrawn: usize = 0,
 
     pub fn approvalWorker(
         self: *ApprovalScreenFailureTestApp,
@@ -4198,6 +4209,13 @@ const ApprovalScreenFailureTestApp = struct {
     ) *ApprovalScreenFailureWorker {
         const lender = self.lender orelse return &agent.worker;
         return &lender.worker;
+    }
+
+    pub fn withdrawAnsweredApproval(
+        self: *ApprovalScreenFailureTestApp,
+        _: *ApprovalScreenFailureAgent,
+    ) void {
+        self.withdrawn += 1;
     }
 
     pub fn writeDomainNotice(
@@ -4249,6 +4267,9 @@ test "a failed approval screen denies the request on the worker that owns it" {
     try std.testing.expect(!app.main_agent.approval_prompt.isActive());
     try std.testing.expectEqual(@as(usize, 1), app.notice_count);
     try std.testing.expectEqualStrings(approval_screen_failure_notice, app.noticeBody());
+    // The answered request's registry binding goes with an accepted answer,
+    // once, as the key path's does.
+    try std.testing.expectEqual(@as(usize, 1), app.withdrawn);
 }
 
 test "a failed approval screen never answers the screen's own request with the same id" {
@@ -4278,6 +4299,37 @@ test "a failed approval screen never answers the screen's own request with the s
 
     try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.accepted);
     try std.testing.expectEqual(@as(usize, 1), child.worker.accepted);
+    try std.testing.expectEqual(@as(usize, 1), app.withdrawn);
+}
+
+test "a failed approval screen that no worker takes withdraws nothing" {
+    const alloc = std.testing.allocator;
+    var app: ApprovalScreenFailureTestApp = .{ .alloc = alloc };
+    defer app.main_agent.approval_prompt.deinit(alloc);
+    var child: ApprovalScreenFailureAgent = .{};
+    defer child.approval_prompt.deinit(alloc);
+    // The request ended before the deny arrived: no worker waits on its id.
+    child.worker.waiting_id = null;
+    app.lender = &child;
+    _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{
+        .id = 7,
+        .label = "write_file note.txt",
+        .origin = .{ .subagent = "writer" },
+    });
+
+    _ = try Runtime(ApprovalScreenFailureTestApp).failApprovalScreen(
+        &app,
+        &app.main_agent,
+        7,
+        error.OutOfMemory,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), child.worker.accepted);
+    try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.accepted);
+    // A deny nobody took answers nothing, so no binding goes with it and no
+    // notice claims a request was denied.
+    try std.testing.expectEqual(@as(usize, 0), app.withdrawn);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
 }
 
 fn initCoordinatorProjectionTestApp(
