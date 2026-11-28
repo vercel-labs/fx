@@ -837,6 +837,7 @@ pub fn Runtime(comptime App: type) type {
                     .tools = app.mcp.host_menu_tools,
                     .notes = app.mcp.host_menu_notes,
                     .sign_in_url = app.mcp.hostMenuSignInUrl(),
+                    .marker_phase = shimmer_pos,
                 } else .{},
                 .help_menu = render_input.helpMenuProjection(
                     &app.input_runtime.help_menu,
@@ -1924,6 +1925,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 presentation_shell.shimmer_active = frame_ctx.activity_result.painted;
                 presentation_shell.shimmer_is_overlay = frame_ctx.activity_result.overlay;
+                presentation_shell.loading_marker_active = footer_frame.composed.loading_marker_visible;
                 if (scroll_plan.remaining_inline_advance_rows > 0) {
                     presentation_shell.markTranscriptDirty();
                 } else if (!render_requests.hasReason(.transcript)) {
@@ -1935,7 +1937,7 @@ pub fn Runtime(comptime App: type) type {
             }
             return .{
                 .shadow_state = result.state(),
-                .animation_visible = frame_ctx.activity_result.painted,
+                .animation_visible = frame_ctx.activity_result.painted or footer_frame.composed.loading_marker_visible,
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
                 // The committed pending UI permits adoption even when its preview

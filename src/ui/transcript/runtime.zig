@@ -5177,6 +5177,7 @@ const transcript_screen_fields = [_][:0]const u8{
     "command_output_render",
     "shimmer_active",
     "shimmer_is_overlay",
+    "loading_marker_active",
     "paint_trace",
     "tail_viewport_request",
     "tail_viewport_resolution",
@@ -5405,6 +5406,8 @@ pub const TranscriptRuntime = struct {
     command_output_render: CommandOutputRenderPolicy = .{},
     shimmer_active: bool = false,
     shimmer_is_overlay: bool = false,
+    /// The last committed footer showed a loading marker, which needs frames.
+    loading_marker_active: bool = false,
     paint_trace: PaintTraceState = .{},
     last_visible_transcript_top_row: u16 = 1,
     last_visible_transcript_start_line: usize = 0,
