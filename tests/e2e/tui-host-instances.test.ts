@@ -24,10 +24,28 @@ const TIMEOUT = 90_000;
 const LIST_HINT = "enter switch";
 // Matches `AppAgentsRuntime.footerIndicator` (`src/core/app/app_agents_runtime.zig:2858-2865`),
 // drawn at the right edge of the footer hint row whenever more than one agent is open.
-const AGENT_INDICATOR = /(?:^| )(?:main|fx \d+\/\d+|[^\s\u00b7]+(?: \u00b7 (?:done|failed|stopped))?)(?: \u2193| \u00b7 ctrl\+x) *$/m;
+const AGENT_INDICATOR = /(?:^| )(?:main|fx \d+\/\d+|[^\s\u00b7]+(?: \u00b7 (?:done|failed|stopped))?)(?: \u2193| \u00b7 ctrl\+x)$/;
+const SUBAGENT_APPROVAL = /Subagent .+ needs permission/;
+const SUBAGENT_STARTED = /^[\u251c\u2514] Started \S/m;
+
+function footerHintRow(pane: string): string {
+  const lines = pane.split("\n");
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i]!.trimEnd();
+    if (line.length > 0) return line;
+  }
+  return "";
+}
+
 // When an approval prompt owns the footer (`choose now`), it hides the agent
-// indicator even though Ctrl+X still opens the agent list.
-const agentListReady = (pane: string) => AGENT_INDICATOR.test(pane) || approvalOpen(pane);
+// indicator even though Ctrl+X still opens the agent list. Accept the approval
+// branch only when a subagent is already visible on screen (its own approval,
+// a started subagent row, or an open agent-list row), never for main's own
+// approval with only one agent open.
+const agentListReady = (pane: string) =>
+  AGENT_INDICATOR.test(footerHintRow(pane)) ||
+  (approvalOpen(pane) && (SUBAGENT_APPROVAL.test(pane) || SUBAGENT_STARTED.test(pane))) ||
+  agentRows(pane).length > 0;
 
 // The agent list's row for instance `number`, and for subagent `name`, which
 // sits under its instance behind a branch.
@@ -3474,12 +3492,13 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
       const command = "echo RAN >> delayed.log";
       const base = grantRuns(new Set(), true);
       let delayedFirst = false;
+      const firstRequestStarted = held();
       const firstReplyGate = held();
       await withHost(
         async (body) => {
           if (!delayedFirst && userTexts(body).join("\n").includes("GRANT_1 ")) {
             delayedFirst = true;
-            setTimeout(firstReplyGate.release, 200);
+            firstRequestStarted.release();
             await firstReplyGate.promise;
           }
           return base(body);
@@ -3490,6 +3509,10 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
           const log = join(workspace, "delayed.log");
           await session.waitForComposer(15_000);
           await session.sendText(`GRANT_1 SUB[alpha] RUN[${command}]`);
+          await firstRequestStarted.promise;
+          expect(agentListReady(await session.capturePane())).toBe(false);
+          await session.sendKeys("C-x");
+          firstReplyGate.release();
           await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 RUN[${command}]`);
           await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
           await session.sendKeys("2");
@@ -3503,7 +3526,6 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
         async (body) => {
           if (!delayedSecond && userTexts(body).join("\n").includes("GRANT_2 ")) {
             delayedSecond = true;
-            setTimeout(secondReplyGate.release, 200);
             await secondReplyGate.promise;
           }
           return base(body);
@@ -3517,7 +3539,10 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
           await session.waitForComposer(15_000);
           await session.sendText(`GRANT_2 SUB[alpha] RUN[${command}]`);
-          await showAgentAfter(session, "fx 2", "alpha");
+          const picking = showAgentAfter(session, "fx 2", "alpha");
+          await session.waitForText(LIST_HINT, 10_000);
+          secondReplyGate.release();
+          await picking;
           await session.waitForPane((pane) => pane.includes("GRANT_CHILD_READY_2"), 30_000);
           await session.sendText(`GRANT_TASK_2 RUN[${command}]`);
           await waitShows(session, "fx 2 alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
