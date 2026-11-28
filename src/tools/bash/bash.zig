@@ -321,6 +321,7 @@ fn callRunLimited(
         .authority = authority,
         .extra_environment = program_environment.items,
         .after_startup = after_startup,
+        .merge_stderr = true,
         .yield_hold = if (bridge_registration) |registration| &registration.hold else null,
         .max_output_bytes = ctx.max_command_output_bytes,
         .timeout_ms = ctx.command_timeout_ms,
@@ -1850,6 +1851,93 @@ test "a program that sets xtrace shows its own lines and no line from the save" 
     const next = try callRun(ctx, "echo \"y=$y\"", program_yield_ms);
     defer next.deinit(alloc);
     try std.testing.expectEqualStrings("y=1\n", try bodyText(next, true));
+}
+
+test "a program's stdout and stderr keep their write order in one stream" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+
+    const command = "printf a; printf B >&2; printf 'c\\n'";
+    try bash.authorize(&ctx, command);
+    const run = try callRun(ctx, command, program_yield_ms);
+    defer run.deinit(alloc);
+    try std.testing.expectEqualStrings("aBc\n", try bodyText(run, true));
+}
+
+test "a 70,000-byte stdout then a stderr line: the result ends with the stderr line, whole" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+
+    const command = "head -c 70000 /dev/zero | tr '\\0' a; printf '\\n'; printf 'ERR\\n' >&2";
+    try bash.authorize(&ctx, command);
+    const run = try callRun(ctx, command, program_yield_ms);
+    defer run.deinit(alloc);
+    try std.testing.expect(std.mem.endsWith(u8, try outcomeText(run, true), "\nERR\n"));
+}
+
+test "a program's EXIT trap writes into the one stream, in write order, with no session line" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+
+    // The trap writes stderr first, so two pipes that reach the reader together would show it after stdout.
+    const command = "trap 'echo TRAP_ERR >&2; echo trap_out' EXIT; printf body_out; printf 'BODY_ERR\\n' >&2";
+    try bash.authorize(&ctx, command);
+    const run = try callRun(ctx, command, program_yield_ms);
+    defer run.deinit(alloc);
+    try std.testing.expectEqualStrings("body_outBODY_ERR\nTRAP_ERR\ntrap_out\n", try bodyText(run, true));
+}
+
+test "stdout and stderr lines written in turn are saved in turn" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+
+    const command = "i=1; while [ $i -le 2000 ]; do echo \"out $i\"; echo \"err $i\" >&2; i=$((i+1)); done";
+    try bash.authorize(&ctx, command);
+    const run = try callRun(ctx, command, program_yield_ms);
+    defer run.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(run, true), "[exit 0, "));
+    const file = try readInFolder(alloc, folder, "1.txt");
+    defer alloc.free(file);
+    var lines = std.mem.splitScalar(u8, file, '\n');
+    var want: usize = 1;
+    while (want <= 2000) : (want += 1) {
+        const out_line = try alloc.print("out {d}", .{want});
+        defer alloc.free(out_line);
+        const err_line = try alloc.print("err {d}", .{want});
+        defer alloc.free(err_line);
+        try std.testing.expectEqualStrings(out_line, lines.next() orelse return error.TestShortOutput);
+        try std.testing.expectEqualStrings(err_line, lines.next() orelse return error.TestShortOutput);
+    }
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try std.testing.expect(lines.next() == null);
 }
 
 test "a notice a previous program left goes into the result of a call that fails to start, and the trace says so" {

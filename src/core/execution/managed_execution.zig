@@ -95,6 +95,8 @@ pub const StartCapturedInput = struct {
     /// definitions, before the command (`command_runner.Config.after_startup`).
     /// Copied before `startCaptured` returns.
     after_startup: []const u8 = "",
+    /// Sends the command's stderr to its stdout (`command_runner.Config.merge_stderr`).
+    merge_stderr: bool = false,
     /// While this count is above zero, `startCaptured` waits past
     /// `yield_time_ms`: the command is waiting on an `fx mcp call` whose
     /// owner is this call, which must not end before the answer does.
@@ -280,6 +282,7 @@ const Entry = struct {
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     extra_environment: []const command_runner.EnvironmentVariable = &.{},
     after_startup: []const u8 = "",
+    merge_stderr: bool = false,
     output_handle: ?[]const u8 = null,
     output_framed_bytes: usize = 0,
     stdout_bytes: usize = 0,
@@ -386,6 +389,7 @@ const Entry = struct {
             .on_output_chunk = input.on_output_chunk,
             .extra_environment = extra_environment,
             .after_startup = after_startup,
+            .merge_stderr = input.merge_stderr,
         };
         entry.started_ms = io_mod.milliTimestamp();
         entry.last_output_ms = entry.started_ms;
@@ -637,6 +641,7 @@ const Entry = struct {
             .command_artifact_dir = self.command_artifact_dir,
             .extra_environment = self.extra_environment,
             .after_startup = self.after_startup,
+            .merge_stderr = self.merge_stderr,
         }, self.arena.allocator(), captured.route) catch |err| {
             const zio = io_mod.getIo();
             self.mutex.lockUncancelable(zio);

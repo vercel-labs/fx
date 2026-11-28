@@ -277,11 +277,14 @@ pub const snapshot_replay_failure_prefix = "fx-shell-snapshot-replay-failed:";
 /// The replay runs with stderr saved on fd 9 and pointed at /dev/null, so
 /// its errors never reach the command's output. The command gets stderr back
 /// through its own redirection (`snapshotScript`), and the bootstrap restores
-/// it once the replay returns, for exit traps and the failure marker.
+/// it once the replay returns, for exit traps and the failure marker. With
+/// `merge_stderr`, a replay that ran restores it to stdout, so exit traps join
+/// the one stream; the failure marker still goes to the stderr pipe.
 pub fn snapshotInvocation(
     alloc: Allocator,
     shell_path: []const u8,
     failure_marker: []const u8,
+    merge_stderr: bool,
 ) (ResolveError || Allocator.Error)!Invocation {
     const kind = shellKind(shell_path) orelse return error.UnsupportedShell;
     var invocation = Invocation{ .path = shell_path };
@@ -299,9 +302,22 @@ pub fn snapshotInvocation(
     // 3.2 hangs on a `command exec`, so bash uses plain `exec`. Nothing is
     // replayed before the first one, and the second runs after the command, so
     // removing a replayed function named `exec` there changes nothing it uses.
-    const park_stderr: []const u8, const restore_stderr: []const u8 = switch (kind) {
-        .zsh => .{ "\\builtin exec 9>&2 2>/dev/null; ", "\\builtin exec 2>&9 9>&-; " },
-        .bash => .{ "exec 9>&2 2>/dev/null; ", "\\builtin unset -f exec; exec 2>&9 9>&-; " },
+    const park_stderr: []const u8 = switch (kind) {
+        .zsh => "\\builtin exec 9>&2 2>/dev/null; ",
+        .bash => "exec 9>&2 2>/dev/null; ",
+    };
+    // With `merge_stderr`, a replay that restored the state points stderr at
+    // stdout here, so exit traps write into the one stream. A replay that did not
+    // keeps stderr on fd 9 for the failure marker.
+    const restore_stderr: []const u8 = switch (kind) {
+        .zsh => if (merge_stderr)
+            "if [[ -n ${__fx_snapshot_restored-} ]]; then \\builtin exec 2>&1 9>&-; else \\builtin exec 2>&9 9>&-; fi; "
+        else
+            "\\builtin exec 2>&9 9>&-; ",
+        .bash => if (merge_stderr)
+            "\\builtin unset -f exec; if [[ -n ${__fx_snapshot_restored-} ]]; then exec 2>&1 9>&-; else exec 2>&9 9>&-; fi; "
+        else
+            "\\builtin unset -f exec; exec 2>&9 9>&-; ",
     };
     // bash 3.2, macOS's /bin/bash, sources a pipe only as far as the bytes it
     // holds at that moment, about 64 KB, so a larger replay would lose its
@@ -348,13 +364,15 @@ pub fn snapshotInvocation(
 /// runs with stdin from /dev/null so it cannot read the rest of the script.
 /// Its stderr is the one `snapshotInvocation` saved on fd 9, which it does
 /// not inherit. A redirection, unlike an `exec`, cannot be replaced by a
-/// replayed function or alias.
+/// replayed function or alias. With `merge_stderr`, the command's stderr is its
+/// stdout instead, so the output is one stream.
 pub fn snapshotScript(
     alloc: Allocator,
     kind: ShellKind,
     replay: []const u8,
     after_startup: []const u8,
     command: []const u8,
+    merge_stderr: bool,
 ) Allocator.Error![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(alloc);
@@ -369,7 +387,7 @@ pub fn snapshotScript(
     if (kind == .zsh) try output.appendSlice(alloc, zsh_command_prelude);
     try output.appendSlice(alloc, "\\builtin eval -- ");
     try appendShellWord(&output, alloc, command);
-    try output.appendSlice(alloc, " </dev/null 2>&9 9>&-\n");
+    try output.appendSlice(alloc, if (merge_stderr) " </dev/null 2>&1 9>&-\n" else " </dev/null 2>&9 9>&-\n");
     return output.toOwnedSlice(alloc);
 }
 
@@ -744,7 +762,7 @@ test "captured invocation provider projection shell-quotes every argv word" {
 }
 
 test "snapshot script turns off zsh equals expansion after the replay" {
-    const zsh = try snapshotScript(std.testing.allocator, .zsh, "builtin setopt equals", "", "echo ======");
+    const zsh = try snapshotScript(std.testing.allocator, .zsh, "builtin setopt equals", "", "echo ======", false);
     defer std.testing.allocator.free(zsh);
     try std.testing.expectEqualStrings(
         "builtin setopt equals\n__fx_snapshot_restored=1\n" ++
@@ -752,7 +770,7 @@ test "snapshot script turns off zsh equals expansion after the replay" {
         zsh,
     );
 
-    const bash = try snapshotScript(std.testing.allocator, .bash, "", "", "echo ======");
+    const bash = try snapshotScript(std.testing.allocator, .bash, "", "", "echo ======", false);
     defer std.testing.allocator.free(bash);
     try std.testing.expectEqualStrings(
         "__fx_snapshot_restored=1\n\\builtin eval -- 'echo ======' </dev/null 2>&9 9>&-\n",
@@ -760,9 +778,18 @@ test "snapshot script turns off zsh equals expansion after the replay" {
     );
 }
 
+test "snapshot script sends the command's stderr to its stdout when it merges streams" {
+    const bash = try snapshotScript(std.testing.allocator, .bash, "", "", "echo ======", true);
+    defer std.testing.allocator.free(bash);
+    try std.testing.expectEqualStrings(
+        "__fx_snapshot_restored=1\n\\builtin eval -- 'echo ======' </dev/null 2>&1 9>&-\n",
+        bash,
+    );
+}
+
 test "snapshot script runs the startup text in a group before the restored flag" {
     const text = "alias ll=\"echo NEW\"";
-    const zsh = try snapshotScript(std.testing.allocator, .zsh, "builtin setopt equals", text, "ll");
+    const zsh = try snapshotScript(std.testing.allocator, .zsh, "builtin setopt equals", text, "ll", false);
     defer std.testing.allocator.free(zsh);
     try std.testing.expectEqualStrings(
         "builtin setopt equals\n{ " ++ text ++ "\n} </dev/null 2>&9\n" ++
@@ -771,7 +798,7 @@ test "snapshot script runs the startup text in a group before the restored flag"
         zsh,
     );
 
-    const bash = try snapshotScript(std.testing.allocator, .bash, "", text, "ll");
+    const bash = try snapshotScript(std.testing.allocator, .bash, "", text, "ll", false);
     defer std.testing.allocator.free(bash);
     try std.testing.expectEqualStrings(
         "{ " ++ text ++ "\n} </dev/null 2>&9\n" ++
@@ -820,20 +847,40 @@ test "snapshot bootstrap hides replay errors and restores stderr afterwards" {
         "\\builtin exit 125; fi; case $__fx_snapshot_status in 129|130|137|143) " ++
         "\\builtin kill -$((__fx_snapshot_status - 128)) $$;; esac; \\builtin exit $__fx_snapshot_status";
 
-    const zsh = try snapshotInvocation(arena, "/bin/zsh", "marker");
+    const zsh = try snapshotInvocation(arena, "/bin/zsh", "marker", false);
     try std.testing.expectEqualStrings(
         "\\builtin exec 9>&2 2>/dev/null; \\builtin source /dev/fd/0; __fx_snapshot_status=$?; " ++
             "\\builtin exec 2>&9 9>&-; " ++ tail,
         zsh.argv()[zsh.argv().len - 1],
     );
 
-    const bash = try snapshotInvocation(arena, "/bin/bash", "marker");
+    const bash = try snapshotInvocation(arena, "/bin/bash", "marker", false);
     try std.testing.expectEqualStrings(
         "exec 9>&2 2>/dev/null; if (( BASH_VERSINFO[0] < 4 )); then \\builtin eval -- \"$(< /dev/fd/0)\"; " ++
             "else \\builtin source /dev/fd/0; fi; __fx_snapshot_status=$?; " ++
             "\\builtin unset -f exec; exec 2>&9 9>&-; " ++ tail,
         bash.argv()[bash.argv().len - 1],
     );
+}
+
+test "merged snapshot bootstrap points stderr at stdout after a restored replay, and keeps fd 9 for the marker" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const zsh = try snapshotInvocation(arena, "/bin/zsh", "marker", true);
+    try std.testing.expect(std.mem.find(
+        u8,
+        zsh.argv()[zsh.argv().len - 1],
+        "if [[ -n ${__fx_snapshot_restored-} ]]; then \\builtin exec 2>&1 9>&-; else \\builtin exec 2>&9 9>&-; fi; ",
+    ) != null);
+
+    const bash = try snapshotInvocation(arena, "/bin/bash", "marker", true);
+    try std.testing.expect(std.mem.find(
+        u8,
+        bash.argv()[bash.argv().len - 1],
+        "\\builtin unset -f exec; if [[ -n ${__fx_snapshot_restored-} ]]; then exec 2>&1 9>&-; else exec 2>&9 9>&-; fi; ",
+    ) != null);
 }
 
 test "profile normalization defaults captured and persistent execution to user" {

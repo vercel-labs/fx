@@ -2198,6 +2198,15 @@ test.skipIf(!tmuxAvailable())(
   60_000,
 );
 
+/// Waits until `path` holds exactly `text`, or fails at `timeoutMs` and names the path.
+async function waitForSavedIndex(path: string, text: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(existsSync(path) && readFileSync(path, "utf8") === text)) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${path}`);
+    await Bun.sleep(25);
+  }
+}
+
 test.skipIf(!tmuxAvailable())(
   "TUI bash interrupt saves partial output to $FX_OUT/1.txt with signal:15 in index.tsv",
   async () => {
@@ -2228,10 +2237,12 @@ test.skipIf(!tmuxAvailable())(
     const resultsRoot = join(fixture.home, ".fx", "results");
     const [sessionId] = readdirSync(resultsRoot);
     const resultsDir = join(resultsRoot, sessionId!);
+    // "Cancelled" can show before the killed program's output is saved, so wait
+    // for the index row, which the save writes after 1.txt.
+    const indexText = `n\texit\tbytes\tlines\tcommand\n1\tsignal:15\t12\t1\techo before-stop; touch "${started}"; sleep 30\n`;
+    await waitForSavedIndex(join(resultsDir, "index.tsv"), indexText, TIMEOUT);
     expect(readFileSync(join(resultsDir, "1.txt"), "utf8")).toBe("before-stop\n");
-    expect(readFileSync(join(resultsDir, "index.tsv"), "utf8")).toBe(
-      `n\texit\tbytes\tlines\tcommand\n1\tsignal:15\t12\t1\techo before-stop; touch "${started}"; sleep 30\n`,
-    );
+    expect(readFileSync(join(resultsDir, "index.tsv"), "utf8")).toBe(indexText);
 
     await active.sendText("/quit");
     expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
