@@ -8740,6 +8740,84 @@ describe("cli: ask stream events", () => {
   );
 
   test(
+    "fx ask --stream-events abbreviates symlinked workspace paths for read_file and write_file",
+    async () => {
+      const home = createIsolatedTestHome();
+      const realWorkspace = join(home, "real");
+      const linkWorkspace = join(home, "link");
+      const outsideDir = join(home, "outside");
+      mkdirSync(join(realWorkspace, "sub"), { recursive: true });
+      mkdirSync(outsideDir, { recursive: true });
+      symlinkSync(realWorkspace, linkWorkspace);
+      const realRead = join(realWorkspace, "sub", "a.txt");
+      const linkRead = join(linkWorkspace, "sub", "a.txt");
+      const linkWrite = join(linkWorkspace, "b.txt");
+      const outsideRead = join(outsideDir, "ext.txt");
+      writeFileSync(realRead, "inside\n");
+      writeFileSync(outsideRead, "outside\n");
+
+      let step = 0;
+      const gateway = startDynamicFakeGateway(async () => {
+        step += 1;
+        if (step === 1) {
+          return fakeGatewaySse([
+            { type: "tool-input-start", id: "call_r_link", toolName: "read_file" },
+            {
+              type: "tool-call",
+              toolCallId: "call_r_link",
+              toolName: "read_file",
+              input: { path: linkRead },
+            },
+            { type: "tool-input-start", id: "call_w_link", toolName: "write_file" },
+            {
+              type: "tool-call",
+              toolCallId: "call_w_link",
+              toolName: "write_file",
+              input: { path: linkWrite, content: "written\n" },
+            },
+            { type: "tool-input-start", id: "call_r_out", toolName: "read_file" },
+            {
+              type: "tool-call",
+              toolCallId: "call_r_out",
+              toolName: "read_file",
+              input: { path: outsideRead },
+            },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "STOP" } },
+          ]);
+        }
+        return fakeGatewayFinalText("SYMLINK_PATHS_DONE");
+      });
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "test-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const res = await runFx(
+          ["ask", "--stream-events", "--no-save", "--full-access", "--model", FAKE_GATEWAY_MODEL, "paths"],
+          { cwd: linkWorkspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(res.code).toBe(0);
+        const events = res.stdout.trimEnd().split("\n").map((line) => JSON.parse(line));
+        const starts = events.filter((e) => e.type === "tool_start");
+        expect(starts.map((e) => ({ call_id: e.call_id, target: e.target }))).toEqual([
+          { call_id: "call_r_link", target: "sub/a.txt" },
+          { call_id: "call_w_link", target: "b.txt" },
+          { call_id: "call_r_out", target: outsideRead },
+        ]);
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx ask --stream-events emits tool_start before malformed or provisional tool_end",
     async () => {
       const home = createIsolatedTestHome();

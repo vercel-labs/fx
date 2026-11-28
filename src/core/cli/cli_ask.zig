@@ -3709,21 +3709,105 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
     }
 }
 
+fn startsWithWorkspaceBoundary(path: []const u8, workspace_root_input: []const u8) bool {
+    var root_end = workspace_root_input.len;
+    while (root_end > 1 and workspace_root_input[root_end - 1] == '/') {
+        root_end -= 1;
+    }
+    const root = workspace_root_input[0..root_end];
+    if (root.len <= 1 or root[0] != '/') return false;
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    return path.len == root.len or path[root.len] == '/';
+}
+
+fn resolvePathOrParent(alloc: Allocator, path: []const u8) Allocator.Error!?[]u8 {
+    if (io_mod.realpathAlloc(alloc, path)) |resolved| {
+        return resolved;
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Unresolvable targets stay unchanged at their original path.
+        else => {},
+    }
+    const dir = std.Io.Dir.path.dirname(path) orelse return null;
+    const base = std.Io.Dir.path.basename(path);
+    if (base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) return null;
+    const resolved_parent = io_mod.realpathAlloc(alloc, dir) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Unresolvable parent folders keep the original model path.
+        else => return null,
+    };
+    return try std.Io.Dir.path.join(alloc, &.{ resolved_parent, base });
+}
+
+fn resolveStreamTargetInWorkspace(
+    alloc: Allocator,
+    tool_registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    call: ToolCall,
+    display_target: ?[]const u8,
+) Allocator.Error!?[]u8 {
+    const shown = (try toolbox.shownBuiltinRun(alloc, tool_registry, call)) orelse call;
+    const spec = tool_registry.lookup(shown.name) orelse return null;
+    if (spec.executor_kind == .web_search or spec.executor_kind == .subagent or spec.executor_kind == .run_command) return null;
+    const args = tool_args.parseToolArgsObject(alloc, shown.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
+    if (presentation.label_arg_kind != .path) return null;
+    const raw_target = display_target orelse
+        shown.resolved_display_target orelse
+        tool_dispatch.presentationLabelValue(presentation, args) orelse
+        return null;
+    if (raw_target.len <= 1 or raw_target[0] != '/') return null;
+    if (startsWithWorkspaceBoundary(raw_target, workspace_root)) return null;
+    const resolved = (try resolvePathOrParent(alloc, raw_target)) orelse return null;
+    if (!startsWithWorkspaceBoundary(resolved, workspace_root)) return null;
+    return resolved;
+}
+
+fn formatStreamStartTarget(
+    alloc: Allocator,
+    tool_registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    call: ToolCall,
+    display_target: ?[]const u8,
+) ![]const u8 {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const resolved = try resolveStreamTargetInWorkspace(
+        scratch_state.allocator(),
+        tool_registry,
+        workspace_root,
+        call,
+        display_target,
+    );
+    var resolved_call = call;
+    if (resolved) |path| resolved_call.resolved_display_target = path;
+    return tool_presentation.formatShortSafeTarget(alloc, .{
+        .tool_registry = tool_registry,
+        .call = resolved_call,
+        .workspace_root = workspace_root,
+        .display_target = resolved orelse display_target,
+    });
+}
+
 fn emitToolStartStreamEvent(ctx: *AskContext, started: anytype) !void {
     if (!try markPendingToolStreamStarted(ctx, started.id.call_id)) return;
     var target_arena = std.heap.ArenaAllocator.init(ctx.alloc);
     defer target_arena.deinit();
-    const target = try tool_presentation.formatShortSafeTarget(target_arena.allocator(), .{
-        .tool_registry = ctx.toolRegistry(),
-        .call = .{
+    const target = try formatStreamStartTarget(
+        target_arena.allocator(),
+        ctx.toolRegistry(),
+        ctx.workspace_root,
+        .{
             .id = started.id.call_id,
             .name = started.tool_name,
             .arguments_json = started.arguments_json orelse "{}",
             .resolved_display_target = started.resolved_display_target,
         },
-        .workspace_root = ctx.workspace_root,
-        .display_target = started.resolved_display_target,
-    });
+        started.resolved_display_target,
+    );
     const line = try renderToolStartEventJson(
         ctx.alloc,
         started.id.call_id,
@@ -10951,4 +11035,95 @@ test "runWithDeps stops on OutputWriteFailed without a second write try in flush
         runWithDeps(alloc, &.{ "--stream-events", "--no-save", "hello" }, testConfig(), deps),
     );
     try std.testing.expectEqual(@as(usize, 2), writer.writes);
+}
+
+test "formatStreamStartTarget resolves symlinked workspace paths and keeps outside or unresolvable paths full" {
+    const alloc = std.testing.allocator;
+    const registry = builtin_tools.advertisement_set.registry;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "real/sub");
+    try tmp.dir.createDirPath(io_mod.getIo(), "outside");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "real/sub/a.txt", .{});
+        file.close(io_mod.getIo());
+    }
+    {
+        var outside = try tmp.dir.createFile(io_mod.getIo(), "outside/ext.txt", .{});
+        outside.close(io_mod.getIo());
+    }
+    try tmp.dir.symLink(io_mod.getIo(), "real", "link", .{ .is_directory = true });
+
+    const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(tmp_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "real");
+    defer alloc.free(workspace_root);
+    const link_root = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "link" });
+    defer alloc.free(link_root);
+
+    const existing_path = try std.Io.Dir.path.join(alloc, &.{ link_root, "sub", "a.txt" });
+    defer alloc.free(existing_path);
+    const existing_args = try std.json.Stringify.valueAlloc(alloc, .{ .path = existing_path }, .{});
+    defer alloc.free(existing_args);
+    const existing_target = try formatStreamStartTarget(alloc, registry, workspace_root, .{
+        .id = "r1",
+        .name = "read_file",
+        .arguments_json = existing_args,
+    }, null);
+    defer alloc.free(existing_target);
+    try std.testing.expectEqualStrings("sub/a.txt", existing_target);
+
+    const new_path = try std.Io.Dir.path.join(alloc, &.{ link_root, "new.txt" });
+    defer alloc.free(new_path);
+    const new_args = try std.json.Stringify.valueAlloc(alloc, .{ .path = new_path, .content = "hi" }, .{});
+    defer alloc.free(new_args);
+    const new_target = try formatStreamStartTarget(alloc, registry, workspace_root, .{
+        .id = "w1",
+        .name = "write_file",
+        .arguments_json = new_args,
+    }, null);
+    defer alloc.free(new_target);
+    try std.testing.expectEqualStrings("new.txt", new_target);
+
+    const outside_path = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "outside", "ext.txt" });
+    defer alloc.free(outside_path);
+    const outside_args = try std.json.Stringify.valueAlloc(alloc, .{ .path = outside_path }, .{});
+    defer alloc.free(outside_args);
+    const expected_outside = try tool_presentation.formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{
+            .id = "r2",
+            .name = "read_file",
+            .arguments_json = outside_args,
+        },
+        .workspace_root = workspace_root,
+    });
+    defer alloc.free(expected_outside);
+    const outside_target = try formatStreamStartTarget(alloc, registry, workspace_root, .{
+        .id = "r2",
+        .name = "read_file",
+        .arguments_json = outside_args,
+    }, null);
+    defer alloc.free(outside_target);
+    try std.testing.expectEqualStrings(expected_outside, outside_target);
+
+    const short_outside_target = try formatStreamStartTarget(alloc, registry, workspace_root, .{
+        .id = "r3",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"/etc/hosts\"}",
+    }, null);
+    defer alloc.free(short_outside_target);
+    try std.testing.expectEqualStrings("/etc/hosts", short_outside_target);
+
+    const unresolvable_path = "/nonexistent-fx-stream-test-dir/missing/new.txt";
+    const unresolvable_args = try std.json.Stringify.valueAlloc(alloc, .{ .path = unresolvable_path }, .{});
+    defer alloc.free(unresolvable_args);
+    const unresolvable_target = try formatStreamStartTarget(alloc, registry, workspace_root, .{
+        .id = "w2",
+        .name = "write_file",
+        .arguments_json = unresolvable_args,
+    }, null);
+    defer alloc.free(unresolvable_target);
+    try std.testing.expectEqualStrings(unresolvable_path, unresolvable_target);
 }
