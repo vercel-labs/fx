@@ -6692,7 +6692,7 @@ noinline fn replay(
         for (page.entries) |entry| {
             _ = piece_arena.reset(.retain_capacity);
             const pa = piece_arena.allocator();
-            if (skip_offset) |offset| if (entry.offset == offset) continue;
+            if (skip_offset) |offset| if (entry.offset == offset or (entry.kind == .compacted and entry.offset < offset)) continue;
             const body = entry.body orelse continue;
             switch (body) {
                 .turn_started => {
@@ -11707,6 +11707,198 @@ test "visitHistoryCycleWithSplitPrefix includes pre-compaction tool calls and re
     try testing.expectEqualStrings("pre tool text", split.execution.tool_steps[0].assistant.?);
     try testing.expectEqualStrings("call_pre_1", split.execution.tool_steps[0].tool_calls[0].id);
     try testing.expectEqualStrings("pre contents\n", split.execution.tool_steps[0].tool_results[0].output);
+}
+
+test "Session.restore rebuilds the same model context and visitHistorySinceCompaction when the last step is written before compacted" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const compacted_json = try jsonValue(a, CompactedData{
+        .summary = "mid-turn summary",
+        .removed_turn_count = 0,
+        .compaction_count = 1,
+        .keep_from_turn = 1,
+        .keep_tool_steps = 1,
+    });
+    const step_events = struct {
+        fn make(alloc: Allocator, n: []const u8, ts: i64) ![3]sm.Event {
+            const text = try alloc.print("step {s} text", .{n});
+            const cid = try alloc.print("call_{s}", .{n});
+            const args = try alloc.print("{{\"path\":\"f{s}.txt\"}}", .{n});
+            const out = try alloc.print("contents {s}\n", .{n});
+            return .{
+                .{ .item = .{ .type = "assistant", .data = try encodePiece(alloc, .{ .assistant = .{ .text = text } }) } },
+                .{ .item = .{ .type = "tool_call", .data = try encodePiece(alloc, .{ .tool_call = .{ .call_id = cid, .tool_name = "read_file", .arguments_json = args } }) } },
+                .{ .item = .{ .type = "tool_result", .data = try encodePiece(alloc, resultEvent(cid, out, ts)) } },
+            };
+        }
+    }.make;
+
+    const s1 = try step_events(a, "1", 100);
+    const s2 = try step_events(a, "2", 200);
+    const s3 = try step_events(a, "3", 300);
+    const s4 = try step_events(a, "4", 400);
+
+    // Log A (old order): step 3 sits after `.compacted`.
+    const id_old = "1786460757754-equiv-old";
+    const imp_old = try t.store.manager.openImport(.{ .id = id_old, .workspace = "/w", .host = .ask, .created_ms = 1000 });
+    _ = try imp_old.appendAt(&.{
+        .turn_started,
+        .{ .item = .{ .type = "user", .data = try encodePiece(a, .{ .user = .{ .text = "equiv_prompt" } }) } },
+        s1[0],
+        s1[1],
+        s1[2],
+        s2[0],
+        s2[1],
+        s2[2],
+        .{ .compacted = compacted_json },
+        s3[0],
+        s3[1],
+        s3[2],
+        s4[0],
+        s4[1],
+        s4[2],
+    }, 2000);
+    try imp_old.publishImport();
+    imp_old.release();
+
+    // Log B (new order): step 3 sits before `.compacted`.
+    const id_new = "1786460757754-equiv-new";
+    const imp_new = try t.store.manager.openImport(.{ .id = id_new, .workspace = "/w", .host = .ask, .created_ms = 1000 });
+    _ = try imp_new.appendAt(&.{
+        .turn_started,
+        .{ .item = .{ .type = "user", .data = try encodePiece(a, .{ .user = .{ .text = "equiv_prompt" } }) } },
+        s1[0],
+        s1[1],
+        s1[2],
+        s2[0],
+        s2[1],
+        s2[2],
+        s3[0],
+        s3[1],
+        s3[2],
+        .{ .compacted = compacted_json },
+        s4[0],
+        s4[1],
+        s4[2],
+    }, 2000);
+    try imp_new.publishImport();
+    imp_new.release();
+
+    const r_old = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id_old }, "/w", .ask);
+    defer r_old.close();
+    const r_new = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id_new }, "/w", .ask);
+    defer r_new.close();
+
+    var restored_old = try r_old.restore(testing.allocator);
+    defer restored_old.deinit(testing.allocator);
+    var restored_new = try r_new.restore(testing.allocator);
+    defer restored_new.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), restored_old.history.len);
+    try testing.expectEqual(@as(usize, 2), restored_new.history.len);
+    try testing.expectEqualStrings(restored_old.history[0].compacted_summary.summary, restored_new.history[0].compacted_summary.summary);
+    const old_steps = restored_old.history[1].interrupted.execution.tool_steps;
+    const new_steps = restored_new.history[1].interrupted.execution.tool_steps;
+    try testing.expectEqual(@as(usize, 3), old_steps.len);
+    try testing.expectEqual(old_steps.len, new_steps.len);
+    for (old_steps, new_steps) |os, ns| {
+        try testing.expectEqualStrings(os.assistant.?, ns.assistant.?);
+        try testing.expectEqualStrings(os.tool_calls[0].id, ns.tool_calls[0].id);
+        try testing.expectEqualStrings(os.tool_results[0].output, ns.tool_results[0].output);
+    }
+
+    const PostVisitor = struct {
+        turns: std.ArrayList(types.HistoryTurn) = .empty,
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.turns.append(testing.allocator, try types.dupeHistoryTurn(testing.allocator, turn));
+        }
+        fn deinit(self: *@This()) void {
+            for (self.turns.items) |turn| types.freeHistoryTurn(testing.allocator, turn);
+            self.turns.deinit(testing.allocator);
+        }
+    };
+    var v_old: PostVisitor = .{};
+    defer v_old.deinit();
+    var v_new: PostVisitor = .{};
+    defer v_new.deinit();
+    try testing.expect(!try r_old.visitHistorySinceCompaction(testing.allocator, &v_old));
+    try testing.expect(!try r_new.visitHistorySinceCompaction(testing.allocator, &v_new));
+    try testing.expectEqual(@as(usize, 1), v_old.turns.items.len);
+    try testing.expectEqual(@as(usize, 1), v_new.turns.items.len);
+    const p_old = v_old.turns.items[0].interrupted.execution.tool_steps;
+    const p_new = v_new.turns.items[0].interrupted.execution.tool_steps;
+    try testing.expectEqual(@as(usize, 4), p_old.len);
+    try testing.expectEqual(p_old.len, p_new.len);
+    for (p_old, p_new) |os, ns| {
+        try testing.expectEqualStrings(os.assistant.?, ns.assistant.?);
+        try testing.expectEqualStrings(os.tool_calls[0].id, ns.tool_calls[0].id);
+    }
+}
+
+test "visitHistoryCycleWithMode skips earlier compactions inside the same split turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c_json = try jsonValue(a, CompactedData{ .summary = "mid", .removed_turn_count = 0, .compaction_count = 1 });
+    const turn_end = try encodePiece(a, .{ .turn_completed = .{} });
+    const id = "1786460757754-multi-split";
+    const imp = try t.store.manager.openImport(.{ .id = id, .workspace = "/w", .host = .ask, .created_ms = 1000 });
+    _ = try imp.appendAt(&.{
+        .turn_started,
+        .{ .item = .{ .type = "user", .data = try encodePiece(a, .{ .user = .{ .text = "zero" } }) } },
+        .{ .item = .{ .type = "assistant", .data = try encodePiece(a, .{ .assistant = .{ .text = "zero_ans" } }) } },
+        .{ .item = .{ .type = "turn_end", .data = turn_end } },
+        .turn_committed,
+        .turn_started,
+        .{ .item = .{ .type = "user", .data = try encodePiece(a, .{ .user = .{ .text = "multi_split_prompt" } }) } },
+        .{ .item = .{ .type = "assistant", .data = try encodePiece(a, .{ .assistant = .{ .text = "part_1" } }) } },
+        .{ .item = .{ .type = "tool_call", .data = try encodePiece(a, .{ .tool_call = .{ .call_id = "c1", .tool_name = "read_file", .arguments_json = "{\"path\":\"1.txt\"}" } }) } },
+        .{ .item = .{ .type = "tool_result", .data = try encodePiece(a, resultEvent("c1", "one\n", 100)) } },
+        .{ .compacted = c_json },
+        .{ .item = .{ .type = "assistant", .data = try encodePiece(a, .{ .assistant = .{ .text = "part_2" } }) } },
+        .{ .item = .{ .type = "tool_call", .data = try encodePiece(a, .{ .tool_call = .{ .call_id = "c2", .tool_name = "read_file", .arguments_json = "{\"path\":\"2.txt\"}" } }) } },
+        .{ .item = .{ .type = "tool_result", .data = try encodePiece(a, resultEvent("c2", "two\n", 200)) } },
+        .{ .compacted = c_json },
+        .{ .item = .{ .type = "assistant", .data = try encodePiece(a, .{ .assistant = .{ .text = "part_3" } }) } },
+        .{ .item = .{ .type = "tool_call", .data = try encodePiece(a, .{ .tool_call = .{ .call_id = "c3", .tool_name = "read_file", .arguments_json = "{\"path\":\"3.txt\"}" } }) } },
+        .{ .item = .{ .type = "tool_result", .data = try encodePiece(a, resultEvent("c3", "three\n", 300)) } },
+        .{ .compacted = c_json },
+    }, 2000);
+    try imp.publishImport();
+    imp.release();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    const Visitor = struct {
+        turns: std.ArrayList(types.HistoryTurn) = .empty,
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.turns.append(testing.allocator, try types.dupeHistoryTurn(testing.allocator, turn));
+        }
+        fn deinit(self: *@This()) void {
+            for (self.turns.items) |turn| types.freeHistoryTurn(testing.allocator, turn);
+            self.turns.deinit(testing.allocator);
+        }
+    };
+    const newest = (try r.previousCompactionCursor(testing.allocator, null)).cursor.?;
+    const prev_2 = (try r.previousCompactionCursor(testing.allocator, newest)).cursor.?;
+    var cycles = try r.cycleReader(testing.allocator);
+    defer cycles.deinit();
+    var visitor: Visitor = .{};
+    defer visitor.deinit();
+    try testing.expect(!try cycles.visitHistoryCycleWithMode(testing.allocator, prev_2, true, &visitor));
+    try testing.expectEqual(@as(usize, 1), visitor.turns.items.len);
+    const split = visitor.turns.items[0].assistant;
+    try testing.expectEqual(@as(usize, 3), split.execution.tool_steps.len);
+    try testing.expectEqualStrings("part_1", split.execution.tool_steps[0].assistant.?);
+    try testing.expectEqualStrings("part_2", split.execution.tool_steps[1].assistant.?);
+    try testing.expectEqualStrings("part_3", split.execution.tool_steps[2].assistant.?);
 }
 
 test "the history visit shows every turn, even those a compaction summarized" {

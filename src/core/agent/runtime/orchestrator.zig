@@ -4705,13 +4705,21 @@ const CompactionSource = struct {
         const self: *CompactionSource = @ptrCast(@alignCast(context));
         const deps = self.deps;
         const job = self.job;
-        const effect = deps.recovery_checkpoint orelse return;
         const execution = try runtime_execution_memory.buildExecutionMemory(self.arena, self.current_turn_messages);
+        const projected = try self.finalization.persistedExecution(self.arena, execution);
+        const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id };
+        if (deps.append_turn_piece) |append| try append(deps.ctx, .{
+            .user = user,
+            .execution = projected,
+            .saved_execution = self.finalization.savedExecution(execution),
+            .recovery_record = .keep,
+        });
+        const effect = deps.recovery_checkpoint orelse return;
         try effect.set(deps.ctx, .{
             .turn_id = job.turn_id,
-            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
+            .user = user,
             .assistant_source = @constCast(""),
-            .execution = try self.finalization.persistedExecution(self.arena, execution),
+            .execution = projected,
             .cause = .compaction_prepared,
             .action = if (self.tool_evidence == .confirmed) .continuing_after_tool else .retrying_request,
             .tool_state = checkpointToolState(self.tool_evidence),
@@ -4855,6 +4863,133 @@ test "running tool calls reach append_turn_piece before they run" {
     // A step with no calls sends nothing.
     try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &.{});
     try std.testing.expectEqual(@as(usize, 1), sink.appends);
+}
+
+test "mid-turn compaction writes finished turn pieces to append_turn_piece before commit_context_compaction" {
+    const support = @import("tests/support.zig");
+    const Host = struct {
+        fake: support.FakeAgentRuntimeDeps,
+        events: std.ArrayList([]u8) = .empty,
+        fail_flush_with_steps: ?usize = null,
+        compaction_calls: usize = 0,
+        stream_calls: usize = 0,
+        calls: [1]ToolCall = .{.{ .id = "call_step_1", .name = "read_file", .arguments_json = "{\"path\":\"step1.txt\"}" }},
+
+        fn from(raw: *anyopaque) *@This() {
+            const fake: *support.FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+            return @fieldParentPtr("fake", fake);
+        }
+        fn deinit(self: *@This()) void {
+            for (self.events.items) |ev| self.fake.alloc.free(ev);
+            self.events.deinit(self.fake.alloc);
+        }
+        fn appendPiece(raw: *anyopaque, progress: runtime_deps.TurnProgress) !void {
+            const self = from(raw);
+            const exec = progress.saved_execution orelse progress.execution;
+            if (self.fail_flush_with_steps) |target| {
+                if (exec.tool_steps.len == target and progress.running_calls.len == 0) {
+                    return error.TestPersistenceFailure;
+                }
+            }
+            const label = try self.fake.alloc.print(
+                "piece:steps={d}:running={d}",
+                .{ exec.tool_steps.len, progress.running_calls.len },
+            );
+            try self.events.append(self.fake.alloc, label);
+        }
+        fn commit(raw: *anyopaque, _: types.CompactedSummaryHistoryTurn, _: ?types.AssistantHistoryTurn, _: ?types.ContextHistoryCut) !void {
+            const self = from(raw);
+            self.compaction_calls += 1;
+            try self.events.append(self.fake.alloc, try self.fake.alloc.dupe(u8, "compacted"));
+        }
+        fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            request.delivery.markPossiblySent();
+            self.stream_calls += 1;
+            if (request.tools.advertised_names.len == 0 and request.tool_choice == .none) {
+                return .{ .completed = .{ .completion = .{ .content = "Facts:\nF1: compacted", .finish_reason = .stop } } };
+            }
+            if (self.stream_calls == 1) {
+                return .{ .completed = .{ .completion = .{
+                    .content = try alloc.dupe(u8, text_utils.repeat("step1 ", 12_000)),
+                    .tool_calls = try alloc.dupe(ToolCall, &self.calls),
+                    .finish_reason = .tool_calls,
+                } } };
+            }
+            return .{ .completed = .{ .completion = .{ .content = try alloc.dupe(u8, "DONE"), .finish_reason = .stop } } };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    // 1. Pre-compaction finished step reaches append_turn_piece before commit_context_compaction.
+    {
+        var fixture: support.PromptFixture = .{};
+        var host: Host = .{ .fake = support.FakeAgentRuntimeDeps.init(alloc) };
+        defer host.fake.deinit();
+        defer host.deinit();
+        const model = "provider/midturn-flush";
+        host.fake.available_capability_overrides = &.{.{ .model = model, .capabilities = .{ .context_window = 28_000 } }};
+        const plans = [_]support.FakeExecPlan{.{ .result = .{ .model_output = "step 1 file contents\n" } }};
+        host.fake.exec_plans = &plans;
+
+        var gateway = support.FakeGateway.init(alloc, &.{});
+        defer gateway.deinit();
+        var deps = host.fake.deps();
+        deps.agent_stream_provider = gateway.provider();
+        deps.agent_stream_provider.context = &host;
+        deps.agent_stream_provider.stream_fn = Host.stream;
+        deps.append_turn_piece = Host.appendPiece;
+        deps.commit_context_compaction = .{ .commit = Host.commit };
+
+        var job = fixture.job();
+        job.model = @constCast(model);
+        var agent: runtime_agent.Agent = .{};
+        defer agent.deinit(alloc);
+        try processAgentPrompt(&agent, &deps, null, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, fixture.config().workspace_root), fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 1), host.compaction_calls);
+        var saw_step1_before_compacted = false;
+        var saw_compacted = false;
+        for (host.events.items) |ev| {
+            if (std.mem.eql(u8, ev, "compacted")) {
+                saw_compacted = true;
+                break;
+            }
+            if (std.mem.eql(u8, ev, "piece:steps=1:running=0")) saw_step1_before_compacted = true;
+        }
+        try std.testing.expect(saw_compacted);
+        try std.testing.expect(saw_step1_before_compacted);
+    }
+
+    // 2. If pre-compaction append_turn_piece fails, compaction aborts before commit_context_compaction.
+    {
+        var fixture: support.PromptFixture = .{};
+        var host: Host = .{ .fake = support.FakeAgentRuntimeDeps.init(alloc), .fail_flush_with_steps = 1 };
+        defer host.fake.deinit();
+        defer host.deinit();
+        const model = "provider/midturn-flush-fail";
+        host.fake.available_capability_overrides = &.{.{ .model = model, .capabilities = .{ .context_window = 28_000 } }};
+        const plans = [_]support.FakeExecPlan{.{ .result = .{ .model_output = "step 1 file contents\n" } }};
+        host.fake.exec_plans = &plans;
+
+        var gateway = support.FakeGateway.init(alloc, &.{});
+        defer gateway.deinit();
+        var deps = host.fake.deps();
+        deps.agent_stream_provider = gateway.provider();
+        deps.agent_stream_provider.context = &host;
+        deps.agent_stream_provider.stream_fn = Host.stream;
+        deps.append_turn_piece = Host.appendPiece;
+        deps.commit_context_compaction = .{ .commit = Host.commit };
+
+        var job = fixture.job();
+        job.model = @constCast(model);
+        var agent: runtime_agent.Agent = .{};
+        defer agent.deinit(alloc);
+        const result = processAgentPrompt(&agent, &deps, null, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, fixture.config().workspace_root), fixture.config(), job);
+        try std.testing.expectError(error.TestPersistenceFailure, result);
+        try std.testing.expectEqual(@as(usize, 0), host.compaction_calls);
+    }
 }
 
 /// Shows a settled call in Ctrl+O as it happens and keeps it with the turn,

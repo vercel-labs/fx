@@ -14829,6 +14829,171 @@ test "failed strict or visual_epoch history write marks turn_piece_save_failed s
     }
 }
 
+test "Ctrl+O after a mid-turn compaction through the orchestrator shows every step with no gap" {
+    const support = @import("../agent/runtime/tests/support.zig");
+    const agent_stream_provider = @import("../agent/stream_provider.zig");
+    const hooks = @import("../hooks/hooks.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try ArchiveTestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(ArchiveTestApp).initializePersistence(&app, app.agent(), true);
+    try Runtime(ArchiveTestApp).beginFresh(&app, app.agent(), .later, null);
+    defer Runtime(ArchiveTestApp).closeWritableSession(&app, app.agent());
+
+    try Runtime(ArchiveTestApp).appendHistoryTurn(&app, app.agent(), .{ .assistant = .{
+        .user = .{ .text = @constCast("PRIOR_TURN_PROMPT") },
+        .assistant = @constCast("PRIOR_TURN_ANSWER"),
+    } });
+    try app.shell.enableTranscriptWindow(alloc, true);
+
+    const Host = struct {
+        app: *ArchiveTestApp,
+        fake: support.FakeAgentRuntimeDeps,
+        turn_calls: usize = 0,
+        calls: [3]types.ToolCall = .{
+            .{ .id = "call_s1", .name = "read_file", .arguments_json = "{\"path\":\"s1.txt\"}" },
+            .{ .id = "call_s2", .name = "read_file", .arguments_json = "{\"path\":\"s2.txt\"}" },
+            .{ .id = "call_s3", .name = "read_file", .arguments_json = "{\"path\":\"s3.txt\"}" },
+        },
+
+        fn from(raw: *anyopaque) *@This() {
+            const fake: *support.FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+            return @fieldParentPtr("fake", fake);
+        }
+        fn appendPiece(raw: *anyopaque, progress: agent_runtime.TurnProgress) !void {
+            try Runtime(ArchiveTestApp).appendTurnPiece(from(raw).app.agent(), progress);
+        }
+        fn commitCompaction(raw: *anyopaque, summary: types.CompactedSummaryHistoryTurn, active_prefix: ?types.AssistantHistoryTurn, retained_from: ?types.ContextHistoryCut) !void {
+            const self = from(raw);
+            try Runtime(ArchiveTestApp).commitContextCompaction(self.app, self.app.agent(), summary, active_prefix, retained_from);
+        }
+        fn stream(raw: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            request.delivery.markPossiblySent();
+            if (request.tools.advertised_names.len == 0 and request.tool_choice == .none) {
+                return .{ .completed = .{ .completion = .{ .content = "Facts:\nF1: compacted mid-turn", .finish_reason = .stop }, .ownership = .borrowed } };
+            }
+            if (request.messages.len > 0) {
+                const last = request.messages[request.messages.len - 1];
+                if (last.content) |text| if (std.mem.find(u8, text, "facts the work depends on") != null) {
+                    return .{ .completed = .{ .completion = .{ .content = "Facts:\nF1: compacted mid-turn", .finish_reason = .stop }, .ownership = .borrowed } };
+                };
+            }
+            self.turn_calls += 1;
+            var metrics: types.Metrics = .{};
+            switch (self.turn_calls) {
+                1 => {
+                    _ = try self.app.shell.appendRawTranscriptEntryClassified(self.app.alloc, "STEP_1_MARKER\n", .unknown_raw);
+                    return .{ .completed = .{ .completion = .{
+                        .content = "STEP_1_MARKER " ++ text_utils.repeat("step1 ", 1_800),
+                        .tool_calls = self.calls[0..1],
+                        .finish_reason = .tool_calls,
+                    }, .ownership = .borrowed } };
+                },
+                2 => {
+                    _ = try self.app.shell.appendRawTranscriptEntryClassified(self.app.alloc, "STEP_2_MARKER\n", .unknown_raw);
+                    return .{ .completed = .{ .completion = .{
+                        .content = "STEP_2_MARKER " ++ text_utils.repeat("step2 ", 12_000),
+                        .tool_calls = self.calls[1..2],
+                        .finish_reason = .tool_calls,
+                    }, .ownership = .borrowed } };
+                },
+                3 => {
+                    _ = try self.app.shell.appendRawTranscriptEntryClassified(self.app.alloc, "STEP_3_MARKER\n", .unknown_raw);
+                    return .{ .completed = .{ .completion = .{
+                        .content = "STEP_3_MARKER",
+                        .tool_calls = self.calls[2..3],
+                        .finish_reason = .tool_calls,
+                    }, .ownership = .borrowed } };
+                },
+                else => {
+                    _ = try self.app.shell.appendRawTranscriptEntryClassified(self.app.alloc, "TURN_DONE_MARKER\n", .unknown_raw);
+                    _ = &metrics;
+                    return .{ .completed = .{ .completion = .{ .content = "TURN_DONE_MARKER", .finish_reason = .stop }, .ownership = .borrowed } };
+                },
+            }
+        }
+    };
+
+    var host: Host = .{ .app = &app, .fake = support.FakeAgentRuntimeDeps.init(alloc) };
+    defer host.fake.deinit();
+    const model = "provider/orch-ctrl-o";
+    host.fake.available_capability_overrides = &.{.{ .model = model, .capabilities = .{ .context_window = 28_000 } }};
+    const plans = [_]support.FakeExecPlan{
+        .{ .result = .{ .model_output = "file 1 contents\n" } },
+        .{ .result = .{ .model_output = "file 2 contents\n" } },
+        .{ .result = .{ .model_output = "file 3 contents\n" } },
+    };
+    host.fake.exec_plans = &plans;
+
+    var gateway = support.FakeGateway.init(alloc, &.{});
+    defer gateway.deinit();
+    var deps = host.fake.deps();
+    deps.agent_stream_provider = gateway.provider();
+    deps.agent_stream_provider.context = &host;
+    deps.agent_stream_provider.stream_fn = Host.stream;
+    deps.append_turn_piece = Host.appendPiece;
+    deps.commit_context_compaction = .{ .commit = Host.commitCompaction };
+
+    var metrics: types.Metrics = .{};
+    const prompt_text = try alloc.dupe(u8, "ORCH_SPLIT_PROMPT");
+    defer alloc.free(prompt_text);
+    _ = try app.shell.writeUserPromptCard(alloc, &metrics, .{ .text = prompt_text }, false, &.{});
+
+    var fixture: support.PromptFixture = .{};
+    var job = fixture.job();
+    job.prompt = prompt_text;
+    job.model = @constCast(model);
+    job.history = app.agent().session.agent.history.items;
+    try agent_runtime.processAgentPrompt(&app.agent().session.agent, &deps, null, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, paths.workspace), fixture.config(), job);
+    _ = try app.shell.appendTurnSummaryEntry(alloc, .{ .turn_duration_ms = 500 });
+    Runtime(ArchiveTestApp).syncTranscriptArchiveAvailable(&app, app.agent());
+
+    _ = app.shell.requestFullTranscriptOpen();
+    try Runtime(ArchiveTestApp).loadTranscriptArchive(&app, app.agent(), 1);
+    var polls: usize = 0;
+    while (!try Runtime(ArchiveTestApp).pollTranscriptArchive(&app, app.agent())) {
+        polls += 1;
+        if (polls > 5_000) return error.TranscriptArchiveReadTimedOut;
+        io_mod.sleep(1_000_000);
+    }
+
+    var page = try app.shell.snapshotFullTranscriptPage(.{ .anchor = .tail, .content_revision = 0, .cols = 80 }, null, null);
+    defer page.deinit(std.heap.c_allocator);
+
+    var combined: std.ArrayList(u8) = .empty;
+    defer combined.deinit(alloc);
+    for (page.entries.items) |entry| switch (entry) {
+        .user_turn => |u| try combined.appendSlice(alloc, u.turn.text),
+        .assistant_turn => |t| try combined.appendSlice(alloc, t.segments.text.items),
+        .raw_bytes => |r| try combined.appendSlice(alloc, r.bytes),
+        else => {},
+    };
+    for (app.shell.notebook.entries.items) |entry| switch (entry) {
+        .user_turn => |u| try combined.appendSlice(alloc, u.turn.text),
+        .assistant_turn => |t| try combined.appendSlice(alloc, t.segments.text.items),
+        .raw_bytes => |r| try combined.appendSlice(alloc, r.bytes),
+        else => {},
+    };
+
+    try std.testing.expect(std.mem.find(u8, combined.items, "ORCH_SPLIT_PROMPT") != null);
+    try std.testing.expect(std.mem.find(u8, combined.items, "STEP_1_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, combined.items, "STEP_2_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, combined.items, "STEP_3_MARKER") != null);
+}
+
 fn holdsPromptText(entries: []const transcript_runtime.TranscriptEntry, needle: []const u8) bool {
     for (entries) |entry| switch (entry) {
         .user_turn => |u| if (std.mem.find(u8, u.turn.text, needle) != null) return true,

@@ -30,8 +30,8 @@ function filler(reply: number, bytes: number): string {
 
 type Session = Awaited<ReturnType<typeof TmuxSession.create>>;
 
-async function waitFor(check: () => boolean, what: string, refresh?: () => Promise<void>) {
-  const deadline = Date.now() + TIMEOUT;
+async function waitFor(check: () => boolean, what: string, refresh?: () => Promise<void>, timeoutMs = TIMEOUT) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await refresh?.();
     if (check()) return;
@@ -375,5 +375,164 @@ describe.skipIf(!tmuxAvailable())("tui: transcript window", () => {
       }
     },
     180_000,
+  );
+
+  test(
+    "Ctrl+O shows every step number with no gaps after one and two mid-turn compactions",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-two-compact-steps-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      for (let i = 1; i <= 40; i += 1) {
+        writeFileSync(join(workspace, `f${String(i).padStart(2, "0")}.txt`), `file ${i} contents\n`);
+      }
+
+      const TAIL = "X".repeat(120);
+      const stepPadding = (n: number) =>
+        Array.from({ length: 48 }, (_, i) => `S${n}L${String(i).padStart(3, "0")}: ${TAIL}`).join("\n");
+
+      let step = 0;
+      let compactions = 0;
+      const compactedAt: number[] = [];
+      let paused: { at: number; release: () => void } | null = null;
+      let pauseRule: ((nextStep: number) => boolean) | null = (next) => compactions >= 1 && next >= (compactedAt[0] ?? 999) + 3;
+      let session: Session | null = null;
+
+      const gateway = startDynamicFakeGateway(
+        async (raw) => {
+          const req = JSON.parse(raw);
+          const isCompactor =
+            (req.toolChoice?.type === "none" && req.tools?.length === 0) ||
+            raw.includes("facts the work depends on") ||
+            raw.includes("Write only these notes.") ||
+            raw.includes("Your notes left out the summary of the earlier compacted conversation") ||
+            raw.includes("Your notes on the turns above left some out");
+          if (isCompactor) {
+            compactions += 1;
+            compactedAt.push(step);
+            return fakeGatewayFinalText(
+              `Rules:\nnone\nFacts:\nF1: compacted at ${step}\nDecisions:\nnone\nStatus:\nnone\nOpen:\nnone\nEarlier:\nCompacted earlier steps at ${step}.`,
+            );
+          }
+          const approxTokens = Math.max(500, Math.round(raw.length / 4));
+          if (compactions < 2 || step < (compactedAt[1] ?? 999) + 3) {
+            if (pauseRule && pauseRule(step + 1)) {
+              pauseRule = null;
+              await new Promise<void>((r) => (paused = { at: step + 1, release: r }));
+              paused = null;
+            }
+            const lastCompactedStep = compactedAt[compactedAt.length - 1] ?? 0;
+            if (step > lastCompactedStep && session) {
+              await session.waitForText(`STEP_${step}_DONE`, TIMEOUT);
+            }
+            step += 1;
+            const n = step;
+            const f = `f${String(Math.min(n, 40)).padStart(2, "0")}.txt`;
+            return fakeGatewaySse([
+              { type: "text-delta", id: `t_${n}`, delta: `MID_STEP_${n}: ${stepPadding(n)}\nSTEP_${n}_DONE\n` },
+              { type: "tool-call", toolCallId: `c_${n}`, toolName: "read_file", input: { path: f } },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: { inputTokens: { total: approxTokens }, outputTokens: { total: 3000 } },
+              },
+            ]);
+          }
+          return fakeGatewayFinalText("TWO_COMPACTIONS_COMPLETE");
+        },
+        {
+          models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 24_000, max_tokens: 4096 }],
+        },
+      );
+
+      writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+        provider: "gateway",
+        model: FAKE_GATEWAY_MODEL,
+        auto_upgrade: false,
+        startup_scrollback: false,
+        session_titles: false,
+        max_agent_steps: 0,
+      }));
+
+      const tracePath = join(root, "trace.log");
+      const env: Record<string, string | undefined> = {
+        HOME: home,
+        TERM: "xterm-256color",
+        NO_COLOR: "1",
+        AI_GATEWAY_API_KEY: "fake-two-compact-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "full-access",
+        FX_SOUND: "0",
+        FX_MAX_AGENT_STEPS: "0",
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "transcript_window,compaction",
+      };
+
+      const checkCtrlOSteps = async (expectedPrompt: string, expectedMaxStep: number) => {
+        await session!.sendHexBytes(["0f"]);
+        await session!.waitForText(NAVIGATION, TIMEOUT);
+        let page = await session!.capturePane();
+        const pages = [page];
+        for (let stuck = 0, presses = 0; stuck < 3 && presses < 300; presses += 1) {
+          const stepRes = await press(session!, "PageUp", page);
+          stuck = stepRes.moved ? 0 : stuck + 1;
+          page = stepRes.pane;
+          pages.push(page);
+        }
+        const full = pages.join("\n");
+        expect(full).toContain(expectedPrompt);
+        const found = new Set([...full.matchAll(/MID_STEP_(\d+):/g)].map((m) => Number(m[1])));
+        const missing: number[] = [];
+        for (let i = 1; i <= expectedMaxStep; i += 1) {
+          if (!found.has(i)) missing.push(i);
+        }
+        expect(missing).toEqual([]);
+        await session!.sendHexBytes(["0f"]);
+        await session!.waitForComposer(TIMEOUT);
+      };
+
+      session = await TmuxSession.create({ cmd: binary, cwd: workspace, env, width: 120, height: 28, isolated: true });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("TWO_COMPACT_PROMPT_MARKER: run steps");
+
+        // Pause after compaction 1 + 2 post-compaction steps.
+        await waitFor(() => paused !== null, "pause after first mid-turn compaction", undefined, 120_000);
+        await waitFor(
+          () => existsSync(tracePath) && /\[transcript_window\] dropped entries=\d+/.test(readFileSync(tracePath, "utf8")),
+          "first mid-turn drop",
+        );
+        await checkCtrlOSteps("TWO_COMPACT_PROMPT_MARKER", step);
+
+        // Continue until compaction 2 + 2 post-compaction steps.
+        const dropsAfter1 = readFileSync(tracePath, "utf8").split("\n").filter((l) => l.includes("dropped entries=")).length;
+        pauseRule = (next) => compactions >= 2 && next >= (compactedAt[1] ?? 999) + 3;
+        paused!.release();
+        await waitFor(() => paused !== null, "pause after second mid-turn compaction", undefined, 120_000);
+        await waitFor(
+          () => readFileSync(tracePath, "utf8").split("\n").filter((l) => l.includes("dropped entries=")).length > dropsAfter1,
+          "second mid-turn drop",
+        );
+        await checkCtrlOSteps("TWO_COMPACT_PROMPT_MARKER", step);
+
+        paused!.release();
+        await session.waitForPane((pane) => pane.includes("TWO_COMPACTIONS_COMPLETE") && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
+        await checkCtrlOSteps("TWO_COMPACT_PROMPT_MARKER", step);
+      } finally {
+        paused?.release();
+        await session.kill();
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    240_000,
   );
 });
