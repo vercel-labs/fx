@@ -651,7 +651,7 @@ pub fn Handlers(comptime App: type) type {
                     closeHelpMenuIfPresent(app);
                     app.input_runtime.settings_menu.close();
                     closeInlineCommandMenusIfPresent(app);
-                    try app.input_runtime.effort_menu.open(app.alloc, provider_runtime.modelOf(app, agent), capabilities, agent.effort);
+                    try app.input_runtime.openEffortMenu(app.alloc, provider_runtime.modelOf(app, agent), capabilities, agent.effort);
                     app.shell.render_requests.request(.footer);
                 },
             }
@@ -1342,7 +1342,7 @@ pub fn Handlers(comptime App: type) type {
             if (comptime @hasField(InputRuntime, "info_panel")) app.input_runtime.info_panel.close();
             if (comptime @hasField(InputRuntime, "usage_menu")) closeUsageMenu(app);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
-            if (comptime @hasField(InputRuntime, "effort_menu")) app.input_runtime.effort_menu.close(app.alloc);
+            if (comptime @hasDecl(InputRuntime, "cancelEffortMenu")) _ = app.input_runtime.cancelEffortMenu(app.alloc, "command_menu_opened");
         }
 
         fn commandCopyLast(ctx: *anyopaque) !void {
