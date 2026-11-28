@@ -5974,6 +5974,10 @@ pub fn Runtime(comptime App: type) type {
                 host.owner_has_parent = agent.role == .subagent;
                 host.authority_resolver.children_nest = agent.role != .subagent;
                 if (comptime runtime_profile.allows(App, .auto_upgrade)) {
+                    // Saves the continuations before the reports below, so
+                    // the fold skips the works they replace. Their slots start
+                    // from the main loop (`takePosts`): this can run inside
+                    // `App.init`, before the app moves.
                     host.continueYieldedWorks();
                 }
                 // What a restart left owed reaches this agent now.

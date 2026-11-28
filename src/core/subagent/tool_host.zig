@@ -513,6 +513,11 @@ pub const Runtime = struct {
     closed_unseen: std.ArrayList([]u8) = .empty,
     /// Whether `closed_unseen` holds a child, read without the lock.
     closed_waiting: std.atomic.Value(bool) = .init(false),
+    /// Continuations `continueYieldedWorks` saved whose slots have not
+    /// started yet, until `startHeldContinues`. Guarded by `admission_mutex`.
+    held_continues: std.ArrayList(HeldContinue) = .empty,
+    /// Whether `held_continues` holds one, read without the lock.
+    continues_held: std.atomic.Value(bool) = .init(false),
     /// Messages waiting for a starting work's turn to begin. A close of
     /// their child marks them, so the message is refused instead of
     /// outliving the close. Guarded by `admission_mutex`.
@@ -606,6 +611,13 @@ pub const Runtime = struct {
         self.closing.deinit(self.alloc);
         for (self.closed_unseen.items) |id| self.alloc.free(id);
         self.closed_unseen.deinit(self.alloc);
+        // Its work stays open in the log: the next open ends it interrupted
+        // (D1) and continues the yielded turn again.
+        for (self.held_continues.items) |*held| {
+            debug_trace.eventf("mailbox", "continue_dropped", .{}, "child={s} work_id={s} reason=host_closed", .{ held.child_id, held.work_id });
+            held.deinit(self.alloc);
+        }
+        self.held_continues.deinit(self.alloc);
         self.start_waits.deinit(self.alloc);
         if (self.held_wait_id) |id| self.alloc.free(id);
         self.usage_ledger.deinit(self.alloc);
@@ -1772,7 +1784,7 @@ pub const Runtime = struct {
 
     /// Continues each open persistent child whose last work ended `cancelled`
     /// or `interrupted` while its turn was yielded, saving a continuation work
-    /// that replaces the stopped one and starting its slot in continue mode.
+    /// that replaces the stopped one. Its slot waits for `startHeldContinues`.
     /// Call right after `Runtime.create` and before `resumeReports`.
     pub fn continueYieldedWorks(self: *Runtime) void {
         if (comptime host_target.is_wasm) return;
@@ -1855,28 +1867,62 @@ pub const Runtime = struct {
             };
         }
 
-        if (self.startContinueWorkLocked(child.id, new_work_id)) |err| {
-            const ended = if (self.managed.endUnstarted(child.id, new_work_id, err, true)) |end| done: {
-                end.deinit(self.alloc);
-                break :done true;
-            } else false;
-            debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} work_id={s} error={s} ended={}", .{ child.id, new_work_id, @errorName(err), ended });
+        self.holdContinueLocked(child.id, old_work_id, new_work_id) catch |err| {
+            self.endUnstartedContinue(child.id, new_work_id, err);
             return;
-        }
-        debug_trace.eventf("mailbox", "continue_yielded", .{}, "child={s} old_work_id={s} work_id={s} reason=continue_yielded", .{ child.id, old_work_id, new_work_id });
+        };
+        debug_trace.eventf("mailbox", "continue_held", .{}, "child={s} old_work_id={s} work_id={s}", .{ child.id, old_work_id, new_work_id });
     }
 
-    fn startContinueWorkLocked(self: *Runtime, child_id: []const u8, work_id: []const u8) ?anyerror {
+    /// Keeps a saved continuation for `startHeldContinues`. Its child is busy
+    /// from now on, so a message sent before the slot starts waits for it.
+    fn holdContinueLocked(self: *Runtime, child_id: []const u8, old_work_id: []const u8, work_id: []const u8) !void {
+        const child_copy = try self.alloc.dupe(u8, child_id);
+        errdefer self.alloc.free(child_copy);
+        const old_copy = try self.alloc.dupe(u8, old_work_id);
+        errdefer self.alloc.free(old_copy);
+        const work_copy = try self.alloc.dupe(u8, work_id);
+        errdefer self.alloc.free(work_copy);
+        try self.held_continues.ensureUnusedCapacity(self.alloc, 1);
         self.markBusyLocked(child_id) catch |err| {
             debug_trace.eventf("mailbox", "start_blocked", .{}, "child={s} work_id={s} error={s} stage=busy", .{ child_id, work_id, @errorName(err) });
             return err;
         };
-        _ = self.managed.startContinue(child_id) catch |err| {
-            debug_trace.eventf("mailbox", "start_blocked", .{}, "child={s} work_id={s} error={s} stage=spawn", .{ child_id, work_id, @errorName(err) });
-            self.clearBusyLocked(child_id);
-            return err;
-        };
-        return null;
+        self.held_continues.appendAssumeCapacity(.{ .child_id = child_copy, .old_work_id = old_copy, .work_id = work_copy });
+        self.continues_held.store(true, .release);
+    }
+
+    /// Starts the slots of the continuations `continueYieldedWorks` saved, in
+    /// continue mode. The app calls it from its main loop, because a slot
+    /// reaches the app through `child_runner.context`: `App.init` opens the
+    /// host on a local that it then copies (`rebindHost`), and a slot started
+    /// before the copy would hand its turn to the local, which no loop reads.
+    pub fn startHeldContinues(self: *Runtime) void {
+        if (!self.continues_held.load(.acquire)) return;
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        for (self.held_continues.items) |*held| {
+            defer held.deinit(self.alloc);
+            _ = self.managed.startContinue(held.child_id) catch |err| {
+                debug_trace.eventf("mailbox", "start_blocked", .{}, "child={s} work_id={s} error={s} stage=spawn", .{ held.child_id, held.work_id, @errorName(err) });
+                self.clearBusyLocked(held.child_id);
+                self.endUnstartedContinue(held.child_id, held.work_id, err);
+                continue;
+            };
+            debug_trace.eventf("mailbox", "continue_yielded", .{}, "child={s} old_work_id={s} work_id={s} reason=continue_yielded", .{ held.child_id, held.old_work_id, held.work_id });
+        }
+        self.held_continues.clearRetainingCapacity();
+        self.continues_held.store(false, .release);
+    }
+
+    /// Ends a continuation whose slot did not start, as any unstarted work
+    /// ends: it owes its report.
+    fn endUnstartedContinue(self: *Runtime, child_id: []const u8, work_id: []const u8, err: anyerror) void {
+        const ended = if (self.managed.endUnstarted(child_id, work_id, err, true)) |end| done: {
+            end.deinit(self.alloc);
+            break :done true;
+        } else false;
+        debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} work_id={s} error={s} ended={}", .{ child_id, work_id, @errorName(err), ended });
     }
 
     /// Posts the reports `session`'s log still owes its owner, oldest first,
@@ -4589,19 +4635,14 @@ fn markChildTurnYielded(alloc: Allocator, parent: *child_state.TestParent, child
     try std.testing.expectEqual(true, try child.markYielded());
 }
 
-test "continueYieldedWorks continues a cancelled child with yielded turn and saved admission, and suppresses old report" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var parent: child_state.TestParent = undefined;
-    try parent.init(alloc);
-    defer parent.deinit();
-
-    const child_id, const old_work_id = blk: {
+/// A reviewer whose working turn yielded and whose work a quit then
+/// cancelled, with its admission saved: what a Ctrl+G restart leaves for the
+/// next open. Returns the child's id and the cancelled work's id, in `arena`.
+fn yieldedReviewer(alloc: Allocator, arena: Allocator, parent: *child_state.TestParent) !struct { []const u8, []const u8 } {
+    const child_id, const work_id = blk: {
         var fixture = MailboxFixture{ .hold = true };
         defer fixture.deinit();
-        const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+        const runtime = try mailboxRuntime(alloc, &fixture, parent);
         defer runtime.deinit();
 
         var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "working" } });
@@ -4627,7 +4668,19 @@ test "continueYieldedWorks continues a cancelled child with yielded turn and sav
         try waitUntilQuiet(runtime);
         break :blk .{ cid, wid };
     };
-    try markChildTurnYielded(alloc, &parent, child_id);
+    try markChildTurnYielded(alloc, parent, child_id);
+    return .{ child_id, work_id };
+}
+
+test "continueYieldedWorks continues a cancelled child with yielded turn and saved admission, and suppresses old report" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const child_id, const old_work_id = try yieldedReviewer(alloc, arena, &parent);
 
     var children2 = child_state.V2Children.init(alloc, parent.parent, parent.home);
     defer children2.deinit();
@@ -4638,6 +4691,7 @@ test "continueYieldedWorks continues a cancelled child with yielded turn and sav
     runtime2.report_sink = .{ .context = &fixture2, .post_fn = MailboxFixture.post };
 
     runtime2.continueYieldedWorks();
+    runtime2.startHeldContinues();
     try waitForRuns(&fixture2, 1);
 
     // A second call while the continuation runs saves nothing more.
@@ -4674,6 +4728,83 @@ test "continueYieldedWorks continues a cancelled child with yielded turn and sav
     try std.testing.expectEqual(true, fixture2.began_continues_yielded.items[0]);
     try std.testing.expectEqual(@as(usize, 1), fixture2.reportCount());
     try std.testing.expect(std.mem.find(u8, fixture2.reports.items[0], " completed ") != null);
+}
+
+test "a continuation's slot starts only from startHeldContinues, so it runs through the host's moved context" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const child_id, const old_work_id = try yieldedReviewer(alloc, arena, &parent);
+
+    // As `App.init` does: the host opens on a context that then moves.
+    var children2 = child_state.V2Children.init(alloc, parent.parent, parent.home);
+    defer children2.deinit();
+    var before = MailboxFixture{ .hold = true };
+    defer before.deinit();
+    var after = MailboxFixture{ .hold = true };
+    defer after.deinit();
+    const runtime2 = try Runtime.create(alloc, &children2, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = &before, .run_fn = MailboxFixture.run, .restarting_fn = MailboxFixture.restarting });
+    defer runtime2.deinit();
+    runtime2.report_sink = .{ .context = &before, .post_fn = MailboxFixture.post };
+
+    runtime2.continueYieldedWorks();
+    // The open saved the continuation and started no slot, which would run
+    // through the context that is about to move.
+    try std.testing.expect(!runtime2.managed.hasRunningChild(child_id));
+    {
+        var reg = try runtime2.managed.state_store.load(arena);
+        try std.testing.expectEqualStrings(old_work_id, reg.findById(child_id).?.active.?.replaces.?);
+    }
+
+    runtime2.rebindHost(&after, .{ .resolve_fn = MailboxFixture.resolve });
+    runtime2.startHeldContinues();
+    try std.testing.expect(runtime2.managed.hasRunningChild(child_id));
+    // A second call has nothing left to start.
+    runtime2.startHeldContinues();
+    try waitForRuns(&after, 1);
+
+    after.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime2);
+    try std.testing.expectEqual(@as(usize, 0), before.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), after.runs.load(.seq_cst));
+    try std.testing.expectEqual(true, after.began_continues_yielded.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), before.reportCount());
+    try std.testing.expectEqual(@as(usize, 1), after.reportCount());
+}
+
+test "a host closed before it starts its held continuations runs none and leaves the work open for the next open" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const child_id, _ = try yieldedReviewer(alloc, arena, &parent);
+
+    var children2 = child_state.V2Children.init(alloc, parent.parent, parent.home);
+    defer children2.deinit();
+    var fixture2 = MailboxFixture{ .hold = true };
+    defer fixture2.deinit();
+    const continuation_id = blk: {
+        const runtime2 = try Runtime.create(alloc, &children2, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = &fixture2, .run_fn = MailboxFixture.run, .restarting_fn = MailboxFixture.restarting });
+        defer runtime2.deinit();
+        runtime2.report_sink = .{ .context = &fixture2, .post_fn = MailboxFixture.post };
+        runtime2.continueYieldedWorks();
+        var reg = try runtime2.managed.state_store.load(arena);
+        break :blk try arena.dupe(u8, reg.findById(child_id).?.active.?.id);
+    };
+    try std.testing.expectEqual(@as(usize, 0), fixture2.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), fixture2.reportCount());
+
+    // The saved continuation is still the child's open work.
+    const store: child_state.Store = .{ .children = &children2, .parent_id = parent.parent.id() };
+    var reg = try store.load(arena);
+    try std.testing.expectEqualStrings(continuation_id, reg.findById(child_id).?.active.?.id);
 }
 
 test "continueYieldedWorks skips a cancelled child whose log does not end in a yielded turn" {
@@ -9674,6 +9805,20 @@ fn terminalResult(
 
 /// How often a message that waits for a starting work's turn asks again.
 const start_wait_poll_ns = 5 * std.time.ns_per_ms;
+
+/// A continuation work saved at the open whose slot has not started
+/// (`Runtime.held_continues`). Owns its ids.
+const HeldContinue = struct {
+    child_id: []u8,
+    old_work_id: []u8,
+    work_id: []u8,
+
+    fn deinit(self: *HeldContinue, alloc: Allocator) void {
+        alloc.free(self.child_id);
+        alloc.free(self.old_work_id);
+        alloc.free(self.work_id);
+    }
+};
 
 /// One message waiting for its child's starting turn (`Runtime.start_waits`).
 /// A child being closed for good (`Runtime.closing`).

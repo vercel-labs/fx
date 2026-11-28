@@ -81,6 +81,7 @@
 #   no-replaces       the continuation does not name the work it replaces   OneReport
 #   reports-first     owed reports go out before the continuation is saved  NoReplacedReport
 #   double            a second continuation for the same yielded turn       OneContinuation
+#   start-in-open     the open starts the slot before the app is in place   BindReachesLoop
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -151,5 +152,6 @@ ChildResume childresume-current YieldedTurnKeptOpen
 ChildResume childresume-mutation-no-replaces OneReport
 ChildResume childresume-mutation-reports-first NoReplacedReport
 ChildResume childresume-mutation-double OneContinuation
+ChildResume childresume-mutation-start-in-open BindReachesLoop
 ChildResume childresume-simulate simulate -simulate num=20000 -depth 40 -seed 1
 EOF

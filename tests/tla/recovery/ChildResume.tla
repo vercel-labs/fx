@@ -20,15 +20,19 @@
 (* reports (step 4), the report fold skips a work that a later work        *)
 (* replaces (step 5), the continuation resumes the held turn (step 6), and *)
 (* a crash during the hold leaves the marker for the next open (step 8).   *)
+(* The open can run inside App.init, which builds the app in a local and   *)
+(* then copies it to its place, so the open holds the continuation's slot, *)
+(* and the main loop, which runs only at the app's place, starts it.       *)
 (* The code that builds the contract today: the crash repair in            *)
 (* src/core/session_manager/session.zig (repair, D1), the continuation in  *)
 (* src/core/subagent/tool_host.zig (continueYieldedWorks and               *)
 (* yieldedContinuationCandidate), its child-turn question in               *)
 (* src/core/session/session_adapter.zig (Store.childTurnYielded), and      *)
 (* src/core/subagent/reports.zig (pendingReports, the fold), the host      *)
-(* in src/core/app/app_session_runtime.zig (enableSubagentHostV2), and     *)
-(* the child's slot in src/core/app/app_agents_runtime.zig                 *)
-(* (startInContext).                                                       *)
+(* in src/core/app/app_session_runtime.zig (enableSubagentHostV2), the     *)
+(* held start in src/core/subagent/tool_host.zig (startHeldContinues) and  *)
+(* src/core/app/app_agents_runtime.zig (takePosts), and the child's slot   *)
+(* in src/core/app/app_agents_runtime.zig (startInContext).                *)
 (*                                                                         *)
 (* The child's log: its steps done, whether its newest turn ends in the    *)
 (* yield marker, and whether a later turn continued that turn. The         *)
@@ -40,9 +44,12 @@
 (* Processes: fx runs or is dead. Ctrl+G asks the restart; Yield, Release, *)
 (* and Exit make the restart's exit; Crash kills fx at any time, and the   *)
 (* open work stays open. Open is a new launch. Continue resumes the held   *)
-(* turn from a continuation work. Step runs the child's next step, Finish  *)
-(* completes the work after the last step, and Deliver hands an owed,      *)
-(* untaken report to the parent.                                           *)
+(* turn from a continuation work. Place copies the app to its place,       *)
+(* StartHeld starts a held slot from the main loop, and Bind hands the     *)
+(* slot's turn to the app it reaches: the placed app, or the local that no *)
+(* loop reads. Step runs the child's next step, Finish completes the work  *)
+(* after the last step, and Deliver hands an owed, untaken report to the   *)
+(* parent.                                                                 *)
 (*                                                                         *)
 (* A crash after the continuation has started ends that work interrupted,  *)
 (* which owes its report, as any crash in a subagent's work does. So the   *)
@@ -65,7 +72,8 @@ CONSTANTS
     Bug           \* "none", or the name of one planted defect
 
 Bugs == {"none", "no_continuation", "no_replaces_link",
-         "reports_before_continuation", "double_continuation"}
+         "reports_before_continuation", "double_continuation",
+         "start_in_open"}
 
 ASSUME /\ N \in Nat /\ N >= 2
        /\ MaxRestarts \in Nat /\ MaxCrashes \in Nat
@@ -89,9 +97,13 @@ VARIABLES
     ran,        \* ghost: how many times each step ran
     yielded,    \* the child's newest turn ends in the yield marker
     continued,  \* a later turn continued that turn
-    works       \* the parent's log: a sequence of works
+    works,      \* the parent's log: a sequence of works
+    placed,     \* the app is at its place, where the main loop runs
+    slot        \* the continuation's slot: none, held, started, bound, or local
 
-vars == <<proc, asked, released, restarts, crashes, steps, ran, yielded, continued, works>>
+vars == <<proc, asked, released, restarts, crashes, steps, ran, yielded, continued, works, placed, slot>>
+
+Slots == {"none", "held", "started", "bound", "local"}
 
 NewWork(link) == [state |-> "open", replaces |-> link, owes |-> FALSE, taken |-> FALSE]
 
@@ -147,6 +159,7 @@ TypeOK ==
     /\ yielded \in BOOLEAN /\ continued \in BOOLEAN
     /\ Len(works) \in 1..WorkCap
     /\ \A i \in 1..Len(works) : works[i] \in WorkRec
+    /\ placed \in BOOLEAN /\ slot \in Slots
 
 Init ==
     /\ proc = TRUE /\ asked = FALSE /\ released = FALSE
@@ -154,6 +167,7 @@ Init ==
     /\ steps = 0 /\ ran = [k \in 1..N |-> 0]
     /\ yielded = FALSE /\ continued = FALSE
     /\ works = << NewWork(0) >>
+    /\ placed = TRUE /\ slot = "none"
 
 -----------------------------------------------------------------------------
 (* The restart.                                                            *)
@@ -163,7 +177,7 @@ CtrlG ==
     /\ proc /\ ~asked /\ ~released /\ restarts < MaxRestarts
     /\ asked' = TRUE
     /\ restarts' = restarts + 1
-    /\ UNCHANGED <<proc, released, crashes, steps, ran, yielded, continued, works>>
+    /\ UNCHANGED <<proc, released, crashes, steps, ran, yielded, continued, works, placed, slot>>
 
 \* The child's turn reaches a step boundary after its first step, while the
 \* restart is asked: it writes the marker and holds.
@@ -171,13 +185,13 @@ Yield ==
     /\ proc /\ asked /\ LastOpen /\ ~yielded
     /\ steps >= 1 /\ steps < N
     /\ yielded' = TRUE /\ continued' = FALSE
-    /\ UNCHANGED <<proc, asked, released, restarts, crashes, steps, ran, works>>
+    /\ UNCHANGED <<proc, asked, released, restarts, crashes, steps, ran, works, placed, slot>>
 
 \* Once nothing runs, the held turns are released.
 Release ==
     /\ proc /\ asked /\ ~released /\ ~Busy
     /\ released' = TRUE
-    /\ UNCHANGED <<proc, asked, restarts, crashes, steps, ran, yielded, continued, works>>
+    /\ UNCHANGED <<proc, asked, restarts, crashes, steps, ran, yielded, continued, works, placed, slot>>
 
 \* The restart's exit (contract step 1): the held turn stays open in the
 \* child's log, and each open work finishes cancelled and owes a report.
@@ -185,14 +199,16 @@ Exit ==
     /\ proc /\ released
     /\ proc' = FALSE /\ asked' = FALSE /\ released' = FALSE
     /\ works' = EndOpen(works, "cancelled")
-    /\ UNCHANGED <<restarts, crashes, steps, ran, yielded, continued>>
+    /\ slot' = "none"
+    /\ UNCHANGED <<restarts, crashes, steps, ran, yielded, continued, placed>>
 
 \* A crash at any time: the open work stays open.
 Crash ==
     /\ proc /\ crashes < MaxCrashes
     /\ proc' = FALSE /\ asked' = FALSE /\ released' = FALSE
     /\ crashes' = crashes + 1
-    /\ UNCHANGED <<restarts, steps, ran, yielded, continued, works>>
+    /\ slot' = "none"
+    /\ UNCHANGED <<restarts, steps, ran, yielded, continued, works, placed>>
 
 -----------------------------------------------------------------------------
 (* The launch.                                                             *)
@@ -204,6 +220,9 @@ Crash ==
 \* it replaces. Planted defect reports_before_continuation: the owed reports
 \* go out before the continuation is saved. Planted defect
 \* double_continuation: AddEach saves a continuation for every such work.
+\* The open runs before the app is at its place, and holds the slot of the
+\* continuation it saves. Planted defect start_in_open: the open starts the
+\* slot itself.
 Open ==
     /\ ~proc
     /\ LET rep == EndOpen(works, "interrupted")
@@ -220,17 +239,43 @@ Open ==
                ELSE Deliverable(withCont)
        IN /\ proc' = TRUE
           /\ works' = DeliverAll(withCont, due)
+          /\ placed' = FALSE
+          /\ slot' = IF Len(withCont) = Len(rep) THEN "none"
+                     ELSE IF Bug = "start_in_open" THEN "started"
+                     ELSE "held"
     /\ UNCHANGED <<asked, released, restarts, crashes, steps, ran, yielded, continued>>
+
+\* App.init returns, and the app is copied to its place, where the main loop
+\* runs.
+Place ==
+    /\ proc /\ ~placed
+    /\ placed' = TRUE
+    /\ UNCHANGED <<proc, asked, released, restarts, crashes, steps, ran, yielded, continued, works, slot>>
+
+\* The main loop starts a held slot. It runs only at the app's place.
+StartHeld ==
+    /\ proc /\ placed /\ slot = "held"
+    /\ slot' = "started"
+    /\ UNCHANGED <<proc, asked, released, restarts, crashes, steps, ran, yielded, continued, works, placed>>
+
+\* The slot hands its turn to the app it reaches. Before the copy that is the
+\* local, whose hand-offs no loop reads.
+Bind ==
+    /\ proc /\ slot = "started"
+    /\ slot' = IF placed THEN "bound" ELSE "local"
+    /\ UNCHANGED <<proc, asked, released, restarts, crashes, steps, ran, yielded, continued, works, placed>>
 
 \* A continuation work resumes the held turn (contract step 6): the marker
 \* clears, the turn is marked continued, and the child goes on. Continue
-\* does not run while the restart is asked.
+\* does not run while the restart is asked, and runs once the main loop has
+\* taken the slot's turn.
 Continue ==
     /\ proc /\ ~asked /\ LastOpen
     /\ works[Len(works)].replaces # 0
     /\ yielded /\ ~continued
+    /\ slot = "bound"
     /\ yielded' = FALSE /\ continued' = TRUE
-    /\ UNCHANGED <<proc, asked, released, restarts, crashes, steps, ran, works>>
+    /\ UNCHANGED <<proc, asked, released, restarts, crashes, steps, ran, works, placed, slot>>
 
 -----------------------------------------------------------------------------
 (* The child's steps and the parent's reports.                             *)
@@ -242,20 +287,20 @@ Step ==
     /\ (~asked \/ steps = 0)
     /\ steps' = steps + 1
     /\ ran' = [ran EXCEPT ![steps + 1] = @ + 1]
-    /\ UNCHANGED <<proc, asked, released, restarts, crashes, yielded, continued, works>>
+    /\ UNCHANGED <<proc, asked, released, restarts, crashes, yielded, continued, works, placed, slot>>
 
 \* After the last step, the open work finishes completed and owes a report.
 Finish ==
     /\ proc /\ LastOpen /\ steps = N /\ ~yielded
     /\ works' = [works EXCEPT ![Len(works)].state = "completed",
                               ![Len(works)].owes = TRUE]
-    /\ UNCHANGED <<proc, asked, released, restarts, crashes, steps, ran, yielded, continued>>
+    /\ UNCHANGED <<proc, asked, released, restarts, crashes, steps, ran, yielded, continued, placed, slot>>
 
 \* An owed, untaken report reaches the parent, once per work.
 Deliver(i) ==
     /\ proc /\ i \in 1..Len(works) /\ Eligible(works, i)
     /\ works' = [works EXCEPT ![i].taken = TRUE]
-    /\ UNCHANGED <<proc, asked, released, restarts, crashes, steps, ran, yielded, continued>>
+    /\ UNCHANGED <<proc, asked, released, restarts, crashes, steps, ran, yielded, continued, placed, slot>>
 
 \* Nothing else is left to do once a report has been delivered.
 Done ==
@@ -264,12 +309,14 @@ Done ==
 
 Next ==
     \/ CtrlG \/ Yield \/ Release \/ Exit \/ Crash \/ Open \/ Continue
+    \/ Place \/ StartHeld \/ Bind
     \/ Step \/ Finish \/ Done
     \/ \E i \in 1..WorkCap : Deliver(i)
 
 \* fx's own steps happen; the person's Ctrl+G and a crash may not.
 Fairness ==
     /\ WF_vars(Open) /\ WF_vars(Release) /\ WF_vars(Exit)
+    /\ WF_vars(Place) /\ WF_vars(StartHeld) /\ WF_vars(Bind)
     /\ WF_vars(Yield) /\ WF_vars(Continue) /\ WF_vars(Step) /\ WF_vars(Finish)
     /\ \A i \in 1..WorkCap : WF_vars(Deliver(i))
 
@@ -296,6 +343,10 @@ NoReplacedReport ==
 OneContinuation ==
     \A i, j \in 1..Len(works) :
         (i # j /\ works[i].replaces # 0) => works[i].replaces # works[j].replaces
+
+\* A continuation's slot hands its turn to the app at its place, where the
+\* main loop takes it. Planted defect start_in_open breaks this.
+BindReachesLoop == slot # "local"
 
 \* While fx runs, a yielded turn's work stays open, so a continuation can
 \* still resume it. Planted defect no_continuation breaks this at the open.

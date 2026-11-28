@@ -3455,6 +3455,7 @@ pub fn Runtime(comptime App: type) type {
         /// Takes every waiting hand-off. Runs on the main loop each pass,
         /// before the children's events are handled.
         pub fn takePosts(app: *App) void {
+            startHeldContinues(app);
             deliverReports(app);
             var posts: std.ArrayList(*Post) = .empty;
             {
@@ -3509,6 +3510,19 @@ pub fn Runtime(comptime App: type) type {
             defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
             child.parent_host = host;
             if (child.agent.root_instance == null) child.agent.root_instance = rootInstance(app, child);
+        }
+
+        /// Starts the continuations each host saved when it opened
+        /// (`subagent_tool_host.Runtime.startHeldContinues`). The main loop
+        /// runs only once the app is at its final address, after `App.init`
+        /// copies it, so a slot started here hands its turn to this app.
+        fn startHeldContinues(app: *App) void {
+            if (comptime !runtime_profile.allows(App, .auto_upgrade)) return;
+            if (app_session_runtime.Runtime(App).subagentHost(app)) |host| host.startHeldContinues();
+            for (app.child_agents.items) |child| {
+                const host = child.agent.session_persistence.subagent_host orelse continue;
+                host.startHeldContinues();
+            }
         }
 
         /// Tells every subagent host that fx is quitting, before any child
