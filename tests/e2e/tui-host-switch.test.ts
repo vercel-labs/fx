@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { processAlive } from "./process-alive";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
@@ -4974,7 +4975,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // main's worker mailbox (not just queued it from the child thread)
           // before unblocking the FIFO-held shell call.
           await until("fine report posted to main", () => trace().includes("child_delivery_posted"));
-          writeFileSync(fifoPath, "go\n");
+          await writeFile(fifoPath, "go\n");
         }
         // Main's turn is over once the three are started; the reports of
         // `broken` and `fine` come after it.
