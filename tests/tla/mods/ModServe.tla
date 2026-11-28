@@ -1,8 +1,10 @@
 ------------------------------ MODULE ModServe ------------------------------
 (***************************************************************************)
 (* Models the MCP servers that a running fx starts from its mods while     *)
-(* other fx processes change the mod store (src/core/mods/store.zig). Not  *)
-(* landed yet: planned for MCP servers from mods.                          *)
+(* other fx processes change the mod store (src/core/mods/store.zig). The  *)
+(* code is Runtime.PinTracker in src/core/mcp_host/runtime.zig, and        *)
+(* serve-walk in tests/tla/drivers/mods/driver.ts drives it along this     *)
+(* model.                                                                  *)
 (*                                                                         *)
 (* It builds on ModUse.tla, which proves the pin protocol: a reader pins   *)
 (* the version that the link names and checks that the folder is still    *)

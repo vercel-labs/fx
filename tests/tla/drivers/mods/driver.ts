@@ -1,31 +1,31 @@
-// Runs the mod store (`src/core/mods/store.zig`) along `ModStore.tla` and the
-// pin protocol (`src/core/mods/pins.zig` + `store.zig`) along `ModUse.tla`.
+// Runs the mod store (`src/core/mods/store.zig`) along `ModStore.tla`, the
+// pin protocol (`src/core/mods/pins.zig` + `store.zig`) along `ModUse.tla`, and
+// mod MCP servers (`src/core/mcp_host/runtime.zig` + `src/mcp/engine.zig`)
+// along `ModServe.tla`.
 //
 // Parts:
-//   mods-walk  TLC dumps the state graph of ModStore.tla (`N = 2`,
-//              `MaxVersion = 2`, `Design = "b"`, `Nonideal = TRUE`), and the
-//              driver walks paths covering every edge. Each hop drives
-//              `lab_store change` step-by-step, injects `SIGKILL` for `Crash`,
-//              and runs `lab_store load` after every hop to verify it matches
-//              the model's `Loaded`.
-//   use-walk   TLC dumps the state graph of ModUse.tla (`NR = 2`,
-//              `MaxVersion = 3`, `Design = "pin"`, `Bug = "none"`), and the
-//              driver walks paths covering every edge with two reader processes
-//              and changer commands through `lab_use.zig`, using `SIGKILL` for
-//              `Exit` and verifying disk state, link, loaded version and marker
-//              reads after every hop.
+//   mods-walk   TLC dumps ModStore.tla (`N = 2`, `MaxVersion = 2`, `Design = "b"`,
+//               `Nonideal = TRUE`), walked through `lab_store.zig` with `SIGKILL`.
+//   use-walk    TLC dumps ModUse.tla (`NR = 2`, `MaxVersion = 3`, `Design = "pin"`),
+//               walked through `lab_use.zig` with two readers and `SIGKILL`.
+//   serve-walk  TLC dumps ModServe.tla (`NR = 2`, `MaxVersion = 3`, `MaxRetire = 2`),
+//               walked through `lab_serve.zig` (`mcp_host.Runtime` + `Engine`) and
+//               `fixtures/mod-stdio-server.ts`, plus curated cases for
+//               release_on_reload, release_on_first_exit, mixed v1/v2, crash
+//               cleanup, and detached UnusedVersionsGo.
 //
-// --self-check rejects tampered expectations and three planted mutants per walk.
+// --self-check rejects tampered expectations and planted mutants per walk.
 //
 // Usage (from the repository root):
 //   bun tests/tla/drivers/mods/driver.ts --self-check
 //   bun tests/tla/drivers/mods/driver.ts mods-walk --self-check
 //   bun tests/tla/drivers/mods/driver.ts use-walk --self-check
+//   bun tests/tla/drivers/mods/driver.ts serve-walk --self-check
 //
 // Exit codes: 0 accepted (and all self-checks rejected), 1 mismatch or
 // self-check not rejected, 2 tool or setup failure.
 
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseValue } from "../graph.mjs";
@@ -37,7 +37,7 @@ type Graph = { states: Map<string, Model>; next: Map<string, Edge[]>; inits: str
 type Hop = { from: string; to: string; label: string };
 type Walk = { init: string; hops: Hop[] };
 type LoadedView = { state: "none" } | { state: "bad" } | { state: "mod"; v: number; off: boolean };
-type Patch = { file: "store" | "pins"; target: string; planted: string };
+type Patch = { file: "store" | "pins" | "runtime"; target: string; planted: string };
 type Mutant = { name: string; patches: Patch[] };
 
 const tlaDir = join(TLA_ROOT, "mods");
@@ -46,6 +46,8 @@ const pinsModule = join(REPO_ROOT, "src", "core", "mods", "pins.zig");
 const manifestModule = join(REPO_ROOT, "src", "core", "mods", "manifest.zig");
 const labStoreSource = join(TLA_ROOT, "drivers", "mods", "lab_store.zig");
 const labUseSource = join(TLA_ROOT, "drivers", "mods", "lab_use.zig");
+const labServeSource = join(TLA_ROOT, "drivers", "mods", "lab_serve.zig");
+const serveFixturePath = join(TLA_ROOT, "drivers", "mods", "fixtures", "mod-stdio-server.ts");
 
 function option(name: string, fallback: number): number {
   const at = process.argv.indexOf(name);
@@ -55,19 +57,23 @@ function option(name: string, fallback: number): number {
   return value;
 }
 
-const ALL_PARTS = ["mods-walk", "use-walk"] as const;
+const ALL_PARTS = ["mods-walk", "use-walk", "serve-walk"] as const;
 const selectedParts = ALL_PARTS.filter((part) => process.argv.includes(part));
 const options = {
   parts: selectedParts.length > 0 ? selectedParts : [...ALL_PARTS],
   selfCheck: process.argv.includes("--self-check"),
+  planOnly: process.argv.includes("--plan"),
   walks: option("--walks", 300),
+  serveWalks: option("--serve-walks", 20),
   steps: option("--steps", 14),
+  serveSteps: option("--serve-steps", 12),
   seed: option("--seed", 1),
   jobs: option("--jobs", 16),
 };
 
 const REQUIRED_STORE_ACTIONS = ["Start", "TakeLock", "CopyStart", "CopyDone", "Switch", "Collect", "Crash", "Load"];
 const REQUIRED_USE_ACTIONS = ["Install", "Remove", "Cleanup", "Start", "Resolve", "Lock", "Check", "StartUse", "EndUse", "Reload", "Exit"];
+const REQUIRED_SERVE_ACTIONS = ["Install", "Remove", "Cleanup", "Start", "Reload", "StartServer", "StopServer", "RetireDone", "Exit", "Crash", "DyingDone"];
 
 const STORE_MUTANTS: Mutant[] = [
   {
@@ -128,6 +134,25 @@ const USE_MUTANTS: Mutant[] = [
         "            }\n" +
         "        },",
       planted: "        .pinned, .not_installed => { _ = old_pin; },",
+    }],
+  },
+];
+
+const SERVE_MUTANTS: Mutant[] = [
+  {
+    name: "releases a version pin on reload while a retired slot still runs",
+    patches: [{
+      file: "runtime",
+      target: "                if (hv.in_list or hv.slots > 0) {",
+      planted: "                if (hv.in_list) {",
+    }],
+  },
+  {
+    name: "releases a version pin on the first destroyed slot",
+    patches: [{
+      file: "runtime",
+      target: "                if (hv.slots > 0) hv.slots -= 1;",
+      planted: "                hv.slots = 0;",
     }],
   },
 ];
@@ -339,8 +364,8 @@ class LineProc {
   private decoder = new TextDecoder();
   private buf = "";
 
-  constructor(cmd: string[]) {
-    this.proc = Bun.spawn(cmd, { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  constructor(cmd: string[], env?: Record<string, string>) {
+    this.proc = Bun.spawn(cmd, { stdin: "pipe", stdout: "pipe", stderr: "pipe", env });
     this.reader = this.proc.stdout.getReader();
   }
 
@@ -1136,6 +1161,930 @@ async function useWalkPart(out: string): Promise<number> {
   }
 }
 
+type ServeServerEvent = {
+  t: number;
+  name: string;
+  pid: number;
+  ppid?: number;
+  cwd: string;
+  ev: string;
+  phase?: string;
+  marker?: string;
+  code?: string;
+  id?: string | number;
+  tool?: string;
+};
+
+type CuratedServeScenario =
+  | "release_on_reload"
+  | "release_on_first_exit"
+  | "mixed_v1_v2"
+  | "crash_then_cleanup"
+  | "unused_versions_go";
+
+function readServeEvents(logPath: string): ServeServerEvent[] {
+  if (!existsSync(logPath)) return [];
+  return readFileSync(logPath, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as ServeServerEvent);
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForServeCondition<T>(
+  what: string,
+  probe: () => T | null | undefined | false | Promise<T | null | undefined | false>,
+  timeoutMs = 5_000,
+  everyMs = 25,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const val = await probe();
+    if (val) return val;
+    await Bun.sleep(everyMs);
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+// Hold timing policy (matching `src/mcp/core/stdio_conn.zig` and `src/mcp/engine.zig`):
+// - `stdio_conn.Config` waits `grace_ms = 1,500` ms after closing stdin before SIGTERM,
+//   then `term_ms = 1,500` ms before SIGKILL; `Engine.sweep` kills a retired slot after
+//   `3,500` ms.
+// - Normal graph walks and curated drain/mixed scenarios take the graceful path:
+//   every fixture hold is capped at `FIXTURE_MAX_HOLD_MS = 900` ms (well under `1,500` ms)
+//   and released explicitly as soon as pin/disk probes finish.
+// - `crash_then_cleanup` and `Crash` hops take the crash path (`SIGKILL` on `lab_serve`),
+//   leaving `src/mcp/io/process.zig`'s helper up to its `2,000` ms TERM->KILL window.
+function createServeSources(dir: string, controlDir: string, logPath: string): [string, string, string] {
+  const out: string[] = [];
+  for (const v of [1, 2, 3]) {
+    const src = join(dir, `src${v}`);
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, "version.txt"), `${v}\n`);
+    writeFileSync(join(src, "mod.json"), JSON.stringify({
+      name: "m",
+      version: String(v),
+      description: `serve mod v${v}`,
+      mcp: {
+        srv: {
+          command: [process.execPath, serveFixturePath],
+          env: {
+            FIXTURE_NAME: `srv-v${v}`,
+            FIXTURE_LOG: logPath,
+            FIXTURE_CONTROL: controlDir,
+            FIXTURE_HOLD_CALL_FILE: `hold-call-v${v}`,
+            FIXTURE_HOLD_EXIT_FILE: `hold-exit-v${v}`,
+            FIXTURE_MAX_HOLD_MS: "900",
+          },
+        },
+      },
+    }));
+    out.push(src);
+  }
+  return [out[0]!, out[1]!, out[2]!];
+}
+
+function createTwoServerSource(dir: string, v: number, controlDir: string, logPath: string): string {
+  const src = join(dir, `src${v}_two`);
+  mkdirSync(src, { recursive: true });
+  writeFileSync(join(src, "version.txt"), `${v}\n`);
+  writeFileSync(join(src, "mod.json"), JSON.stringify({
+    name: "m",
+    version: String(v),
+    description: `two-server v${v}`,
+    mcp: {
+      s1: {
+        command: [process.execPath, serveFixturePath],
+        env: {
+          FIXTURE_NAME: `s1-v${v}`,
+          FIXTURE_LOG: logPath,
+          FIXTURE_CONTROL: controlDir,
+          FIXTURE_HOLD_EXIT_FILE: `hold-s1-v${v}`,
+          FIXTURE_MAX_HOLD_MS: "900",
+        },
+      },
+      s2: {
+        command: [process.execPath, serveFixturePath],
+        env: {
+          FIXTURE_NAME: `s2-v${v}`,
+          FIXTURE_LOG: logPath,
+          FIXTURE_CONTROL: controlDir,
+          FIXTURE_HOLD_CALL_FILE: `hold-s2-call-v${v}`,
+          FIXTURE_HOLD_EXIT_FILE: `hold-s2-v${v}`,
+          FIXTURE_MAX_HOLD_MS: "900",
+        },
+      },
+    },
+  }));
+  return src;
+}
+
+function buildServeLab(
+  out: string,
+  name: string,
+  patches: Patch[] = [],
+): string | null {
+  const stageDir = join(out, `${name}-stage`);
+  const stageSrc = join(stageDir, "src");
+  rmSync(stageDir, { recursive: true, force: true });
+  mkdirSync(stageDir, { recursive: true });
+  cpSync(join(REPO_ROOT, "src"), stageSrc, { recursive: true });
+  copyFileSync(labServeSource, join(stageSrc, "lab_serve_root.zig"));
+
+  if (patches.length > 0) {
+    const rtPath = join(stageSrc, "core", "mcp_host", "runtime.zig");
+    let rtSrc = readFileSync(rtPath, "utf8");
+    for (const patch of patches) {
+      if (patch.file !== "runtime") continue;
+      if (!rtSrc.includes(patch.target)) {
+        console.log(`self-check: target missing in runtime.zig for "${name}": ${patch.target}`);
+        return null;
+      }
+      rtSrc = rtSrc.replaceAll(patch.target, patch.planted);
+    }
+    writeFileSync(rtPath, rtSrc);
+  }
+
+  const targetsJson = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fuzz", "targets.json"), "utf8")) as {
+    targets: Array<{ name: string }>;
+  };
+  const fcText = targetsJson.targets.map((t) => `pub const ${t.name}: *const [0][]const u8 = &.{};`).join("\n") + "\n";
+  const fcPath = join(stageDir, "fc.zig");
+  const boPath = join(stageDir, "bo.zig");
+  const smBoPath = join(stageDir, "sm_bo.zig");
+  const tpPath = join(stageDir, "tp.zig");
+  writeFileSync(fcPath, fcText);
+  writeFileSync(boPath, [
+    'pub const git_commit = "test";',
+    'pub const app_version = "0.0.0-test";',
+    'pub const update_channel = "stable";',
+    "pub const WasmSurface = enum { none, core, term };",
+    "pub const wasm_surface: WasmSurface = .none;",
+    "pub const libfx = false;",
+    "pub const builtin_tools = true;",
+    "",
+  ].join("\n"));
+  writeFileSync(smBoPath, [
+    "pub const hooks = false;",
+    'pub const trace_dir = "/tmp/sm-traces";',
+    'pub const src_dir = "src/core/session_manager";',
+    "",
+  ].join("\n"));
+  writeFileSync(tpPath, [
+    'pub const product_exe = "zig-out/bin/fx";',
+    'pub const source_root = "src";',
+    'pub const fixtures_dir = "tests";',
+    "",
+  ].join("\n"));
+
+  const bin = join(out, name);
+  const build = Bun.spawnSync(
+    [
+      "zig", "build-exe", "-O", "ReleaseSafe", "-lc",
+      "--dep", "fuzz_seed", "--dep", "fuzz_corpus", "--dep", "build_options", "--dep", "test_paths", "--dep", "session_manager",
+      `-Mroot=${join(stageSrc, "lab_serve_root.zig")}`,
+      `-Mfuzz_seed=${join(stageSrc, "fuzz_seed.zig")}`,
+      `-Mfuzz_corpus=${fcPath}`,
+      `-Mbuild_options=${boPath}`,
+      `-Mtest_paths=${tpPath}`,
+      "--dep", "build_options=sm_bo",
+      `-Msession_manager=${join(stageSrc, "core", "session_manager", "api.zig")}`,
+      `-Msm_bo=${smBoPath}`,
+      "--name", name,
+      `-femit-bin=${bin}`,
+    ],
+    { cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" },
+  );
+  if (build.exitCode !== 0) {
+    console.log(`building ${name} failed:\n${new TextDecoder().decode(build.stderr).slice(0, 2000)}`);
+    return null;
+  }
+  return bin;
+}
+
+async function loadModServeGraph(out: string): Promise<Graph | null> {
+  const dir = join(out, "serve-graph");
+  mkdirSync(dir, { recursive: true });
+  // `check.sh` checks PROPERTIES ServesCurrent and UnusedVersionsGo; drop
+  // PROPERTIES here so TLC dumps the exact 81,182-state graph in one pass.
+  const cfg = readFileSync(join(tlaDir, "mods-serve.cfg"), "utf8")
+    .split("\n")
+    .filter((line) => !/^PROPERTIES\b/.test(line.trim()))
+    .join("\n");
+  writeFileSync(join(dir, "Driver.cfg"), cfg);
+  const run = await runTlc(dir, "ModServe", "Driver.cfg", ["ModServe.tla"], tlaDir, ["-dump", "dot,actionlabels", "graph"]);
+  if (run.exitCode !== 0) {
+    console.log(`TLC failed on ModServe.tla (exit ${run.exitCode}); see ${join(dir, "tlc.log")}`);
+    return null;
+  }
+  const graph = parseDotGraph(join(dir, "graph.dot"));
+  if (!graph) {
+    console.log("serve-walk: the graph has no initial states");
+    return null;
+  }
+  console.log(`serve-walk: graph of ${graph.states.size} states (${graph.inits.length} initial), ${run.durationMs} ms`);
+  return graph;
+}
+
+function retiringTotalForReader(state: Model, readerIdx: number): number {
+  const ret: number[] = state.retiring[readerIdx]!;
+  let sum = 0;
+  for (const c of ret) sum += c;
+  return sum;
+}
+
+// Same-name rule: Runtime holds a server-starting request (`tools`/`call`) while
+// any retired slot under that same server name is still stopping (`engine.stopping`,
+// `src/core/mcp_host/runtime.zig:1296`). Skip `StartServer(r)` edges while `r`
+// still has any server in `retiring[r]`.
+function isServeEdgeBlockedBySameName(from: Model, to: Model, label: string): boolean {
+  if (label !== "StartServer") return false;
+  for (let r = 0; r < from.serving.length; r += 1) {
+    if (from.serving[r] === 0 && to.serving[r] !== 0) {
+      return retiringTotalForReader(from, r) > 0;
+    }
+  }
+  return false;
+}
+
+function serveEdgeSignature(from: Model, to: Model, label: string): string {
+  switch (label) {
+    case "Start": {
+      const r = from.up.findIndex((u: boolean, i: number) => !u && to.up[i]);
+      return `Start:r${r}:link=${from.link}`;
+    }
+    case "Reload": {
+      const r = from.loaded.findIndex((v: number, i: number) => v !== to.loaded[i]);
+      return `Reload:r${r}:from=${from.loaded[r]}:srv=${from.serving[r]}:ret=${retiringTotalForReader(from, r)}:to=${to.loaded[r]}`;
+    }
+    case "StartServer": {
+      const r = from.serving.findIndex((v: number, i: number) => v === 0 && to.serving[i] !== 0);
+      return `StartServer:r${r}:v=${to.serving[r]}`;
+    }
+    case "StopServer": {
+      const r = from.serving.findIndex((v: number, i: number) => v !== 0 && to.serving[i] === 0);
+      return `StopServer:r${r}:v=${from.serving[r]}`;
+    }
+    case "RetireDone": {
+      for (let r = 0; r < from.retiring.length; r += 1) {
+        for (let v = 0; v < from.retiring[r]!.length; v += 1) {
+          if (from.retiring[r]![v]! > to.retiring[r]![v]!) {
+            const keepList = from.loaded[r] === v + 1;
+            const rem = to.retiring[r]![v]!;
+            return `RetireDone:v${v + 1}:keep=${keepList}:rem=${rem}`;
+          }
+        }
+      }
+      return "RetireDone";
+    }
+    case "Exit": {
+      const r = from.up.findIndex((u: boolean, i: number) => u && !to.up[i]);
+      return `Exit:r${r}:had=${from.loaded[r]}`;
+    }
+    case "Crash": {
+      const r = from.up.findIndex((u: boolean, i: number) => u && !to.up[i]);
+      const hadLive = from.serving[r] !== 0 || retiringTotalForReader(from, r) > 0;
+      return `Crash:r${r}:live=${hadLive}`;
+    }
+    case "DyingDone": {
+      const lost = from.dying.find((v: number) => !to.dying.includes(v)) ?? 0;
+      return `DyingDone:inPresent=${from.present.includes(lost)}`;
+    }
+    case "Cleanup": {
+      const gone = from.present.find((v: number) => !to.present.includes(v)) ?? 0;
+      return `Cleanup:v=${gone}:rem=${to.present.length}`;
+    }
+    case "Install":
+      return `Install:v=${to.latest}`;
+    case "Remove":
+      return `Remove:had=${from.link}`;
+    default:
+      return label;
+  }
+}
+
+function boundedServeWalks(graph: Graph): Walk[] {
+  const parent = new Map<string, { from: string; label: string } | null>();
+  const initOf = new Map<string, string>();
+  const queue: string[] = [];
+  for (const initId of graph.inits) {
+    parent.set(initId, null);
+    initOf.set(initId, initId);
+    queue.push(initId);
+  }
+  for (let at = 0; at < queue.length; at += 1) {
+    const fromId = queue[at]!;
+    const fromState = graph.states.get(fromId)!;
+    for (const edge of graph.next.get(fromId) ?? []) {
+      if (parent.has(edge.to)) continue;
+      const toState = graph.states.get(edge.to)!;
+      if (isServeEdgeBlockedBySameName(fromState, toState, edge.label)) continue;
+      parent.set(edge.to, { from: fromId, label: edge.label });
+      initOf.set(edge.to, initOf.get(fromId)!);
+      queue.push(edge.to);
+    }
+  }
+
+  const seenSigs = new Set<string>();
+  const walks: Walk[] = [];
+  const pathTo = (targetId: string, finalEdge?: Edge): Walk => {
+    const hops: Hop[] = finalEdge ? [{ from: targetId, to: finalEdge.to, label: finalEdge.label }] : [];
+    for (let cur = targetId; parent.get(cur); cur = parent.get(cur)!.from) {
+      const p = parent.get(cur)!;
+      hops.unshift({ from: p.from, to: cur, label: p.label });
+    }
+    return { init: initOf.get(targetId)!, hops };
+  };
+
+  for (const id of queue) {
+    const fromState = graph.states.get(id)!;
+    for (const edge of graph.next.get(id) ?? []) {
+      const toState = graph.states.get(edge.to)!;
+      if (isServeEdgeBlockedBySameName(fromState, toState, edge.label)) continue;
+      const sig = serveEdgeSignature(fromState, toState, edge.label);
+      if (seenSigs.has(sig)) continue;
+      seenSigs.add(sig);
+      walks.push(pathTo(id, edge));
+    }
+  }
+
+  // Add seeded random walks for multi-step interleavings across both readers.
+  const random = generator(options.seed);
+  for (let w = 0; w < options.serveWalks; w += 1) {
+    const init = graph.inits[Math.floor(random() * graph.inits.length)]!;
+    const hops: Hop[] = [];
+    let at = init;
+    for (let i = 0; i < options.serveSteps; i += 1) {
+      const fromState = graph.states.get(at)!;
+      const edges = (graph.next.get(at) ?? []).filter((e) =>
+        !isServeEdgeBlockedBySameName(fromState, graph.states.get(e.to)!, e.label),
+      );
+      if (edges.length === 0) break;
+      const edge = edges[Math.floor(random() * edges.length)]!;
+      hops.push({ from: at, to: edge.to, label: edge.label });
+      at = edge.to;
+    }
+    if (hops.length > 0) walks.push({ init, hops });
+  }
+  return walks;
+}
+
+function changedServeReader(from: Model, to: Model, pred: (i: number) => boolean): number {
+  const found: number[] = [];
+  for (let i = 0; i < from.up.length; i += 1) {
+    if (pred(i)) found.push(i);
+  }
+  if (found.length !== 1) throw new Error(`expected 1 changed serve reader, got ${found.length}`);
+  return found[0]!;
+}
+
+function serveLabEnv(): Record<string, string> {
+  return {
+    ...process.env,
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_SOUND: "0",
+    FX_AUTO_UPGRADE: "0",
+  };
+}
+
+async function runOneServeWalk(
+  labBin: string,
+  walk: Walk,
+  walkIndex: number,
+  graph: Graph,
+  scratchBase: string,
+  tamper: boolean,
+): Promise<string | null> {
+  const root = mkdtempSync(join(scratchBase, `s${walkIndex}-`));
+  const sourcesDir = join(root, ".src");
+  const controlDir = join(root, ".ctrl");
+  const logPath = join(root, ".srv.jsonl");
+  mkdirSync(sourcesDir, { recursive: true });
+  mkdirSync(controlDir, { recursive: true });
+  const sources = createServeSources(sourcesDir, controlDir, logPath);
+  const labEnv = serveLabEnv();
+  const changer = new LineProc([labBin, "changer", root, "m"], labEnv);
+  const readers: Array<LineProc | null> = [null, null];
+  const readerLoaded: [number, number] = [0, 0];
+  const readerServingPid: [number | null, number | null] = [null, null];
+  const retiringPids: Array<Map<number, number[]>> = [new Map(), new Map()];
+  const trace: string[] = [];
+
+  const probePinBusy = async (v: number): Promise<boolean> => {
+    const res = await runChangerCmdRaw(changer, `probe-pin ${tokenOf(v)}`);
+    if (res === "pin busy") return true;
+    if (res === "pin free") return false;
+    throw new Error(`unexpected probe-pin response: ${JSON.stringify(res)}`);
+  };
+
+  const verifyServeState = async (state: Model, where: string): Promise<string | null> => {
+    const disk = inspectDisk(root);
+    let expectedLink: number = state.link;
+    const expectedPresent = [...(state.present as number[])].sort((a, b) => a - b);
+    if (tamper) expectedLink = expectedLink === 0 ? 1 : 0;
+    if (disk.link !== expectedLink) {
+      return `serve walk ${walkIndex} ${where}: link mismatch: model ${expectedLink}, disk ${disk.link}`;
+    }
+    if (JSON.stringify(disk.present) !== JSON.stringify(expectedPresent)) {
+      return `serve walk ${walkIndex} ${where}: present mismatch: model ${JSON.stringify(expectedPresent)}, disk ${JSON.stringify(disk.present)}`;
+    }
+    for (let r = 0; r < 2; r += 1) {
+      if (readerLoaded[r] !== state.loaded[r]) {
+        return `serve walk ${walkIndex} ${where}: reader ${r + 1} loaded mismatch: model ${state.loaded[r]}, lab ${readerLoaded[r]}`;
+      }
+      const isUp = readers[r] !== null && readers[r]!.proc.exitCode === null;
+      if (isUp !== state.up[r]) {
+        return `serve walk ${walkIndex} ${where}: reader ${r + 1} up mismatch: model ${state.up[r]}, lab ${isUp}`;
+      }
+    }
+    for (const v of expectedPresent) {
+      const expectedHeld = (state.pins[v - 1] ?? state.pins[String(v)] ?? []).length > 0;
+      const gotHeld = await probePinBusy(v);
+      if (gotHeld !== expectedHeld) {
+        return `serve walk ${walkIndex} ${where}: pin[${v}] mismatch: model held=${expectedHeld}, flock busy=${gotHeld}`;
+      }
+    }
+    return null;
+  };
+
+  try {
+    const changerReady = await changer.readLine();
+    if (changerReady !== "ready") return `serve walk ${walkIndex} init: changer expected "ready", got ${JSON.stringify(changerReady)}`;
+
+    const initState = graph.states.get(walk.init)!;
+    const initErr = await runChangerCmd(changer, `install ${sources[0]} ${tokenOf(1)}`);
+    if (initErr) return `serve walk ${walkIndex} init: ${initErr}`;
+    const initCheck = await verifyServeState(initState, "init");
+    if (initCheck) return initCheck;
+
+    for (let stepIdx = 0; stepIdx < walk.hops.length; stepIdx += 1) {
+      const hop = walk.hops[stepIdx]!;
+      const from = graph.states.get(hop.from)!;
+      const to = graph.states.get(hop.to)!;
+      trace.push(hop.label);
+      const where = `step ${stepIdx} (${trace.join(" > ")})`;
+
+      switch (hop.label) {
+        case "Install": {
+          const v: number = to.latest;
+          const err = await runChangerCmd(changer, `install ${sources[v - 1]!} ${tokenOf(v)}`);
+          if (err) return `serve walk ${walkIndex} ${where}: ${err}`;
+          break;
+        }
+        case "Remove": {
+          const err = await runChangerCmd(changer, "remove");
+          if (err) return `serve walk ${walkIndex} ${where}: ${err}`;
+          break;
+        }
+        case "Cleanup": {
+          const fromSet = new Set<number>(from.present);
+          const toSet = new Set<number>(to.present);
+          const removed = [...fromSet].filter((v) => !toSet.has(v));
+          if (removed.length !== 1) return `serve walk ${walkIndex} ${where}: expected 1 cleaned version, got ${removed.length}`;
+          const err = await runChangerCmd(changer, `cleanup-version ${tokenOf(removed[0]!)}`);
+          if (err) return `serve walk ${walkIndex} ${where}: ${err}`;
+          break;
+        }
+        case "Start": {
+          const r = changedServeReader(from, to, (i) => !from.up[i] && to.up[i]);
+          const proc = new LineProc([labBin, "reader", root, "m", "--no-cleanup"], labEnv);
+          readers[r] = proc;
+          const line = await proc.readLine(10_000);
+          if (line !== "ready") return `serve walk ${walkIndex} ${where}: reader ${r + 1} expected "ready", got ${JSON.stringify(line)}`;
+          break;
+        }
+        case "Reload": {
+          const r = changedServeReader(from, to, (i) => from.loaded[i] !== to.loaded[i]);
+          const proc = readers[r];
+          if (!proc) return `serve walk ${walkIndex} ${where}: reader ${r + 1} not running`;
+          const oldLive = readerServingPid[r];
+          if (oldLive !== null && from.serving[r] > 0) {
+            const prevV: number = from.serving[r];
+            const list = retiringPids[r]!.get(prevV) ?? [];
+            list.push(oldLive);
+            retiringPids[r]!.set(prevV, list);
+            readerServingPid[r] = null;
+          }
+          proc.sendText("reload\n");
+          const line = await proc.readLine(10_000);
+          const wantV: number = to.loaded[r];
+          const wantLine = wantV === 0 ? "reloaded none" : `reloaded ${tokenOf(wantV)}`;
+          if (line !== wantLine) return `serve walk ${walkIndex} ${where}: reader ${r + 1} expected ${JSON.stringify(wantLine)}, got ${JSON.stringify(line)}`;
+          readerLoaded[r] = wantV;
+          break;
+        }
+        case "StartServer": {
+          const r = changedServeReader(from, to, (i) => from.serving[i] === 0 && to.serving[i] !== 0);
+          const proc = readers[r];
+          if (!proc) return `serve walk ${walkIndex} ${where}: reader ${r + 1} not running`;
+          const v: number = to.serving[r];
+          writeFileSync(join(controlDir, `hold-exit-v${v}`), "hold\n");
+          writeFileSync(join(controlDir, `hold-call-v${v}`), "hold\n");
+          const beforeCount = readServeEvents(logPath).filter((e) => e.ev === "start" && e.name === `srv-v${v}`).length;
+          proc.sendText("start_server\n");
+          const line = await proc.readLine(10_000);
+          if (!line || !line.startsWith("started ")) {
+            return `serve walk ${walkIndex} ${where}: reader ${r + 1} expected "started ...", got ${JSON.stringify(line)}`;
+          }
+          const startedEv = await waitForServeCondition(
+            `srv-v${v} start`,
+            () => {
+              const evs = readServeEvents(logPath).filter((e) => e.ev === "start" && e.name === `srv-v${v}`);
+              return evs.length > beforeCount ? evs[evs.length - 1]! : null;
+            },
+            5_000,
+          );
+          readerServingPid[r] = startedEv.pid;
+          break;
+        }
+        case "StopServer": {
+          const r = changedServeReader(from, to, (i) => from.serving[i] !== 0 && to.serving[i] === 0);
+          const proc = readers[r];
+          if (!proc) return `serve walk ${walkIndex} ${where}: reader ${r + 1} not running`;
+          const prevV: number = from.serving[r];
+          const livePid = readerServingPid[r];
+          if (livePid !== null) {
+            const list = retiringPids[r]!.get(prevV) ?? [];
+            list.push(livePid);
+            retiringPids[r]!.set(prevV, list);
+            readerServingPid[r] = null;
+          }
+          proc.sendText("stop_server\n");
+          const line = await proc.readLine(10_000);
+          if (line !== "stopped") return `serve walk ${walkIndex} ${where}: reader ${r + 1} expected "stopped", got ${JSON.stringify(line)}`;
+          break;
+        }
+        case "RetireDone": {
+          let targetR = -1;
+          let targetV = 0;
+          for (let r = 0; r < from.retiring.length; r += 1) {
+            for (let v = 0; v < from.retiring[r]!.length; v += 1) {
+              if (from.retiring[r]![v]! > to.retiring[r]![v]!) {
+                targetR = r;
+                targetV = v + 1;
+              }
+            }
+          }
+          if (targetR < 0) return `serve walk ${walkIndex} ${where}: no retiring server decreased`;
+          const proc = readers[targetR];
+          if (!proc) return `serve walk ${walkIndex} ${where}: reader ${targetR + 1} not running`;
+          const list = retiringPids[targetR]!.get(targetV) ?? [];
+          const pid = list.shift();
+          rmSync(join(controlDir, `hold-call-v${targetV}`), { force: true });
+          rmSync(join(controlDir, `hold-exit-v${targetV}`), { force: true });
+          if (pid !== undefined) {
+            await waitForServeCondition(`retiring pid ${pid} exit`, () => !pidAlive(pid), 5_000);
+          }
+          proc.sendText("sweep\n");
+          const sweepLine = await proc.readLine(10_000);
+          if (sweepLine !== "swept") return `serve walk ${walkIndex} ${where}: reader ${targetR + 1} expected "swept", got ${JSON.stringify(sweepLine)}`;
+          if (to.retiring[targetR]![targetV - 1] === 0 && to.loaded[targetR] !== targetV) {
+            await waitForServeCondition(`pin v${targetV} release`, async () => !(await probePinBusy(targetV)), 2_000).catch(() => {});
+          }
+          break;
+        }
+        case "Exit": {
+          const r = changedServeReader(from, to, (i) => from.up[i] && !to.up[i]);
+          const proc = readers[r];
+          if (!proc) return `serve walk ${walkIndex} ${where}: reader ${r + 1} not running`;
+          proc.sendText("quit\n");
+          const code = await proc.proc.exited;
+          readers[r] = null;
+          readerLoaded[r] = 0;
+          if (code !== 0) return `serve walk ${walkIndex} ${where}: reader ${r + 1} exited ${code}`;
+          break;
+        }
+        case "Crash": {
+          const r = changedServeReader(from, to, (i) => from.up[i] && !to.up[i]);
+          const proc = readers[r];
+          if (!proc) return `serve walk ${walkIndex} ${where}: reader ${r + 1} not running`;
+          await proc.killAndWait();
+          readers[r] = null;
+          readerLoaded[r] = 0;
+          break;
+        }
+        case "DyingDone": {
+          const goneV = (from.dying as number[]).find((v) => !(to.dying as number[]).includes(v)) ?? 0;
+          for (let r = 0; r < 2; r += 1) {
+            const pLive = readerServingPid[r];
+            if (pLive !== null && from.serving[r] === goneV) {
+              await waitForServeCondition(`dying pid ${pLive} exit`, () => !pidAlive(pLive), 4_500);
+              readerServingPid[r] = null;
+            }
+            const ret = retiringPids[r]!.get(goneV) ?? [];
+            for (const p of ret) {
+              await waitForServeCondition(`dying retired pid ${p} exit`, () => !pidAlive(p), 4_500);
+            }
+            retiringPids[r]!.delete(goneV);
+          }
+          break;
+        }
+        default:
+          return `serve walk ${walkIndex} ${where}: unknown model action ${hop.label}`;
+      }
+
+      const checkErr = await verifyServeState(to, where);
+      if (checkErr) return checkErr;
+    }
+    return null;
+  } catch (err) {
+    return `serve walk ${walkIndex} (${trace.join(" > ")}): ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    await changer.killAndWait();
+    for (const proc of readers) {
+      if (proc) await proc.killAndWait();
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+async function runChangerCmdRaw(proc: LineProc, cmd: string): Promise<string | null> {
+  proc.sendText(`${cmd}\n`);
+  return await proc.readLine();
+}
+
+function curateServeScenarios(): CuratedServeScenario[] {
+  return [
+    "release_on_reload",
+    "release_on_first_exit",
+    "mixed_v1_v2",
+    "crash_then_cleanup",
+    "unused_versions_go",
+  ];
+}
+
+async function runCuratedServeScenario(
+  labBin: string,
+  scenario: CuratedServeScenario,
+  scratchBase: string,
+): Promise<string | null> {
+  const root = mkdtempSync(join(scratchBase, `curated-${scenario}-`));
+  const sourcesDir = join(root, ".src");
+  const controlDir = join(root, ".ctrl");
+  const logPath = join(root, ".srv.jsonl");
+  mkdirSync(sourcesDir, { recursive: true });
+  mkdirSync(controlDir, { recursive: true });
+  const sources = createServeSources(sourcesDir, controlDir, logPath);
+  const twoServerV1 = createTwoServerSource(sourcesDir, 1, controlDir, logPath);
+  const twoServerV2 = createTwoServerSource(sourcesDir, 2, controlDir, logPath);
+  const labEnv = serveLabEnv();
+  const changer = new LineProc([labBin, "changer", root, "m"], labEnv);
+  const readers: LineProc[] = [];
+
+  const probePinBusy = async (v: number): Promise<boolean> => {
+    const res = await runChangerCmdRaw(changer, `probe-pin ${tokenOf(v)}`);
+    if (res === "pin busy") return true;
+    if (res === "pin free") return false;
+    throw new Error(`unexpected probe-pin response: ${JSON.stringify(res)}`);
+  };
+
+  try {
+    if ((await changer.readLine()) !== "ready") return `${scenario}: changer did not print ready`;
+    const isTwoServer = scenario === "release_on_first_exit" || scenario === "mixed_v1_v2";
+    const installSrc = isTwoServer ? twoServerV1 : sources[0];
+    const err1 = await runChangerCmd(changer, `install ${installSrc} ${tokenOf(1)}`);
+    if (err1) return `${scenario}: init install failed: ${err1}`;
+
+    const cleanupFlag = scenario === "unused_versions_go" ? "--cleanup" : "--no-cleanup";
+    const reader = new LineProc([labBin, "reader", root, "m", cleanupFlag], labEnv);
+    readers.push(reader);
+    if ((await reader.readLine(10_000)) !== "ready") return `${scenario}: reader not ready`;
+
+    reader.sendText("reload\n");
+    if ((await reader.readLine(10_000)) !== `reloaded ${tokenOf(1)}`) return `${scenario}: initial reload failed`;
+
+    if (isTwoServer) {
+      // Graceful drain holds (< 900 ms, under stdio_conn's 1,500 ms SIGTERM grace):
+      // s1 exits at once on reload, while s2 holds its slow call on v1.
+      writeFileSync(join(controlDir, "hold-s2-call-v1"), "hold\n");
+      writeFileSync(join(controlDir, "hold-s2-v1"), "hold\n");
+      reader.sendText("start_server s1\n");
+      if (!(await reader.readLine(10_000))?.startsWith("started ")) return `${scenario}: s1 start failed`;
+      reader.sendText("start_call s2 slow\n");
+      if (!(await reader.readLine(10_000))?.startsWith("calling ")) return `${scenario}: s2 slow call failed`;
+      await waitForServeCondition("s2-v1 call_start", () =>
+        readServeEvents(logPath).find((e) => e.ev === "call_start" && e.name === "s2-v1"), 5_000);
+
+      const v2Src = scenario === "mixed_v1_v2" ? twoServerV2 : sources[1];
+      const err2 = await runChangerCmd(changer, `install ${v2Src} ${tokenOf(2)}`);
+      if (err2) return `${scenario}: install v2 failed: ${err2}`;
+      reader.sendText("reload\n");
+      if ((await reader.readLine(10_000)) !== `reloaded ${tokenOf(2)}`) return `${scenario}: reload v2 failed`;
+
+      // s1-v1 exits immediately while s2-v1 still drains its slow call on v1.
+      const s1Pid = readServeEvents(logPath).find((e) => e.ev === "start" && e.name === "s1-v1")!.pid;
+      await waitForServeCondition("s1-v1 exit", () => !pidAlive(s1Pid), 5_000);
+      reader.sendText("sweep\n");
+      if ((await reader.readLine(10_000)) !== "swept") return `${scenario}: sweep after s1 exit failed`;
+
+      if (!(await probePinBusy(1))) return `${scenario}: pin v1 dropped on first server exit while s2 still runs`;
+      const cleanupWhileBusy = await runChangerCmd(changer, `cleanup-version ${tokenOf(1)}`);
+      if (cleanupWhileBusy) return `${scenario}: cleanup probe failed: ${cleanupWhileBusy}`;
+      if (!inspectDisk(root).present.includes(1)) return `${scenario}: v1 folder deleted while s2 still runs`;
+
+      if (scenario === "mixed_v1_v2") {
+        // Start s1 on v2 while s2 on v1 is still stopping/draining: both versions stay pinned
+        // and each server reads its own version.txt.
+        reader.sendText("start_server s1\n");
+        if (!(await reader.readLine(10_000))?.startsWith("started ")) return `${scenario}: s1 on v2 failed to start while s2-v1 stops`;
+        await waitForServeCondition("s1-v2 read_ok", () =>
+          readServeEvents(logPath).find((e) => e.ev === "read_ok" && e.name === "s1-v2" && e.marker === "2"), 5_000);
+        if (!(await probePinBusy(1)) || !(await probePinBusy(2))) {
+          return `${scenario}: expected both v1 and v2 pinned during mixed execution`;
+        }
+        if (!inspectDisk(root).present.includes(1) || !inspectDisk(root).present.includes(2)) {
+          return `${scenario}: missing v1 or v2 folder during mixed execution`;
+        }
+      }
+
+      rmSync(join(controlDir, "hold-s2-call-v1"), { force: true });
+      rmSync(join(controlDir, "hold-s2-v1"), { force: true });
+      await waitForServeCondition("s2-v1 call_end marker read", () =>
+        readServeEvents(logPath).find((e) => e.ev === "read_ok" && e.name === "s2-v1" && e.phase === "call_end" && e.marker === "1"), 5_000);
+      reader.sendText("wait_call\n");
+      const callRes = await reader.readLine(10_000);
+      if (!callRes?.startsWith("call_done ")) return `${scenario}: s2 slow call join failed: ${JSON.stringify(callRes)}`;
+      const s2Pid = readServeEvents(logPath).find((e) => e.ev === "start" && e.name === "s2-v1")!.pid;
+      await waitForServeCondition("s2-v1 exit", () => !pidAlive(s2Pid), 5_000);
+      reader.sendText("sweep\n");
+      if ((await reader.readLine(10_000)) !== "swept") return `${scenario}: final sweep failed`;
+      await waitForServeCondition("pin v1 release", async () => !(await probePinBusy(1)), 2_000);
+      const cleanupDone = await runChangerCmd(changer, `cleanup-version ${tokenOf(1)}`);
+      if (cleanupDone) return `${scenario}: final cleanup failed: ${cleanupDone}`;
+      if (inspectDisk(root).present.includes(1)) return `${scenario}: v1 folder stayed after last server exited`;
+      if (scenario === "mixed_v1_v2" && !(await probePinBusy(2))) return `${scenario}: v2 pin lost while s1-v2 runs`;
+      reader.sendText("quit\n");
+      if ((await reader.proc.exited) !== 0) return `${scenario}: reader non-zero exit`;
+      return null;
+    }
+
+    // `release_on_reload`, `crash_then_cleanup`, and `unused_versions_go` hold a slow call on v1 across v2 reload
+    // (graceful path: <= 900 ms hold unless crash_then_cleanup sends SIGKILL immediately).
+    writeFileSync(join(controlDir, "hold-call-v1"), "hold\n");
+    writeFileSync(join(controlDir, "hold-exit-v1"), "hold\n");
+    reader.sendText("start_call srv slow\n");
+    if (!(await reader.readLine(10_000))?.startsWith("calling ")) return `${scenario}: v1 slow call did not start`;
+    const v1Start = await waitForServeCondition("srv-v1 call_start", () =>
+      readServeEvents(logPath).find((e) => e.ev === "call_start" && e.name === "srv-v1"), 5_000);
+
+    const err2 = await runChangerCmd(changer, `install ${sources[1]} ${tokenOf(2)}`);
+    if (err2) return `${scenario}: install v2 failed: ${err2}`;
+    reader.sendText("reload\n");
+    if ((await reader.readLine(10_000)) !== `reloaded ${tokenOf(2)}`) return `${scenario}: reload v2 failed`;
+
+    if (scenario === "crash_then_cleanup") {
+      // Crash path: SIGKILL drops reader pins in the OS kernel; process.zig helper kills dying server within 2 s.
+      await reader.killAndWait();
+      if (await probePinBusy(1)) return `${scenario}: pin v1 stayed held after reader SIGKILL`;
+      if (await probePinBusy(2)) return `${scenario}: pin v2 stayed held after reader SIGKILL`;
+      const cleanupErr = await runChangerCmd(changer, `cleanup-version ${tokenOf(1)}`);
+      if (cleanupErr) return `${scenario}: cleanup after crash failed: ${cleanupErr}`;
+      if (inspectDisk(root).present.includes(1)) return `${scenario}: v1 remained after crash cleanup`;
+      await waitForServeCondition("dying srv-v1 killed by helper", () => !pidAlive(v1Start.pid), 4_500);
+      return null;
+    }
+
+    if (!(await probePinBusy(1))) return `${scenario}: pin v1 released on reload while retired server still drains`;
+    if (scenario === "release_on_reload") {
+      const cleanupBusy = await runChangerCmd(changer, `cleanup-version ${tokenOf(1)}`);
+      if (cleanupBusy) return `${scenario}: cleanup probe failed: ${cleanupBusy}`;
+    }
+    if (!inspectDisk(root).present.includes(1)) return `${scenario}: v1 deleted while retired server still drains`;
+
+    rmSync(join(controlDir, "hold-call-v1"), { force: true });
+    rmSync(join(controlDir, "hold-exit-v1"), { force: true });
+    await waitForServeCondition("srv-v1 call_end marker read", () =>
+      readServeEvents(logPath).find((e) => e.ev === "read_ok" && e.name === "srv-v1" && e.phase === "call_end" && e.marker === "1"), 5_000);
+    reader.sendText("wait_call\n");
+    const callRes = await reader.readLine(10_000);
+    if (!callRes?.startsWith("call_done ")) return `${scenario}: v1 slow call join failed: ${JSON.stringify(callRes)}`;
+    await waitForServeCondition("srv-v1 exit", () => !pidAlive(v1Start.pid), 5_000);
+    reader.sendText("sweep\n");
+    if ((await reader.readLine(10_000)) !== "swept") return `${scenario}: final sweep failed`;
+    await waitForServeCondition("pin v1 release", async () => !(await probePinBusy(1)), 2_000);
+
+    if (scenario === "unused_versions_go") {
+      await waitForServeCondition("detached cleanup removes v1", () => !inspectDisk(root).present.includes(1), 5_000);
+    } else {
+      const cleanupDone = await runChangerCmd(changer, `cleanup-version ${tokenOf(1)}`);
+      if (cleanupDone) return `${scenario}: cleanup failed: ${cleanupDone}`;
+      if (inspectDisk(root).present.includes(1)) return `${scenario}: v1 remained after final cleanup`;
+    }
+    reader.sendText("quit\n");
+    const exitCode = await reader.proc.exited;
+    if (exitCode !== 0) return `${scenario}: reader exited ${exitCode}`;
+    return null;
+  } finally {
+    await changer.killAndWait();
+    for (const r of readers) await r.killAndWait();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+async function runServeWalkSet(
+  labBin: string,
+  walks: Walk[],
+  curated: CuratedServeScenario[],
+  graph: Graph,
+  scratchBase: string,
+  tamper: boolean,
+  stopOnFirst: boolean,
+): Promise<string[]> {
+  const mismatches: string[] = [];
+  let next = 0;
+  let stopped = false;
+
+  await Promise.all(Array.from({ length: Math.max(1, options.jobs) }, async () => {
+    while (!stopped && next < walks.length) {
+      const idx = next++;
+      const err = await runOneServeWalk(labBin, walks[idx]!, idx, graph, scratchBase, tamper);
+      if (err) {
+        mismatches.push(err);
+        if (stopOnFirst) stopped = true;
+      }
+    }
+  }));
+  if (!stopOnFirst || mismatches.length === 0) {
+    for (const scenario of curated) {
+      const err = await runCuratedServeScenario(labBin, scenario, scratchBase);
+      if (err) {
+        mismatches.push(err);
+        if (stopOnFirst) break;
+      }
+    }
+  }
+  return mismatches;
+}
+
+async function serveWalkPart(out: string): Promise<number> {
+  const graph = await loadModServeGraph(out);
+  if (!graph) return 2;
+
+  const walks = boundedServeWalks(graph);
+  const curated = curateServeScenarios();
+  const steps = walks.reduce((sum, walk) => sum + walk.hops.length, 0);
+  const walked = new Set(walks.flatMap((w) => w.hops.map((h) => h.label)));
+  for (const action of REQUIRED_SERVE_ACTIONS) {
+    if (!walked.has(action)) {
+      console.log(`serve-walk: action ${action} was never walked`);
+      return 1;
+    }
+  }
+
+  if (options.planOnly) {
+    console.log(`serve-walk: selected ${walks.length} graph walks (${steps} steps) + ${curated.length} curated scenarios`);
+    return 0;
+  }
+
+  const serveLab = buildServeLab(out, "lab_serve");
+  if (!serveLab) return 2;
+
+  const scratchBase = mkdtempSync(join(tmpdir(), "fx-serve-walk-"));
+  try {
+    const started = performance.now();
+    const mismatches = await runServeWalkSet(serveLab, walks, curated, graph, scratchBase, false, false);
+    const elapsed = ((performance.now() - started) / 1000).toFixed(1);
+    console.log(`serve-walk: ${walks.length} graph walks + ${curated.length} curated scenarios (${steps} steps), ${mismatches.length} mismatches in ${elapsed}s`);
+    if (mismatches.length > 0) {
+      console.log(`first mismatch: ${mismatches[0]}`);
+      return 1;
+    }
+    console.log("serve-walk: ACCEPTED");
+
+    if (options.selfCheck) {
+      const tampered = await runServeWalkSet(serveLab, walks.slice(0, 10), [], graph, scratchBase, true, true);
+      const tamperedRejected = tampered.length > 0;
+      console.log(`self-check: serve-walk, tampered expectation ${tamperedRejected ? "rejected" : "NOT rejected"}`);
+      let allCaught = tamperedRejected;
+
+      for (const [index, mutant] of SERVE_MUTANTS.entries()) {
+        const mutantBin = buildServeLab(out, `lab_serve_mutant_${index}`, mutant.patches);
+        if (!mutantBin) {
+          allCaught = false;
+          continue;
+        }
+        const mutantMismatches = await runServeWalkSet(mutantBin, walks, curated, graph, scratchBase, false, true);
+        const rejected = mutantMismatches.length > 0;
+        console.log(`self-check: serve-walk that ${mutant.name} ${rejected ? "rejected" : "NOT rejected"}`);
+        allCaught &&= rejected;
+      }
+      if (!allCaught) return 1;
+    }
+
+    return 0;
+  } finally {
+    rmSync(scratchBase, { recursive: true, force: true });
+  }
+}
+
 async function main(): Promise<number> {
   const out = outDir("mods");
   let code = 0;
@@ -1145,6 +2094,10 @@ async function main(): Promise<number> {
   }
   if (options.parts.includes("use-walk")) {
     const partCode = await useWalkPart(out);
+    if (partCode !== 0) code = partCode;
+  }
+  if (options.parts.includes("serve-walk")) {
+    const partCode = await serveWalkPart(out);
     if (partCode !== 0) code = partCode;
   }
   return code;
