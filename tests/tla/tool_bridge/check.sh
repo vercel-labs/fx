@@ -29,6 +29,16 @@
 # quiet wait, a wait that ended on mail, and a wait refused after the first
 # call yielded.
 #
+# AskWait models `fx tool ask`, the slice-8 design; its code has not landed. A
+# question holds the bridge's prompt lock until it ends, so one prompt shows at a
+# time, and a watch withdraws a question whose program is gone. ask-design must
+# pass. ask-mutant-watch-off removes the watch, so a gone program's bash call
+# waits for a person who may never answer. ask-mutant-admission-lock-only holds
+# the lock only for the permission check, as the bridge does today, so a second
+# question fills the session's one question slot. The ask-witness-* configs show
+# an answer, a withdrawn question, a request that gave up, Esc, a host with no
+# question UI, a refusal after the yield, and two questions in turn.
+#
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 set -eu
 
@@ -65,6 +75,16 @@ AgentWait agent-witness-canceled NeverCanceled
 AgentWait agent-witness-quiet NeverQuiet
 AgentWait agent-witness-mail NeverMailAfterWait
 AgentWait agent-witness-unavailable NeverUnavailable
+AskWait ask-design -
+AskWait ask-mutant-watch-off temporal
+AskWait ask-mutant-admission-lock-only NoCrash
+AskWait ask-witness-answered NeverAnswered
+AskWait ask-witness-withdrawn NeverWithdrawn
+AskWait ask-witness-gave-up NeverGaveUp
+AskWait ask-witness-esc NeverEsc
+AskWait ask-witness-no-ui NeverNoUi
+AskWait ask-witness-unavailable NeverUnavailable
+AskWait ask-witness-two-asked NeverTwoAsked
 EOT
 
 # The driver: the design-bridge state graph walked on the real harness,
