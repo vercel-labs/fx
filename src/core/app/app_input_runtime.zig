@@ -10670,6 +10670,40 @@ test "app_input_runtime empty composer paste checks the clipboard for an image" 
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "composer paste empty action=clipboard_image"));
 }
 
+test "app_input_runtime control-only composer paste drops its bytes without a clipboard check" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "control-only-composer-paste.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    const notices_before = app.notice_write_count;
+    try feedRoutingBytes(&app, "\x1b[200~\x01\x02\x1b[201~");
+    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
+    try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+    try std.testing.expectEqualStrings(
+        "Pasted text contains unsupported bytes and was not added to the draft.",
+        app.notice_body.items,
+    );
+    debug_trace.shutdown();
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "composer paste dropped bytes=2 reason=unsupported_bytes"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, trace, "action=clipboard_image"));
+}
+
 test "app_input_runtime empty composer paste skips the clipboard while the model picker borrows the composer" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -90,6 +90,9 @@ pub const State = struct {
     overflow_bytes: usize = 0,
     buffer_limit: usize = std.math.maxInt(usize),
     decision_bytes: usize = 0,
+    /// Payload bytes the paste carried before the owner's filter, excluding its
+    /// end marker. A paste of only dropped bytes is not an empty paste.
+    carried_bytes: usize = 0,
     buffer: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *State, alloc: Allocator) void {
@@ -155,6 +158,7 @@ pub const State = struct {
                     self.end_candidate_buffer_len,
                 );
                 self.overflow_bytes = self.end_candidate_overflow_bytes;
+                self.carried_bytes -|= paste_end_marker.len;
             },
         }
         self.end_match_len = 0;
@@ -300,6 +304,7 @@ pub const State = struct {
         self.overflow_bytes = 0;
         self.buffer_limit = std.math.maxInt(usize);
         self.decision_bytes = 0;
+        self.carried_bytes = 0;
         self.buffer.clearRetainingCapacity();
     }
 
@@ -312,6 +317,7 @@ pub const State = struct {
             .none => return,
             .decision_prompt => self.decision_bytes +|= 1,
             .composer, .question_freeform, .approval_amendment, .auth_code => {
+                self.carried_bytes +|= 1;
                 const captured_byte: u8 = if (self.owner == .question_freeform and byte == '\t')
                     ' '
                 else
@@ -539,6 +545,22 @@ test "capturing remains active when a delivery epoch ends before the marker" {
     try std.testing.expect(state.active());
     try std.testing.expectEqual(BoundaryState.capturing, state.boundary);
     try std.testing.expectEqual(Settlement.none, state.settleDeliveryEpoch());
+}
+
+test "carried bytes count bytes a filter drops and reset when a paste opens" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    state.begin(.composer, std.math.maxInt(usize));
+    for ("\x01a\x02" ++ paste_end_marker) |byte| {
+        try state.consumeByte(std.testing.allocator, byte);
+    }
+    try std.testing.expectEqualStrings("a", state.buffer.items);
+    try std.testing.expectEqual(@as(usize, 3), state.carried_bytes);
+
+    state.beginHandling();
+    state.finishHandled();
+    state.begin(.composer, std.math.maxInt(usize));
+    try std.testing.expectEqual(@as(usize, 0), state.carried_bytes);
 }
 
 test "end candidate stays paste owned until delivery epoch settlement" {
