@@ -7,8 +7,9 @@
 # model-checks tests/tla/sdk/ and drives libfx along its state graphs, which
 # takes about 40 minutes. A pull request runs it only when it touches code
 # libfx owns: sdk/, the SDK models in tests/tla/sdk/, their drivers in
-# tests/tla/drivers/*.mjs, the Node-API and WebAssembly core entry points,
-# src/acp/, src/core/hosts/, or src/core/session_manager/.
+# tests/tla/drivers/*.mjs, the shared TLC code in tests/tla/lib/, the
+# Node-API and WebAssembly core entry points, src/acp/, src/core/hosts/, or
+# src/core/session_manager/.
 #
 # mcp: the TLA+ MCP jobs, the engine models and driver and the host models and
 # drivers (three parts of one job: the SignIn model, the other models, and the
@@ -18,7 +19,8 @@
 # src/core/mcp_host/, src/core/mcp/, src/core/shared/net_connect.zig (the
 # connect its model Connect.tla checks), those models, their drivers in
 # tests/tla/drivers/mcp/, tests/tla/drivers/mcp_host/, and
-# tests/tla/drivers/lib/, the MCP fixtures in tests/e2e/fixtures/, or the
+# tests/tla/drivers/lib/, the shared TLC code in tests/tla/lib/ (the MCP
+# driver's bridge runs it), the MCP fixtures in tests/e2e/fixtures/, or the
 # helpers the drivers load: tests/e2e/tmux-helpers.ts,
 # tests/evals/eval-helpers.ts, and tests/e2e/render-lab/tape.ts.
 #
@@ -214,6 +216,8 @@ while IFS= read -r -d '' path; do
     tests/tla/acp/*)
       require_acp "$path: ACP model changed" ;;
     tests/tla/lib/*)
+      require_libfx "$path: shared model-check code changed"
+      require_mcp "$path: shared model-check code changed"
       require_subagent "$path: shared model-check code changed"
       require_managed_execution "$path: shared model-check code changed"
       require_acp "$path: shared TLC script changed" ;;

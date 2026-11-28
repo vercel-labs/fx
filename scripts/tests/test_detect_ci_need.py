@@ -225,7 +225,7 @@ class DetectCiNeedTests(unittest.TestCase):
 
     def test_shared_model_check_code_needs_each_check_that_loads_it(self) -> None:
         self.commit_each(
-            ("tests/tla/lib/tlc.sh",), libfx=False, mcp=False, subagent=True, managed_execution=True, acp=True,
+            ("tests/tla/lib/tlc.sh",), libfx=True, mcp=True, subagent=True, managed_execution=True, acp=True,
         )
 
     def test_other_session_and_agent_files_need_no_subagent_check(self) -> None:
