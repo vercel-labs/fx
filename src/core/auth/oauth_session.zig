@@ -1908,6 +1908,53 @@ test "OAuth session mutation lock serializes independent handles" {
     );
 }
 
+test "the fx login lock records each wait it makes, and none for a lock it only tries" {
+    sign_in_trace.reset();
+    defer sign_in_trace.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A lock fx only tries (wait 0) is no wait: taken or busy, it records nothing.
+    var held = try lockMutationWithOps(.{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, 0, .{});
+    try std.testing.expectError(
+        error.LockBusy,
+        lockMutationWithOps(.{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, 0, .{}),
+    );
+    var events: [sign_in_trace.ring_capacity]sign_in_trace.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), sign_in_trace.snapshot(&events));
+
+    // A wait that runs out while another holds the lock gives up.
+    try std.testing.expectError(
+        error.LockBusy,
+        lockMutationWithOps(.{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, 50, .{}),
+    );
+    held.deinit();
+
+    // A free lock is taken; any other lock error is recorded by name.
+    var taken = try lockMutationWithOps(.{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, 50, .{});
+    taken.deinit();
+    const Denied = struct {
+        fn tryLock(_: ?*anyopaque, _: std.Io.File) anyerror!bool {
+            return error.AccessDenied;
+        }
+    };
+    // The caller sees a storage failure; the record keeps the lock's own error.
+    try std.testing.expectError(
+        error.CredentialStorageUnavailable,
+        lockMutationWithOps(.{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, 50, .{ .try_lock = Denied.tryLock }),
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), sign_in_trace.snapshot(&events));
+    try std.testing.expect(events[0].failed);
+    try std.testing.expect(std.mem.startsWith(u8, events[0].detail(), "outcome=given_up waited_ms="));
+    try std.testing.expect(std.mem.endsWith(u8, events[0].detail(), " limit_ms=50"));
+    try std.testing.expect(!events[1].failed);
+    try std.testing.expect(std.mem.startsWith(u8, events[1].detail(), "outcome=taken waited_ms="));
+    try std.testing.expect(events[2].failed);
+    try std.testing.expect(std.mem.startsWith(u8, events[2].detail(), "outcome=AccessDenied waited_ms="));
+    for (events[0..3]) |*event| try std.testing.expectEqualStrings("lock_wait", event.name());
+}
+
 test "oauth E2E issuer override accepts loopback HTTP only" {
     try std.testing.expectEqualStrings(
         "http://127.0.0.1:43123",

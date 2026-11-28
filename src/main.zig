@@ -404,6 +404,7 @@ fn currentBuild() update_target.CurrentBuild {
         .channel = compiled_update_channel,
         .version = version,
         .revision = build_options.git_commit,
+        .build = build_options.build_number,
     };
 }
 
@@ -713,6 +714,14 @@ const App = struct {
     pub fn screenAgent(self: anytype) @TypeOf(&self.main_agent) {
         agents.assertLoopThread(@returnAddress());
         return self.screen_owner orelse &self.main_agent;
+    }
+
+    pub fn anyMenuOrPickerActive(self: *const Self, agent: *const agents.Agent) bool {
+        return RenderAppRuntime.anyMenuOrPickerActive(self, agent);
+    }
+
+    pub fn anyDraftNonEmpty(self: *const Self, agent: *const agents.Agent) bool {
+        return UpgradeAppRuntime.anyDraftNonEmpty(self, agent);
     }
 
     pub fn init(
@@ -4934,6 +4943,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -4971,6 +4981,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -5008,6 +5019,7 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -5821,6 +5833,7 @@ test {
     _ = @import("acp/server.zig");
     _ = @import("acp/libfx_hooks.zig");
     _ = @import("acp/types.zig");
+    _ = @import("protocol/spec/schemas.zig");
     _ = @import("core/mcp_host/model.zig");
     _ = @import("core/output/activity_status.zig");
     _ = @import("core/agent/agent_runtime.zig");

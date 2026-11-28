@@ -363,11 +363,15 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         /// The model picker lends the composer out as its query box: the
-        /// catalog, then a Ctrl+P flow's inline stages. An image attached
-        /// there would outlive the query, so image input stays out of it.
+        /// catalog, then a Ctrl+P flow's inline stages. The `/effort` menu
+        /// does too. An image attached there would outlive the query, so
+        /// image input stays out of it.
         pub fn modelPickerBorrowsComposer(app: *const App) bool {
             if (comptime @hasField(@TypeOf(app.input_runtime), "model_picker_draft")) {
                 if (app.input_runtime.model_picker_draft != null) return true;
+            }
+            if (comptime @hasField(@TypeOf(app.input_runtime), "effort_menu")) {
+                if (app.input_runtime.effort_menu.active) return true;
             }
             if (comptime !@hasField(App, "model_cache")) return false;
             return app.model_cache.menu.active;
@@ -654,6 +658,10 @@ pub fn PasteEditRuntime(comptime App: type) type {
         fn maybeOpenPastedSkillMenu(app: *App, start: usize, end: usize) void {
             if (comptime !@hasField(App, "skills")) return;
             if (app.skills.menu.active) return;
+            // A pasted `$name` is part of the open `/effort` menu's query.
+            if (comptime @hasField(@TypeOf(app.input_runtime), "effort_menu")) {
+                if (app.input_runtime.effort_menu.active) return;
+            }
 
             const input = app.input_runtime.edit_state.input.items;
             var index = @min(start, input.len);

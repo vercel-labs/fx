@@ -1345,6 +1345,81 @@ describe("/mcp in the shell", () => {
     expect(await tui.captureFullScrollback()).not.toContain("Removed web");
   }, 90_000);
 
+  test.skipIf(!tmuxAvailable())("/mcp blinks fx's working marker on the row of a server that connects or lists its first tools, and drops it once its tools are in", async () => {
+    // An HTTP server that answers initialize, then tools/list, only when the test lets it.
+    let answerInitialize = () => {};
+    const initializeHeld = new Promise<void>((resolve) => (answerInitialize = resolve));
+    let answerToolsList = () => {};
+    const toolsListHeld = new Promise<void>((resolve) => (answerToolsList = resolve));
+    const slow = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        if (request.method === "DELETE") return new Response(null, { status: 204 });
+        if (request.method !== "POST") return new Response(null, { status: 405 });
+        const message = (await request.json()) as { id?: unknown; method?: string };
+        if (message.method === "server/discover") return new Response(null, { status: 404 });
+        if (message.method?.startsWith("notifications/")) return new Response(null, { status: 202 });
+        if (message.method === "initialize") {
+          await initializeHeld;
+          return Response.json({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "slow", version: "1" } } });
+        }
+        if (message.method === "tools/list") {
+          await toolsListHeld;
+          return Response.json({ jsonrpc: "2.0", id: message.id, result: { tools: [{ name: "echo_slow", description: "Echo.", inputSchema: { type: "object", properties: {} } }] } });
+        }
+        return Response.json({ jsonrpc: "2.0", id: message.id ?? null, error: { code: -32601, message: "Method not found" } });
+      },
+    });
+    try {
+      const root = createRoot({ mcpServers: { slow: { type: "http", url: `http://127.0.0.1:${slow.port}/mcp`, startup_timeout_ms: 60_000 } } });
+      gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 100,
+        height: 36,
+        env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+      });
+      await tui.waitForComposer(15_000);
+      const lineWith = (pane: string, text: string) => pane.split("\n").find((line) => line.includes(text)) ?? "";
+      // The marker blinks: lit, then its two columns blank with the words in place.
+      const blinks = async (text: string) => {
+        await tui!.waitForPane((pane) => lineWith(pane, text).includes(`• ${text}`), 5_000);
+        await tui!.waitForPane((pane) => lineWith(pane, text).includes(`  ${text}`) && !lineWith(pane, text).includes("•"), 5_000);
+        await tui!.waitForPane((pane) => lineWith(pane, text).includes(`• ${text}`), 5_000);
+      };
+
+      await tui.sendText("/mcp");
+      await tui.waitForText("MCP servers  1", 10_000);
+      await tui.waitForText(/› slow +• connecting/, 10_000);
+      await blinks("connecting");
+
+      // Connected, it still waits for its first tools, and says so on its row.
+      answerInitialize();
+      await tui.waitForText(/› slow +• ready, 0 tools/, 10_000);
+      await blinks("ready, 0 tools");
+
+      // Its screen blinks it on the status and on the tools it waits for.
+      await tui.sendKeys("Enter");
+      await tui.waitForText("Loading tools…", 10_000);
+      await blinks("Loading tools…");
+      await tui.waitForText(/status +• ready/, 5_000);
+
+      answerToolsList();
+      await tui.waitForText("Tools 1", 15_000);
+      await tui.waitForText(/status +ready/, 5_000);
+      const menuLines = (pane: string) => pane.split("\n").filter((line) => /slow|status|Tools|Loading/.test(line));
+      expect(menuLines(await tui.capturePane()).join("\n")).not.toContain("•");
+      await tui.sendKeys("Escape");
+      await tui.waitForText(/› slow +ready, 1 tool/, 5_000);
+      expect(menuLines(await tui.capturePane()).join("\n")).not.toContain("•");
+    } finally {
+      answerInitialize();
+      answerToolsList();
+      slow.stop(true);
+    }
+  }, 90_000);
+
   test.skipIf(!tmuxAvailable())("/mcp names HOME and writes nothing when HOME is not absolute", async () => {
     // fx treats a relative HOME as unset, and the shell's /mcp must not build
     // `.fx/mcp.json` against the workspace instead.

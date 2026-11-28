@@ -119,6 +119,9 @@ pub const Status = struct {
     /// The HTTP status behind `tools_error` when its words say the server is temporarily unavailable (429, 503), else
     /// 0: `fx mcp show` and the `/mcp` screen say "unavailable (HTTP n)" for it. A number, so every copy carries it.
     tools_unavailable: u16 = 0,
+    /// A `ready` server's first tool list is on its way: `tools` says 0 only because none came yet. The `/mcp` menu
+    /// shows its row as loading.
+    tools_pending: bool = false,
     /// How many tools of the list fx left out of what the model gets, by reason, for a server that is `ready`: the ones
     /// the engine skipped (`mcp.tools.Store.addPage`) and the ones the host's reading refuses (`dropped_tools`). Plain
     /// counts, so every copy of a `Status` carries them as it is.
@@ -2467,6 +2470,7 @@ pub const Runtime = struct {
                 o.tools_unavailable = if (o.tools_error != null) st.list_unavailable else 0;
             }
             if (o.state == .ready) {
+                o.tools_pending = st.tools_pending;
                 o.dropped = st.dropped;
                 // The tools it counts are the ones it lists and the model gets: the host's reading keeps them.
                 if (r.hostReading(i, s.name)) |read| {
