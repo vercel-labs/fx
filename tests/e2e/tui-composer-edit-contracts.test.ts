@@ -32,6 +32,10 @@ const COMPOSER_BYTE_LIMIT = 8 * 1024 * 1024;
 const PASTE_START = ["1b", "5b", "32", "30", "30", "7e"] as const;
 const PASTE_END = ["1b", "5b", "32", "30", "31", "7e"] as const;
 const SUFFIX_IGNORED_NOTICE = "Input that arrived right after the paste was ignored.";
+const UNSUPPORTED_BYTES_NOTICE = "Pasted text contains unsupported bytes and was not added to the draft.";
+const CLIPBOARD_CHECK_TRACE = "composer paste empty action=clipboard_image";
+const MODEL_PICKER_BORROW_TRACE = "composer paste empty action=none reason=model_picker_borrows_composer";
+const CONTROL_ONLY_PASTE_TRACE = "composer paste dropped bytes=2 reason=unsupported_bytes";
 const MANAGED_REVIEW_BODY = "GROUP_C_MANAGED_REVIEW_BODY";
 const WORKSPACE_REVIEW_BODY = "GROUP_C_WORKSPACE_REVIEW_BODY";
 
@@ -340,6 +344,62 @@ tmuxTest(
 
     expect(finalUserText()).toBe("CRLF_SENTINEL_A\nCRLF_SENTINEL_B");
     expect(await active.captureFullScrollback()).not.toContain(SUFFIX_IGNORED_NOTICE);
+    expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "empty bracketed paste checks the clipboard and leaves the composer empty",
+  async () => {
+    const active = await startFx(true, 1, false, "input");
+
+    await active.sendHexBytes([...PASTE_START, ...PASTE_END]);
+    await waitForTraceOrExit(active, CLIPBOARD_CHECK_TRACE);
+    // Input is handled in order, so the key that follows shows whether the
+    // empty paste added anything before it.
+    await active.sendLiteralText("x");
+    const pane = await active.waitForPane(
+      (pane) => /^\s*(?:┃|❯|>)\s+x\s*$/m.test(pane),
+      TIMEOUT,
+    );
+    expect(pane).not.toContain(UNSUPPORTED_BYTES_NOTICE);
+    expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "empty bracketed paste under the model picker leaves the picker open",
+  async () => {
+    const active = await startFx(true, 1, false, "input");
+
+    await active.sendText("/model");
+    await active.waitForPane(
+      (pane) => pane.includes("Models") && pane.includes("esc close"),
+      TIMEOUT,
+    );
+
+    await active.sendHexBytes([...PASTE_START, ...PASTE_END]);
+    await waitForTraceOrExit(active, MODEL_PICKER_BORROW_TRACE);
+    const pane = await active.waitForPane((pane) => pane.includes("esc close"), TIMEOUT);
+    expect(pane).toContain("Models");
+    expect(readFileSync(join(root!, "trace.log"), "utf8")).not.toContain(CLIPBOARD_CHECK_TRACE);
+    expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "bracketed paste of only dropped control bytes shows the unsupported notice without a clipboard check",
+  async () => {
+    const active = await startFx(true, 1, false, "input");
+
+    await active.sendHexBytes([...PASTE_START, "01", "02", ...PASTE_END]);
+    await waitForTraceOrExit(active, CONTROL_ONLY_PASTE_TRACE);
+    const pane = await active.waitForText(UNSUPPORTED_BYTES_NOTICE, TIMEOUT);
+    expect(hasEmptyComposer(pane)).toBe(true);
+    expect(readFileSync(join(root!, "trace.log"), "utf8")).not.toContain(CLIPBOARD_CHECK_TRACE);
     expectCleanRuntime(active);
   },
   TIMEOUT,

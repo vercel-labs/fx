@@ -220,7 +220,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
             };
 
             // Never let all-control-byte decoded composer text reach
-            // finalizePastedBlock, which treats an empty buffer as a clipboard image check.
+            // finalizePastedBlock, which checks the clipboard for an empty buffer that carried no bytes.
             if (capture.owner == .composer and
                 app.input_runtime.paste.overflow_bytes == 0 and
                 app.input_runtime.paste.buffer.items.len == 0)
@@ -468,7 +468,15 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         pub fn finalizePastedBlock(app: *App, agent: *AppAgent, max_input_len: usize) !void {
-            if (app.input_runtime.paste.buffer.items.len == 0) return checkClipboardOnEmptyPaste(app);
+            if (app.input_runtime.paste.buffer.items.len == 0) {
+                if (app.input_runtime.paste.carried_bytes == 0) return checkClipboardOnEmptyPaste(app);
+                debug_trace.logf(
+                    "input",
+                    "composer paste dropped bytes={d} reason=unsupported_bytes",
+                    .{app.input_runtime.paste.carried_bytes},
+                );
+                return rejectUnsupportedPaste(app, .footer);
+            }
 
             // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
