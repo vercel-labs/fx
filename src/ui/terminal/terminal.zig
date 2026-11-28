@@ -82,7 +82,7 @@ pub fn terminalGone(fd: std.posix.fd_t, err: anyerror) bool {
     _ = std.posix.poll(&fds, 0) catch return false;
     const hangup_at_first_poll = (fds[0].revents & gone_poll_flags) != 0;
     const foreign_foreground = foreignForeground(fd);
-    // A call that fails, such as a revoked descriptor's, cannot prove the descriptor is still a terminal.
+    // A failed isatty proves nothing, so the descriptor counts as a terminal still.
     const still_terminal = file.isTty(io_mod.getIo()) catch true;
     // Error path only: teardown can raise EIO before POLLHUP/POLLNVAL appears (`tests/tla/terminal_hangup/TerminalHangup.tla` `GoneIsQuiet`).
     io_mod.sleep(@as(u64, @intCast(hangup_sign_wait_ms)) * std.time.ns_per_ms);
