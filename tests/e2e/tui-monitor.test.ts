@@ -277,10 +277,11 @@ scenario("a blocked agent gets the newest twenty events, a count of the rest, an
 });
 
 scenario("a stream that spans several event windows leaves every line in the file", async (profile) => {
-  // Thirty kilobytes a second for fourteen seconds, past the ten second gap
-  // between events. The entry keeps only 64 KiB of output not yet read, so a
-  // file written once per event would lose most of the second window.
-  const stream = "echo $$ > pid.txt; for i in $(seq 1 14); do printf 'burst-%02d ' $i; head -c 30000 /dev/zero | tr '\\0' x; echo; sleep 1; done";
+  // A hundred kilobytes a second for fourteen seconds, past the ten second
+  // gap between events. A shell run keeps 64 KiB of output not yet read, so a
+  // file written once per event, or a read that comes a second late, would
+  // lose some of it.
+  const stream = "echo $$ > pid.txt; for i in $(seq 1 14); do printf 'burst-%02d ' $i; head -c 100000 /dev/zero | tr '\\0' x; echo; sleep 1; done";
   profile.script("Watch the stream.", [
     () => fakeGatewayToolCall("m1", "monitor", { action: "start", command: stream, label: "stream" }),
     () => fakeGatewayFinalText("STREAM_STARTED"),
@@ -298,7 +299,7 @@ scenario("a stream that spans several event windows leaves every line in the fil
   const logged = readFileSync(file, "utf8");
   for (let index = 1; index <= 14; index++) expect(logged).toContain(`burst-${String(index).padStart(2, "0")} `);
   expect(logged).not.toContain("bytes truncated");
-  expect(statSync(file).size).toBeGreaterThanOrEqual(14 * 30_000);
+  expect(statSync(file).size).toBeGreaterThanOrEqual(14 * 100_000);
   // Nothing rolled over: the whole stream is under the 4 MiB the file keeps.
   expect(existsSync(`${file}.1`)).toBe(false);
 });

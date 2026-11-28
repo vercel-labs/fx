@@ -98,7 +98,11 @@ fn callStart(ctx: tool_dispatch.DispatchContext, registry: *monitor.Registry, in
     // cancel of this turn leaves it running (`shell.zig` `withoutSteeringYield`).
     const shell_args = try shellArguments(ctx.allocator, .{ .action = "run", .command = input.command, .yield_time_ms = 0 });
     defer ctx.allocator.free(shell_args);
-    const started = try runShell(ctx, shell_args);
+    // A monitor's output is read once a second, so its command may print more
+    // between two reads than a shell run keeps.
+    var start_ctx = ctx;
+    start_ctx.max_command_output_bytes = monitor.max_unread_output_bytes;
+    const started = try runShell(start_ctx, shell_args);
     switch (started) {
         .failure => return started,
         .rich => return started,

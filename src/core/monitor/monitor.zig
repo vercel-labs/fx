@@ -25,6 +25,12 @@ pub const max_monitors: usize = 16;
 /// agent never has a queue of them to read later.
 pub const max_queued_events: usize = 1;
 
+/// The output of a monitor's command that the loop has not read yet, at most.
+/// The loop reads about once a second, and a read can come two seconds late
+/// near an event, so this bounds how fast a command can print and still reach
+/// the file whole. A burst past it keeps its first and last halves.
+pub const max_unread_output_bytes: usize = 1024 * 1024;
+
 /// What a monitor keeps of its command's output between two events. The file
 /// holds all of it (`output_log`), so what does not fit here only misses the
 /// next event's words.
