@@ -3361,6 +3361,33 @@ test "permission target resolution and outcome report unsupported tty shell to t
         "Shell path must be absolute \"bin/zsh\"; supported shells: bash, zsh",
         relative_outcome.tool_failure orelse return error.TestExpectedToolFailure,
     );
+
+    const empty_shell_call: ToolCall = .{
+        .id = "empty_shell_path",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"\"}}",
+    };
+    const empty_shell_msg = (try permissionTargetResolutionFailureMessage(arena, empty_shell_call, error.RelativeShellPath)).?;
+    try std.testing.expectEqualStrings(
+        "Shell path must be absolute; supported shells: bash, zsh",
+        empty_shell_msg,
+    );
+    const empty_shell_outcome = try requestPermissionOutcome(input, arena, empty_shell_call, .auto, &.{});
+    try std.testing.expectEqualStrings(
+        "Shell path must be absolute; supported shells: bash, zsh",
+        empty_shell_outcome.tool_failure orelse return error.TestExpectedToolFailure,
+    );
+
+    const missing_login_call: ToolCall = .{
+        .id = "missing_login_shell",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"tty\":true,\"shell\":{\"kind\":\"user_login\"}}",
+    };
+    const missing_login_msg = (try permissionTargetResolutionFailureMessage(arena, missing_login_call, error.MissingLoginShell)).?;
+    try std.testing.expectEqualStrings(
+        "Missing login shell; supported shells: bash, zsh",
+        missing_login_msg,
+    );
 }
 
 test "interactive terminal exec approval permits command amendments" {
