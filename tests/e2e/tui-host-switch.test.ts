@@ -6581,4 +6581,151 @@ describe("a subagent's wait shows in the view the person is on", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "/stop stops a subagent waiting on a question and a working subagent, and finalizes the question transcript",
+    async () => {
+      const workerHeld = held();
+      const mainHeld = held();
+      let workerCalls = 0;
+      let askerCalls = 0;
+      const reports = new Map<string, { agent: string; outcome: string; cause?: string }>();
+      const collectReports = (body: string) => {
+        const walk = (value: unknown) => {
+          if (typeof value === "string") {
+            const idx = value.indexOf(REPORT_HEADER);
+            if (idx < 0) return;
+            for (const line of value.slice(idx).split("\n")) {
+              if (!line.startsWith("{")) continue;
+              const parsed = JSON.parse(line);
+              if (parsed.agent) {
+                reports.set(parsed.agent, { agent: parsed.agent, outcome: parsed.outcome, cause: parsed.cause });
+              }
+            }
+          } else if (Array.isArray(value)) value.forEach(walk);
+          else if (value && typeof value === "object") Object.values(value).forEach(walk);
+        };
+        walk(JSON.parse(body));
+      };
+      try {
+        await withFx(async (body) => {
+          const latest = latestUserText(body);
+          if (!isMainRequest(body)) {
+            if (body.includes("STOP_Q_TASK")) {
+              askerCalls += 1;
+              if (askerCalls === 1) {
+                return toolCall("asker_q", "ask_user_question", {
+                  questions: [{ question: "STOP_QUESTION pick one", options: [{ label: "OPT_ONE" }, { label: "OPT_TWO" }] }],
+                });
+              }
+              return text("asker_after", "ASKER_AFTER");
+            }
+            workerCalls += 1;
+            await workerHeld.promise;
+            return text("worker_done", "WORKER_DONE");
+          }
+          collectReports(body);
+          if (latest.startsWith(REPORT_HEADER)) {
+            return text(`main_report_${reports.size}`, "MAIN_SAW_REPORT");
+          }
+          if (!body.includes('"main_spawn_asker"')) {
+            return toolCall("main_spawn_asker", "subagent", {
+              request: { action: "message", agent: "asker", message: "STOP_Q_TASK ask" },
+            });
+          }
+          if (!body.includes('"main_spawn_worker"')) {
+            return toolCall("main_spawn_worker", "subagent", {
+              request: { action: "message", agent: "worker", message: "STOP_W_TASK work" },
+            });
+          }
+          await until("asker and worker active", () => askerCalls >= 1 && workerCalls >= 1);
+          await mainHeld.promise;
+          return text("main_done", "MAIN_Q_FINISHED");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER start asker and worker");
+          await session.waitForPane((pane) => pane.includes("STOP_QUESTION pick one") && pane.includes("asker asks"), 30_000);
+          await until("worker running", () => workerCalls >= 1);
+
+          // Switch to `worker` so the composer is open while `asker` waits on its question
+          // and `worker` continues running.
+          await showAgent(session, "worker");
+          await session.waitForPane((pane) => pane.includes("worker") && pane.includes("asker has a question"), 10_000);
+
+          await session.sendText("/stop");
+          await session.waitForText("Stopped 2 subagents.", 15_000);
+
+          // Switch to `asker` and confirm its question was finalized as Cancelled.
+          await showAgent(session, "asker");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("Cancelled"), 15_000);
+          const askerPane = await session.capturePane();
+          expect(askerPane).not.toContain("STOP_QUESTION pick one");
+
+          // Switch back to `main`, release main's stream, and confirm both user-stop reports arrive.
+          await showAgent(session, "main");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+
+          mainHeld.release();
+          await session.waitForPane((pane) => pane.includes("MAIN_Q_FINISHED") && turnSettled(pane), 30_000);
+          await until("both user-stop reports arrive", () => reports.has("asker") && reports.has("worker"), 30_000);
+          expect(reports.get("asker")).toEqual({ agent: "asker", outcome: "cancelled", cause: "user_stop" });
+          expect(reports.get("worker")).toEqual({ agent: "worker", outcome: "cancelled", cause: "user_stop" });
+        });
+      } finally {
+        workerHeld.release();
+        mainHeld.release();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "alt+k bound to /fast stays blocked while a turn streams and runs once settled",
+    async () => {
+      const mainHeld = held();
+      let mainCalls = 0;
+      try {
+        await withFx(
+          async () => {
+            mainCalls += 1;
+            if (mainCalls === 1) await mainHeld.promise;
+            return text(`turn_${mainCalls}`, `BLOCK_CHORD_DONE_${mainCalls}`);
+          },
+          async (session) => {
+            await session.sendText("STREAM_FOR_CHORD_TEST");
+            await session.waitForPane(
+              (pane) => pane.includes("Thinking (") || pane.includes("Generating ("),
+              10_000,
+            );
+
+            // Alt+K bound to `/fast` must NOT run while `cancel_pending` is set by the streaming turn.
+            await session.sendHexBytes(["1b", "6b"]);
+            await session.sendLiteral("AFTER_BLOCKED_CHORD");
+            const duringTurn = await session.waitForPane(
+              (pane) => composerContains(pane, "AFTER_BLOCKED_CHORD"),
+              10_000,
+            );
+            expect(duringTurn).not.toContain("fast:");
+
+            mainHeld.release();
+            await session.waitForPane((pane) => pane.includes("BLOCK_CHORD_DONE_1") && turnSettled(pane), 30_000);
+            expect(await session.capturePane()).not.toContain("fast:");
+
+            // Once settled, the same Alt+K shortcut runs `/fast` and keeps the draft.
+            await session.sendHexBytes(["1b", "6b"]);
+            const afterTurn = await session.waitForPane((pane) => pane.includes("fast:"), 10_000);
+            expect(composerContains(afterTurn, "AFTER_BLOCKED_CHORD")).toBe(true);
+          },
+          (home) => {
+            writeFileSync(
+              join(home, ".fx", "settings.json"),
+              JSON.stringify({ sandbox: "none", shortcuts: { "alt+k": "/fast" } }),
+            );
+          },
+        );
+      } finally {
+        mainHeld.release();
+      }
+    },
+    TIMEOUT,
+  );
 });

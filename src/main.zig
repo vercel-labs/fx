@@ -3759,7 +3759,7 @@ const App = struct {
     }
 
     /// `/stop`: stops every working subagent in the current session's tree.
-    pub fn stopWorkingSubagents(self: *App) !usize {
+    pub fn stopWorkingSubagents(self: *App) AgentsAppRuntime.StopSubagentsResult {
         return AgentsAppRuntime.stopWorkingSubagents(self);
     }
 

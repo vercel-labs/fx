@@ -482,17 +482,30 @@ pub fn Handlers(comptime App: type) type {
         fn commandStopSubagents(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !@hasDecl(App, "stopWorkingSubagents")) return;
-            const stopped = try app.stopWorkingSubagents();
+            const result = app.stopWorkingSubagents();
             var body_buf: [64]u8 = undefined;
-            const body = if (stopped == 0)
+            const body = if (result.stopped == 0)
                 "No subagent is working."
             else
-                try std.mem.print(&body_buf, "Stopped {d} subagent{s}.", .{ stopped, if (stopped == 1) "" else "s" });
+                try std.mem.print(&body_buf, "Stopped {d} subagent{s}.", .{ result.stopped, if (result.stopped == 1) "" else "s" });
             try app.writeDomainNotice(.{
                 .topic = "subagent",
                 .tone = .neutral,
                 .body = body,
             }, true);
+            if (result.first_error) |err| {
+                var err_buf: [128]u8 = undefined;
+                const err_body = try std.mem.print(
+                    &err_buf,
+                    "Failed to stop {d} subagent{s}: {s}.",
+                    .{ result.failed, if (result.failed == 1) "" else "s", @errorName(err) },
+                );
+                try app.writeDomainNotice(.{
+                    .topic = "subagent",
+                    .tone = .@"error",
+                    .body = err_body,
+                }, true);
+            }
         }
 
         fn commandResumeSession(ctx: *anyopaque) !void {
@@ -2916,20 +2929,33 @@ test "/version command writes dev build label and omits unresolved revision" {
 
 test "/stop command writes stopped count or idle notice" {
     const FakeStopApp = struct {
+        const Result = struct {
+            stopped: usize = 0,
+            failed: usize = 0,
+            first_error: ?anyerror = null,
+        };
         alloc: std.mem.Allocator,
         stop_result: usize = 0,
+        fail_count: usize = 0,
+        first_error: ?anyerror = null,
         calls: usize = 0,
+        notices: std.ArrayList(u8) = .empty,
         notice_topic: ?[]const u8 = null,
         notice_tone: ?types.NoticeTone = null,
         notice_body: std.ArrayList(u8) = .empty,
 
         fn deinit(self: *@This()) void {
+            self.notices.deinit(self.alloc);
             self.notice_body.deinit(self.alloc);
         }
 
-        pub fn stopWorkingSubagents(self: *@This()) !usize {
+        pub fn stopWorkingSubagents(self: *@This()) Result {
             self.calls += 1;
-            return self.stop_result;
+            return .{
+                .stopped = self.stop_result,
+                .failed = self.fail_count,
+                .first_error = self.first_error,
+            };
         }
 
         noinline fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
@@ -2937,6 +2963,8 @@ test "/stop command writes stopped count or idle notice" {
             self.notice_tone = notice.tone;
             self.notice_body.clearRetainingCapacity();
             try self.notice_body.appendSlice(self.alloc, notice.body);
+            if (self.notices.items.len > 0) try self.notices.append(self.alloc, '\n');
+            try self.notices.appendSlice(self.alloc, notice.body);
         }
     };
 
@@ -2956,4 +2984,12 @@ test "/stop command writes stopped count or idle notice" {
     app.stop_result = 3;
     try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
     try std.testing.expectEqualStrings("Stopped 3 subagents.", app.notice_body.items);
+
+    app.notices.clearRetainingCapacity();
+    app.stop_result = 2;
+    app.fail_count = 1;
+    app.first_error = error.OutOfMemory;
+    try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
+    try std.testing.expectEqualStrings("Stopped 2 subagents.\nFailed to stop 1 subagent: OutOfMemory.", app.notices.items);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.notice_tone.?);
 }
