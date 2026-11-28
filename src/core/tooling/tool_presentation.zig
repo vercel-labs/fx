@@ -2271,3 +2271,45 @@ test "formatShortSafeTarget abbreviates workspace paths for file tools and keeps
     try std.testing.expectEqualStrings("dir/\\x1b[2Jfile.txt", safe_read);
     try std.testing.expect(safe_read.len <= max_run_command_activity_bytes);
 }
+
+test "formatShortSafeTarget pins long UTF-8 clipping, web_search, and subagent targets" {
+    const alloc = std.testing.allocator;
+    const registry = test_builtin_tools.advertisement_set.registry;
+
+    // Place a 3-byte UTF-8 character across byte 117 (120 - "..." = 117) so
+    // clipping must fall back before that codepoint rather than splitting it.
+    const prefix: [115]u8 = @splat('a');
+    const long_path = prefix ++ "\u{2603}tail.txt".*;
+    const long_args = try alloc.print("{{\"path\":\"{s}\"}}", .{&long_path});
+    defer alloc.free(long_args);
+    const clipped = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{ .id = "long1", .name = "read_file", .arguments_json = long_args },
+        .workspace_root = "/tmp/ws",
+    });
+    defer alloc.free(clipped);
+    try std.testing.expect(clipped.len <= max_run_command_activity_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(clipped));
+    try std.testing.expect(std.mem.endsWith(u8, clipped, "..."));
+    try std.testing.expectEqualStrings(&(prefix ++ "...".*), clipped);
+
+    const search_target = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{ .id = "ws1", .name = "web_search", .arguments_json = "{\"query\":\"zig 0.17 release notes\"}" },
+        .workspace_root = "/tmp/ws",
+    });
+    defer alloc.free(search_target);
+    try std.testing.expectEqualStrings("zig 0.17 release notes", search_target);
+
+    const subagent_target = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{
+            .id = "sa1",
+            .name = "subagent",
+            .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"helper\",\"message\":\"check tests\"}}",
+        },
+        .workspace_root = "/tmp/ws",
+    });
+    defer alloc.free(subagent_target);
+    try std.testing.expectEqualStrings("· check tests", subagent_target);
+}

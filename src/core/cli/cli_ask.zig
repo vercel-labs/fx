@@ -2258,7 +2258,8 @@ fn runAskTurn(
         else => {
             if (err == error.TerminalHungUp or
                 err == error.TerminalInputClosed or
-                err == error.OutputReaderGone)
+                err == error.OutputReaderGone or
+                err == error.OutputWriteFailed)
             {
                 return err;
             }
@@ -4017,7 +4018,7 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
         .unsafe_assistant_output,
         .unsafe_tool_start,
         .content_filter,
-        => ctx.output_mode != .json and ctx.output_mode != .quiet,
+        => !ctx.output_mode.capturesJson() and ctx.output_mode != .quiet,
     };
     if (!notice) return;
     var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
@@ -10883,4 +10884,71 @@ test "NonInteractivePermissionRequired closes started stream tools and fills mod
     try std.testing.expectEqualStrings(turn_model, p4.value.object.get("model").?.string);
     try std.testing.expectEqual(@as(i64, 1), p4.value.object.get("steps").?.integer);
     try std.testing.expectEqualStrings("NonInteractivePermissionRequired", p4.value.object.get("error").?.string);
+}
+
+test "pushRouteRecoveryStatus suppresses content_filter and safety notices in stream_events like json" {
+    const alloc = std.testing.allocator;
+    for ([_]OutputMode{ .json, .stream_events }) |mode| {
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+
+        var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
+        defer ctx.deinit();
+        ctx.output_mode = mode;
+
+        try pushRouteRecoveryStatus(&ctx, .{ .kind = .content_filter, .attempt = 1 });
+        try pushRouteRecoveryStatus(&ctx, .{ .kind = .unsafe_assistant_output, .attempt = 1 });
+        try pushRouteRecoveryStatus(&ctx, .{ .kind = .unsafe_tool_start, .attempt = 1 });
+        try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+    }
+}
+
+fn testProcessQueuedPromptMidTurnWriteFail(
+    agent: *agent_runtime.Agent,
+    deps: *const agent_runtime.AgentRuntimeDeps,
+    _: ?agent_runtime.SemanticPresentationSink,
+    _: agent_runtime.LifecycleContext,
+    _: agent_runtime.Config,
+    _: worker_runtime.QueuedPrompt,
+) !void {
+    agent.startTurn();
+    try pushToolLifecycle(deps.ctx, .{ .authoritative_started = .{
+        .id = .{ .turn_id = 1, .call_id = "call_write_fail_1" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .open,
+        .arguments_json = "{\"path\":\"q.txt\"}",
+    } });
+    return error.OutputWriteFailed;
+}
+
+test "runWithDeps stops on OutputWriteFailed without a second write try in flushUnclosedStreamToolEnds" {
+    const alloc = std.testing.allocator;
+    const WriteCountFail = struct {
+        writes: usize = 0,
+
+        fn write(ctx: ?*anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.writes += 1;
+            if (self.writes >= 2) return error.OutputWriteFailed;
+        }
+    };
+
+    var dummy_stdout: TestCapture = .{};
+    defer dummy_stdout.deinit(alloc);
+    var writer: WriteCountFail = .{};
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+
+    var deps = testPromptRunDepsWithProcess(&dummy_stdout, &stderr_capture, testProcessQueuedPromptMidTurnWriteFail);
+    deps.stdout_ctx = &writer;
+    deps.write_stdout = WriteCountFail.write;
+
+    try std.testing.expectError(
+        error.OutputWriteFailed,
+        runWithDeps(alloc, &.{ "--stream-events", "--no-save", "hello" }, testConfig(), deps),
+    );
+    try std.testing.expectEqual(@as(usize, 2), writer.writes);
 }
