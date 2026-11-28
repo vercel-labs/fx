@@ -648,6 +648,51 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             npm_publish_job,
         )
 
+    def test_libfx_publish_guard_lets_only_stable_publish_a_tag_other_than_dev(
+        self,
+    ) -> None:
+        publish_libfx = PUBLISH_LIBFX_WORKFLOW_PATH.read_text(encoding="utf-8")
+        publish_step = publish_libfx.split(
+            "      - name: Publish the verified archive with npm trusted publishing\n", 1
+        )[1].split("\n      - name: ", 1)[0]
+
+        self.assertIn("NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}", publish_step)
+        self.assertIn("CHANNEL: ${{ needs.metadata.outputs.channel }}", publish_step)
+
+        script_lines = [
+            line.strip() for line in publish_step.split("        run: |\n", 1)[1].splitlines()
+        ]
+        # The guard must run before anything else in the step, so nothing can
+        # publish or change CHANNEL or NPM_TAG before it decides.
+        self.assertEqual("set -euo pipefail", script_lines[0])
+        self.assertTrue(
+            script_lines[1].startswith('if [ "$CHANNEL" != stable ]'),
+            f"the dev-tag guard is not the first command of the publish step: {script_lines[1]!r}",
+        )
+        guard_start = 1
+        guard_end = script_lines.index("fi", guard_start) + 1
+        guard = "\n".join(script_lines[guard_start:guard_end]) + "\n"
+
+        cases = [
+            ("stable", "latest", 0),
+            ("stable", "dev", 0),
+            ("dev", "dev", 0),
+            ("dev", "latest", 1),
+            ("dev", "", 1),
+            ("", "latest", 1),
+            ("", "dev", 0),
+        ]
+        for channel, npm_tag, want in cases:
+            with self.subTest(channel=channel, npm_tag=npm_tag):
+                result = subprocess.run(
+                    ["bash", "-c", "set -euo pipefail\n" + guard],
+                    env={"PATH": os.environ["PATH"], "CHANNEL": channel, "NPM_TAG": npm_tag},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(want, result.returncode, result.stdout + result.stderr)
+
     def test_stable_release_is_the_only_workflow_with_signing_secrets(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
         pgso = PGSO_WORKFLOW_PATH.read_text(encoding="utf-8")

@@ -78,7 +78,7 @@ fn sourceLabelOrMissing(source: ?credentials.Source) []const u8 {
 /// Names the screen a credential failure notice went to, so each screen
 /// hears of a failure once (`Runtime.recordCredentialFailure`). The app picks
 /// the values; `main_notice_screen` is main's.
-pub const NoticeScreen = usize;
+pub const NoticeScreen = u64;
 pub const main_notice_screen: NoticeScreen = 0;
 
 /// The screens that showed one credential failure's notice. It holds no

@@ -1796,6 +1796,9 @@ const FxLoginRefreshProbe = struct {
     token_disposition: oauth_transport.Disposition,
     token_body: []const u8,
     auth_path_to_make_read_only: ?[]const u8 = null,
+    /// Replaced by a folder during the token request, so neither saving the
+    /// rotated login nor deleting it can work.
+    auth_path_to_make_folder: ?[]const u8 = null,
     calls: usize = 0,
 
     fn provider(self: *FxLoginRefreshProbe) oauth_transport.Provider {
@@ -1822,6 +1825,13 @@ const FxLoginRefreshProbe = struct {
                         io_mod.getIo(),
                         std.Io.File.Permissions.fromMode(0o400),
                     );
+                }
+                if (self.auth_path_to_make_folder) |auth_path| {
+                    try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), auth_path);
+                    try std.Io.Dir.createDirAbsolute(io_mod.getIo(), auth_path, .default_dir);
+                    var inside = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), auth_path, .{});
+                    defer inside.close(io_mod.getIo());
+                    try inside.writeFile(io_mod.getIo(), .{ .sub_path = "keep", .data = "x" });
                 }
                 break :blk self.token_body;
             },
@@ -2235,6 +2245,8 @@ test "an fx login refresh retires the consumed token when durable replacement fa
         .auth_path_to_make_read_only = fixture.auth_path,
     };
 
+    sign_in_trace.reset();
+    defer sign_in_trace.reset();
     try std.testing.expectError(
         error.OAuthSessionCleanupUncertain,
         refreshFxLoginCredential(alloc, refresh.provider(), null),
@@ -2244,6 +2256,43 @@ test "an fx login refresh retires the consumed token when durable replacement fa
     var persisted = try oauth_session.load(alloc);
     defer if (persisted) |*session| session.deinit(alloc);
     try std.testing.expect(persisted == null);
+    try expectIssuerFailure("step=save err=OAuthSessionCleanupUncertain", "login_deleted=true");
+}
+
+test "an fx login refresh whose save and delete both fail says the login was not deleted" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    var refresh = FxLoginRefreshProbe{
+        .token_disposition = .accepted,
+        .token_body = "{\"access_token\":\"new-access\",\"refresh_token\":\"rotated-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
+        .auth_path_to_make_folder = fixture.auth_path,
+    };
+
+    sign_in_trace.reset();
+    defer sign_in_trace.reset();
+    try std.testing.expectError(
+        error.OAuthSessionCleanupUncertain,
+        refreshFxLoginCredential(alloc, refresh.provider(), null),
+    );
+    try std.testing.expectEqual(@as(usize, 2), refresh.calls);
+    try expectIssuerFailure("step=save err=OAuthSessionCleanupUncertain", "login_deleted=false");
+}
+
+/// The one failed `issuer` record holds both parts, and no record holds a token.
+fn expectIssuerFailure(step_and_error: []const u8, deleted: []const u8) !void {
+    var events: [sign_in_trace.ring_capacity]sign_in_trace.Event = undefined;
+    const count = sign_in_trace.snapshot(&events);
+    var issuer_failures: usize = 0;
+    for (events[0..count]) |*event| {
+        try std.testing.expect(std.mem.find(u8, event.detail(), "rotated-refresh") == null);
+        try std.testing.expect(std.mem.find(u8, event.detail(), "new-access") == null);
+        if (event.kind != .issuer or !event.failed) continue;
+        issuer_failures += 1;
+        try std.testing.expect(std.mem.find(u8, event.detail(), step_and_error) != null);
+        try std.testing.expect(std.mem.find(u8, event.detail(), deleted) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), issuer_failures);
 }
 
 test "a disabled store still reports why the fx login was silent" {

@@ -680,13 +680,13 @@ pub fn Runtime(comptime App: type) type {
             return error.ContextCompactionPersistenceUnavailable;
         }
 
-        pub fn propagateGrant(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
+        pub fn propagateGrant(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
             if (comptime @hasDecl(App, "propagateGrant")) {
-                try app.propagateGrant(tool_name, target_path);
+                try app.propagateGrant(tool_name, target_path, shell_epoch);
                 return;
             }
-            try app_permission_runtime.Runtime(App).allowAtOnce(app, agent, tool_name, target_path);
-            try agent.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path);
+            try app_permission_runtime.Runtime(App).allowAtOnce(app, agent, tool_name, target_path, shell_epoch);
+            try agent.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path, shell_epoch);
         }
 
         pub fn pushEvent(app: *App, agent: *AppAgent, event: WorkerEvent) !void {
@@ -1675,7 +1675,9 @@ pub fn Runtime(comptime App: type) type {
                         // composer; it closes first and gives back the draft
                         // it set aside, so the rule below sees the real draft.
                         if (comptime @hasDecl(@TypeOf(app.input_runtime), "cancelEffortMenu")) {
-                            _ = app.input_runtime.cancelEffortMenu(app.alloc, "failed_prompt_restored");
+                            if (app.input_runtime.cancelEffortMenu(app.alloc, "failed_prompt_restored")) {
+                                app.shell.render_requests.request(.footer);
+                            }
                         }
                         // Never clobber a draft the user typed while the doomed
                         // turn was still retrying; only an empty composer gets
@@ -2136,7 +2138,7 @@ const FakeWorker = struct {
         self.propagated_history_turns += 1;
     }
 
-    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
+    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8, _: u64) !void {
         _ = alloc;
         _ = tool_name;
         _ = target_path;

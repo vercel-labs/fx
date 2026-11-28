@@ -2591,12 +2591,18 @@ pub const UpgradeSnapshot = struct {
                 }
             },
             .up_to_date => {
-                if (std.mem.eql(u8, self.channel, "dev") and self.latest_revision.len > 0) {
-                    try out.writer.print("fx dev {s} is already up to date (", .{shortRevision(self.latest_revision)});
+                // fx refuses a dev build with a lower build number even when its commit
+                // differs, so the line names the running build, not the manifest's.
+                const running_known = self.current_revision.len > 0;
+                const revision = if (running_known) self.current_revision else self.latest_revision;
+                const version = if (running_known) self.current else self.latest;
+                if (std.mem.eql(u8, self.channel, "dev") and revision.len > 0) {
+                    try out.writer.print("fx dev {s} is already up to date (", .{shortRevision(revision)});
+                    try writeVersionWithPrefix(&out.writer, version);
                 } else {
                     try out.writer.writeAll("fx is already up to date (");
+                    try writeVersionWithPrefix(&out.writer, self.latest);
                 }
-                try writeVersionWithPrefix(&out.writer, self.latest);
                 try out.writer.writeAll(")\n");
             },
             .failed => try out.writer.writeAll("upgrade failed\n"),
@@ -3356,8 +3362,8 @@ test "doctor's MCP rows say what doctor found for each server it checked" {
 
 test "core permissions snapshot text and json stay stable" {
     const grants = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("write_file"), .target_path = @constCast("/tmp/workspace/src/app.zig") },
-        .{ .tool_name = @constCast("run_command"), .target_path = @constCast("/tmp/workspace::npm test") },
+        .{ .tool_name = @constCast("write_file"), .target_path = @constCast("/tmp/workspace/src/app.zig"), .shell_epoch = 0 },
+        .{ .tool_name = @constCast("run_command"), .target_path = @constCast("/tmp/workspace::npm test"), .shell_epoch = 0 },
     };
     const rules = [_]types.PermissionRule{
         .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .allow },
@@ -4439,6 +4445,22 @@ test "core upgrade snapshot identifies dev revisions" {
         "{\"kind\":\"upgrade\",\"current\":\"0.3.66\",\"latest\":\"0.3.66\",\"channel\":\"dev\",\"current_channel\":\"stable\",\"current_revision\":\"111111111111\",\"latest_revision\":\"abcdef0123456789abcdef0123456789abcdef01\",\"status\":\"upgraded\"}",
         json,
     );
+}
+
+test "core upgrade snapshot names the running dev build when an older one is refused" {
+    const snapshot = UpgradeSnapshot{
+        .current = "0.3.67",
+        .latest = "0.3.66",
+        .channel = "dev",
+        .current_channel = "dev",
+        .current_revision = "1e945b009f0123456789abcdef0123456789abcd",
+        .latest_revision = "111111111111",
+        .status = .up_to_date,
+    };
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("fx dev 1e945b009f01 is already up to date (v0.3.67)\n", text);
 }
 
 test "workspace snapshot renders source availability and mutation in text and json" {
