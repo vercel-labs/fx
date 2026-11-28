@@ -5803,6 +5803,8 @@ test {
     _ = @import("core/auth/command_helper.zig");
     _ = @import("core/auth/command_auth.zig");
     _ = @import("core/mods/manifest.zig");
+    _ = @import("core/mods/mod_pins.zig");
+    _ = @import("core/mods/pins.zig");
     _ = @import("core/mods/source.zig");
     _ = @import("core/mods/mods.zig");
     _ = @import("core/mods/verbs.zig");

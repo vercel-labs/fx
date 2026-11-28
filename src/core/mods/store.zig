@@ -12,15 +12,19 @@
 
 const std = @import("std");
 const manifest = @import("manifest.zig");
+pub const pins = @import("pins.zig");
 
 pub const default_lock_deadline_ms: u64 = 2_000;
 pub const max_copy_files: usize = 4096;
 pub const max_copy_bytes: u64 = 64 * 1024 * 1024;
-pub const token_hex_bytes: usize = 16;
+pub const token_hex_bytes: usize = pins.token_hex_bytes;
 pub const max_record_bytes: usize = 16 * 1024;
 pub const record_file_name = ".fx-mod-source.json";
 
-const store_dir_name = ".store";
+const store_dir_name = pins.store_dir_name;
+const isVersionFolderForMod = pins.isVersionFolderForMod;
+const formatVersionFolder = pins.formatVersionFolder;
+const isLowerHex = pins.isLowerHex;
 /// A top-level git folder is never copied into a version, from a folder or a clone.
 const source_git_dir_name = ".git";
 const off_suffix = ".off";
@@ -178,6 +182,7 @@ pub const Ops = struct {
     ) anyerror!LockAttempt,
     fill_token: *const fn (ctx: ?*anyopaque, io: std.Io, out_hex: *[token_hex_bytes]u8) void = defaultFillToken,
     step: *const fn (ctx: ?*anyopaque, step: Step) void = defaultStep,
+    collect_after_switch: bool = true,
 };
 
 pub const Store = struct {
@@ -212,6 +217,87 @@ pub fn setOn(alloc: std.mem.Allocator, store: Store, name: []const u8, on: bool)
 
 pub fn remove(alloc: std.mem.Allocator, store: Store, name: []const u8) !Outcome {
     return runChange(alloc, store, .remove, name, "", null);
+}
+
+/// Best-effort cleanup of unlinked, unpinned version folders, leftover temp
+/// links, and stray pin files for `name` under the mod's lock.
+pub fn collect(store: Store, name: []const u8) !Outcome {
+    if (!manifest.validName(name)) return .{ .invalid = .bad_name };
+    const io = store.ops.io;
+
+    var lock = switch (try acquireModLock(store, name)) {
+        .acquired => |l| l,
+        .busy => return .busy,
+    };
+    defer lock.release(io);
+
+    var root_dir = std.Io.Dir.cwd().openDir(io, store.root_path, .{
+        .iterate = true,
+        .follow_symlinks = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .ok,
+        else => return err,
+    };
+    defer root_dir.close(io);
+
+    var off_name_buf: [manifest.max_name_bytes + off_suffix.len]u8 = undefined;
+    const off_name = formatOffName(&off_name_buf, name);
+    try collectForMod(root_dir, io, name, off_name);
+    return .ok;
+}
+
+/// Cleans up one specific unlinked version `<name>-<token_hex>` under the mod's
+/// lock (`ModUse.tla` `Cleanup(v)`).
+pub fn collectVersion(store: Store, name: []const u8, token_hex: *const [token_hex_bytes]u8) !Outcome {
+    if (!manifest.validName(name)) return .{ .invalid = .bad_name };
+    const io = store.ops.io;
+
+    var lock = switch (try acquireModLock(store, name)) {
+        .acquired => |l| l,
+        .busy => return .busy,
+    };
+    defer lock.release(io);
+
+    var root_dir = std.Io.Dir.cwd().openDir(io, store.root_path, .{
+        .iterate = true,
+        .follow_symlinks = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .ok,
+        else => return err,
+    };
+    defer root_dir.close(io);
+
+    var off_name_buf: [manifest.max_name_bytes + off_suffix.len]u8 = undefined;
+    const off_name = formatOffName(&off_name_buf, name);
+    var on_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var off_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const live_on = try readLiveStoreFolder(root_dir, io, name, &on_buf);
+    const live_off = try readLiveStoreFolder(root_dir, io, off_name, &off_buf);
+
+    var folder_buf: [manifest.max_name_bytes + 1 + token_hex_bytes]u8 = undefined;
+    const folder_name = formatVersionFolder(&folder_buf, name, token_hex);
+    if (isLiveStoreFolder(live_on, live_off, folder_name)) return .ok;
+
+    var store_dir = root_dir.openDir(io, store_dir_name, .{
+        .iterate = false,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .ok,
+        else => return err,
+    };
+    defer store_dir.close(io);
+
+    const stat = store_dir.statFile(io, folder_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return .ok,
+        else => return err,
+    };
+    if (stat.kind != .directory) return .ok;
+
+    var pins_dir = try pins.openOrCreatePrivatePinsDir(root_dir, io);
+    defer pins_dir.close(io);
+
+    try collectVersionFolder(io, store_dir, pins_dir, folder_name);
+    return .ok;
 }
 
 /// Reads the source record of an installed mod through its link, enabled or
@@ -571,7 +657,9 @@ fn runChange(
 
     // The change is done once the link switched. What collect cannot delete
     // now is never read, and the next change of this mod collects it.
-    collectForMod(root_dir, io, name, off_name) catch {};
+    if (store.ops.collect_after_switch) {
+        collectForMod(root_dir, io, name, off_name) catch {};
+    }
     return .ok;
 }
 
@@ -761,13 +849,43 @@ fn collectForMod(root_dir: std.Io.Dir, io: std.Io, name: []const u8, off_name: [
         error.FileNotFound => null,
         else => return err,
     };
-    if (maybe_store) |*store_dir| {
-        defer store_dir.close(io);
+    defer if (maybe_store) |*s| s.close(io);
+
+    var maybe_pins: ?std.Io.Dir = try pins.openPrivatePinsDirIfPresent(root_dir, io);
+    defer if (maybe_pins) |*p| p.close(io);
+
+    if (maybe_store) |store_dir| {
         var it = store_dir.iterate();
         while (try it.next(io)) |entry| {
             if (!isVersionFolderForMod(entry.name, name)) continue;
             if (isLiveStoreFolder(live_on, live_off, entry.name)) continue;
-            try store_dir.deleteTree(io, entry.name);
+            if (maybe_pins == null) {
+                maybe_pins = try pins.openOrCreatePrivatePinsDir(root_dir, io);
+            }
+            try collectVersionFolder(io, store_dir, maybe_pins.?, entry.name);
+        }
+    }
+
+    if (maybe_pins) |pins_dir| {
+        var pin_it = pins_dir.iterate();
+        while (try pin_it.next(io)) |entry| {
+            if (!isVersionFolderForMod(entry.name, name)) continue;
+            if (isLiveStoreFolder(live_on, live_off, entry.name)) continue;
+            if (try versionFolderExists(maybe_store, io, entry.name)) continue;
+            switch (try pins.tryAcquireExclusive(io, pins_dir, entry.name)) {
+                .busy => {},
+                .acquired => |pin_file| {
+                    var f = pin_file;
+                    defer {
+                        f.unlock(io);
+                        f.close(io);
+                    }
+                    pins_dir.deleteFile(io, entry.name) catch |err| switch (err) {
+                        error.FileNotFound => {},
+                        else => return err,
+                    };
+                },
+            }
         }
     }
 
@@ -776,6 +894,39 @@ fn collectForMod(root_dir: std.Io.Dir, io: std.Io, name: []const u8, off_name: [
         if (!isTempLinkForMod(entry.name, name)) continue;
         try root_dir.deleteFile(io, entry.name);
     }
+}
+
+fn collectVersionFolder(
+    io: std.Io,
+    store_dir: std.Io.Dir,
+    pins_dir: std.Io.Dir,
+    folder_name: []const u8,
+) !void {
+    const lock_attempt = try pins.tryAcquireExclusive(io, pins_dir, folder_name);
+    switch (lock_attempt) {
+        .busy => return,
+        .acquired => |pin_file| {
+            var f = pin_file;
+            defer {
+                f.unlock(io);
+                f.close(io);
+            }
+            try store_dir.deleteTree(io, folder_name);
+            pins_dir.deleteFile(io, folder_name) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        },
+    }
+}
+
+fn versionFolderExists(maybe_store: ?std.Io.Dir, io: std.Io, folder_name: []const u8) !bool {
+    const store_dir = maybe_store orelse return false;
+    const stat = store_dir.statFile(io, folder_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return stat.kind == .directory;
 }
 
 fn readLiveStoreFolder(
@@ -807,13 +958,6 @@ fn isLiveStoreFolder(live_on: ?[]const u8, live_off: ?[]const u8, candidate: []c
     return false;
 }
 
-fn isVersionFolderForMod(entry_name: []const u8, mod_name: []const u8) bool {
-    if (entry_name.len != mod_name.len + 1 + token_hex_bytes) return false;
-    if (!std.mem.startsWith(u8, entry_name, mod_name)) return false;
-    if (entry_name[mod_name.len] != '-') return false;
-    return isLowerHex(entry_name[mod_name.len + 1 ..]);
-}
-
 fn isTempLinkForMod(entry_name: []const u8, mod_name: []const u8) bool {
     const expected_len = 1 + mod_name.len + temp_link_infix.len + token_hex_bytes;
     if (entry_name.len != expected_len) return false;
@@ -822,14 +966,6 @@ fn isTempLinkForMod(entry_name: []const u8, mod_name: []const u8) bool {
     const infix_start = 1 + mod_name.len;
     if (!std.mem.eql(u8, entry_name[infix_start .. infix_start + temp_link_infix.len], temp_link_infix)) return false;
     return isLowerHex(entry_name[infix_start + temp_link_infix.len ..]);
-}
-
-fn isLowerHex(bytes: []const u8) bool {
-    for (bytes) |byte| {
-        const ok = (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f');
-        if (!ok) return false;
-    }
-    return true;
 }
 
 const InspectedMod = union(enum) {
@@ -949,14 +1085,6 @@ fn resolveEntryKind(dir: std.Io.Dir, io: std.Io, name: []const u8, hint: std.Io.
 
 fn formatOffName(buf: *[manifest.max_name_bytes + off_suffix.len]u8, name: []const u8) []const u8 {
     return std.mem.print(buf, "{s}{s}", .{ name, off_suffix }) catch unreachable;
-}
-
-fn formatVersionFolder(
-    buf: *[manifest.max_name_bytes + 1 + token_hex_bytes]u8,
-    name: []const u8,
-    token_hex: *const [token_hex_bytes]u8,
-) []const u8 {
-    return std.mem.print(buf, "{s}-{s}", .{ name, token_hex }) catch unreachable;
 }
 
 fn formatTempLink(
@@ -1499,4 +1627,106 @@ test "a source that ships its own source record is refused as reserved" {
     var loaded = try load(alloc, s, "glm");
     defer loaded.deinit(alloc);
     try std.testing.expect(loaded == .none);
+}
+
+test "pin keeps old version during cleanup until released, then cleanup deletes folder and pin file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try makeTempDirPath(alloc, &tmp, "mods");
+    defer alloc.free(root);
+    const src1 = try writeModSource(alloc, &tmp, "src1", "glm", "1.0.0");
+    defer alloc.free(src1);
+    const src2 = try writeModSource(alloc, &tmp, "src2", "glm", "2.0.0");
+    defer alloc.free(src2);
+
+    var state: TestLockState = .{};
+    defer state.steps.deinit(alloc);
+    const s = testStore(root, &state);
+
+    try std.testing.expectEqual(Outcome.ok, try add(alloc, s, "glm", src1, null));
+
+    const pinned_res = try pins.pin(alloc, root, "glm", .{ .io = std.testing.io, .lock_deadline_ms = 20 });
+    try std.testing.expect(pinned_res == .pinned);
+    var p1 = pinned_res.pinned;
+    var p1_released = false;
+    defer if (!p1_released) p1.release(alloc, std.testing.io);
+
+    // Updating while v1 is pinned keeps v1 in `.store/`.
+    try std.testing.expectEqual(Outcome.ok, try update(alloc, s, "glm", src2, null));
+    const store_sub = try std.Io.Dir.path.join(alloc, &.{ root, ".store" });
+    defer alloc.free(store_sub);
+    try std.testing.expectEqual(@as(usize, 2), try countEntriesInDir(store_sub));
+
+    // Releasing v1 and calling `collect` removes v1 and its pin file.
+    p1.release(alloc, std.testing.io);
+    p1_released = true;
+    try std.testing.expectEqual(Outcome.ok, try collect(s, "glm"));
+    try std.testing.expectEqual(@as(usize, 1), try countEntriesInDir(store_sub));
+
+    const pins_sub = try std.Io.Dir.path.join(alloc, &.{ root, ".locks", "pins" });
+    defer alloc.free(pins_sub);
+    try std.testing.expectEqual(@as(usize, 0), try countEntriesInDir(pins_sub));
+}
+
+test "cleanup sweeps stray pin files and keeps versions held by a second open of the pin file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try makeTempDirPath(alloc, &tmp, "mods");
+    defer alloc.free(root);
+    const src1 = try writeModSource(alloc, &tmp, "src1", "glm", "1.0.0");
+    defer alloc.free(src1);
+    const src2 = try writeModSource(alloc, &tmp, "src2", "glm", "2.0.0");
+    defer alloc.free(src2);
+
+    var state: TestLockState = .{};
+    defer state.steps.deinit(alloc);
+    const s = testStore(root, &state);
+
+    try std.testing.expectEqual(Outcome.ok, try add(alloc, s, "glm", src1, null));
+
+    var root_dir = try std.Io.Dir.cwd().openDir(std.testing.io, root, .{});
+    defer root_dir.close(std.testing.io);
+    var pins_dir = try pins.openOrCreatePrivatePinsDir(root_dir, std.testing.io);
+    defer pins_dir.close(std.testing.io);
+
+    // Hold a shared flock on v1's pin file via a direct open in the same process.
+    const v1_folder = "glm-1010101010101010";
+    var v1_pin = try pins_dir.createFile(std.testing.io, v1_folder, .{ .read = true, .truncate = false });
+    defer v1_pin.close(std.testing.io);
+    try v1_pin.lock(std.testing.io, .shared);
+
+    // Create two stray pin files (no `.store` folder): one unlocked, one held by another mod's lock.
+    const stray_free = "glm-aaaaaaaaaaaaaaaa";
+    const stray_busy = "glm-bbbbbbbbbbbbbbbb";
+    const other_stray = "other-cccccccccccccccc";
+    (try pins_dir.createFile(std.testing.io, stray_free, .{ .read = true, .truncate = false })).close(std.testing.io);
+    var busy_stray_file = try pins_dir.createFile(std.testing.io, stray_busy, .{ .read = true, .truncate = false });
+    defer busy_stray_file.close(std.testing.io);
+    try busy_stray_file.lock(std.testing.io, .shared);
+    (try pins_dir.createFile(std.testing.io, other_stray, .{ .read = true, .truncate = false })).close(std.testing.io);
+
+    try std.testing.expectEqual(Outcome.ok, try update(alloc, s, "glm", src2, null));
+
+    const store_sub = try std.Io.Dir.path.join(alloc, &.{ root, ".store" });
+    defer alloc.free(store_sub);
+    // v1 is kept because its pin file is locked; v2 is live.
+    try std.testing.expectEqual(@as(usize, 2), try countEntriesInDir(store_sub));
+
+    // `stray_free` was swept; `v1_folder`, `stray_busy`, and `other_stray` stay.
+    try std.testing.expectError(error.FileNotFound, pins_dir.statFile(std.testing.io, stray_free, .{}));
+    _ = try pins_dir.statFile(std.testing.io, v1_folder, .{});
+    _ = try pins_dir.statFile(std.testing.io, stray_busy, .{});
+    _ = try pins_dir.statFile(std.testing.io, other_stray, .{});
+
+    v1_pin.unlock(std.testing.io);
+    busy_stray_file.unlock(std.testing.io);
+    try std.testing.expectEqual(Outcome.ok, try collect(s, "glm"));
+    try std.testing.expectEqual(@as(usize, 1), try countEntriesInDir(store_sub));
+    try std.testing.expectError(error.FileNotFound, pins_dir.statFile(std.testing.io, v1_folder, .{}));
+    try std.testing.expectError(error.FileNotFound, pins_dir.statFile(std.testing.io, stray_busy, .{}));
+    _ = try pins_dir.statFile(std.testing.io, other_stray, .{});
 }

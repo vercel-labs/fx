@@ -11,10 +11,19 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 pub const manifest = @import("manifest.zig");
+pub const mod_pins = @import("mod_pins.zig");
+pub const pins = @import("pins.zig");
 pub const source = @import("source.zig");
 pub const store = @import("store.zig");
 
 pub const Manifest = manifest.Manifest;
+pub const ModPins = mod_pins.ModPins;
+pub const ModRoot = mod_pins.ModRoot;
+pub const ModRoots = mod_pins.ModRoots;
+pub const RootKind = mod_pins.RootKind;
+pub const Pin = pins.Pin;
+pub const PinResult = pins.PinResult;
+pub const PinOps = pins.Ops;
 pub const Step = store.Step;
 pub const Outcome = store.Outcome;
 pub const Invalid = store.Invalid;
@@ -35,6 +44,47 @@ pub fn realOps() Ops {
         .lock_deadline_ms = default_lock_deadline_ms,
         .acquire_lock = acquireRealModLock,
     };
+}
+
+pub fn realPinOps() PinOps {
+    return .{
+        .io = io_mod.getIo(),
+        .lock_deadline_ms = default_lock_deadline_ms,
+        .prepare_pins_dir = prepareRealPinsDir,
+    };
+}
+
+pub fn realModPinsOps() ModPins.Ops {
+    return .{
+        .store_ops = realOps(),
+        .pin_ops = realPinOps(),
+    };
+}
+
+pub fn loadModPins(alloc: std.mem.Allocator, root_path: []const u8) !ModPins {
+    return ModPins.load(alloc, root_path, realModPinsOps());
+}
+
+pub fn withPinnedMods(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+    ctx: anytype,
+    comptime R: type,
+    comptime body: fn (@TypeOf(ctx), *const ModPins) anyerror!R,
+) !R {
+    return mod_pins.withPinnedMods(alloc, root_path, realModPinsOps(), ctx, R, body);
+}
+
+pub fn pin(alloc: std.mem.Allocator, root_path: []const u8, name: []const u8) !PinResult {
+    return pins.pin(alloc, root_path, name, realPinOps());
+}
+
+pub fn reloadPin(alloc: std.mem.Allocator, root_path: []const u8, name: []const u8, old_pin: *?Pin) !PinResult {
+    return pins.reload(alloc, root_path, name, old_pin, realPinOps());
+}
+
+pub fn collect(root_path: []const u8, name: []const u8) !Outcome {
+    return store.collect(realStore(root_path), name);
 }
 
 pub fn realStore(root_path: []const u8) Store {
@@ -679,6 +729,13 @@ fn releaseRealModLock(self: *store.Lock, _: std.Io) void {
     lock.release();
 }
 
+fn prepareRealPinsDir(_: ?*anyopaque, _: std.Io, root_dir: std.Io.Dir) anyerror!std.Io.Dir {
+    var lock_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(root_dir, locks_dir_name);
+    defer lock_dir.close();
+    const pins_dir = try io_mod.openOrCreateVerifiedPrivateDir(&lock_dir, pins.pins_dir_name);
+    return pins_dir.dir;
+}
+
 fn gitRun(alloc: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     const run = try runGit(null, alloc, .{ .argv = argv, .timeout_ms = 30_000, .cancel = null });
     switch (run) {
@@ -1001,14 +1058,47 @@ test "mods front door runs real store lifecycle and enforces verified private lo
     try std.testing.expectEqual(@as(u32, 0o700), locks_stat.permissions.toMode() & 0o777);
 
     // Contention while lock file is held returns `.busy` at deadline.
-    var lock_file = try locks_dir.openFile(io_mod.getIo(), "glm", .{ .mode = .read_write });
-    defer lock_file.close(io_mod.getIo());
-    try std.testing.expect(try lock_file.tryLock(io_mod.getIo(), .exclusive));
-    defer lock_file.unlock(io_mod.getIo());
+    {
+        var lock_file = try locks_dir.openFile(io_mod.getIo(), "glm", .{ .mode = .read_write });
+        defer lock_file.close(io_mod.getIo());
+        try std.testing.expect(try lock_file.tryLock(io_mod.getIo(), .exclusive));
+        defer lock_file.unlock(io_mod.getIo());
 
-    var short_ops = realOps();
-    short_ops.lock_deadline_ms = 10;
-    try std.testing.expectEqual(Outcome.busy, try store.setOn(alloc, .{ .root_path = root, .ops = short_ops }, "glm", false));
+        var short_ops = realOps();
+        short_ops.lock_deadline_ms = 10;
+        try std.testing.expectEqual(Outcome.busy, try store.setOn(alloc, .{ .root_path = root, .ops = short_ops }, "glm", false));
+    }
+
+    // Real pin, reloadPin, and collect wrappers through the mods front door.
+    var pinned: ?Pin = switch (try pin(alloc, root, "glm")) {
+        .pinned => |p| p,
+        else => return error.TestUnexpectedResult,
+    };
+    defer if (pinned) |*p| p.release(alloc, io_mod.getIo());
+    try std.testing.expectEqual(Outcome.ok, try update(alloc, root, "glm", src));
+    const reloaded = try reloadPin(alloc, root, "glm", &pinned);
+    try std.testing.expect(reloaded == .pinned);
+    pinned = reloaded.pinned;
+    try std.testing.expectEqual(Outcome.ok, try collect(root, "glm"));
+    if (pinned) |*p| {
+        p.release(alloc, io_mod.getIo());
+        pinned = null;
+    }
+
+    // Real ModPins verifies `.locks` with io.zig's private-dir check.
+    var set = try loadModPins(alloc, root);
+    defer set.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), set.pins.len);
+    set.deinit(alloc);
+
+    var mods_dir = try tmp.dir.openDir(io_mod.getIo(), "mods", .{});
+    defer mods_dir.close(io_mod.getIo());
+    try mods_dir.deleteTree(io_mod.getIo(), ".locks");
+    try tmp.dir.createDirPath(io_mod.getIo(), "fake_locks");
+    const fake_locks = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fake_locks");
+    defer alloc.free(fake_locks);
+    try mods_dir.symLink(io_mod.getIo(), fake_locks, ".locks", .{ .is_directory = true });
+    try std.testing.expectError(error.DurablePathUnsafe, pin(alloc, root, "glm"));
 }
 
 test "loadModProviders returns sorted enabled providers, ignores disabled mods, and reports broken mods" {
