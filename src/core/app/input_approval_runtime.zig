@@ -259,8 +259,6 @@ pub fn ApprovalRuntime(comptime App: type) type {
             const lent = if (comptime @hasDecl(App, "lentApproval")) app.lentApproval() else null;
             const worker = if (comptime @hasDecl(App, "approvalWorker"))
                 app.approvalWorker(agent)
-            else if (lent) |subagent|
-                &subagent.worker
             else
                 &agent.worker;
             const result = worker.submitPermissionResponse(request_id, response);
