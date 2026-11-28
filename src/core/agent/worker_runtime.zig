@@ -3248,6 +3248,22 @@ pub const WorkerRuntime = struct {
         return count;
     }
 
+    /// Whether every queued item comes back after an upgrade's restart: a
+    /// user prompt the session log keeps (`input_id`), with no image or skill
+    /// binding, which the exit's cleanup and the restore do not carry. A queued
+    /// compaction or another agent's message does not come back.
+    pub fn queuedWorkSurvivesRestart(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.queued_context_compaction != null) return false;
+        for (self.queued_prompts.items) |queued| {
+            if (comptime !runtime_profile.host.durable_sessions) return false;
+            if (queued.author != .user or queued.input_id == null) return false;
+            if (queued.images.len > 0 or queued.skill_bindings.len > 0) return false;
+        }
+        return true;
+    }
+
     pub fn queuedPromptCount(self: *WorkerRuntime) usize {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());

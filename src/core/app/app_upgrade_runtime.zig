@@ -135,13 +135,13 @@ pub fn Runtime(comptime App: type) type {
         /// typed work, an answer an agent waits for, a view that is open, or
         /// prompts queued on another agent (`upgradeUnavailableNotice`,
         /// `needsUserElsewhere`, `queuedWorkElsewhere`). Prompts queued on
-        /// `agent`, whose session the relaunch reopens, do not count: the
-        /// session keeps them, and the relaunched fx sends them after the
-        /// turn goes on (`app_session_runtime.zig`
-        /// `schedulePendingAcceptedInputsRestore`). Another agent's would wait
-        /// in its composer, so they still hold the restart.
+        /// `agent` do not count when the session keeps them whole
+        /// (`queuedWorkSurvivesRestart`): the turn takes them at its step
+        /// boundary before it stops and goes on with them after the relaunch,
+        /// and one left over comes back to the composer.
         fn restartBlocked(app: *App, agent: *AppAgent) bool {
             if (upgradeUnavailableNotice(app, agent) != null) return true;
+            if (!queuedWorkSurvivesRestart(agent)) return true;
             var name_buf: [32]u8 = undefined;
             if (comptime @hasDecl(App, "needsUserElsewhere")) {
                 if (app.needsUserElsewhere(&name_buf) != null) return true;
@@ -150,6 +150,19 @@ pub fn Runtime(comptime App: type) type {
                 if (app.queuedWorkElsewhere(&name_buf) != null) return true;
             }
             return false;
+        }
+
+        /// Whether `agent`'s queue comes back after the relaunch
+        /// (`WorkerRuntime.queuedWorkSurvivesRestart`). A prompt with an
+        /// image, a skill binding, or no saved record would come back without
+        /// it, or not at all, so it holds the restart until it runs.
+        fn queuedWorkSurvivesRestart(agent: *AppAgent) bool {
+            if (comptime agents.hasAgentField(App, "worker")) {
+                if (comptime @hasDecl(@TypeOf(agent.worker), "queuedWorkSurvivesRestart")) {
+                    return agent.worker.queuedWorkSurvivesRestart();
+                }
+            }
+            return queuedPromptsNotice(agent) == null;
         }
 
         fn queuedPromptsNotice(agent: *AppAgent) ?[]const u8 {
@@ -506,10 +519,16 @@ const TestUpgrader = struct {
 
 const TestWorker = struct {
     queued_count: usize = 0,
+    /// Whether the queue holds only prompts the session keeps whole.
+    queue_survives_restart: bool = true,
     shutdown_count: usize = 0,
 
     pub fn queuedPromptCount(self: *const TestWorker) usize {
         return self.queued_count;
+    }
+
+    pub fn queuedWorkSurvivesRestart(self: *const TestWorker) bool {
+        return self.queue_survives_restart;
     }
 
     fn requestShutdown(self: *TestWorker) void {
@@ -754,7 +773,7 @@ test "app_upgrade_runtime lets queued prompts elsewhere run before the restart, 
     try std.testing.expectEqual(@as(usize, 0), app.release_count);
 }
 
-test "app_upgrade_runtime stops the turns for prompts queued on the agent on screen, since the relaunch sends them" {
+test "app_upgrade_runtime stops the turns for prompts queued on the agent on screen, since the session keeps them" {
     var app = TestApp{ .alloc = std.testing.allocator };
     defer app.deinit();
     app.upgrader.state = .ready;
@@ -769,7 +788,7 @@ test "app_upgrade_runtime stops the turns for prompts queued on the agent on scr
     try std.testing.expect(app.agent().upgrade_handoff);
 
     // The turn holds; the queue does not hold the release or the exit, since
-    // the session keeps the prompts for the relaunched fx.
+    // the session keeps the prompts.
     app.turn_held = true;
     Runtime(TestApp).collectUpgradeFacts(&app);
     try std.testing.expectEqual(auto_upgrade.RestartWait.releasing, app.upgrader.restart);
@@ -777,6 +796,21 @@ test "app_upgrade_runtime stops the turns for prompts queued on the agent on scr
     app.turn_held = false;
     Runtime(TestApp).collectUpgradeFacts(&app);
     try std.testing.expect(app.should_exit);
+}
+
+test "app_upgrade_runtime waits for idle when a prompt queued on screen would come back without its image" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    app.agent().worker.queued_count = 1;
+    app.agent().worker.queue_survives_restart = false;
+    var deps_state = TestDepsState{};
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+
+    try std.testing.expectEqual(ApplyOutcome.waiting, outcome);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.when_idle, app.upgrader.restart);
+    try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
 }
 
 test "app_upgrade_runtime validates then requests normal relaunch handoff" {

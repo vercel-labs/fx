@@ -6293,11 +6293,13 @@ test.skipIf(!tmuxAvailable())(
 // One press of Ctrl+G never refuses. With a prompt queued behind a running
 // command, the turn stops at its next step and the prompt goes out after the
 // restart; with text in the composer, the restart waits until it is sent.
-for (const blocker of ["queued", "draft"] as const) {
+for (const blocker of ["queued", "draft", "image"] as const) {
   test.skipIf(!tmuxAvailable())(
     blocker === "queued"
       ? "upgrade ctrl-g with a prompt queued behind a running command never refuses, and restarts after it"
-      : "upgrade ctrl-g with text in the composer never refuses, and restarts after it is sent",
+      : blocker === "draft"
+        ? "upgrade ctrl-g with text in the composer never refuses, and restarts after it is sent"
+        : "upgrade ctrl-g with an image prompt queued waits for idle, and the prompt goes out with its image before the restart",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-never-refuses-")));
       const home = join(root, "home");
@@ -6320,8 +6322,13 @@ for (const blocker of ["queued", "draft"] as const) {
       const releaseFifo = join(root, "release-held-command");
       execFileSync("mkfifo", [releaseFifo]);
       const command = `read -r _ < ${JSON.stringify(releaseFifo)}; printf HELD_COMMAND_DONE`;
+      // Whether the queued prompt first reached the model before the restart.
+      let secondSentBeforeRelaunch: boolean | null = null;
       const gateway = startDynamicFakeGateway(async (body) => {
-        if (body.includes("SECOND_PROMPT")) return fakeGatewayFinalText("SECOND_ANSWERED");
+        if (body.includes("SECOND_PROMPT")) {
+          secondSentBeforeRelaunch ??= !relaunched();
+          return fakeGatewayFinalText("SECOND_ANSWERED");
+        }
         if (body.includes("HELD_COMMAND_DONE")) return fakeGatewayFinalText("FIRST_ANSWERED");
         if (body.includes("FIRST_PROMPT")) {
           firstAsked.fire();
@@ -6354,12 +6361,20 @@ for (const blocker of ["queued", "draft"] as const) {
         await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
         const version = (await runFx(["--version"])).stdout.trim();
 
-        if (blocker === "queued") {
+        if (blocker !== "draft") {
           await active.sendText("FIRST_PROMPT run the command");
           await firstAsked.fired;
           await active.waitForText("Running read", TIMEOUT);
+          if (blocker === "image") {
+            // An image the exit cannot carry across the restart.
+            const imagePath = join(workspaceRoot, "queued-image.png");
+            copyFileSync(join(import.meta.dir, "fixtures", "favicon.png"), imagePath);
+            await active.sendText(`/image ${imagePath}`);
+            await active.waitForText("attached image: queued-image.png", TIMEOUT);
+          }
           await active.sendText("SECOND_PROMPT waits in the queue");
-          await active.waitForText("┋ SECOND_PROMPT waits in the queue", TIMEOUT);
+          // An image prompt's row starts with its image token.
+          await active.waitForText(blocker === "image" ? "┋ [Image #1]SECOND_PROMPT waits in the queue" : "┋ SECOND_PROMPT waits in the queue", TIMEOUT);
         } else {
           await active.sendLiteral("SECOND_PROMPT typed, not sent");
           await active.waitForPane((pane) => composerContains(pane, "SECOND_PROMPT typed, not sent"), TIMEOUT);
@@ -6380,8 +6395,9 @@ for (const blocker of ["queued", "draft"] as const) {
         expect(pressed).not.toContain("before upgrading");
         expect(relaunched()).toBe(false);
 
-        if (blocker === "queued") {
-          // The command ends, and the queued prompt goes out before fx restarts.
+        if (blocker !== "draft") {
+          // The command ends; the turn takes the queued prompt, before the
+          // restart for an image and after it for text.
           writeFileSync(releaseFifo, "release\n");
         } else {
           await active.sendKeys("Enter");
@@ -6391,6 +6407,9 @@ for (const blocker of ["queued", "draft"] as const) {
         // A queued prompt goes out after the relaunch, once the turn goes on.
         await active.waitForPane((pane) => pane.includes("SECOND_ANSWERED") && turnSettled(pane), TIMEOUT);
         expect(gateway.requests.some((request) => request.body.includes("SECOND_PROMPT"))).toBe(true);
+        // The image prompt goes out in this process, so the exit cannot drop
+        // its image.
+        if (blocker === "image") expect(secondSentBeforeRelaunch).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
 
         await active.waitForComposer(TIMEOUT);
