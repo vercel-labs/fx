@@ -743,13 +743,6 @@ function savedFastMode(fixture: Fixture): boolean | undefined {
   return (JSON.parse(readFileSync(path, "utf8")) as { fast_mode?: boolean }).fast_mode;
 }
 
-// The startup scrollback the profile saves, or undefined when it saves no value.
-function savedStartupScrollback(fixture: Fixture): boolean | undefined {
-  const path = join(fixture.home, ".fx", "settings.json");
-  if (!existsSync(path)) return undefined;
-  return (JSON.parse(readFileSync(path, "utf8")) as { startup_scrollback?: boolean }).startup_scrollback;
-}
-
 test.skipIf(!tmuxAvailable())(
   "a settings-menu change waits for a ConfigChange hook: the working line shows, the screen stays live, the setting keeps its value until the hook allows, then it is saved",
   async () => {
@@ -764,7 +757,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("/settings");
     await session.waitForText("←→ change", TIMEOUT);
     await session.sendLiteral("prompt history");
-    await session.waitForPane((pane) => pane.includes("Prompt history") && !pane.includes("Startup scrollback"), TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("Prompt history") && !pane.includes("Status line context"), TIMEOUT);
     await session.sendKeys("Left");
     // The open menu replaces the footer, so the working line shows once the menu closes.
     await session.sendKeys("Escape");
@@ -835,23 +828,6 @@ test.skipIf(!tmuxAvailable())(
     await session.waitForText("A hook refused this setting change: no fast", TIMEOUT);
     expect(await session.capturePane()).not.toContain("* fast: on");
     expect(savedFastMode(fixture)).not.toBe(true);
-  },
-  TEST_TIMEOUT,
-);
-
-test.skipIf(!tmuxAvailable())(
-  "/settings startup-scrollback with a refusing ConfigChange hook keeps the saved value and shows the refusal",
-  async () => {
-    const fixture = makeFixture();
-    writeProjectHooks(fixture, configChangeHooks("scrollback-no", "echo no scrollback >&2; exit 2"));
-    await trust(fixture, "scrollback-no");
-    const { session } = await launch(fixture, [fakeGatewayFinalText("unused")]);
-    await session.waitForText("full access ·", TIMEOUT);
-
-    await session.sendText("/settings startup-scrollback off");
-    await session.waitForText("A hook refused this setting change: no scrollback", TIMEOUT);
-    expect(await session.capturePane()).not.toContain("startup_scrollback: off");
-    expect(savedStartupScrollback(fixture)).not.toBe(false);
   },
   TEST_TIMEOUT,
 );

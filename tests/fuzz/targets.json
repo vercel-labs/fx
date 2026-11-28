@@ -72,6 +72,7 @@
     {"name": "trace_record_text", "module": "fx", "test": "trace records stay one valid JSON line for fuzzed text", "iterations": 12000},
     {"name": "mcp_object_fields", "module": "fx", "test": "the engine reads an object's field names as std.json decodes them", "iterations": 1000000},
     {"name": "mcp_wire", "module": "fx", "test": "MCP wire decoding returns only whole JSON values from valid input", "iterations": 900000},
+    {"name": "mcp_input_round", "module": "fx", "test": "a round the engine read gets the answer the text form gets, with its keys and state as written", "iterations": 300000},
     {"name": "mcp_elicitation_escapes", "module": "fx", "test": "the engine's equality and length limits of a form's strings and an answer's match std.json's decoded strings", "iterations": 150000},
     {"name": "mcp_challenge", "module": "fx", "test": "a WWW-Authenticate challenge is read within its bounds on fuzzed bytes", "iterations": 1500000},
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
@@ -113,6 +114,7 @@
     {"name": "hook_output_read", "module": "fx", "test": "a hook's stdout and exit code read as one answer or failure, borrowing from the output for fuzzed bytes", "iterations": 1000000},
     {"name": "hook_trust_load", "module": "fx", "test": "a trust file loads into digests and disabled hooks, or is refused, for fuzzed bytes", "iterations": 60000},
     {"name": "hook_log_line", "module": "fx", "test": "a run-log line is read as one run, or skipped, for fuzzed bytes", "iterations": 900000},
+    {"name": "file_index_snapshot", "module": "fx", "test": "a saved file-index snapshot loads or is refused on fuzzed bytes", "iterations": 3000},
     {"name": "shortcut_map", "module": "fx", "test": "shortcut map parses or is refused on fuzzed bytes", "iterations": 400000}
   ]
 }
