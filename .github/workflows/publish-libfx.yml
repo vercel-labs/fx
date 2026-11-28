@@ -450,6 +450,10 @@ jobs:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
+          if [ -z "${LIBFX_VERSION:-}" ]; then
+            echo "::error::LIBFX_VERSION is empty, so there is no version to wait for"
+            exit 1
+          fi
           deadline_seconds=600
           poll_interval_seconds=15
           deadline=$((SECONDS + deadline_seconds))
@@ -471,7 +475,9 @@ jobs:
                 continue
               fi
               cat /tmp/npm-view.err >&2
-              echo "::error::npm view ${name}@${LIBFX_VERSION} failed with exit ${status} and code '${code}': ${output}"
+              # npm prints --json errors on several lines; an annotation keeps only its first line.
+              one_line=$({ jq -c . <<<"$output" 2>/dev/null || printf '%s' "$output"; } | tr '\n' ' ')
+              echo "::error::npm view ${name}@${LIBFX_VERSION} failed with exit ${status} and code '${code}': ${one_line}"
               exit 1
             done
             if [ "${#missing[@]}" -eq 0 ]; then

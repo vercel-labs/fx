@@ -661,6 +661,18 @@ tmuxTest("pane environment does not poison a shared tmux server", async () => {
   }
 });
 
+test("waitForReplyAndTurnEnd without a timeout waits as long as waitForText does", async () => {
+  const timeouts: Array<number | undefined> = [];
+  const stub = { waitForPane: async (_predicate: (pane: string) => boolean, timeoutMs?: number) => {
+    timeouts.push(timeoutMs);
+    return "";
+  } };
+  await TmuxSession.prototype.waitForReplyAndTurnEnd.call(stub as unknown as TmuxSession, "REPLY");
+  await TmuxSession.prototype.waitForText.call(stub as unknown as TmuxSession, "REPLY");
+  expect(timeouts[0]).toBeDefined();
+  expect(timeouts[0]).toBe(timeouts[1]);
+});
+
 tmuxTest("waitForReplyAndTurnEnd waits for the turn's end, not only the reply's text", async () => {
   const root = mkdtempSync(join(tmpdir(), "fx-tmux-reply-turn-end-"));
   const releasePath = join(root, "release");

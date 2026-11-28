@@ -1536,7 +1536,7 @@ export class TmuxSession {
   }
 
   /** Waits for a reply's text and its turn's end together. The text can show before the turn ends, so a test that reads saved state or sends the next prompt waits here, not on the text alone. */
-  async waitForReplyAndTurnEnd(text: string, timeoutMs: number): Promise<string> {
+  async waitForReplyAndTurnEnd(text: string, timeoutMs = 15_000): Promise<string> {
     return this.waitForPane(
       (pane) => pane.includes(text) && turnSettled(pane),
       timeoutMs,

@@ -8557,7 +8557,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendText("UPGRADE_MAIN start solo");
       await soloAsked.fired;
-      await active.waitForPane((pane) => pane.includes("MAIN_STARTED") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("MAIN_STARTED", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
       // Main's turn has ended, so only the subagent holds the restart. It
@@ -8665,7 +8665,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendText("UPGRADE_MAIN start solo");
       await soloAsked.fired;
-      await active.waitForPane((pane) => pane.includes("MAIN_STARTED") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("MAIN_STARTED", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
       await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
@@ -8896,7 +8896,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendText("UPGRADE_MAIN start solo");
       await soloAsked.fired;
-      await active.waitForPane((pane) => pane.includes("MAIN_STARTED") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("MAIN_STARTED", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
       await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);

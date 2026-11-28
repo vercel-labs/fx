@@ -27,7 +27,8 @@ PACKAGES = (
 
 # The fake npm reads one JSON plan: for each package, how many `npm view`
 # calls answer "not found" before the version shows, or an error code that
-# npm returns every time.
+# npm returns every time. With "pretty", it prints its JSON on several
+# lines, as the real npm does.
 FAKE_NPM = r'''#!/usr/bin/env python3
 import json
 import os
@@ -47,8 +48,9 @@ entry = plan.get(name, {"hidden_calls": 0})
 code = entry.get("error")
 if code is None and calls[name] <= entry["hidden_calls"]:
     code = entry.get("hidden_code", "E404")
+indent = 2 if entry.get("pretty") else None
 if code is not None:
-    print(json.dumps({"error": {"code": code, "summary": f"{code} for {name}@{version}"}}))
+    print(json.dumps({"error": {"code": code, "summary": f"{code} for {name}@{version}"}}, indent=indent))
     print(f"npm error code {code}", file=sys.stderr)
     raise SystemExit(1)
 print(json.dumps(version))
@@ -178,6 +180,21 @@ class WaitForPublishedPackagesTests(unittest.TestCase):
         self.assertEqual(self.sleeps(), 0)
         self.assertIn("::error::npm view @libfx/libfx-darwin-arm64@1.2.3 failed with exit 1 and code 'E401'", result.stdout)
         self.assertIn("npm error code E401", result.stderr)
+
+    def test_an_npm_error_on_several_lines_stays_on_one_annotation_line(self) -> None:
+        result = self.run_wait({"@libfx/libfx-darwin-arm64": {"error": "E401", "pretty": True}})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        annotation = [line for line in result.stdout.splitlines() if line.startswith("::error::")]
+        self.assertEqual(len(annotation), 1, result.stdout)
+        self.assertIn('"code":"E401"', annotation[0])
+        self.assertIn('"summary":"E401 for @libfx/libfx-darwin-arm64@1.2.3"', annotation[0])
+
+    def test_fails_before_asking_npm_when_the_version_is_empty(self) -> None:
+        self.env["LIBFX_VERSION"] = ""
+        result = self.run_wait({})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse((self.root / "calls.json").exists(), "npm must not be asked about an empty version")
+        self.assertIn("::error::LIBFX_VERSION is empty", result.stdout)
 
 
 if __name__ == "__main__":
