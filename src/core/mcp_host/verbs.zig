@@ -1366,18 +1366,22 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
 fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
     var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
     if (try std.posix.poll(&fds, 100) == 0) return null;
-    return readPastedFrom(arena, line, std.posix.STDIN_FILENO, std.posix.read, ui_terminal.terminalGone);
+    return readPastedFrom(arena, line, std.posix.STDIN_FILENO, std.posix.read, ui_terminal.terminalGone, sleepPasteSlice);
 }
 
-/// Reads what waits on `fd` and takes a complete line from it. Test seam for the read and the hang-up check.
-fn readPastedFrom(arena: Allocator, line: *std.ArrayList(u8), fd: std.posix.fd_t, comptime readFn: anytype, comptime goneFn: anytype) !?[]const u8 {
+/// Reads what waits on `fd` and takes a complete line from it. Test seam for the read, the hang-up check, and the wait.
+fn readPastedFrom(arena: Allocator, line: *std.ArrayList(u8), fd: std.posix.fd_t, comptime readFn: anytype, comptime goneFn: anytype, comptime sleepFn: anytype) !?[]const u8 {
     var buffer: [1024]u8 = undefined;
     const n = readFn(fd, &buffer) catch |err| {
         if (goneFn(fd, err)) return error.TerminalHungUp;
-        return sleepPasteSlice();
+        sleepFn();
+        return null;
     };
     // stdin closed: wait for the browser instead.
-    if (n == 0) return sleepPasteSlice();
+    if (n == 0) {
+        sleepFn();
+        return null;
+    }
     try line.appendSlice(arena, buffer[0..n]);
     const end = std.mem.findScalar(u8, line.items, '\n') orelse return null;
     const pasted = std.mem.trim(u8, line.items[0..end], " \t\r");
@@ -1387,9 +1391,8 @@ fn readPastedFrom(arena: Allocator, line: *std.ArrayList(u8), fd: std.posix.fd_t
 }
 
 /// Waits out one paste slice, so a stdin that keeps failing cannot spin the wait loop.
-fn sleepPasteSlice() ?[]const u8 {
+fn sleepPasteSlice() void {
     io_mod.sleep(100 * std.time.ns_per_ms);
-    return null;
 }
 
 const testing = std.testing;
@@ -1416,40 +1419,50 @@ fn goneNo(_: std.posix.fd_t, _: anyerror) bool {
     return false;
 }
 
-/// A slice of the paste wait, which a failed or empty read must sleep out.
-const min_paste_slice_ns: i128 = 50 * std.time.ns_per_ms;
+/// Counts the paste slices a read waited out. Each test resets it first.
+const CountingSleep = struct {
+    var calls: usize = 0;
 
-test "a failed paste read on a terminal that is gone ends the login as a hang-up" {
+    fn sleep() void {
+        calls += 1;
+    }
+};
+
+test "a failed paste read on a terminal that is gone ends the login as a hang-up, without sleeping" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     var line: std.ArrayList(u8) = .empty;
-    try testing.expectError(error.TerminalHungUp, readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readEio, goneYes));
+    CountingSleep.calls = 0;
+    try testing.expectError(error.TerminalHungUp, readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readEio, goneYes, CountingSleep.sleep));
+    try testing.expectEqual(@as(usize, 0), CountingSleep.calls);
 }
 
-test "a failed paste read on a terminal that is still there sleeps out its slice before it returns" {
+test "a failed paste read on a terminal that is still there waits one slice before it returns" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     var line: std.ArrayList(u8) = .empty;
-    const started = io_mod.nanoTimestamp();
-    try testing.expectEqual(@as(?[]const u8, null), try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readEio, goneNo));
-    try testing.expect(io_mod.nanoTimestamp() - started >= min_paste_slice_ns);
+    CountingSleep.calls = 0;
+    try testing.expectEqual(@as(?[]const u8, null), try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readEio, goneNo, CountingSleep.sleep));
+    try testing.expectEqual(@as(usize, 1), CountingSleep.calls);
 }
 
-test "a paste read of zero bytes sleeps out its slice and keeps waiting for the browser" {
+test "a paste read of zero bytes waits one slice and keeps waiting for the browser" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     var line: std.ArrayList(u8) = .empty;
-    const started = io_mod.nanoTimestamp();
-    try testing.expectEqual(@as(?[]const u8, null), try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readNothing, goneNo));
-    try testing.expect(io_mod.nanoTimestamp() - started >= min_paste_slice_ns);
+    CountingSleep.calls = 0;
+    try testing.expectEqual(@as(?[]const u8, null), try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readNothing, goneNo, CountingSleep.sleep));
+    try testing.expectEqual(@as(usize, 1), CountingSleep.calls);
 }
 
-test "a complete pasted line is returned without its line break" {
+test "a complete pasted line is returned without its line break, without sleeping" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     var line: std.ArrayList(u8) = .empty;
-    const pasted = (try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readPastedLine, goneNo)).?;
+    CountingSleep.calls = 0;
+    const pasted = (try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readPastedLine, goneNo, CountingSleep.sleep)).?;
     try testing.expectEqualStrings("abc", pasted);
+    try testing.expectEqual(@as(usize, 0), CountingSleep.calls);
 }
 
 fn parseCli(arena: Allocator, args: []const []const u8) !Parsed {

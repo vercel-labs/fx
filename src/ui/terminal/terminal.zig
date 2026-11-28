@@ -73,33 +73,35 @@ pub fn terminalGone(fd: std.posix.fd_t, err: anyerror) bool {
     const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
     // A descriptor that cannot be stat'ed is closed, so no terminal is left to hang up.
     const stat = file.stat(io_mod.getIo()) catch return true;
-    // macOS XNU poll with events=0 reports no flags on a closed pty; POLL.OUT surfaces POLLHUP and POLLNVAL.
-    var fds = [_]std.posix.pollfd{.{
-        .fd = fd,
-        .events = std.posix.POLL.OUT,
-        .revents = 0,
-    }};
-    _ = std.posix.poll(&fds, 0) catch return false;
-    const hangup_at_first_poll = (fds[0].revents & gone_poll_flags) != 0;
-    const foreign_foreground = foreignForeground(fd);
-    // A failed isatty proves nothing, so the descriptor counts as a terminal still.
-    const still_terminal = file.isTty(io_mod.getIo()) catch true;
-    // Error path only: teardown can raise EIO before POLLHUP/POLLNVAL appears (`tests/tla/terminal_hangup/TerminalHangup.tla` `GoneIsQuiet`).
-    io_mod.sleep(@as(u64, @intCast(hangup_sign_wait_ms)) * std.time.ns_per_ms);
-    fds[0].revents = 0;
-    _ = std.posix.poll(&fds, 0) catch return false;
-    return goneFromEvidence(.{
-        .character_device = stat.kind == .character_device,
-        .null_device = isNullDevice(fd),
-        .hangup_at_first_poll = hangup_at_first_poll,
-        .foreign_foreground = foreign_foreground,
-        .still_terminal = still_terminal,
-        .hangup_at_second_poll = (fds[0].revents & gone_poll_flags) != 0,
-    });
+    var seen: Gathered = .{ .character_device = stat.kind == .character_device };
+    while (true) {
+        switch (goneStep(seen)) {
+            .gone => return true,
+            .not_gone => return false,
+            .need_null_device => seen.null_device = isNullDevice(fd),
+            .need_first_poll => seen.hangup_at_first_poll = pollGoneFlags(fd) catch return false,
+            .need_foreground => seen.foreign_foreground = foreignForeground(fd),
+            // A failed isatty proves nothing, so the descriptor counts as a terminal still.
+            .need_still_terminal => seen.still_terminal = file.isTty(io_mod.getIo()) catch true,
+            .check_again => {
+                // Error path only: teardown can raise EIO before POLLHUP/POLLNVAL appears (`tests/tla/terminal_hangup/TerminalHangup.tla` `GoneIsQuiet`).
+                io_mod.sleep(@as(u64, @intCast(hangup_sign_wait_ms)) * std.time.ns_per_ms);
+                seen.hangup_at_second_poll = pollGoneFlags(fd) catch return false;
+            },
+        }
+    }
 }
 
 /// The poll flags that mean the terminal hung up, was revoked, or was invalidated.
 const gone_poll_flags = std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL;
+
+/// Whether a `POLL.OUT` poll of `fd` shows a hang-up, an error, or an invalid descriptor.
+/// macOS XNU poll with events=0 reports no flags on a closed pty; POLL.OUT surfaces POLLHUP and POLLNVAL.
+fn pollGoneFlags(fd: std.posix.fd_t) !bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+    _ = try std.posix.poll(&fds, 0);
+    return (fds[0].revents & gone_poll_flags) != 0;
+}
 
 /// Whether another process group holds the terminal's foreground.
 fn foreignForeground(fd: std.posix.fd_t) bool {
@@ -113,94 +115,112 @@ pub fn terminalInputGone(fd: std.posix.fd_t) bool {
     return terminalGone(fd, error.InputOutput);
 }
 
-/// What `terminalGone` saw of a descriptor after a failed read. Each field is one observation.
-pub const GoneEvidence = struct {
+/// The observations `terminalGone` has gathered so far. A null field is not gathered yet.
+const Gathered = struct {
     character_device: bool,
-    null_device: bool,
-    hangup_at_first_poll: bool,
-    foreign_foreground: bool,
-    still_terminal: bool,
-    hangup_at_second_poll: bool,
+    null_device: ?bool = null,
+    hangup_at_first_poll: ?bool = null,
+    foreign_foreground: ?bool = null,
+    still_terminal: ?bool = null,
+    hangup_at_second_poll: ?bool = null,
 };
 
-/// Decides from the observations alone whether the terminal is gone.
-pub fn goneFromEvidence(evidence: GoneEvidence) bool {
-    if (!evidence.character_device) return false;
-    if (evidence.null_device) return false;
-    if (evidence.hangup_at_first_poll or evidence.foreign_foreground) return true;
+/// What `terminalGone` does next: a verdict, the wait before the second poll, or one observation to gather.
+const GoneStep = enum {
+    gone,
+    not_gone,
+    check_again,
+    need_null_device,
+    need_first_poll,
+    need_foreground,
+    need_still_terminal,
+};
+
+/// Decides as far as the gathered observations allow, in the order `terminalGone` checks them.
+/// A rule that decides returns before any later observation is needed.
+fn goneStep(seen: Gathered) GoneStep {
+    if (!seen.character_device) return .not_gone;
+    const is_null_device = seen.null_device orelse return .need_null_device;
+    if (is_null_device) return .not_gone;
+    const hangup_first = seen.hangup_at_first_poll orelse return .need_first_poll;
+    if (hangup_first) return .gone;
+    const foreign = seen.foreign_foreground orelse return .need_foreground;
+    if (foreign) return .gone;
     // macOS 15 polls a revoked terminal as readable only, so the poll flags miss it; a descriptor that is no longer a terminal is gone.
-    if (!evidence.still_terminal) return true;
-    return evidence.hangup_at_second_poll;
+    const still = seen.still_terminal orelse return .need_still_terminal;
+    if (!still) return .gone;
+    const hangup_second = seen.hangup_at_second_poll orelse return .check_again;
+    return if (hangup_second) .gone else .not_gone;
 }
 
-test "a failed read on a terminal that polls no hang-up and is still a terminal is not gone" {
-    try std.testing.expect(!goneFromEvidence(.{
+test "a file, pipe, or other non-device is not gone, without any poll" {
+    try std.testing.expectEqual(GoneStep.not_gone, goneStep(.{ .character_device = false }));
+}
+
+test "a failed read on /dev/null is not gone, without any poll" {
+    try std.testing.expectEqual(GoneStep.not_gone, goneStep(.{ .character_device = true, .null_device = true }));
+}
+
+test "a character device that is not /dev/null asks for its first poll next" {
+    try std.testing.expectEqual(GoneStep.need_first_poll, goneStep(.{ .character_device = true, .null_device = false }));
+}
+
+test "a hang-up at the first poll is gone, without the foreground, terminal, or second check" {
+    try std.testing.expectEqual(GoneStep.gone, goneStep(.{
+        .character_device = true,
+        .null_device = false,
+        .hangup_at_first_poll = true,
+    }));
+}
+
+test "no hang-up at the first poll asks for the foreground group next" {
+    try std.testing.expectEqual(GoneStep.need_foreground, goneStep(.{
+        .character_device = true,
+        .null_device = false,
+        .hangup_at_first_poll = false,
+    }));
+}
+
+test "a foreign foreground group is gone, without the terminal or second check" {
+    try std.testing.expectEqual(GoneStep.gone, goneStep(.{
+        .character_device = true,
+        .null_device = false,
+        .hangup_at_first_poll = false,
+        .foreign_foreground = true,
+    }));
+}
+
+test "our own foreground group asks whether the descriptor is still a terminal" {
+    try std.testing.expectEqual(GoneStep.need_still_terminal, goneStep(.{
         .character_device = true,
         .null_device = false,
         .hangup_at_first_poll = false,
         .foreign_foreground = false,
-        .still_terminal = true,
-        .hangup_at_second_poll = false,
     }));
 }
 
-test "a failed read on a terminal that polls readable only and is no longer a terminal is gone" {
-    try std.testing.expect(goneFromEvidence(.{
+test "EIO, poll shows only readable, the fd is no longer a terminal: gone, without the second check" {
+    try std.testing.expectEqual(GoneStep.gone, goneStep(.{
         .character_device = true,
         .null_device = false,
         .hangup_at_first_poll = false,
         .foreign_foreground = false,
         .still_terminal = false,
-        .hangup_at_second_poll = false,
     }));
 }
 
-test "a failed read on a file, pipe, or other non-device is never gone" {
-    try std.testing.expect(!goneFromEvidence(.{
-        .character_device = false,
-        .null_device = false,
-        .hangup_at_first_poll = true,
-        .foreign_foreground = true,
-        .still_terminal = false,
-        .hangup_at_second_poll = true,
-    }));
-}
-
-test "a failed read on /dev/null is never gone, even when its poll shows a hang-up" {
-    try std.testing.expect(!goneFromEvidence(.{
-        .character_device = true,
-        .null_device = true,
-        .hangup_at_first_poll = true,
-        .foreign_foreground = true,
-        .still_terminal = false,
-        .hangup_at_second_poll = true,
-    }));
-}
-
-test "a hang-up at the first poll is gone" {
-    try std.testing.expect(goneFromEvidence(.{
-        .character_device = true,
-        .null_device = false,
-        .hangup_at_first_poll = true,
-        .foreign_foreground = false,
-        .still_terminal = true,
-        .hangup_at_second_poll = false,
-    }));
-}
-
-test "a foreign foreground group is gone" {
-    try std.testing.expect(goneFromEvidence(.{
+test "EIO, still a terminal, no flags: wait and poll again" {
+    try std.testing.expectEqual(GoneStep.check_again, goneStep(.{
         .character_device = true,
         .null_device = false,
         .hangup_at_first_poll = false,
-        .foreign_foreground = true,
+        .foreign_foreground = false,
         .still_terminal = true,
-        .hangup_at_second_poll = false,
     }));
 }
 
-test "a hang-up at the second poll is gone" {
-    try std.testing.expect(goneFromEvidence(.{
+test "EIO, still a terminal, the second poll shows a hang-up: gone" {
+    try std.testing.expectEqual(GoneStep.gone, goneStep(.{
         .character_device = true,
         .null_device = false,
         .hangup_at_first_poll = false,
@@ -210,8 +230,8 @@ test "a hang-up at the second poll is gone" {
     }));
 }
 
-test "a second poll that shows only readable, on a terminal still there, is not gone" {
-    try std.testing.expect(!goneFromEvidence(.{
+test "EIO, still a terminal, the second poll shows only readable: not gone" {
+    try std.testing.expectEqual(GoneStep.not_gone, goneStep(.{
         .character_device = true,
         .null_device = false,
         .hangup_at_first_poll = false,
