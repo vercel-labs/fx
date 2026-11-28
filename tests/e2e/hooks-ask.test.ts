@@ -519,6 +519,34 @@ describe("fx ask with hooks", () => {
     });
   }, TIMEOUT);
 
+  test("fx ask --stream-events carries the waiting-for-trust notice in its result event, as --json does", async () => {
+    const root = createRoot({ experimental: { hooks: true } });
+    writeProjectHooks(root, denyShellHooks(root.hookRan));
+
+    const { result } = await runAsk(
+      root,
+      "Say hello.",
+      startFakeGateway([fakeGatewayFinalText("hello")]),
+      ["--yolo", "--stream-events"],
+      false,
+      false,
+    );
+
+    expect(result.code).toBe(0);
+    expect(existsSync(root.hookRan)).toBe(false);
+    const events = result.stdout
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string; notices?: unknown[] });
+    const final = events[events.length - 1];
+    expect(final.type).toBe("result");
+    expect(final.notices).toContainEqual({
+      topic: "hooks",
+      tone: "neutral",
+      text: "1 hook waits for trust and does not run. Run fx hook list to review it.",
+    });
+  }, TIMEOUT);
+
   test("fx ask prints the waiting-for-trust notice on stderr in text mode", async () => {
     const root = createRoot({ experimental: { hooks: true } });
     writeProjectHooks(root, denyShellHooks(root.hookRan));

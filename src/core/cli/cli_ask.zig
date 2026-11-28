@@ -4010,7 +4010,7 @@ fn pushHookNotice(raw_ctx: *anyopaque, tone: agent_runtime.HookNoticeTone, text:
 
 /// Keeps a copy of a notice for `fx ask --json`. The notice still prints on stderr either way.
 fn recordNotice(ctx: *AskContext, topic: []const u8, tone: []const u8, text: []const u8) void {
-    if (ctx.output_mode != .json) return;
+    if (!ctx.output_mode.capturesJson()) return;
     ctx.notice_log.record(ctx.alloc, topic, tone, text);
 }
 
