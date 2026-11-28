@@ -8466,6 +8466,133 @@ describe("fx ask --json recovery", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "fx ask --json drops discarded restarted previews when the final content-filter block has no text",
+    async () => {
+      const sseContentFilter = (partialText?: string) =>
+        fakeGatewaySse([
+          ...(partialText ? [{ type: "text-delta", id: "t_cf", delta: partialText }] : []),
+          { type: "finish", finishReason: { unified: "content-filter", raw: "content_filter" } },
+        ]);
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      const gateway = startFakeGateway([
+        sseContentFilter("OBSOLETE_PREVIEW "),
+        sseContentFilter("OBSOLETE_PREVIEW "),
+        sseContentFilter("OBSOLETE_PREVIEW "),
+        sseContentFilter(),
+        sseContentFilter("OBSOLETE_PREVIEW "),
+        sseContentFilter("OBSOLETE_PREVIEW "),
+        sseContentFilter("OBSOLETE_PREVIEW "),
+        sseContentFilter(),
+      ]);
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-cf-empty-last-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const res = await runFx(["ask", "--json", "--no-save", "restarted then empty"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(res.code).toBe(1);
+        const json = JSON.parse(res.stdout);
+        expect(json.exit_code).toBe(1);
+        expect(json.output).toBe("");
+        expect(json.final_output).toBe("");
+        expect("partial" in json).toBe(false);
+        expect(json.error).toBe("ModelError");
+        expect(json.recovery).toMatchObject({ state: "failed", attempt: 4, cause: "content_filter" });
+
+        const streamRes = await runFx(["ask", "--stream-events", "--no-save", "restarted then empty"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(streamRes.code).toBe(1);
+        const streamLines = streamRes.stdout.trimEnd().split("\n");
+        expect(streamLines).toHaveLength(2);
+        const resultLine = streamLines[1]!;
+        expect(`{${resultLine.slice('{"type":"result",'.length)}\n`).toBe(res.stdout);
+        const streamJson = JSON.parse(resultLine);
+        expect(streamJson.output).toBe("");
+        expect("partial" in streamJson).toBe(false);
+        expect(streamJson.recovery).toMatchObject({ state: "failed", attempt: 4, cause: "content_filter" });
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --json drops a restarted preview when the retry fails with HTTP 400",
+    async () => {
+      const sseContentFilter = (partialText?: string) =>
+        fakeGatewaySse([
+          ...(partialText ? [{ type: "text-delta", id: "t_cf", delta: partialText }] : []),
+          { type: "finish", finishReason: { unified: "content-filter", raw: "content_filter" } },
+        ]);
+      const badRequest = () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              type: "invalid_request_error",
+              message: "bad request fixture",
+            },
+          }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      const gateway = startFakeGateway([
+        sseContentFilter("OBSOLETE_PREVIEW "),
+        badRequest(),
+        sseContentFilter("OBSOLETE_PREVIEW "),
+        badRequest(),
+      ]);
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-cf-then-400-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const res = await runFx(["ask", "--json", "--no-save", "restarted then http 400"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(res.code).toBe(1);
+        const json = JSON.parse(res.stdout);
+        expect(json.exit_code).toBe(1);
+        expect(json.output).not.toContain("OBSOLETE_PREVIEW");
+        expect(json.output).toContain("HTTP 400");
+        expect(json.final_output).toBe("");
+        expect("partial" in json).toBe(false);
+
+        const streamRes = await runFx(["ask", "--stream-events", "--no-save", "restarted then http 400"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(streamRes.code).toBe(1);
+        const streamLines = streamRes.stdout.trimEnd().split("\n");
+        expect(streamLines).toHaveLength(2);
+        const resultLine = streamLines[1]!;
+        expect(`{${resultLine.slice('{"type":"result",'.length)}\n`).toBe(res.stdout);
+        const streamJson = JSON.parse(resultLine);
+        expect(streamJson.output).not.toContain("OBSOLETE_PREVIEW");
+        expect("partial" in streamJson).toBe(false);
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: ask stream events", () => {
