@@ -22,6 +22,30 @@ import {
 
 const TIMEOUT = 90_000;
 const LIST_HINT = "enter switch";
+// Matches `AppAgentsRuntime.footerIndicator` (`src/core/app/app_agents_runtime.zig:2858-2865`),
+// drawn at the right edge of the footer hint row whenever more than one agent is open.
+const AGENT_INDICATOR = /(?:^| )(?:main|fx \d+\/\d+|[^\s\u00b7]+(?: \u00b7 (?:done|failed|stopped))?)(?: \u2193| \u00b7 ctrl\+x)$/;
+const SUBAGENT_APPROVAL = /Subagent .+ needs permission/;
+const SUBAGENT_STARTED = /^[\u251c\u2514] Started \S/m;
+
+function footerHintRow(pane: string): string {
+  const lines = pane.split("\n");
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i]!.trimEnd();
+    if (line.length > 0) return line;
+  }
+  return "";
+}
+
+// When an approval prompt owns the footer (`choose now`), it hides the agent
+// indicator even though Ctrl+X still opens the agent list. Accept the approval
+// branch only when a subagent is already visible on screen (its own approval,
+// a started subagent row, or an open agent-list row), never for main's own
+// approval with only one agent open.
+const agentListReady = (pane: string) =>
+  AGENT_INDICATOR.test(footerHintRow(pane)) ||
+  (approvalOpen(pane) && (SUBAGENT_APPROVAL.test(pane) || SUBAGENT_STARTED.test(pane))) ||
+  agentRows(pane).length > 0;
 
 // The agent list's row for instance `number`, and for subagent `name`, which
 // sits under its instance behind a branch.
@@ -65,8 +89,9 @@ async function waitForSelected(session: TmuxSession, name: string, ms = 10_000):
 // moment after the parent's turn shows it did.
 async function showNamedAgent(session: TmuxSession, name: string) {
   const deadline = Date.now() + 30_000;
+  await session.waitForPane(agentListReady, Math.max(1, deadline - Date.now()));
   await session.sendKeys("C-x");
-  await session.waitForText(LIST_HINT, 10_000);
+  await session.waitForText(LIST_HINT, Math.max(1, deadline - Date.now()));
   // The list redraws as agents come, so its pane is the signal that a row a
   // parent started a moment ago is drawn.
   await session.waitForPane(
@@ -86,8 +111,15 @@ async function showNamedAgent(session: TmuxSession, name: string) {
 // Opens the agent list and selects the row `name` that follows `anchor`, for a
 // host whose instances each have a subagent of the same name.
 async function showAgentAfter(session: TmuxSession, anchor: string, name: string) {
+  const deadline = Date.now() + 30_000;
+  await session.waitForPane(agentListReady, Math.max(1, deadline - Date.now()));
   await session.sendKeys("C-x");
-  await session.waitForText(LIST_HINT, 10_000);
+  await session.waitForText(LIST_HINT, Math.max(1, deadline - Date.now()));
+  await session.waitForPane((value) => {
+    const rows = agentRows(value);
+    const under = rows.findIndex((row) => row.name === anchor);
+    return under >= 0 && rows.some((row, index) => index > under && row.name === name);
+  }, Math.max(1, deadline - Date.now()));
   const rows = agentRows(await session.capturePaneEscapes());
   const from = rows.findIndex((row) => row.selected);
   const under = rows.findIndex((row) => row.name === anchor);
@@ -3450,6 +3482,74 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
         await Bun.sleep(300);
         expect(await session.capturePane()).not.toContain("needs you");
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "showNamedAgent waits for the footer indicator when main's first reply is delayed, and showAgentAfter waits for the row",
+    async () => {
+      const command = "echo RAN >> delayed.log";
+      const base = grantRuns(new Set(), true);
+      let delayedFirst = false;
+      const firstRequestStarted = held();
+      const firstReplyGate = held();
+      await withHost(
+        async (body) => {
+          if (!delayedFirst && userTexts(body).join("\n").includes("GRANT_1 ")) {
+            delayedFirst = true;
+            firstRequestStarted.release();
+            await firstReplyGate.promise;
+          }
+          return base(body);
+        },
+        { env: { FX_PERMISSION_MODE: "ask" } },
+        async ({ home, workspace, session }) => {
+          writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+          const log = join(workspace, "delayed.log");
+          await session.waitForComposer(15_000);
+          await session.sendText(`GRANT_1 SUB[alpha] RUN[${command}]`);
+          await firstRequestStarted.promise;
+          expect(agentListReady(await session.capturePane())).toBe(false);
+          await session.sendKeys("C-x");
+          firstReplyGate.release();
+          await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 RUN[${command}]`);
+          await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+          await session.sendKeys("2");
+          await waitUntil("the subagent's two runs", () => countLines(log) === 2, 30_000, session);
+        },
+      );
+
+      let delayedSecond = false;
+      const secondReplyGate = held();
+      await withHost(
+        async (body) => {
+          if (!delayedSecond && userTexts(body).join("\n").includes("GRANT_2 ")) {
+            delayedSecond = true;
+            await secondReplyGate.promise;
+          }
+          return base(body);
+        },
+        { instances: 2, env: { FX_PERMISSION_MODE: "ask" } },
+        async ({ home, workspace, session }) => {
+          writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
+          const log = join(workspace, "delayed.log");
+          await session.waitForComposer(15_000);
+          await switchAgent(session, 2);
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText(`GRANT_2 SUB[alpha] RUN[${command}]`);
+          const picking = showAgentAfter(session, "fx 2", "alpha");
+          await session.waitForText(LIST_HINT, 10_000);
+          secondReplyGate.release();
+          await picking;
+          await session.waitForPane((pane) => pane.includes("GRANT_CHILD_READY_2"), 30_000);
+          await session.sendText(`GRANT_TASK_2 RUN[${command}]`);
+          await waitShows(session, "fx 2 alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
+          await session.sendKeys("1");
+          await waitUntil("the second instance's first run", () => countLines(log) === 1, 30_000, session);
+        },
+      );
     },
     TIMEOUT,
   );
