@@ -30,6 +30,7 @@ import {
   toolShapesWithoutDescriptions,
 } from "./conditional-guidance-oracle";
 import { LineQueue } from "./line-queue";
+import { RAW_ANSWER, RAW_KEYS, RAW_STATE, expectRawRetry, rawLinesAt, rawRequests } from "./mcp-raw-rounds";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { childLines, childWork, copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
@@ -1212,6 +1213,76 @@ test("ACP shell completed and replayed updates show the command output", async (
     fixture.close();
   }
 }, 45000);
+
+// A loaded session sends the toolbox menu its first request sent, so each
+// request still starts with the whole request before it, and a skill added
+// since arrives as a change note at the end of the turn
+// (tests/tla/toolbox/Toolbox.tla MenuFixed and Informed).
+test("ACP session/load sends the toolbox menu the session sent first and notes a skill added since", async () => {
+  const root = createIsolatedRoot("fx-acp-toolbox-menu-");
+  const changeNote = "The toolbox now holds something other than the toolbox menu above lists.";
+  const writeSkill = (name: string) => {
+    const dir = join(root.home, ".fx", "skills", name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: The ${name} steps.\n---\n\n# ${name}\n`);
+  };
+  const withoutProviderOptions = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutProviderOptions);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "providerOptions").map(([key, item]) => [key, withoutProviderOptions(item)]));
+    }
+    return value;
+  };
+  writeSkill("menu-first");
+  const answers = ["ACP_MENU_FIRST", "ACP_MENU_SECOND", "ACP_MENU_THIRD"];
+  let turn = 0;
+  const gateway = startDynamicFakeGateway(() => finalText(answers[turn]!));
+  let client: AcpClient | undefined;
+  try {
+    let sessionId = "";
+    for (const [index, prompt] of ["First question.", "Second question.", "Third question."].entries()) {
+      turn = index;
+      if (index === 1) writeSkill("menu-added");
+      client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      await client.request("initialize", { protocolVersion: 1 }, 1);
+      if (index === 0) {
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        if (created.error) throw new Error(JSON.stringify(created));
+        sessionId = created.result.sessionId;
+      } else {
+        const loaded = await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 2) as any;
+        if (loaded.error) throw new Error(JSON.stringify(loaded));
+      }
+      const answered = await runPrompt(client, prompt, TIMEOUT);
+      expect(answered.promptResult.result.stopReason).toBe("end_turn");
+      expect(client.stderr).toBe("");
+      client.endStdin();
+      expect(await client.waitForExit()).toBe(0);
+      await client.close();
+      client = undefined;
+    }
+
+    const requests = gateway.requests
+      .map((request) => JSON.parse(request.body))
+      .filter((request) => (request.tools ?? []).length > 0);
+    expect(requests.length).toBe(3);
+    for (let i = 1; i < requests.length; i++) {
+      expect(JSON.stringify(requests[i].tools)).toBe(JSON.stringify(requests[i - 1].tools));
+      const earlier = requests[i - 1].prompt.map((message: unknown) => JSON.stringify(withoutProviderOptions(message)));
+      const later = requests[i].prompt.slice(0, earlier.length).map((message: unknown) => JSON.stringify(withoutProviderOptions(message)));
+      expect(later).toEqual(earlier);
+    }
+    expect(JSON.stringify(requests[0].prompt)).not.toContain("menu-added");
+    const noted = JSON.stringify(requests[1].prompt.at(-1));
+    expect(noted).toContain(changeNote);
+    expect(noted).toContain("menu-added");
+    expect(JSON.stringify(requests[2].prompt).split(changeNote).length - 1).toBe(1);
+  } finally {
+    await client?.close();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 90000);
 
 test("ACP shell output after a yielded call keeps the run card completed", async () => {
   // The command blocks on this FIFO until the test writes to it, so its output
@@ -6987,6 +7058,63 @@ describe("acp: model-independent", () => {
     },
     LIVE_TIMEOUT,
   );
+
+  // A 2026 round's keys and requestState go back as the server wrote them, whatever the editor answers
+  // (mcp-raw-rounds.ts has the bytes).
+  for (const [name, answers, steps] of [
+    ["accepts every request", [RAW_ANSWER.accept("f1"), RAW_ANSWER.accept("f2"), RAW_ANSWER.accept("f3")], ["accept", "accept", "accept"]],
+    ["declines the first and accepts the rest", [RAW_ANSWER.decline, RAW_ANSWER.accept("f2"), RAW_ANSWER.accept("f3")], ["decline", "accept", "accept"]],
+    ["cancels the second, which cancels the rest", [RAW_ANSWER.accept("f1"), RAW_ANSWER.cancel, RAW_ANSWER.cancel], ["accept", "cancel"]],
+  ] as const) {
+    test(
+      `ACP gives a round's keys and requestState back as the server wrote them when the client ${name}`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-mcp-raw-round-");
+        const pidPath = join(root.root, "mcp-raw-round.pid");
+        const rawLines = join(root.root, "mcp-raw-lines.txt");
+        const gateway = startFakeGateway([
+          fakeGatewayToolCall("select_raw", "toolbox", { open: MCP_TOOL_NAME }),
+          fakeGatewayToolCall("call_raw", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp-raw" } }),
+          finalText("ACP raw round complete"),
+        ]);
+        const asked: string[] = [];
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          await client.request("initialize", { protocolVersion: 1, clientCapabilities: { elicitation: { form: {} } } }, 1);
+          const created = await client.request("session/new", {
+            cwd: root.workspace,
+            mcpServers: [acpStdioServer("unused", pidPath, "mrtr_raw", {
+              FX_MCP_EXPECT_ELICITATION: "form",
+              FX_MCP_MRTR_RAW: JSON.stringify([{ requests: rawRequests(RAW_KEYS), state: RAW_STATE }]),
+              FX_MCP_RAW_LINES: rawLines,
+            })],
+          }, 2) as any;
+          expect(created.error).toBeUndefined();
+          await client.readLine();
+          await client.request("session/set_mode", { modeId: "auto" }, 3);
+          client.setElicitationHandler((params) => {
+            const field = /Question (f\d)/.exec(String(params.message))?.[1] ?? "";
+            asked.push(field);
+            const step = steps[asked.length - 1] ?? "cancel";
+            return step === "accept" ? { action: "accept", content: { [field]: true } } : { action: step };
+          });
+
+          const prompt = await runPrompt(client, "Call the supplied raw round MCP tool.", TIMEOUT);
+          expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+          expect(asked).toEqual(["f1", "f2", "f3"].slice(0, steps.length));
+          const lines = rawLinesAt(rawLines);
+          expect(lines).toHaveLength(2);
+          expectRawRetry(lines[1], RAW_KEYS, [...answers], RAW_STATE);
+        } finally {
+          await client?.close();
+          if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      LIVE_TIMEOUT,
+    );
+  }
 
   // A server writes a form's keys and enum values as JSON text, and may spell a
   // character with an escape. fx shows the form with the characters decoded,
