@@ -9455,6 +9455,13 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
                             .runtime_context = try runtimeContextTexts(arena, runtime_context.messages()),
+                            // fx's summary starts a new prefix; a turn that sent
+                            // an earlier turn's copy sends the current one after
+                            // it, saved with the summary (D94).
+                            .summary_runtime_context = if (runtime_context.captured == null)
+                                try runtimeContextTexts(arena, current_runtime_context.items)
+                            else
+                                &.{},
                         },
                     });
                     // The turn's duration leaves out the compaction, as its
@@ -9515,6 +9522,15 @@ fn processQueuedPromptLoop(
                         trace_count_after_compaction = true;
                         active_compaction_history_tail = compacted_messages.items[1..];
                         compaction_history = next_history;
+                        if (try runtime_context.restartAfterSummary(arena, overlay_arena, next_history, current_runtime_context.items)) |restart| {
+                            ephemeral_overlay.clearRetainingCapacity();
+                            try ephemeral_overlay.appendSlice(overlay_arena, runtime_context.messages());
+                            if (restart.update) |note| {
+                                const update = [_]ChatMessage{.{ .role = .system, .content = note, .context_note = true }};
+                                try insertBoundaryNotes(arena, &within_turn_suffix, compacted_suffix_len, &update);
+                            }
+                            debug_trace.logf("context", "runtime context from summary step={d} messages={d} update={}", .{ current_step_index, runtime_context.messages().len, restart.update != null });
+                        }
                         finalization.compacted_execution = .{
                             .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
                             .steering = finalization.compacted_execution.steering + active_cut.steering,

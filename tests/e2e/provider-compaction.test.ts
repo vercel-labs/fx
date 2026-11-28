@@ -224,6 +224,34 @@ describe("provider compaction", () => {
     });
   }, 240_000);
 
+  test("a Claude turn after a switch from GPT-6 whose compaction ends with fx's summary keeps every later request's prefix", async () => {
+    const models = Object.values(FAMILIES).map((family) => ({ id: family.model, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }));
+    await withSession(FAMILIES.openai.model, { models, compaction: () => ({ kind: "status", status: 400 }) }, async (session, { observed, counts, edits }) => {
+      const { root, cwd, env, sessionId, before } = session;
+      const claude = FAMILIES.anthropic.model;
+      // The GPT-6 turns saved the turn context with GPT's model line. Claude's
+      // compaction fails, so fx writes its own summary inside turn 7: the rest
+      // of that turn sends Claude's model line, and turn 8 must send the same
+      // bytes before turn 7's signed reasoning.
+      const seventh = await ask({ ...env, FX_MODEL: claude, FX_AUTO_COMPACT_PERCENT: "10" }, cwd, root, "t7", ["--resume", sessionId, "--model", claude], "TURN 7 Continue.");
+      expect(seventh.code).toBe(0);
+      const eighth = await ask({ ...env, FX_MODEL: claude }, cwd, root, "t8", ["--resume", sessionId, "--model", claude], "TURN 8 Thanks.");
+      expect(edits).toEqual([]);
+      expect(eighth.code).toBe(0);
+      expect(counts.provider).toBeGreaterThanOrEqual(1);
+      expect(counts.fx).toBeGreaterThanOrEqual(1);
+
+      const seventhRequest = agentRequestFor(observed, before, 7)!;
+      const eighthRequest = agentRequestFor(observed, before, 8)!;
+      expect(isFxSummary(conversationOf(seventhRequest)[0]!)).toBe(true);
+      expect(eighthRequest.prompt.slice(0, seventhRequest.prompt.length).map(withoutCacheMarkers)).toEqual(seventhRequest.prompt.map(withoutCacheMarkers));
+      expect(observed.slice(before).filter((request) => request.model === claude && request.kind === "agent").length).toBeGreaterThanOrEqual(2);
+      const instructions = JSON.stringify(seventhRequest.prompt.slice(0, leadingSystem(seventhRequest.prompt)));
+      expect(instructions).toContain(`model: ${claude}`);
+      expect(instructions).not.toContain(`model: ${FAMILIES.openai.model}`);
+    });
+  }, 240_000);
+
   test("a fork of a provider-compacted session sends the block to its own model and fx's text to another", async () => {
     const models = Object.values(FAMILIES).map((family) => ({ id: family.model, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }));
     await withSession(FAMILIES.anthropic.model, { models }, async (session, { observed, counts, edits }) => {
