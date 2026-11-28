@@ -279,6 +279,36 @@ fn requestResumeExit(app: anytype) void {
     app.should_exit = true;
 }
 
+pub fn writeStopSubagentsNotice(app: anytype, result: anytype) !void {
+    if (result.stopped > 0 or result.failed == 0) {
+        var body_buf: [64]u8 = undefined;
+        const body = if (result.stopped == 0)
+            "No subagent is working."
+        else
+            try std.mem.print(&body_buf, "Stopped {d} subagent{s}.", .{ result.stopped, if (result.stopped == 1) "" else "s" });
+        try app.writeDomainNotice(.{
+            .topic = "subagent",
+            .tone = .neutral,
+            .body = body,
+        }, true);
+    }
+    if (result.first_error) |err| {
+        debug_trace.logf("subagent", "stop_subagents_notice failed={d} err={s}", .{ result.failed, @errorName(err) });
+        var plain_buf: [64]u8 = undefined;
+        var err_buf: [128]u8 = undefined;
+        const err_body = try std.mem.print(
+            &err_buf,
+            "Failed to stop {d} subagent{s}: {s}.",
+            .{ result.failed, if (result.failed == 1) "" else "s", types.plainErrorText(@errorName(err), &plain_buf) },
+        );
+        try app.writeDomainNotice(.{
+            .topic = "subagent",
+            .tone = .@"error",
+            .body = err_body,
+        }, true);
+    }
+}
+
 pub fn Handlers(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -296,6 +326,7 @@ pub fn Handlers(comptime App: type) type {
                 .launch_instance = commandLaunchInstance,
                 .close_instance = commandCloseInstance,
                 .show_agents = commandShowAgents,
+                .stop_subagents = commandStopSubagents,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
                 .fork_session = commandForkSession,
@@ -474,6 +505,14 @@ pub fn Handlers(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !@hasDecl(App, "openAgentsMenu")) return;
             try app.openAgentsMenu();
+        }
+
+        /// `/stop` stops every working subagent in the current session's tree
+        /// and reports how many were stopped without cancelling main's turn.
+        fn commandStopSubagents(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !@hasDecl(App, "stopWorkingSubagents")) return;
+            try writeStopSubagentsNotice(app, app.stopWorkingSubagents());
         }
 
         fn commandResumeSession(ctx: *anyopaque) !void {
@@ -2881,4 +2920,79 @@ test "/version command writes dev build label and omits unresolved revision" {
     try expectVersionCommandBody(.dev, "f1862c5061f5", "0.0.17-f1862c5 (dev)");
     try expectVersionCommandBody(.dev, "unknown", "0.0.17 (dev)");
     try expectVersionCommandBody(.dev, "", "0.0.17 (dev)");
+}
+
+test "/stop command writes stopped count or idle notice" {
+    const FakeStopApp = struct {
+        const Result = struct {
+            stopped: usize = 0,
+            failed: usize = 0,
+            first_error: ?anyerror = null,
+        };
+        alloc: std.mem.Allocator,
+        stop_result: usize = 0,
+        fail_count: usize = 0,
+        first_error: ?anyerror = null,
+        calls: usize = 0,
+        notices: std.ArrayList(u8) = .empty,
+        notice_topic: ?[]const u8 = null,
+        notice_tone: ?types.NoticeTone = null,
+        notice_body: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.notices.deinit(self.alloc);
+            self.notice_body.deinit(self.alloc);
+        }
+
+        pub fn stopWorkingSubagents(self: *@This()) Result {
+            self.calls += 1;
+            return .{
+                .stopped = self.stop_result,
+                .failed = self.fail_count,
+                .first_error = self.first_error,
+            };
+        }
+
+        noinline fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            self.notice_topic = notice.topic;
+            self.notice_tone = notice.tone;
+            self.notice_body.clearRetainingCapacity();
+            try self.notice_body.appendSlice(self.alloc, notice.body);
+            if (self.notices.items.len > 0) try self.notices.append(self.alloc, '\n');
+            try self.notices.appendSlice(self.alloc, notice.body);
+        }
+    };
+
+    var app = FakeStopApp{ .alloc = std.testing.allocator, .stop_result = 0 };
+    defer app.deinit();
+
+    try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
+    try std.testing.expectEqual(@as(usize, 1), app.calls);
+    try std.testing.expectEqualStrings("subagent", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
+    try std.testing.expectEqualStrings("No subagent is working.", app.notice_body.items);
+
+    app.stop_result = 1;
+    try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
+    try std.testing.expectEqualStrings("Stopped 1 subagent.", app.notice_body.items);
+
+    app.stop_result = 3;
+    try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
+    try std.testing.expectEqualStrings("Stopped 3 subagents.", app.notice_body.items);
+
+    app.notices.clearRetainingCapacity();
+    app.stop_result = 2;
+    app.fail_count = 1;
+    app.first_error = error.OutOfMemory;
+    try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
+    try std.testing.expectEqualStrings("Stopped 2 subagents.\nFailed to stop 1 subagent: out of memory.", app.notices.items);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.notice_tone.?);
+
+    app.notices.clearRetainingCapacity();
+    app.stop_result = 0;
+    app.fail_count = 1;
+    app.first_error = error.OutOfMemory;
+    try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
+    try std.testing.expectEqualStrings("Failed to stop 1 subagent: out of memory.", app.notices.items);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.notice_tone.?);
 }

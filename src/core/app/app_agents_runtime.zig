@@ -22,6 +22,9 @@ const agents_menu_presentation = @import("../../ui/footer/agents_menu_presentati
 const session_mod = @import("../session/session.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_process_runtime = @import("app_process_runtime.zig");
+const input_approval_runtime = @import("input_approval_runtime.zig");
+const input_question_runtime = @import("input_question_runtime.zig");
+const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -1337,12 +1340,22 @@ pub fn Runtime(comptime App: type) type {
             child.agent.question_prompt.discard(app.alloc, "owner_cleared");
         }
 
+        /// The subagent whose question `agent`'s prompt shows, while that
+        /// instance is in context: an answer or cancel there goes to that
+        /// subagent's worker.
+        pub fn lentQuestion(app: *App, agent: *AppAgent) ?*ChildAgent {
+            const lender = app.question_lender orelse return null;
+            if (agent != rootInstance(app, lender)) return null;
+            return lender;
+        }
+
         /// Runs `body`, an answer or a cancel, in the context of the subagent
         /// whose question the instance's screen shows, so the answer reaches
         /// its worker and joins its conversation. False when the question is
         /// the instance's own.
-        pub fn answerLentQuestion(app: *App, comptime body: fn (*App, *AppAgent) anyerror!void) !bool {
-            const child = returnQuestion(app) orelse return false;
+        pub fn answerLentQuestion(app: *App, agent: *AppAgent, comptime body: fn (*App, *AppAgent) anyerror!void) !bool {
+            if (lentQuestion(app, agent) == null) return false;
+            const child = returnQuestion(app).?;
             const Answer = struct {
                 fn run(_: void, a: *App, lender: *agents.Agent) anyerror!void {
                     try body(a, lender);
@@ -2183,6 +2196,25 @@ pub fn Runtime(comptime App: type) type {
             return changed;
         }
 
+        pub const StopSubagentsResult = struct {
+            stopped: usize = 0,
+            failed: usize = 0,
+            first_error: ?anyerror = null,
+        };
+
+        /// Which active-turn states of `stateOf` mean `child` has a turn in
+        /// flight (running, queued without a running turn yet, or waiting on
+        /// the user). Shared by `workingNote` and `/stop` so both follow
+        /// `stateOf` identically.
+        fn subagentTurnInFlight(app: *App, child: *ChildAgent) ?InstanceState {
+            if (child.agent.worker.isTurnCancelRequested()) return null;
+            const state = stateOf(app, child);
+            return switch (state) {
+                .working, .waiting, .needs_approval, .has_question, .needs_you => state,
+                .finished, .idle, .failed, .stopped => null,
+            };
+        }
+
         /// The footer note for hidden subagents that work, such as "1
         /// subagent working", so the agent on screen shows that work goes on
         /// elsewhere; empty when none does. One that waits for the user is
@@ -2191,7 +2223,7 @@ pub fn Runtime(comptime App: type) type {
             var count: usize = 0;
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .subagent or child == app.agent_on_screen) continue;
-                if (stateOf(app, child) == .working) count += 1;
+                if (subagentTurnInFlight(app, child) == .working) count += 1;
             }
             if (count == 0) return "";
             return std.mem.print(buf, "{d} subagent{s} working", .{ count, if (count == 1) "" else "s" }) catch "";
@@ -3957,6 +3989,67 @@ pub fn Runtime(comptime App: type) type {
             endRun(run, outcome);
         }
 
+        /// Stops every working subagent in the current session's tree using the
+        /// per-child user-stop path (`noteUserStop` and per-child cancel),
+        /// leaving idle subagents, other instances' subagents, the main turn,
+        /// and the composer draft untouched. Keeps going on per-child errors
+        /// so earlier and later stops are still counted and reported.
+        pub fn stopWorkingSubagents(app: *App) StopSubagentsResult {
+            const screen = agents.screenAgentOf(app);
+            const session_root: *AppAgent = if (hostedOf(app, screen)) |child|
+                if (child.agent.role == .subagent) rootInstance(app, child) else screen
+            else
+                screen;
+            var result: StopSubagentsResult = .{};
+            for (app.child_agents.items) |child| {
+                if (child.agent.role != .subagent or rootInstance(app, child) != session_root) continue;
+                if (subagentTurnInFlight(app, child) == null) continue;
+                if (app.approval_lender == child) _ = returnApproval(app);
+                if (app.question_lender == child) _ = returnQuestion(app);
+                if (app.wait_card_lender == child) _ = returnWaitCard(app);
+                const stop_result = if (child == app.agent_on_screen)
+                    stopChildAgentInContext({}, app, &child.agent)
+                else
+                    visit(app, child, {}, stopChildAgentInContext);
+                if (stop_result) |_| {
+                    result.stopped += 1;
+                } else |err| {
+                    result.failed += 1;
+                    if (result.first_error == null) result.first_error = err;
+                    debug_trace.logf("host", "stop_subagent_failed agent={s} err={s}", .{ child.id, @errorName(err) });
+                }
+            }
+            if (result.stopped > 0) {
+                if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
+            }
+            if (result.stopped > 0 or result.failed > 0) {
+                app.shell.render_requests.request(.footer);
+            }
+            return result;
+        }
+
+        fn stopChildAgentInContext(_: void, app: *App, agent: *AppAgent) anyerror!void {
+            if (agent.approval_prompt.isActive()) {
+                try input_approval_runtime.ApprovalRuntime(App).cancelApprovalOperation(app, agent);
+                return;
+            }
+            if (agent.question_prompt.isActive()) {
+                try input_question_runtime.QuestionRuntime(App).cancelQuestionPrompt(app, agent);
+                return;
+            }
+            if (agent.stream.active) {
+                try input_interrupt_runtime.InterruptRuntime(App).cancelActiveStreamSilent(app, agent);
+                return;
+            }
+            input_interrupt_runtime.InterruptRuntime(App).traceInterruptRequested(app, agent, "stop_subagents");
+            noteUserStop(app, agent);
+            agent.worker.requestInteractiveCancel();
+            app_worker_runtime.Runtime(App).clearPacer(app, agent, "stop_subagents");
+            if (agent.worker.contextCompactionStatus() != .idle) {
+                _ = agent.worker.cancelContextCompaction(std.heap.c_allocator);
+            }
+        }
+
         /// The user stops a subagent's turn on its own screen (Esc, or
         /// cancelling its approval or question) while it works for its
         /// parent: the other agents' messages waiting in its queue are
@@ -4719,4 +4812,363 @@ test "only a subagent has a purpose to show, and the list's search reads it with
     try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "parser"));
     try std.testing.expect(!matchesSearchText("auditor", "Review the parser", text, "giraffe"));
     try std.testing.expect(!matchesSearchText("auditor", "", "", "zebra"));
+}
+
+fn deinitTestChild(alloc: Allocator, child: *ChildAgent) void {
+    child.agent.worker.deinit(alloc);
+    child.screen.deinit(alloc);
+    child.agent.approval_prompt.deinit(alloc);
+    child.agent.question_prompt.deinit(alloc);
+    alloc.free(child.id);
+}
+
+test "stopWorkingSubagents stops only working subagents in the active session tree without touching main or idle children" {
+    const alloc = std.testing.allocator;
+    const composer_input = @import("../input/runtime.zig");
+    const FakeStopTreeApp = struct {
+        alloc: Allocator,
+        main_agent: agents.Agent = .{},
+        main_screen: ScreenSlot = .{},
+        screen_owner: ?*agents.Agent = null,
+        agent_on_screen: ?*ChildAgent = null,
+        child_agents: std.ArrayList(*ChildAgent) = .empty,
+        approval_lender: ?*ChildAgent = null,
+        question_lender: ?*ChildAgent = null,
+        wait_card_lender: ?*ChildAgent = null,
+        pacer: AssistantPacer = .{},
+        fast_mode: bool = false,
+        approval_screen: @import("../../ui/footer/interaction_state.zig").ApprovalScreenState = .{},
+        permission_state: struct { authority_mutex: std.Io.Mutex = .init } = .{},
+        instances: struct {
+            first_open: bool = true,
+            agents_menu: struct { open: bool = false } = .{},
+        } = .{},
+        input_runtime: composer_input.Runtime = .{},
+        shell: transcript_runtime.TranscriptRuntime = .{},
+        metrics: types.Metrics = .{},
+        inject_transcript_failure: bool = false,
+
+        pub fn stopStream(_: *@This(), agent: *agents.Agent) void {
+            agent.stream = .{};
+        }
+
+        pub fn appendReplaceableTranscriptLine(self: *@This(), text: []const u8) !u32 {
+            if (self.inject_transcript_failure) return error.OutOfMemory;
+            return self.shell.appendReplaceableTranscriptLine(self.alloc, &self.metrics, text);
+        }
+
+        pub fn appendReplaceableTranscriptLineClassified(
+            self: *@This(),
+            text: []const u8,
+            class: transcript_runtime.RawEntryClass,
+        ) !u32 {
+            if (self.inject_transcript_failure) return error.OutOfMemory;
+            return self.shell.appendReplaceableTranscriptLineClassified(self.alloc, &self.metrics, text, class);
+        }
+    };
+
+    var app = FakeStopTreeApp{ .alloc = alloc };
+    defer {
+        app.main_agent.worker.deinit(alloc);
+        app.main_screen.deinit(alloc);
+        app.pacer.deinit(alloc);
+        app.input_runtime.deinit(alloc);
+        app.shell.deinit(alloc);
+    }
+    try app.input_runtime.edit_state.setText(alloc, "keep this draft");
+
+    // Only the hosts' addresses are compared by `rootInstance` when no `child_run` is attached.
+    var main_host: subagent_tool_host.Runtime = undefined;
+    var other_host: subagent_tool_host.Runtime = undefined;
+    app.main_agent.session_persistence.subagent_host = &main_host;
+
+    var other_instance: ChildAgent = .{
+        .id = try alloc.dupe(u8, "inst-2"),
+        .agent = .{ .role = .instance },
+    };
+    defer deinitTestChild(alloc, &other_instance);
+    other_instance.agent.session_persistence.subagent_host = &other_host;
+
+    var work_a: ChildAgent = .{
+        .id = try alloc.dupe(u8, "work-a"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &work_a);
+    var work_b: ChildAgent = .{
+        .id = try alloc.dupe(u8, "work-b"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &work_b);
+    var question_child: ChildAgent = .{
+        .id = try alloc.dupe(u8, "question-q"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &question_child);
+    var idle_child: ChildAgent = .{
+        .id = try alloc.dupe(u8, "idle-c"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &idle_child);
+    var other_child: ChildAgent = .{
+        .id = try alloc.dupe(u8, "other-d"),
+        .agent = .{ .role = .subagent, .root_instance = &other_instance.agent },
+        .parent_host = &other_host,
+    };
+    defer deinitTestChild(alloc, &other_child);
+
+    const q_opts = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const q_entries = [_]types.QuestionBatchEntry{.{ .question = "Proceed?", .options = &q_opts }};
+    try question_child.agent.question_prompt.syncFrom(alloc, &q_entries);
+
+    try app.child_agents.appendSlice(alloc, &.{ &other_instance, &work_a, &work_b, &question_child, &idle_child, &other_child });
+    defer app.child_agents.deinit(alloc);
+
+    try std.testing.expect(app.main_agent.worker.beginDirectProcessing(1));
+    defer app.main_agent.worker.finishProcessing();
+    try std.testing.expect(work_a.agent.worker.beginDirectProcessing(2));
+    defer work_a.agent.worker.finishProcessing();
+    try std.testing.expect(work_b.agent.worker.beginDirectProcessing(3));
+    defer work_b.agent.worker.finishProcessing();
+    try std.testing.expect(question_child.agent.worker.beginDirectProcessing(4));
+    defer question_child.agent.worker.finishProcessing();
+    try std.testing.expect(other_child.agent.worker.beginDirectProcessing(5));
+    defer other_child.agent.worker.finishProcessing();
+
+    const result = Runtime(FakeStopTreeApp).stopWorkingSubagents(&app);
+    try std.testing.expectEqual(@as(usize, 3), result.stopped);
+    try std.testing.expectEqual(@as(usize, 0), result.failed);
+    try std.testing.expect(result.first_error == null);
+    try std.testing.expect(work_a.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(work_b.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(question_child.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(!question_child.agent.question_prompt.isActive());
+    const rendered_q = try transcript_runtime.renderEntriesToBytes(
+        alloc,
+        question_child.screen.transcript.notebook.entries.items,
+        80,
+        .{},
+    );
+    defer alloc.free(rendered_q);
+    try std.testing.expect(std.mem.find(u8, rendered_q, "Cancelled") != null);
+    try std.testing.expect(!idle_child.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(!other_child.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(!app.main_agent.worker.isTurnCancelRequested());
+    try std.testing.expectEqualStrings("keep this draft", app.input_runtime.edit_state.input.items);
+    // Calling again when none remain uncancelled stops 0.
+    const repeat = Runtime(FakeStopTreeApp).stopWorkingSubagents(&app);
+    try std.testing.expectEqual(@as(usize, 0), repeat.stopped);
+    try std.testing.expectEqual(@as(usize, 0), repeat.failed);
+
+    // A child with only a queued prompt (no running turn yet) is treated the
+    // same by `workingNote` and `stopWorkingSubagents`.
+    var queued_child: ChildAgent = .{
+        .id = try alloc.dupe(u8, "queued-only"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &queued_child);
+    try queued_child.agent.worker.enqueuePrompt(alloc, .{
+        .prompt = try alloc.dupe(u8, "queued task"),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    });
+    var note_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("1 subagent working", Runtime(FakeStopTreeApp).workingNote(&app, &note_buf));
+    try app.child_agents.append(alloc, &queued_child);
+    try std.testing.expectEqualStrings("2 subagents working", Runtime(FakeStopTreeApp).workingNote(&app, &note_buf));
+    const queued_stop = Runtime(FakeStopTreeApp).stopWorkingSubagents(&app);
+    try std.testing.expectEqual(@as(usize, 1), queued_stop.stopped);
+    try std.testing.expect(queued_child.agent.worker.isTurnCancelRequested());
+    try std.testing.expectEqualStrings("1 subagent working", Runtime(FakeStopTreeApp).workingNote(&app, &note_buf));
+
+    // A subagent paused on an approval prompt is stopped via
+    // `cancelApprovalOperation` (clears prompt + cancels turn + requests frame).
+    var approval_child: ChildAgent = .{
+        .id = try alloc.dupe(u8, "approval-a"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &approval_child);
+    _ = try approval_child.agent.approval_prompt.syncRequest(alloc, .{
+        .id = 42,
+        .label = "run_shell",
+        .command = "echo hi",
+    });
+    try std.testing.expect(approval_child.agent.worker.beginDirectProcessing(6));
+    defer approval_child.agent.worker.finishProcessing();
+    try app.child_agents.append(alloc, &approval_child);
+    const approval_stop = Runtime(FakeStopTreeApp).stopWorkingSubagents(&app);
+    try std.testing.expectEqual(@as(usize, 1), approval_stop.stopped);
+    try std.testing.expect(!approval_child.agent.approval_prompt.isActive());
+    try std.testing.expect(approval_child.agent.worker.isTurnCancelRequested());
+
+    // A failure stopping one child still stops the remaining working children
+    // and reports both counts.
+    var failing_q: ChildAgent = .{
+        .id = try alloc.dupe(u8, "fail-q"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &failing_q);
+    try failing_q.agent.question_prompt.syncFrom(alloc, &q_entries);
+    var after_fail: ChildAgent = .{
+        .id = try alloc.dupe(u8, "after-fail"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &after_fail);
+    try std.testing.expect(failing_q.agent.worker.beginDirectProcessing(7));
+    defer failing_q.agent.worker.finishProcessing();
+    try std.testing.expect(after_fail.agent.worker.beginDirectProcessing(8));
+    defer after_fail.agent.worker.finishProcessing();
+    try app.child_agents.appendSlice(alloc, &.{ &failing_q, &after_fail });
+
+    app.inject_transcript_failure = true;
+    const partial = Runtime(FakeStopTreeApp).stopWorkingSubagents(&app);
+    try std.testing.expectEqual(@as(usize, 1), partial.stopped);
+    try std.testing.expectEqual(@as(usize, 1), partial.failed);
+    try std.testing.expectEqual(error.OutOfMemory, partial.first_error.?);
+    try std.testing.expect(after_fail.agent.worker.isTurnCancelRequested());
+}
+
+test "stopWorkingSubagents stops two question subagents when the second one's question is lent to main" {
+    const alloc = std.testing.allocator;
+    const app_commands = @import("app_commands.zig");
+    const composer_input = @import("../input/runtime.zig");
+    const FakeLentQuestionStopApp = struct {
+        alloc: Allocator,
+        main_agent: agents.Agent = .{},
+        main_screen: ScreenSlot = .{},
+        screen_owner: ?*agents.Agent = null,
+        agent_on_screen: ?*ChildAgent = null,
+        child_agents: std.ArrayList(*ChildAgent) = .empty,
+        approval_lender: ?*ChildAgent = null,
+        question_lender: ?*ChildAgent = null,
+        wait_card_lender: ?*ChildAgent = null,
+        pacer: AssistantPacer = .{},
+        fast_mode: bool = false,
+        approval_screen: @import("../../ui/footer/interaction_state.zig").ApprovalScreenState = .{},
+        permission_state: struct { authority_mutex: std.Io.Mutex = .init } = .{},
+        instances: struct {
+            first_open: bool = true,
+            agents_menu: struct { open: bool = false } = .{},
+        } = .{},
+        input_runtime: composer_input.Runtime = .{},
+        shell: transcript_runtime.TranscriptRuntime = .{},
+        metrics: types.Metrics = .{},
+        notices: std.ArrayList(u8) = .empty,
+
+        pub fn stopStream(_: *@This(), agent: *agents.Agent) void {
+            agent.stream = .{};
+        }
+
+        pub fn appendReplaceableTranscriptLine(self: *@This(), text: []const u8) !u32 {
+            return self.shell.appendReplaceableTranscriptLine(self.alloc, &self.metrics, text);
+        }
+
+        pub fn appendReplaceableTranscriptLineClassified(
+            self: *@This(),
+            text: []const u8,
+            class: transcript_runtime.RawEntryClass,
+        ) !u32 {
+            return self.shell.appendReplaceableTranscriptLineClassified(self.alloc, &self.metrics, text, class);
+        }
+
+        pub fn answerLentQuestion(
+            self: *@This(),
+            agent: *agents.Agent,
+            comptime body: fn (*@This(), *agents.Agent) anyerror!void,
+        ) !bool {
+            return Runtime(@This()).answerLentQuestion(self, agent, body);
+        }
+
+        pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            if (self.notices.items.len > 0) try self.notices.append(self.alloc, '\n');
+            try self.notices.appendSlice(self.alloc, notice.body);
+        }
+    };
+
+    var app = FakeLentQuestionStopApp{ .alloc = alloc };
+    defer {
+        app.notices.deinit(alloc);
+        app.main_agent.worker.deinit(alloc);
+        app.main_screen.deinit(alloc);
+        app.main_agent.question_prompt.deinit(alloc);
+        app.pacer.deinit(alloc);
+        app.input_runtime.deinit(alloc);
+        app.shell.deinit(alloc);
+    }
+
+    var main_host: subagent_tool_host.Runtime = undefined;
+    app.main_agent.session_persistence.subagent_host = &main_host;
+
+    var child_x: ChildAgent = .{
+        .id = try alloc.dupe(u8, "child-x"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &child_x);
+    var child_y: ChildAgent = .{
+        .id = try alloc.dupe(u8, "child-y"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &child_y);
+
+    const opts = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Proceed?", .options = &opts }};
+    try child_x.agent.question_prompt.syncFrom(alloc, &entries);
+    try child_y.agent.question_prompt.syncFrom(alloc, &entries);
+
+    // X appears before Y in the stop loop; Y's question is lent to main's screen.
+    try app.child_agents.appendSlice(alloc, &.{ &child_x, &child_y });
+    defer app.child_agents.deinit(alloc);
+
+    try std.testing.expect(child_x.agent.worker.beginDirectProcessing(1));
+    defer child_x.agent.worker.finishProcessing();
+    try std.testing.expect(child_y.agent.worker.beginDirectProcessing(2));
+    defer child_y.agent.worker.finishProcessing();
+
+    Runtime(FakeLentQuestionStopApp).lendQuestion(&app, &app.main_agent, &child_y);
+    try std.testing.expectEqual(&child_y, app.question_lender.?);
+    try std.testing.expect(app.main_agent.question_prompt.isActive());
+
+    const result = Runtime(FakeLentQuestionStopApp).stopWorkingSubagents(&app);
+    try app_commands.writeStopSubagentsNotice(&app, result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.stopped);
+    try std.testing.expectEqual(@as(usize, 0), result.failed);
+    try std.testing.expectEqualStrings("Stopped 2 subagents.", app.notices.items);
+    try std.testing.expect(child_x.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(child_y.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(!child_x.agent.question_prompt.isActive());
+    try std.testing.expect(!child_y.agent.question_prompt.isActive());
+    try std.testing.expect(!app.main_agent.question_prompt.isActive());
+    try std.testing.expect(app.question_lender == null);
+
+    const rendered_x = try transcript_runtime.renderEntriesToBytes(
+        alloc,
+        child_x.screen.transcript.notebook.entries.items,
+        80,
+        .{},
+    );
+    defer alloc.free(rendered_x);
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, rendered_x, "\n"), "Cancelled"));
+
+    const rendered_y = try transcript_runtime.renderEntriesToBytes(
+        alloc,
+        child_y.screen.transcript.notebook.entries.items,
+        80,
+        .{},
+    );
+    defer alloc.free(rendered_y);
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, rendered_y, "\n"), "Cancelled"));
 }

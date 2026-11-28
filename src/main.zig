@@ -3752,8 +3752,8 @@ const App = struct {
 
     /// Runs an answer or cancel of the question on main's screen in the
     /// context of the subagent that asked it. False for main's own question.
-    pub fn answerLentQuestion(self: *App, comptime body: fn (*App, *agents.Agent) anyerror!void) !bool {
-        return AgentsAppRuntime.answerLentQuestion(self, body);
+    pub fn answerLentQuestion(self: *App, agent: *agents.Agent, comptime body: fn (*App, *agents.Agent) anyerror!void) !bool {
+        return AgentsAppRuntime.answerLentQuestion(self, agent, body);
     }
 
     /// Readies the subagent on screen, if any, for a turn the user starts
@@ -3788,6 +3788,11 @@ const App = struct {
     pub fn openAgentsMenu(self: *App) !void {
         app_commands.Handlers(App).closeFooterMenus(self);
         try AgentsAppRuntime.openMenu(self);
+    }
+
+    /// `/stop`: stops every working subagent in the current session's tree.
+    pub fn stopWorkingSubagents(self: *App) AgentsAppRuntime.StopSubagentsResult {
+        return AgentsAppRuntime.stopWorkingSubagents(self);
     }
 
     pub fn closeAgentsMenu(self: *App) void {

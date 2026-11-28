@@ -63,7 +63,7 @@ pub fn QuestionRuntime(comptime App: type) type {
 
         pub fn cancelQuestionPrompt(app: *App, agent: *AppAgent) !void {
             if (comptime @hasDecl(App, "answerLentQuestion")) {
-                if (try app.answerLentQuestion(cancelQuestionPrompt)) return;
+                if (try app.answerLentQuestion(agent, cancelQuestionPrompt)) return;
             }
             const route_recovery = isRouteRecoveryPrompt(agent);
             const mcp_elicitation = isMcpElicitationPrompt(agent);
@@ -91,7 +91,7 @@ pub fn QuestionRuntime(comptime App: type) type {
 
         pub fn submitQuestionBatch(app: *App, agent: *AppAgent) !void {
             if (comptime @hasDecl(App, "answerLentQuestion")) {
-                if (try app.answerLentQuestion(submitQuestionBatch)) return;
+                if (try app.answerLentQuestion(agent, submitQuestionBatch)) return;
             }
             if (comptime @hasDecl(App, "screenAgentId")) {
                 debug_trace.eventf("host", "question_answered", .{}, "agent={s} screen={s}", .{

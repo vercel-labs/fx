@@ -91,6 +91,13 @@ pub fn InterruptRuntime(comptime App: type) type {
                 return;
             }
             if (!agent.stream.active) return;
+            try cancelActiveStream(app, agent);
+        }
+
+        /// Cancels `agent`'s active stream using the per-agent interrupt path,
+        /// leaving app-wide provider preparation alone and playing no sound.
+        pub fn cancelActiveStreamSilent(app: *App, agent: *AppAgent) !void {
+            if (!agent.stream.active) return;
             // Pending approval keeps the stream active until resolution.
             // Avoid duplicate cancellation notices once the worker is cancelled.
             if (turnCancelled(agent)) return;
@@ -109,7 +116,6 @@ pub fn InterruptRuntime(comptime App: type) type {
             }
             try app.shell.freezeAssistantTail(app.alloc, "cancel");
             app_worker_runtime.Runtime(App).clearPacer(app, agent, "cancel");
-            if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
             if (compacting) {
                 app.shell.render_requests.request(.footer);
                 return;
@@ -135,6 +141,12 @@ pub fn InterruptRuntime(comptime App: type) type {
             }
             agent.stream = .{};
             app.shell.render_requests.request(.footer);
+        }
+
+        fn cancelActiveStream(app: *App, agent: *AppAgent) !void {
+            if (!agent.stream.active or turnCancelled(agent)) return;
+            if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
+            try cancelActiveStreamSilent(app, agent);
         }
 
         pub fn traceInterruptRequested(app: *App, agent: *AppAgent, source: []const u8) void {

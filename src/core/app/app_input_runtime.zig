@@ -657,6 +657,15 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        fn boundChordAllowsCancelPending(app: *App, chord: shortcut_rules.Chord) bool {
+            if (comptime !@hasField(App, "personal_shortcuts")) return false;
+            const entry = app.personal_shortcuts.map.find(chord) orelse return false;
+            return switch (entry.action) {
+                .command => |*command| command_router.parse(app.slashRegistry(), command.text()) == .stop_subagents,
+                .select_model => false,
+            };
+        }
+
         pub fn handleTerminalInputIngressWithLimits(
             app: *App,
             ingress: input_action.TerminalInputIngress,
@@ -706,8 +715,14 @@ pub fn Runtime(comptime App: type) type {
             // A chord the profile binds claims its key before the original
             // event routes. A replayed byte arrives as its own ingress without
             // a chord, so a byte such as 6 never reads as Ctrl+F here.
+            // While an active turn sets `cancel_pending`, only `/stop` bypasses
+            // the gate so other bound chords stay blocked as on main.
             if (ingress.chord) |chord| {
-                if (!ingressCancelPending(ingress) and try routeBoundChord(app, agents.screenAgentOf(app), chord)) return null;
+                if ((!ingressCancelPending(ingress) or boundChordAllowsCancelPending(app, chord)) and
+                    try routeBoundChord(app, agents.screenAgentOf(app), chord))
+                {
+                    return null;
+                }
             }
 
             var replay_byte = ingress.replay_byte_after_routing;
@@ -3619,6 +3634,7 @@ const FakeApprovalShell = struct {
 const routing_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general },
     .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "clear the terminal transcript", .presentation_category = .general },
+    .{ .kind = .stop_subagents, .command = "/stop", .help_entry = "/stop", .completion_description = "stop every working subagent", .presentation_category = .agents },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose a model", .presentation_category = .model, .has_args = true, .accepts_payload = true, .requires_prompt_credential = true },
@@ -4021,6 +4037,7 @@ const RoutingFakeApp = struct {
     terminal: shell_runtime.TerminalState = .{},
     subagents: RoutingSubagents = .{},
     permission_engine: permissions.PermissionEngine = .{},
+    personal_shortcuts: personal_shortcut_runtime.State = .{},
     upgrader: RoutingUpgradeStatus = .{},
     main_agent: struct {
         pending_images: std.ArrayList(types.ImageAttachment) = .empty,
@@ -16527,4 +16544,43 @@ test "app input bridge loads the most recent durable history in chronological or
     try std.testing.expectEqual(@as(usize, 100), app.input_runtime.composer_history.count());
     try std.testing.expectEqualStrings("prompt-1", app.input_runtime.composer_history.entryText(0).?);
     try std.testing.expectEqualStrings("prompt-100", app.input_runtime.composer_history.entryText(99).?);
+}
+
+test "bound /stop shortcut runs while streaming with cancel_pending and keeps composer draft" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"alt+h\":\"/help\",\"alt+k\":\"/stop\"}", .{});
+    defer parsed.deinit();
+    app.personal_shortcuts.map = try shortcut_rules.parseJsonObject(parsed.value);
+
+    app.agent().stream.active = true;
+    try app.input_runtime.edit_state.setText(alloc, "draft in composer");
+
+    const help_chord = shortcut_rules.fromLegacyAlt('h').?;
+    _ = try Runtime(RoutingFakeApp).handleTerminalInputIngressWithLimits(
+        &app,
+        .{
+            .event = .{ .action = .{ .action = .ignore, .cancel_pending = true } },
+            .chord = help_chord,
+        },
+        .{ .composer_bytes = RoutingFakeApp.input_byte_limit },
+        100,
+    );
+    try std.testing.expect(app.last_command == null);
+
+    const chord = shortcut_rules.fromLegacyAlt('k').?;
+    const replay = try Runtime(RoutingFakeApp).handleTerminalInputIngressWithLimits(
+        &app,
+        .{
+            .event = .{ .action = .{ .action = .ignore, .cancel_pending = true } },
+            .chord = chord,
+        },
+        .{ .composer_bytes = RoutingFakeApp.input_byte_limit },
+        100,
+    );
+    try std.testing.expect(replay == null);
+    try std.testing.expectEqualStrings("/stop", app.last_command.?);
+    try std.testing.expectEqualStrings("draft in composer", app.input_runtime.edit_state.input.items);
 }
