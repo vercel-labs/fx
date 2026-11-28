@@ -125,6 +125,7 @@
     {"name": "hook_trust_load", "module": "fx", "test": "a trust file loads into digests and disabled hooks, or is refused, for fuzzed bytes", "iterations": 60000},
     {"name": "hook_log_line", "module": "fx", "test": "a run-log line is read as one run, or skipped, for fuzzed bytes", "iterations": 900000},
     {"name": "file_index_snapshot", "module": "fx", "test": "a saved file-index snapshot loads or is refused on fuzzed bytes", "iterations": 3000},
-    {"name": "shortcut_map", "module": "fx", "test": "shortcut map parses or is refused on fuzzed bytes", "iterations": 400000}
+    {"name": "shortcut_map", "module": "fx", "test": "shortcut map parses or is refused on fuzzed bytes", "iterations": 400000},
+    {"name": "command_environment_evidence", "module": "fx", "test": "command environment evidence keeps its lines on fuzzed shells", "iterations": 30000}
   ]
 }

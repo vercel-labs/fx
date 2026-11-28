@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
+import { startFakeIssuer, writeFxLogin } from "./fx-login-fakes";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -566,6 +567,14 @@ function sameTurn(base: (body: string) => Response, gates: { later?: Gate; child
 }
 
 // Whether the trace log at `path` holds `text` yet.
+async function until(what: string, done: () => boolean, ms = 30_000) {
+  const deadline = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await Bun.sleep(50);
+  }
+}
+
 function traceHas(path: string, text: string): boolean {
   return existsSync(path) && readFileSync(path, "utf8").includes(text);
 }
@@ -3268,6 +3277,90 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
         const typed = await session.waitForPane((pane) => composerContains(pane, "fxZ 3") || composerContains(pane, "fx 3Z"), 10_000);
         expect(composerContains(typed, "fxZ 3")).toBe(true);
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an instance launched after another closed still says its sign-in refresh failed",
+    async () => {
+      // A failure's notice shows once on each screen. An instance launched in
+      // place of a closed one is a new screen, even when it takes the same
+      // memory, so its prompt says why it waits instead of only "Thinking".
+      const issuer = startFakeIssuer({ refresh: () => new Response("unavailable", { status: 500 }) });
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-instances-")));
+      const trace = join(home, "fx-trace.log");
+      const awaiting = () => (existsSync(trace) ? readFileSync(trace, "utf8") : "").split("pending_prompt_awaiting_auth").length - 1;
+      const notices = (pane: string) => pane.split("credential refresh failed").length - 1;
+      writeFxLogin(home, issuer.issuerUrl, "seeded-token");
+      try {
+        await withHost(answerByLetter, {
+          reuse: { home, workspace },
+          settings: { credential_source: "fx_login" },
+          env: {
+            // Empty counts as unset, so the saved fx login is the credential.
+            AI_GATEWAY_API_KEY: "",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+            FX_TRACE_LOG: trace,
+            FX_TRACE_SCOPES: "input",
+          },
+        }, async ({ session }) => {
+          // One answered prompt first takes the credential fx refreshed at
+          // startup, so the prompts below refresh the saved login again.
+          await session.sendText("HOST_A warm up");
+          await session.waitForReplyAndTurnEnd("HOST_ANSWER_A", 30_000);
+          await session.sendText("/launch");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await switchAgent(session, 1);
+          await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+
+          // The saved login is past its refresh deadline, and the issuer
+          // cannot refresh it: fx 1 and then fx 2 each show the failure.
+          writeFxLogin(home, issuer.issuerUrl, "seeded-token", { expiresAtMs: Date.now() - 120_000 });
+          let before = awaiting();
+          await session.sendText("NOTICE_ON_FX1");
+          await until("fx 1's prompt waits", () => awaiting() > before);
+          expect(notices(await session.waitForPane((pane) => notices(pane) > 0, 15_000))).toBe(1);
+          await session.sendKeys("C-c");
+
+          await switchAgent(session, 2);
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          before = awaiting();
+          await session.sendText("NOTICE_ON_FX2");
+          await until("fx 2's prompt waits", () => awaiting() > before);
+          expect(notices(await session.waitForPane((pane) => notices(pane) > 0, 15_000))).toBe(1);
+          await session.sendKeys("C-c");
+          await session.waitForComposer(15_000);
+
+          // Close fx 2 from the agent list, then launch a new one while the
+          // same failure is still recorded.
+          await session.sendKeys("Down");
+          await waitForSelected(session, "fx 2");
+          await session.sendKeys("BSpace");
+          await session.waitForText("press delete again to close this instance", 10_000);
+          await session.sendKeys("BSpace");
+          await session.waitForPane((pane) => !instanceRow(2).test(pane) && pane.includes(LIST_HINT), 15_000);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+          await session.sendText("/launch");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+
+          before = awaiting();
+          await session.sendText("NOTICE_ON_NEW_FX2");
+          await until("the new fx 2's prompt waits", () => awaiting() > before);
+          const shown = await session.waitForPane((pane) => pane.includes("NOTICE_ON_NEW_FX2") && notices(pane) > 0, 15_000);
+          expect(notices(shown)).toBe(1);
+          expect(shown).toContain("press enter to retry. Your prompt is saved.");
+        });
+      } finally {
+        issuer.stop();
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
     },
     TIMEOUT,
   );

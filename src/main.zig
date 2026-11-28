@@ -643,6 +643,10 @@ const App = struct {
     /// started, each marked by its role. Owned by
     /// `app_agents_runtime`.
     child_agents: std.ArrayList(*app_agents_runtime.ChildAgent) = .empty,
+    /// The `screen_id` the next agent in `child_agents` gets; 0 is the
+    /// first instance's. Owned by `app_agents_runtime`; main loop only, like
+    /// the writes to `child_agents`.
+    next_screen_id: u64 = 1,
     /// What every instance starts from, and how many startup opens. Owned
     /// by `app_instances_runtime`.
     instances: app_instances_runtime.State = .{},
