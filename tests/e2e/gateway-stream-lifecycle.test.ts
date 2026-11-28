@@ -14473,6 +14473,141 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     }
   });
 
+  test("fx ask --json with context false and stdio MCP hints the shell tool when a model calls bash", async () => {
+    const root = createFixtureRoot("bash-tool-hint-context-off-mcp");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, ".fx.json"), JSON.stringify({ context: false }));
+    writeFileSync(
+      join(root.home, ".fx", "mcp.json"),
+      JSON.stringify({
+        mcp: {
+          fixture: {
+            type: "local",
+            command: [process.execPath, join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs")],
+            enabled: true,
+          },
+        },
+      }),
+    );
+    const responses = [
+      fakeGatewayToolCall("bash_ctx_off_1", "bash", { command: "printf ok" }),
+      fakeGatewayFinalText("Recovered after bash hint with context off."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Run a command."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.final_output).toBe("Recovered after bash hint with context off.");
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("Unsupported tool: bash. Use shell instead.");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test.skipIf(!tmuxAvailable())("TUI with context false and no MCP hints the shell tool when a model calls bash", async () => {
+    const root = createFixtureRoot("tui-bash-tool-hint-context-off");
+    const stderrPath = join(root.root, "stderr.log");
+    writeFileSync(join(root.workspace, ".fx.json"), JSON.stringify({ context: false }));
+    const responses = [
+      fakeGatewayToolCall("bash_tui_ctx_off_1", "bash", { command: "printf ok" }),
+      fakeGatewayFinalText("TUI_BASH_HINT_CONTEXT_OFF_DONE"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    let tui: TmuxSession | null = null;
+    try {
+      tui = await TmuxSession.create({
+        cwd: root.workspace,
+        env: {
+          ...fixtureEnv(root, gateway, join(root.root, "trace.log")),
+          FX_PERMISSION_MODE: "auto",
+        },
+        stderrPath,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Run a command.");
+      await tui.waitForPane(
+        (pane) => pane.includes("TUI_BASH_HINT_CONTEXT_OFF_DONE") && hasEmptyComposer(pane) && turnSettled(pane),
+        15_000,
+      );
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("Unsupported tool: bash. Use shell instead.");
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+    } finally {
+      if (tui) await tui.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test.skipIf(!tmuxAvailable())("TUI with context false and stdio MCP hints the shell tool when a model calls bash", async () => {
+    const root = createFixtureRoot("tui-bash-tool-hint-context-off-mcp");
+    const stderrPath = join(root.root, "stderr.log");
+    writeFileSync(join(root.workspace, ".fx.json"), JSON.stringify({ context: false }));
+    writeFileSync(
+      join(root.home, ".fx", "mcp.json"),
+      JSON.stringify({
+        mcp: {
+          fixture: {
+            type: "local",
+            command: [process.execPath, join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs")],
+            enabled: true,
+          },
+        },
+      }),
+    );
+    const responses = [
+      fakeGatewayToolCall("bash_tui_ctx_off_mcp_1", "bash", { command: "printf ok" }),
+      fakeGatewayFinalText("TUI_BASH_HINT_CONTEXT_OFF_MCP_DONE"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    let tui: TmuxSession | null = null;
+    try {
+      tui = await TmuxSession.create({
+        cwd: root.workspace,
+        env: {
+          ...fixtureEnv(root, gateway, join(root.root, "trace.log")),
+          FX_PERMISSION_MODE: "auto",
+        },
+        stderrPath,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Run a command.");
+      await tui.waitForPane(
+        (pane) => pane.includes("TUI_BASH_HINT_CONTEXT_OFF_MCP_DONE") && hasEmptyComposer(pane) && turnSettled(pane),
+        15_000,
+      );
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("Unsupported tool: bash. Use shell instead.");
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+    } finally {
+      if (tui) await tui.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("model response recovery keeps retrying status failures past ten real requests", async () => {
     const root = createFixtureRoot("provider-attempt-budget");
     const tracePath = join(root.root, "trace.log");
