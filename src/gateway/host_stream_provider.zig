@@ -3,6 +3,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_client = @import("client.zig");
 const vercel_protocol = @import("vercel_protocol.zig");
+const vercel_model_policy = @import("vercel_model_policy.zig");
 const vercel_failure_diagnostics = @import("vercel_failure_diagnostics.zig");
 const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const credential_authority = @import("../core/auth/credential_authority.zig");
@@ -76,6 +77,9 @@ pub fn provider(context: *ProviderContext) stream_provider.Provider {
         .stream_fn = stream,
         .build_request_fn = buildRequest,
         .project_replay_fn = vercel_protocol.selectReplayParts,
+        // The host writes no compaction block, but its replies bind their
+        // reasoning as the native Gateway's do.
+        .binds_reasoning_fn = vercel_model_policy.bindsReasoning,
     };
 }
 
@@ -85,6 +89,18 @@ pub fn initContext(
     transport: Transport,
 ) ProviderContext {
     return .{ .build_fn = build_fn, .endpoint = endpoint, .transport = transport };
+}
+
+test "host provider says which replies bind their reasoning and writes no compaction block" {
+    var context: ProviderContext = undefined;
+    const adapter = provider(&context);
+    const binds = adapter.binds_reasoning_fn.?;
+    try std.testing.expect(binds("anthropic/claude-opus-5.1"));
+    try std.testing.expect(binds("openai/gpt-6.1-sol"));
+    try std.testing.expect(!binds("google/gemini-3-pro"));
+    try std.testing.expect(!binds("anthropic/claude-sonnet-4.5"));
+    try std.testing.expect(adapter.provider_compaction_fn == null);
+    try std.testing.expect(adapter.providerCompaction("anthropic/claude-opus-5.1") == null);
 }
 
 test "host provider selects replay without changing canonical input" {

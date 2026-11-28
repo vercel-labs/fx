@@ -33,6 +33,7 @@ const records = @import("records.zig");
 const settings = @import("settings.zig");
 const trace = @import("trace.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 
@@ -239,9 +240,15 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
             // Overflow recovery has no request the provider could compact.
             trace.failure(trace_ctx, .provider_block_failed, "model={s} reason=no_request; fx writes its own summary and keeps no turns", .{caller.model});
         }
-        // fx's own summary keeps no turn after it: the newest turns' reasoning
+    }
+    const bound_kept = if (caller.bindsReasoning()) null else boundReasoningModel(caller, chosen.kept);
+    if (bound_kept) |bound_model| trace.log(false, "kept turns hold reasoning that model={s} binds; fx's summary keeps no turns", .{bound_model});
+    if (caller.bindsReasoning() or bound_kept != null) {
+        // fx's own summary keeps no turn whose reasoning a provider binds: it
         // would follow a summary the provider never read before it
-        // (`tests/tla/compaction/ProviderCompaction.tla` Commit).
+        // (`tests/tla/compaction/ProviderCompaction.tla` Commit). The
+        // conversation's own model may bind, or a kept turn may hold another
+        // model's reasoning, which that model reads again after a switch back.
         chosen_window = try window.chooseEverything(out, request.history, request.active, request.size, .{ .provider = caller.provider, .model = caller.model }) orelse return error.NothingToCompact;
         earlier = try earlierFrom(out, request.records, chosen_window.earlier);
         turns = try turnsFrom(out, chosen_window.older, request.append_messages);
@@ -291,6 +298,28 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .cut = chosen_fx.cut,
         .tool_count = summary.compacted.tool_count,
     };
+}
+
+/// The first model among `turns`' replies whose provider binds their
+/// reasoning, or null when no reply's reasoning is bound.
+fn boundReasoningModel(caller: ModelCaller, turns: []const types.HistoryTurn) ?[]const u8 {
+    for (turns) |turn| {
+        const execution = switch (turn) {
+            .assistant => |entry| blk: {
+                if (entry.provider_replay) |replay| {
+                    if (caller.modelBindsReasoning(replay.source.model)) return replay.source.model;
+                }
+                break :blk entry.execution;
+            },
+            .interrupted => |entry| entry.execution,
+            .compacted_summary => continue,
+        };
+        for (execution.tool_steps) |step| {
+            const replay = step.provider_replay orelse continue;
+            if (caller.modelBindsReasoning(replay.source.model)) return replay.source.model;
+        }
+    }
+    return null;
 }
 
 /// Asks the conversation's own model for its compaction block over the older
@@ -470,6 +499,39 @@ fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message:
 /// not list answers, as when the question was not answered.
 fn questionAnswers(arena: Allocator, output: []const u8) Allocator.Error![]const []const u8 {
     return try types.questionAnswers(arena, output) orelse &.{};
+}
+
+test "a kept turn's reasoning counts as bound only when its model's provider binds it" {
+    const Policy = struct {
+        fn bindsReasoning(reply_model: []const u8) bool {
+            return std.mem.startsWith(u8, reply_model, "anthropic/");
+        }
+    };
+    const caller: ModelCaller = .{
+        .context = undefined,
+        .vtable = undefined,
+        .model = "google/gemini-3-pro",
+        .provider = .gateway,
+        .credential_source = null,
+        .binds_reasoning_of = Policy.bindsReasoning,
+    };
+    const claude: types.ProviderReplay = .{ .source = .{ .provider = .gateway, .model = "anthropic/claude-fable-5.2" }, .parts_json = "[]" };
+    const gemini: types.ProviderReplay = .{ .source = .{ .provider = .gateway, .model = "google/gemini-3-pro" }, .parts_json = "[]" };
+    var claude_steps = [_]types.ToolExecutionStep{.{ .provider_replay = claude }};
+    var gemini_steps = [_]types.ToolExecutionStep{.{ .provider_replay = gemini }};
+    const plain: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("q") }, .assistant = @constCast("a") } };
+    const unbound: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("q") }, .assistant = @constCast("a"), .provider_replay = gemini, .execution = .{ .tool_steps = &gemini_steps } } };
+    const bound_answer: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("q") }, .assistant = @constCast("a"), .provider_replay = claude } };
+    const bound_step: types.HistoryTurn = .{ .interrupted = .{ .user = .{ .text = @constCast("q") }, .execution = .{ .tool_steps = &claude_steps } } };
+
+    // A turn with no replay, or one whose model does not bind, stays kept.
+    try std.testing.expect(boundReasoningModel(caller, &.{ plain, unbound }) == null);
+    try std.testing.expectEqualStrings("anthropic/claude-fable-5.2", boundReasoningModel(caller, &.{ plain, bound_answer }).?);
+    try std.testing.expectEqualStrings("anthropic/claude-fable-5.2", boundReasoningModel(caller, &.{ unbound, bound_step }).?);
+    // A caller with no policy counts no other model's reasoning as bound.
+    var no_policy = caller;
+    no_policy.binds_reasoning_of = null;
+    try std.testing.expect(boundReasoningModel(no_policy, &.{bound_answer}) == null);
 }
 
 test "a question's result gives the user's answers, not the questions" {

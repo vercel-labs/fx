@@ -458,6 +458,45 @@ describe("provider compaction", () => {
     }
   }, 240_000);
 
+  test("a Claude turn after fx's summary on a model without provider compaction sends the kept Claude turns as Claude accepts them", async () => {
+    // Claude turns 1 to 6, then Gemini, which has no provider compaction,
+    // writes fx's own summary. Back on Claude, no reasoning Claude signed
+    // before the summary may follow it: the summary replaced what that
+    // reasoning was written after.
+    const claude = FAMILIES.anthropic.model, gemini = "google/gemini-3-pro";
+    const models = [claude, gemini].map((id) => ({ id, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }));
+    await withSession(claude, { models }, async (session, { observed, counts, edits }) => {
+      const { root, cwd, env, sessionId, before } = session;
+      const seventh = await ask({ ...env, FX_MODEL: gemini, FX_AUTO_COMPACT_PERCENT: "10" }, cwd, root, "t7", ["--resume", sessionId, "--model", gemini], "TURN 7 Continue.");
+      expect(seventh.code).toBe(0);
+      expect(counts.provider).toBe(0);
+      expect(isFxSummary(conversationOf(agentRequestFor(observed, before, 7)!)[0]!)).toBe(true);
+      const eighth = await ask({ ...env, FX_MODEL: claude }, cwd, root, "t8", ["--resume", sessionId, "--model", claude], "TURN 8 Continue.");
+      expect(edits).toEqual([]);
+      expect(eighth.code).toBe(0);
+    });
+  }, 240_000);
+
+  test.skipIf(!tmuxAvailable())("a manual /compact on a model without provider compaction, then Claude, sends the kept Claude turns as Claude accepts them", async () => {
+    const claude = FAMILIES.anthropic.model, gemini = "google/gemini-3-pro";
+    const models = [claude, gemini].map((id) => ({ id, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }));
+    await withTerminal(claude, { models }, async (terminal, { observed, counts, edits }) => {
+      await runTurns(terminal, 1, 6);
+      await switchModel(terminal, gemini);
+      const before = observed.length;
+      await terminal.sendText("/compact");
+      await terminal.waitForText("Context compacted", 30_000);
+      await terminal.waitForStableComposer(15_000);
+      await switchModel(terminal, claude);
+      await terminal.sendText("TURN 7 Continue.");
+      const pane = await terminal.waitForPane((text) => text.includes("Turn 7 done.") || /HTTP 400|invalid_request_error|Request failed|Invalid `signature`|rejected this request/.test(text), 30_000);
+      expect(counts.provider).toBe(0);
+      expect(isFxSummary(conversationOf(agentRequestFor(observed, before, 7)!)[0]!)).toBe(true);
+      expect(edits).toEqual([]);
+      expect(pane).toContain("Turn 7 done.");
+    });
+  }, 240_000);
+
   test.skipIf(!tmuxAvailable())("a manual /compact between turns with fx's summary lets the next turn capture the current turn context, and the turn after sends it unchanged", async () => {
     // Neither model has provider compaction, so /compact writes fx's summary
     // at once and saves no copy with it. Nothing is sent between the summary

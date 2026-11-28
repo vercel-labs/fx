@@ -317,6 +317,7 @@ pub const CompactorCaller = struct {
             // summary on Token Pass.
             .fallback_model = if (self.provider == .gateway) token_pass_team.compactionFallback(self.model) else null,
             .provider_compaction = if (self.provider == .gateway) self.stream_provider.providerCompaction(self.model) else null,
+            .binds_reasoning_of = if (self.provider == .gateway) self.stream_provider.binds_reasoning_fn else null,
         };
     }
 
@@ -924,4 +925,39 @@ test "a provider compaction request rejected with 401 is sent once more with the
             },
         }
     }
+}
+
+test "the summary caller asks its Gateway stream which replies bind their reasoning, even one that writes no compaction block" {
+    const testing = std.testing;
+    const Host = struct {
+        fn stream(_: ?*anyopaque, _: Allocator, _: agent_stream_provider.ModelRequest) anyerror!agent_stream_provider.Result {
+            return error.UnexpectedRequest;
+        }
+        fn binds(model: []const u8) bool {
+            return std.mem.eql(u8, model, "anthropic/claude-opus-5.1");
+        }
+        fn capabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
+            return .{};
+        }
+    };
+    var unused: u8 = 0;
+    var summary_model: CompactorCaller = .{
+        .stream_provider = .{ .stream_fn = Host.stream, .binds_reasoning_fn = Host.binds },
+        .provider = .gateway,
+        .model = "anthropic/claude-opus-5.1",
+        .api_key = "key",
+        .retry_count = 0,
+        .capabilities_context = &unused,
+        .capabilities_fn = Host.capabilities,
+    };
+    defer summary_model.deinit();
+    const caller = summary_model.caller();
+    // The libfx host writes no compaction block, so the conversation's own
+    // model does not bind as a caller, but its replies still bind.
+    try testing.expect(!caller.bindsReasoning());
+    try testing.expect(caller.modelBindsReasoning("anthropic/claude-opus-5.1"));
+    try testing.expect(!caller.modelBindsReasoning("google/gemini-3-pro"));
+    // Another provider's route does not take the Gateway's policy.
+    summary_model.provider = .codex;
+    try testing.expect(!summary_model.caller().modelBindsReasoning("anthropic/claude-opus-5.1"));
 }
