@@ -16,6 +16,12 @@
 # fail; mods-use-pin (a shared lock on each version in use) must pass, and each
 # mods-use-mutant-*.cfg must be caught by its rule.
 #
+# ModServe.tla: the MCP servers a running fx starts from a mod, one copy per
+# fx, while other fx processes change the mod. mods-serve must pass;
+# mods-serve-crash-window shows that a server fx's helper stops after a crash
+# can lose its files, which the design accepts; each mods-serve-mutant-*.cfg
+# must be caught by its rule.
+#
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
 # Usage:
@@ -43,4 +49,10 @@ ModUse mods-use-mutant-cleanup-ignores-pins UseFindsFiles
 ModUse mods-use-mutant-no-check UseFindsFiles
 ModUse mods-use-mutant-keeps-old-pin temporal
 ModUse mods-use-mutant-no-reload temporal
+ModServe mods-serve -
+ModServe mods-serve-crash-window DyingFindsFiles
+ModServe mods-serve-mutant-release-on-reload ServersFindFiles
+ModServe mods-serve-mutant-release-on-first-exit ServersFindFiles
+ModServe mods-serve-mutant-outlives-reader ServersFindFiles
+ModServe mods-serve-mutant-no-restart temporal
 VERDICTS
