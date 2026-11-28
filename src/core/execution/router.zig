@@ -1,11 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const host_target = @import("../hosts/target.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_environment = @import("command_environment.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const local_executor = @import("local_executor.zig");
 const command_runner = @import("../execution/command_runner.zig");
+const launch = @import("../runner/runner.zig");
 
 pub const RouteKind = local_executor.RouteKind;
 pub const PreparedCommandRoute = local_executor.PreparedCommand;
@@ -30,6 +32,7 @@ pub fn prepareAuthorizedRoute(
     return switch (authority) {
         .direct_only => |fingerprint| blk: {
             if (!fingerprint.matches(command_ctx)) return error.CommandAdmissionChanged;
+            if (!host_target.is_wasm and command_ctx.placement != .local) break :blk try placedRoute(alloc, command_ctx, null, null);
             var admission = command_effect.plan(
                 alloc,
                 command_ctx.command,
@@ -51,6 +54,9 @@ pub fn prepareAuthorizedRoute(
         .shell_allowed => |shell| blk: {
             if (!shell.fingerprint.matches(command_ctx)) {
                 return error.CommandAuthorityContextMismatch;
+            }
+            if (!host_target.is_wasm and command_ctx.placement != .local) {
+                break :blk try placedRoute(alloc, command_ctx, shell.source, shell.grant_epoch);
             }
             if (command_ctx.environment.requiresShellRoute()) {
                 debug_trace.logf(
@@ -97,6 +103,42 @@ pub fn prepareAuthorizedRoute(
             }
         },
     };
+}
+
+/// A placed command never takes the direct route and never runs its own text
+/// here. The route runs the provider invocation, and the stop grace comes from
+/// the launch. Without a launch there is no provider, so the command is refused.
+fn placedRoute(
+    alloc: std.mem.Allocator,
+    command_ctx: command_admission.CommandContext,
+    source: ?command_admission.ShellAuthorizationSource,
+    grant_epoch: ?u64,
+) !PreparedCommandRoute {
+    // WASM hosts never place a command (A4), so no launch exists there.
+    if (comptime host_target.is_wasm) return error.SandboxUnavailable;
+    const sandbox = command_ctx.sandbox orelse return error.SandboxUnavailable;
+    const run_command = try launch.invocation(
+        alloc,
+        sandbox,
+        command_ctx.command,
+        command_ctx.resolved_cwd,
+        command_ctx.placement,
+        command_ctx.placement_profile,
+        command_ctx.timeout_ms,
+    );
+    debug_trace.logf(
+        "core",
+        "shell.run placement={s} route=approved_shell provider",
+        .{@tagName(command_ctx.placement)},
+    );
+    return .{ .approved_shell = .{
+        .command_ctx = command_ctx,
+        .reason = .dynamic_shell,
+        .source = source,
+        .grant_epoch = grant_epoch,
+        .run_command = run_command,
+        .termination_grace_ms = @as(i64, sandbox.grace_ms),
+    } };
 }
 
 pub fn executePreparedRoute(
@@ -232,7 +274,7 @@ test "router permits approval-bearing grammar only with sourced shell authority"
     );
     try std.testing.expectEqual(command_effect.ApprovalReason.filesystem_write, route.approved_shell.reason);
     try std.testing.expectEqual(
-        command_admission.ShellAuthorizationSource.configured_rule,
+        @as(?command_admission.ShellAuthorizationSource, .configured_rule),
         route.approved_shell.source,
     );
 }
@@ -283,4 +325,70 @@ test "router executes direct plan without consulting approved shell capacity" {
         @as(?[]const u8, null),
         routed.result.command_result.?.output_file,
     );
+}
+
+test "router sends a placed command to its provider invocation for either authority" {
+    const provider = [_][]const u8{"/opt/fx/vercel.sh"};
+    const sandbox: launch.Launch = .{
+        .provider = &provider,
+        .state_dir = "/tmp/state",
+        .workspace_root = "/tmp",
+        .grace_ms = 2500,
+    };
+    var ctx = context("pwd", false);
+    ctx.placement = .remote;
+    ctx.sandbox = &sandbox;
+
+    var direct = try prepareAuthorizedRoute(std.testing.allocator, ctx, directAuthority(ctx));
+    defer direct.deinit(std.testing.allocator);
+    try std.testing.expect(direct == .approved_shell);
+    try std.testing.expectEqualStrings(
+        "exec /opt/fx/vercel.sh run --mode remote --root /tmp --cwd /tmp --state /tmp/state -- pwd",
+        direct.approved_shell.run_command.?,
+    );
+    try std.testing.expectEqual(@as(?i64, 2500), direct.approved_shell.termination_grace_ms);
+    try std.testing.expectEqual(command_effect.ApprovalReason.dynamic_shell, direct.approved_shell.reason);
+    try std.testing.expectEqual(@as(?command_admission.ShellAuthorizationSource, null), direct.approved_shell.source);
+    try std.testing.expectEqualStrings("pwd", direct.approved_shell.command_ctx.command);
+
+    var shell = try prepareAuthorizedRoute(
+        std.testing.allocator,
+        ctx,
+        shellAuthority(ctx, .configured_rule),
+    );
+    defer shell.deinit(std.testing.allocator);
+    try std.testing.expect(shell == .approved_shell);
+    try std.testing.expectEqualStrings(direct.approved_shell.run_command.?, shell.approved_shell.run_command.?);
+    try std.testing.expectEqual(
+        @as(?command_admission.ShellAuthorizationSource, .configured_rule),
+        shell.approved_shell.source,
+    );
+}
+
+test "router refuses a placed command without a sandbox launch" {
+    var ctx = context("zig build test", false);
+    ctx.placement = .isolated;
+    try std.testing.expectError(
+        error.SandboxUnavailable,
+        prepareAuthorizedRoute(std.testing.allocator, ctx, directAuthority(ctx)),
+    );
+    try std.testing.expectError(
+        error.SandboxUnavailable,
+        prepareAuthorizedRoute(std.testing.allocator, ctx, shellAuthority(ctx, .interactive_once)),
+    );
+}
+
+test "router keeps a local command on its own route beside a sandbox launch" {
+    const provider = [_][]const u8{"/opt/fx/vercel.sh"};
+    const sandbox: launch.Launch = .{
+        .provider = &provider,
+        .state_dir = "/tmp/state",
+        .workspace_root = "/tmp",
+        .grace_ms = 2500,
+    };
+    var ctx = context("pwd", false);
+    ctx.sandbox = &sandbox;
+    var route = try prepareAuthorizedRoute(std.testing.allocator, ctx, directAuthority(ctx));
+    defer route.deinit(std.testing.allocator);
+    try std.testing.expect(route == .direct_read_only);
 }

@@ -1642,6 +1642,16 @@ pub fn Runtime(comptime App: type) type {
             return lender;
         }
 
+        /// The worker that owns the approval `agent`'s prompt shows: the
+        /// subagent's while its request is lent to that prompt, else `agent`'s
+        /// own. Every answer, including a failed screen's deny, goes through
+        /// it, so no answer reaches a worker that does not own the request
+        /// (`tests/tla/subagent/TuiParentApproval.tla` NoAnswerToNonOwner).
+        pub fn approvalWorker(app: *App, agent: *AppAgent) *@TypeOf(agent.worker) {
+            const lender = lentApproval(app, agent) orelse return &agent.worker;
+            return &lender.agent.worker;
+        }
+
         /// Runs `body`, a cancel, in the context of the subagent whose
         /// approval the instance's screen shows, as its own screen would.
         /// False when the approval is the instance's own.

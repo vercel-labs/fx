@@ -131,6 +131,7 @@ const Writable = enum {
     context,
     effort,
     @"experimental.hooks",
+    @"experimental.sandbox_execution",
     fast_mode,
     max_agent_steps,
     max_tool_result_bytes,
@@ -236,6 +237,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .collapse_tool_calls => patch.collapse_tool_calls = enabled,
         .context => patch.context = enabled,
         .@"experimental.hooks" => patch.experimental_hooks = enabled,
+        .@"experimental.sandbox_execution" => patch.experimental_sandbox_execution = enabled,
         .fast_mode => patch.fast_mode = enabled,
         .@"prompt_history.enabled" => patch.prompt_history_enabled = enabled,
         .provider_strict => patch.provider_strict = enabled,
@@ -363,6 +365,7 @@ fn checkShortcutMap(shortcuts: std.json.Value) bool {
 
 /// What to use instead of `fx config` for a setting it doesn't change.
 fn ownerHint(key: []const u8) []const u8 {
+    if (std.mem.eql(u8, key, "experimental")) return "set experimental.hooks or experimental.sandbox_execution";
     const head = key[0 .. std.mem.findScalar(u8, key, '.') orelse key.len];
     const hints = [_]struct { keys: []const []const u8, hint: []const u8 }{
         .{ .keys = &.{ "model", "models", "codex_model", "grok_model" }, .hint = "use /model in a session" },
@@ -379,7 +382,6 @@ fn ownerHint(key: []const u8) []const u8 {
         .{ .keys = &.{"status_line"}, .hint = "set status_line.context, status_line.session, or status_line.workspace" },
         .{ .keys = &.{"sound"}, .hint = "set sound.turn_end, sound.attention_required, or sound.max" },
         .{ .keys = &.{"prompt_history"}, .hint = "set prompt_history.enabled" },
-        .{ .keys = &.{"experimental"}, .hint = "set experimental.hooks" },
         .{ .keys = &.{"tool_placement"}, .hint = "set tool_placement.<tool> to toolbox or direct, for one of " ++ config_runtime.tool_placement.movable_list },
         .{ .keys = &.{"shortcuts"}, .hint = "set shortcuts.<chord> to a command such as /fast or a model preset, or unset it" },
         .{ .keys = &.{"trusted"}, .hint = profile_paths.displayText("fx sets it when you allow a folder; remove it from the folder's entry in ~/.fx/settings.json to be asked again") },
@@ -558,16 +560,16 @@ pub const Effective = union(enum) {
 /// The keys `fx config` reads from the resolved state instead of the files.
 /// A test checks that each plain key is here or in `files_only_keys`.
 pub const resolved_keys = [_][]const u8{
-    "auto_compact_percent",   "auto_upgrade",                   "cache_warming",
-    "collapse_tool_calls",    "context",                        "effort",
-    "experimental.hooks",     "experimental.workspace_capture", "fast_mode",
-    "first_call_tool_choice", "max_agent_steps",                "max_tool_result_bytes",
-    "permission_mode",        "prompt_history.enabled",         "provider",
-    "provider_order",         "provider_strict",                "review_model",
-    "session_titles",         "slash_menu_categories",          "sound.attention_required",
-    "sound.max",              "sound.turn_end",                 "status_line.context",
-    "status_line.session",    "status_line.workspace",          "theme",
-    "ultrafast_mode",         "update_channel",
+    "auto_compact_percent",     "auto_upgrade",                   "cache_warming",
+    "collapse_tool_calls",      "context",                        "effort",
+    "experimental.hooks",       "experimental.sandbox_execution", "experimental.workspace_capture",
+    "fast_mode",                "first_call_tool_choice",         "max_agent_steps",
+    "max_tool_result_bytes",    "permission_mode",                "prompt_history.enabled",
+    "provider",                 "provider_order",                 "provider_strict",
+    "review_model",             "session_titles",                 "slash_menu_categories",
+    "sound.attention_required", "sound.max",                      "sound.turn_end",
+    "status_line.context",      "status_line.session",            "status_line.workspace",
+    "theme",                    "ultrafast_mode",                 "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -597,6 +599,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "collapse_tool_calls")) return boolean(state.collapse_tool_calls);
     if (eql(u8, key, "context")) return boolean(state.context_enabled);
     if (eql(u8, key, "effort")) return string(state.effort.label());
+    if (eql(u8, key, "experimental.sandbox_execution")) return boolean(state.sandbox_execution);
     if (eql(u8, key, "experimental.workspace_capture")) return boolean(state.workspace_capture);
     if (eql(u8, key, "fast_mode")) return boolean(state.fast_mode);
     if (eql(u8, key, "first_call_tool_choice")) return string(state.first_call_tool_choice.label());
@@ -932,6 +935,12 @@ test "config set turns each value into the patch the save path writes" {
     try std.testing.expectEqual(true, hook.patch.experimental_hooks.?);
     try std.testing.expect(hook.value.?.bool);
 
+    const sandbox_on = try changeForTest(&.{ "set", "experimental.sandbox_execution", "true" }, &problem);
+    try std.testing.expectEqual(true, sandbox_on.patch.experimental_sandbox_execution.?);
+    try std.testing.expect(sandbox_on.value.?.bool);
+    const sandbox_off = try changeForTest(&.{ "set", "experimental.sandbox_execution", "false" }, &problem);
+    try std.testing.expectEqual(false, sandbox_off.patch.experimental_sandbox_execution.?);
+
     const status = try changeForTest(&.{ "set", "status_line.workspace", "true" }, &problem);
     try std.testing.expectEqual(settings_store.StatuslineItem.workspace, status.patch.statusline_item.?.item);
 
@@ -953,10 +962,42 @@ test "config set turns each value into the patch the save path writes" {
     try std.testing.expect(unset_hook.value == null);
 }
 
+test "experimental.sandbox_execution resolves from settings.json as the boolean it holds" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cases = [_]struct { text: []const u8, expected: bool }{
+        .{ .text = "{\"experimental\":{\"sandbox_execution\":true}}", .expected = true },
+        .{ .text = "{\"experimental\":{\"sandbox_execution\":false}}", .expected = false },
+    };
+    for (cases) |case| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "settings.json", .data = case.text });
+        var paths: config_runtime.Paths = .{
+            .user_settings = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "settings.json"),
+            .workspace_settings = try alloc.dupe(u8, "/nonexistent/.fx.json"),
+            .workspace_root = try alloc.dupe(u8, "/w"),
+        };
+        defer paths.deinit(alloc);
+        var failed: ?[]const u8 = null;
+        var global = try load(alloc, paths, "/w", .global, &failed);
+        defer global.deinit(alloc);
+        var found = false;
+        for (global.entries.items) |entry| {
+            if (!std.mem.eql(u8, entry.key, "experimental.sandbox_execution")) continue;
+            try std.testing.expectEqual(case.expected, entry.value.bool);
+            found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
 test "config set explains a bad value or a key it doesn't change" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { args: []const [:0]const u8, err: anyerror, message: []const u8 }{
         .{ .args = &.{ "set", "fast_mode", "maybe" }, .err = error.InvalidConfigValue, .message = "invalid value for fast_mode: maybe (use true or false)" },
+        .{ .args = &.{ "set", "experimental.sandbox_execution", "maybe" }, .err = error.InvalidConfigValue, .message = "invalid value for experimental.sandbox_execution: maybe (use true or false)" },
+        .{ .args = &.{ "set", "experimental.workspace_capture", "true" }, .err = error.RefusedConfigSetting, .message = "can't change experimental.workspace_capture with fx config; edit ~/.fx/settings.json" },
+        .{ .args = &.{ "set", "experimental", "true" }, .err = error.RefusedConfigSetting, .message = "can't change experimental with fx config; set experimental.hooks or experimental.sandbox_execution" },
         .{ .args = &.{ "set", "max_tool_result_bytes", "12" }, .err = error.InvalidConfigValue, .message = "invalid value for max_tool_result_bytes: 12 (use a whole number of bytes, at least 1024)" },
         .{ .args = &.{ "set", "permission_mode", "full-access" }, .err = error.RefusedConfigSetting, .message = "can't change permission_mode with fx config; use /permissions in a session, or --permission-mode for one run" },
         .{ .args = &.{ "unset", "review_model" }, .err = error.RefusedConfigSetting, .message = "can't change review_model with fx config; edit ~/.fx/settings.json, or set FX_REVIEW_MODEL for one run" },

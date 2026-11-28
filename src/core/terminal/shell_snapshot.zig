@@ -35,6 +35,8 @@ const max_capture_bytes: usize = 8 * 1024 * 1024;
 const wait_poll_ns: u64 = 2 * std.time.ns_per_ms;
 const read_poll_ms: i64 = 100;
 pub const max_notice_bytes = 256;
+/// Starts the fallback warning every surface shows once when the startup files cannot be replayed.
+pub const fallback_notice_prefix = "shell snapshot unavailable ";
 const nonce_bytes = 16;
 
 /// zsh reads its user files from up to three directories: an inherited
@@ -741,7 +743,7 @@ pub const Owner = struct {
         self.failed_fingerprint = fingerprint.*;
         const text = std.mem.print(
             &self.notice.text,
-            "shell snapshot unavailable ({s}); startup files run for every command",
+            fallback_notice_prefix ++ "({s}); startup files run for every command",
             .{reason.description()},
         ) catch self.notice.text[0..0];
         self.notice.len = text.len;

@@ -33,6 +33,7 @@ const glob_pattern = @import("../workspace/glob_pattern.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const command_admission = @import("../permissions/command_admission.zig");
+const sandbox_policy = @import("../runner/runner.zig");
 const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -193,6 +194,10 @@ pub const Context = struct {
     host_tool_provider: ?tool_dispatch.HostToolProvider = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
+    /// The user turn this context serves: the turn id a surface creates at its
+    /// user-turn boundary. Zero when a surface has none, and the decline mark then
+    /// uses the worker's active turn (spec U4).
+    user_turn_id: u64 = 0,
     permission_mode: PermissionMode,
     permission_grants: []const PermissionGrant,
     session_grants: []const PermissionGrant = &.{},
@@ -267,12 +272,17 @@ pub const Context = struct {
     on_web_fetch_progress: ?tool_dispatch.WebFetchProgressFn = null,
     workspace_executor: ?js_host_workspace.Executor = null,
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
+    /// The sandbox policy for shell commands. Null when sandbox execution is off.
+    sandbox_policy: ?*const sandbox_policy.Policy = null,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?subagent_tool_host.ModelOverrideResolver = null,
     /// False when running outside an interactive TUI (e.g. ACP). Tools
     /// that require a live user (like `ask_user_question`) short-circuit
     /// in that case.
     interactive: bool = true,
+    /// False for a sub-agent's tool context, so its calls never start remote
+    /// setup (spec U2). Main conversations keep the default.
+    remote_setup_allowed: bool = true,
     /// Lets a turn that is not interactive still ask the user questions: a
     /// subagent's, whose questions show on its own screen and on main's.
     ask_user_questions: bool = false,
@@ -310,6 +320,7 @@ pub const Context = struct {
                 .result_dir = self.tool_result_dir,
             },
             .host_sandbox_default = self.host_sandbox_default,
+            .sandbox_policy = self.sandbox_policy,
         };
         if (self.permission_state_override != null) {
             input.session_permission_state_provider = null;
@@ -1971,6 +1982,22 @@ fn recordContextNoticeForDispatch(raw_ctx: ?*anyopaque, notice: []const u8) erro
     try state.notices.append(state.allocator, duplicate);
 }
 
+/// The decline key of a main call with no saved session, such as `fx ask
+/// --no-save`: one key for the process, so a decline holds for its turn (U4).
+const process_setup_key = "fx-process-setup";
+
+/// The remote setup values of one tool call. The turn id is the surface's user
+/// turn, and the worker's active turn when the surface has none. The session key
+/// is the main session's id, or the process key when there is none. It is null
+/// when setup is not allowed (spec U2), so such a call reads no decline mark (U4).
+fn remoteSetupContext(ctx: Context) tool_dispatch.RemoteSetupContext {
+    return .{
+        .allowed = ctx.remote_setup_allowed,
+        .session_key = if (ctx.remote_setup_allowed) (ctx.lifecycle_scope.session_id orelse process_setup_key) else null,
+        .turn_id = if (ctx.user_turn_id != 0) ctx.user_turn_id else ctx.worker.activeTurnId(),
+    };
+}
+
 fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchContext {
     var capabilities = tool_dispatch.ToolCapabilities.for_host(
         host_capabilities.current(),
@@ -1980,6 +2007,8 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
     return .{
         .allocator = arena,
         .observer = ctx.observer,
+        .sandbox_policy = ctx.sandbox_policy,
+        .remote_setup = remoteSetupContext(ctx),
         .permission_mode = ctx.permission_mode,
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.access_scope,
@@ -2390,12 +2419,22 @@ fn toolRunCommand(
 ) !ToolExecutionResult {
     const command = request.command;
     const cwd = request.resolved_cwd;
-    const command_ctx = command_admission.CommandContext{
-        .command = command,
-        .resolved_cwd = cwd,
-        .target_os = builtin.target.os.tag,
-        .environment = request.environment,
-    };
+    // The run keeps the placement its authority approved. A changed placement
+    // refuses the run, and a placed run gets its launch from the policy.
+    const command_ctx = (try tool_admission.placementAsApproved(
+        ctx.sandbox_policy,
+        arena,
+        ctx.workspace_root,
+        managed_execution.admittedFingerprint(authority),
+        .{
+            .command = command,
+            .resolved_cwd = cwd,
+            .target_os = builtin.target.os.tag,
+            .environment = request.environment,
+        },
+        std.meta.activeTag(request.environment) != .workspace_clean,
+        null,
+    )) orelse return error.CommandAdmissionChanged;
     const timeout = try effectiveCommandTimeout(
         request.timeout_ms,
         ctx.command_timeout_ms,
@@ -3341,6 +3380,8 @@ const TestRuntime = struct {
     session: SessionRuntime = .{ .max_history_turns = 8 },
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
+    user_turn_id: u64 = 0,
     model: []const u8 = "",
     reviewer_model: []const u8 = "",
     session_allocator: Allocator = std.testing.allocator,
@@ -3426,6 +3467,8 @@ const TestRuntime = struct {
             .tool_registry = self.tool_registry,
             .subagent_host = self.subagent_host,
             .subagent_caller_id = self.subagent_caller_id,
+            .lifecycle_scope = .{ .kind = .interactive, .workspace_root = "", .session_id = self.session_id },
+            .user_turn_id = self.user_turn_id,
             .worker = &self.worker,
             .permission_prompter = if (self.interactive)
                 tool_admission.workerPrompter(&self.worker)
@@ -6285,6 +6328,50 @@ test "registered read_tool_result restores an omitted stored-result suffix" {
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
     try expectContains(result.model_output, "integration suffix needle");
     try expectContains(result.model_output, handle);
+}
+
+test "the decline mark uses the surface's user turn, and the worker's active turn only when there is none" {
+    var rt = TestRuntime{ .session_id = "session-main", .user_turn_id = 9 };
+    rt.worker.active_turn_id = 7;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqual(@as(u64, 9), typedDispatchContext(rt.context(), arena).remote_setup.turn_id);
+    rt.user_turn_id = 0;
+    try std.testing.expectEqual(@as(u64, 7), typedDispatchContext(rt.context(), arena).remote_setup.turn_id);
+}
+
+test "a main call with no saved session still has a session key, so its declines hold in the process" {
+    var rt = TestRuntime{};
+    rt.worker.active_turn_id = 3;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const main_call = typedDispatchContext(rt.context(), arena).remote_setup;
+    try std.testing.expect(main_call.allowed);
+    try std.testing.expect(main_call.session_key != null);
+}
+
+test "typedDispatchContext copies the remote setup values: the flag, the session key and the active turn" {
+    var rt = TestRuntime{ .session_id = "session-main" };
+    rt.worker.active_turn_id = 7;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const main_call = typedDispatchContext(rt.context(), arena).remote_setup;
+    try std.testing.expect(main_call.allowed);
+    try std.testing.expectEqualStrings("session-main", main_call.session_key.?);
+    try std.testing.expectEqual(@as(u64, 7), main_call.turn_id);
+
+    var sub_context = rt.context();
+    sub_context.remote_setup_allowed = false;
+    const sub_call = typedDispatchContext(sub_context, arena).remote_setup;
+    try std.testing.expect(!sub_call.allowed);
+    try std.testing.expect(sub_call.session_key == null);
+    try std.testing.expectEqual(@as(u64, 7), sub_call.turn_id);
 }
 
 test "no-save terminal exec publishes one readable ephemeral replay" {

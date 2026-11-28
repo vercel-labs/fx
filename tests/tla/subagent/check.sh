@@ -266,7 +266,9 @@ ParentApproval parent-approval-mutation-no-nudge deadlock
 # copy outliving its wait), a breaks NoStalePrompt (the call frees its review).
 # a2, b and c must pass; c is the code in this change (the prompt owns its
 # copy, so NoStalePrompt holds by construction).
-# lend_routed, free_anyway and note_typed each break the rule named on its row.
+# lend_routed, free_anyway, note_typed and screen_worker each break the rule
+# named on its row. screen_worker is a screen that cannot open, submitting its
+# deny through the screen's own worker instead of the request's owner.
 # Two defects have no config because they cannot fail: no_withdraw (one request
 # per kid) and b_note_keeps_prompt (b's free guard waits on the prompt).
 # The simulate pair runs under ideal and non-ideal conditions.
@@ -282,6 +284,7 @@ TuiParentApproval tui-approval-design-b-person -
 TuiParentApproval tui-approval-mutant-lend-routed NoPersonPromptForParentRouted
 TuiParentApproval tui-approval-mutant-free-anyway NoStalePrompt
 TuiParentApproval tui-approval-mutant-note-typed TypedStaysWithPerson
+TuiParentApproval tui-approval-mutant-screen-worker NoAnswerToNonOwner
 TuiParentApproval tui-approval-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
 TuiParentApproval tui-approval-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 # The ViewWaits configs:

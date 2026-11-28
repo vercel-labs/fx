@@ -8,6 +8,7 @@ const hooks_host = @import("../hooks_host/hooks_host.zig");
 const pathing = @import("../workspace/pathing.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const wildcard = @import("../shared/wildcard.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const vision_contracts = @import("../agent/runtime/vision_contracts.zig");
 const tool_args = @import("../tooling/tool_args.zig");
@@ -1642,7 +1643,7 @@ fn webFetchRuleApplies(rule: types.PermissionRule, target: []const u8) bool {
     if (std.mem.eql(u8, rule.pattern, "*")) return true;
     var buf: [max_web_fetch_domain_pattern_len]u8 = undefined;
     const pattern = normalizedWebFetchDomainPattern(rule.pattern, &buf) orelse return false;
-    return wildcardMatch(pattern, target);
+    return wildcard.match(pattern, target);
 }
 
 /// The longest host name, without its trailing dot, plus the `domain:` prefix.
@@ -1683,9 +1684,9 @@ pub fn webFetchRuleWarningCount(rules: []const types.PermissionRule) usize {
 }
 
 fn ruleMatchesPermission(rule_permission: []const u8, permission: []const u8, tool_name: ?[]const u8) bool {
-    if (wildcardMatch(rule_permission, permission)) return true;
+    if (wildcard.match(rule_permission, permission)) return true;
     const name = tool_name orelse return false;
-    if (wildcardMatch(rule_permission, name)) return true;
+    if (wildcard.match(rule_permission, name)) return true;
     return false;
 }
 
@@ -1695,7 +1696,7 @@ fn permissionPatternMatchesTool(pattern: []const u8, permission: []const u8, too
 
 fn permissionPatternMatchesTarget(pattern: []const u8, candidate: []const u8) bool {
     if (directoryTreePatternMatches(pattern, candidate)) return true;
-    return wildcardMatch(pattern, candidate);
+    return wildcard.match(pattern, candidate);
 }
 
 fn ruleTargetMatches(permission: []const u8, action: RuleDecision, pattern: []const u8, candidate: []const u8) bool {
@@ -1817,37 +1818,6 @@ fn directoryTreePatternMatches(pattern: []const u8, candidate: []const u8) bool 
     return candidate.len > dir.len and
         std.mem.startsWith(u8, candidate, dir) and
         candidate[dir.len] == '/';
-}
-
-fn wildcardMatch(pattern: []const u8, candidate: []const u8) bool {
-    var pattern_index: usize = 0;
-    var candidate_index: usize = 0;
-    var star_index: ?usize = null;
-    var star_candidate_index: usize = 0;
-
-    while (candidate_index < candidate.len) {
-        if (pattern_index < pattern.len and
-            (pattern[pattern_index] == '?' or pattern[pattern_index] == candidate[candidate_index]))
-        {
-            pattern_index += 1;
-            candidate_index += 1;
-            continue;
-        }
-        if (pattern_index < pattern.len and pattern[pattern_index] == '*') {
-            star_index = pattern_index;
-            pattern_index += 1;
-            star_candidate_index = candidate_index;
-            continue;
-        }
-
-        const star = star_index orelse return false;
-        star_candidate_index += 1;
-        candidate_index = star_candidate_index;
-        pattern_index = star + 1;
-    }
-
-    while (pattern_index < pattern.len and pattern[pattern_index] == '*') : (pattern_index += 1) {}
-    return pattern_index == pattern.len;
 }
 
 fn isGlobalTargetPattern(pattern: []const u8) bool {
@@ -2591,8 +2561,8 @@ test "generic wildcard matching remains total for maximum command-sized input" {
     const candidate = try std.testing.allocator.alloc(u8, 64 * 1024);
     defer std.testing.allocator.free(candidate);
     @memset(candidate, 'x');
-    try std.testing.expect(wildcardMatch("*", candidate));
-    try std.testing.expect(!wildcardMatch("?", candidate));
+    try std.testing.expect(wildcard.match("*", candidate));
+    try std.testing.expect(!wildcard.match("?", candidate));
 }
 
 test "rulesDenyAllTargetsForPermission honors last matching overrides" {
@@ -2681,6 +2651,27 @@ test "web_fetch exact matcher never calls generic url wildcard matcher" {
     };
     try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, .{ .rules = &generic_only }, "/tmp/workspace", "web_fetch", target, .none));
     try std.testing.expectEqual(RuleDecision.allow, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", target, .none));
+}
+
+// #2153 and spec A2: a configured rule matches the command with its placement stripped
+// (patternForRuleMatch), so a configured allow or deny applies to local and remote runs alike.
+// A remote run therefore never escapes a configured deny.
+test "a configured allow or deny for make matches a remote make as well as a local one" {
+    const alloc = std.testing.allocator;
+    const local_target = "/tmp/workspace::make";
+    const remote_target = "/tmp/workspace::@fx-placement:remote:prj_1:make";
+    var allow_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("make"), .action = .allow },
+    };
+    const allow: types.PermissionRuleSet = .{ .rules = &allow_buf };
+    try std.testing.expectEqual(RuleDecision.allow, try ruleDecisionFor(alloc, allow, "/tmp/workspace", "run_command", local_target, .command_cwd));
+    try std.testing.expectEqual(RuleDecision.allow, try ruleDecisionFor(alloc, allow, "/tmp/workspace", "run_command", remote_target, .command_cwd));
+    var deny_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("make"), .action = .deny },
+    };
+    const deny: types.PermissionRuleSet = .{ .rules = &deny_buf };
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, deny, "/tmp/workspace", "run_command", local_target, .command_cwd));
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, deny, "/tmp/workspace", "run_command", remote_target, .command_cwd));
 }
 
 test "web_fetch grants do not authorize other tools" {
@@ -3147,13 +3138,13 @@ test "structured file grant offer rejects wildcard-bearing literal roots" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    for ([_]u8{ '*', '?' }) |wildcard| {
+    for ([_]u8{ '*', '?' }) |wildcard_byte| {
         for ([_]Scope{ .workspace, .external }) |scope| {
             const external = scope == .external;
             const root_prefix = if (external) "external" else "workspace";
             const literal_root = try arena.print(
                 "/tmp/{s}{c}literal",
-                .{ root_prefix, wildcard },
+                .{ root_prefix, wildcard_byte },
             );
             const workspace_root = if (external) "/tmp/workspace" else literal_root;
 
