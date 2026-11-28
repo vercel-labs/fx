@@ -4199,13 +4199,26 @@ pub const Session = struct {
         step_count: ?u64 = null,
         cost_usd: ?f64 = null,
         cost_unknown: ?bool = null,
+        totals_unknown: ?bool = null,
+
+        pub fn jsonStringify(self: SavedUsage, writer: *std.json.Stringify) !void {
+            try writer.beginObject();
+            inline for (@typeInfo(SavedUsage).@"struct".field_names) |field_name| {
+                const skip = comptime std.mem.eql(u8, field_name, "totals_unknown");
+                if (!skip or self.totals_unknown == true) {
+                    try writer.objectField(field_name);
+                    try writer.write(@field(self, field_name));
+                }
+            }
+            try writer.endObject();
+        }
     };
 
     fn decodeSavedUsage(sa: Allocator, session_id: []const u8, raw: ?[]const u8) types.SessionUsage {
         const text = raw orelse return .{};
         const decoded = json_decode.parseFromSliceLeaky(SavedUsage, sa, text, .{ .ignore_unknown_fields = true }) catch |err| {
             debug_trace.logf("session", "event=sessions_v2_usage_reset session={s} reason={s} dropped=saved_usage", .{ session_id, @errorName(err) });
-            return .{ .cost_status = .unknown };
+            return .{ .cost_status = .unknown, .totals_unknown = true };
         };
         const has_tokens = decoded.input_tokens != null or
             decoded.output_tokens != null or
@@ -4222,8 +4235,9 @@ pub const Session = struct {
             .cache_write_seen = decoded.cache_write_tokens != null,
             .reasoning_seen = decoded.reasoning_tokens != null,
             .step_count = step_count,
+            .totals_unknown = decoded.totals_unknown == true,
         };
-        if (decoded.cost_unknown == true) {
+        if (out.totals_unknown or decoded.cost_unknown == true) {
             out.cost_status = .unknown;
         } else if (decoded.cost_usd) |cost| {
             if (std.math.isFinite(cost) and cost >= 0) {
@@ -4269,6 +4283,7 @@ pub const Session = struct {
                 .known => false,
                 .unknown => true,
             },
+            .totals_unknown = if (total.totals_unknown) true else null,
         };
         const value = try std.json.Stringify.valueAlloc(sa, encoded, .{});
         _ = try self.write(&.{.{ .set = .{ .key = .usage, .value = value } }});
@@ -17698,14 +17713,106 @@ test "Session.recordUsage persists summed tokens and gateway cost across resume,
 }
 
 test "corrupt saved usage decodes with unknown cost status so the next step cannot claim the session total" {
-    const corrupt = Session.decodeSavedUsage(testing.allocator, "corrupt", "{not valid json");
-    try testing.expectEqual(types.SessionCostStatus.unknown, corrupt.cost_status);
+    for ([_][]const u8{ "{not valid json", "{\"input_tokens\":\"lots\"}" }) |bad_raw| {
+        const corrupt = Session.decodeSavedUsage(testing.allocator, "corrupt", bad_raw);
+        try testing.expectEqual(types.SessionCostStatus.unknown, corrupt.cost_status);
+        try testing.expect(corrupt.totals_unknown);
 
-    var next = corrupt;
-    next.observe(.{ .tokens = .{ .input_tokens = 10, .output_tokens = 5 }, .gateway_cost_usd = 0.0025 });
-    try testing.expectEqual(types.SessionCostStatus.unknown, next.cost_status);
+        var next = corrupt;
+        next.observe(.{ .tokens = .{ .input_tokens = 10, .output_tokens = 5 }, .gateway_cost_usd = 0.0025 });
+        try testing.expectEqual(types.SessionCostStatus.unknown, next.cost_status);
+        try testing.expect(next.totals_unknown);
+    }
 
-    // Absent saved usage still starts at .none so the first step becomes .known.
+    // Absent saved usage still starts at .none with known (zero) totals so the first step becomes .known.
     const absent = Session.decodeSavedUsage(testing.allocator, "absent", null);
     try testing.expectEqual(types.SessionCostStatus.none, absent.cost_status);
+    try testing.expect(!absent.totals_unknown);
+}
+
+test "saved usage round-trips totals_unknown and omits it on normal sessions" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("ok"),
+    } }, types.ConversationLanguage.default());
+    // Normal session writes exact 8-field JSON with no totals_unknown key.
+    try s.recordUsage(.{
+        .tokens = .{ .input_tokens = 100, .output_tokens = 7, .cache_read_tokens = 80, .reasoning_tokens = 2 },
+        .gateway_cost_usd = null,
+    });
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const normal_state = try s.handle.state(arena_state.allocator());
+    try testing.expectEqualStrings(
+        "{\"input_tokens\":100,\"output_tokens\":7,\"cache_read_tokens\":80,\"cache_write_tokens\":null,\"reasoning_tokens\":2,\"step_count\":1,\"cost_usd\":null,\"cost_unknown\":true}",
+        normal_state.usage.?,
+    );
+    s.close();
+
+    // Corrupt set usage persists totals_unknown across a later step and resume.
+    var model2 = "m".*;
+    const s2 = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model2));
+    const id2 = try testing.allocator.dupe(u8, s2.id());
+    defer testing.allocator.free(id2);
+    try s2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn two") },
+        .assistant = @constCast("ok"),
+    } }, types.ConversationLanguage.default());
+    _ = try s2.write(&.{.{ .set = .{ .key = .usage, .value = "{\"input_tokens\":\"lots\"}" } }});
+    try s2.recordUsage(.{
+        .tokens = .{ .input_tokens = 50, .output_tokens = 10 },
+        .gateway_cost_usd = 0.0010,
+    });
+    s2.close();
+
+    const reopened = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id2 }, "/w", .app);
+    defer reopened.close();
+    var restored = try reopened.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expect(restored.session_usage.totals_unknown);
+    try testing.expectEqual(types.SessionCostStatus.unknown, restored.session_usage.cost_status);
+}
+
+test "saved usage JSON decodes or resets cleanly on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzDecodeSavedUsage, .{
+        .corpus = &@import("fuzz_seed").slices(.{
+            "",
+            "{}",
+            "{not valid json",
+            "{\"input_tokens\":\"lots\"}",
+            "{\"input_tokens\":100,\"output_tokens\":7,\"cache_read_tokens\":80,\"cache_write_tokens\":null,\"reasoning_tokens\":2,\"step_count\":1,\"cost_usd\":null,\"cost_unknown\":true}",
+            "{\"input_tokens\":50,\"output_tokens\":10,\"step_count\":1,\"cost_usd\":0.001,\"cost_unknown\":true,\"totals_unknown\":true}",
+            "{\"input_tokens\":50,\"cost_usd\":-1}",
+            "{\"cost_usd\":1e309}",
+        }),
+    });
+}
+
+fn fuzzDecodeSavedUsage(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const usage = Session.decodeSavedUsage(arena_state.allocator(), "fuzz", buffer[0..len]);
+    if (usage.totals_unknown) {
+        try testing.expectEqual(types.SessionCostStatus.unknown, usage.cost_status);
+        try testing.expectEqual(@as(f64, 0), usage.cost_usd);
+    }
+    if (usage.cost_status == .known) {
+        try testing.expect(std.math.isFinite(usage.cost_usd) and usage.cost_usd >= 0);
+    } else {
+        try testing.expectEqual(@as(f64, 0), usage.cost_usd);
+    }
+    if (usage.step_count > 0) {
+        try testing.expect(usage.cost_status != .none);
+    }
 }

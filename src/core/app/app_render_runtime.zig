@@ -965,7 +965,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "statusline_session_usage")) {
                 if (app.statusline_session_usage) {
                     const session_usage = agents.loadSessionUsage(agent);
-                    if (session_usage.step_count > 0) items.session_usage = session_usage;
+                    if (session_usage.step_count > 0 or session_usage.totals_unknown) items.session_usage = session_usage;
                 }
             }
             return items;

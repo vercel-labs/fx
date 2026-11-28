@@ -2352,6 +2352,7 @@ pub const SessionUsage = struct {
     step_count: u64 = 0,
     cost_status: SessionCostStatus = .none,
     cost_usd: f64 = 0,
+    totals_unknown: bool = false,
 
     pub fn cachedTokens(self: SessionUsage) u64 {
         return self.cache_read_tokens +| self.cache_write_tokens;
@@ -2380,6 +2381,11 @@ pub const SessionUsage = struct {
             self.reasoning_seen = true;
         }
         self.step_count +|= 1;
+        if (self.totals_unknown) {
+            self.cost_status = .unknown;
+            self.cost_usd = 0;
+            return;
+        }
         if (step.gateway_cost_usd) |cost| {
             if (std.math.isFinite(cost) and cost >= 0) {
                 switch (self.cost_status) {

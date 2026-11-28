@@ -2,10 +2,11 @@
 // and the Grok CLI proxy. The clock is pinned so day ranges are exact.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
+import { savedSessionIds, sessionDir } from "./saved-sessions";
 import { fakeGatewaySse, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 import { rotateFxLogin, startFakeIssuer, writeFxLogin } from "./fx-login-fakes";
 import {
@@ -334,6 +335,124 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       await session.sendText("/usage");
       const unknownPane = await session.waitForText("This session", TIMEOUT);
       expect(unknownPane).toMatch(/total\s+2\.5K\s+600\s+700\s+cost unknown/);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "corrupt saved set usage shows unknown totals and cost across resume and later steps",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-tui-corrupt-usage-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ status_line: { session_usage: true } }),
+      );
+      const clock = join(root, "clock");
+      writeUsageClock(clock, USAGE_NOW_MS);
+      const fake = usageFake({ report: (from) => rows(from) });
+      let step = 0;
+      const gateway = startDynamicFakeGateway(
+        async () => {
+          step += 1;
+          if (step === 1) {
+            return fakeGatewaySse([
+              { type: "text-delta", id: "t1", delta: "SEED_OK" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: { inputTokens: { total: 200 }, outputTokens: { total: 50 } },
+                providerMetadata: { gateway: { cost: "0.0010" } },
+              },
+            ]);
+          }
+          return fakeGatewaySse([
+            { type: "text-delta", id: "t2", delta: "AFTER_CORRUPT_OK" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: { inputTokens: { total: 500 }, outputTokens: { total: 100 } },
+              providerMetadata: { gateway: { cost: "0.0020" } },
+            },
+          ]);
+        },
+        { usage: fake.handler },
+      );
+      stop = () => {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      };
+      const env = {
+        ...usageEnv(gateway.baseUrl, clock),
+        HOME: realpathSync(home),
+        AI_GATEWAY_API_KEY: "e2e-usage-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_AUTO_UPGRADE: "0",
+      };
+
+      session = await TmuxSession.create({ cwd: realpathSync(workspace), env });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("seed prompt");
+      await session.waitForText("SEED_OK", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd()).toBe(true);
+      await session.kill();
+      session = null;
+
+      // Append a valid CRC32C-sealed `set usage` record with a string input_tokens.
+      const realHome = realpathSync(home);
+      const [id] = savedSessionIds(realHome);
+      expect(id).toBeDefined();
+      const logPath = join(sessionDir(realHome, id!), "log.jsonl");
+      const rawLog = readFileSync(logPath, "utf8");
+      const lastLine = JSON.parse(rawLog.trimEnd().split("\n").at(-1)!);
+      const crcTable = new Uint32Array(256);
+      for (let n = 0; n < 256; n += 1) {
+        let c = n;
+        for (let k = 0; k < 8; k += 1) c = c & 1 ? 0x82f63b78 ^ (c >>> 1) : c >>> 1;
+        crcTable[n] = c >>> 0;
+      }
+      const crc32c = (bytes: Uint8Array) => {
+        let crc = 0xffffffff;
+        for (const byte of bytes) crc = crcTable[(crc ^ byte) & 0xff]! ^ (crc >>> 8);
+        return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, "0");
+      };
+      const head = `{"v":1,"seq":${lastLine.seq + 1},"ts":${(lastLine.ts ?? Date.now()) + 1},"kind":"set","key":"usage","value":{"input_tokens":"lots"}`;
+      const corruptLine = `${head},"crc":"${crc32c(Buffer.from(head))}"}`;
+      writeFileSync(logPath, `${rawLog.trimEnd()}\n${corruptLine}\n`);
+
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        cmd: `${FX_BIN} -c`,
+        env,
+      });
+      await session.waitForComposer(TIMEOUT);
+      const footerBefore = await session.capturePane();
+      expect(footerBefore).toContain("usage unknown");
+      await session.sendText("/usage");
+      const resumedUsage = await session.waitForText("period", TIMEOUT);
+      expect(resumedUsage).toContain("This session");
+      expect(resumedUsage).toMatch(/total\s+unknown\s+unknown\s+unknown\s+cost unknown/);
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("This session"), TIMEOUT);
+
+      // Sending one more prompt must not display partial token or cost totals.
+      await session.sendText("after corrupt");
+      await session.waitForText("AFTER_CORRUPT_OK", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      const footerAfter = await session.capturePane();
+      expect(footerAfter).toContain("usage unknown");
+      expect(footerAfter).not.toContain("600 tok");
+      await session.sendText("/usage");
+      const usageAfter = await session.waitForText("This session", TIMEOUT);
+      expect(usageAfter).toMatch(/total\s+unknown\s+unknown\s+unknown\s+cost unknown/);
+      expect(usageAfter).not.toMatch(/total\s+500/);
     },
     TIMEOUT * 2,
   );

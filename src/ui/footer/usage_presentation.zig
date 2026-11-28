@@ -134,7 +134,7 @@ pub fn showsTables(p: Projection) bool {
 }
 
 fn hasSessionUsage(p: Projection) bool {
-    return p.session_usage.step_count > 0;
+    return p.session_usage.step_count > 0 or p.session_usage.totals_unknown;
 }
 
 fn sessionRows(p: Projection) usize {
@@ -543,8 +543,8 @@ const session_header_wide = [_]Cell{
 
 const session_header_narrow = [_]Cell{
     .{ .text = "This session", .width = 12, .left = true },
-    .{ .text = "in", .width = 6 },
-    .{ .text = "out", .width = 6 },
+    .{ .text = "in", .width = 7 },
+    .{ .text = "out", .width = 7 },
     .{ .text = "cost", .width = 14 },
 };
 
@@ -557,6 +557,7 @@ fn composeSessionHeader(alloc: Allocator, limit: usize) !std.ArrayList(u8) {
 }
 
 fn sessionCostLabel(buf: *[32]u8, u: types.SessionUsage) []const u8 {
+    if (u.totals_unknown) return "cost unknown";
     return switch (u.cost_status) {
         .none => "-",
         .unknown => "cost unknown",
@@ -570,21 +571,25 @@ fn composeSessionRow(alloc: Allocator, p: Projection, limit: usize) !std.ArrayLi
     var output_buf: [16]u8 = undefined;
     var cached_buf: [16]u8 = undefined;
     var cost_buf: [32]u8 = undefined;
+    const in_text = if (u.totals_unknown) "unknown" else compact(&input_buf, u.input_tokens);
+    const out_text = if (u.totals_unknown) "unknown" else compact(&output_buf, u.output_tokens);
+    const cached_text = if (u.totals_unknown) "unknown" else compact(&cached_buf, u.cachedTokens());
+    const cost_text = sessionCostLabel(&cost_buf, u);
     if (limit >= cellsWidth(&session_header_wide)) {
         const cells = [_]Cell{
             .{ .text = "total", .width = 12, .left = true },
-            .{ .text = compact(&input_buf, u.input_tokens), .width = 8 },
-            .{ .text = compact(&output_buf, u.output_tokens), .width = 8 },
-            .{ .text = compact(&cached_buf, u.cachedTokens()), .width = 8 },
-            .{ .text = sessionCostLabel(&cost_buf, u), .width = 14 },
+            .{ .text = in_text, .width = 8 },
+            .{ .text = out_text, .width = 8 },
+            .{ .text = cached_text, .width = 8 },
+            .{ .text = cost_text, .width = 14 },
         };
         return composeCells(alloc, &cells, .data, "", limit);
     }
     const cells = [_]Cell{
         .{ .text = "total", .width = 12, .left = true },
-        .{ .text = compact(&input_buf, u.input_tokens), .width = 6 },
-        .{ .text = compact(&output_buf, u.output_tokens), .width = 6 },
-        .{ .text = sessionCostLabel(&cost_buf, u), .width = 14 },
+        .{ .text = in_text, .width = 7 },
+        .{ .text = out_text, .width = 7 },
+        .{ .text = cost_text, .width = 14 },
     };
     return composeCells(alloc, &cells, .data, "", limit);
 }
@@ -2575,4 +2580,25 @@ test "This session section renders at the top with tokens and gateway cost or co
     try testing.expect(std.mem.startsWith(u8, unknown_screen.row(2), "This session"));
     try testing.expect(std.mem.find(u8, unknown_screen.row(3), "cost unknown") != null);
     try testing.expect(std.mem.find(u8, unknown_screen.row(5), "(use /login, or set AI_GATEWAY_API_KEY)") != null);
+
+    // Corrupt saved totals (totals_unknown with step_count 0, or after another step)
+    // still show the section with "unknown" and "cost unknown", never a partial token count.
+    for ([_]u64{ 0, 1 }) |steps| {
+        var corrupt_screen = try draw(.{
+            .active = true,
+            .snapshot = &unavailable,
+            .session_usage = .{
+                .input_tokens = if (steps == 0) 0 else 500,
+                .output_tokens = if (steps == 0) 0 else 100,
+                .step_count = steps,
+                .cost_status = .unknown,
+                .totals_unknown = true,
+            },
+        }, 80, 40);
+        defer corrupt_screen.deinit();
+        try testing.expect(std.mem.startsWith(u8, corrupt_screen.row(2), "This session"));
+        try testing.expect(std.mem.find(u8, corrupt_screen.row(3), "unknown") != null);
+        try testing.expect(std.mem.find(u8, corrupt_screen.row(3), "cost unknown") != null);
+        try testing.expect(std.mem.find(u8, corrupt_screen.row(3), "500") == null);
+    }
 }

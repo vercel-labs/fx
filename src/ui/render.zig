@@ -508,7 +508,9 @@ fn appendSessionStatusSegments(
         }
     }
     if (statusline.session_usage) |session_usage| {
-        if (session_usage.step_count > 0) {
+        if (session_usage.totals_unknown) {
+            appendStatusSegment(out, end, "usage unknown");
+        } else if (session_usage.step_count > 0) {
             var tok_buf: [32]u8 = undefined;
             var cost_buf: [32]u8 = undefined;
             appendStatusSegment(out, end, formatStatuslineTokens(&tok_buf, session_usage.totalTokens()));
@@ -1431,4 +1433,18 @@ test "buildSessionStatusLine formats session tokens and gateway cost or cost unk
         },
     }, 100, &unknown_buf);
     try std.testing.expectEqualStrings("gpt-5 · 190 tok · cost unknown", unknown_line);
+
+    for ([_]u64{ 0, 1 }) |steps| {
+        var corrupt_buf: [160]u8 = undefined;
+        const corrupt_line = buildSessionStatusLine("openai/gpt-5", .auto, false, .{
+            .session_usage = .{
+                .input_tokens = if (steps == 0) 0 else 500,
+                .output_tokens = if (steps == 0) 0 else 100,
+                .step_count = steps,
+                .cost_status = .unknown,
+                .totals_unknown = true,
+            },
+        }, 100, &corrupt_buf);
+        try std.testing.expectEqualStrings("gpt-5 · usage unknown", corrupt_line);
+    }
 }
