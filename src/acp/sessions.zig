@@ -4,7 +4,7 @@ const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const agent_frame = @import("../core/shared/agent_frame.zig");
 const recovery_prompt = @import("../core/shared/recovery_prompt.zig");
-const continuation = @import("../core/continuation/continuation.zig");
+const turn_continuation = @import("../core/continuation/continuation.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -1844,7 +1844,7 @@ fn sendExecutionHistory(
                 }
                 // fx's resume notice is not the user's words: it replays as
                 // the notice the terminal app shows.
-                if (std.mem.eql(u8, text, continuation.resume_notice)) {
+                if (std.mem.eql(u8, text, turn_continuation.resume_notice)) {
                     try sendAgentHistoryChunk(state, alloc, session_id, session_runtime.resumed_request_notice.body);
                     continue;
                 }
@@ -2805,7 +2805,7 @@ test "ACP history replays a resume notice in steering as fx's notice, not the us
     defer capture.close(io_mod.getIo());
 
     var steering = [_]types.PersistedSteering{.{
-        .text = @constCast(continuation.resume_notice),
+        .text = @constCast(turn_continuation.resume_notice),
         .after_tool_step_count = 0,
     }};
     {
@@ -2820,7 +2820,7 @@ test "ACP history replays a resume notice in steering as fx's notice, not the us
 
     const captured = try readCaptured(&capture, alloc);
     defer alloc.free(captured);
-    try std.testing.expect(std.mem.find(u8, captured, continuation.resume_notice) == null);
+    try std.testing.expect(std.mem.find(u8, captured, turn_continuation.resume_notice) == null);
     try std.testing.expect(std.mem.find(u8, captured, session_runtime.resumed_request_notice.body) != null);
     try std.testing.expect(std.mem.find(u8, captured, "DONE_ANSWER") != null);
 }
