@@ -1227,13 +1227,13 @@ fn readProfile(
     const settings = readFile(arena, settings_path, max_settings_bytes, within) catch |err| switch (err) {
         error.FileNotFound => return null,
         error.OutOfMemory => return error.OutOfMemory,
-        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, settings_path, try readFailure(arena, err, max_settings_bytes) }),
+        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, settings_path, try readFailure(arena, err, max_settings_bytes, source) }),
     };
     const prompt_path = try std.Io.Dir.path.join(arena, &.{ dir, name, prompt_file_name });
     const prompt = readFile(arena, prompt_path, max_prompt_bytes, within) catch |err| switch (err) {
         error.FileNotFound => "",
         error.OutOfMemory => return error.OutOfMemory,
-        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, prompt_path, try readFailure(arena, err, max_prompt_bytes) }),
+        else => return fail(arena, failure, "profile '{s}': cannot read {s}: {s}", .{ name, prompt_path, try readFailure(arena, err, max_prompt_bytes, source) }),
     };
     return parse(arena, name, source, settings, prompt, failure) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -1242,8 +1242,9 @@ fn readProfile(
 }
 
 /// Why a profile file couldn't be read, in words, with the error's name when
-/// there are none for it. The result belongs to `arena`.
-fn readFailure(arena: Allocator, err: anyerror, max_bytes: usize) Allocator.Error![]const u8 {
+/// there are none for it. A link out of the profile's folder names where the
+/// profile comes from. The result belongs to `arena`.
+fn readFailure(arena: Allocator, err: anyerror, max_bytes: usize, source: Source) Allocator.Error![]const u8 {
     return switch (err) {
         error.StreamTooLong => if (max_bytes == max_prompt_bytes)
             "it is larger than the 256 KiB a profile file may hold"
@@ -1252,7 +1253,10 @@ fn readFailure(arena: Allocator, err: anyerror, max_bytes: usize) Allocator.Erro
         error.AccessDenied, error.PermissionDenied => "fx isn't allowed to read it",
         error.IsDir => "it is a folder, not a file",
         error.NotRegularFile => "it isn't a regular file",
-        error.OutsideRepository => "it links outside the repository, and a repository's profile may read only its own files",
+        error.OutsideRepository => if (source == .mod)
+            "it links outside the mod, and a mod's profile may read only its own files"
+        else
+            "it links outside the repository, and a repository's profile may read only its own files",
         else => try arena.print("the file couldn't be read ({s})", .{@errorName(err)}),
     };
 }
@@ -1261,10 +1265,16 @@ test "profile read failures name the limit or the cause instead of an error" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try std.testing.expect(std.mem.find(u8, try readFailure(arena, error.StreamTooLong, max_prompt_bytes), "256 KiB") != null);
-    try std.testing.expect(std.mem.find(u8, try readFailure(arena, error.StreamTooLong, max_settings_bytes), "64 KiB") != null);
-    try std.testing.expectEqualStrings("it is a folder, not a file", try readFailure(arena, error.IsDir, max_prompt_bytes));
-    try std.testing.expectEqualStrings("the file couldn't be read (SymLinkLoop)", try readFailure(arena, error.SymLinkLoop, max_prompt_bytes));
+    try std.testing.expect(std.mem.find(u8, try readFailure(arena, error.StreamTooLong, max_prompt_bytes, .project), "256 KiB") != null);
+    try std.testing.expect(std.mem.find(u8, try readFailure(arena, error.StreamTooLong, max_settings_bytes, .project), "64 KiB") != null);
+    try std.testing.expectEqualStrings("it is a folder, not a file", try readFailure(arena, error.IsDir, max_prompt_bytes, .project));
+    try std.testing.expectEqualStrings("the file couldn't be read (SymLinkLoop)", try readFailure(arena, error.SymLinkLoop, max_prompt_bytes, .project));
+    // A link out of the folder names the profile's own origin.
+    try std.testing.expect(std.mem.find(u8, try readFailure(arena, error.OutsideRepository, max_prompt_bytes, .project), "outside the repository") != null);
+    try std.testing.expectEqualStrings(
+        "it links outside the mod, and a mod's profile may read only its own files",
+        try readFailure(arena, error.OutsideRepository, max_prompt_bytes, .mod),
+    );
 }
 
 test "profile parsing stays bounded on fuzzed settings and prompts" {
@@ -1298,8 +1308,8 @@ fn fuzzProfileParse(_: void, smith: *std.testing.Smith) anyerror!void {
 /// Reads the profile file at `path`, up to `max_bytes`, into `arena`. It
 /// reads only a regular file, so a link to a terminal, a pipe, or a device
 /// can neither hang fx nor feed it. With `within`, the file's real path must
-/// lie inside that folder, so a link can't hand a repository's profile a
-/// file from elsewhere on the machine.
+/// lie inside that folder, so a link can't hand a repository's or a mod's
+/// profile a file from elsewhere on the machine.
 fn readFile(arena: Allocator, path: []const u8, max_bytes: usize, within: ?[]const u8) ![]u8 {
     const io = io_mod.getIo();
     const target = try io_mod.realpathAlloc(arena, path);
