@@ -546,6 +546,7 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   // A forced approval-screen failure left there would deny the next approval
   // of every test's fx.
   "FX_TEST_APPROVAL_SCREEN_FAIL",
+  "FX_TEST_RECOVERY_RETRY_BUDGET_MS",
   "FX_TEST_REPORT_DELIVERY_HELD",
   "FX_TEST_REPORT_DELIVERY_RELEASE",
   "FX_TEST_SESSION_WRITE_HELD",
