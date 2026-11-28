@@ -3144,9 +3144,9 @@ fn parseToolResultWith(
             try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
         else
             try exactObject(value, v4_keys), .extended = true },
-        // Versions 11 (D93), 12 (D94) and 13 (D103) changed only the
-        // execution's keys.
-        10, 11, 12, 13 => blk: {
+        // Versions 11 (D93), 12 (D94), 13 (D103) and 14 (D104) changed only
+        // the execution's keys.
+        10, 11, 12, 13, 14 => blk: {
             const keys = v4_keys.* ++ [_][]const u8{"review_feedback"};
             break :blk .{ .object = if (value == .object and value.object.contains("tool_images"))
                 try exactObject(value, &(keys ++ [_][]const u8{"tool_images"}))
@@ -5412,6 +5412,64 @@ test "a turn with toolbox records and an effort round-trips at version 14; toolb
         try std.testing.expectEqualStrings(captured[0], execution.runtime_context.?[0]);
         // Writing the decoded turn again gives the same bytes.
         const again: session.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("done"), .execution = execution } };
+        var reencoded: std.Io.Writer.Allocating = .init(alloc);
+        defer reencoded.deinit();
+        try writeHistoryTurn(&reencoded.writer, again);
+        try std.testing.expectEqualStrings(encoded.written(), reencoded.written());
+    }
+}
+
+test "a turn at version 14 reads its tool results back, with or without toolbox records (D104)" {
+    // Version 14 kept the tool result keys of version 13, so a saved turn
+    // with an effort and a tool step must resume.
+    const alloc = std.testing.allocator;
+    const effort = types.ReasoningEffort.literal;
+    const menu: types.SavedToolboxMenu = .{ .text = @constCast("lead\n- review"), .entries_hash = 7 };
+    const noted: types.ToolboxNoted = .{ .entries_hash = 7, .compaction_count = 0 };
+    const Case = struct { toolbox: bool, effort: bool, version: []const u8 };
+    for ([_]Case{
+        .{ .toolbox = false, .effort = true, .version = "\"schema_version\":14" },
+        .{ .toolbox = true, .effort = true, .version = "\"schema_version\":14" },
+        .{ .toolbox = true, .effort = false, .version = "\"schema_version\":13" },
+    }) |case| {
+        var calls = [_]session.ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "{}" }};
+        var results = [_]session.PersistedToolResult{persistedResultForTest("call", "read_file")};
+        var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+        const turn: session.HistoryTurn = .{ .assistant = .{
+            .user = .{ .text = @constCast("read") },
+            .assistant = @constCast("done"),
+            .execution = .{
+                .tool_steps = &steps,
+                .toolbox_menu = if (case.toolbox) menu else null,
+                .toolbox_noted = if (case.toolbox) noted else null,
+                .turn_effort = if (case.effort) effort("low") else null,
+                .effort_update = if (case.effort) effort("low") else null,
+            },
+        } };
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+        if (std.mem.find(u8, encoded.written(), case.version) == null) {
+            std.debug.print("expected {s} in {s}\n", .{ case.version, encoded.written() });
+            return error.TestUnexpectedResult;
+        }
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = try parseHistoryTurn(alloc, parsed.value);
+        defer session.freeHistoryTurn(alloc, decoded);
+        const execution = decoded.assistant.execution;
+        try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+        try std.testing.expectEqualStrings("call", execution.tool_steps[0].tool_results[0].tool_call_id);
+        try std.testing.expectEqualStrings("stale", execution.tool_steps[0].tool_results[0].output);
+        try std.testing.expectEqual(case.toolbox, execution.toolbox_menu != null);
+        if (case.effort) {
+            try std.testing.expectEqualStrings("low", execution.turn_effort.?.label());
+            try std.testing.expectEqualStrings("low", execution.effort_update.?.label());
+        } else {
+            try std.testing.expect(execution.turn_effort == null and execution.effort_update == null);
+        }
+        // Writing the decoded turn again gives the same bytes.
+        const again: session.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("read") }, .assistant = @constCast("done"), .execution = execution } };
         var reencoded: std.Io.Writer.Allocating = .init(alloc);
         defer reencoded.deinit();
         try writeHistoryTurn(&reencoded.writer, again);

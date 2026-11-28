@@ -67,9 +67,10 @@ const delta_version: u8 = 2;
 /// fx that reads only up to version 2 reports a newer journal instead of an
 /// invalid one.
 const naming_version: u8 = 3;
-/// The version of an event that holds a turn with context notes or a saved
-/// runtime context (D93, D94), whatever else it holds, so an fx that reads
-/// only up to version 3 reports a newer journal instead of an invalid one.
+/// The version of an event that holds a turn `session_codec` writes at
+/// execution schema 11 or later (`executionUsesNotesSchema`: D93, D94, D103,
+/// D104), whatever else it holds, so an fx that reads only up to version 3
+/// reports a newer journal instead of an invalid one.
 const notes_version: u8 = 4;
 /// The most event bytes one load accepts, and the most bytes one snapshot
 /// holds: each travels as one host attachment, and an attachment holds at
@@ -149,7 +150,7 @@ pub const Event = union(EventType) {
     tool_result: ToolResult,
 
     /// The version `Cursor.write` gives the event: `notes_version` when it
-    /// holds a turn with context notes or a saved runtime context, and
+    /// holds a turn at execution schema 11 or later, and
     /// `naming_version` when it names an image, one `stored` holds or one the
     /// session dropped.
     fn eventVersion(self: Event, stored: ?*const session_codec.StoredImages) u8 {
@@ -276,8 +277,8 @@ pub const Cursor = struct {
     }
 };
 
-/// Whether `event` holds a turn that `session_codec` writes as execution
-/// schema 11 or 12.
+/// Whether `event` holds a turn that `session_codec` writes at execution
+/// schema 11 or later.
 fn eventUsesNotesSchema(event: Event) bool {
     return switch (event) {
         .turn_committed => |turn| session_codec.turnUsesNotesSchema(turn),
@@ -319,8 +320,8 @@ const snapshot_version: u8 = 2;
 /// Version 2's layout, with an open turn that names images: ones the host
 /// stored, or ones the session dropped.
 const snapshot_naming_version: u8 = 3;
-/// Version 2's layout, with an open turn that has context notes or a saved
-/// runtime context (D93, D94), whether or not it names images.
+/// Version 2's layout, with an open turn at execution schema 11 or later
+/// (`session_codec.executionUsesNotesSchema`), whether or not it names images.
 const snapshot_notes_version: u8 = 4;
 const snapshot_header_bytes = snapshot_magic.len + 1 + 8 + 8 + 1;
 
@@ -364,8 +365,8 @@ pub fn encodeSnapshotNamingImages(
     return encodeSnapshotWith(alloc, seq, turn, last_turn_id, open_turn, checkpoint, snapshot_naming_version);
 }
 
-/// Like `encodeSnapshot`, for an `open_turn` whose progress has context notes
-/// or a saved runtime context (`session_codec.executionUsesNotesSchema`),
+/// Like `encodeSnapshot`, for an `open_turn` whose progress is at execution
+/// schema 11 or later (`session_codec.executionUsesNotesSchema`),
 /// whether or not it names images.
 pub fn encodeSnapshotWithNotes(
     alloc: Allocator,
@@ -1990,6 +1991,53 @@ test "a turn with context notes or a saved runtime context is a version 4 event 
     defer alloc.free(snapshot);
     try std.testing.expectEqual(snapshot_notes_version, snapshot[snapshot_magic.len]);
     try std.testing.expectEqualStrings("{}", (try parseSnapshot(snapshot)).open_turn.?);
+}
+
+test "a turn with a saved effort and a tool result folds back from a version 4 event and checkpoint (D104)" {
+    // The codec writes this turn's execution as schema 14, and the journal
+    // and checkpoint read it back through the codec.
+    const alloc = std.testing.allocator;
+    var turn = try testTurn(alloc, "read", "done");
+    defer types.freeHistoryTurn(alloc, turn);
+    const calls = [_]types.ToolCall{.{ .id = "call-read", .name = "read_file", .arguments_json = "{}" }};
+    const results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("contents"),
+        .output_bytes = 8,
+        .stored_output_bytes = 8,
+    }};
+    const steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = try types.dupeToolCallSlice(alloc, &calls),
+        .tool_results = try types.dupePersistedToolResults(alloc, &results),
+    }};
+    turn.assistant.execution.tool_steps = try alloc.dupe(types.ToolExecutionStep, &steps);
+    turn.assistant.execution.turn_effort = types.ReasoningEffort.literal("low");
+    turn.assistant.execution.effort_update = types.ReasoningEffort.literal("low");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    _ = try (Cursor{}).write(&out.writer, .{ .turn_committed = turn });
+    try out.writer.writeByte(']');
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "[{\"v\":4,"));
+    var folded = try fold(alloc, out.written());
+    defer folded.deinit(alloc);
+
+    const checkpoint = try checkpoint_codec.encode(alloc, &.{turn}, .{}, .{});
+    defer alloc.free(checkpoint);
+    try std.testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, checkpoint[4..6], .little));
+    var decoded = try checkpoint_codec.decode(alloc, checkpoint);
+    defer decoded.deinit(alloc);
+
+    for ([_]types.HistoryTurn{ folded.history[0], decoded.history[0] }) |read| {
+        const execution = read.assistant.execution;
+        try std.testing.expectEqualStrings("low", execution.turn_effort.?.label());
+        try std.testing.expectEqualStrings("low", execution.effort_update.?.label());
+        try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+        try std.testing.expectEqualStrings("contents", execution.tool_steps[0].tool_results[0].output);
+    }
 }
 
 test "one fold names every image the host did not stage" {
