@@ -3720,8 +3720,8 @@ const App = struct {
 
     /// Runs an answer or cancel of the question on main's screen in the
     /// context of the subagent that asked it. False for main's own question.
-    pub fn answerLentQuestion(self: *App, comptime body: fn (*App, *agents.Agent) anyerror!void) !bool {
-        return AgentsAppRuntime.answerLentQuestion(self, body);
+    pub fn answerLentQuestion(self: *App, agent: *agents.Agent, comptime body: fn (*App, *agents.Agent) anyerror!void) !bool {
+        return AgentsAppRuntime.answerLentQuestion(self, agent, body);
     }
 
     /// Readies the subagent on screen, if any, for a turn the user starts

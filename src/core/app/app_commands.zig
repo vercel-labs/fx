@@ -279,6 +279,36 @@ fn requestResumeExit(app: anytype) void {
     app.should_exit = true;
 }
 
+pub fn writeStopSubagentsNotice(app: anytype, result: anytype) !void {
+    if (result.stopped > 0 or result.failed == 0) {
+        var body_buf: [64]u8 = undefined;
+        const body = if (result.stopped == 0)
+            "No subagent is working."
+        else
+            try std.mem.print(&body_buf, "Stopped {d} subagent{s}.", .{ result.stopped, if (result.stopped == 1) "" else "s" });
+        try app.writeDomainNotice(.{
+            .topic = "subagent",
+            .tone = .neutral,
+            .body = body,
+        }, true);
+    }
+    if (result.first_error) |err| {
+        debug_trace.logf("subagent", "stop_subagents_notice failed={d} err={s}", .{ result.failed, @errorName(err) });
+        var plain_buf: [64]u8 = undefined;
+        var err_buf: [128]u8 = undefined;
+        const err_body = try std.mem.print(
+            &err_buf,
+            "Failed to stop {d} subagent{s}: {s}.",
+            .{ result.failed, if (result.failed == 1) "" else "s", types.plainErrorText(@errorName(err), &plain_buf) },
+        );
+        try app.writeDomainNotice(.{
+            .topic = "subagent",
+            .tone = .@"error",
+            .body = err_body,
+        }, true);
+    }
+}
+
 pub fn Handlers(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -482,32 +512,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandStopSubagents(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !@hasDecl(App, "stopWorkingSubagents")) return;
-            const result = app.stopWorkingSubagents();
-            if (result.stopped > 0 or result.failed == 0) {
-                var body_buf: [64]u8 = undefined;
-                const body = if (result.stopped == 0)
-                    "No subagent is working."
-                else
-                    try std.mem.print(&body_buf, "Stopped {d} subagent{s}.", .{ result.stopped, if (result.stopped == 1) "" else "s" });
-                try app.writeDomainNotice(.{
-                    .topic = "subagent",
-                    .tone = .neutral,
-                    .body = body,
-                }, true);
-            }
-            if (result.first_error) |err| {
-                var err_buf: [128]u8 = undefined;
-                const err_body = try std.mem.print(
-                    &err_buf,
-                    "Failed to stop {d} subagent{s}: {s}.",
-                    .{ result.failed, if (result.failed == 1) "" else "s", @errorName(err) },
-                );
-                try app.writeDomainNotice(.{
-                    .topic = "subagent",
-                    .tone = .@"error",
-                    .body = err_body,
-                }, true);
-            }
+            try writeStopSubagentsNotice(app, app.stopWorkingSubagents());
         }
 
         fn commandResumeSession(ctx: *anyopaque) !void {
@@ -2992,7 +2997,7 @@ test "/stop command writes stopped count or idle notice" {
     app.fail_count = 1;
     app.first_error = error.OutOfMemory;
     try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
-    try std.testing.expectEqualStrings("Stopped 2 subagents.\nFailed to stop 1 subagent: OutOfMemory.", app.notices.items);
+    try std.testing.expectEqualStrings("Stopped 2 subagents.\nFailed to stop 1 subagent: out of memory.", app.notices.items);
     try std.testing.expectEqual(types.NoticeTone.@"error", app.notice_tone.?);
 
     app.notices.clearRetainingCapacity();
@@ -3000,6 +3005,6 @@ test "/stop command writes stopped count or idle notice" {
     app.fail_count = 1;
     app.first_error = error.OutOfMemory;
     try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
-    try std.testing.expectEqualStrings("Failed to stop 1 subagent: OutOfMemory.", app.notices.items);
+    try std.testing.expectEqualStrings("Failed to stop 1 subagent: out of memory.", app.notices.items);
     try std.testing.expectEqual(types.NoticeTone.@"error", app.notice_tone.?);
 }

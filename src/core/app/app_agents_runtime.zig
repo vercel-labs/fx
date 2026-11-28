@@ -1336,12 +1336,22 @@ pub fn Runtime(comptime App: type) type {
             child.agent.question_prompt.discard(app.alloc, "owner_cleared");
         }
 
+        /// The subagent whose question `agent`'s prompt shows, while that
+        /// instance is in context: an answer or cancel there goes to that
+        /// subagent's worker.
+        pub fn lentQuestion(app: *App, agent: *AppAgent) ?*ChildAgent {
+            const lender = app.question_lender orelse return null;
+            if (agent != rootInstance(app, lender)) return null;
+            return lender;
+        }
+
         /// Runs `body`, an answer or a cancel, in the context of the subagent
         /// whose question the instance's screen shows, so the answer reaches
         /// its worker and joins its conversation. False when the question is
         /// the instance's own.
-        pub fn answerLentQuestion(app: *App, comptime body: fn (*App, *AppAgent) anyerror!void) !bool {
-            const child = returnQuestion(app) orelse return false;
+        pub fn answerLentQuestion(app: *App, agent: *AppAgent, comptime body: fn (*App, *AppAgent) anyerror!void) !bool {
+            if (lentQuestion(app, agent) == null) return false;
+            const child = returnQuestion(app).?;
             const Answer = struct {
                 fn run(_: void, a: *App, lender: *agents.Agent) anyerror!void {
                     try body(a, lender);
@@ -4969,4 +4979,138 @@ test "stopWorkingSubagents stops only working subagents in the active session tr
     try std.testing.expectEqual(@as(usize, 1), partial.failed);
     try std.testing.expectEqual(error.OutOfMemory, partial.first_error.?);
     try std.testing.expect(after_fail.agent.worker.isTurnCancelRequested());
+}
+
+test "stopWorkingSubagents stops two question subagents when the second one's question is lent to main" {
+    const alloc = std.testing.allocator;
+    const app_commands = @import("app_commands.zig");
+    const composer_input = @import("../input/runtime.zig");
+    const FakeLentQuestionStopApp = struct {
+        alloc: Allocator,
+        main_agent: agents.Agent = .{},
+        main_screen: ScreenSlot = .{},
+        screen_owner: ?*agents.Agent = null,
+        agent_on_screen: ?*ChildAgent = null,
+        child_agents: std.ArrayList(*ChildAgent) = .empty,
+        approval_lender: ?*ChildAgent = null,
+        question_lender: ?*ChildAgent = null,
+        wait_card_lender: ?*ChildAgent = null,
+        pacer: AssistantPacer = .{},
+        fast_mode: bool = false,
+        approval_screen: @import("../../ui/footer/interaction_state.zig").ApprovalScreenState = .{},
+        permission_state: struct { authority_mutex: std.Io.Mutex = .init } = .{},
+        instances: struct {
+            first_open: bool = true,
+            agents_menu: struct { open: bool = false } = .{},
+        } = .{},
+        input_runtime: composer_input.Runtime = .{},
+        shell: transcript_runtime.TranscriptRuntime = .{},
+        metrics: types.Metrics = .{},
+        notices: std.ArrayList(u8) = .empty,
+
+        pub fn stopStream(_: *@This(), agent: *agents.Agent) void {
+            agent.stream = .{};
+        }
+
+        pub fn appendReplaceableTranscriptLine(self: *@This(), text: []const u8) !u32 {
+            return self.shell.appendReplaceableTranscriptLine(self.alloc, &self.metrics, text);
+        }
+
+        pub fn appendReplaceableTranscriptLineClassified(
+            self: *@This(),
+            text: []const u8,
+            class: transcript_runtime.RawEntryClass,
+        ) !u32 {
+            return self.shell.appendReplaceableTranscriptLineClassified(self.alloc, &self.metrics, text, class);
+        }
+
+        pub fn answerLentQuestion(
+            self: *@This(),
+            agent: *agents.Agent,
+            comptime body: fn (*@This(), *agents.Agent) anyerror!void,
+        ) !bool {
+            return Runtime(@This()).answerLentQuestion(self, agent, body);
+        }
+
+        pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            if (self.notices.items.len > 0) try self.notices.append(self.alloc, '\n');
+            try self.notices.appendSlice(self.alloc, notice.body);
+        }
+    };
+
+    var app = FakeLentQuestionStopApp{ .alloc = alloc };
+    defer {
+        app.notices.deinit(alloc);
+        app.main_agent.worker.deinit(alloc);
+        app.main_screen.deinit(alloc);
+        app.main_agent.question_prompt.deinit(alloc);
+        app.pacer.deinit(alloc);
+        app.input_runtime.deinit(alloc);
+        app.shell.deinit(alloc);
+    }
+
+    var main_host: subagent_tool_host.Runtime = undefined;
+    app.main_agent.session_persistence.subagent_host = &main_host;
+
+    var child_x: ChildAgent = .{
+        .id = try alloc.dupe(u8, "child-x"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &child_x);
+    var child_y: ChildAgent = .{
+        .id = try alloc.dupe(u8, "child-y"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer deinitTestChild(alloc, &child_y);
+
+    const opts = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Proceed?", .options = &opts }};
+    try child_x.agent.question_prompt.syncFrom(alloc, &entries);
+    try child_y.agent.question_prompt.syncFrom(alloc, &entries);
+
+    // X appears before Y in the stop loop; Y's question is lent to main's screen.
+    try app.child_agents.appendSlice(alloc, &.{ &child_x, &child_y });
+    defer app.child_agents.deinit(alloc);
+
+    try std.testing.expect(child_x.agent.worker.beginDirectProcessing(1));
+    defer child_x.agent.worker.finishProcessing();
+    try std.testing.expect(child_y.agent.worker.beginDirectProcessing(2));
+    defer child_y.agent.worker.finishProcessing();
+
+    Runtime(FakeLentQuestionStopApp).lendQuestion(&app, &app.main_agent, &child_y);
+    try std.testing.expectEqual(&child_y, app.question_lender.?);
+    try std.testing.expect(app.main_agent.question_prompt.isActive());
+
+    const result = Runtime(FakeLentQuestionStopApp).stopWorkingSubagents(&app);
+    try app_commands.writeStopSubagentsNotice(&app, result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.stopped);
+    try std.testing.expectEqual(@as(usize, 0), result.failed);
+    try std.testing.expectEqualStrings("Stopped 2 subagents.", app.notices.items);
+    try std.testing.expect(child_x.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(child_y.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(!child_x.agent.question_prompt.isActive());
+    try std.testing.expect(!child_y.agent.question_prompt.isActive());
+    try std.testing.expect(!app.main_agent.question_prompt.isActive());
+    try std.testing.expect(app.question_lender == null);
+
+    const rendered_x = try transcript_runtime.renderEntriesToBytes(
+        alloc,
+        child_x.screen.transcript.notebook.entries.items,
+        80,
+        .{},
+    );
+    defer alloc.free(rendered_x);
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, rendered_x, "\n"), "Cancelled"));
+
+    const rendered_y = try transcript_runtime.renderEntriesToBytes(
+        alloc,
+        child_y.screen.transcript.notebook.entries.items,
+        80,
+        .{},
+    );
+    defer alloc.free(rendered_y);
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, rendered_y, "\n"), "Cancelled"));
 }
