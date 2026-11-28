@@ -5,6 +5,7 @@ const host_target = @import("../../core/hosts/target.zig");
 const command_admission = @import("../../core/permissions/command_admission.zig");
 const command_contract = @import("../../core/execution/command_contract.zig");
 const command_environment = @import("../../core/execution/command_environment.zig");
+const config_runtime = @import("../../core/config/config_runtime.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
@@ -1760,6 +1761,39 @@ fn placeRunStart(
     return .{ .placed = placed };
 }
 
+const SetupIntentLoad = union(enum) {
+    ok: sandbox_runner.SetupIntent,
+    refused: []const u8,
+};
+
+fn loadSetupIntent(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    fx_home: []const u8,
+    workspace_root: []const u8,
+) std.mem.Allocator.Error!SetupIntentLoad {
+    const canonical_root = io_mod.realpathAlloc(arena, workspace_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => workspace_root,
+    };
+    const settings_path = try std.Io.Dir.path.join(arena, &.{ fx_home, "settings.json" });
+    const workspace_settings = try std.Io.Dir.path.join(arena, &.{ canonical_root, ".fx.json" });
+    const paths: config_runtime.Paths = .{
+        .user_settings = @constCast(settings_path),
+        .workspace_settings = @constCast(workspace_settings),
+        .workspace_root = @constCast(canonical_root),
+    };
+    var settings = config_runtime.loadMergedSettingsFromPaths(gpa, paths) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .refused = try sandbox_runner.settingsErrorText(arena, settings_path, err) },
+    };
+    defer settings.deinit(gpa);
+    return .{ .ok = .{
+        .team = if (settings.sandbox_team) |team| try arena.dupe(u8, team) else null,
+        .project = if (settings.sandbox_project) |project| try arena.dupe(u8, project) else null,
+    } };
+}
+
 /// Runs remote setup for a built-in remote run (R4 to R5, U1 to U11). Returns
 /// the refusal text, or null when the run may go on. A canceled setup gives
 /// error.Cancelled. The session, turn and responder come from the tool context,
@@ -1773,11 +1807,18 @@ fn remoteSetupRefusal(
     if (comptime host_target.is_wasm) return null;
     const policy = ctx.sandbox_policy orelse return null;
     if (!policy.needsVercelDestination(ctx.workspace_root, command, runner)) return null;
+    const intent = switch (try loadSetupIntent(ctx.allocator, arena, policy.fx_home, ctx.workspace_root)) {
+        .ok => |found| found,
+        .refused => |text| {
+            tool_admission.traceRefusal("remote_setup", text);
+            return text;
+        },
+    };
     var no_cancel = std.atomic.Value(bool).init(false);
     const setup_call = sandbox_runner.remoteCall(
         arena,
         ctx.workspace_root,
-        .{},
+        intent,
         ctx.remote_setup.allowed,
         ctx.remote_setup.session_key,
         ctx.remote_setup.turn_id,
@@ -3598,6 +3639,49 @@ test "placeRunStart refuses an unconsented repo without channel and allows isola
             try std.testing.expect(approved.ctx.sandbox != null);
         },
     }
+}
+
+test "remoteSetupRefusal reads live sandbox_team and sandbox_project settings and refuses unreadable settings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const policy = try loadRemoteSetupPolicy(std.testing.allocator, tmp.dir, remote_ready_config);
+    defer policy.destroy();
+    try primeRemoteLoginUser(policy);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "work");
+    const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, "work");
+    const key = try sandbox_runner.repoKey(arena, "usr_1", root);
+    try sandbox_runner.writeConsentForTest(arena, policy.fx_home, key, "team_1", "prj_1", 1_800_000_000);
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .sandbox_policy = policy,
+        .workspace_root = root,
+        .remote_setup = .{ .allowed = true, .session_key = "session-a", .turn_id = 5 },
+    };
+
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "fxhome/settings.json",
+        .data = "{\"sandbox_team\":\"acme\",\"sandbox_project\":\"repo\"}",
+    });
+    try std.testing.expectEqual(@as(?[]const u8, null), try remoteSetupRefusal(ctx, arena, "zig build test", .remote));
+
+    // Updating settings.json without reloading Policy takes effect on the next call.
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "fxhome/settings.json",
+        .data = "{\"sandbox_team\":\"other-team\",\"sandbox_project\":\"repo\"}",
+    });
+    const changed = (try remoteSetupRefusal(ctx, arena, "zig build test", .remote)) orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqualStrings(remote_e7_text, changed);
+
+    // A malformed settings file refuses with a clear settings error.
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "fxhome/settings.json",
+        .data = "{not valid json",
+    });
+    const broken = (try remoteSetupRefusal(ctx, arena, "zig build test", .remote)) orelse return error.TestExpectedRefusal;
+    try std.testing.expect(std.mem.find(u8, broken, "could not read settings") != null);
 }
 
 test "runner with the runner field off gets the unknown field result that foo gets" {

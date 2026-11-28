@@ -8,6 +8,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const workspace_trusted_key = "trusted";
+pub const sandbox_team_key = "sandbox_team";
+pub const sandbox_project_key = "sandbox_project";
 
 pub const Where = enum {
     /// Profile `settings.json` and its workspace overrides. A project

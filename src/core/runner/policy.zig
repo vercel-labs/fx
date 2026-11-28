@@ -1203,9 +1203,10 @@ test "ensureRemote refuses headless without consent, and accepts isolated once r
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const isolated_config_text = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"isolated\"}],\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"repo\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
     const policy = try load(alloc, fx_home, "/Users/example", "/usr/bin:/bin");
     defer policy.destroy();
-    try writeConfigFile(tmp.dir, remote_config_text);
+    try writeConfigFile(tmp.dir, isolated_config_text);
     try policy.remote.setDestination(.{
         .team_id = "team_1",
         .team_slug = "acme",
@@ -1221,6 +1222,7 @@ test "ensureRemote refuses headless without consent, and accepts isolated once r
 
     const repo = try makeRepo(alloc, tmp.dir);
     defer alloc.free(repo);
+    try testing.expect(policy.needsVercelDestination(repo, "zig build test", null));
     var cancel = std.atomic.Value(bool).init(false);
     const without_consent = try policy.ensureRemote(setup_host.callFor(arena, repo, .{}, true, "session-a", 5, null, &cancel));
     try testing.expectEqual(std.meta.Tag(setup_host.Result).refused, std.meta.activeTag(without_consent));
@@ -1230,7 +1232,7 @@ test "ensureRemote refuses headless without consent, and accepts isolated once r
     try consent.write(arena, fx_home, key, "team_1", "prj_1", 1_800_000_000);
     const with_consent = try policy.ensureRemote(setup_host.callFor(arena, repo, .{}, true, "session-a", 5, null, &cancel));
     try testing.expectEqual(std.meta.Tag(setup_host.Result).ready, std.meta.activeTag(with_consent));
-    const isolated = try policy.place(arena, repo, "zig build test", .isolated, null);
+    const isolated = try policy.place(arena, repo, "zig build test", null, null);
     try testing.expectEqual(command_environment.Placement.isolated, isolated.placement);
     try testing.expect(isolated.launch != null);
 }

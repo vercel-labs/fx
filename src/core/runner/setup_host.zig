@@ -12,6 +12,7 @@ const consent = @import("consent.zig");
 const remote_slot = @import("remote_slot.zig");
 const config = @import("config.zig");
 const config_write = @import("config_write.zig");
+const settings_keys = @import("../config/settings_keys.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -25,8 +26,8 @@ const TokenHash = remote_slot.TokenHash;
 const host_wire: @import("../mcp/elicitation.zig").Wire = .modern_mcp;
 const host_operation: @import("../mcp/elicitation.zig").Operation = .{ .tools_call = "" };
 
-pub const team_setting_key = "sandbox_team";
-pub const project_setting_key = "sandbox_project";
+pub const team_setting_key = settings_keys.sandbox_team_key;
+pub const project_setting_key = settings_keys.sandbox_project_key;
 
 const copy_key = "copy";
 const choice_yes = "Yes";
@@ -705,6 +706,13 @@ fn projectCreateFailedText(arena: std.mem.Allocator, failure: vercel.Failure) st
     return arena.print(
         "fx did not run this command: could not create project `{s}` ({s}). Ask the person for a project name and run `fx config set {s} <name>`.",
         .{ vercel.sandbox_project_name, detail, project_setting_key },
+    );
+}
+
+pub fn settingsErrorText(arena: std.mem.Allocator, settings_path: []const u8, err: anyerror) std.mem.Allocator.Error![]const u8 {
+    return arena.print(
+        "fx did not run this command: could not read settings {f} ({s}). Fix it and try again.",
+        .{ text_utils.terminalSafe(settings_path), @errorName(err) },
     );
 }
 
