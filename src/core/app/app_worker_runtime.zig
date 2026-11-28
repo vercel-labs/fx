@@ -1671,6 +1671,12 @@ pub fn Runtime(comptime App: type) type {
                         try handlers.error_text(handlers.ctx, notice);
                     },
                     .restore_failed_prompt => |prompt| {
+                        // An open `/effort` menu holds only its query in the
+                        // composer; it closes first and gives back the draft
+                        // it set aside, so the rule below sees the real draft.
+                        if (comptime @hasDecl(@TypeOf(app.input_runtime), "cancelEffortMenu")) {
+                            _ = app.input_runtime.cancelEffortMenu(app.alloc, "failed_prompt_restored");
+                        }
                         // Never clobber a draft the user typed while the doomed
                         // turn was still retrying; only an empty composer gets
                         // the failed prompt back.

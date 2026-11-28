@@ -278,6 +278,26 @@ pub const McpToolName = struct {
     tool: []const u8,
 };
 
+/// Where an admitted shell command runs: on this machine (`local`), in the
+/// kept remote sandbox (`remote`), or in a fresh isolated sandbox (`isolated`).
+/// Live lifecycle events and in-memory transcript records carry it; saved
+/// sessions never write it (R3.5).
+pub const CommandPlacement = enum {
+    local,
+    remote,
+    isolated,
+
+    /// The runner phrase placed after the row verb (`"on remote"`, `"on isolated"`),
+    /// or null for a local run whose text does not change.
+    pub fn runnerPhrase(self: CommandPlacement) ?[]const u8 {
+        return switch (self) {
+            .local => null,
+            .remote => "on remote",
+            .isolated => "on isolated",
+        };
+    }
+};
+
 pub const ToolLifecycleEvent = union(enum) {
     provisional: struct {
         id: ToolLifecycleId,
@@ -308,6 +328,9 @@ pub const ToolLifecycleEvent = union(enum) {
         resolved_display_target: ?[]const u8 = null,
         /// As `provisional.mcp_tool`.
         mcp_tool: ?McpToolName = null,
+        /// Where an admitted shell command runs, when admission placed it.
+        /// Live memory only; saved sessions never write it (R3.5).
+        command_placement: ?CommandPlacement = null,
     },
     progress: struct {
         id: ToolLifecycleId,
@@ -1108,6 +1131,9 @@ pub const ToolCall = struct {
     /// decide it as the tool it replaced. Borrowed only for this action.
     /// Copies and durable/provider encodings omit it.
     toolbox_lookup: ?ToolboxLookup = null,
+    /// Where an admitted shell command runs, when admission placed it.
+    /// Action-scoped only; copies and durable/provider encodings omit it (R3.5).
+    command_placement: ?CommandPlacement = null,
 
     /// The name the model called, which this call's result goes back under.
     pub fn calledName(self: ToolCall) []const u8 {
@@ -1476,6 +1502,9 @@ pub const ToolResultMemory = struct {
     tool_image_handle: ?[]const u8 = null,
     output_handle: ?[]const u8 = null,
     preview: ?[]const u8 = null,
+    /// The notice lines of a shell run's result, joined by newlines, without the shell snapshot
+    /// warning (`shell_result_notice.visibleNotice`). The person sees them; the model sees the result.
+    notice: ?[]const u8 = null,
     output_bytes: usize = 0,
     stored_output_bytes: usize = 0,
     truncated: bool = false,
@@ -1492,6 +1521,9 @@ pub const ToolResultMemory = struct {
     /// A `subagent` message that made a new subagent, so its row reads
     /// "Started" rather than "Messaged". The model never sees it.
     subagent_started: bool = false,
+    /// Where an admitted shell command ran, when admission placed it.
+    /// Live memory only; saved sessions never write it (R3.5).
+    command_placement: ?CommandPlacement = null,
 };
 
 /// A shell command that crossed the quiet limit during a wait: its command
@@ -1873,6 +1905,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
         .subagent_started = memory.subagent_started,
+        .command_placement = memory.command_placement,
     };
 }
 
@@ -1908,6 +1941,7 @@ test "dupeToolResultMemory copies survive teardown of every source allocation" {
         .model_view_covers_full_file = false,
         .command_output_replay = .{ .available = .{ .handle = try alloc.dupe(u8, "cmd-replay-1"), .framed_bytes = 42 } },
         .command_process_presentation = .{ .exit_code = 3 },
+        .command_placement = .remote,
     };
     const copy = try dupeToolResultMemory(alloc, source);
     // Tear down every source allocation; the testing allocator scribbles
@@ -1938,6 +1972,8 @@ test "dupeToolResultMemory copies survive teardown of every source allocation" {
         .unavailable => return error.TestUnexpectedResult,
     }
     try std.testing.expect(copy.command_process_presentation.? == .exit_code);
+    try std.testing.expectEqual(?CommandPlacement, @TypeOf(copy.command_placement));
+    try std.testing.expectEqual(@as(?CommandPlacement, .remote), copy.command_placement);
 
     freeToolResultMemory(alloc, copy);
 }
@@ -4199,11 +4235,13 @@ test "dupeToolCall drops action scoped bindings" {
         .arguments_json = "{\"open\":\"/skills/workflow\"}",
         .toolbox_lookup = .{ .permission = "skill", .target = "workflow" },
         .resolved_display_target = "more output from zig build test",
+        .command_placement = .remote,
     };
     const copy = try dupeToolCall(std.testing.allocator, source);
     defer freeToolCall(std.testing.allocator, copy);
     try std.testing.expect(copy.toolbox_lookup == null);
     try std.testing.expect(copy.resolved_display_target == null);
+    try std.testing.expect(copy.command_placement == null);
     try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }
 

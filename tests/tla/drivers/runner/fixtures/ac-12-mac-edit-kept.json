@@ -1,0 +1,27 @@
+{
+  "covers": [
+    "AC-12"
+  ],
+  "title": "The command changes a.txt and the user edits a.txt on the Mac during the run: the Mac keeps its version.",
+  "run": {
+    "events": [
+      "push_ok",
+      "send_ran",
+      "id_arrives",
+      "cmd_edits",
+      "mac_edit",
+      "cmd_exits",
+      "stream_end",
+      "bring_back_kept",
+      "exit_cmd"
+    ]
+  },
+  "tamper": {
+    "run": "overwrite-mac"
+  },
+  "drive": {
+    "command": "echo remote > a.txt; sleep 1",
+    "file": "a.txt",
+    "macEdit": true
+  }
+}

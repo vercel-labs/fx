@@ -838,9 +838,54 @@ test "pollInput reports a revoked or closed descriptor as closed" {
     try std.testing.expect(poll_result.closed());
 }
 
-fn testSigWinchWake(_: std.posix.SIG) callconv(.c) void {
-    notifyResizeWakePipe();
-}
+/// Test support for SIGWINCH. The handler wakes `pollInput` and then counts its
+/// runs, so a peer thread can wait for the handler and for `pollInput` to take
+/// the wake instead of sleeping (RULES.md R7.3).
+pub const test_winch = if (builtin.is_test) struct {
+    /// How long a test lets `pollInput` or a probe wait. A lost wake waits all
+    /// of it; the tests expect the wake in under half, which leaves a loaded
+    /// runner room.
+    pub const poll_timeout_ms: i32 = 5_000;
+    /// How long a peer thread waits for the handler or for the drained wake pipe.
+    pub const peer_wait_ms: i64 = 2_000;
+
+    var handled: std.atomic.Value(u32) = .init(0);
+
+    /// Counts after the wake byte is written, so a count the peer sees means the byte is there.
+    pub fn handler(_: std.posix.SIG) callconv(.c) void {
+        notifyResizeWakePipe();
+        _ = handled.fetchAdd(1, .release);
+    }
+
+    pub fn count() u32 {
+        return handled.load(.acquire);
+    }
+
+    /// Yields until the handler has run more than `seen` times. False at the deadline.
+    pub fn awaitHandled(seen: u32, timeout_ms: i64) bool {
+        const deadline_ms = io_mod.milliTimestamp() + timeout_ms;
+        while (count() <= seen) {
+            if (io_mod.milliTimestamp() >= deadline_ms) return false;
+            // A failed yield only spins once more; the deadline still ends the wait.
+            std.Thread.yield() catch {};
+        }
+        return true;
+    }
+
+    /// Yields until the wake pipe is empty, which means `pollInput` took the
+    /// wake. False at the deadline.
+    pub fn awaitWakeDrained(wake_fd: std.posix.fd_t, timeout_ms: i64) bool {
+        const deadline_ms = io_mod.milliTimestamp() + timeout_ms;
+        while (true) {
+            var fds = [_]std.posix.pollfd{.{ .fd = wake_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, 0) catch return false;
+            if (ready == 0) return true;
+            if (io_mod.milliTimestamp() >= deadline_ms) return false;
+            // A failed yield only spins once more; the deadline still ends the wait.
+            std.Thread.yield() catch {};
+        }
+    }
+} else struct {};
 
 test "pollInput wakes promptly on SIGWINCH during a long timeout" {
     if (comptime !supports_resize_signal) return error.SkipZigTest;
@@ -850,27 +895,30 @@ test "pollInput wakes promptly on SIGWINCH during a long timeout" {
     defer closeTestFd(stdin_pipe[1]);
 
     var terminal = TerminalState{ .stdin_fd = stdin_pipe[0] };
-    terminal.installResizeSignal(testSigWinchWake);
+    terminal.installResizeSignal(test_winch.handler);
     defer terminal.uninstallResizeSignal();
 
     const Sender = struct {
-        fn run(pid: std.c.pid_t) void {
-            // Makes the signal likely to land during `poll`; a signal before it leaves a byte in the pipe, so either order passes.
-            io_mod.sleep(5 * std.time.ns_per_ms);
+        fn run(pid: std.c.pid_t, polling: *std.Io.Event) void {
+            // Sends once the main thread is about to poll; a signal before the poll leaves a byte in the pipe, so either order passes.
+            polling.waitUncancelable(io_mod.getIo());
             _ = std.c.kill(pid, std.posix.SIG.WINCH);
         }
     };
-    const pid = std.c.getpid();
-    var thread = try std.Thread.spawn(.{}, Sender.run, .{pid});
+    var polling: std.Io.Event = .unset;
+    const seen = test_winch.count();
+    var thread = try std.Thread.spawn(.{}, Sender.run, .{ std.c.getpid(), &polling });
     defer thread.join();
 
     const started_ms = io_mod.milliTimestamp();
-    const poll_result = try terminal.pollInput(500);
+    polling.set(io_mod.getIo());
+    const poll_result = try terminal.pollInput(test_winch.poll_timeout_ms);
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
 
+    try std.testing.expect(test_winch.awaitHandled(seen, test_winch.peer_wait_ms));
     try std.testing.expect(!poll_result.readable);
     try std.testing.expect(!poll_result.closed());
-    try std.testing.expect(elapsed_ms < 50);
+    try std.testing.expect(elapsed_ms < @divTrunc(test_winch.poll_timeout_ms, 2));
 
     // Uninstall disarms the signal's write target and keeps the pipe open.
     terminal.uninstallResizeSignal();
@@ -888,27 +936,28 @@ test "queryCursorPosition keeps waiting across SIGWINCH until reply arrives" {
     defer closeTestFd(stdin_pipe[1]);
 
     var terminal = TerminalState{ .stdin_fd = stdin_pipe[0] };
-    terminal.installResizeSignal(testSigWinchWake);
+    terminal.installResizeSignal(test_winch.handler);
     defer {
         terminal.uninstallResizeSignal();
         closeWakePipe(&terminal.resize_wake_pipe);
     }
 
     const Peer = struct {
-        fn run(pid: std.c.pid_t, write_fd: std.posix.fd_t) void {
-            io_mod.sleep(5 * std.time.ns_per_ms);
+        fn run(pid: std.c.pid_t, write_fd: std.posix.fd_t, wake_fd: std.posix.fd_t, seen: u32) void {
             _ = std.c.kill(pid, std.posix.SIG.WINCH);
-            io_mod.sleep(20 * std.time.ns_per_ms);
+            // The reply goes only after the probe took the wake, so the wake comes first; with no wake the probe reaches its deadline and the test fails.
+            if (!test_winch.awaitHandled(seen, test_winch.peer_wait_ms)) return;
+            if (!test_winch.awaitWakeDrained(wake_fd, test_winch.peer_wait_ms)) return;
             const reply = "\x1b[12;34R";
             _ = std.c.write(write_fd, reply.ptr, reply.len);
         }
     };
     const pid = std.c.getpid();
-    var thread = try std.Thread.spawn(.{}, Peer.run, .{ pid, stdin_pipe[1] });
+    var thread = try std.Thread.spawn(.{}, Peer.run, .{ pid, stdin_pipe[1], terminal.resize_wake_pipe[0], test_winch.count() });
     defer thread.join();
 
-    // A deadline well past the peer's 25 ms keeps a loaded CI machine from ending the wait first; the old code still fails, because it stopped at the wake.
-    const pos = try terminal.readCursorPositionUntilDeadline(io_mod.milliTimestamp() + 2_000);
+    // The old code fails, because it stopped at the wake.
+    const pos = try terminal.readCursorPositionUntilDeadline(io_mod.milliTimestamp() + test_winch.poll_timeout_ms);
     try std.testing.expectEqual(@as(u16, 12), pos.row);
     try std.testing.expectEqual(@as(u16, 34), pos.col);
 }

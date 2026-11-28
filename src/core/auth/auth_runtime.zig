@@ -75,6 +75,40 @@ fn sourceLabelOrMissing(source: ?credentials.Source) []const u8 {
     return credentials.sourceLabel(source orelse return "missing");
 }
 
+/// Names the screen a credential failure notice went to, so each screen
+/// hears of a failure once (`Runtime.recordCredentialFailure`). The app picks
+/// the values; `main_notice_screen` is main's.
+pub const NoticeScreen = usize;
+pub const main_notice_screen: NoticeScreen = 0;
+
+/// The screens that showed one credential failure's notice. It holds no
+/// allocation, so it keeps the first `capacity` screens; a screen past them
+/// is never noted and hears of the failure again on each prompt, a repeat
+/// rather than a lost notice.
+pub const NoticeScreens = struct {
+    pub const capacity = 16;
+
+    items: [capacity]NoticeScreen = undefined,
+    len: u8 = 0,
+
+    pub fn only(screen: NoticeScreen) NoticeScreens {
+        var screens: NoticeScreens = .{};
+        screens.add(screen);
+        return screens;
+    }
+
+    pub fn contains(self: *const NoticeScreens, screen: NoticeScreen) bool {
+        return std.mem.findScalar(NoticeScreen, self.items[0..self.len], screen) != null;
+    }
+
+    /// Notes `screen`, unless the list is full.
+    pub fn add(self: *NoticeScreens, screen: NoticeScreen) void {
+        if (self.contains(screen) or self.len == capacity) return;
+        self.items[self.len] = screen;
+        self.len += 1;
+    }
+};
+
 pub const CredentialFailureReason = enum {
     temporary_unavailable,
     invalid_credential,
@@ -2481,7 +2515,9 @@ pub const Runtime = struct {
     selected_credential: ?credentials.Credential = null,
     credential_failure: ?struct {
         failure: CredentialFailure,
-        notice_claimed: bool,
+        /// The screens that showed this failure's notice
+        /// (`recordCredentialFailure`).
+        notice_screens: NoticeScreens,
     } = null,
     source_inventory: SourceSet = .empty,
     unavailable_sources: SourceSet = .empty,
@@ -2755,20 +2791,23 @@ pub const Runtime = struct {
     }
 
     /// Records recovery state even when silent. Returns true only when claiming
-    /// the first requested notice of this failure episode.
+    /// the first requested notice of this failure episode on `screen`. A prompt
+    /// shows on its own agent's screen, so a failure the person saw on one
+    /// screen is still news to a prompt that waits on another.
     pub fn recordCredentialFailure(
         self: *Self,
         failure: CredentialFailure,
-        options: struct { notify: bool = true },
+        options: struct { notify: bool = true, screen: NoticeScreen = main_notice_screen },
     ) bool {
         std.debug.assert(self.credentialSource() == failure.source);
         const same_failure = if (self.credential_failure) |current|
             current.failure.source == failure.source and current.failure.reason == failure.reason
         else
             false;
-        if (!same_failure) self.credential_failure = .{ .failure = failure, .notice_claimed = false };
-        if (!options.notify or self.credential_failure.?.notice_claimed) return false;
-        self.credential_failure.?.notice_claimed = true;
+        if (!same_failure) self.credential_failure = .{ .failure = failure, .notice_screens = .{} };
+        const screens = &self.credential_failure.?.notice_screens;
+        if (!options.notify or screens.contains(options.screen)) return false;
+        screens.add(options.screen);
         return true;
     }
 
@@ -2877,7 +2916,7 @@ pub const Runtime = struct {
         if (self.auth_mode == .local and self.selected_credential == null) {
             self.credential_failure = if (load_failure) |failure| .{
                 .failure = classifyCredentialFailure(failure.source, failure.err),
-                .notice_claimed = true,
+                .notice_screens = .only(main_notice_screen),
             } else null;
         }
     }
@@ -4826,6 +4865,52 @@ test "credential failure episodes deduplicate and clear on adoption" {
     try std.testing.expect(runtime.credentialFailure() == null);
     try std.testing.expect(runtime.recordCredentialFailure(temporary, .{}));
     try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{}));
+}
+
+test "a credential failure claims one notice on each screen that hears of it" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var login = try makeTestCredential(alloc, "login-token", .fx_login, null, null);
+    _ = runtime.adoptCredential(alloc, &login);
+    const temporary = classifyCredentialFailure(.fx_login, error.OAuthRequestFailed);
+    const subagent_screen: NoticeScreen = 7;
+
+    // Main's screen hears of it once; a subagent's screen still has to.
+    try std.testing.expect(runtime.recordCredentialFailure(temporary, .{}));
+    try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{}));
+    try std.testing.expect(runtime.recordCredentialFailure(temporary, .{ .screen = subagent_screen }));
+    try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{ .screen = subagent_screen }));
+    try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{ .notify = false, .screen = main_notice_screen }));
+    try std.testing.expectEqual(temporary, runtime.credentialFailure().?);
+    // Back on main after the subagent's screen: main already heard of it.
+    try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{}));
+    try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{ .screen = subagent_screen }));
+
+    // A new failure is news to every screen again.
+    const expired = classifyCredentialFailure(.fx_login, error.InvalidGrant);
+    try std.testing.expect(runtime.recordCredentialFailure(expired, .{ .screen = subagent_screen }));
+    try std.testing.expect(runtime.recordCredentialFailure(expired, .{}));
+    try std.testing.expect(!runtime.recordCredentialFailure(expired, .{}));
+}
+
+test "a credential failure seen on more screens than it notes repeats its notice, never drops it" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var login = try makeTestCredential(alloc, "login-token", .fx_login, null, null);
+    _ = runtime.adoptCredential(alloc, &login);
+    const temporary = classifyCredentialFailure(.fx_login, error.OAuthRequestFailed);
+
+    for (0..NoticeScreens.capacity) |screen| {
+        try std.testing.expect(runtime.recordCredentialFailure(temporary, .{ .screen = screen }));
+    }
+    for (0..NoticeScreens.capacity) |screen| {
+        try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{ .screen = screen }));
+    }
+    const past_the_list: NoticeScreen = NoticeScreens.capacity;
+    try std.testing.expect(runtime.recordCredentialFailure(temporary, .{ .screen = past_the_list }));
+    try std.testing.expect(runtime.recordCredentialFailure(temporary, .{ .screen = past_the_list }));
 }
 
 test "auth runtime adopts credential ownership and prefers team id" {

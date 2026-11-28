@@ -1733,10 +1733,26 @@ permission mode does not rewrite a cached prompt prefix):
     The system prompt says what the block is and that its values replace
     the runtime context from then on (`src/builtins/system_prompt.md`);
     without that line, GPT-6.1 kept the instructions' permission mode.
-  - **Compaction:** a compaction summary ends the search, so the next turn
-    captures the current runtime context. An update kept after the summary
-    still counts as what the model last saw, so a turn whose new copy
-    differs from it adds one more update.
+  - **Compaction:** fx's own summary starts a new prefix, so the first
+    request after it captures the current runtime context, including the
+    rest of the turn that wrote it. A turn that sent an earlier turn's copy
+    captures it there and saves it in the summary record, the checkpoint's
+    `runtime_context` (`src/core/compactor/checkpoint.zig`), not on the
+    turn, so nothing the turn already saved is written again (D87). The
+    summary record is one write, with its copy in it. Later turns and
+    resumes read the copy from the summary and send the same bytes after it
+    (`src/core/agent/runtime/runtime_context.zig` restartAfterSummary,
+    `tests/tla/prompt_context/PromptCache.tla` "summary"). A turn that
+    captured its own copy keeps it, and so does a turn the summary kept:
+    the requests after the summary then send the kept turn's copy, not the
+    summary's. A summary that saved no copy, such as a manual `/compact`
+    between turns or one an older fx wrote, ends the search, so the next
+    turn captures one; nothing was sent after it before then. An update the
+    cut removed no longer counts. An update kept after the summary, in a
+    kept turn or in the running turn's kept messages, still counts as what
+    the model last saw, so a turn whose new copy differs from it adds one
+    more update, and only one. A provider's compaction block keeps the copy
+    the turns after it were sent with.
   - **Older fx:** an fx from before D94 leaves the item out (D17) and
     rebuilds the runtime context for every request, as it did.
 

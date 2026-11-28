@@ -141,6 +141,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_APPROVAL_SCREEN_FAIL": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_AUTH_LOCK_CONTENTION": {
       "job": "test",
       "stability": "internal"
@@ -266,6 +270,10 @@
       "stability": "internal"
     },
     "FX_TEST_OPENAI_CODEX_RESPONSES_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_RECOVERY_RETRY_BUDGET_MS": {
       "job": "test",
       "stability": "internal"
     },
@@ -413,6 +421,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_VERCEL_API_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_WEB_FETCH_DNS_READY": {
       "job": "test",
       "stability": "internal"
@@ -513,8 +525,10 @@
     "TYPESAFE_BASE_URL",
     "USER",
     "USERPROFILE",
+    "VERCEL_TOKEN",
     "WAYLAND_DISPLAY",
     "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
     "ZDOTDIR"
   ],
   "hand_parsed_flags": {
@@ -523,6 +537,7 @@
     "--version": "Detects a version request before any command parser runs.",
     "-v": "Short form of --version.",
     "--json": "Picks the error format when a command's own parser has rejected its arguments.",
+    "--stream-events": "Picks the stream-events error format when fx ask's own parser has rejected its arguments.",
     "--resume": "The fixed resume grammar: --resume takes an optional last or ID operand.",
     "--continue": "The fixed resume grammar.",
     "-c": "The fixed resume grammar.",
