@@ -9,6 +9,7 @@
 //! `tests/tla/mcp_host/ElicitationRouting.tla`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const observation = @import("../agent/runtime/observation.zig");
 const mcp = @import("../../mcp/mcp.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -714,7 +715,8 @@ pub const Runtime = struct {
         r.mutex.unlock(r.io);
         r.engine.wake();
         // The no-thread path is for tests only: one started with `startOwner(…, false)` ends its owner's steps here.
-        if (r.thread) |t| t.join() else r.shutdown();
+        // It is compiled only into tests, so other builds, such as the terminal wasm, never reach the owner's loop.
+        if (r.thread) |t| t.join() else if (builtin.is_test) r.shutdown();
         // The owner ended every request; let their callers leave first.
         while (r.active.load(.acquire) != 0) std.Io.sleep(r.io, .fromMilliseconds(1), .awake) catch {};
         r.queue.deinit(r.gpa);
