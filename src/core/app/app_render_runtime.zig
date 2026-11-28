@@ -4198,6 +4198,10 @@ const ApprovalScreenFailureTestApp = struct {
     approval_screen: interaction_state.ApprovalScreenState = .{},
     main_agent: ApprovalScreenFailureAgent = .{},
     lender: ?*ApprovalScreenFailureAgent = null,
+    /// The hosted child this app answers for, as `child_agents` holds it:
+    /// production withdraws a binding only for an agent that is one, and main
+    /// is not.
+    hosted_child: ?*ApprovalScreenFailureAgent = null,
     notice_count: usize = 0,
     notice_buf: [128]u8 = undefined,
     notice_len: usize = 0,
@@ -4213,8 +4217,10 @@ const ApprovalScreenFailureTestApp = struct {
 
     pub fn withdrawAnsweredApproval(
         self: *ApprovalScreenFailureTestApp,
-        _: *ApprovalScreenFailureAgent,
+        agent: *ApprovalScreenFailureAgent,
     ) void {
+        const child = self.hosted_child orelse return;
+        if (agent != child) return;
         self.withdrawn += 1;
     }
 
@@ -4267,9 +4273,10 @@ test "a failed approval screen denies the request on the worker that owns it" {
     try std.testing.expect(!app.main_agent.approval_prompt.isActive());
     try std.testing.expectEqual(@as(usize, 1), app.notice_count);
     try std.testing.expectEqualStrings(approval_screen_failure_notice, app.noticeBody());
-    // The answered request's registry binding goes with an accepted answer,
-    // once, as the key path's does.
-    try std.testing.expectEqual(@as(usize, 1), app.withdrawn);
+    // The screen agent is main, which is not a hosted child, so production
+    // withdraws nothing: the key path passes main here too and the binding, if
+    // the request has one, is the subagent's own.
+    try std.testing.expectEqual(@as(usize, 0), app.withdrawn);
 }
 
 test "a failed approval screen never answers the screen's own request with the same id" {
@@ -4299,19 +4306,22 @@ test "a failed approval screen never answers the screen's own request with the s
 
     try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.accepted);
     try std.testing.expectEqual(@as(usize, 1), child.worker.accepted);
-    try std.testing.expectEqual(@as(usize, 1), app.withdrawn);
+    // Main's own screen answers through the subagent's worker and withdraws
+    // nothing for main.
+    try std.testing.expectEqual(@as(usize, 0), app.withdrawn);
 }
 
-test "a failed approval screen that no worker takes withdraws nothing" {
+test "a failed screen on the subagent's own screen withdraws its answered request" {
     const alloc = std.testing.allocator;
     var app: ApprovalScreenFailureTestApp = .{ .alloc = alloc };
-    defer app.main_agent.approval_prompt.deinit(alloc);
     var child: ApprovalScreenFailureAgent = .{};
     defer child.approval_prompt.deinit(alloc);
-    // The request ended before the deny arrived: no worker waits on its id.
-    child.worker.waiting_id = null;
-    app.lender = &child;
-    _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{
+    child.worker.waiting_id = 7;
+    app.hosted_child = &child;
+    // The subagent's own screen shows its request, so the answer goes to its
+    // worker, and its binding goes with the answer
+    // (`withdrawAnsweredApproval` for a hosted child).
+    _ = try child.approval_prompt.syncRequest(alloc, .{
         .id = 7,
         .label = "write_file note.txt",
         .origin = .{ .subagent = "writer" },
@@ -4319,7 +4329,35 @@ test "a failed approval screen that no worker takes withdraws nothing" {
 
     _ = try Runtime(ApprovalScreenFailureTestApp).failApprovalScreen(
         &app,
-        &app.main_agent,
+        &child,
+        7,
+        error.OutOfMemory,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), child.worker.accepted);
+    try std.testing.expect(!child.approval_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqual(@as(usize, 1), app.withdrawn);
+}
+
+test "a failed approval screen that no worker takes withdraws nothing" {
+    const alloc = std.testing.allocator;
+    var app: ApprovalScreenFailureTestApp = .{ .alloc = alloc };
+    var child: ApprovalScreenFailureAgent = .{};
+    defer child.approval_prompt.deinit(alloc);
+    // The request ended before the deny arrived: its own worker waits on
+    // nothing.
+    child.worker.waiting_id = null;
+    app.hosted_child = &child;
+    _ = try child.approval_prompt.syncRequest(alloc, .{
+        .id = 7,
+        .label = "write_file note.txt",
+        .origin = .{ .subagent = "writer" },
+    });
+
+    _ = try Runtime(ApprovalScreenFailureTestApp).failApprovalScreen(
+        &app,
+        &child,
         7,
         error.OutOfMemory,
     );

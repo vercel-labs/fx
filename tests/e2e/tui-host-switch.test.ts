@@ -5792,6 +5792,89 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
     TIMEOUT,
   );
 
+  // A request main's model asked for is registered, and it shows on the
+  // subagent's own screen. When that screen fails, fx denies it there and the
+  // binding goes with the answer, so main's later answer finds no request at
+  // all instead of resolving one whose worker already took the deny.
+  test(
+    "a failed approval screen on the subagent's own screen leaves main nothing to answer",
+    async () => {
+      const arrived = held();
+      const answered = held();
+      const denied = held();
+      let childCalls = 0;
+      let childSawReason = false;
+      let mainAnswer = "";
+      await withFx(
+        (body) => {
+          if (!SPIKE_MAIN(body)) {
+            childCalls += 1;
+            // The write waits for the person to be on the subagent's own
+            // screen, so the request shows there and is not lent to main.
+            if (childCalls === 1) {
+              return arrived.promise.then(() =>
+                toolCall("child_e7_write", "write_file", { path: "spike-e7.txt", content: "SPIKE_WROTE\n" })
+              );
+            }
+            childSawReason = body.includes("could not show this request, so it was refused");
+            // The subagent's turn stays open, so its worker is still attached
+            // and its binding, if nothing withdrew it, still waits for main's
+            // answer.
+            return denied.promise.then(() => text("child_e7_done", "SPIKE_E7_DENIED"));
+          }
+          if (!body.includes('"main_e7_start"')) {
+            return toolCall("main_e7_start", "subagent", {
+              request: { action: "message", agent: "writer", message: "SPIKE_E7_TASK", profile: "writer" },
+            });
+          }
+          if (body.includes('"main_e7_answer"')) {
+            // The code decides which text this is: no request at all, or one
+            // that no longer waits (`answerApproval` in
+            // `src/core/subagent/tool_host.zig`).
+            mainAnswer = body.includes("has no approval request waiting")
+              ? "has no approval request waiting"
+              : body.includes("is no longer waiting") ? "is no longer waiting" : "other";
+            return text("main_e7_said", "SPIKE_E7_MAIN_ANSWERED");
+          }
+          if (!body.includes(SPIKE_NOTE)) return text("main_e7_tail", "SPIKE_E7_MAIN_DONE");
+          // Main answers the request its note named, once the screen has
+          // already failed, so the order under test is the one that runs.
+          return answered.promise.then(() => toolCall("main_e7_answer", "subagent", { action: "approve", agent: "writer" }));
+        },
+        async (session, { workspace, stderrPath }) => {
+          await session.sendText("SPIKE_USER_e7");
+          await session.waitForText("SPIKE_E7_MAIN_DONE", 30_000);
+          await showAgent(session, "writer");
+          arrived.release();
+          // The request is main's, so the subagent's own screen shows it, and
+          // the hook fails that screen.
+          await session.waitForText("The approval screen could not open", 30_000);
+          await until("the subagent read the reason", () => childSawReason);
+          answered.release();
+          // Main answers the request its note named: with the binding gone it
+          // finds nothing, and main's screen shows no request waiting.
+          await showAgent(session, "main");
+          await session.waitForText("SPIKE_E7_MAIN_ANSWERED", 30_000);
+          expect(mainAnswer).toBe("has no approval request waiting");
+          expect(await session.capturePane()).not.toContain("needs permission");
+          denied.release();
+          await showAgent(session, "writer");
+          await session.waitForText("SPIKE_E7_DENIED", 30_000);
+          expect(existsSync(join(workspace, "spike-e7.txt"))).toBe(false);
+          expect(stderrPath).toBeDefined();
+          expect(readFileSync(stderrPath!, "utf8")).toBe("");
+        },
+        writeSpikeWriter,
+        false,
+        { FX_TEST_APPROVAL_SCREEN_FAIL: "1" },
+        {},
+        "",
+        true,
+      );
+    },
+    TIMEOUT,
+  );
+
   test(
     "two subagents wait at once, and main answers both",
     async () => {
