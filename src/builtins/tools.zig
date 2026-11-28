@@ -23,6 +23,7 @@ const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
+const monitor_impl = @import("../tools/monitor/monitor.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
 const toolbox_impl = @import("../tools/capabilities/toolbox.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
@@ -498,6 +499,48 @@ pub fn shellProcessOnlySpec() ToolSpec {
     return shell_process_only;
 }
 
+const monitor_description =
+    "Start a command and get its new output as messages, instead of polling it with shell or a subagent. A message arrives at most every 10 seconds, and one more when the command ends. Use it for CI checks, logs, and slow jobs. Monitors end with fx: start them again after a restart.";
+
+const monitor_properties = [_]model_tool_schema.Property{
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "start", "list", "stop" } } },
+    .{ .name = "command", .json_type = .string, .description = "For start: a shell command that prints a line for each event, such as gh pr checks 123 --watch." },
+    .{ .name = "label", .json_type = .string, .description = "For start: a short name for its messages." },
+    .{ .name = "id", .json_type = .string, .description = "For stop: the id start returned." },
+};
+
+/// The shell tool's captured run, held to what a monitor needs: the same
+/// permission review of its command, the same sandbox runner, and the same
+/// cleanup. `start` is the action that runs a command.
+pub const monitor = blk: {
+    var spec = shell;
+    spec.name = "monitor";
+    spec.description = monitor_description;
+    spec.model_schema = .{
+        .name = "monitor",
+        .description = monitor_description,
+        .input_schema = .{
+            .properties = &monitor_properties,
+            .required = &.{"action"},
+            .additional_properties = false,
+        },
+    };
+    spec.action_label = "Monitoring";
+    spec.completed_action_label = "Monitored";
+    spec.label_arg_default = "monitor request";
+    spec.presentation_fn = monitor_impl.presentation;
+    spec.decode = monitor_impl.decode;
+    spec.validate = monitor_impl.validate;
+    spec.call = monitor_impl.call;
+    spec.captured_command_action = "start";
+    spec.captured_command_fn = monitor_impl.isCapturedCommand;
+    spec.infer_action_fn = null;
+    spec.process_local_fn = monitor_impl.isProcessLocal;
+    spec.reads_only_fn = monitor_impl.readsOnly;
+    spec.irreversible_fn = monitor_impl.isIrreversible;
+    break :blk spec;
+};
+
 pub const install_skill = ToolSpec{
     .name = "install_skill",
     .description = install_skill_description,
@@ -684,6 +727,7 @@ pub const all = [_]tool_dispatch.Tool{
     web_fetch,
     web_search,
     shell,
+    monitor,
     install_skill,
     subagent,
     ask_user_question,
@@ -774,6 +818,7 @@ pub const advertisement_order = [_][]const u8{
     "edit_file",
     "write_file",
     "shell",
+    "monitor",
     "subagent",
     "toolbox",
     "ask_user_question",
@@ -850,9 +895,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "c78ae877fb42327d4ed1ab58d95a32b492858a08cd1442600c5a9f8997a5114a"
+            "6f67766736dcf9c7b1ac62dbe6003095276a433843e6ca70a694b04b6aa28401"
         else
-            "1c1204ee8981d61a12a5e85135ed2eb2617e972115a8c9196b4855ae5028a771",
+            "f2ef336a4544febcfde7cb25ae8aa7867bf61ad29bae3692f989c2d8cc63f84e",
         &actual_hex,
     );
 }
@@ -910,6 +955,7 @@ test "built-in tools register exact active local order" {
         "web_fetch",
         "web_search",
         "shell",
+        "monitor",
         "install_skill",
         "subagent",
         "ask_user_question",

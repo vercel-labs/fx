@@ -38,6 +38,7 @@ test {
     _ = @import("core/tooling/tool_mcp_registry.zig");
     _ = @import("core/mcp/tool_result.zig");
     _ = @import("core/mcp/tool_search.zig");
+    _ = @import("core/monitor/saved.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/mcp_host/config_file.zig");
     _ = @import("core/output/turn_clock.zig");

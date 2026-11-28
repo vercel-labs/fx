@@ -428,6 +428,11 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
     if (comptime !cooperative and @hasDecl(App, "clearProgramResume")) {
         if (relaunch_request == null) app.clearProgramResume();
     }
+    // The same quit leaves no monitors to restart. An upgrade relaunch and a
+    // crash keep the record, so the resumed session can tell the agent.
+    if (comptime !cooperative and @hasDecl(App, "clearMonitorRecord")) {
+        if (relaunch_request == null) app.clearMonitorRecord();
+    }
     var graceful_exit_sigint_guard = GracefulExitSigintGuard.install(
         !cooperative and relaunch_request == null,
     );

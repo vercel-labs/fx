@@ -31,6 +31,7 @@ pub const Tool = enum {
     web_fetch,
     web_search,
     shell,
+    monitor,
     install_skill,
     subagent,
     ask_user_question,

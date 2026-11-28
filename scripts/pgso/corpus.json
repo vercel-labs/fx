@@ -134,6 +134,7 @@
     {"name": "verify-tui-host-switch", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-host-switch.test.ts"], "test_file": "tui-host-switch.test.ts"},
     {"name": "verify-tui-mcp-deny-rules", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-mcp-deny-rules.test.ts"], "test_file": "tui-mcp-deny-rules.test.ts"},
     {"name": "verify-tui-mcp-http-many-servers", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-mcp-http-many-servers.test.ts"], "test_file": "tui-mcp-http-many-servers.test.ts"},
+    {"name": "verify-tui-monitor", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-monitor.test.ts"], "test_file": "tui-monitor.test.ts"},
     {"name": "verify-tui-render-replay", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-render-replay.test.ts"], "test_file": "tui-render-replay.test.ts"},
     {"name": "verify-tui-resume", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-resume.test.ts"], "test_file": "tui-resume.test.ts"},
     {"name": "verify-tui-program-resume", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-program-resume.test.ts"], "test_file": "tui-program-resume.test.ts"},

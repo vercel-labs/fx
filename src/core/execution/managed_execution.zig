@@ -1001,6 +1001,22 @@ pub const Runtime = struct {
         return entry.statusSnapshot();
     }
 
+    /// How many bytes of output a captured command printed that no result has
+    /// delivered yet, or null when `execution_id` is not a live entry. Reads
+    /// only, so a monitor can look at a quiet command without taking a
+    /// snapshot of it.
+    pub fn pendingOutputBytesFor(
+        self: *Runtime,
+        execution_id: []const u8,
+    ) ?u64 {
+        const entry = self.acquireEntry(execution_id) orelse return null;
+        defer self.releaseEntry(entry);
+        const zio = io_mod.getIo();
+        entry.mutex.lockUncancelable(zio);
+        defer entry.mutex.unlock(zio);
+        return entry.pendingOutputBytes();
+    }
+
     pub fn ttyCursorFor(
         self: *Runtime,
         execution_id: []const u8,
@@ -1393,7 +1409,10 @@ pub const Runtime = struct {
             entry.mutex.unlock(zio);
             return error.UnknownReservation;
         };
-        const next = try entry.delivery.commit(reservation_id);
+        const next = entry.delivery.commit(reservation_id) catch |err| {
+            entry.mutex.unlock(zio);
+            return err;
+        };
         entry.removeDeliveredOutput(reservation.range.end - reservation.range.start) catch |err| {
             entry.mutex.unlock(zio);
             return err;
@@ -1424,8 +1443,8 @@ pub const Runtime = struct {
     ) !void {
         const zio = io_mod.getIo();
         entry.mutex.lockUncancelable(zio);
+        defer entry.mutex.unlock(zio);
         entry.delivery = try entry.delivery.cancel(reservation_id);
-        entry.mutex.unlock(zio);
     }
 
     pub fn commitReservation(
