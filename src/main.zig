@@ -577,7 +577,7 @@ const App = struct {
 
     /// A quit the user chose: the next resume has no monitors to restart.
     pub fn clearMonitorRecord(self: *Self) void {
-        MonitorAppRuntime.clearRecord(self);
+        if (comptime !host_target.is_wasm) MonitorAppRuntime.clearRecord(self);
     }
 
     pub fn clearProgramResume(self: *Self) void {
@@ -863,7 +863,7 @@ const App = struct {
                 // with the startup instances, or once the picker has chosen.
                 if (picks) app.instances.restore_on_pick = true else app.instances.restore_pending = true;
                 SessionAppRuntime.syncTerminalTitle(&app, &app.main_agent);
-                MonitorAppRuntime.noteLeftRunning(&app);
+                if (comptime !host_target.is_wasm) MonitorAppRuntime.noteLeftRunning(&app);
             } else if (launch.upgrade_relaunch) |relaunch| {
                 SessionAppRuntime.writeUpgradeNotice(&app, app_version, build_update_channel, relaunch.previous_revision orelse "", build_revision) catch |err|
                     debug_trace.logf("session", "event=upgrade_notice_unavailable err={s}", .{@errorName(err)});
@@ -2264,7 +2264,7 @@ const App = struct {
             .permission_rules = permission_rules,
             .subagent_available = subagent_available,
             // Monitors run for the main conversation only.
-            .monitor_available = agent.child_run == null,
+            .monitor_available = !host_target.is_wasm and agent.child_run == null,
             .subagent_profiles = subagent_profiles,
             .behind_toolbox = self.toolbox_behind.slice(),
         });
@@ -3672,7 +3672,7 @@ const App = struct {
         // (`messageStartedBy`), so it stays right when that turn's end is
         // handled first.
         AgentsAppRuntime.takePosts(self);
-        MonitorAppRuntime.tick(self);
+        if (comptime !host_target.is_wasm) MonitorAppRuntime.tick(self);
         try tickAgentInContext({}, self, self.screenAgent());
         // Every other agent keeps working while it is hidden, each handled in
         // its own context.

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const host_target = @import("../core/hosts/target.zig");
 const builtin_gateway = @import("gateway.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_projection = @import("../core/tooling/tool_projection.zig");
@@ -727,7 +728,8 @@ pub const all = [_]tool_dispatch.Tool{
     web_fetch,
     web_search,
     shell,
-    monitor,
+    // A browser has no process to watch: its shell is a host bridge.
+    if (host_target.is_wasm) nameOnly(monitor) else monitor,
     install_skill,
     subagent,
     ask_user_question,
@@ -744,7 +746,12 @@ pub const registry = tool_dispatch.Registry{ .tools = if (build_options.builtin_
 
 const names_only = blk: {
     var tools: [all.len]tool_dispatch.Tool = undefined;
-    for (&tools, all) |*tool, real| tool.* = .{
+    for (&tools, all) |*tool, real| tool.* = nameOnly(real);
+    break :blk tools;
+};
+
+fn nameOnly(real: tool_dispatch.Tool) tool_dispatch.Tool {
+    return .{
         .name = real.name,
         .description = "",
         .model_schema = .{ .name = real.name, .description = "" },
@@ -754,8 +761,7 @@ const names_only = blk: {
         .reads_only_fn = unavailableReadsOnly,
         .irreversible_fn = unavailableIrreversible,
     };
-    break :blk tools;
-};
+}
 
 // A call that reaches a tool kept only by name gets the answer fx gives for
 // any tool it doesn't have, which the model can read and recover from.
