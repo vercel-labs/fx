@@ -103,9 +103,14 @@ pub const ActivityGrowth = struct {
     writes: bool = false,
 };
 
+/// Minimum CPU growth counted as active activity (10 ms, matching one Linux
+/// USER_HZ=100 clock tick so macOS's finer Mach timebase does not report
+/// momentary wakeups as sustained CPU work).
+pub const min_cpu_growth_ns: u64 = 10 * std.time.ns_per_ms;
+
 pub fn compareActivity(previous: ActivitySample, current: ActivitySample) ActivityGrowth {
     return .{
-        .cpu = current.cpu_time > previous.cpu_time,
+        .cpu = current.cpu_time -| previous.cpu_time >= min_cpu_growth_ns,
         .writes = current.write_bytes > previous.write_bytes,
     };
 }
@@ -1526,7 +1531,7 @@ fn captureLinuxSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot
                 .parent_pid = parent_pid orelse
                     return error.ProcessIdentityUnavailable,
                 .zombie = zombie,
-                .cpu_time = utime +| stime,
+                .cpu_time = linuxClockTicksToNs(utime +| stime, linuxTicksPerSecond()),
             };
         }
     }
@@ -1581,6 +1586,33 @@ fn parseLinuxProcIoWriteBytes(text: []const u8) u64 {
     return 0;
 }
 
+fn linuxTicksPerSecond() u64 {
+    if (comptime builtin.target.os.tag != .linux) return 100;
+    const sc_clk_tck: c_int = 2;
+    const hz = linuxSysconf(sc_clk_tck);
+    if (hz <= 0 or hz > std.time.ns_per_s) return 100;
+    return @intCast(hz);
+}
+
+extern "c" fn sysconf(name: c_int) c_long;
+
+fn linuxSysconf(name: c_int) c_long {
+    if (comptime builtin.target.os.tag != .linux) return 100;
+    return sysconf(name);
+}
+
+fn linuxClockTicksToNs(ticks: u64, ticks_per_sec: u64) u64 {
+    if (ticks == 0 or ticks_per_sec == 0) return 0;
+    const ns: u128 = (@as(u128, ticks) * std.time.ns_per_s) / ticks_per_sec;
+    return @intCast(@min(ns, std.math.maxInt(u64)));
+}
+
+fn machTicksToNs(ticks: u64, numer: u32, denom: u32) u64 {
+    if (ticks == 0 or denom == 0) return 0;
+    const ns: u128 = (@as(u128, ticks) * numer) / denom;
+    return @intCast(@min(ns, std.math.maxInt(u64)));
+}
+
 fn sampleMacOSProcessActivity(
     pid: std.posix.pid_t,
     expected_identity: Identity,
@@ -1596,10 +1628,15 @@ fn sampleMacOSProcessActivity(
         &task_info,
         @sizeOf(Darwin.ProcTaskInfo),
     );
-    const cpu_time: u64 = if (task_len == @sizeOf(Darwin.ProcTaskInfo))
+    const raw_ticks: u64 = if (task_len == @sizeOf(Darwin.ProcTaskInfo))
         task_info.pti_total_user +| task_info.pti_total_system
     else
         0;
+    var timebase: std.c.mach_timebase_info_data = .{ .numer = 1, .denom = 1 };
+    if (std.c.mach_timebase_info(&timebase) != 0 or timebase.denom == 0) {
+        timebase = .{ .numer = 1, .denom = 1 };
+    }
+    const cpu_time = machTicksToNs(raw_ticks, timebase.numer, timebase.denom);
     var rusage: Darwin.RusageInfoV2 = undefined;
     const write_bytes: u64 = if (Darwin.proc_pid_rusage(pid, Darwin.rusage_info_v2, &rusage) == 0)
         rusage.ri_diskio_byteswritten
@@ -1925,26 +1962,42 @@ test "Darwin witness scan excludes processes older than command root" {
 }
 
 test "compareActivity reports cpu, writes, both, or neither" {
+    const unit = std.time.ns_per_ms;
     try std.testing.expectEqual(
         ActivityGrowth{},
-        compareActivity(.{ .cpu_time = 10, .write_bytes = 4096 }, .{ .cpu_time = 10, .write_bytes = 4096 }),
+        compareActivity(.{ .cpu_time = 10 * unit, .write_bytes = 4096 }, .{ .cpu_time = 10 * unit, .write_bytes = 4096 }),
     );
     try std.testing.expectEqual(
         ActivityGrowth{},
-        compareActivity(.{ .cpu_time = 10, .write_bytes = 4096 }, .{ .cpu_time = 5, .write_bytes = 0 }),
+        compareActivity(.{ .cpu_time = 10 * unit, .write_bytes = 4096 }, .{ .cpu_time = 5 * unit, .write_bytes = 0 }),
     );
     try std.testing.expectEqual(
         ActivityGrowth{ .cpu = true, .writes = false },
-        compareActivity(.{ .cpu_time = 10, .write_bytes = 4096 }, .{ .cpu_time = 11, .write_bytes = 4096 }),
+        compareActivity(.{ .cpu_time = 10 * unit, .write_bytes = 4096 }, .{ .cpu_time = 20 * unit, .write_bytes = 4096 }),
     );
     try std.testing.expectEqual(
         ActivityGrowth{ .cpu = false, .writes = true },
-        compareActivity(.{ .cpu_time = 10, .write_bytes = 4096 }, .{ .cpu_time = 10, .write_bytes = 8192 }),
+        compareActivity(.{ .cpu_time = 10 * unit, .write_bytes = 4096 }, .{ .cpu_time = 10 * unit, .write_bytes = 8192 }),
     );
     try std.testing.expectEqual(
         ActivityGrowth{ .cpu = true, .writes = true },
-        compareActivity(.{ .cpu_time = 10, .write_bytes = 4096 }, .{ .cpu_time = 15, .write_bytes = 8192 }),
+        compareActivity(.{ .cpu_time = 10 * unit, .write_bytes = 4096 }, .{ .cpu_time = 25 * unit, .write_bytes = 8192 }),
     );
+}
+
+test "compareActivity ignores sub-threshold CPU growth and counts growth at the minimum" {
+    const base: ActivitySample = .{ .cpu_time = 100 * std.time.ns_per_ms, .write_bytes = 4096 };
+    try std.testing.expectEqual(
+        ActivityGrowth{},
+        compareActivity(base, .{ .cpu_time = base.cpu_time + min_cpu_growth_ns - 1, .write_bytes = 4096 }),
+    );
+    try std.testing.expectEqual(
+        ActivityGrowth{ .cpu = true, .writes = false },
+        compareActivity(base, .{ .cpu_time = base.cpu_time + min_cpu_growth_ns, .write_bytes = 4096 }),
+    );
+    try std.testing.expectEqual(@as(u64, 10_000_000), linuxClockTicksToNs(1, 100));
+    try std.testing.expectEqual(@as(u64, 10_000_000), machTicksToNs(240_000, 125, 3));
+    try std.testing.expect(machTicksToNs(35_000, 125, 3) < min_cpu_growth_ns);
 }
 
 test "linux proc io write_bytes parser reads write_bytes and ignores missing or malformed text" {
@@ -1986,7 +2039,21 @@ test "activity sample grows for a busy or writing child and stays flat for a sle
     try std.testing.expectEqual(@as(usize, 1), try sleepy.stdout.?.readStreaming(io, &.{&ready}));
     var sleepy_tracker = try Tracker.init(std.testing.allocator);
     defer sleepy_tracker.deinit();
-    const s1 = sleepy_tracker.sampleActivity(sleepy.id.?, true);
+    // Wait until exec + dyld finish and two consecutive samples match before taking s1.
+    var s1 = sleepy_tracker.sampleActivity(sleepy.id.?, true);
+    var settled = false;
+    const settle_deadline_ms = io_mod.milliTimestamp() + 2_000;
+    while (io_mod.milliTimestamp() < settle_deadline_ms) {
+        const next = sleepy_tracker.sampleActivity(sleepy.id.?, true);
+        if (std.meta.eql(s1, next)) {
+            s1 = next;
+            settled = true;
+            break;
+        }
+        s1 = next;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(settled);
 
     // CPU-busy child: wait until cpu_time grows (bounded).
     {
