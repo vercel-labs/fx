@@ -335,8 +335,8 @@ function sandboxSetupPrompt(options: {
     `- Last destination used: ${last}`,
     "When sandbox_team is not set, fx finds the team itself (from the Vercel CLI's current team or the account's default team) and uses project fx-sandbox when sandbox_project is not set; do not guess the CLI's current team or inspect Vercel CLI files yourself.",
     "1. Show my current choice from the facts above.",
-    "2. If the Vercel CLI is installed, list my choices: `vercel teams ls`, then `vercel project ls --scope <team>`.",
-    "3. Ask me with the ask tool which team and project to use, with keeping the current choice as one option.",
+    "2. If the Vercel CLI is installed, list my teams with `vercel teams ls`, and ask me with the ask tool which team to use, with keeping the current choice as one option.",
+    "3. Then list the projects of that one team with `vercel project ls --scope <team>`, and ask me which project to use, with fx-sandbox as one option. If a Vercel command waits for a login, stop it and ask me instead.",
     `4. Save my answer with \`${options.fxBin} config set sandbox_team <slug>\` and \`${options.fxBin} config set sandbox_project <name>\`, or go back to the defaults with \`${options.fxBin} config unset sandbox_team\` and \`${options.fxBin} config unset sandbox_project\`.`,
     "fx asks me again before it first copies a repository to a team or project I have not used.",
   ].join("\n");

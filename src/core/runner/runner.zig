@@ -47,8 +47,8 @@ pub fn setupPrompt(alloc: std.mem.Allocator, ctx: SetupPromptContext) std.mem.Al
         \\- Last destination used: {s}
         \\When {s} is not set, fx finds the team itself (from the Vercel CLI's current team or the account's default team) and uses project fx-sandbox when {s} is not set; do not guess the CLI's current team or inspect Vercel CLI files yourself.
         \\1. Show my current choice from the facts above.
-        \\2. If the Vercel CLI is installed, list my choices: `vercel teams ls`, then `vercel project ls --scope <team>`.
-        \\3. Ask me with the ask tool which team and project to use, with keeping the current choice as one option.
+        \\2. If the Vercel CLI is installed, list my teams with `vercel teams ls`, and ask me with the ask tool which team to use, with keeping the current choice as one option.
+        \\3. Then list the projects of that one team with `vercel project ls --scope <team>`, and ask me which project to use, with fx-sandbox as one option. If a Vercel command waits for a login, stop it and ask me instead.
         \\4. Save my answer with `{s} config set {s} <slug>` and `{s} config set {s} <name>`, or go back to the defaults with `{s} config unset {s}` and `{s} config unset {s}`.
         \\fx asks me again before it first copies a repository to a team or project I have not used.
     ,
@@ -141,6 +141,11 @@ test "setupPrompt includes fx path, settings, last destination, and no-guess rul
     try std.testing.expect(std.mem.find(u8, defaults, "/opt/fx/bin/fx config set sandbox_team <slug>") != null);
     try std.testing.expect(std.mem.find(u8, defaults, "/opt/fx/bin/fx config unset sandbox_team") != null);
     try std.testing.expect(std.mem.find(u8, defaults, "do not guess") != null);
+    // One team's projects only, and never a wait on a login prompt (a SAML team's
+    // `vercel project ls` waits for a browser login).
+    try std.testing.expect(std.mem.find(u8, defaults, "Then list the projects of that one team with `vercel project ls --scope <team>`") != null);
+    try std.testing.expect(std.mem.find(u8, defaults, "If a Vercel command waits for a login, stop it and ask me instead.") != null);
+    try std.testing.expect(std.mem.find(u8, defaults, "list my choices") == null);
 
     const configured = try setupPrompt(alloc, .{
         .fx_bin = "/opt/fx/bin/fx",
