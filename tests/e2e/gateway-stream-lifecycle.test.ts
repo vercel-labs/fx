@@ -17910,6 +17910,14 @@ test("fx ask --json reports unsupported tty shell as a failed tool result and co
         shell: { kind: "executable", path: "/nonexistent_eb47_shell" },
       },
     }),
+    fakeGatewayToolCall("bad_shell_esc", "shell", {
+      request: {
+        action: "run",
+        command: "echo hi",
+        tty: true,
+        shell: { kind: "executable", path: "/nonexistent_eb47_shell\u001b]0;owned\u0007" },
+      },
+    }),
     fakeGatewayFinalText("Saw unsupported shell error."),
   ];
   const gateway = startGateway(() =>
@@ -17928,12 +17936,18 @@ test("fx ask --json reports unsupported tty shell as a failed tool result and co
     const json = parseAskJson(result.stdout);
     expect(json.exit_code).toBe(0);
     expect(json.output).toBe("Saw unsupported shell error.");
-    expect(gateway.requestCount()).toBe(2);
+    expect(gateway.requestCount()).toBe(3);
     const toolOutput = toolResultOutput(gateway.requests[1]!.body, "bad_shell_1");
     expect(toolOutput).toContain("Unsupported shell");
     expect(toolOutput).toContain("/nonexistent_eb47_shell");
     expect(toolOutput).toContain("bash");
     expect(toolOutput).toContain("zsh");
+    const escToolOutput = toolResultOutput(gateway.requests[2]!.body, "bad_shell_esc");
+    expect(escToolOutput).not.toContain("\u001b");
+    expect(escToolOutput).not.toContain("\u0007");
+    expect(escToolOutput).not.toContain("&amp;amp;");
+    expect(escToolOutput).not.toContain("&amp;#x1b;");
+    expect(escToolOutput).toContain("/nonexistent_eb47_shell&#x1b;]0;owned&#x07;");
     expect(json.tool_calls).toContainEqual(
       expect.objectContaining({ name: "shell", status: "error" }),
     );
