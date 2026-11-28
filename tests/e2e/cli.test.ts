@@ -8468,7 +8468,7 @@ describe("fx ask --json recovery", () => {
   );
 
   test(
-    "fx ask --json drops discarded restarted previews when the final content-filter block has no text",
+    "fx ask --json keeps an unreplaced restarted preview and sets partial when the final content-filter block has no text",
     async () => {
       const sseContentFilter = (partialText?: string) =>
         fakeGatewaySse([
@@ -8503,9 +8503,9 @@ describe("fx ask --json recovery", () => {
         expect(res.code).toBe(1);
         const json = JSON.parse(res.stdout);
         expect(json.exit_code).toBe(1);
-        expect(json.output).toBe("");
+        expect(json.output).toBe("OBSOLETE_PREVIEW ");
         expect(json.final_output).toBe("");
-        expect("partial" in json).toBe(false);
+        expect(json.partial).toBe(true);
         expect(json.error).toBe("ModelError");
         expect(json.recovery).toMatchObject({ state: "failed", attempt: 4, cause: "content_filter" });
 
@@ -8516,8 +8516,8 @@ describe("fx ask --json recovery", () => {
         const resultLine = streamLines[1]!;
         expect(`{${resultLine.slice('{"type":"result",'.length)}\n`).toBe(res.stdout);
         const streamJson = JSON.parse(resultLine);
-        expect(streamJson.output).toBe("");
-        expect("partial" in streamJson).toBe(false);
+        expect(streamJson.output).toBe("OBSOLETE_PREVIEW ");
+        expect(streamJson.partial).toBe(true);
         expect(streamJson.recovery).toMatchObject({ state: "failed", attempt: 4, cause: "content_filter" });
       } finally {
         gateway.stop();
@@ -8528,7 +8528,7 @@ describe("fx ask --json recovery", () => {
   );
 
   test(
-    "fx ask --json drops a restarted preview when the retry fails with HTTP 400",
+    "fx ask --json keeps an unreplaced restarted preview and sets partial when the retry fails with HTTP 400",
     async () => {
       const sseContentFilter = (partialText?: string) =>
         fakeGatewaySse([
@@ -8572,10 +8572,10 @@ describe("fx ask --json recovery", () => {
         expect(res.code).toBe(1);
         const json = JSON.parse(res.stdout);
         expect(json.exit_code).toBe(1);
-        expect(json.output).not.toContain("OBSOLETE_PREVIEW");
+        expect(json.output).toContain("OBSOLETE_PREVIEW ");
         expect(json.output).toContain("HTTP 400");
         expect(json.final_output).toBe("");
-        expect("partial" in json).toBe(false);
+        expect(json.partial).toBe(true);
 
         const streamRes = await runFx(["ask", "--stream-events", "--no-save", "restarted then http 400"], { cwd: workspace, env, timeoutMs: TIMEOUT });
         expect(streamRes.code).toBe(1);
@@ -8584,8 +8584,8 @@ describe("fx ask --json recovery", () => {
         const resultLine = streamLines[1]!;
         expect(`{${resultLine.slice('{"type":"result",'.length)}\n`).toBe(res.stdout);
         const streamJson = JSON.parse(resultLine);
-        expect(streamJson.output).not.toContain("OBSOLETE_PREVIEW");
-        expect("partial" in streamJson).toBe(false);
+        expect(streamJson.output).toContain("OBSOLETE_PREVIEW ");
+        expect(streamJson.partial).toBe(true);
       } finally {
         gateway.stop();
         cleanupIsolatedTestHome(home);

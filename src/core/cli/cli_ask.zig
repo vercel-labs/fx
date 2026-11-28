@@ -752,6 +752,7 @@ const AskContext = struct {
     raw_boundary_pending: bool = false,
     response_output_start: usize = 0,
     response_has_model_output_start: bool = false,
+    response_restart_pending: bool = false,
     raw_trailing_newlines: u8 = 0,
     raw_has_output: bool = false,
     has_model_output: bool = false,
@@ -2645,6 +2646,7 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     if (outcome == .failed or outcome == .paused) {
         ctx.failed = true;
     }
+    if (outcome == .completed) discard_restarted_json_preview(ctx);
 }
 
 /// Takes the subagent mail that joined the running turn at a model or final
@@ -3591,13 +3593,14 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     switch (emission) {
         .assistant_started => {
+            discard_restarted_json_preview(ctx);
             ctx.response_output_start = ctx.assistant_output.items.len;
             ctx.response_has_model_output_start = ctx.has_model_output;
         },
         .assistant_restarted => |text| switch (ctx.output_mode) {
             .raw => try writeRawAssistantBytes(ctx, text),
             .json, .stream_events => {
-                discardRestartedJsonPreview(ctx);
+                ctx.response_restart_pending = true;
                 try ctx.writeStderr(text);
             },
             .quiet => try ctx.writeStderr(text),
@@ -3618,9 +3621,11 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     }
 }
 
-fn discardRestartedJsonPreview(ctx: *AskContext) void {
+fn discard_restarted_json_preview(ctx: *AskContext) void {
+    if (!ctx.response_restart_pending) return;
     debug_trace.logf("agent", "discarding interrupted JSON preview bytes={d}", .{ctx.assistant_output.items.len - ctx.response_output_start});
     ctx.assistant_output.shrinkRetainingCapacity(ctx.response_output_start);
+    ctx.response_restart_pending = false;
     ctx.has_model_output = ctx.response_has_model_output_start;
     ctx.raw_has_output = ctx.assistant_output.items.len > 0;
     ctx.raw_boundary_pending = ctx.raw_has_output;
@@ -9955,7 +9960,7 @@ test "CLI response restart preserves completed output and removes only the faile
     try deps.push_text(deps.ctx, .assistant_started);
     try deps.push_text(deps.ctx, .{ .assistant_source = "DISCARDED partial" });
     try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart notice\n" });
-    try std.testing.expectEqualStrings("Completed tool commentary.", ctx.assistant_output.items);
+    try std.testing.expectEqualStrings("Completed tool commentary.DISCARDED partial", ctx.assistant_output.items);
     try deps.push_text(deps.ctx, .assistant_started);
     try deps.push_text(deps.ctx, .{ .assistant_source = "Replacement." });
     try std.testing.expectEqualStrings("Completed tool commentary.\n\nReplacement.", ctx.assistant_output.items);
@@ -9969,7 +9974,7 @@ test "CLI response restart preserves completed output and removes only the faile
     try std.testing.expectEqualStrings("partial\n\nRestart notice\n\nReplacement.", stdout_capture.bytes.items);
 }
 
-test "CLI discards a restarted preview across all turn outcomes" {
+test "CLI keeps an unreplaced preview on failure and discards it on completion" {
     const alloc = std.testing.allocator;
     for ([_]types.TurnPresentationOutcome{ .paused, .failed, .interrupted, .completed }) |outcome| {
         var stdout_capture: TestCapture = .{};
@@ -9993,7 +9998,7 @@ test "CLI discards a restarted preview across all turn outcomes" {
         try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart\n" });
         try deps.finalize_turn(deps.ctx, 1, outcome, null);
         try std.testing.expectEqualStrings(
-            "Completed commentary.\n\n",
+            if (outcome == .completed) "Completed commentary.\n\n" else "Completed commentary.\n\nRetained preview.",
             ctx.assistant_output.items,
         );
         try std.testing.expectEqual(@as(usize, 0), ctx.final_output.items.len);
@@ -10475,9 +10480,9 @@ test "isPartial ignores whitespace-only model text, HTTP errors, and discarded p
     defer alloc.free(discarded_json);
     try std.testing.expect(std.mem.find(u8, discarded_json, "\"partial\"") == null);
 
-    // 4. Restart followed by no new response start (empty retry or HTTP error)
-    // must discard the obsolete preview and omit "partial".
-    const restart_no_text_json = try renderModeJson(alloc, &struct {
+    // 4. Unreplaced restarted preview on failure stays in output (as on main)
+    // and therefore counts as partial.
+    const kept_preview_json = try renderModeJson(alloc, &struct {
         fn f(ctx: *AskContext) !void {
             const deps = agentRuntimeDeps(ctx);
             try deps.push_text(deps.ctx, .assistant_started);
@@ -10486,9 +10491,9 @@ test "isPartial ignores whitespace-only model text, HTTP errors, and discarded p
             try deps.finalize_turn(deps.ctx, 1, .failed, null);
         }
     }.f);
-    defer alloc.free(restart_no_text_json);
-    try std.testing.expect(std.mem.find(u8, restart_no_text_json, "OBSOLETE_PREVIEW") == null);
-    try std.testing.expect(std.mem.find(u8, restart_no_text_json, "\"partial\"") == null);
+    defer alloc.free(kept_preview_json);
+    try std.testing.expect(std.mem.find(u8, kept_preview_json, "OBSOLETE_PREVIEW ") != null);
+    try std.testing.expect(std.mem.find(u8, kept_preview_json, "\"partial\":true") != null);
 }
 
 test "parse options applies last flag wins for --stream-events, --json, and --quiet" {
