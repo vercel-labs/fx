@@ -236,6 +236,7 @@ When the detector can't read the change, the `macOS arm64` check fails instead o
 
 - `sdk/`
 - The SDK models in `tests/tla/sdk/` or their drivers in `tests/tla/drivers/*.mjs`
+- The shared TLC code in `tests/tla/lib/`
 - The Node-API or WebAssembly core entry point
 - `src/acp/`, `src/core/hosts/`, or `src/core/session_manager/`
 
@@ -243,6 +244,7 @@ The `TLA+ MCP engine models and driver`, `TLA+ MCP host SignIn model`, `TLA+ MCP
 
 - `src/mcp/`, `src/core/mcp_host/`, or `src/core/mcp/`
 - The models in `tests/tla/mcp/` or `tests/tla/mcp_host/`, or their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, or `tests/tla/drivers/lib/`
+- The shared TLC code in `tests/tla/lib/`, which the MCP driver's bridge runs
 - The `tests/e2e/fixtures/mcp-*` servers, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`
 
 The `TLA+ transcript window model` job takes about 4 minutes and runs its checks when the change touches:
