@@ -6403,7 +6403,7 @@ describe("cli: ask success", () => {
 
   // GPT-6 loses the whole prompt cache when the request's own `reasoning`
   // changes, so a session keeps its first effort there and sends each later
-  // change as an update message before that turn's user message (D103).
+  // change as an update message before that turn's user message (D104).
   for (const family of [
     { model: "openai/gpt-6.1-sol", updates: true },
     { model: "anthropic/claude-fable-5.2", updates: false },

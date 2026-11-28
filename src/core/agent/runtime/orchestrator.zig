@@ -5283,7 +5283,7 @@ fn isResumedRequest(job: QueuedPrompt) bool {
 
 /// The history this turn's requests send: a resumed request leaves out the
 /// resumes a later one replaced. The projection, the turn's effort decision
-/// and the request's effort anchor all read this one (D103).
+/// and the request's effort anchor all read this one (D104).
 fn sentHistory(job: QueuedPrompt) []const HistoryTurn {
     return if (isResumedRequest(job)) session_runtime.withoutSupersededResumes(job.history) else job.history;
 }
@@ -6796,19 +6796,30 @@ fn prepareSkillCatalog(
 }
 
 /// The toolbox menu for this request: the one this conversation sent first,
-/// or, on its first request, one rendered from the visible skills, the
-/// configured MCP servers, and the built-in tools behind toolbox. Null when
-/// toolbox isn't advertised. The result lives in `agent`.
+/// saved with the turn that sent it so a resume sends it too, or, on its
+/// first request, one rendered from the visible skills, the configured MCP
+/// servers, and the built-in tools behind toolbox. Null when toolbox isn't
+/// advertised. The result lives in `agent`; what the turn keeps or notes
+/// goes in `finalization`, so every save of the turn records it (D103).
 fn toolboxMenu(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
     config: Config,
     agent: *runtime_agent.Agent,
+    job: QueuedPrompt,
+    finalization: *TurnFinalizationGuard,
     skill_section: ?*const skill_runtime.BoundedPromptSection,
     context_window: ?u32,
     turn_notes: *std.ArrayList(ChatMessage),
 ) !?[]const u8 {
+    const attempt = if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null;
+    // A recovered turn keeps what its first attempt saved.
+    if (attempt) |execution| {
+        if (execution.toolbox_menu) |menu| finalization.saved_toolbox_menu = .{ .text = try arena.dupe(u8, menu.text), .entries_hash = menu.entries_hash };
+        finalization.toolbox_noted = execution.toolbox_noted;
+    }
     if (!toolbox.isAdvertised(config.advertised_tool_names)) return null;
+    try agent.restoreToolboxMenu(arena, job.history, attempt);
     // Once the conversation keeps its menu, each entry's kind and name are
     // all a request needs: the change hash and the change note read only
     // those, so the descriptions and the shared-name scan are skipped.
@@ -6838,7 +6849,9 @@ fn toolboxMenu(
         skill_runtime.writeListShortened(&notice.writer, config.context_limits, context_window) catch return error.OutOfMemory;
         try deps.pushContextNotice(notice.written());
     }
+    if (!kept) finalization.saved_toolbox_menu = .{ .text = try arena.dupe(u8, decided.menu), .entries_hash = agent.toolbox_menu.entries_hash };
     if (decided.note) |note| {
+        finalization.toolbox_noted = .{ .entries_hash = agent.toolbox_menu.noted_hash, .compaction_count = runtime_agent.compactionCount(job.history) };
         // A note in the turn, saved with it, so the model learns of the
         // change while the menu and everything earlier requests sent stay as
         // they were (D93).
@@ -7245,7 +7258,7 @@ fn processQueuedPromptInner(
             debug_trace.logf("skills", "explicit skill note queued index={d} bytes={d}", .{ explicit_note_index.?, section.text.len });
         }
     }
-    const toolbox_menu = try toolboxMenu(arena, deps, config, agent, if (skill_section) |*section| section else null, request_capabilities.context_window, &within_turn_suffix);
+    const toolbox_menu = try toolboxMenu(arena, deps, config, agent, job, finalization, if (skill_section) |*section| section else null, request_capabilities.context_window, &within_turn_suffix);
     try appendStablePromptContext(arena, deps, config, toolbox_menu orelse if (skill_section) |section| section.text else null, &stable_prefix);
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
@@ -7309,7 +7322,7 @@ fn processQueuedPromptInner(
     }
     // Every save of the turn carries the effort it asked for and the update
     // it decided to send, the prompt's first one included, for a model that
-    // takes effort changes as messages (D103). The turn decides once, here,
+    // takes effort changes as messages (D104). The turn decides once, here,
     // with the same listed efforts the request writer checks. A recovered
     // turn keeps what its first attempt saved.
     if (deps.agent_stream_provider.effortUpdates(job.model)) {
@@ -8778,7 +8791,7 @@ fn processQueuedPromptLoop(
     finalization.captured_runtime_context = runtime_context.captured;
     debug_trace.logf("context", "runtime context saved_copy={} known_update={}", .{ runtime_context.frozen != null, runtime_context.known_update != null });
     // Every request names the session's first effort, and a later change
-    // rides as an update before its turn's message (D103).
+    // rides as an update before its turn's message (D104).
     // It reads the history the turn's decision read (`sentHistory`).
     var effort_anchor: ?types.ReasoningEffort = if (finalization.turn_effort) |asked|
         (try effort_anchor_state.sessionAnchor(arena, sentHistory(initial_job))) orelse asked
@@ -9315,7 +9328,7 @@ fn processQueuedPromptLoop(
             // The anchor and the saved updates go only to a model that takes
             // effort changes as messages: a subagent's request can go on on
             // another model after a wait (`applyContinuedSelection`), and that
-            // model gets its own effort (D103). A resend after a reply cut
+            // model gets its own effort (D104). A resend after a reply cut
             // while it reasoned names its lower effort itself, so that effort
             // applies; the next step names the anchor again.
             const takes_effort_updates = deps.agent_stream_provider.effortUpdates(gateway_model);
@@ -9515,6 +9528,7 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
                             .runtime_context = try runtimeContextTexts(arena, runtime_context.messages()),
+                            .toolbox_menu = try agent.compactionToolboxMenu(arena, compaction_history),
                             // The effort this compaction's request named.
                             .reasoning_anchor = if (!takes_effort_updates) null else if (effort_anchor) |*anchor| anchor.label() else null,
                         },
@@ -9580,10 +9594,10 @@ fn processQueuedPromptLoop(
                         // The block does not keep the effort the turns it
                         // replaced had set, so a turn with none of its own
                         // steps after it decides again against the new
-                        // history (D103). One whose steps the block kept
+                        // history (D104). One whose steps the block kept
                         // keeps the bytes it sent them with, and runs at the
                         // anchor when its update came from a removed turn,
-                        // which D103 accepts. A changed decision changes the turn's
+                        // which D104 accepts. A changed decision changes the turn's
                         // saved effort piece, so its next save rewrites the
                         // open turn whole (`session_adapter.zig`
                         // streamedPrefix).

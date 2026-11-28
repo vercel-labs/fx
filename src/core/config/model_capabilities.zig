@@ -41,7 +41,7 @@ pub const ResolvedProviderOptions = struct {
     provider_strict: bool = false,
     /// Set only for a model that takes effort changes as messages: then
     /// `reasoning` holds the session's first effort, and the request writer
-    /// prints each turn's saved update before its message (D103).
+    /// prints each turn's saved update before its message (D104).
     effort_updates: ?EffortUpdates = null,
 };
 

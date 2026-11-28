@@ -3,7 +3,7 @@
 //! change of the request's own effort drops the whole prompt cache. A turn
 //! that asks for another one sends an update right before its message, and
 //! saves that decision, so every later request sends the turn the same way
-//! (D103, `tests/tla/prompt_context/PromptCache.tla` "effort",
+//! (D104, `tests/tla/prompt_context/PromptCache.tla` "effort",
 //! `tests/tla/compaction/ProviderCompaction.tla` RunsAsAsked).
 
 const std = @import("std");

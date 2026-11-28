@@ -42,7 +42,7 @@ Carried(req) == Cardinality({j \in 1..Len(req) : req[j].k \in {"asstc", "userc",
 \* the message that caused it, so no block of its own may appear.
 Inserted == {"scoped", "skill"}
 Noted == {"note", "skilltext", "skillnote"}
-\* An effort update is its own block in either carrier (D103).
+\* An effort update is its own block in either carrier (D104).
 ConversationKinds ==
   CASE ~Notes -> {"user", "asst"}
     [] Carrier = "message" -> PC!MessageKinds \cup {"eff"}

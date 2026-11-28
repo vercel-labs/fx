@@ -156,7 +156,27 @@ pub const Payload = struct {
     /// wrote one: requests to that model send it in place of the compacted
     /// turns, and requests to any other model read the rest of this payload.
     provider: ?ProviderBlock = null,
+    /// The toolbox menu the conversation sent before this compaction, which
+    /// every later request sends unchanged (D103,
+    /// `tests/tla/toolbox/Toolbox.tla` MenuFixed). Null in checkpoints written
+    /// before it, and for a conversation that sent none; an older fx ignores
+    /// it.
+    toolbox_menu: ?ToolboxMenu = null,
 };
+
+/// A conversation's toolbox menu as a checkpoint keeps it.
+pub const ToolboxMenu = struct {
+    /// The lead and the menu, as the requests send them.
+    text: []const u8,
+    /// `toolbox.entriesHash` of what the menu lists.
+    entries_hash: u64,
+};
+
+/// The toolbox menu a checkpoint keeps, or null when it keeps none.
+pub fn toolboxMenu(arena: Allocator, summary: []const u8) Allocator.Error!?ToolboxMenu {
+    const payload = try parse(arena, summary) orelse return null;
+    return payload.toolbox_menu;
+}
 
 /// A compaction block a provider wrote over the turns a checkpoint replaces
 /// (`tests/tla/compaction/ProviderCompaction.tla` KeepCompaction and
@@ -183,7 +203,7 @@ pub const ProviderBlock = struct {
     runtime_context: []const []const u8 = &.{},
     /// The effort the compaction request named, for a model that takes
     /// effort changes as messages. Later requests name it too, so the block's
-    /// reasoning stays valid (D103). An older block has none.
+    /// reasoning stays valid (D104). An older block has none.
     reasoning_anchor: ?[]const u8 = null,
 
     /// Leaves out an absent anchor, so a block without one keeps the bytes an
@@ -692,7 +712,7 @@ test "payload checkpoints round trip and render each turn in order, then the ent
     try testing.expect(std.mem.find(u8, text, "\"turn_count\"") == null);
 }
 
-test "a provider block keeps the request effort it was written at, and an older block reads without one (D103)" {
+test "a provider block keeps the request effort it was written at, and an older block reads without one (D104)" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -820,6 +840,41 @@ test "the saved line names only what can be opened" {
     const one = try render(alloc, .{ .turn_count = 1 });
     defer alloc.free(one);
     try testing.expect(std.mem.find(u8, one, "Saved word for word: turn M1. Search them by text, or open one by its ID (like M1)") != null);
+}
+
+test "a checkpoint keeps the conversation's toolbox menu, and one written before it reads as before (D103)" {
+    const alloc = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tools = [_]Tool{.{ .number = 1, .line = "shell make (2 bytes)" }};
+    const without: Payload = .{
+        .turns = &.{.{ .number = 1, .users = &.{"build it"}, .final = "Built.", .first_tool = 1, .last_tool = 1, .tools = &tools }},
+        .entries = &.{.{ .id = "F1", .text = "F1 (T1): make works" }},
+        .turn_count = 1,
+        .tool_count = 1,
+        .provider = .{ .provider = "gateway", .model = "anthropic/claude-fable-5.2", .parts_json = "[]", .runtime_context = &.{"ctx"} },
+    };
+    var with = without;
+    with.toolbox_menu = .{ .text = "lead\n- review", .entries_hash = std.math.maxInt(u64) };
+
+    const saved = try encode(arena, with);
+    const kept = (try toolboxMenu(arena, saved)).?;
+    try testing.expectEqualStrings("lead\n- review", kept.text);
+    try testing.expectEqual(std.math.maxInt(u64), kept.entries_hash);
+
+    // An fx from before the field wrote the same bytes without it: it reads
+    // with no menu, and written again keeps every other field's bytes.
+    const new_bytes = try encode(arena, without);
+    const null_field = ",\"toolbox_menu\":null";
+    try testing.expect(std.mem.endsWith(u8, new_bytes, null_field ++ "}"));
+    const older = try std.mem.concat(arena, u8, &.{ new_bytes[0 .. new_bytes.len - null_field.len - 1], "}" });
+    const read = (try parse(arena, older)).?;
+    try testing.expect(read.toolbox_menu == null);
+    try testing.expectEqualStrings(new_bytes, try encode(arena, read));
+    try testing.expect(try toolboxMenu(arena, older) == null);
+    // Other checkpoints hold no menu.
+    try testing.expect(try toolboxMenu(arena, legacy_handoff_open ++ "summary") == null);
 }
 
 test "older checkpoints are recognized but not parsed" {

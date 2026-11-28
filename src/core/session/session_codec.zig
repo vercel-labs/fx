@@ -598,12 +598,12 @@ pub fn namesImages(user: session.UserTurn, stored: ?*const StoredImages) bool {
 }
 
 /// Whether `execution` is written as schema 11, 12 or 13, with context notes
-/// (D93), a saved runtime context (D94) or a saved turn effort (D103), which
-/// an fx from before them rejects. A journal event, checkpoint, or snapshot that holds one says so
+/// (D93), a saved runtime context (D94), a toolbox record (D103) or a saved
+/// turn effort (D104), which an fx from before them rejects. A journal event, checkpoint, or snapshot that holds one says so
 /// in its own version, so an older reader reports a newer format instead of
 /// a corrupt one. Matches the choice in `writeExecutionMemoryJsonFrom`.
 pub fn executionUsesNotesSchema(execution: session.ExecutionMemory) bool {
-    return execution.runtime_context != null or execution.context_notes.len > 0 or execution.turn_effort != null;
+    return execution.runtime_context != null or execution.context_notes.len > 0 or executionHasToolbox(execution) or executionHasEffort(execution);
 }
 
 pub fn turnUsesNotesSchema(turn: session.HistoryTurn) bool {
@@ -1871,12 +1871,20 @@ fn writeExecutionMemoryJsonFrom(
 ) !void {
     std.debug.assert(from.tool_steps <= execution.tool_steps.len and from.files <= execution.files.len and from.steering <= execution.steering.len);
     // Version 11 adds `context_notes` (D93), version 12 `runtime_context`
-    // (D94) and version 13 `turn_effort` (D103). Only an execution that has
-    // them uses them, so one without keeps version 10 and its exact bytes; an
-    // older fx rejects each version as it rejects every newer version.
-    const with_turn_effort = format == .durable and execution.turn_effort != null;
-    const with_runtime_context = format == .durable and execution.runtime_context != null;
-    try writer.writeAll(if (with_turn_effort)
+    // (D94), version 13 `toolbox_menu` and `toolbox_noted` (D103) and
+    // version 14 `turn_effort` and `effort_update` (D104). Only an execution
+    // that has them uses them, so one without keeps version 10 and its exact
+    // bytes; an older fx rejects each version as it rejects every newer
+    // version.
+    const with_effort = format == .durable and executionHasEffort(execution);
+    // Whether the toolbox keys are written: version 14 names them too.
+    const with_toolbox = format == .durable and (executionHasToolbox(execution) or with_effort);
+    // Whether the `runtime_context` key is written: versions 13 and 14 name
+    // it too.
+    const with_runtime_context = format == .durable and (execution.runtime_context != null or with_toolbox);
+    try writer.writeAll(if (with_effort)
+        "{\"schema_version\":14,\"tool_steps\":["
+    else if (with_toolbox)
         "{\"schema_version\":13,\"tool_steps\":["
     else if (with_runtime_context)
         "{\"schema_version\":12,\"tool_steps\":["
@@ -1900,9 +1908,9 @@ fn writeExecutionMemoryJsonFrom(
         if (i > 0) try writer.writeByte(',');
         try writeExecutionSteering(writer, steering, format);
     }
-    if (with_turn_effort or with_runtime_context or (format == .durable and execution.context_notes.len > 0)) {
+    if (with_runtime_context or (format == .durable and execution.context_notes.len > 0)) {
         // Only an execution with notes names them, so one without stays as
-        // before (D93); versions 12 and 13 always name them. A delta writes them
+        // before (D93); version 12 always names them. A delta writes them
         // whole: the journal's merge keeps the delta's list (`journal.zig`
         // mergeDelta).
         try writer.writeAll("],\"context_notes\":[");
@@ -1915,33 +1923,19 @@ fn writeExecutionMemoryJsonFrom(
             try writer.writeByte('}');
         }
     }
-    if (with_turn_effort or with_runtime_context) {
-        // Whole in every delta too, like the notes above. Version 13 writes
-        // null for a turn that saved none.
-        try writer.writeAll("],\"runtime_context\":");
-        if (execution.runtime_context) |texts| {
-            try writer.writeByte('[');
-            for (texts, 0..) |text, i| {
-                if (i > 0) try writer.writeByte(',');
-                try writeExecutionBytes(writer, text, format);
-            }
-            try writer.writeByte(']');
-        } else {
-            try writer.writeAll("null");
-        }
+    if (with_runtime_context) {
+        // Whole in every delta too, like the notes above. Version 13 always
+        // names it, null when the turn captured none.
+        try writer.writeByte(']');
+        try writeOptionalRuntimeContext(writer, execution.runtime_context, format);
     }
-    if (with_turn_effort) {
-        try writer.writeAll(",\"turn_effort\":");
-        try std.json.Stringify.value(execution.turn_effort.?.label(), .{}, writer);
-        try writer.writeAll(",\"effort_update\":");
-        if (execution.effort_update) |*update| {
-            try std.json.Stringify.value(update.label(), .{}, writer);
-        } else {
-            try writer.writeAll("null");
-        }
+    if (with_toolbox) {
+        // Whole in every delta too, like the notes above.
+        try writeToolboxRecords(writer, execution, format);
     }
+    if (with_effort) try writeTurnEffort(writer, execution);
     if (format == .durable) {
-        try writer.writeAll(if (with_turn_effort or with_runtime_context) ",\"turn_summary\":" else "],\"turn_summary\":");
+        try writer.writeAll(if (with_runtime_context) ",\"turn_summary\":" else "],\"turn_summary\":");
         if (execution.turn_summary) |summary| {
             try writeTurnSummary(writer, summary);
         } else {
@@ -1951,6 +1945,53 @@ fn writeExecutionMemoryJsonFrom(
         try writer.writeByte(']');
     }
     try writer.writeByte('}');
+}
+
+/// Whether `execution` holds a toolbox record, which needs schema version 13
+/// (D103).
+fn executionHasToolbox(execution: session.ExecutionMemory) bool {
+    return execution.toolbox_menu != null or execution.toolbox_noted != null;
+}
+
+/// Whether `execution` holds a saved turn effort, which needs schema version
+/// 14 (D104).
+fn executionHasEffort(execution: session.ExecutionMemory) bool {
+    return execution.turn_effort != null or execution.effort_update != null;
+}
+
+fn writeTurnEffort(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
+    try writer.writeAll(",\"turn_effort\":");
+    if (execution.turn_effort) |*effort| try std.json.Stringify.value(effort.label(), .{}, writer) else try writer.writeAll("null");
+    try writer.writeAll(",\"effort_update\":");
+    if (execution.effort_update) |*update| try std.json.Stringify.value(update.label(), .{}, writer) else try writer.writeAll("null");
+}
+
+fn writeOptionalRuntimeContext(writer: *std.Io.Writer, texts: ?[]const []u8, format: ExecutionMemoryJsonFormat) !void {
+    try writer.writeAll(",\"runtime_context\":");
+    const captured = texts orelse return writer.writeAll("null");
+    try writer.writeByte('[');
+    for (captured, 0..) |text, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeExecutionBytes(writer, text, format);
+    }
+    try writer.writeByte(']');
+}
+
+fn writeToolboxRecords(writer: *std.Io.Writer, execution: session.ExecutionMemory, format: ExecutionMemoryJsonFormat) !void {
+    try writer.writeAll(",\"toolbox_menu\":");
+    if (execution.toolbox_menu) |menu| {
+        try writer.writeAll("{\"text\":");
+        try writeExecutionBytes(writer, menu.text, format);
+        try writer.print(",\"entries_hash\":{d}}}", .{menu.entries_hash});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"toolbox_noted\":");
+    if (execution.toolbox_noted) |noted| {
+        try writer.print("{{\"entries_hash\":{d},\"compaction_count\":{d}}}", .{ noted.entries_hash, noted.compaction_count });
+    } else {
+        try writer.writeAll("null");
+    }
 }
 
 fn writeExecutionToolStep(writer: *std.Io.Writer, step: session.ToolExecutionStep, format: ExecutionMemoryJsonFormat, image_mode: anytype) !void {
@@ -2064,7 +2105,7 @@ pub fn executionHashes(alloc: Allocator, checkpoint: RecoveryCheckpoint) !Execut
 }
 
 fn hasDurableExecutionMemory(execution: session.ExecutionMemory) bool {
-    return !execution.isEmpty() or execution.turn_summary != null or execution.runtime_context != null or execution.turn_effort != null;
+    return !execution.isEmpty() or execution.turn_summary != null or execution.runtime_context != null or executionHasToolbox(execution) or executionHasEffort(execution);
 }
 
 fn writeTurnSummary(writer: *std.Io.Writer, summary: types.TurnSummary) !void {
@@ -2599,7 +2640,8 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         7...10 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         11 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "turn_summary" }),
         12 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "runtime_context", "turn_summary" }),
-        13 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "runtime_context", "turn_effort", "effort_update", "turn_summary" }),
+        13 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "runtime_context", "toolbox_menu", "toolbox_noted", "turn_summary" }),
+        14 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "runtime_context", "toolbox_menu", "toolbox_noted", "turn_effort", "effort_update", "turn_summary" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -2627,19 +2669,17 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         &.{};
     errdefer types.freePersistedContextNotes(alloc, context_notes);
     const runtime_context: ?[][]u8 = if (object.get("runtime_context")) |texts|
-        // Only version 13 has a null one: the turn saved its effort and no runtime context.
         if (schema_version >= 13 and texts == .null) null else try parseRuntimeContext(alloc, texts)
     else
         null;
     errdefer if (runtime_context) |texts| types.freeRuntimeContext(alloc, texts);
-    const turn_effort: ?types.ReasoningEffort = if (object.get("turn_effort")) |label|
-        try parseTurnEffort(label)
-    else
-        null;
-    const effort_update: ?types.ReasoningEffort = if (object.get("effort_update")) |label|
-        if (label == .null) null else try parseTurnEffort(label)
-    else
-        null;
+    const toolbox_menu = if (object.get("toolbox_menu")) |menu| try parseToolboxMenu(alloc, menu) else null;
+    errdefer if (toolbox_menu) |menu| alloc.free(menu.text);
+    const toolbox_noted = if (object.get("toolbox_noted")) |noted| try parseToolboxNoted(noted) else null;
+    const turn_effort: ?types.ReasoningEffort = if (object.get("turn_effort")) |label| try parseOptionalTurnEffort(label) else null;
+    const effort_update: ?types.ReasoningEffort = if (object.get("effort_update")) |label| try parseOptionalTurnEffort(label) else null;
+    // Version 14 is written only for a turn that saved an effort.
+    if (schema_version == 14 and turn_effort == null and effort_update == null) return error.InvalidSessionFormat;
     const turn_summary = if (schema_version >= 5)
         try parseOptionalTurnSummary(object.get("turn_summary").?)
     else
@@ -2650,16 +2690,35 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        .toolbox_menu = toolbox_menu,
+        .toolbox_noted = toolbox_noted,
         .turn_effort = turn_effort,
         .effort_update = effort_update,
         .turn_summary = turn_summary,
     };
 }
 
-/// A saved turn effort is one effort label, `auto` included (D103).
-fn parseTurnEffort(value: std.json.Value) !types.ReasoningEffort {
+/// A saved turn effort or update is one effort label, `auto` included, or
+/// null for none (D104).
+fn parseOptionalTurnEffort(value: std.json.Value) !?types.ReasoningEffort {
+    if (value == .null) return null;
     if (value != .string) return error.InvalidSessionFormat;
     return types.ReasoningEffort.parse(value.string) orelse error.InvalidSessionFormat;
+}
+
+/// Caller owns the text. Null when the turn kept no menu (D103).
+fn parseToolboxMenu(alloc: Allocator, value: std.json.Value) !?types.SavedToolboxMenu {
+    if (value == .null) return null;
+    const object = try exactObject(value, &.{ "text", "entries_hash" });
+    const entries_hash = try requireU64(object, "entries_hash");
+    return .{ .text = try parseRequiredDurableBytes(alloc, object, "text"), .entries_hash = entries_hash };
+}
+
+/// Null when the turn added no toolbox change note (D103).
+fn parseToolboxNoted(value: std.json.Value) !?types.ToolboxNoted {
+    if (value == .null) return null;
+    const object = try exactObject(value, &.{ "entries_hash", "compaction_count" });
+    return .{ .entries_hash = try requireU64(object, "entries_hash"), .compaction_count = try requireUsize(object, "compaction_count") };
 }
 
 /// Caller owns the result. Boundaries never decrease and never pass the
@@ -3084,8 +3143,9 @@ fn parseToolResultWith(
             try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
         else
             try exactObject(value, v4_keys), .extended = true },
-        // Versions 11 (D93) and 12 (D94) changed only the execution's keys.
-        10, 11, 12 => blk: {
+        // Versions 11 (D93), 12 (D94) and 13 (D103) changed only the
+        // execution's keys.
+        10, 11, 12, 13 => blk: {
             const keys = v4_keys.* ++ [_][]const u8{"review_feedback"};
             break :blk .{ .object = if (value == .object and value.object.contains("tool_images"))
                 try exactObject(value, &(keys ++ [_][]const u8{"tool_images"}))
@@ -5094,7 +5154,108 @@ test "execution memory codec writes the runtime context only for the turn that c
     }
 }
 
-test "execution memory codec writes a turn's effort only when the turn saved one (D103)" {
+test "execution memory codec writes the toolbox menu and noted hash only for a turn that has them (D103)" {
+    const alloc = std.testing.allocator;
+    var calls = [_]session.ToolCall{.{ .id = "call_menu", .name = "read_file", .arguments_json = "{}" }};
+    var results = [_]session.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_menu"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("ok"),
+        .output_bytes = 2,
+        .stored_output_bytes = 2,
+    }};
+    var steps = [_]session.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+    var captured = [_][]u8{@constCast("Runtime context: permission mode is ask.")};
+    var notes = [_]types.PersistedContextNote{.{ .text = @constCast("toolbox change"), .after_tool_step_count = 0 }};
+    // A hash past an i64, which JSON readers keep only as digits.
+    const menu: types.SavedToolboxMenu = .{ .text = @constCast("lead\n- review\n- fixture"), .entries_hash = std.math.maxInt(u64) };
+    const noted: types.ToolboxNoted = .{ .entries_hash = 7, .compaction_count = 2 };
+    const Case = struct { menu: bool, noted: bool, runtime: bool, notes: bool, version: []const u8 };
+    for ([_]Case{
+        .{ .menu = false, .noted = false, .runtime = false, .notes = false, .version = "\"schema_version\":10" },
+        .{ .menu = false, .noted = false, .runtime = true, .notes = true, .version = "\"schema_version\":12" },
+        .{ .menu = true, .noted = false, .runtime = false, .notes = false, .version = "\"schema_version\":13" },
+        .{ .menu = false, .noted = true, .runtime = false, .notes = true, .version = "\"schema_version\":13" },
+        .{ .menu = true, .noted = true, .runtime = true, .notes = true, .version = "\"schema_version\":13" },
+    }) |case| {
+        const turn: session.HistoryTurn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast("done"),
+            .execution = .{
+                .tool_steps = steps[0..],
+                .context_notes = if (case.notes) notes[0..] else &.{},
+                .runtime_context = if (case.runtime) captured[0..] else null,
+                .toolbox_menu = if (case.menu) menu else null,
+                .toolbox_noted = if (case.noted) noted else null,
+            },
+        } };
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+        if (std.mem.find(u8, encoded.written(), case.version) == null) {
+            std.debug.print("expected {s} in {s}\n", .{ case.version, encoded.written() });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(case.menu or case.noted, std.mem.find(u8, encoded.written(), "\"toolbox_menu\"") != null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = parseHistoryTurn(alloc, parsed.value) catch |err| {
+            std.debug.print("case did not parse ({s}): {s}\n", .{ @errorName(err), encoded.written() });
+            return err;
+        };
+        defer session.freeHistoryTurn(alloc, decoded);
+        const execution = decoded.assistant.execution;
+        try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+        try std.testing.expectEqual(@as(usize, @intFromBool(case.notes)), execution.context_notes.len);
+        try std.testing.expectEqual(case.runtime, execution.runtime_context != null);
+        if (case.menu) {
+            try std.testing.expectEqualStrings(menu.text, execution.toolbox_menu.?.text);
+            try std.testing.expectEqual(menu.entries_hash, execution.toolbox_menu.?.entries_hash);
+        } else {
+            try std.testing.expect(execution.toolbox_menu == null);
+        }
+        try std.testing.expectEqual(if (case.noted) noted else null, execution.toolbox_noted);
+        // fx's own state for the model, never shown.
+        var shown: std.Io.Writer.Allocating = .init(alloc);
+        defer shown.deinit();
+        try writeExecutionMemoryJson(&shown.writer, turn.assistant.execution, .presentation);
+        try std.testing.expect(std.mem.find(u8, shown.written(), "toolbox") == null);
+    }
+
+    // Only version 13 names them, always both, each whole; older versions
+    // still read.
+    for ([_]struct { json: []const u8, rejected: ?anyerror = null }{
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"toolbox_menu\":{\"text\":\"m\",\"entries_hash\":5},\"toolbox_noted\":null,\"turn_summary\":null}" },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\"],\"toolbox_menu\":null,\"toolbox_noted\":{\"entries_hash\":5,\"compaction_count\":0},\"turn_summary\":null}" },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"toolbox_menu\":{\"text\":\"m\",\"entries_hash\":5},\"turn_summary\":null}", .rejected = error.InvalidSessionFormat },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"toolbox_menu\":{\"text\":\"m\"},\"toolbox_noted\":null,\"turn_summary\":null}", .rejected = error.InvalidSessionFormat },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"toolbox_menu\":{\"text\":1,\"entries_hash\":5},\"toolbox_noted\":null,\"turn_summary\":null}", .rejected = error.InvalidDurableBytes },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"toolbox_menu\":null,\"toolbox_noted\":{\"entries_hash\":-1,\"compaction_count\":0},\"turn_summary\":null}", .rejected = error.InvalidSessionFormat },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[],\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_summary\":null}", .rejected = error.InvalidSessionFormat },
+        .{ .json = "{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\"],\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_summary\":null}", .rejected = error.InvalidSessionFormat },
+        .{ .json = "{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\"],\"turn_summary\":null}" },
+        .{ .json = "{\"schema_version\":11,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"turn_summary\":null}" },
+        .{ .json = "{\"schema_version\":10,\"tool_steps\":[],\"files\":[],\"steering\":[],\"turn_summary\":null}" },
+    }) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        if (case.rejected) |expected| {
+            try std.testing.expectError(expected, parseExecutionMemory(alloc, parsed.value));
+            continue;
+        }
+        const execution = parseExecutionMemory(alloc, parsed.value) catch |err| {
+            std.debug.print("case did not parse ({s}): {s}\n", .{ @errorName(err), case.json });
+            return err;
+        };
+        defer session.freeExecutionMemory(alloc, execution);
+        const names_menu = std.mem.find(u8, case.json, "\"toolbox_menu\":{") != null;
+        try std.testing.expectEqual(names_menu, execution.toolbox_menu != null);
+        if (names_menu) try std.testing.expectEqualStrings("m", execution.toolbox_menu.?.text);
+    }
+}
+
+test "execution memory codec writes a turn's effort only when the turn saved one (D104)" {
     const alloc = std.testing.allocator;
     var captured = [_][]u8{@constCast("Runtime context: permission mode is ask.")};
     const effort = types.ReasoningEffort.literal;
@@ -5102,10 +5263,10 @@ test "execution memory codec writes a turn's effort only when the turn saved one
     for ([_]Case{
         .{ .effort = null, .runtime = false, .version = "\"schema_version\":10", .field = null },
         .{ .effort = null, .runtime = true, .version = "\"schema_version\":12", .field = null },
-        .{ .effort = effort("low"), .runtime = false, .version = "\"schema_version\":13", .field = "\"turn_effort\":\"low\",\"effort_update\":null" },
-        .{ .effort = effort("low"), .update = effort("low"), .runtime = false, .version = "\"schema_version\":13", .field = "\"turn_effort\":\"low\",\"effort_update\":\"low\"" },
-        .{ .effort = .auto, .update = effort("medium"), .runtime = false, .version = "\"schema_version\":13", .field = "\"turn_effort\":\"auto\",\"effort_update\":\"medium\"" },
-        .{ .effort = effort("high"), .runtime = true, .version = "\"schema_version\":13", .field = "\"turn_effort\":\"high\"" },
+        .{ .effort = effort("low"), .runtime = false, .version = "\"schema_version\":14", .field = "\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_effort\":\"low\",\"effort_update\":null" },
+        .{ .effort = effort("low"), .update = effort("low"), .runtime = false, .version = "\"schema_version\":14", .field = "\"turn_effort\":\"low\",\"effort_update\":\"low\"" },
+        .{ .effort = .auto, .update = effort("medium"), .runtime = false, .version = "\"schema_version\":14", .field = "\"turn_effort\":\"auto\",\"effort_update\":\"medium\"" },
+        .{ .effort = effort("high"), .runtime = true, .version = "\"schema_version\":14", .field = "\"turn_effort\":\"high\"" },
     }) |case| {
         const turn: session.HistoryTurn = .{ .assistant = .{
             .user = .{ .text = @constCast("prompt") },
@@ -5145,6 +5306,7 @@ test "execution memory codec writes a turn's effort only when the turn saved one
             try std.testing.expect(execution.effort_update == null);
         }
         try std.testing.expectEqual(case.runtime, execution.runtime_context != null);
+        try std.testing.expect(execution.toolbox_menu == null and execution.toolbox_noted == null);
         var shown: std.Io.Writer.Allocating = .init(alloc);
         defer shown.deinit();
         try writeExecutionMemoryJson(&shown.writer, turn.assistant.execution, .presentation);
@@ -5161,16 +5323,20 @@ test "execution memory codec writes a turn's effort only when the turn saved one
     try writeHistoryTurn(&interrupted_encoded.writer, interrupted);
     try std.testing.expect(std.mem.find(u8, interrupted_encoded.written(), "\"turn_effort\":\"low\",\"effort_update\":\"low\"") != null);
 
-    // Only version 13 names it, with a readable value; older versions read as before.
+    // Only version 14 names them, with every key version 13 names, and a
+    // readable value; older versions read as before.
+    const keys13 = "\"schema_version\":14,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],";
     for ([_]struct { json: []const u8, effort: ?[]const u8 = null, valid: bool }{
-        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"turn_effort\":\"xhigh\",\"effort_update\":null,\"turn_summary\":null}", .effort = "xhigh", .valid = true },
-        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\"],\"turn_effort\":\"auto\",\"effort_update\":null,\"turn_summary\":null}", .effort = "auto", .valid = true },
-        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"turn_effort\":\"!!\",\"effort_update\":null,\"turn_summary\":null}", .valid = false },
-        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"turn_effort\":\"low\",\"effort_update\":\"!!\",\"turn_summary\":null}", .valid = false },
-        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"turn_effort\":\"low\",\"turn_summary\":null}", .valid = false },
-        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"turn_effort\":null,\"effort_update\":null,\"turn_summary\":null}", .valid = false },
-        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[],\"turn_effort\":\"low\",\"effort_update\":null,\"turn_summary\":null}", .valid = false },
-        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"effort_update\":null,\"turn_summary\":null}", .valid = false },
+        .{ .json = "{" ++ keys13 ++ "\"runtime_context\":null,\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_effort\":\"xhigh\",\"effort_update\":null,\"turn_summary\":null}", .effort = "xhigh", .valid = true },
+        .{ .json = "{" ++ keys13 ++ "\"runtime_context\":[\"a\"],\"toolbox_menu\":{\"text\":\"m\",\"entries_hash\":5},\"toolbox_noted\":null,\"turn_effort\":\"auto\",\"effort_update\":null,\"turn_summary\":null}", .effort = "auto", .valid = true },
+        .{ .json = "{" ++ keys13 ++ "\"runtime_context\":null,\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_effort\":\"!!\",\"effort_update\":null,\"turn_summary\":null}", .valid = false },
+        .{ .json = "{" ++ keys13 ++ "\"runtime_context\":null,\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_effort\":\"low\",\"effort_update\":\"!!\",\"turn_summary\":null}", .valid = false },
+        .{ .json = "{" ++ keys13 ++ "\"runtime_context\":null,\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_effort\":\"low\",\"turn_summary\":null}", .valid = false },
+        .{ .json = "{" ++ keys13 ++ "\"runtime_context\":null,\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_effort\":null,\"effort_update\":null,\"turn_summary\":null}", .valid = false },
+        .{ .json = "{" ++ keys13 ++ "\"runtime_context\":[],\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_effort\":\"low\",\"effort_update\":null,\"turn_summary\":null}", .valid = false },
+        // Version 14 names the toolbox keys too.
+        .{ .json = "{" ++ keys13 ++ "\"runtime_context\":null,\"turn_effort\":\"low\",\"effort_update\":null,\"turn_summary\":null}", .valid = false },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_effort\":\"low\",\"effort_update\":null,\"turn_summary\":null}", .valid = false },
         .{ .json = "{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\"],\"turn_effort\":\"low\",\"turn_summary\":null}", .valid = false },
         .{ .json = "{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\"],\"turn_summary\":null}", .valid = true },
         .{ .json = "{\"schema_version\":11,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"turn_summary\":null}", .valid = true },
@@ -5189,6 +5355,66 @@ test "execution memory codec writes a turn's effort only when the turn saved one
         } else {
             try std.testing.expect(execution.turn_effort == null);
         }
+    }
+}
+
+test "a turn with toolbox records and an effort round-trips at version 14; toolbox alone stays 13 (D103, D104)" {
+    const alloc = std.testing.allocator;
+    const effort = types.ReasoningEffort.literal;
+    const menu: types.SavedToolboxMenu = .{ .text = @constCast("lead\n- review"), .entries_hash = std.math.maxInt(u64) };
+    const noted: types.ToolboxNoted = .{ .entries_hash = 7, .compaction_count = 2 };
+    var captured = [_][]u8{@constCast("Runtime context: permission mode is ask.")};
+    const Case = struct { toolbox: bool, effort: bool, version: []const u8 };
+    for ([_]Case{
+        .{ .toolbox = true, .effort = true, .version = "\"schema_version\":14" },
+        .{ .toolbox = true, .effort = false, .version = "\"schema_version\":13" },
+        .{ .toolbox = false, .effort = true, .version = "\"schema_version\":14" },
+    }) |case| {
+        const turn: session.HistoryTurn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast("done"),
+            .execution = .{
+                .runtime_context = captured[0..],
+                .toolbox_menu = if (case.toolbox) menu else null,
+                .toolbox_noted = if (case.toolbox) noted else null,
+                .turn_effort = if (case.effort) effort("low") else null,
+                .effort_update = if (case.effort) effort("low") else null,
+            },
+        } };
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+        if (std.mem.find(u8, encoded.written(), case.version) == null) {
+            std.debug.print("expected {s} in {s}\n", .{ case.version, encoded.written() });
+            return error.TestUnexpectedResult;
+        }
+        // Version 13 keeps its exact keys: no effort key in it.
+        try std.testing.expectEqual(case.effort, std.mem.find(u8, encoded.written(), "\"turn_effort\"") != null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = try parseHistoryTurn(alloc, parsed.value);
+        defer session.freeHistoryTurn(alloc, decoded);
+        const execution = decoded.assistant.execution;
+        if (case.toolbox) {
+            try std.testing.expectEqualStrings(menu.text, execution.toolbox_menu.?.text);
+            try std.testing.expectEqual(menu.entries_hash, execution.toolbox_menu.?.entries_hash);
+            try std.testing.expectEqual(@as(?types.ToolboxNoted, noted), execution.toolbox_noted);
+        } else {
+            try std.testing.expect(execution.toolbox_menu == null and execution.toolbox_noted == null);
+        }
+        if (case.effort) {
+            try std.testing.expectEqualStrings("low", execution.turn_effort.?.label());
+            try std.testing.expectEqualStrings("low", execution.effort_update.?.label());
+        } else {
+            try std.testing.expect(execution.turn_effort == null and execution.effort_update == null);
+        }
+        try std.testing.expectEqualStrings(captured[0], execution.runtime_context.?[0]);
+        // Writing the decoded turn again gives the same bytes.
+        const again: session.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("done"), .execution = execution } };
+        var reencoded: std.Io.Writer.Allocating = .init(alloc);
+        defer reencoded.deinit();
+        try writeHistoryTurn(&reencoded.writer, again);
+        try std.testing.expectEqualStrings(encoded.written(), reencoded.written());
     }
 }
 

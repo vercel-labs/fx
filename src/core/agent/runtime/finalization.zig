@@ -46,9 +46,14 @@ pub const TurnFinalizationGuard = struct {
     /// Every save of the turn carries it, so a streamed turn keeps one prefix
     /// (D94). Borrowed from the turn's arena.
     captured_runtime_context: ?[][]u8 = null,
+    /// The toolbox menu this turn sent first for the conversation, and what
+    /// its change note told it, if it did. Every save of the turn carries
+    /// them (D103). Borrowed from the turn's arena.
+    saved_toolbox_menu: ?types.SavedToolboxMenu = null,
+    toolbox_noted: ?types.ToolboxNoted = null,
     /// The effort this turn asked for, for a model that takes effort changes
     /// as messages, and the update it sends before its message. Every save of
-    /// the turn carries them, from the first (D103).
+    /// the turn carries them, from the first (D104).
     turn_effort: ?types.ReasoningEffort = null,
     effort_update: ?types.ReasoningEffort = null,
     lease_allocator: Allocator = std.heap.c_allocator,
@@ -104,6 +109,8 @@ pub const TurnFinalizationGuard = struct {
         var with_records = execution;
         with_records.model_calls = self.model_calls.items;
         with_records.runtime_context = self.captured_runtime_context;
+        with_records.toolbox_menu = self.saved_toolbox_menu;
+        with_records.toolbox_noted = self.toolbox_noted;
         with_records.turn_effort = self.turn_effort;
         with_records.effort_update = self.effort_update;
         return with_records;

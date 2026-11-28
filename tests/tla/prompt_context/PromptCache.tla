@@ -116,7 +116,7 @@
 (* runtime block follow the current values on every request. Mutation      *)
 (* "overlay_not_saved" freezes them but recaptures them when fx restarts.  *)
 (* Event "effort" is a user turn that asks for another reasoning effort,   *)
-(* for a model that takes the change as a message (GPT-6 and later, D103). *)
+(* for a model that takes the change as a message (GPT-6 and later, D104). *)
 (* The request's own effort is part of the provider's cache key, so it is  *)
 (* modeled as part of the first block. With Notes the request keeps the    *)
 (* session's first effort and an update block, "eff", comes right before   *)

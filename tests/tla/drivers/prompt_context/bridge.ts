@@ -217,7 +217,7 @@ export function abstractRequest(body: string, family: Family): Abstraction {
   for (; i < prompt.length; i += 1) {
     const role = prompt[i].role;
     if (role === "system") {
-      // An effort update rides right before its turn's message (D103).
+      // An effort update rides right before its turn's message (D104).
       const update = prompt[i]?.providerOptions?.openai?.reasoningEffortUpdate;
       if (typeof update === "string") {
         blocks.push({ k: "eff", v: short(update) });
@@ -335,7 +335,7 @@ export function coverage(observed: ObservedRequest[]): Record<Property, number> 
   // when fx put a notice in the instructions mid-session.
   const rt = (r: ObservedRequest) => r.req.find((b) => b.k === "rt")?.v;
   // The first block holds the request's own effort, which a model that takes
-  // effort changes as messages keeps for the session (D103).
+  // effort changes as messages keeps for the session (D104).
   const tools = (r: ObservedRequest) => r.req[0]?.v;
   const rtChanged = (x: Derived, n: number) => x.prev !== null && (rt(x.prev) !== rt(observed[n]!) || tools(x.prev) !== tools(observed[n]!));
   return {

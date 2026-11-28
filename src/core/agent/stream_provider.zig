@@ -763,7 +763,7 @@ pub const Provider = struct {
     /// A reply's provider replay parts hold one compaction block.
     holds_compaction_block_fn: ?*const fn (alloc: Allocator, parts_json: []const u8) bool = null,
     /// `model` takes a change of reasoning effort as a message in the
-    /// conversation through this provider (D103).
+    /// conversation through this provider (D104).
     effort_updates_fn: ?*const fn (model: []const u8) bool = null,
 
     pub fn effortUpdates(self: Provider, model: []const u8) bool {

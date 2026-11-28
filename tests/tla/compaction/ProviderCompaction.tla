@@ -23,7 +23,7 @@
 (* follow a prefix it was never written after. A crash before the commit   *)
 (* saves nothing, so the resumed session sends what it sent before.        *)
 (*                                                                         *)
-(* Each turn asks for one of Efforts (D103). Every request names the       *)
+(* Each turn asks for one of Efforts (D104). Every request names the       *)
 (* session's first effort, the anchor; a block keeps it and fx's own       *)
 (* summary starts it again. A turn decides once, when it starts, whether   *)
 (* to send an update right before its message, and saves that decision;   *)

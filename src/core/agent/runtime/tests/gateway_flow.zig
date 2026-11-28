@@ -3571,7 +3571,7 @@ fn runSwitchedSubagentTurn(gateway: *FakeGateway, hooks: *FakeAgentRuntimeDeps, 
     try std.testing.expectEqualStrings(to, gateway.request_models.items[1]);
 }
 
-test "a GPT-6 subagent turn that goes on on Claude sends Claude its own effort and no update (D103)" {
+test "a GPT-6 subagent turn that goes on on Claude sends Claude its own effort and no update (D104)" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{ .status = .forbidden, .err_body = out_of_credits_body },
@@ -3591,7 +3591,7 @@ test "a GPT-6 subagent turn that goes on on Claude sends Claude its own effort a
     try expectBodyNotContains(&gateway, 1, "reasoningEffortUpdate");
 }
 
-test "a Claude subagent turn that goes on on GPT-6 sends its own effort, as before (D103)" {
+test "a Claude subagent turn that goes on on GPT-6 sends its own effort, as before (D104)" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{ .status = .forbidden, .err_body = out_of_credits_body },
@@ -3611,7 +3611,7 @@ test "a Claude subagent turn that goes on on GPT-6 sends its own effort, as befo
     try expectSavedEffort(&hooks, null, null);
 }
 
-test "a GPT-6 subagent turn that goes on on another GPT-6 model keeps the anchor and its update (D103)" {
+test "a GPT-6 subagent turn that goes on on another GPT-6 model keeps the anchor and its update (D104)" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{ .status = .forbidden, .err_body = out_of_credits_body },
@@ -3633,7 +3633,7 @@ test "a GPT-6 subagent turn that goes on on another GPT-6 model keeps the anchor
     try expectSavedEffort(&hooks, "low", "low");
 }
 
-test "a resumed GPT-6 request names the anchor its decision read, without the resume it replaces (D103)" {
+test "a resumed GPT-6 request names the anchor its decision read, without the resume it replaces (D104)" {
     const alloc = std.testing.allocator;
     const model = "openai/gpt-6.1-sol";
     const overrides = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 400_000, .reasoning_efforts = .fromSlice(&gpt6_efforts) } }};
@@ -3672,7 +3672,7 @@ test "a resumed GPT-6 request names the anchor its decision read, without the re
     try expectSavedEffort(&hooks, "high", null);
 }
 
-test "a recovered GPT-6 turn sends the update its first attempt saved, not the effort set since (D103)" {
+test "a recovered GPT-6 turn sends the update its first attempt saved, not the effort set since (D104)" {
     const alloc = std.testing.allocator;
     const model = "openai/gpt-6.1-sol";
     const overrides = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 400_000, .reasoning_efforts = .fromSlice(&gpt6_efforts) } }};
@@ -3721,7 +3721,7 @@ test "a recovered GPT-6 turn sends the update its first attempt saved, not the e
     try expectSavedEffort(&restored_hooks, "low", "low");
 }
 
-test "a GPT-6 turn whose first request compacts decides its effort again against the new history (D103)" {
+test "a GPT-6 turn whose first request compacts decides its effort again against the new history (D104)" {
     const alloc = std.testing.allocator;
     const model = "openai/gpt-6.1-sol";
     const effort = types.ReasoningEffort.literal;

@@ -20,7 +20,7 @@
 #                                  its turns set                                 RunsAsAsked
 #
 # provider-compaction-effort.cfg is the design with effort changes between
-# turns (D103): each turn saves the update it decided, and a turn whose first
+# turns (D104): each turn saves the update it decided, and a turn whose first
 # request compacts with none of its steps kept decides again.
 # provider-compaction-effort-switch.cfg checks it across model switches.
 #

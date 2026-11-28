@@ -285,7 +285,7 @@ const MID_PLANS: MidSessionPlan[] = [
   },
   {
     // The second turn asks for another effort, and the third for the same
-    // one again (D103). Only named runs take it: a model without effort
+    // one again (D104). Only named runs take it: a model without effort
     // updates loses its cache on such a change by design.
     session: 7, event: "effort", turns: [
       { prompt: "Show the readme.", effort: "low", replies: (h, id) => [h.fakeShellRun(id, "cat README.md"), h.fakeGatewayFinalText("done")] },

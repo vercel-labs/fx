@@ -32,7 +32,7 @@
 #
 # p6-openai-effort.cfg adds a turn that asks for another reasoning effort on
 # GPT-6: the request keeps the session's first effort and an update block rides
-# right before that turn's message (D103). p6-mutant-effort-follows-current.cfg
+# right before that turn's message (D104). p6-mutant-effort-follows-current.cfg
 # lets the request's own effort follow the turn, as fx did, which
 # MidSessionKeepsHistory catches.
 #

@@ -344,7 +344,7 @@ test.skipIf(!tmuxAvailable())("/effort <level> applies the level directly, and t
 
 test.skipIf(!tmuxAvailable())("/effort on GPT-6 keeps the session's first effort and sends the change as an update before the next message", async () => {
   // GPT-6 drops its whole prompt cache when the request's own effort changes
-  // (D103).
+  // (D104).
   const gpt6 = "openai/gpt-6.1-sol";
   const current = await launch({ model: gpt6, catalog: [{ ...catalog[0]!, id: gpt6 }, catalog[1]!] });
   const { session, gateway } = current;

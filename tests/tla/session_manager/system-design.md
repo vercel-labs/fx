@@ -307,9 +307,10 @@ manager:
   `data` comes from v1's piece codec (`encodeConversationFrame`,
   `src/core/session/session_event.zig` lines 439 to 482). The types are
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
-  `context_note` (D93), `runtime_context` (D94), `model_call` (D96),
+  `context_note` (D93), `runtime_context` (D94), `toolbox_menu` and
+  `toolbox_noted` (D103), `model_call` (D96),
   `mcp_bridge_call` (D99), `cancelled_command` (D100), `subagent_started`
-  (D101), `cancelled_wait` (D102), `turn_effort` (D103), `turn_end` (files
+  (D101), `cancelled_wait` (D102), `turn_effort` (D104), `turn_end` (files
   and turn summary), `interruption` (reason detail, partial text, command
   refs, origin), `recovery`, `model_recovery` (a model request's recovery
   status, for reading the log), `workspace_capture` (D98) and `continues`.
@@ -2229,9 +2230,54 @@ as it was sent):
   turn's last completed wait, which miss a subagent that started or ended
   after it.
 
+Settled for the toolbox menu (2026-11-27, so a resume does not rewrite a
+cached prompt prefix):
+- **D103 Decision:** a conversation sends one toolbox menu on every request,
+  resumed ones included (`tests/tla/toolbox/Toolbox.tla` MenuFixed). The
+  turn that renders it saves it, and a turn whose change note tells the
+  conversation the toolbox changed saves what the note told.
+  - **Save:** the turn that kept the menu saves its bytes, the lead and the
+    menu as sent, with the hash of the entries it lists, as a
+    `toolbox_menu` item. A turn that adds a toolbox change note saves a
+    `toolbox_noted` item with the hash of what the toolbox held and the
+    conversation's compaction count then. Both come right after the user
+    item, before `runtime_context` (D94): the turn has them before its
+    first step captures the runtime context, and every save of the turn
+    carries them, so a streamed turn keeps its prefix. In the execution JSON
+    they need schema version 13, written only for that turn, which names
+    `runtime_context` too, null when the turn captured none; libfx versions
+    the journal, checkpoint, and snapshot that hold it as D93 does. A v1 log
+    never holds them.
+  - **Compaction:** a compaction checkpoint keeps the menu in its payload's
+    `toolbox_menu`, for fx's own summary and a provider's block alike, so a
+    resume of a compacted session, which reads no turn before the
+    checkpoint, still has it.
+  - **Restore:** before a resumed conversation's first request, fx reads its
+    history oldest to newest: a checkpoint sets the menu it kept, or none,
+    and counts the conversation as told only what the menu lists, since the
+    notes before it went with its summary, as one process does after a
+    compaction; a turn that saved a menu sets it when none is set; and a
+    turn's `toolbox_noted` sets what the conversation was told, unless its
+    compaction count is older than the newest checkpoint's, as for a turn
+    the compaction kept or cut. A recovered turn's first attempt counts as
+    the newest turn. Without a saved menu, as in a session from before
+    D103 or after a checkpoint without the field, the next request renders
+    a menu and saves it. Clearing the conversation renders a new one, and
+    a fork copies the turns with their items.
+  - **Older fx:** an fx from before D103 leaves the items out (D17), ignores
+    the payload field, and renders the menu again on resume, as it did.
+
+  **Why:** the menu sits in the instructions, so a resume that rendered it
+  from the skills and MCP servers configured then rewrote the cached prefix
+  of every request after it, and providers that bind reasoning to what came
+  before it dropped the conversation's reasoning.
+  **Alternative:** keep the menu only in memory, which every resume, `fx ask
+  --resume` and ACP `session/load` rebuild; or derive what a change note told
+  from its text, which the note does not hold in full.
+
 Settled for reasoning effort on GPT-6 (2026-11-27, so a changed effort does
 not drop the cached prompt):
-- **D103 Decision:** for a model that takes an effort change as a message
+- **D104 Decision:** for a model that takes an effort change as a message
   (GPT-6 and later, `src/gateway/vercel_model_policy.zig` effortUpdates),
   every request names the session's first effort as its own `reasoning`, and
   a later change goes as an update message right before that turn's user
@@ -2242,9 +2288,14 @@ not drop the cached prompt):
     and the update it decided to send, in every save from the prompt's
     first. A v2 session writes a `turn_effort` item,
     `{"effort":"low","update":"low"}` (no `update` for none), right after
-    the user item and before any `runtime_context` item. In the execution JSON it needs schema version
-    13, written only for such a turn, and libfx versions the journal,
-    checkpoint, and snapshot that hold it as D93 does.
+    the user item, ahead of any toolbox item (D103) and any
+    `runtime_context` item: the save before the first request has it. In
+    the execution JSON it needs schema version 14, written only for such a
+    turn, which names every key version 13 names (`runtime_context`,
+    `toolbox_menu` and `toolbox_noted`, null when the turn has none) and
+    adds `turn_effort` and `effort_update`; a turn with toolbox records and
+    no effort keeps version 13. libfx versions the journal, checkpoint, and
+    snapshot that hold it as D93 does.
   - **Anchor:** the first effort a retained turn saved. A provider's
     compaction block saves the effort its request named
     (`reasoning_anchor`) and stands in for the turns it replaced; fx's own
@@ -2277,7 +2328,7 @@ not drop the cached prompt):
     at the anchor's effort, not the one it asked for (the model's `stale`
     case; `tests/e2e/provider-compaction.test.ts` "a GPT-6 block that keeps
     the running turn's steps leaves the rest of that turn at the anchor,
-    and the next turn decides again (D103)"). The next turn decides
+    and the next turn decides again (D104)"). The next turn decides
     against the block and the kept turns and runs as asked. FXC-1610
     tracks sending the update after the kept steps, which needs a live
     provider check.
@@ -2289,12 +2340,12 @@ not drop the cached prompt):
     least effort. Other models name the turn's effort, as before, and so
     does each request a turn sends to another model: a subagent's request
     that goes on on Claude after a wait gets its own effort and no update.
-  - **Older fx:** an fx from before D103 leaves the `turn_effort` item out
+  - **Older fx:** an fx from before D104 leaves the `turn_effort` item out
     (D17) and names each turn's effort, as it did. It rejects execution
-    JSON at schema version 13 (`session_codec.zig`
-    parseExecutionMemoryWith), as an fx from before D93 or D94 rejects
-    version 11 or 12: it refuses that saved state and neither rewrites nor
-    migrates it.
+    JSON at schema version 14 (`session_codec.zig`
+    parseExecutionMemoryWith), as an fx from before D93, D94 or D103
+    rejects version 11, 12 or 13: it refuses that saved state and neither
+    rewrites nor migrates it.
 
   **Why:** a changed `reasoning` made GPT-6 read none of the prompt from
   its cache and drop its earlier reasoning; the update kept the cache and

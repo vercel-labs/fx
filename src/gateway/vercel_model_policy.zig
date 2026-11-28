@@ -62,7 +62,7 @@ const first_gpt_compaction: ModelVersion = .{ .major = 6, .minor = 0 };
 /// Whether `model` takes a change of reasoning effort as a message in the
 /// conversation: GPT-6 and later. A change of the request's own `reasoning`
 /// drops its whole prompt cache and its earlier reasoning, so a session keeps
-/// its first effort there and sends each later change as an update (D103).
+/// its first effort there and sends each later change as an update (D104).
 pub fn effortUpdates(model: []const u8) bool {
     const version = gptVersion(model) orelse return false;
     return version.atLeast(first_gpt_effort_updates);

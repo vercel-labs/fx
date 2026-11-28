@@ -22,7 +22,7 @@
 // src/core/agent/runtime/orchestrator.zig carryExplicitSkill).
 // On GPT-6 a reasoning effort changed between turns keeps the session's first
 // effort on every request and rides as an update message right before that
-// turn's own message (D103, src/gateway/vercel_protocol.zig).
+// turn's own message (D104, src/gateway/vercel_protocol.zig).
 //
 // Evidence goes to FX_TLA_OUT or a temp folder, under midsession/: every
 // Gateway request, activity.jsonl, observed.json, timeline.md and TLC logs.
@@ -55,7 +55,7 @@ const SKILL_USED = "<fx-skill-used>";
 
 interface PromptMessage { role: string; content: unknown; providerOptions?: any }
 
-/** The effort an update message sets (D103), or null for any other message. */
+/** The effort an update message sets (D104), or null for any other message. */
 function effortUpdate(message: PromptMessage): string | null {
   const value = message.providerOptions?.openai?.reasoningEffortUpdate;
   return typeof value === "string" ? value : null;

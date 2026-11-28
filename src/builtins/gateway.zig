@@ -205,7 +205,7 @@ pub fn buildAgentRequest(
     provider_options.cache_markers = vercel_model_policy.cacheMarkers(request.model);
     provider_options.single_system_message = vercel_model_policy.singleSystemMessage(request.model);
     // An effort update is an OpenAI message: no other model gets one, even
-    // when the caller left the anchor's options on (D103).
+    // when the caller left the anchor's options on (D104).
     if (!vercel_model_policy.effortUpdates(request.model)) provider_options.effort_updates = null;
 
     if (request.verified_images) |images| {
@@ -433,7 +433,7 @@ test "agent request builder keeps default reasoning silent and emits output limi
     try std.testing.expect(parsed.value.object.get("providerOptions") == null);
 }
 
-test "agent request builder sends effort updates only to a model that takes them (D103)" {
+test "agent request builder sends effort updates only to a model that takes them (D104)" {
     const alloc = std.testing.allocator;
     const effort = shared_types.ReasoningEffort.literal;
     const listed = [_]shared_types.ReasoningEffort{ effort("low"), effort("high") };
