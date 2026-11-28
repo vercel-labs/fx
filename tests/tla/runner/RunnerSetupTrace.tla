@@ -1,7 +1,8 @@
 -------------------------- MODULE RunnerSetupTrace --------------------------
 (***************************************************************************)
 (* Trace validation: checks one observed scenario of where shell runs went *)
-(* and of the in-chat remote setup against RunnerSetup's own actions.      *)
+(* and of the copy question that sets up a remote runner, against          *)
+(* RunnerSetup's own actions.                                              *)
 (*                                                                         *)
 (* This checks the code in src/core/runner/. The driver                   *)
 (* runs the built fx only with --next; --self-check checks hand-written    *)
@@ -11,10 +12,17 @@
 (* It defines, for the calls in Calls:                                     *)
 (*   ObsReq, ObsRule, ObsFloor   call -> the model's request, the first     *)
 (*                               matching rule, the folder default          *)
-(*   ObsSurface, ObsLogin, ObsConfigured, ObsConfigValid, ObsTeams   the other inputs *)
-(*   ObsAnswers      the user's answers to setup prompts, in order          *)
+(*   ObsRepo         call -> its repository                                 *)
+(*   ObsSurface, ObsLogin, ObsConfigured, ObsConfigValid   the other inputs *)
+(*   ObsDestOk       TRUE when the destination resolves (no team, team not  *)
+(*                   found, or a set project missing: FALSE)               *)
+(*   ObsSandbox      TRUE when fx-sandbox exists at the start              *)
+(*   ObsRecords      repository -> its consent record at the start: "none", *)
+(*                   "dest" (this destination), or "other"                 *)
+(*   ObsAnswers      the user's answers to copy questions, in order: "accept" *)
+(*                   (yes), "decline" (no or dismissed), "no_answer"       *)
 (*   ObsCancels      call -> how often the user cancelled it while it      *)
-(*                   waited or its prompt was open                         *)
+(*                   waited or its question was open                       *)
 (*   ObsRetries      call -> how often the model repeated it after a       *)
 (*                   refusal                                               *)
 (*   ObsNewTurns     user turns after the first                            *)
@@ -23,8 +31,8 @@
 (*                   or "any"                                              *)
 (*   ObsOutcomes     call -> each result in order: "local", "remote",      *)
 (*                   "isolated" (where it ran) or "refused"                *)
-(*   ObsPrompts      host prompts opened: P1 (two or more teams) and P2     *)
-(*   ObsWrites       writes of config.remote                               *)
+(*   ObsPrompts      copy questions opened                                 *)
+(*   ObsWrites       writes of the remote slot                             *)
 (*                                                                         *)
 (* TraceInit fixes the inputs. TraceStep takes fx's own steps freely,      *)
 (* answers only from ObsAnswers in order, and the user's optional actions  *)
@@ -38,7 +46,7 @@ EXTENDS RunnerSetup, RunnerSetupObserved, Sequences
 VARIABLES
     ai,       \* the next observed answer
     oi,       \* call -> its next observed outcome
-    opened,   \* host prompts opened so far
+    opened,   \* copy questions opened so far
     cancels   \* call -> user cancels so far
 
 traceVars == <<vars, ai, oi, opened, cancels>>
@@ -48,24 +56,24 @@ TraceInit ==
     /\ req = ObsReq
     /\ rule = ObsRule
     /\ floor = ObsFloor
+    /\ repo = ObsRepo
     /\ surface = ObsSurface
     /\ login = ObsLogin
     /\ configured = ObsConfigured
     /\ configValid = ObsConfigValid
-    /\ teams = ObsTeams
+    /\ destOk = ObsDestOk
+    /\ sandboxExists = ObsSandbox
+    /\ rec = ObsRecords
     /\ ai = 1
     /\ oi = [c \in Calls |-> 1]
     /\ opened = 0
     /\ cancels = [c \in Calls |-> 0]
 
-\* The answer an Answer step took, told apart by its effect. A project accept
-\* at P2 is the consent and counts; a team accept at P1 is not consent; decline,
-\* a dismissed form and no answer set the decline mark; a failed setup REST call
-\* does neither.
+\* The answer an Answer step took, told apart by its effect. A yes is the
+\* consent and counts; decline and no answer set the decline mark.
 AnswerIs(a) ==
     CASE a = "accept" -> accepts' = accepts + 1
-      [] a = "team_accept" -> accepts' = accepts
-      [] a \in {"decline", "cancel", "no_answer"} -> accepts' = accepts /\ declined'
+      [] a \in {"decline", "no_answer"} -> accepts' = accepts /\ declined'
       [] OTHER -> accepts' = accepts /\ declined' = declined
 
 Ended(c) == st[c] \notin Terminal /\ st'[c] \in Terminal
