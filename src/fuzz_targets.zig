@@ -8,6 +8,7 @@ test {
     _ = @import("acp/jsonrpc.zig");
     _ = @import("acp/mcp_servers.zig");
     _ = @import("builtins/context.zig");
+    _ = @import("builtins/gateway.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/agent/presentation/inline_render.zig");
     _ = @import("core/auth/credentials.zig");
@@ -28,6 +29,7 @@ test {
     _ = @import("core/app/host_record.zig");
     _ = @import("core/config/tool_placement.zig");
     _ = @import("core/gateway/token_pass_memory.zig");
+    _ = @import("core/gateway/saved_catalog.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");

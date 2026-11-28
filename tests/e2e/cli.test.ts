@@ -5477,6 +5477,59 @@ describe("cli: credits", () => {
     TIMEOUT,
   );
 
+  test(
+    "fx ask answers from the model catalog it saved while a fresh one never arrives",
+    async () => {
+      const home = createIsolatedTestHome();
+      let catalogHangs = false;
+      const gateway = startFakeGateway([fakeGatewayFinalText("FIRST_ASK"), fakeGatewayFinalText("SAVED_CATALOG_ASK")], {
+        models: () => catalogHangs
+          ? new Promise<Response>(() => {})
+          : [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+        usage: (url) => url.pathname === "/coding-agent/v1/credits"
+          ? Response.json({ balance: "5.00", token_pass: null })
+          : null,
+      });
+      const path = join(home, ".fx", "cache", "model-catalog-v1.json");
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-saved-catalog-ask-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+        };
+        const first = await runFx(["ask", "--json", "--no-save", "Say hello."], { env, timeoutMs: TIMEOUT });
+        expect(first.code, first.stderr).toBe(0);
+        expect(first.stdout).toContain("FIRST_ASK");
+        expect(existsSync(path)).toBe(true);
+
+        // Ten minutes later the catalog is due, and AI Gateway never answers
+        // for it. Waiting for it would take its 30-second deadline.
+        const text = readFileSync(path, "utf8");
+        const newline = text.indexOf("\n");
+        const header = JSON.parse(text.slice(0, newline));
+        header.saved_ms = Date.now() - 10 * 60_000;
+        writeFileSync(path, JSON.stringify(header) + text.slice(newline));
+        catalogHangs = true;
+        const started = Date.now();
+        const second = await runFx(["ask", "--json", "--no-save", "Say hello again."], { env, timeoutMs: TIMEOUT });
+        expect(second.code, second.stderr).toBe(0);
+        expect(second.stdout).toContain("SAVED_CATALOG_ASK");
+        expect(gateway.modelRequests.length).toBe(2);
+        expect(Date.now() - started).toBeLessThan(10_000);
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
   test.skipIf(!HAS_API_KEY)(
     "fx credits --json returns credits JSON or exits non-zero",
     async () => {

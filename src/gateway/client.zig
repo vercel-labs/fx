@@ -3528,6 +3528,13 @@ pub fn resolveChatUrlForWarmup(default_url: []const u8) []const u8 {
     return resolveE2eGatewayUrl(e2e_gateway_chat_url_env, default_url) catch default_url;
 }
 
+/// Model catalog URL exactly as `fetchGatewayJsonCancellable` resolves it,
+/// including the E2E loopback override. With an invalid override no request
+/// goes out, so the default stands in.
+pub fn resolveModelsUrl(default_url: []const u8) []const u8 {
+    return resolveE2eGatewayUrl(e2e_gateway_models_url_env, default_url) catch default_url;
+}
+
 fn selectE2eGatewayUrl(override_url: ?[]const u8, default_url: []const u8) ![]const u8 {
     const override = override_url orelse return default_url;
     if (!isLoopbackHttpUrl(override)) return error.InvalidE2EGatewayUrl;

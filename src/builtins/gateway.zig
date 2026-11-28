@@ -2527,7 +2527,56 @@ pub const model_catalog_provider = model_catalog.Provider{
     // appear without a restart. Only user activity starts the refetch.
     .refresh_interval_ms = 5 * std.time.ms_per_min,
     .reports_connection = true,
+    .saved = .{ .url_fn = savedCatalogUrl, .parse_fn = parseSavedCatalog },
 };
+
+/// The URL a catalog fetch of `endpoint` asks, without the team the request
+/// may add: the saved catalog's key names the team on its own.
+fn savedCatalogUrl(alloc: std.mem.Allocator, endpoint: []const u8) ?[]u8 {
+    const url = modelCatalogUrl(alloc, endpoint, io_mod.getenv(base_url_env)) catch return null;
+    defer alloc.free(url);
+    return alloc.dupe(u8, gateway_client.resolveModelsUrl(url)) catch null;
+}
+
+fn parseSavedCatalog(alloc: std.mem.Allocator, body: []const u8) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    const catalog = parseModelCatalogForView(alloc, body, .full) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = .{ .category = .malformed_response } };
+    };
+    return .{ .catalog = catalog };
+}
+
+test "a model catalog body parses the same saved or fetched, or is refused, on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzCatalogBody, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"data\":[]}",
+            "{\"data\":[{\"id\":\"example/model\",\"type\":\"language\",\"tags\":[\"tool-use\",\"vision\"],\"context_window\":128000,\"max_tokens\":32000,\"reasoning_options\":[{\"type\":\"effort\",\"values\":[\"low\",\"high\"]}],\"token_pass\":true}]}",
+            "{\"data\":[{\"id\":\"\"},{\"id\":7},{\"type\":\"embedding\",\"id\":\"example/embed\"}]}",
+            "{\"data\":{}}",
+            "[]",
+            "not json",
+        }) ++ @import("fuzz_corpus").model_catalog_body.*),
+    });
+}
+
+fn fuzzCatalogBody(_: void, smith: *std.testing.Smith) anyerror!void {
+    const alloc = std.testing.allocator;
+    var buffer: [16 * 1024]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    var picker = parseModelCatalogForView(alloc, bytes, .picker) catch null;
+    defer if (picker) |*catalog| freeModelCatalog(alloc, catalog);
+    var fetched = parseModelCatalogForView(alloc, bytes, .full) catch null;
+    defer if (fetched) |*catalog| freeModelCatalog(alloc, catalog);
+    var saved = try parseSavedCatalog(alloc, bytes);
+    defer if (saved == .catalog) freeModelCatalog(alloc, &saved.catalog);
+    // A saved body reads as the fetch that saved it did.
+    if (fetched) |catalog| {
+        try std.testing.expectEqual(catalog.items.len, saved.catalog.items.len);
+        for (catalog.items, saved.catalog.items) |a, b| try std.testing.expectEqualStrings(a.id, b.id);
+    } else {
+        try std.testing.expect(saved == .failure);
+    }
+}
 
 pub const ModelCatalogEntry = model_catalog.ModelCatalogEntry;
 pub const freeModelCatalog = model_catalog.freeModelCatalog;
@@ -2559,12 +2608,17 @@ fn fetchCatalogForProvider(
             .failure = model_catalog.failureForHttpStatus(status),
         },
     };
-    defer alloc.free(json_text);
+    var owned_text: ?[]u8 = json_text;
+    defer if (owned_text) |text| alloc.free(text);
 
     const catalog = parseModelCatalogForView(alloc, json_text, input.view) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
+    if (input.body_out) |out| {
+        out.* = json_text;
+        owned_text = null;
+    }
     return .{ .catalog = catalog };
 }
 

@@ -23,6 +23,10 @@ var answer: ?token_pass.Answer = null;
 var heard_this_run = false;
 /// The models the catalog marks as paid by the team's Token Pass.
 var models: token_pass.TeamModels = .{};
+/// Whether those marks come from a catalog fetched in this run. Marks from a
+/// saved catalog name the models but never answer for the team, which may
+/// have lost its pass since.
+var marks_fetched = false;
 
 /// Takes the team's answer. `heard` is true for one AI Gateway gave in this
 /// run, and false for the answer saved from an earlier run.
@@ -33,9 +37,19 @@ pub fn publishAnswer(new_answer: ?token_pass.Answer, heard: bool) void {
     if (heard) heard_this_run = true;
 }
 
-/// Takes the Token Pass models an AI Gateway catalog marks. It does not set
-/// the answer; see `catalogAnswers`.
+/// Takes the Token Pass models an AI Gateway catalog fetched in this run
+/// marks. It does not set the answer; see `catalogAnswers`.
 pub fn publishCatalog(entries: []const model_catalog.ModelCatalogEntry) void {
+    publishMarks(entries, true);
+}
+
+/// Takes the Token Pass models a saved AI Gateway catalog marks, which list
+/// the models and never answer for the team (`catalogAnswers`).
+pub fn publishSavedCatalog(entries: []const model_catalog.ModelCatalogEntry) void {
+    publishMarks(entries, false);
+}
+
+fn publishMarks(entries: []const model_catalog.ModelCatalogEntry, fetched: bool) void {
     var marked: token_pass.TeamModels = .{};
     for (entries) |entry| {
         if (!entry.token_pass) continue;
@@ -44,13 +58,14 @@ pub fn publishCatalog(entries: []const model_catalog.ModelCatalogEntry) void {
     mutex.lockUncancelable(io_mod.getIo());
     defer mutex.unlock(io_mod.getIo());
     models = marked;
+    marks_fetched = fetched;
 }
 
 /// Whether the catalog's marks answer for the team: AI Gateway marks models
 /// only for a team with an active pass, so a catalog with marks says the team
 /// has Token Pass until AI Gateway answers otherwise in this run. An answer
-/// from this run wins when the two disagree, and a catalog without marks says
-/// nothing.
+/// from this run wins when the two disagree, and a catalog without marks, or
+/// a saved one, says nothing.
 pub fn catalogAnswers() bool {
     mutex.lockUncancelable(io_mod.getIo());
     defer mutex.unlock(io_mod.getIo());
@@ -58,7 +73,7 @@ pub fn catalogAnswers() bool {
 }
 
 fn catalogAnswersLocked() bool {
-    return !heard_this_run and models.count > 0;
+    return !heard_this_run and marks_fetched and models.count > 0;
 }
 
 /// Forgets the team, for a new credential or provider.
@@ -68,6 +83,7 @@ pub fn clear() void {
     answer = null;
     heard_this_run = false;
     models = .{};
+    marks_fetched = false;
 }
 
 /// A copy of what the process knows of the team.
@@ -135,4 +151,29 @@ test "token pass team: marks answer until AI Gateway does, and an answer from th
     clear();
     try std.testing.expect(!snapshot().has_pass);
     try std.testing.expectEqual(@as(u8, 0), snapshot().models.count);
+}
+
+test "token pass team: a saved catalog's marks name the models and never answer, until a fetched catalog's do" {
+    defer clear();
+    clear();
+    var entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .token_pass = true },
+        .{ .id = @constCast("openai/gpt-6-sol"), .model_type = @constCast("language") },
+    };
+    publishSavedCatalog(&entries);
+    try std.testing.expect(!catalogAnswers());
+    try std.testing.expect(!snapshot().has_pass);
+    try std.testing.expectEqual(@as(u8, 1), snapshot().models.count);
+    // With the team's answer, the saved marks name what its pass pays for.
+    publishAnswer(.has_pass, false);
+    try std.testing.expect(paysFor("zai/glm-5.3"));
+    try std.testing.expect(!paysFor("openai/gpt-6-sol"));
+
+    publishAnswer(null, false);
+    publishCatalog(&entries);
+    try std.testing.expect(catalogAnswers());
+    try std.testing.expect(snapshot().has_pass);
+    // A saved catalog taken again, as after a team switch, stops answering.
+    publishSavedCatalog(&entries);
+    try std.testing.expect(!catalogAnswers());
 }
