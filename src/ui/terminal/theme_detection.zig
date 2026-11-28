@@ -52,11 +52,13 @@ pub fn detectTheme(_: std.mem.Allocator, terminal_state: *const shell_runtime.Te
 fn queryTerminalBackground(terminal_state: *const shell_runtime.TerminalState) ?TerminalBackground {
     var stdout_file = std.Io.File.stdout();
     stdout_file.writeStreamingAll(io_mod.getIo(), terminal_sequences.theme_background_query_with_fence) catch return null;
+    return readBackgroundReplyUntilDeadline(terminal_state, io_mod.milliTimestamp() + 200);
+}
 
+fn readBackgroundReplyUntilDeadline(terminal_state: *const shell_runtime.TerminalState, deadline_ms: i64) ?TerminalBackground {
     // Room for the longest background reply plus a full device attributes list.
     var buf: [192]u8 = undefined;
     var len: usize = 0;
-    const deadline_ms = io_mod.milliTimestamp() + 200;
 
     while (len < buf.len) {
         const now_ms = io_mod.milliTimestamp();
@@ -64,7 +66,8 @@ fn queryTerminalBackground(terminal_state: *const shell_runtime.TerminalState) ?
 
         const remaining_ms: i32 = @intCast(deadline_ms - now_ms);
         const poll = terminal_state.pollInput(remaining_ms) catch return null;
-        if (poll.closed() or !poll.readable) break;
+        if (poll.closed()) break;
+        if (!poll.readable) continue;
 
         const n = terminal_state.read(buf[len .. len + 1]) catch return null;
         if (n == 0) break;
@@ -105,4 +108,45 @@ test "the background probe keeps reading until the fence completes" {
     try std.testing.expect(fencedBackgroundReply("\x1b]11;rgb:cccc/cccc/cccc\x1b\\") == .pending);
     try std.testing.expect(fencedBackgroundReply("\x1b]11;rgb:cccc/cccc/cccc\x1b\\\x1b[?62;2") == .pending);
     try std.testing.expect(fencedBackgroundReply("") == .pending);
+}
+
+fn testThemeProbeSigWinchWake(_: std.posix.SIG) callconv(.c) void {
+    shell_runtime.notifyResizeWakePipe();
+}
+
+test "queryTerminalBackground keeps waiting across SIGWINCH until reply arrives" {
+    if (comptime !shell_runtime.supports_resize_signal) return error.SkipZigTest;
+
+    const stdin_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer _ = std.c.close(stdin_pipe[0]);
+    defer _ = std.c.close(stdin_pipe[1]);
+
+    var terminal = shell_runtime.TerminalState{ .stdin_fd = stdin_pipe[0] };
+    terminal.installResizeSignal(testThemeProbeSigWinchWake);
+    defer {
+        terminal.uninstallResizeSignal();
+        for (&terminal.resize_wake_pipe) |*fd| {
+            if (fd.* >= 0) {
+                _ = std.c.close(fd.*);
+                fd.* = -1;
+            }
+        }
+    }
+
+    const Peer = struct {
+        fn run(pid: std.c.pid_t, write_fd: std.posix.fd_t) void {
+            io_mod.sleep(5 * std.time.ns_per_ms);
+            _ = std.c.kill(pid, std.posix.SIG.WINCH);
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            const reply = "\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[?62;22c";
+            _ = std.c.write(write_fd, reply.ptr, reply.len);
+        }
+    };
+    const pid = std.c.getpid();
+    var thread = try std.Thread.spawn(.{}, Peer.run, .{ pid, stdin_pipe[1] });
+    defer thread.join();
+
+    // A deadline well past the peer's 25 ms keeps a loaded CI machine from ending the wait first; the old code still fails, because it stopped at the wake.
+    const bg = readBackgroundReplyUntilDeadline(&terminal, io_mod.milliTimestamp() + 2_000) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(bg.light);
 }
