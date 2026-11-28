@@ -9,11 +9,13 @@
 //! `tests/tla/mcp_host/ElicitationRouting.tla`.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const observation = @import("../agent/runtime/observation.zig");
 const mcp = @import("../../mcp/mcp.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const io_mod = @import("../shared/io.zig");
 const host_target = @import("../hosts/target.zig");
+const mods = if (build_options.libfx) struct {} else @import("../mods/mods.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const url_opener = @import("../hosts/url_opener.zig");
@@ -247,6 +249,9 @@ pub const Options = struct {
     /// Sharing MCP servers with other fx sessions through one owner process.
     /// Null runs every server here, as before.
     share: ?Share = null,
+    /// Enabled mod pins held by the runtime while loaded or serving (`tests/tla/mods/ModServe.tla` ServersPinned).
+    mod_pins: if (build_options.libfx) struct {} else ?*mods.ModPins = if (build_options.libfx) .{} else null,
+    mods_root: if (build_options.libfx) struct {} else ?[]const u8 = if (build_options.libfx) .{} else null,
 };
 
 /// Where this session's shared servers come from.
@@ -347,7 +352,12 @@ const Request = struct {
         /// What the user answered, posted by the caller that asked.
         answer: struct { pending: Pending, json: ?[]u8 },
         /// The config changed: see `reload`.
-        reload: struct { configs: []const mcp_contract.McpServerConfig, inherited: *const std.process.Environ.Map },
+        reload: struct {
+            configs: []const mcp_contract.McpServerConfig,
+            inherited: *const std.process.Environ.Map,
+            mod_pins: if (build_options.libfx) struct {} else ?*mods.ModPins = if (build_options.libfx) .{} else null,
+            mods_root: if (build_options.libfx) struct {} else ?[]const u8 = if (build_options.libfx) .{} else null,
+        },
 
         /// Whether handling it could start a server.
         fn mayStart(k: Kind) bool {
@@ -538,6 +548,218 @@ pub const Runtime = struct {
     /// Finished requests, woken only once the snapshot that follows them is
     /// published, so a caller never reads a status older than its result.
     finished: std.ArrayList(*Request) = .empty,
+    /// Owner thread only: pins held per mod version while in the loaded list or
+    /// serving a live/retired slot (`tests/tla/mods/ModServe.tla` ServersPinned).
+    pin_tracker: PinTracker = .{},
+
+    const PinTracker = if (build_options.libfx) struct {
+        fn deinit(_: *@This(), _: Allocator) void {}
+        fn releaseAll(_: *@This(), _: Allocator) void {}
+        fn onSlotDestroyed(_: *@This(), _: Allocator, _: u64) void {}
+        fn prepare(_: *@This(), _: Allocator, _: std.Io, _: struct {}, _: struct {}, _: []mcp.engine.Config, _: []const usize, _: []const config.Server, _: ?*const mcp.engine.Engine) !void {}
+        fn rollback(_: *@This(), _: Allocator) void {}
+        fn commit(_: *@This(), _: Allocator, _: struct {}) void {}
+    } else struct {
+        io: std.Io = undefined,
+        mods_root: ?[]u8 = null,
+        held_versions: std.ArrayList(HeldVersion) = .empty,
+        slot_tags: std.ArrayList(SlotTag) = .empty,
+        next_tag: u64 = 1,
+        staged_tags_start: usize = 0,
+        staged_root: ?[]u8 = null,
+
+        const HeldVersion = struct {
+            pin: mods.Pin,
+            in_list: bool = false,
+            slots: usize = 0,
+        };
+
+        const SlotTag = struct {
+            tag: u64,
+            mod_name: []u8,
+            token: [mods.pins.token_hex_bytes]u8,
+        };
+
+        fn deinit(pt: *@This(), gpa: Allocator) void {
+            pt.rollback(gpa);
+            for (pt.slot_tags.items) |st| gpa.free(st.mod_name);
+            pt.slot_tags.deinit(gpa);
+            for (pt.held_versions.items) |*hv| hv.pin.release(gpa, pt.io);
+            pt.held_versions.deinit(gpa);
+            if (pt.mods_root) |root| gpa.free(root);
+            pt.* = .{};
+        }
+
+        fn releaseAll(pt: *@This(), gpa: Allocator) void {
+            for (pt.held_versions.items) |*hv| hv.in_list = false;
+            pt.sweepUnused(gpa, false);
+        }
+
+        fn prepare(
+            pt: *@This(),
+            gpa: Allocator,
+            io: std.Io,
+            next_pins_opt: ?*mods.ModPins,
+            next_mods_root: ?[]const u8,
+            local_configs: []mcp.engine.Config,
+            local_servers: []const usize,
+            resolved_servers: []const config.Server,
+            existing_engine: ?*const mcp.engine.Engine,
+        ) Allocator.Error!void {
+            pt.io = io;
+            pt.staged_tags_start = pt.slot_tags.items.len;
+            errdefer pt.rollback(gpa);
+
+            if (next_mods_root) |root| {
+                if (pt.mods_root == null or !std.mem.eql(u8, pt.mods_root.?, root)) {
+                    pt.staged_root = try gpa.dupe(u8, root);
+                }
+            }
+
+            if (next_pins_opt) |np| {
+                try pt.held_versions.ensureUnusedCapacity(gpa, np.pins.len);
+                for (local_configs, local_servers) |*c, j| {
+                    if (resolved_servers[j].source != .mod or c.transport != .stdio) continue;
+                    if (existing_engine) |eng| if (eng.keeps(c.*)) continue;
+                    const mod_name = resolved_servers[j].mod_name orelse continue;
+                    const pin_entry = for (np.pins) |p| {
+                        if (std.mem.eql(u8, p.name, mod_name)) break p;
+                    } else continue;
+                    const tag = pt.next_tag;
+                    const owned_name = try gpa.dupe(u8, mod_name);
+                    errdefer gpa.free(owned_name);
+                    try pt.slot_tags.append(gpa, .{
+                        .tag = tag,
+                        .mod_name = owned_name,
+                        .token = pin_entry.token,
+                    });
+                    c.host_tag = tag;
+                    pt.next_tag += 1;
+                }
+            }
+        }
+
+        fn rollback(pt: *@This(), gpa: Allocator) void {
+            if (pt.staged_root) |root| {
+                gpa.free(root);
+                pt.staged_root = null;
+            }
+            while (pt.slot_tags.items.len > pt.staged_tags_start) {
+                const st = pt.slot_tags.pop().?;
+                gpa.free(st.mod_name);
+            }
+        }
+
+        fn commit(pt: *@This(), gpa: Allocator, next_pins_opt: ?*mods.ModPins) void {
+            if (pt.staged_root) |root| {
+                if (pt.mods_root) |old| gpa.free(old);
+                pt.mods_root = root;
+                pt.staged_root = null;
+            }
+            for (pt.held_versions.items) |*hv| hv.in_list = false;
+            if (next_pins_opt) |np| {
+                for (np.pins) |*p| {
+                    if (pt.findHeld(p.name, &p.token)) |hv| {
+                        hv.in_list = true;
+                        p.release(gpa, np.io);
+                    } else {
+                        pt.held_versions.appendAssumeCapacity(.{
+                            .pin = p.*,
+                            .in_list = true,
+                            .slots = 0,
+                        });
+                    }
+                }
+                if (np.pins.len > 0) gpa.free(np.pins);
+                for (np.problems) |msg| gpa.free(msg);
+                if (np.problems.len > 0) gpa.free(np.problems);
+                if (np.resolved_root) |rr| gpa.free(rr);
+                np.* = .{};
+            }
+            for (pt.slot_tags.items[pt.staged_tags_start..]) |st| {
+                if (pt.findHeld(st.mod_name, &st.token)) |hv| hv.slots += 1;
+            }
+            pt.staged_tags_start = pt.slot_tags.items.len;
+            pt.sweepUnused(gpa, true);
+        }
+
+        /// Releases a version's pin only when its last slot is destroyed and the
+        /// active list no longer pins it (`tests/tla/mods/ModServe.tla` ServersPinned).
+        fn onSlotDestroyed(pt: *@This(), gpa: Allocator, tag: u64) void {
+            if (tag == 0) return;
+            const idx = for (pt.slot_tags.items, 0..) |st, i| {
+                if (st.tag == tag) break i;
+            } else return;
+            const st = pt.slot_tags.swapRemove(idx);
+            defer gpa.free(st.mod_name);
+            if (pt.findHeld(st.mod_name, &st.token)) |hv| {
+                if (hv.slots > 0) hv.slots -= 1;
+            }
+            pt.sweepUnused(gpa, true);
+        }
+
+        fn findHeld(pt: *@This(), mod_name: []const u8, token: *const [mods.pins.token_hex_bytes]u8) ?*HeldVersion {
+            for (pt.held_versions.items) |*hv| {
+                if (std.mem.eql(u8, hv.pin.name, mod_name) and std.mem.eql(u8, &hv.pin.token, token)) return hv;
+            }
+            return null;
+        }
+
+        fn sweepUnused(pt: *@This(), gpa: Allocator, collect: bool) void {
+            const bg_alloc = std.heap.c_allocator;
+            var names: std.ArrayList([]u8) = .empty;
+            var cleanup_ok = collect and pt.mods_root != null;
+
+            var i: usize = 0;
+            while (i < pt.held_versions.items.len) {
+                const hv = &pt.held_versions.items[i];
+                if (hv.in_list or hv.slots > 0) {
+                    i += 1;
+                    continue;
+                }
+                var removed = pt.held_versions.swapRemove(i);
+                if (cleanup_ok) {
+                    const seen = for (names.items) |existing| {
+                        if (std.mem.eql(u8, existing, removed.pin.name)) break true;
+                    } else false;
+                    if (!seen) {
+                        if (bg_alloc.dupe(u8, removed.pin.name)) |name_copy| {
+                            names.append(bg_alloc, name_copy) catch {
+                                bg_alloc.free(name_copy);
+                                cleanup_ok = false;
+                            };
+                        } else |_| {
+                            cleanup_ok = false;
+                        }
+                    }
+                }
+                removed.pin.release(gpa, pt.io);
+            }
+
+            if (!cleanup_ok or names.items.len == 0) {
+                for (names.items) |n| bg_alloc.free(n);
+                names.deinit(bg_alloc);
+                if (collect and pt.mods_root != null and !cleanup_ok) {
+                    debug_trace.logf("mods", "mod cleanup not started: out of memory; the next change of the mod collects", .{});
+                }
+                return;
+            }
+            const root_copy = bg_alloc.dupe(u8, pt.mods_root.?) catch {
+                for (names.items) |n| bg_alloc.free(n);
+                names.deinit(bg_alloc);
+                debug_trace.logf("mods", "mod cleanup not started: out of memory; the next change of the mod collects", .{});
+                return;
+            };
+            const owned_names = names.toOwnedSlice(bg_alloc) catch {
+                bg_alloc.free(root_copy);
+                for (names.items) |n| bg_alloc.free(n);
+                names.deinit(bg_alloc);
+                debug_trace.logf("mods", "mod cleanup not started: out of memory; the next change of the mod collects", .{});
+                return;
+            };
+            mods.mod_pins.collectDetached(bg_alloc, root_copy, owned_names, mods.realModPinsOps());
+        }
+    };
 
     const Flags = struct {
         needs_login: bool = false,
@@ -672,11 +894,14 @@ pub const Runtime = struct {
             try local_engine.appendSlice(scratch.allocator(), resolved.engine);
             r.resolved.engine_server = try arena.dupe(usize, resolved.engine_server);
         }
-        try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log }, .{
+        try r.pin_tracker.prepare(gpa, io, options.mod_pins, options.mods_root, local_engine.items, r.resolved.engine_server, r.resolved.servers, null);
+        errdefer r.pin_tracker.deinit(gpa);
+        try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log, .slot_destroyed = onSlotDestroyed }, .{
             .client = .{ .info = .{ .name = "fx", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
             .gate = mcp.core.engine.limitsFor(options.idle_ms),
         }, local_engine.items);
         errdefer r.engine.deinit();
+        r.pin_tracker.commit(gpa, options.mod_pins);
         try r.publish();
         r.thread = try std.Thread.spawn(.{}, run, .{r});
     }
@@ -720,6 +945,7 @@ pub const Runtime = struct {
         r.gpa.free(r.tools_epochs);
         r.snapshot_arena.deinit();
         r.arena.deinit();
+        r.pin_tracker.deinit(r.gpa);
         const was_retired = r.retired.load(.acquire);
         r.* = undefined;
         // Its servers are down: the others may start theirs.
@@ -836,7 +1062,17 @@ pub const Runtime = struct {
     /// `configs` and `inherited` are read only during the call. The host's
     /// lifecycle is modeled in `tests/tla/mcp_host/HostLifecycle.tla`.
     pub fn reload(r: *Runtime, configs: []const mcp_contract.McpServerConfig, inherited: *const std.process.Environ.Map) Error!Reloaded {
-        var req: Request = .{ .kind = .{ .reload = .{ .configs = configs, .inherited = inherited } }, .alloc = r.gpa };
+        return r.reloadWithPins(configs, inherited, if (build_options.libfx) .{} else null, if (build_options.libfx) .{} else null);
+    }
+
+    pub fn reloadWithPins(
+        r: *Runtime,
+        configs: []const mcp_contract.McpServerConfig,
+        inherited: *const std.process.Environ.Map,
+        mod_pins: if (build_options.libfx) struct {} else ?*mods.ModPins,
+        mods_root: if (build_options.libfx) struct {} else ?[]const u8,
+    ) Error!Reloaded {
+        var req: Request = .{ .kind = .{ .reload = .{ .configs = configs, .inherited = inherited, .mod_pins = mod_pins, .mods_root = mods_root } }, .alloc = r.gpa };
         try r.submit(&req, null);
         return switch (req.result) {
             .reloaded => |done| done,
@@ -1132,7 +1368,7 @@ pub const Runtime = struct {
                 };
                 r.finish(req, .ok);
             },
-            .reload => |c| r.finish(req, .{ .reloaded = try r.applyReload(c.configs, c.inherited) }),
+            .reload => |c| r.finish(req, .{ .reloaded = try r.applyReload(c.configs, c.inherited, c.mod_pins, c.mods_root) }),
             .call => |c| {
                 const i = r.serverIndex(c.server) orelse return r.finish(req, .{ .call = .unknown_server });
                 if (r.resolved.servers[i].held != null) return r.finish(req, .{ .failed = error.Held });
@@ -2090,7 +2326,13 @@ pub const Runtime = struct {
 
     /// The owner's side of `reload`. What can fail before a server is touched
     /// comes first; only the engine's own reload can fail after that.
-    fn applyReload(r: *Runtime, configs: []const mcp_contract.McpServerConfig, inherited: *const std.process.Environ.Map) !Reloaded {
+    fn applyReload(
+        r: *Runtime,
+        configs: []const mcp_contract.McpServerConfig,
+        inherited: *const std.process.Environ.Map,
+        mod_pins: if (build_options.libfx) struct {} else ?*mods.ModPins,
+        mods_root: if (build_options.libfx) struct {} else ?[]const u8,
+    ) !Reloaded {
         var scratch: std.heap.ArenaAllocator = .init(r.gpa);
         defer scratch.deinit();
         const s = scratch.allocator();
@@ -2190,8 +2432,11 @@ pub const Runtime = struct {
             dropped = true;
             r.dropServer(i, next.servers);
         };
+        try r.pin_tracker.prepare(r.gpa, r.io, mod_pins, mods_root, local_configs.items, local_servers.items, next.servers, &r.engine);
+        errdefer r.pin_tracker.rollback(r.gpa);
         // The engine copies what it keeps; the rest goes with `scratch`.
         try r.engine.reload(local_configs.items);
+        r.pin_tracker.commit(r.gpa, mod_pins);
         r.moveServers(to);
         r.mutex.lockUncancelable(r.io);
         const old_flags = r.flags;
@@ -2401,6 +2646,7 @@ pub const Runtime = struct {
         // Before the engine: the adapter's reader thread wakes it.
         if (r.shared) |*s| s.deinit();
         r.engine.deinit();
+        r.pin_tracker.releaseAll(r.gpa);
     }
 
     /// Rebuilds the status snapshot from the engine.
@@ -3029,6 +3275,11 @@ pub const Runtime = struct {
 
     fn log(_: *anyopaque, server: []const u8, line: []const u8) void {
         debug_trace.logf("mcp", "MCP server stderr server={s} line={s}", .{ server, line[0..@min(line.len, 512)] });
+    }
+
+    fn onSlotDestroyed(context: *anyopaque, host_tag: u64) void {
+        const r: *Runtime = @ptrCast(@alignCast(context));
+        r.pin_tracker.onSlotDestroyed(r.gpa, host_tag);
     }
 };
 
@@ -5438,4 +5689,390 @@ test "deinit while a shared call waits ends it and returns" {
     } else if (err_out) |err| {
         try testing.expect(err == error.Stopped or err == error.Cancelled);
     } else return error.TheCallNeverEnded;
+}
+
+test "mod pin lifetime holds version across reload until retired server exits and counts per slot" {
+    if (comptime build_options.libfx) return;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+
+    // Server script that sleeps 350ms on slow tool call before replying and exits on stdin EOF.
+    try f.tmp.dir.createDirPath(testing.io, "mods");
+    try f.tmp.dir.createDirPath(testing.io, "src");
+    const mods_root = try io_mod.dirRealpathAlloc(testing.allocator, f.tmp.dir, "mods");
+    defer testing.allocator.free(mods_root);
+    const src_dir = try io_mod.dirRealpathAlloc(testing.allocator, f.tmp.dir, "src");
+    defer testing.allocator.free(src_dir);
+
+    const server_body = try f.tmp.dir.readFileAlloc(testing.io, "server", testing.allocator, .limited(64 * 1024));
+    defer testing.allocator.free(server_body);
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "src/srv", .data = server_body, .flags = .{ .permissions = .executable_file } });
+    try f.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"s1\":{\"command\":\"srv\"},\"s2\":{\"command\":\"srv\"}}}",
+    });
+    try testing.expectEqual(mods.Outcome.ok, try mods.add(testing.allocator, mods_root, "alpha", src_dir));
+
+    var pins_v1 = try mods.loadModPins(testing.allocator, mods_root);
+    defer pins_v1.deinit(testing.allocator);
+    const v1_token = pins_v1.pins[0].token;
+    const v1_path = try testing.allocator.dupe(u8, pins_v1.pins[0].path);
+    defer testing.allocator.free(v1_path);
+    const v1_srv = try std.Io.Dir.path.join(testing.allocator, &.{ v1_path, "srv" });
+    defer testing.allocator.free(v1_srv);
+
+    const cfgs_v1 = [_]mcp_contract.McpServerConfig{
+        .{ .name = "s1", .source = .mod, .scope = .profile, .mod_name = "alpha", .command = v1_srv, .cwd = v1_path },
+        .{ .name = "s2", .source = .mod, .scope = .profile, .mod_name = "alpha", .command = v1_srv, .cwd = v1_path },
+    };
+    var opts = f.options();
+    opts.mod_pins = &pins_v1;
+    opts.mods_root = mods_root;
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &cfgs_v1, &f.inherited, opts);
+    var up = true;
+    defer if (up) r.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Start both servers from v1 so both slots hold active child processes.
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "s1", null)).tools.len);
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "s2", null)).tools.len);
+
+    // Update alpha to v2 so v2 is available on disk while we test per-slot
+    // counting on v1.
+    try f.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"2.0.0\",\"mcp\":{\"s1\":{\"command\":\"srv\"}}}",
+    });
+    try testing.expectEqual(mods.Outcome.ok, try mods.update(testing.allocator, mods_root, "alpha", src_dir));
+
+    var pins_v2 = try mods.loadModPins(testing.allocator, mods_root);
+    defer pins_v2.deinit(testing.allocator);
+    const v2_path = try testing.allocator.dupe(u8, pins_v2.pins[0].path);
+    defer testing.allocator.free(v2_path);
+    const v2_srv = try std.Io.Dir.path.join(testing.allocator, &.{ v2_path, "srv" });
+    defer testing.allocator.free(v2_srv);
+
+    // Move only s1 to v2 while keeping s2 on v1 so v1 drops from `in_list`
+    // and its `s1` slot retires, leaving only `s2` on v1 (`slots == 1`).
+    const cfgs_mid = [_]mcp_contract.McpServerConfig{
+        .{ .name = "s1", .source = .mod, .scope = .profile, .mod_name = "alpha", .command = v2_srv, .cwd = v2_path },
+        .{ .name = "s2", .source = .mod, .scope = .profile, .mod_name = "alpha", .command = v1_srv, .cwd = v1_path },
+    };
+    _ = try r.reloadWithPins(&cfgs_mid, &f.inherited, &pins_v2, mods_root);
+
+    // Even after retired s1(v1) exits, s2(v1) still keeps v1 pinned (slots count > 0 -> release_on_first_exit prevented).
+    try testing.io.sleep(.fromMilliseconds(150), .awake);
+    var mods_dir = try std.Io.Dir.cwd().openDir(testing.io, mods_root, .{});
+    defer mods_dir.close(testing.io);
+    var pins_dir = try mods.pins.openPrivatePinsDirIfPresent(mods_dir, testing.io);
+    if (pins_dir) |*pd| {
+        defer pd.close(testing.io);
+        var folder_buf: [mods.manifest.max_name_bytes + 1 + mods.pins.token_hex_bytes]u8 = undefined;
+        const folder_v1 = mods.pins.formatVersionFolder(&folder_buf, "alpha", &v1_token);
+        switch (try mods.pins.tryAcquireExclusive(testing.io, pd.*, folder_v1)) {
+            .busy => {},
+            .acquired => |lf| {
+                var f_mut = lf;
+                f_mut.unlock(testing.io);
+                f_mut.close(testing.io);
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+
+    // Now drop s2(v1) by reloading to v2 only -> once retired s2(v1) exits, v1 pin releases and v1 folder is collected.
+    var pins_v2b = try mods.loadModPins(testing.allocator, mods_root);
+    defer pins_v2b.deinit(testing.allocator);
+    const cfgs_v2 = [_]mcp_contract.McpServerConfig{
+        .{ .name = "s1", .source = .mod, .scope = .profile, .mod_name = "alpha", .command = v2_srv, .cwd = v2_path },
+    };
+    _ = try r.reloadWithPins(&cfgs_v2, &f.inherited, &pins_v2b, mods_root);
+
+    var cleaned = false;
+    for (0..40) |_| {
+        std.Io.Dir.accessAbsolute(testing.io, v1_path, .{}) catch {
+            cleaned = true;
+            break;
+        };
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    try testing.expect(cleaned);
+
+    // Normal deinit stops s1(v2) before releasing v2's pin.
+    r.deinit();
+    up = false;
+}
+
+test "reload keeps old mod pin held while retired server is still exiting (ModServe release_on_reload)" {
+    if (comptime build_options.libfx) return;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+
+    try f.tmp.dir.createDirPath(testing.io, "mods");
+    try f.tmp.dir.createDirPath(testing.io, "src");
+    const mods_root = try io_mod.dirRealpathAlloc(testing.allocator, f.tmp.dir, "mods");
+    defer testing.allocator.free(mods_root);
+    const src_dir = try io_mod.dirRealpathAlloc(testing.allocator, f.tmp.dir, "src");
+    defer testing.allocator.free(src_dir);
+
+    const server_body = try f.tmp.dir.readFileAlloc(testing.io, "server", testing.allocator, .limited(64 * 1024));
+    defer testing.allocator.free(server_body);
+    // Ignore TERM and sleep 350ms after stdin EOF so the retired process outlives `reloadWithPins`.
+    const slow_exit_body = try testing.allocator.print("#!/bin/sh\ntrap '' TERM\n{s}\nsleep 0.35\n", .{server_body});
+    defer testing.allocator.free(slow_exit_body);
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "src/srv", .data = slow_exit_body, .flags = .{ .permissions = .executable_file } });
+    try f.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"s1\":{\"command\":\"srv\"}}}",
+    });
+    try testing.expectEqual(mods.Outcome.ok, try mods.add(testing.allocator, mods_root, "alpha", src_dir));
+
+    var pins_v1 = try mods.loadModPins(testing.allocator, mods_root);
+    defer pins_v1.deinit(testing.allocator);
+    const v1_token = pins_v1.pins[0].token;
+    const v1_path = try testing.allocator.dupe(u8, pins_v1.pins[0].path);
+    defer testing.allocator.free(v1_path);
+    const v1_srv = try std.Io.Dir.path.join(testing.allocator, &.{ v1_path, "srv" });
+    defer testing.allocator.free(v1_srv);
+
+    const cfgs_v1 = [_]mcp_contract.McpServerConfig{
+        .{ .name = "s1", .source = .mod, .scope = .profile, .mod_name = "alpha", .command = v1_srv, .cwd = v1_path },
+    };
+    var opts = f.options();
+    opts.mod_pins = &pins_v1;
+    opts.mods_root = mods_root;
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &cfgs_v1, &f.inherited, opts);
+    defer r.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 1), (try r.tools(arena.allocator(), "s1", null)).tools.len);
+
+    // Update to v2 and reload: v1 is completely absent from the new list, yet its retired slot is still running.
+    try f.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"2.0.0\",\"mcp\":{\"s1\":{\"command\":\"srv\"}}}",
+    });
+    try testing.expectEqual(mods.Outcome.ok, try mods.update(testing.allocator, mods_root, "alpha", src_dir));
+
+    var pins_v2 = try mods.loadModPins(testing.allocator, mods_root);
+    defer pins_v2.deinit(testing.allocator);
+    const v2_path = try testing.allocator.dupe(u8, pins_v2.pins[0].path);
+    defer testing.allocator.free(v2_path);
+    const v2_srv = try std.Io.Dir.path.join(testing.allocator, &.{ v2_path, "srv" });
+    defer testing.allocator.free(v2_srv);
+    const cfgs_v2 = [_]mcp_contract.McpServerConfig{
+        .{ .name = "s1", .source = .mod, .scope = .profile, .mod_name = "alpha", .command = v2_srv, .cwd = v2_path },
+    };
+
+    _ = try r.reloadWithPins(&cfgs_v2, &f.inherited, &pins_v2, mods_root);
+
+    // Immediately after reloadWithPins returns, v1 MUST still be pinned while its retired server sleeps.
+    {
+        var mods_dir = try std.Io.Dir.cwd().openDir(testing.io, mods_root, .{});
+        defer mods_dir.close(testing.io);
+        var pins_dir = (try mods.pins.openPrivatePinsDirIfPresent(mods_dir, testing.io)).?;
+        defer pins_dir.close(testing.io);
+        var folder_buf: [mods.manifest.max_name_bytes + 1 + mods.pins.token_hex_bytes]u8 = undefined;
+        const folder_v1 = mods.pins.formatVersionFolder(&folder_buf, "alpha", &v1_token);
+        switch (try mods.pins.tryAcquireExclusive(testing.io, pins_dir, folder_v1)) {
+            .busy => {},
+            .acquired => |lf| {
+                var f_mut = lf;
+                f_mut.unlock(testing.io);
+                f_mut.close(testing.io);
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+
+    // Once the retired server finishes its 350ms sleep and exits, v1 is unpinned and collected.
+    var cleaned = false;
+    for (0..40) |_| {
+        std.Io.Dir.accessAbsolute(testing.io, v1_path, .{}) catch {
+            cleaned = true;
+            break;
+        };
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    try testing.expect(cleaned);
+}
+
+test "HTTP mod server with same URL across versions does not pin old version across reload" {
+    if (comptime build_options.libfx) return;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+
+    try f.tmp.dir.createDirPath(testing.io, "mods");
+    try f.tmp.dir.createDirPath(testing.io, "src");
+    const mods_root = try io_mod.dirRealpathAlloc(testing.allocator, f.tmp.dir, "mods");
+    defer testing.allocator.free(mods_root);
+    const src_dir = try io_mod.dirRealpathAlloc(testing.allocator, f.tmp.dir, "src");
+    defer testing.allocator.free(src_dir);
+
+    try f.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"web\":{\"type\":\"http\",\"url\":\"https://127.0.0.1:1/mcp\"}}}",
+    });
+    try testing.expectEqual(mods.Outcome.ok, try mods.add(testing.allocator, mods_root, "alpha", src_dir));
+
+    var pins_v1 = try mods.loadModPins(testing.allocator, mods_root);
+    defer pins_v1.deinit(testing.allocator);
+    const v1_path = try testing.allocator.dupe(u8, pins_v1.pins[0].path);
+    defer testing.allocator.free(v1_path);
+
+    const cfgs_http = [_]mcp_contract.McpServerConfig{
+        .{ .name = "web", .source = .mod, .scope = .profile, .mod_name = "alpha", .transport = .http, .url = "https://127.0.0.1:1/mcp" },
+    };
+    var opts = f.options();
+    opts.mod_pins = &pins_v1;
+    opts.mods_root = mods_root;
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &cfgs_http, &f.inherited, opts);
+    defer r.deinit();
+
+    try f.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"2.0.0\",\"mcp\":{\"web\":{\"type\":\"http\",\"url\":\"https://127.0.0.1:1/mcp\"}}}",
+    });
+    try testing.expectEqual(mods.Outcome.ok, try mods.update(testing.allocator, mods_root, "alpha", src_dir));
+
+    var pins_v2 = try mods.loadModPins(testing.allocator, mods_root);
+    defer pins_v2.deinit(testing.allocator);
+    _ = try r.reloadWithPins(&cfgs_http, &f.inherited, &pins_v2, mods_root);
+
+    var cleaned = false;
+    for (0..40) |_| {
+        std.Io.Dir.accessAbsolute(testing.io, v1_path, .{}) catch {
+            cleaned = true;
+            break;
+        };
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    try testing.expect(cleaned);
+}
+
+test "reload releases old pin and runs store cleanup detached without waiting on store lock" {
+    if (comptime build_options.libfx) return;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+
+    try f.tmp.dir.createDirPath(testing.io, "mods");
+    try f.tmp.dir.createDirPath(testing.io, "src");
+    const mods_root = try io_mod.dirRealpathAlloc(testing.allocator, f.tmp.dir, "mods");
+    defer testing.allocator.free(mods_root);
+    const src_dir = try io_mod.dirRealpathAlloc(testing.allocator, f.tmp.dir, "src");
+    defer testing.allocator.free(src_dir);
+
+    const server_body = try f.tmp.dir.readFileAlloc(testing.io, "server", testing.allocator, .limited(64 * 1024));
+    defer testing.allocator.free(server_body);
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "src/srv", .data = server_body, .flags = .{ .permissions = .executable_file } });
+    try f.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"s1\":{\"command\":\"srv\"}}}",
+    });
+    try testing.expectEqual(mods.Outcome.ok, try mods.add(testing.allocator, mods_root, "alpha", src_dir));
+
+    var pins_v1 = try mods.loadModPins(testing.allocator, mods_root);
+    defer pins_v1.deinit(testing.allocator);
+    const v1_token = pins_v1.pins[0].token;
+    const v1_path = try testing.allocator.dupe(u8, pins_v1.pins[0].path);
+    defer testing.allocator.free(v1_path);
+    const v1_srv = try std.Io.Dir.path.join(testing.allocator, &.{ v1_path, "srv" });
+    defer testing.allocator.free(v1_srv);
+
+    const cfgs_v1 = [_]mcp_contract.McpServerConfig{
+        .{ .name = "s1", .source = .mod, .scope = .profile, .mod_name = "alpha", .command = v1_srv, .cwd = v1_path },
+    };
+    var opts = f.options();
+    opts.mod_pins = &pins_v1;
+    opts.mods_root = mods_root;
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &cfgs_v1, &f.inherited, opts);
+    defer r.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 1), (try r.tools(arena.allocator(), "s1", null)).tools.len);
+
+    try f.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "src/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"2.0.0\",\"mcp\":{\"s1\":{\"command\":\"srv\"}}}",
+    });
+    try testing.expectEqual(mods.Outcome.ok, try mods.update(testing.allocator, mods_root, "alpha", src_dir));
+
+    // Hold alpha's store lock across the reload so synchronous collect would stall for `ops.lock_deadline_ms` (2s).
+    const ops = mods.realOps();
+    var store_lock = switch (try ops.acquire_lock(ops.ctx, ops.io, mods_root, "alpha", ops.lock_deadline_ms)) {
+        .acquired => |lock| lock,
+        .busy => return error.TestUnexpectedResult,
+    };
+    var store_lock_held = true;
+    defer if (store_lock_held) store_lock.release(ops.io);
+
+    var pins_v2 = try mods.loadModPins(testing.allocator, mods_root);
+    defer pins_v2.deinit(testing.allocator);
+    const v2_path = try testing.allocator.dupe(u8, pins_v2.pins[0].path);
+    defer testing.allocator.free(v2_path);
+    const v2_srv = try std.Io.Dir.path.join(testing.allocator, &.{ v2_path, "srv" });
+    defer testing.allocator.free(v2_srv);
+    const cfgs_v2 = [_]mcp_contract.McpServerConfig{
+        .{ .name = "s1", .source = .mod, .scope = .profile, .mod_name = "alpha", .command = v2_srv, .cwd = v2_path },
+    };
+
+    const reload_started = io_mod.milliTimestamp();
+    _ = try r.reloadWithPins(&cfgs_v2, &f.inherited, &pins_v2, mods_root);
+
+    // Wait until the retired slot is destroyed (v1's pin lock becomes free).
+    var mods_dir = try std.Io.Dir.cwd().openDir(testing.io, mods_root, .{});
+    defer mods_dir.close(testing.io);
+    var pins_dir = (try mods.pins.openPrivatePinsDirIfPresent(mods_dir, testing.io)).?;
+    defer pins_dir.close(testing.io);
+    var folder_buf: [mods.manifest.max_name_bytes + 1 + mods.pins.token_hex_bytes]u8 = undefined;
+    const folder_v1 = mods.pins.formatVersionFolder(&folder_buf, "alpha", &v1_token);
+
+    var pin_free = false;
+    for (0..40) |_| {
+        switch (try mods.pins.tryAcquireExclusive(testing.io, pins_dir, folder_v1)) {
+            .acquired => |lf| {
+                var f_mut = lf;
+                f_mut.unlock(testing.io);
+                f_mut.close(testing.io);
+                pin_free = true;
+                break;
+            },
+            .busy => try testing.io.sleep(.fromMilliseconds(25), .awake),
+        }
+    }
+    try testing.expect(pin_free);
+
+    // Runtime answers well under the 2s store lock deadline because cleanup is detached.
+    _ = try r.statuses(arena.allocator());
+    const elapsed_ms = io_mod.milliTimestamp() - reload_started;
+    try testing.expect(elapsed_ms < @as(i64, @intCast(ops.lock_deadline_ms)));
+
+    // While the store lock is held, v1's folder remains on disk.
+    try std.Io.Dir.accessAbsolute(testing.io, v1_path, .{});
+
+    // Releasing the store lock before the deadline lets the detached cleanup delete v1.
+    store_lock_held = false;
+    store_lock.release(ops.io);
+    var cleaned = false;
+    for (0..40) |_| {
+        std.Io.Dir.accessAbsolute(testing.io, v1_path, .{}) catch {
+            cleaned = true;
+            break;
+        };
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    try testing.expect(cleaned);
 }

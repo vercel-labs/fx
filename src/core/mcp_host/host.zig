@@ -2,6 +2,7 @@
 //! engine, and the catalog the model sees.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const builtin = @import("builtin");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
@@ -9,6 +10,7 @@ const elicitation = @import("../mcp/elicitation.zig");
 const runtime_mod = @import("runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const model = @import("model.zig");
+const mods = if (build_options.libfx) struct {} else @import("../mods/mods.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -102,12 +104,23 @@ pub const Host = struct {
         inherited: *const std.process.Environ.Map,
         notes: []const []const u8,
     ) !void {
+        return h.reloadWithPins(configs, inherited, notes, if (build_options.libfx) .{} else null, if (build_options.libfx) .{} else null);
+    }
+
+    pub fn reloadWithPins(
+        h: *Host,
+        configs: []const mcp_contract.McpServerConfig,
+        inherited: *const std.process.Environ.Map,
+        notes: []const []const u8,
+        mod_pins: if (build_options.libfx) struct {} else ?*mods.ModPins,
+        mods_root: if (build_options.libfx) struct {} else ?[]const u8,
+    ) !void {
         h.notes_mutex.lockUncancelable(h.runtime.io);
         const old = h.notes;
         h.notes = notes;
         h.notes_mutex.unlock(h.runtime.io);
         freeNotes(h.gpa, old);
-        try h.catalog.reload(try h.runtime.reload(configs, inherited));
+        try h.catalog.reload(try h.runtime.reloadWithPins(configs, inherited, mod_pins, mods_root));
     }
 
     fn freeNotes(gpa: Allocator, notes: []const []const u8) void {

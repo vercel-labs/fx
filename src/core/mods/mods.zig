@@ -669,6 +669,41 @@ fn gitOps() source.Ops {
     };
 }
 
+pub const ModMcpClash = mcp_config.ModMcpClash;
+pub const LoadedModServers = mcp_config.LoadedModServers;
+
+pub fn loadModMcpServersFromPins(
+    alloc: std.mem.Allocator,
+    pinned: *const ModPins,
+    profile_configs: []const mcp_config.McpServerConfig,
+) !LoadedModServers {
+    return mcp_config.loadFromPinned(alloc, io_mod.getIo(), pinned, profile_configs);
+}
+
+pub fn findModMcpClashes(
+    alloc: std.mem.Allocator,
+    mods_dir: []const u8,
+    profile_configs: []const mcp_config.McpServerConfig,
+) ![]ModMcpClash {
+    const Ctx = struct {
+        alloc: std.mem.Allocator,
+        profile_configs: []const mcp_config.McpServerConfig,
+    };
+    const Body = struct {
+        fn run(ctx: Ctx, pinned: *const ModPins) anyerror![]ModMcpClash {
+            var loaded = try mcp_config.loadFromPinned(ctx.alloc, io_mod.getIo(), pinned, ctx.profile_configs);
+            const clashes = loaded.clashes;
+            loaded.clashes = &.{};
+            loaded.deinit(ctx.alloc);
+            return clashes;
+        }
+    };
+    return withPinnedMods(alloc, mods_dir, Ctx{
+        .alloc = alloc,
+        .profile_configs = profile_configs,
+    }, []ModMcpClash, Body.run);
+}
+
 pub const ModProviderEntry = struct {
     mod_name: []const u8,
     link_path: []const u8,
@@ -1470,4 +1505,65 @@ test "prepareInstall and prepareUpdate strictly refuse invalid mod mcp servers" 
     try std.testing.expect(bad_upd == .bad_mcp);
     try std.testing.expectEqualStrings("fs", bad_upd.bad_mcp.server);
     try std.testing.expect(std.mem.find(u8, bad_upd.bad_mcp.reason, "must stay inside the mod") != null);
+}
+
+test "loadModMcpServersFromPins resolves against pinned version path, enforces clashes, and shadows profile" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "mods");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "mods");
+    defer alloc.free(root);
+
+    try tmp.dir.createDirPath(io, "alpha");
+    try tmp.dir.createDirPath(io, "beta");
+    const alpha_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "alpha");
+    defer alloc.free(alpha_src);
+    const beta_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "beta");
+    defer alloc.free(beta_src);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "alpha/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"a\":{\"command\":\"bin/a\"},\"shared\":{\"command\":\"bin/sa\"},\"prof\":{\"command\":\"bin/pa\"}}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "beta/mod.json",
+        .data = "{\"name\":\"beta\",\"version\":\"1.0.0\",\"mcp\":{\"b\":{\"type\":\"http\",\"url\":\"https://b.example/mcp\"},\"shared\":{\"command\":\"bin/sb\"},\"prof\":{\"command\":\"bin/pb\"}}}",
+    });
+
+    try std.testing.expectEqual(Outcome.ok, try add(alloc, root, "alpha", alpha_src));
+    try std.testing.expectEqual(Outcome.ok, try add(alloc, root, "beta", beta_src));
+
+    var pinned = try loadModPins(alloc, root);
+    defer pinned.deinit(alloc);
+
+    const profile = [_]mcp_config.McpServerConfig{.{ .name = "prof", .command = "profile-prof" }};
+    var loaded = try loadModMcpServersFromPins(alloc, &pinned, &profile);
+    defer loaded.deinit(alloc);
+
+    // `a` and `b` load in mod name order; `prof` is shadowed by profile (no clash); `shared` clashes and loads from neither.
+    try std.testing.expectEqual(@as(usize, 2), loaded.configs.items.len);
+    try std.testing.expectEqualStrings("a", loaded.configs.items[0].name);
+    try std.testing.expectEqualStrings("alpha", loaded.configs.items[0].mod_name.?);
+    try std.testing.expect(std.mem.find(u8, loaded.configs.items[0].command.?, "/.store/alpha-") != null);
+    try std.testing.expect(std.mem.endsWith(u8, loaded.configs.items[0].command.?, "/bin/a"));
+    try std.testing.expect(std.mem.find(u8, loaded.configs.items[0].cwd.?, "/.store/alpha-") != null);
+    try std.testing.expectEqualStrings("b", loaded.configs.items[1].name);
+    try std.testing.expectEqualStrings("beta", loaded.configs.items[1].mod_name.?);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.clashes.len);
+    try std.testing.expectEqualStrings("shared", loaded.clashes[0].server);
+    try std.testing.expectEqual(@as(usize, 2), loaded.clashes[0].mods.len);
+    try std.testing.expectEqualStrings("alpha", loaded.clashes[0].mods[0]);
+    try std.testing.expectEqualStrings("beta", loaded.clashes[0].mods[1]);
+
+    const clashes = try findModMcpClashes(alloc, root, &profile);
+    defer {
+        for (clashes) |*c| c.deinit(alloc);
+        alloc.free(clashes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), clashes.len);
+    try std.testing.expectEqualStrings("shared", clashes[0].server);
 }

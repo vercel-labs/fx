@@ -1,12 +1,41 @@
 const std = @import("std");
 const manifest = @import("manifest.zig");
+const mod_pins = @import("mod_pins.zig");
+const store = @import("store.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const project_config = @import("../mcp/project_config.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const io_mod = @import("../shared/io.zig");
 const mod_program = @import("../shared/mod_program.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
-const McpServerConfig = mcp_contract.McpServerConfig;
+pub const McpServerConfig = mcp_contract.McpServerConfig;
+
+pub const ModMcpClash = struct {
+    server: []u8,
+    mods: [][]u8,
+
+    pub fn deinit(self: *ModMcpClash, alloc: Allocator) void {
+        alloc.free(self.server);
+        for (self.mods) |m| alloc.free(m);
+        alloc.free(self.mods);
+        self.* = undefined;
+    }
+};
+
+pub const LoadedModServers = struct {
+    configs: std.ArrayList(McpServerConfig) = .empty,
+    clashes: []ModMcpClash = &.{},
+
+    pub fn deinit(self: *LoadedModServers, alloc: Allocator) void {
+        deinitConfigs(alloc, &self.configs);
+        for (self.clashes) |*clash| clash.deinit(alloc);
+        if (self.clashes.len > 0) alloc.free(self.clashes);
+        self.* = .{};
+    }
+};
 
 pub const ModSource = struct {
     name: []const u8,
@@ -133,6 +162,153 @@ pub fn parse(alloc: Allocator, mcp_val: std.json.Value, mod_source: ModSource) !
     return .{ .ok = configs };
 }
 
+/// Loads enabled mods' `"mcp"` servers in `pinned` mod-name order, resolving
+/// stdio commands and `cwd` against each mod's pinned version path. Servers
+/// shadowed by `profile_configs` are skipped without a clash, and any name
+/// defined by two or more enabled mods loads from neither and is returned in
+/// `clashes`. Broken mods trace to `debug_trace` only.
+pub fn loadFromPinned(
+    alloc: Allocator,
+    io: std.Io,
+    pinned: *const mod_pins.ModPins,
+    profile_configs: []const McpServerConfig,
+) error{OutOfMemory}!LoadedModServers {
+    for (pinned.problems) |problem| {
+        debug_trace.logf("mcp", "mod MCP pin problem reason={s}", .{problem});
+    }
+
+    var candidates: std.ArrayList(McpServerConfig) = .empty;
+    var ownership_transferred = false;
+    errdefer if (!ownership_transferred) deinitConfigs(alloc, &candidates);
+
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+
+    for (pinned.pins) |pin_entry| {
+        _ = scratch_state.reset(.retain_capacity);
+        const scratch = scratch_state.allocator();
+
+        const read_res = try store.readManifestAt(scratch, std.Io.Dir.cwd(), io, pin_entry.path, pin_entry.name);
+        const decoded = switch (read_res) {
+            .ok => |m| m,
+            .problem => |p| {
+                debug_trace.logf("mcp", "mod MCP manifest skipped mod={s} problem={s}", .{ pin_entry.name, @tagName(p) });
+                continue;
+            },
+        };
+        const mcp_val = decoded.mcp orelse continue;
+
+        const parsed = parse(alloc, mcp_val, .{ .name = pin_entry.name, .dir = pin_entry.path }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("mcp", "mod MCP parse skipped mod={s} err={s}", .{ pin_entry.name, @errorName(err) });
+                continue;
+            },
+        };
+        switch (parsed) {
+            .ok => |list| {
+                var mut = list;
+                defer mut.deinit(alloc);
+                errdefer for (mut.items) |*item| item.deinit(alloc);
+                try candidates.appendSlice(alloc, mut.items);
+                mut.clearRetainingCapacity();
+            },
+            .invalid => |bad| {
+                var mut_bad = bad;
+                defer mut_bad.deinit(alloc);
+                debug_trace.logf("mcp", "mod MCP entry skipped mod={s} server={s} reason={s}", .{ pin_entry.name, mut_bad.server, mut_bad.reason });
+            },
+        }
+    }
+
+    const items = candidates.items;
+    const keep = try alloc.alloc(bool, items.len);
+    defer alloc.free(keep);
+    @memset(keep, false);
+
+    var clashes: std.ArrayList(ModMcpClash) = .empty;
+    errdefer {
+        for (clashes.items) |*clash| clash.deinit(alloc);
+        clashes.deinit(alloc);
+    }
+
+    // Pass 1 only decides keep/drop and records clashes without freeing or
+    // moving any candidate, so earlier entries stay valid for later compares
+    // and any OOM leaves `candidates` intact for `errdefer`.
+    var kept_count: usize = 0;
+    for (items, 0..) |cand, idx| {
+        const name = cand.name;
+        if (project_config.configNamePresent(profile_configs, name)) continue;
+        var seen_earlier = false;
+        for (items[0..idx]) |earlier| {
+            if (std.mem.eql(u8, earlier.name, name)) {
+                seen_earlier = true;
+                break;
+            }
+        }
+        if (seen_earlier) continue;
+
+        var clash_count: usize = 1;
+        for (items[idx + 1 ..]) |later| {
+            if (std.mem.eql(u8, later.name, name)) clash_count += 1;
+        }
+        if (clash_count > 1) {
+            var mods_list: std.ArrayList([]u8) = .empty;
+            errdefer {
+                for (mods_list.items) |m| alloc.free(m);
+                mods_list.deinit(alloc);
+            }
+            for (items[idx..]) |entry| {
+                if (!std.mem.eql(u8, entry.name, name)) continue;
+                const mod_name = entry.mod_name orelse continue;
+                var already = false;
+                for (mods_list.items) |prev| if (std.mem.eql(u8, prev, mod_name)) {
+                    already = true;
+                    break;
+                };
+                if (!already) {
+                    const duped = try alloc.dupe(u8, mod_name);
+                    errdefer alloc.free(duped);
+                    try mods_list.append(alloc, duped);
+                }
+            }
+            const clash_server = try alloc.dupe(u8, name);
+            errdefer alloc.free(clash_server);
+            const clash_mods = try mods_list.toOwnedSlice(alloc);
+            errdefer {
+                for (clash_mods) |m| alloc.free(m);
+                alloc.free(clash_mods);
+            }
+            try clashes.append(alloc, .{ .server = clash_server, .mods = clash_mods });
+            continue;
+        }
+
+        keep[idx] = true;
+        kept_count += 1;
+    }
+
+    var kept: std.ArrayList(McpServerConfig) = .empty;
+    errdefer deinitConfigs(alloc, &kept);
+    try kept.ensureTotalCapacity(alloc, kept_count);
+    const clashes_slice = try clashes.toOwnedSlice(alloc);
+
+    // Pass 2 cannot fail: move kept entries and free dropped ones.
+    ownership_transferred = true;
+    for (items, 0..) |*cand, idx| {
+        if (keep[idx]) {
+            kept.appendAssumeCapacity(cand.*);
+        } else {
+            cand.deinit(alloc);
+        }
+    }
+    candidates.deinit(alloc);
+
+    return .{
+        .configs = kept,
+        .clashes = clashes_slice,
+    };
+}
+
 test "parse accepts valid stdio and http mod servers, resolves relative command, and sets cwd and mod_name" {
     const alloc = std.testing.allocator;
     const mod_dir = "/tmp/fx-home/mods/.store/alpha-0123456789abcdef";
@@ -219,4 +395,58 @@ test "parse strictly refuses Authorization headers, .. escapes, unprintable name
             },
         }
     }
+}
+
+test "loadFromPinned survives allocation failures across profile shadows, clashes, and kept servers" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "alpha");
+    try tmp.dir.createDirPath(io, "beta");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "alpha/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"prof\":{\"command\":\"bin/p\"},\"clash\":{\"command\":\"bin/ca\"},\"kept\":{\"command\":\"bin/k\"}}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "beta/mod.json",
+        .data = "{\"name\":\"beta\",\"version\":\"1.0.0\",\"mcp\":{\"clash\":{\"command\":\"bin/cb\"}}}",
+    });
+
+    const alpha_dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "alpha");
+    defer std.testing.allocator.free(alpha_dir);
+    const beta_dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "beta");
+    defer std.testing.allocator.free(beta_dir);
+
+    const alpha_name = try std.testing.allocator.dupe(u8, "alpha");
+    defer std.testing.allocator.free(alpha_name);
+    const beta_name = try std.testing.allocator.dupe(u8, "beta");
+    defer std.testing.allocator.free(beta_name);
+
+    const pin_items = [_]@import("pins.zig").Pin{
+        .{ .name = alpha_name, .token = @splat('0'), .path = alpha_dir, .file = undefined },
+        .{ .name = beta_name, .token = @splat('1'), .path = beta_dir, .file = undefined },
+    };
+    const pinned: mod_pins.ModPins = .{ .io = io, .pins = @constCast(&pin_items) };
+    const profile = [_]McpServerConfig{.{ .name = "prof", .command = "profile-prof" }};
+
+    const Body = struct {
+        io: std.Io,
+        pinned: *const mod_pins.ModPins,
+        profile: []const McpServerConfig,
+
+        fn run(alloc: Allocator, self: @This()) !void {
+            var loaded = try loadFromPinned(alloc, self.io, self.pinned, self.profile);
+            defer loaded.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), loaded.configs.items.len);
+            try std.testing.expectEqualStrings("kept", loaded.configs.items[0].name);
+            try std.testing.expectEqual(@as(usize, 1), loaded.clashes.len);
+            try std.testing.expectEqualStrings("clash", loaded.clashes[0].server);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        Body.run,
+        .{Body{ .io = io, .pinned = &pinned, .profile = &profile }},
+    );
 }

@@ -1321,3 +1321,180 @@ describe("mod preview, update confirmation, and live TUI refresh", () => {
     }
   }, 90000);
 });
+
+describe("mod MCP servers", () => {
+  const MODERN_STDIO_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
+
+  function modServerFile(resultText?: string): string {
+    const body = readFileSync(MODERN_STDIO_FIXTURE, "utf8");
+    return resultText === undefined
+      ? body
+      : body.replace('process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT"', JSON.stringify(resultText));
+  }
+
+  test("fx mcp list shows mod <name>, fx ask calls its tool without project approval, and order/clash rules hold", async () => {
+    const f = fixture(body => {
+      const messages = Array.isArray(body.messages) ? body.messages : [];
+      const toolCount = messages.filter((m: any) => m.role === "tool").length;
+      if (toolCount === 0) {
+        return toolCompletion(body.model, "toolbox", { open: "mcp_modsrv_echo" }, "open_mod_echo");
+      }
+      if (toolCount === 1) {
+        return toolCompletion(body.model, "toolbox", { run: "mcp_modsrv_echo", arguments: { text: "ping" } }, "call_mod_echo");
+      }
+      const lastTool = messages.findLast((m: any) => m.role === "tool")?.content ?? "";
+      return completion(body.model, `TOOL_OUT:${lastTool}`);
+    });
+    try {
+      const alpha = makeModFolder(
+        f,
+        "alpha",
+        {
+          name: "alpha",
+          version: "1.0.0",
+          mcp: {
+            modsrv: { command: [process.execPath, "bin/server.mjs"], env: { FX_MCP_RESULT_TEXT: "ALPHA_MOD_RESULT" } },
+            prof_wins: { command: [process.execPath, "bin/server.mjs"], env: { FX_MCP_RESULT_TEXT: "MOD_SHOULD_LOSE" } },
+            clash_srv: { command: [process.execPath, "bin/server.mjs"] },
+          },
+        },
+        { "bin/server.mjs": modServerFile() },
+      );
+      const beta = makeModFolder(
+        f,
+        "beta",
+        {
+          name: "beta",
+          version: "1.0.0",
+          mcp: {
+            clash_srv: { command: [process.execPath, "bin/server.mjs"] },
+          },
+        },
+        { "bin/server.mjs": modServerFile() },
+      );
+      writeFileSync(
+        join(f.home, ".fx", "mcp.json"),
+        JSON.stringify({
+          mcp: {
+            prof_wins: { command: process.execPath, args: [MODERN_STDIO_FIXTURE], env: { FX_MCP_RESULT_TEXT: "PROFILE_WINS" } },
+          },
+        }),
+      );
+      writeFileSync(
+        join(f.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            modsrv: { command: process.execPath, args: [MODERN_STDIO_FIXTURE], env: { FX_MCP_RESULT_TEXT: "PROJECT_SHOULD_LOSE" } },
+            proj_only: { command: process.execPath, args: [MODERN_STDIO_FIXTURE] },
+          },
+        }),
+      );
+
+      expect((await fxMod(f, ["add", "--yes", alpha])).code).toBe(0);
+      expect((await fxMod(f, ["add", "--yes", beta])).code).toBe(0);
+
+      // `fx mcp list` shows mod <name>, profile wins, mod shadows project, clash loads neither with note.
+      const listed = await runFx(["mcp", "list"], { cwd: f.workspace, env: f.env, timeoutMs: TIMEOUT_MS });
+      expect(listed.code, listed.stderr).toBe(0);
+      expect(listed.stderr).toContain("MCP server 'clash_srv' is defined by multiple mods (alpha, beta), so neither loads.");
+      expect(listed.stdout).toContain("modsrv");
+      expect(listed.stdout).toContain("mod alpha");
+      expect(listed.stdout).toContain("prof_wins");
+      expect(listed.stdout).toContain("proj_only");
+      expect(listed.stdout).not.toContain("clash_srv");
+
+      const listJsonOut = await runFx(["mcp", "list", "--json"], { cwd: f.workspace, env: f.env, timeoutMs: TIMEOUT_MS });
+      expect(listJsonOut.code, listJsonOut.stderr).toBe(0);
+      const servers = JSON.parse(listJsonOut.stdout).servers as Array<Record<string, any>>;
+      const modEntry = servers.find(s => s.name === "modsrv");
+      expect(modEntry).toMatchObject({
+        name: "modsrv",
+        source: "mod",
+        mod: "alpha",
+        file: join(modsDir(f), "alpha", "mod.json"),
+        transport: "stdio",
+      });
+      expect(servers.find(s => s.name === "prof_wins")).toMatchObject({ source: "profile" });
+      expect(servers.find(s => s.name === "clash_srv")).toBeUndefined();
+
+      // `fx doctor` warns on the cross-mod clash under `mcp`.
+      const doc = await doctorJson(f);
+      const docParsed = JSON.parse(doc.stdout);
+      expect(docParsed.checks.some((c: any) => c.name === "mcp" && c.status === "warn" && String(c.detail).includes("clash_srv"))).toBe(true);
+
+      // `fx ask` calls the mod server's tool without workspace approval.
+      const asked = await runFx(["ask", "--json", "--full-access", "--no-save", "Use modsrv echo."], {
+        cwd: f.workspace,
+        env: f.env,
+        timeoutMs: TIMEOUT_MS,
+      });
+      expect(asked.code, asked.stderr).toBe(0);
+      expect(JSON.parse(asked.stdout).output).toContain("ALPHA_MOD_RESULT");
+      expect(JSON.parse(asked.stdout).output).not.toContain("PROJECT_SHOULD_LOSE");
+    } finally {
+      f.close();
+    }
+  }, 90000);
+
+  test.skipIf(!tmuxAvailable())("updating a mod from another process restarts its server on the next prompt and collects the old version", async () => {
+    let phase = 0;
+    const f = fixture(body => {
+      const messages = Array.isArray(body.messages) ? body.messages : [];
+      const toolCount = messages.filter((m: any) => m.role === "tool").length;
+      if (phase === 0) {
+        if (toolCount === 0) return toolCompletion(body.model, "toolbox", { open: "mcp_modsrv_echo" }, "open_1");
+        if (toolCount === 1) return toolCompletion(body.model, "toolbox", { run: "mcp_modsrv_echo", arguments: { text: "go1" } }, "call_1");
+        phase = 1;
+        const lastTool = messages.findLast((m: any) => m.role === "tool")?.content ?? "";
+        return completion(body.model, `GOT1:${lastTool}`);
+      }
+      if (toolCount === 2) return toolCompletion(body.model, "toolbox", { run: "mcp_modsrv_echo", arguments: { text: "go2" } }, "call_2");
+      const lastTool = messages.findLast((m: any) => m.role === "tool")?.content ?? "";
+      return completion(body.model, `GOT2:${lastTool}`);
+    });
+    let session: TmuxSession | null = null;
+    try {
+      f.settings.permission_mode = "full-access";
+      f.save();
+
+      const folder = makeModFolder(
+        f,
+        "alpha",
+        {
+          name: "alpha",
+          version: "1.0.0",
+          mcp: { modsrv: { command: [process.execPath, "bin/server.mjs"] } },
+        },
+        { "bin/server.mjs": modServerFile("V1_MOD_SERVER") },
+      );
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+      const v1Dir = realpathSync(join(modsDir(f), "alpha"));
+
+      session = await openTui(f);
+      await session.waitForComposer(TIMEOUT_MS);
+      await session.sendText("first turn");
+      await session.waitForText("V1_MOD_SERVER", TIMEOUT_MS);
+
+      // Update mod alpha to v2 from outside the TUI.
+      writeFile(folder, "bin/server.mjs", modServerFile("V2_MOD_SERVER"));
+      writeFile(folder, "mod.json", JSON.stringify({
+        name: "alpha",
+        version: "2.0.0",
+        mcp: { modsrv: { command: [process.execPath, "bin/server.mjs"] } },
+      }));
+      expect((await fxMod(f, ["update", "alpha", "--yes"])).code).toBe(0);
+      const v2Dir = realpathSync(join(modsDir(f), "alpha"));
+      expect(v2Dir).not.toBe(v1Dir);
+
+      // Next prompt reloads the host, calls the v2 server, and collects v1 after v1's server exits.
+      await session.sendText("second turn");
+      await session.waitForText("V2_MOD_SERVER", TIMEOUT_MS);
+
+      await waitForCondition(() => !existsSync(v1Dir), 10_000, 100);
+      expect(existsSync(v2Dir)).toBe(true);
+    } finally {
+      if (session) await session.kill();
+      f.close();
+    }
+  }, 90000);
+});

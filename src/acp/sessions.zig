@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const agent_frame = @import("../core/shared/agent_frame.zig");
@@ -1006,7 +1007,15 @@ fn appendMcpConfigs(
         for (profile.items) |*config| config.deinit(alloc);
         profile.deinit(alloc);
     }
-    try builtin_mcp.mergeNativeConfigs(alloc, &loaded, &profile, &project);
+    var mod_configs: std.ArrayList(mcp_contract.McpServerConfig) = .empty;
+    defer {
+        for (mod_configs.items) |*config| config.deinit(alloc);
+        mod_configs.deinit(alloc);
+    }
+    if (comptime !build_options.libfx) {
+        mod_configs = try builtin_mcp.loadModServersForProfile(alloc, home, profile.items, &loaded.diagnostics, &loaded.mod_pins, &loaded.mods_root);
+    }
+    try builtin_mcp.mergeNativeConfigsWithMods(alloc, &loaded, &profile, &mod_configs, &project);
     // Read only while the servers are composed.
     var inherited = try io_mod.cloneEnvironMap(alloc);
     defer inherited.deinit();
@@ -1016,6 +1025,14 @@ fn appendMcpConfigs(
     configs.setNotes(alloc, notes);
     try configs.items.appendSlice(alloc, loaded.configs.items);
     loaded.configs.clearRetainingCapacity();
+    if (comptime !build_options.libfx) {
+        if (configs.mod_pins) |*p| p.deinit(alloc);
+        configs.mod_pins = loaded.mod_pins;
+        loaded.mod_pins = null;
+        if (configs.mods_root) |r| alloc.free(r);
+        configs.mods_root = loaded.mods_root;
+        loaded.mods_root = null;
+    }
 }
 
 fn profileMcpRequested(alloc: Allocator, params_raw: ?[]const u8) bool {
@@ -4118,4 +4135,80 @@ test "eb03: failed ACP pending input scan sends error chunk and leaves records p
     defer remaining.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), remaining.ids.len);
     try std.testing.expectEqualStrings("keep across failed acp scan", remaining.texts[0]);
+}
+
+test "ACP profileMcpServers loads mod MCP servers and clash notes through shared helper" {
+    if (comptime build_options.libfx) return;
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "home/.fx/mods");
+    try tmp.dir.createDirPath(io, "workspace");
+    try tmp.dir.createDirPath(io, "src-alpha");
+    try tmp.dir.createDirPath(io, "src-beta");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const mods_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/mods");
+    defer alloc.free(mods_dir);
+    const alpha_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src-alpha");
+    defer alloc.free(alpha_src);
+    const beta_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src-beta");
+    defer alloc.free(beta_src);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "src-alpha/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"mod_srv\":{\"command\":\"bin/srv\"},\"clash\":{\"command\":\"bin/c1\"}}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "src-beta/mod.json",
+        .data = "{\"name\":\"beta\",\"version\":\"1.0.0\",\"mcp\":{\"clash\":{\"command\":\"bin/c2\"}}}",
+    });
+
+    const mods_mod = @import("../core/mods/mods.zig");
+    try std.testing.expectEqual(mods_mod.Outcome.ok, try mods_mod.add(alloc, mods_dir, "alpha", alpha_src));
+    try std.testing.expectEqual(mods_mod.Outcome.ok, try mods_mod.add(alloc, mods_dir, "beta", beta_src));
+
+    var state: server.ServerState = .{
+        .alloc = alloc,
+        .cfg = .{
+            .default_model = "m",
+            .default_agent_step_limit = 1,
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .gateway_models_path = "",
+            .gateway_provider = test_builtin_gateway.provider,
+            .provider_set = provider_set.gateway_only(acp_session_test_bundle),
+            .secret_store = host.unavailable_secret_store,
+            .prompt_policy = .{ .system_prompt = "" },
+            .ignored_list_entries = &.{},
+            .max_list_entries = 0,
+            .max_read_file_bytes = 0,
+            .max_read_file_lines = 0,
+            .max_read_file_line_len = 0,
+            .max_command_output_bytes = 0,
+            .max_tool_result_bytes = 1024,
+            .max_history_turns = 10,
+            .context_registry = undefined,
+            .mode_registry = undefined,
+            .home_override = home,
+        },
+        .writer = undefined,
+    };
+
+    var configs: mcp_servers.OwnedServerConfigs = .{};
+    defer configs.deinit(alloc);
+    try appendMcpConfigs(&state, alloc, "{\"_meta\":{\"fx\":{\"profileMcpServers\":true}}}", workspace, &configs);
+
+    try std.testing.expectEqual(@as(usize, 1), configs.items.items.len);
+    try std.testing.expectEqualStrings("mod_srv", configs.items.items[0].name);
+    try std.testing.expectEqual(mcp_contract.ConfigSource.mod, configs.items.items[0].source);
+    try std.testing.expectEqualStrings("alpha", configs.items.items[0].mod_name.?);
+    try std.testing.expect(configs.mod_pins != null);
+    try std.testing.expectEqual(@as(usize, 1), configs.notes.len);
+    try std.testing.expect(std.mem.find(u8, configs.notes[0], "alpha, beta") != null);
 }

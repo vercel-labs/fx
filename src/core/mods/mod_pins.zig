@@ -9,6 +9,8 @@
 //! libfx and builds standalone in unit tests (`RULES.md` R1.7, R3.9).
 
 const std = @import("std");
+const builtin = @import("builtin");
+const debug_trace = @import("../shared/debug_trace.zig");
 const manifest = @import("manifest.zig");
 const pins = @import("pins.zig");
 const store = @import("store.zig");
@@ -169,6 +171,33 @@ pub const ModPins = struct {
     /// true when the set of enabled mods or any link target changed.
     pub fn changed(self: *const ModPins, root_path: []const u8) bool {
         return computeStamp(self.io, root_path) != self.stamp;
+    }
+
+    /// Acquires independent shared locks for the exact same pinned versions held
+    /// by `self`. Used when a copy of `ModPins` must outlive the caller's set.
+    pub fn clone(self: *const ModPins, alloc: std.mem.Allocator, ops: Ops) !ModPins {
+        const root = self.resolved_root orelse return .{ .io = self.io, .stamp = self.stamp };
+        const root_copy = try alloc.dupeSentinel(u8, root, 0);
+        errdefer alloc.free(root_copy);
+
+        var cloned: std.ArrayList(pins.Pin) = .empty;
+        errdefer {
+            for (cloned.items) |*p| p.release(alloc, self.io);
+            cloned.deinit(alloc);
+        }
+        try cloned.ensureTotalCapacity(alloc, self.pins.len);
+        for (self.pins) |p| {
+            switch (try pins.pinVersion(alloc, root_copy, p.name, p.token, ops.pin_ops)) {
+                .pinned => |np| cloned.appendAssumeCapacity(np),
+                .not_installed, .bad_link, .busy => {},
+            }
+        }
+        return .{
+            .io = self.io,
+            .resolved_root = root_copy,
+            .pins = try cloned.toOwnedSlice(alloc),
+            .stamp = self.stamp,
+        };
     }
 
     /// Pins the current enabled versions into a new set first, releases `self`'s
@@ -376,6 +405,53 @@ pub fn collectNames(root_path: []const u8, ops: ModPins.Ops, names: []const []u8
 pub fn freeCleanupNames(alloc: std.mem.Allocator, names: [][]u8) void {
     for (names) |name| alloc.free(name);
     if (names.len > 0) alloc.free(names);
+}
+
+/// Takes ownership of `root` and `names`, freeing both with `alloc` once
+/// done. Runs best-effort store cleanup on a detached thread so callers on
+/// input, render, or runtime threads never wait on another fx's store lock.
+/// Logs under `"mods"` when the background job cannot start.
+pub fn collectDetached(alloc: std.mem.Allocator, root: []u8, names: [][]u8, ops: ModPins.Ops) void {
+    const job = alloc.create(CleanupJob) catch {
+        dropCleanup(alloc, root, names, "out of memory");
+        return;
+    };
+    job.* = .{ .alloc = alloc, .root = root, .names = names, .ops = ops };
+    if (comptime builtin.single_threaded) {
+        alloc.destroy(job);
+        dropCleanup(alloc, root, names, "threads are unavailable");
+        return;
+    }
+    const thread = std.Thread.spawn(.{}, CleanupJob.run, .{job}) catch {
+        job.release();
+        debug_trace.logf("mods", "mod cleanup not started: thread unavailable; the next change of the mod collects", .{});
+        return;
+    };
+    thread.detach();
+}
+
+const CleanupJob = struct {
+    alloc: std.mem.Allocator,
+    root: []u8,
+    names: [][]u8,
+    ops: ModPins.Ops,
+
+    fn release(job: *CleanupJob) void {
+        freeCleanupNames(job.alloc, job.names);
+        job.alloc.free(job.root);
+        job.alloc.destroy(job);
+    }
+
+    fn run(job: *CleanupJob) void {
+        collectNames(job.root, job.ops, job.names);
+        job.release();
+    }
+};
+
+fn dropCleanup(alloc: std.mem.Allocator, root: []u8, names: [][]u8, reason: []const u8) void {
+    freeCleanupNames(alloc, names);
+    alloc.free(root);
+    debug_trace.logf("mods", "mod cleanup not started: {s}; the next change of the mod collects", .{reason});
 }
 
 /// Cleanup after a set's pins go is best-effort: another reader or a lock

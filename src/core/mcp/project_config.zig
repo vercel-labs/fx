@@ -76,6 +76,8 @@ pub const WorkspaceDiagnosticCause = enum {
     ignored_key,
     /// A profile key that looks like a misspelling of its servers key.
     misspelled_key,
+    /// Two or more enabled mods define the same MCP server name.
+    mod_clash,
 };
 
 /// The keys fx reads but doesn't act on.
@@ -181,6 +183,7 @@ pub const WorkspaceDiagnostic = struct {
     /// About `~/.fx/mcp.json` rather than `.mcp.json`.
     profile: bool = false,
     mod_name: ?[]u8 = null,
+    mod_list: ?[]u8 = null,
     server_name: ?[]u8 = null,
     environment_variable: ?[]u8 = null,
     environment_field: ?WorkspaceEnvironmentField = null,
@@ -194,6 +197,7 @@ pub const WorkspaceDiagnostic = struct {
 
     pub fn deinit(self: *WorkspaceDiagnostic, alloc: Allocator) void {
         if (self.mod_name) |mod_name| alloc.free(mod_name);
+        if (self.mod_list) |mod_list| alloc.free(mod_list);
         if (self.server_name) |name| alloc.free(name);
         if (self.environment_variable) |name| alloc.free(name);
         self.* = undefined;
@@ -244,6 +248,10 @@ pub fn renderWorkspaceDiagnostic(
         defer alloc.free(words);
         return alloc.print("{s}: {s}.", .{ file, words });
     }
+    if (diagnostic.cause == .mod_clash) return alloc.print(
+        "MCP server '{s}' is defined by multiple mods ({s}), so neither loads.",
+        .{ encoded_server.bytes, diagnostic.mod_list orelse "multiple mods" },
+    );
     // Every reason is a constant, so this is the one `print` there is.
     const why: []const u8 = if (diagnostic.cause == .invalid_entry) entryProblemWords(diagnostic.problem orelse .other) else if (diagnostic.cause == .ignored_alias)
         "the file has both \"mcp\" and \"mcpServers\", and fx reads only \"mcp\"; merge them into one"
@@ -1225,10 +1233,31 @@ pub fn mergeNative(
     primary: *std.ArrayList(McpServerConfig),
     workspace: *std.ArrayList(McpServerConfig),
 ) !std.ArrayList(McpServerConfig) {
+    var empty_mods: std.ArrayList(McpServerConfig) = .empty;
+    return mergeNativeWithMods(alloc, primary, &empty_mods, workspace);
+}
+
+/// Merges `primary` (`~/.fx/mcp.json`), then `mod_configs` (mods in name order),
+/// then `workspace` (`.mcp.json`) into one list without changing `primary` +
+/// `workspace` semantics when `mod_configs` is empty. Consumes all three lists.
+pub fn mergeNativeWithMods(
+    alloc: Allocator,
+    primary: *std.ArrayList(McpServerConfig),
+    mod_configs: *std.ArrayList(McpServerConfig),
+    workspace: *std.ArrayList(McpServerConfig),
+) !std.ArrayList(McpServerConfig) {
     var merged: std.ArrayList(McpServerConfig) = .empty;
     errdefer deinitConfigs(alloc, &merged);
-    try merged.ensureTotalCapacity(alloc, primary.items.len + workspace.items.len);
+    try merged.ensureTotalCapacity(alloc, primary.items.len + mod_configs.items.len + workspace.items.len);
     while (primary.items.len > 0) merged.appendAssumeCapacity(primary.orderedRemove(0));
+    while (mod_configs.items.len > 0) {
+        var candidate = mod_configs.orderedRemove(0);
+        if (configNamePresent(merged.items, candidate.name)) {
+            candidate.deinit(alloc);
+            continue;
+        }
+        merged.appendAssumeCapacity(candidate);
+    }
     while (workspace.items.len > 0) {
         var candidate = workspace.orderedRemove(0);
         if (configNamePresent(merged.items, candidate.name)) {

@@ -15,6 +15,9 @@ const settings_messages = @import("settings_messages.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
+const config_file = @import("../mcp_host/config_file.zig");
+const project_config = @import("../mcp/project_config.zig");
+const mods_mod = if (build_options.libfx) struct {} else @import("../mods/mods.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const types = @import("../shared/types.zig");
 const configured_provider = @import("../config/configured_provider.zig");
@@ -855,6 +858,38 @@ fn appendModAssetChecks(checks: *std.ArrayList(Check), alloc: Allocator, home_fx
             try alloc.dupe(u8, "disable or remove one of those mods, or place the theme in ~/.fx/themes"),
         );
     }
+
+    var profile_mcp: std.ArrayList(mcp_contract.McpServerConfig) = .empty;
+    defer project_config.deinitConfigs(alloc, &profile_mcp);
+    const mcp_path = try std.Io.Dir.path.join(alloc, &.{ fx_dir, "mcp.json" });
+    defer alloc.free(mcp_path);
+    if (config_file.read(alloc, mcp_path) catch null) |json_text| {
+        defer alloc.free(json_text);
+        var skipped: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
+        defer {
+            for (skipped.items) |*d| d.deinit(alloc);
+            skipped.deinit(alloc);
+        }
+        profile_mcp = project_config.parseProfileServers(alloc, json_text, &skipped) catch .empty;
+    }
+
+    const mcp_clashes = try mods_mod.findModMcpClashes(alloc, mods_dir, profile_mcp.items);
+    defer {
+        for (mcp_clashes) |*c| c.deinit(alloc);
+        alloc.free(mcp_clashes);
+    }
+    for (mcp_clashes) |clash| {
+        const mod_list = try joinNames(alloc, clash.mods);
+        defer alloc.free(mod_list);
+        try appendCheckOwnedFix(
+            checks,
+            alloc,
+            "mcp",
+            .warn,
+            try alloc.print("MCP server '{s}' is defined by multiple mods ({s}), so neither loads", .{ clash.server, mod_list }),
+            try alloc.dupe(u8, "disable or remove one of those mods, or define the server in ~/.fx/mcp.json"),
+        );
+    }
 }
 
 fn joinNames(alloc: Allocator, items: []const []u8) ![]u8 {
@@ -1417,4 +1452,52 @@ test "a mod skill diagnostic names its mod in doctor" {
     const place = try skillDiagnosticPlace(alloc, diagnostic);
     defer alloc.free(place);
     try std.testing.expectEqualStrings("mod glm: /h/.fx/mods/.store/glm-0123456789abcdef/skills/bad", place);
+}
+
+test "appendModAssetChecks warns on mod MCP clashes and skips profile-shadowed names" {
+    if (comptime build_options.libfx) return;
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "fx/mods");
+    try tmp.dir.createDirPath(io, "alpha");
+    try tmp.dir.createDirPath(io, "beta");
+    const fx_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fx");
+    defer alloc.free(fx_dir);
+    const mods_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fx/mods");
+    defer alloc.free(mods_dir);
+    const alpha_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "alpha");
+    defer alloc.free(alpha_src);
+    const beta_src = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "beta");
+    defer alloc.free(beta_src);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "fx/mcp.json",
+        .data = "{\"mcp\":{\"prof_win\":{\"command\":\"node\"}}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "alpha/mod.json",
+        .data = "{\"name\":\"alpha\",\"version\":\"1.0.0\",\"mcp\":{\"clash\":{\"command\":\"bin/a\"},\"prof_win\":{\"command\":\"bin/pa\"}}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "beta/mod.json",
+        .data = "{\"name\":\"beta\",\"version\":\"1.0.0\",\"mcp\":{\"clash\":{\"command\":\"bin/b\"},\"prof_win\":{\"command\":\"bin/pb\"}}}",
+    });
+
+    try std.testing.expectEqual(mods_mod.Outcome.ok, try mods_mod.add(alloc, mods_dir, "alpha", alpha_src));
+    try std.testing.expectEqual(mods_mod.Outcome.ok, try mods_mod.add(alloc, mods_dir, "beta", beta_src));
+
+    var checks: std.ArrayList(Check) = .empty;
+    defer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+    try appendModAssetChecks(&checks, alloc, fx_dir);
+    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
+    try std.testing.expectEqualStrings("mcp", checks.items[0].name);
+    try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
+    try std.testing.expectEqualStrings("MCP server 'clash' is defined by multiple mods (alpha, beta), so neither loads", checks.items[0].detail);
+    try std.testing.expectEqualStrings("disable or remove one of those mods, or define the server in ~/.fx/mcp.json", checks.items[0].fix.?);
 }

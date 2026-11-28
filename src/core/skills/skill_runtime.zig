@@ -2359,52 +2359,7 @@ fn handOffCleanup(alloc: Allocator, set: *ModPinsSet, current: ?*const ModPinsSe
         mods.mod_pins.freeCleanupNames(alloc, names);
         return;
     }
-    startCleanup(alloc, root, names);
-}
-
-const CleanupJob = struct {
-    alloc: Allocator,
-    root: []u8,
-    names: [][]u8,
-    ops: mods.ModPins.Ops,
-
-    fn release(job: *CleanupJob) void {
-        mods.mod_pins.freeCleanupNames(job.alloc, job.names);
-        job.alloc.free(job.root);
-        job.alloc.destroy(job);
-    }
-
-    fn run(job: *CleanupJob) void {
-        mods.mod_pins.collectNames(job.root, job.ops, job.names);
-        job.release();
-    }
-};
-
-/// Takes ownership of `root` and `names`. Runs the cleanup on a detached
-/// thread, which frees them when it ends (`app_mods_runtime.zig` VerbJob).
-fn startCleanup(alloc: Allocator, root: []u8, names: [][]u8) void {
-    const job = alloc.create(CleanupJob) catch {
-        dropCleanup(alloc, root, names, "out of memory");
-        return;
-    };
-    job.* = .{ .alloc = alloc, .root = root, .names = names, .ops = mods.realModPinsOps() };
-    if (comptime @import("builtin").single_threaded) {
-        alloc.destroy(job);
-        dropCleanup(alloc, root, names, "threads are unavailable");
-        return;
-    }
-    const thread = std.Thread.spawn(.{}, CleanupJob.run, .{job}) catch {
-        job.release();
-        debug_trace.logf("skills", "mod cleanup not started: thread unavailable; the next change of the mod collects", .{});
-        return;
-    };
-    thread.detach();
-}
-
-fn dropCleanup(alloc: Allocator, root: []u8, names: [][]u8, reason: []const u8) void {
-    mods.mod_pins.freeCleanupNames(alloc, names);
-    alloc.free(root);
-    debug_trace.logf("skills", "mod cleanup not started: {s}; the next change of the mod collects", .{reason});
+    mods.mod_pins.collectDetached(alloc, root, names, mods.realModPinsOps());
 }
 
 pub const Runtime = struct {
