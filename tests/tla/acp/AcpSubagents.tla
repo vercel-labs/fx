@@ -172,7 +172,8 @@ ChildStops(k, report) ==
     /\ steersTaken' = steersTaken + waiting[k]
     /\ waiting' = [waiting EXCEPT ![k] = 0]
     /\ perm' = [perm EXCEPT ![k] = 0]
-    /\ chan' = IF perm[k] # 0 THEN Append(chan, Msg("cancel", k, perm[k])) ELSE chan
+    /\ chan' = (IF perm[k] # 0 THEN Append(chan, Msg("cancel", k, perm[k])) ELSE chan)
+               \o (IF waiting[k] > 0 THEN ToClient(<<Work(k)>>) ELSE <<>>)
     /\ reportsMade' = IF report THEN reportsMade + 1 ELSE reportsMade
     /\ reports' = IF report THEN reports + 1 ELSE reports
 
@@ -200,6 +201,7 @@ CancelChild(k) ==
 StopChildren ==
     LET running == {k \in Kids : child[k] = "running"}
         stopped == SeqOf({k \in running : perm[k] # 0})
+        restarted == SeqOf({k \in running : waiting[k] > 0})
     IN /\ parent' = "idle"
        /\ child' = [k \in Kids |-> IF k \in running THEN (IF waiting[k] > 0 THEN "running" ELSE "idle") ELSE child[k]]
        /\ childTurns' = childTurns + Cardinality({k \in running : waiting[k] > 0})
@@ -207,6 +209,7 @@ StopChildren ==
        /\ waiting' = [k \in Kids |-> IF k \in running THEN 0 ELSE waiting[k]]
        /\ perm' = [k \in Kids |-> IF k \in running THEN 0 ELSE perm[k]]
        /\ chan' = chan \o [i \in 1..Len(stopped) |-> Msg("cancel", stopped[i], perm[stopped[i]])]
+                       \o ToClient([i \in 1..Len(restarted) |-> Work(restarted[i])])
 
 \* session/cancel of the parent. Today it stops the parent only: the children
 \* run on.
@@ -242,16 +245,17 @@ SteerChild(k) ==
        THEN /\ steersSent' = steersSent + 1
             /\ IF child[k] = "running"
                THEN /\ waiting' = [waiting EXCEPT ![k] = @ + 1]
-                    /\ UNCHANGED <<child, childTurns, steersTaken>>
+                    /\ UNCHANGED <<child, childTurns, steersTaken, chan>>
                ELSE /\ childTurns < MaxChildTurns
                     /\ child' = [child EXCEPT ![k] = "running"]
                     /\ childTurns' = childTurns + 1
                     /\ steersTaken' = steersTaken + 1
+                    /\ chan' = chan \o ToClient(<<Work(k)>>)
                     /\ UNCHANGED waiting
             /\ UNCHANGED flags
        ELSE /\ Flag("child_prompt_refused")
-            /\ UNCHANGED <<steersSent, waiting, child, childTurns, steersTaken>>
-    /\ UNCHANGED <<parent, perm, asks, shown, chan, seen, reportsMade, reports, reportsTaken,
+            /\ UNCHANGED <<steersSent, waiting, child, childTurns, steersTaken, chan>>
+    /\ UNCHANGED <<parent, perm, asks, shown, seen, reportsMade, reports, reportsTaken,
                    cancels, loads>>
 
 \* The client loads the parent again. It forgets what it read, and fx replays
@@ -325,6 +329,15 @@ ChildPromptsWork == "child_prompt_refused" \notin flags
 WorkReachesClient ==
     [][\A k \in Kids : (Spawn(k) \/ Reuse(k) \/ ChildWork(k)) =>
         Len(chan') > 0 /\ chan'[Len(chan')] = Msg("work", k, 0)]_vars
+
+\* Each turn a child starts, from the parent, a message, or a waiting message,
+\* sends the client an update of the child's work in the same step. A message
+\* that joins the running turn (ChildTakeSteer) starts no turn.
+TurnStartSendsWork ==
+    [][\A k \in Kids :
+        (child'[k] = "running"
+         /\ (child[k] # "running" \/ (waiting[k] > 0 /\ waiting'[k] = 0 /\ childTurns' > childTurns)))
+            => \E i \in (Len(chan) + 1)..Len(chan') : chan'[i] = Msg("work", k, 0)]_vars
 
 \* A child that isn't running sends no work and no request.
 NoWorkWhenStopped ==

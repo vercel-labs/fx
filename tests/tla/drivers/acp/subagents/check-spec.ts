@@ -16,6 +16,36 @@ const lines = (...rows: string[]) => rows.join("\n");
 
 const MUTANTS: Mutant[] = [
   {
+    id: "steer-start-no-work",
+    note: "a message that starts an idle child sends the client none of its work",
+    edits: [
+      {
+        from: String.raw`/\ steersTaken' = steersTaken + 1
+                    /\ chan' = chan \o ToClient(<<Work(k)>>)`,
+        to: String.raw`/\ steersTaken' = steersTaken + 1
+                    /\ chan' = chan`,
+      },
+    ],
+    expect: "TurnStartSendsWork",
+  },
+  {
+    id: "queued-run-no-work",
+    note: "a waiting message that runs as the child's next turn sends none of its work",
+    edits: [{ from: String.raw`\o (IF waiting[k] > 0 THEN ToClient(<<Work(k)>>) ELSE <<>>)`, to: String.raw`\o <<>>` }],
+    expect: "TurnStartSendsWork",
+  },
+  {
+    id: "stop-restart-no-work",
+    note: "a child that restarts with a waiting message after a parent stop sends none of its work",
+    edits: [
+      {
+        from: String.raw`\o ToClient([i \in 1..Len(restarted) |-> Work(restarted[i])])`,
+        to: String.raw`\o <<>>`,
+      },
+    ],
+    expect: "TurnStartSendsWork",
+  },
+  {
     id: "work-before-announce",
     note: "a new child's first update goes out before its announcement",
     edits: [
@@ -48,8 +78,8 @@ const MUTANTS: Mutant[] = [
     note: "a child's waiting request isn't cancelled when its work stops",
     edits: [
       {
-        from: String.raw`chan' = IF perm[k] # 0 THEN Append(chan, Msg("cancel", k, perm[k])) ELSE chan`,
-        to: String.raw`chan' = chan`,
+        from: String.raw`chan' = (IF perm[k] # 0 THEN Append(chan, Msg("cancel", k, perm[k])) ELSE chan)`,
+        to: String.raw`chan' = (chan)`,
       },
     ],
     expect: "RequestEndsWithChild",
@@ -228,6 +258,7 @@ const ACTION_PROPERTIES = new Set([
   "ParentStopStopsChildren",
   "ChildStopLeavesParent",
   "WorkReachesClient",
+  "TurnStartSendsWork",
   "NoWorkWhenStopped",
   "CancelChildStops",
   "CancelReports",
