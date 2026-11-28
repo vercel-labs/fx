@@ -3,7 +3,9 @@ const domain = @import("domain.zig");
 const types = @import("../shared/types.zig");
 const profiles = @import("../profiles/profiles.zig");
 const reports = @import("reports.zig");
+const child_state = @import("child_state.zig");
 const session_commands = @import("../session/session_commands.zig");
+const tool_projection = @import("../tooling/tool_projection.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -119,12 +121,22 @@ pub const MessageInput = struct {
     effort: ?[]const u8 = null,
     profile: ?[]const u8 = null,
 };
+const CloseInput = struct {
+    agent: ?[]const u8 = null,
+    agents: ?[]const []const u8 = null,
+};
+
+pub const CloseRequest = union(enum) {
+    one: []u8,
+    many: [][]u8,
+};
+
 pub const RequestInput = union(Action) {
     message: MessageInput,
     wait,
     status: struct { agent: ?[]const u8 = null },
     stop: struct { agent: []const u8 },
-    close: struct { agent: []const u8 },
+    close: CloseInput,
     approve: struct { agent: []const u8 },
     deny: struct { agent: []const u8, message: ?[]const u8 = null },
 };
@@ -162,8 +174,8 @@ pub const Request = union(Action) {
     status: struct { agent: ?[]u8 = null },
     /// Ends a subagent's running turn and drops what waits for it.
     stop: struct { agent: []u8 },
-    /// Stops a subagent and removes it for good, with its conversation.
-    close: struct { agent: []u8 },
+    /// Stops one or several subagents and removes them for good, with their conversations.
+    close: CloseRequest,
     /// Allows the approval request the subagent waits on, once.
     approve: struct { agent: []u8 },
     /// Refuses the approval request the subagent waits on; `message` tells it why.
@@ -181,7 +193,13 @@ pub const Request = union(Action) {
             .wait => {},
             .status => |value| if (value.agent) |agent| alloc.free(agent),
             .stop => |value| alloc.free(value.agent),
-            .close => |value| alloc.free(value.agent),
+            .close => |value| switch (value) {
+                .one => |agent| alloc.free(agent),
+                .many => |agents| {
+                    for (agents) |agent| alloc.free(agent);
+                    alloc.free(agents);
+                },
+            },
             .approve => |value| alloc.free(value.agent),
             .deny => |value| {
                 alloc.free(value.agent);
@@ -201,7 +219,10 @@ pub const Request = union(Action) {
             .wait => null,
             .status => |value| value.agent,
             .stop => |value| value.agent,
-            .close => |value| value.agent,
+            .close => |value| switch (value) {
+                .one => |agent| agent,
+                .many => null,
+            },
             .approve => |value| value.agent,
             .deny => |value| value.agent,
         };
@@ -224,6 +245,10 @@ pub const Request = union(Action) {
 pub const ValidationError = error{
     OutOfMemory,
     InvalidAgent,
+    /// `close` with `agents: []` or without `agent`/`agents`.
+    EmptyAgentList,
+    /// `close` with `agents` longer than `child_state.max_children`.
+    TooManyAgents,
     /// `stop`, `close`, `approve` or `deny` named "parent", which is no subagent of the caller's.
     InvalidParentTarget,
     InvalidInstructions,
@@ -294,9 +319,13 @@ pub fn validateRequest(
             break :blk .{ .stop = .{ .agent = try alloc.dupe(u8, value.agent) } };
         },
         .close => |value| blk: {
-            if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
-            if (std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidParentTarget;
-            break :blk .{ .close = .{ .agent = try alloc.dupe(u8, value.agent) } };
+            if (value.agent != null and value.agents != null) return error.InvalidAgent;
+            if (value.agents) |raw_agents| {
+                break :blk .{ .close = .{ .many = try validateUniqueCloseAgents(alloc, raw_agents) } };
+            }
+            const agent = value.agent orelse return error.EmptyAgentList;
+            try validateChildTarget(agent);
+            break :blk .{ .close = .{ .one = try alloc.dupe(u8, agent) } };
         },
         .approve => |value| blk: {
             if (!domain.validAgentName(value.agent)) return error.InvalidAgent;
@@ -331,6 +360,29 @@ fn validateOverrideText(
 
 fn validateProfile(profile: ?[]const u8) ValidationError!void {
     if (profile) |name| if (!profiles.validName(name)) return error.InvalidProfile;
+}
+
+fn validateChildTarget(agent: []const u8) ValidationError!void {
+    if (!domain.validAgentName(agent)) return error.InvalidAgent;
+    if (std.mem.eql(u8, agent, parent_agent)) return error.InvalidParentTarget;
+}
+
+fn validateUniqueCloseAgents(alloc: Allocator, raw_agents: []const []const u8) ValidationError![][]u8 {
+    if (raw_agents.len == 0) return error.EmptyAgentList;
+    if (raw_agents.len > child_state.max_children) return error.TooManyAgents;
+    var unique: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (unique.items) |item| alloc.free(item);
+        unique.deinit(alloc);
+    }
+    for (raw_agents) |agent| {
+        try validateChildTarget(agent);
+        if (tool_projection.containsName(@ptrCast(unique.items), agent)) continue;
+        const copy = try alloc.dupe(u8, agent);
+        errdefer alloc.free(copy);
+        try unique.append(alloc, copy);
+    }
+    return try unique.toOwnedSlice(alloc);
 }
 
 /// Returns an owned copy the caller frees, or null. Never fails on null.
@@ -523,6 +575,15 @@ test "minimal request validation owns each action's intent" {
     defer close.deinit(alloc);
     try std.testing.expectEqualStrings("reviewer", close.agentName().?);
     try std.testing.expectError(error.InvalidParentTarget, validateRequest(alloc, .{ .close = .{ .agent = "parent" } }));
+    try std.testing.expectError(error.EmptyAgentList, validateRequest(alloc, .{ .close = .{ .agents = &.{} } }));
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .close = .{ .agent = "a", .agents = &.{"b"} } }));
+    try std.testing.expectError(error.InvalidParentTarget, validateRequest(alloc, .{ .close = .{ .agents = &.{ "alpha", "parent" } } }));
+    var batch = try validateRequest(alloc, .{ .close = .{ .agents = &.{ "alpha", "beta", "alpha" } } });
+    defer batch.deinit(alloc);
+    try std.testing.expect(batch.agentName() == null);
+    try std.testing.expectEqual(@as(usize, 2), batch.close.many.len);
+    try std.testing.expectEqualStrings("alpha", batch.close.many[0]);
+    try std.testing.expectEqualStrings("beta", batch.close.many[1]);
     try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .status = .{ .agent = "Bad Name" } }));
 
     var message = try validateRequest(alloc, .{ .message = .{
@@ -544,6 +605,14 @@ test "minimal request validation owns each action's intent" {
             .instructions = "",
             .message = "review this",
         } }),
+    );
+}
+
+test "validateRequest frees duplicated batch close names when list append fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        validateRequest(failing.allocator(), .{ .close = .{ .agents = &.{"alpha"} } }),
     );
 }
 

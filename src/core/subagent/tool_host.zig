@@ -935,7 +935,10 @@ pub const Runtime = struct {
             },
             .close => {
                 if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
-                return self.closeNamed(alloc, request.close.agent);
+                return switch (request.close) {
+                    .one => |agent| self.closeNamed(alloc, agent),
+                    .many => |agents_list| self.closeMany(alloc, agents_list),
+                };
             },
             .approve => {
                 if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
@@ -3169,6 +3172,144 @@ pub const Runtime = struct {
             agent,
         });
         return self.encodeManaged(alloc, .{ .ok = true, .result = text });
+    }
+
+    const CloseChildFn = *const fn (*Runtime, []const u8, CloseBy) anyerror!?Closed;
+
+    const BatchCloseState = struct {
+        closed_count: usize = 0,
+        lines_written: usize = 0,
+        any_not_open: bool = false,
+        any_not_saved: bool = false,
+        first_err: ?anyerror = null,
+    };
+
+    fn callCloseChild(self: *Runtime, child_id: []const u8, by: CloseBy) anyerror!?Closed {
+        return self.closeChild(child_id, by);
+    }
+
+    fn recordBatchCloseError(
+        writer: *std.Io.Writer,
+        state: *BatchCloseState,
+        agent: []const u8,
+        child_id: ?[]const u8,
+        err: anyerror,
+    ) void {
+        if (state.first_err == null) state.first_err = err;
+        debug_trace.logf(
+            "mailbox",
+            "close failed child={s} agent={s} err={s}",
+            .{ child_id orelse "unknown", agent, @errorName(err) },
+        );
+        writer.print("The close of {s} failed, so it is still open.\n", .{agent}) catch return;
+        state.lines_written += 1;
+    }
+
+    fn recordBatchNotOpen(
+        writer: *std.Io.Writer,
+        state: *BatchCloseState,
+        agent: []const u8,
+    ) !void {
+        try writer.print("No open subagent is named \"{s}\".\n", .{agent});
+        state.lines_written += 1;
+        state.any_not_open = true;
+    }
+
+    fn closeManyAgent(
+        self: *Runtime,
+        a: Allocator,
+        agent: []const u8,
+        writer: *std.Io.Writer,
+        state: *BatchCloseState,
+        close_fn: CloseChildFn,
+    ) !void {
+        const child_id = blk: {
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            var registry = try self.managed.state_store.load(a);
+            const child = registry.findPersistent(agent) orelse break :blk null;
+            break :blk try a.dupe(u8, child.id);
+        };
+        const id = child_id orelse {
+            try recordBatchNotOpen(writer, state, agent);
+            return;
+        };
+        const closed_opt = close_fn(self, id, .parent) catch |err| switch (err) {
+            error.CloseNotSaved => {
+                try writer.print("The close of {s} couldn't be saved, so it is still open.\n", .{agent});
+                state.lines_written += 1;
+                state.any_not_saved = true;
+                return;
+            },
+            else => {
+                recordBatchCloseError(writer, state, agent, id, err);
+                return;
+            },
+        };
+        const closed = closed_opt orelse {
+            try recordBatchNotOpen(writer, state, agent);
+            return;
+        };
+        const dropped_text = switch (closed.dropped) {
+            0 => "",
+            1 => " The message waiting for it was dropped.",
+            // Child already closed; keep the closed line without the count suffix on OOM.
+            else => a.print(" The {d} messages waiting for it were dropped.", .{closed.dropped}) catch "",
+        };
+        state.closed_count += 1;
+        try writer.print("Closed {s}{s}.{s}\n", .{
+            agent,
+            if (closed.stopped) ", ending its turn" else "",
+            dropped_text,
+        });
+        state.lines_written += 1;
+    }
+
+    /// `close` with `agents`: closes each unique name in order, reporting one
+    /// line per name and ending with the reopen note.
+    fn closeMany(self: *Runtime, alloc: Allocator, agents_list: []const []const u8) !ManagedExecutionResult {
+        return self.closeManyWith(alloc, agents_list, callCloseChild);
+    }
+
+    fn closeManyWith(
+        self: *Runtime,
+        alloc: Allocator,
+        agents_list: []const []const u8,
+        close_fn: CloseChildFn,
+    ) !ManagedExecutionResult {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var out: std.Io.Writer.Allocating = .init(a);
+        var state: BatchCloseState = .{};
+
+        for (agents_list) |agent| {
+            self.closeManyAgent(a, agent, &out.writer, &state, close_fn) catch |err| {
+                recordBatchCloseError(&out.writer, &state, agent, null, err);
+            };
+        }
+
+        if (state.lines_written == 0) {
+            return state.first_err orelse error.Unexpected;
+        }
+
+        if (state.any_not_open) {
+            const open = try self.roster(a, false);
+            refusal.writeOpenRoster(&out.writer, open) catch return error.OutOfMemory;
+            try out.writer.writeByte('\n');
+        }
+        try out.writer.writeAll("A later message to a closed name starts a new one.");
+
+        if (state.closed_count > 0) {
+            return self.encodeManaged(alloc, .{ .ok = true, .result = out.written() });
+        }
+        const err_code: []const u8 = if (state.any_not_saved) "close_not_saved" else @tagName(std.meta.Tag(refusal.Refusal).child_unavailable);
+        return self.encodeManaged(alloc, .{
+            .ok = false,
+            .error_code = err_code,
+            .result = out.written(),
+        });
     }
 
     /// Whether a child was closed since the last `takeClosed`.
@@ -13371,4 +13512,256 @@ test "wait card: the note to main names the reason and nothing else" {
     const resend = try waitingNoteText(alloc, "Out of credits", true);
     defer alloc.free(resend);
     try std.testing.expectEqualStrings("fx: my last request failed and waits for a follow-up (Out of credits). A message from you sends it again.", resend);
+}
+
+test "batch close closes two idle subagents in order and preserves single close on agent" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "alpha", .message = "one" } }, "call-1", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "beta", .message = "two" } }, "call-2", null);
+    try waitUntilQuiet(runtime);
+
+    const closed = try callToolResult(runtime, arena, .{ .close = .{ .agents = &.{ "alpha", "beta" } } }, "call-3", null);
+    try std.testing.expect(!closed.started);
+    try expectBodyHas(closed.body, "\"ok\":true");
+    try expectBodyHas(closed.body, "Closed alpha.");
+    try expectBodyHas(closed.body, "Closed beta.");
+    try expectBodyHas(closed.body, "A later message to a closed name starts a new one.");
+
+    const status = try callTool(runtime, arena, .{ .status = .{} }, "call-4", null);
+    try expectBodyHas(status, "No subagents yet.");
+}
+
+test "batch close stops a working child, drops its waiting messages, and closes an idle child" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "alpha", .message = "work" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "alpha", .message = "queued" } }, "call-2", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "beta", .message = "idle-work" } }, "call-3", null);
+    try waitForRuns(&fixture, 2);
+
+    const closed = try callTool(runtime, arena, .{ .close = .{ .agents = &.{ "alpha", "beta" } } }, "call-4", null);
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+
+    try expectBodyHas(closed, "\"ok\":true");
+    try expectBodyHas(closed, "Closed alpha, ending its turn. The message waiting for it was dropped.");
+    try expectBodyHas(closed, "Closed beta, ending its turn.");
+    try expectBodyHas(closed, "A later message to a closed name starts a new one.");
+}
+
+test "batch close reports unknown names alongside closed names, and fails with child_unavailable when none closed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "alpha", .message = "one" } }, "call-1", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "gamma", .message = "two" } }, "call-2", null);
+    try waitUntilQuiet(runtime);
+
+    const mixed = try callTool(runtime, arena, .{ .close = .{ .agents = &.{ "ghost", "alpha", "phantom" } } }, "call-3", null);
+    try expectBodyHas(mixed, "\"ok\":true");
+    try expectBodyHas(mixed, "No open subagent is named \\\"ghost\\\".");
+    try expectBodyHas(mixed, "Closed alpha.");
+    try expectBodyHas(mixed, "No open subagent is named \\\"phantom\\\".");
+    try expectBodyHas(mixed, "Open subagents: gamma.");
+    try expectBodyHas(mixed, "A later message to a closed name starts a new one.");
+
+    const none_closed = try callTool(runtime, arena, .{ .close = .{ .agents = &.{ "alpha", "missing" } } }, "call-4", null);
+    try expectBodyHas(none_closed, "\"ok\":false");
+    try expectBodyHas(none_closed, "\"error_code\":\"child_unavailable\"");
+    try expectBodyHas(none_closed, "Open subagents: gamma.");
+}
+
+test "batch close reports close_not_saved for one name while closing the other" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "alpha", .message = "one" } }, "call-1", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "beta", .message = "two" } }, "call-2", null);
+    try waitUntilQuiet(runtime);
+
+    const beta_id = blk: {
+        var lock = runtime.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try runtime.managed.state_store.load(arena);
+        break :blk try arena.dupe(u8, registry.findPersistent("beta").?.id);
+    };
+    const FailBeta = struct {
+        var target_id: []const u8 = "";
+        fn hold(child_id: []const u8) void {
+            close_test_controls.test_write_error = if (std.mem.eql(u8, child_id, target_id)) error.DiskFull else null;
+        }
+    };
+    FailBeta.target_id = beta_id;
+    close_test_controls.test_hold = FailBeta.hold;
+    defer {
+        close_test_controls.test_hold = null;
+        close_test_controls.test_write_error = null;
+    }
+
+    const partial = try callTool(runtime, arena, .{ .close = .{ .agents = &.{ "alpha", "beta" } } }, "call-3", null);
+    try expectBodyHas(partial, "\"ok\":true");
+    try expectBodyHas(partial, "Closed alpha.");
+    try expectBodyHas(partial, "beta");
+    try expectBodyHas(partial, "couldn't be saved");
+
+    const all_failed = try callTool(runtime, arena, .{ .close = .{ .agents = &.{"beta"} } }, "call-4", null);
+    try expectBodyHas(all_failed, "\"ok\":false");
+    try expectBodyHas(all_failed, "\"error_code\":\"close_not_saved\"");
+
+    close_test_controls.test_hold = null;
+    close_test_controls.test_write_error = null;
+    _ = try callTool(runtime, arena, .{ .close = .{ .agent = "beta" } }, "call-5", null);
+}
+
+test "batch close reports per-name failure and closes remaining names when closeChild returns another error" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "alpha", .message = "one" } }, "call-1", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "beta", .message = "two" } }, "call-2", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "gamma", .message = "three" } }, "call-3", null);
+    try waitUntilQuiet(runtime);
+
+    const beta_id = blk: {
+        var lock = runtime.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try runtime.managed.state_store.load(arena);
+        break :blk try arena.dupe(u8, registry.findPersistent("beta").?.id);
+    };
+    const FakeClose = struct {
+        var fail_id: []const u8 = "";
+        fn close(rt: *Runtime, child_id: []const u8, by: Runtime.CloseBy) anyerror!?Runtime.Closed {
+            if (std.mem.eql(u8, child_id, fail_id)) return error.Unexpected;
+            return rt.closeChild(child_id, by);
+        }
+    };
+    FakeClose.fail_id = beta_id;
+
+    const result = try runtime.closeManyWith(arena, &.{ "alpha", "beta", "gamma" }, FakeClose.close);
+    try expectBodyHas(result.body, "\"ok\":true");
+    try expectBodyHas(result.body, "Closed alpha.");
+    try expectBodyHas(result.body, "The close of beta failed, so it is still open.");
+    try expectBodyHas(result.body, "Closed gamma.");
+
+    const status = try callTool(runtime, arena, .{ .status = .{} }, "call-4", null);
+    try expectBodyHas(status, "beta");
+    try std.testing.expect(std.mem.find(u8, status, "alpha") == null);
+    try std.testing.expect(std.mem.find(u8, status, "gamma") == null);
+
+    // When every name fails but writes a line, return ok=false with that line;
+    // when no name can produce a line (OOM), propagate the error.
+    const only_failed = try runtime.closeManyWith(arena, &.{"beta"}, FakeClose.close);
+    try expectBodyHas(only_failed.body, "\"ok\":false");
+    try expectBodyHas(only_failed.body, "The close of beta failed, so it is still open.");
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runtime.closeManyWith(failing.allocator(), &.{"beta"}, FakeClose.close),
+    );
+}
+
+test "batch close still reports a closed agent when dropped-count formatting fails with OOM" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "alpha", .message = "one" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+
+    const StubClose = struct {
+        var calls: usize = 0;
+        fn close(rt: *Runtime, child_id: []const u8, by: Runtime.CloseBy) anyerror!?Runtime.Closed {
+            _ = rt;
+            _ = child_id;
+            _ = by;
+            calls += 1;
+            return .{ .stopped = false, .dropped = 2 };
+        }
+    };
+
+    var saw_close_with_oom = false;
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        StubClose.calls = 0;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var failing = std.testing.FailingAllocator.init(scratch.allocator(), .{ .fail_index = fail_index });
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        var state: Runtime.BatchCloseState = .{};
+        runtime.closeManyAgent(failing.allocator(), "alpha", &out.writer, &state, StubClose.close) catch |err| switch (err) {
+            error.OutOfMemory => {
+                // If close_fn already closed the child, returning OOM here means
+                // closeManyWith would report it as failed/still open!
+                if (StubClose.calls > 0) return error.TestUnexpectedResult;
+                continue;
+            },
+            else => return err,
+        };
+        if (StubClose.calls == 1) {
+            saw_close_with_oom = true;
+            try std.testing.expectEqual(@as(usize, 1), state.closed_count);
+            try expectBodyHas(out.written(), "Closed alpha.");
+            break;
+        }
+    }
+    try std.testing.expect(saw_close_with_oom);
 }
