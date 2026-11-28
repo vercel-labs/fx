@@ -147,6 +147,7 @@ pub const Body = union(Kind) {
         text: []const u8,
         blobs: []const []const u8 = &.{},
         images: []const InputAcceptedImage = &.{},
+        retry_key_hash: ?[]const u8 = null,
     };
     pub const InputRef = struct { id: u64 };
 
@@ -251,6 +252,7 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
         .input_accepted => |a| {
             try w.number("id", a.id);
             try w.string("text", a.text);
+            if (a.retry_key_hash) |hash| try w.string("retry_key_hash", hash);
             try w.blobList(a.blobs);
             if (a.images.len > 0) {
                 try w.key("images");
@@ -342,6 +344,7 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .text = try f.req([]const u8, "text"),
             .blobs = try f.opt([]const []const u8, "blobs") orelse &.{},
             .images = try f.opt([]const Body.InputAcceptedImage, "images") orelse &.{},
+            .retry_key_hash = try f.opt([]const u8, "retry_key_hash"),
         } },
         .input_delivered => .{ .input_delivered = .{ .id = try f.req(u64, "id") } },
         .input_withdrawn => .{ .input_withdrawn = .{ .id = try f.req(u64, "id") } },

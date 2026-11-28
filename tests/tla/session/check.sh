@@ -76,6 +76,8 @@ fi
 sim="-simulate num=${SIM_RUNS:-20000} -depth 40 -seed 1"
 sim_accepted="-simulate num=${SIM_RUNS:-20000} -depth 20 -seed 1"
 tlc_verdicts "$@" <<EOF
+KeyedInputReceipt keyed-input-receipt -
+KeyedInputReceipt keyed-input-receipt-forgotten OneReceiptPerKey
 ShellSession holds -
 ShellSession witness-saved-empty-status NoSavedEmptyStatus
 ShellSession witness-unsaved-status NoUnsavedStatus

@@ -793,6 +793,7 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             if (a.id == 0 or a.text.len == 0) return error.InvalidArgument;
             if (a.text.len > max_value_bytes) return error.TooLarge;
             if (!std.unicode.utf8ValidateSlice(a.text)) return error.InvalidArgument;
+            if (a.retry_key_hash) |hash| if (!schema.validBlobHash(hash)) return error.InvalidArgument;
             for (a.blobs) |hash| if (!schema.validBlobHash(hash)) return error.InvalidArgument;
             if (a.images.len > max_accepted_images) return error.TooLarge;
             for (a.images) |img| {
@@ -2505,6 +2506,7 @@ const api_tests = struct {
         try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 0, .text = "hi" } }}));
         try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 1, .text = "" } }}));
         try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 1, .text = "\xff" } }}));
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 1, .text = "hi", .retry_key_hash = "not a digest" } }}));
         try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_delivered = .{ .id = 0 } }}));
         try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_withdrawn = .{ .id = 0 } }}));
 
