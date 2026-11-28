@@ -14,6 +14,8 @@ const composer_selection = @import("composer_selection.zig");
 const composer_skill_binding = @import("composer_skill_binding.zig");
 const composer_text_replacement = @import("composer_text_replacement.zig");
 const composer_undo = @import("composer_undo.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const pasted_blocks = @import("pasted_blocks.zig");
 const composer_history = @import("composer_history.zig");
 const composer_stash = @import("composer_stash.zig");
 const edit_history = @import("edit_history.zig");
@@ -85,6 +87,24 @@ pub const Runtime = struct {
         self.edit_history.deinit(alloc);
         if (self.model_picker_draft) |*draft| draft.deinit(alloc);
         if (self.card_model_picker_draft) |*draft| draft.deinit(alloc);
+    }
+
+    /// Closes the `/effort` menu and clears its query from the composer, as
+    /// Esc on the `/model` menu does. Every surface that takes the footer
+    /// from the menu calls it first, so Enter never reaches a menu that is
+    /// not on screen and the query is never kept as a draft. False when the
+    /// menu was not open.
+    pub fn cancelEffortMenu(self: *Runtime, alloc: Allocator, reason: []const u8) bool {
+        if (!self.effort_menu.active) return false;
+        debug_trace.logf("input", "effort menu closed and its query cleared reason={s} query_bytes={d} pasted_blocks={d}", .{
+            reason,
+            self.edit_state.input.items.len,
+            self.entities.pasted_blocks.items.len,
+        });
+        self.effort_menu.close(alloc);
+        self.inputResetState().clearCurrent(alloc);
+        pasted_blocks.clearBlocks(alloc, &self.entities.pasted_blocks);
+        return true;
     }
 
     /// Sets the person's draft aside so the model picker a card's "Change

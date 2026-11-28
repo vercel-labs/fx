@@ -406,6 +406,82 @@ test.skipIf(!tmuxAvailable())("Ctrl+P over the open /effort menu closes it with 
   expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=model_menu_opened query_bytes=1");
 }, TIMEOUT);
 
+test.skipIf(!tmuxAvailable())("a typed $ over the open /effort menu is part of its query and opens no skill list", async () => {
+  const current = await launch();
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("$");
+  await session.waitForPane((pane) => pane.includes("Effort 0") && pane.includes("No levels found.") && /^┃ \$$/m.test(pane), 5_000);
+  // Enter applies nothing for a query with no match, even the level that
+  // was highlighted before the $.
+  await session.sendKeys("Enter");
+  await session.sendKeys("BSpace");
+  await session.sendLiteral("x");
+  await session.waitForPane((pane) => pane.includes("Effort 1") && /^┃ x$/m.test(pane), 5_000);
+  await session.sendKeys("Enter");
+  await session.waitForText("Reasoning effort set to xhigh for acme/thinker", 5_000);
+  expect(await session.capturePane()).not.toContain("Reasoning effort set to default");
+  expect(savedEffort(current)).toBe("xhigh");
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("Tab over the open /effort menu leaves its query as typed, even when the query reads like a command", async () => {
+  const current = await launch();
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  for (const query of ["/effort h", "/model", "/effort"]) {
+    await session.sendLiteral(query);
+    await session.waitForPane((pane) => pane.includes("Effort 0") && new RegExp(`^┃ ${query.replace("/", "\\/")}$`, "m").test(pane), 5_000);
+    await session.sendKeys("Tab");
+    await session.sendKeys("C-u");
+    await session.waitForPane((pane) => pane.includes("Effort 5") && /^┃ *$/m.test(pane), 5_000);
+  }
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  // No frame showed a completion that Tab wrote into the query.
+  const rows = [...replayGrids(FX_BIN, current.tape, join(current.root, "tab.frames")).values()]
+    .flatMap((grid) => grid.map((row) => row.trimEnd()));
+  expect(rows).not.toContain("┃ /effort high");
+  expect(rows.filter((row) => /^┃ \/model \S/.test(row))).toEqual([]);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("switching models from the out-of-credits card closes the open /effort menu, and the prompt, not its query, comes back as the draft", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const current = await launch({
+    respond: (body) => body.includes("first question")
+      ? held.then(() => new Response(
+        JSON.stringify({ error: { code: "credit_card_required", message: "Buy credits to use AI Gateway." } }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      ))
+      : fakeGatewayFinalText("ANSWER"),
+  });
+  const { session } = current;
+  await session.sendText("first question");
+  await session.waitForText("Thinking", 10_000);
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  release();
+  await session.waitForText("Switch to another model", 10_000);
+  await session.sendKeys("Down");
+  await session.sendKeys("Enter");
+  await session.waitForPane((pane) => /^┃ \/model *$/m.test(pane) && !pane.includes("Effort "), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => /^┃ first question$/m.test(pane), 5_000);
+  expect(savedEffort(current)).toBeUndefined();
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await session.sendKeys("C-u");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=worker_model_picker query_bytes=1");
+}, TIMEOUT);
+
 test.skipIf(!tmuxAvailable())("a level the model does not offer, or a malformed one, changes nothing and names the levels", async () => {
   const current = await launch();
   const { session } = current;

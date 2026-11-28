@@ -1530,6 +1530,10 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (cycleModelMenuProvider(app, 1) or cycleSkillsMenuSource(app, 1)) {
                         app.shell.render_requests.request(.footer);
+                    } else if (app.input_runtime.effort_menu.active) {
+                        // The open `/effort` menu owns Tab, as the `/model`
+                        // menu does. It has no tabs, and its query is never a
+                        // command to complete.
                     } else if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try completion_rt.openCurrentModelPicker(app);
                     } else if (picker_state.isBareEffortCommandAtCursor(&app.input_runtime.edit_state)) {
@@ -1681,7 +1685,7 @@ pub fn Runtime(comptime App: type) type {
                             selection.start
                         else
                             app.input_runtime.edit_state.cursor;
-                        if (byte == '$' and !file_picker_path.contains_position(app.input_runtime.edit_state.input.items, insertion_start) and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app)) {
+                        if (byte == '$' and !file_picker_path.contains_position(app.input_runtime.edit_state.input.items, insertion_start) and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app) and !app.input_runtime.effort_menu.active) {
                             if ((try insertComposerSliceBounded(app, agent, &.{byte}, max_input_len, false)) == .limit_exceeded) {
                                 try input_limit_feedback.report(App, app, .composer, 1);
                                 return;
@@ -3490,21 +3494,8 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// Closes the `/effort` menu and clears its query from the
-        /// composer, as Esc on the `/model` menu does. Another surface that
-        /// takes the footer closes it too, as an edit did before the menu
-        /// filtered, so Enter never reaches a menu that is not on screen.
         fn cancelEffortMenu(app: *App, reason: []const u8) bool {
-            if (!app.input_runtime.effort_menu.active) return false;
-            debug_trace.logf("input", "effort menu closed and its query cleared reason={s} query_bytes={d} pasted_blocks={d}", .{
-                reason,
-                app.input_runtime.edit_state.input.items.len,
-                app.input_runtime.entities.pasted_blocks.items.len,
-            });
-            app.input_runtime.effort_menu.close(app.alloc);
-            app.input_runtime.inputResetState().clearCurrent(app.alloc);
-            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
-            return true;
+            return app.input_runtime.cancelEffortMenu(app.alloc, reason);
         }
 
         /// Applies the level highlighted in the `/effort` menu and closes it.
