@@ -42,6 +42,7 @@ const auto_classifier_context = @import("../../../permissions/auto_classifier_co
 
 const test_support = @import("support.zig");
 const text_utils = @import("../../../shared/text_utils.zig");
+const compactor = @import("../../../compactor/compactor.zig");
 
 const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
@@ -3832,6 +3833,102 @@ test "a session keeps its first runtime context ahead of the history and notes a
     try std.testing.expectEqual(@as(usize, 0), third_saved.context_notes.len);
 }
 
+fn countInstruction(instructions: []const []const u8, text: []const u8) usize {
+    var count: usize = 0;
+    for (instructions) |instruction| {
+        if (std.mem.eql(u8, instruction, text)) count += 1;
+    }
+    return count;
+}
+
+test "fx's own summary in a turn that sent an earlier turn's runtime context captures the current one for the rest of the session (D94)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const before = "<fx-turn-context>\nmodel: openai/gpt-6.1-sol\n</fx-turn-context>";
+    const after = "<fx-turn-context>\nmodel: anthropic/claude-fable-5.2\n</fx-turn-context>";
+    const answer = [_]FakeCompletion{.{ .content = "Final" }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The first turn captures the runtime context with model A and saves it.
+    var first_gateway = FakeGateway.init(alloc, &answer);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.runtime_context_text = before;
+    var first = fixture.job();
+    first.prompt = @constCast("First.");
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first);
+    try std.testing.expectEqualStrings(before, first_hooks.history_turns.items[0].assistant.execution.runtime_context.?[0]);
+
+    // The second turn runs on model B. It sends the first turn's copy, then a
+    // large tool result makes fx write its own summary in the turn.
+    var second_gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{toolCall("large-read", "read_file", "{\"path\":\"large.txt\"}")} },
+        .{ .content = "Turn in progress\nIn between: The read completed." },
+        .{ .content = "Completed after the summary." },
+    });
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.runtime_context_text = after;
+    const small_model = "provider/small-window";
+    const capabilities = [_]test_support.ModelCapabilityOverride{.{ .model = small_model, .capabilities = .{ .context_window = 3_000 } }};
+    second_hooks.available_capability_overrides = &capabilities;
+    second_hooks.permission_decisions = &.{.once};
+    second_hooks.exec_plans = &.{.{ .result = .{ .model_output = "LARGE\n" ++ text_utils.repeat("r", 10_000) } }};
+    var second = fixture.job();
+    second.model = @constCast(small_model);
+    second.prompt = @constCast("Second.");
+    second.history = first_hooks.history_turns.items[0..1];
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), second);
+    try std.testing.expectEqual(@as(usize, 3), second_gateway.request_bodies.items.len);
+    try expectBodyContains(&second_gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&second_gateway, 2, "compacted_conversation");
+    const before_summary = try leadingSystemContents(arena, second_gateway.request_bodies.items[0]);
+    try std.testing.expect(countInstruction(before_summary.items, before) == 1);
+
+    // The summary starts a new prefix: the rest of the turn sends model B,
+    // with no update note for a change it already shows.
+    const after_summary_body = second_gateway.request_bodies.items[2];
+    const after_summary = try leadingSystemContents(arena, after_summary_body);
+    try std.testing.expectEqual(@as(usize, 1), countInstruction(after_summary.items, after));
+    try std.testing.expectEqual(@as(usize, 0), countInstruction(after_summary.items, before));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, after_summary_body, "fx-context-update>"));
+    for ((try userMessageTexts(arena, after_summary_body)).items) |text| try std.testing.expect(!std.mem.eql(u8, text, "First."));
+
+    // The summary saves the copy sent after it, and the turn adds none, so
+    // nothing the turn saved before the summary is written again (D87).
+    const turns = second_hooks.history_turns.items;
+    try std.testing.expectEqual(@as(usize, 2), turns.len);
+    const kept = try compactor.savedRuntimeContext(arena, turns[0].compacted_summary.summary);
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqualStrings(after, kept[0]);
+    try std.testing.expect(turns[1].assistant.execution.runtime_context == null);
+
+    // The next turn restores the saved history, as a resume does, and sends
+    // that copy unchanged with no update.
+    var third_gateway = FakeGateway.init(alloc, &answer);
+    defer third_gateway.deinit();
+    var third_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer third_hooks.deinit();
+    third_hooks.runtime_context_text = after;
+    var third = fixture.job();
+    third.prompt = @constCast("Third.");
+    third.history = turns;
+    try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), third);
+    const third_body = third_gateway.request_bodies.items[0];
+    try expectSameInstructions(alloc, after_summary_body, third_body);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, third_body, "fx-context-update>"));
+    try std.testing.expect(third_hooks.history_turns.items[0].assistant.execution.runtime_context == null);
+}
+
 test "a named skill's text rides on its turn's message and the turn saves it as sent (D95)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4542,6 +4639,131 @@ test "modern mixed batch materializes unsupported terminal before admission" {
     try std.testing.expectEqual(types.PersistedToolStatus.success, results[0].status);
     try std.testing.expectEqualStrings("Unsupported tool: missing_tool", results[1].output);
     try std.testing.expectEqual(types.PersistedToolStatus.failure, results[1].status);
+}
+
+test "unsupported bash call hints the registered shell tool when no bash tool is registered" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var renamed_shell = builtin_tools.shell;
+    renamed_shell.name = "terminal";
+    renamed_shell.model_schema.name = "terminal";
+    const renamed_tools = [_]tool_dispatch.Tool{ builtin_tools.read_file, renamed_shell };
+    const no_shell_tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
+
+    const cases = [_]struct {
+        tools: ?[]const tool_dispatch.Tool,
+        expected: []const u8,
+    }{
+        .{ .tools = null, .expected = "Unsupported tool: bash. Use shell instead." },
+        .{ .tools = &renamed_tools, .expected = "Unsupported tool: bash. Use terminal instead." },
+        .{ .tools = &no_shell_tools, .expected = "Unsupported tool: bash" },
+    };
+
+    for (cases) |case| {
+        const calls = [_]ToolCall{toolCall("bash_1", "bash", "{\"command\":\"true\"}")};
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &calls },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.context_enabled = true;
+        hooks.context_registry = EmptyApplicableContext.registry;
+        hooks.validation_not_registered_names = &.{"bash"};
+        if (case.tools) |tools| hooks.tool_registry = .{ .tools = tools };
+        var fixture = PromptFixture{ .workspace_root = workspace };
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+        const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings(case.expected, results[0].output);
+        try std.testing.expectEqual(types.PersistedToolStatus.failure, results[0].status);
+    }
+}
+
+test "unsupported bash_placeholder keeps the generic message" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    for ([_][]const u8{ "bash_placeholder", "bash_tool_placeholder" }) |name| {
+        const calls = [_]ToolCall{toolCall("bad_1", name, "{}")};
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &calls },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.context_enabled = true;
+        hooks.context_registry = EmptyApplicableContext.registry;
+        hooks.validation_not_registered_names = &.{name};
+        var fixture = PromptFixture{ .workspace_root = workspace };
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        const expected = try alloc.print("Unsupported tool: {s}", .{name});
+        defer alloc.free(expected);
+        const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings(expected, results[0].output);
+        try std.testing.expectEqual(types.PersistedToolStatus.failure, results[0].status);
+    }
+}
+
+test "registered bash tool dispatches directly without unsupported hint" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var bash_tool = builtin_tools.read_file;
+    bash_tool.name = "bash";
+    bash_tool.model_schema.name = "bash";
+    const tools = [_]tool_dispatch.Tool{ builtin_tools.shell, bash_tool };
+
+    const calls = [_]ToolCall{toolCall("bash_1", "bash", "{\"path\":\"notes.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.context_registry = EmptyApplicableContext.registry;
+    hooks.tool_registry = .{ .tools = &tools };
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "bash tool ran" } }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("bash", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
+    const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("bash tool ran", results[0].output);
+    try std.testing.expectEqual(types.PersistedToolStatus.success, results[0].status);
 }
 
 test "modern cancellation during later context selection stops before context or tool history commit" {
