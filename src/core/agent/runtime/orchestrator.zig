@@ -9457,7 +9457,8 @@ fn processQueuedPromptLoop(
                             .runtime_context = try runtimeContextTexts(arena, runtime_context.messages()),
                             // fx's summary starts a new prefix; a turn that sent
                             // an earlier turn's copy sends the current one after
-                            // it, saved with the summary (D94).
+                            // it, saved with the summary, unless a kept turn
+                            // holds its own copy (D94).
                             .summary_runtime_context = if (runtime_context.captured == null)
                                 try runtimeContextTexts(arena, current_runtime_context.items)
                             else
@@ -9522,7 +9523,7 @@ fn processQueuedPromptLoop(
                         trace_count_after_compaction = true;
                         active_compaction_history_tail = compacted_messages.items[1..];
                         compaction_history = next_history;
-                        if (try runtime_context.restartAfterSummary(arena, overlay_arena, next_history, current_runtime_context.items)) |restart| {
+                        if (try runtime_context.restartAfterSummary(arena, overlay_arena, next_history, within_turn_suffix.items[compacted_suffix_len..], current_runtime_context.items)) |restart| {
                             ephemeral_overlay.clearRetainingCapacity();
                             try ephemeral_overlay.appendSlice(overlay_arena, runtime_context.messages());
                             if (restart.update) |note| {

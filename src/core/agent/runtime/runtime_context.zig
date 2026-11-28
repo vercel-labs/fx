@@ -109,23 +109,25 @@ pub const State = struct {
         return note;
     }
 
-    /// Sends the copy fx's own summary saved, after that summary was written
-    /// in this turn: the summary starts a new prefix, so the rest of the turn
-    /// and every later turn send the current runtime context it holds (D94,
-    /// `compactor.Request.summary_runtime_context`). The turn's own record
-    /// does not change, so nothing it already saved is written again. An
-    /// update the cut removed no longer counts as seen; one kept after the
-    /// summary still does. A provider's block keeps the copy it was sent
-    /// with, a turn that captured its own copy keeps it, and a summary that
-    /// saved none changes nothing. `history` is the history after the
-    /// summary, the summary first. Returns null when the copy stays;
-    /// otherwise the update note to add at this boundary, as `refresh`
-    /// returns it.
+    /// Sends what later turns will send after fx's own summary, written in
+    /// this turn: the copy `init` finds after it, which is a kept turn's own
+    /// copy when one holds it, or else the current runtime context the
+    /// summary saved (D94, `compactor.Request.summary_runtime_context`). The
+    /// turn's own record does not change, so nothing it already saved is
+    /// written again. An update the cut removed no longer counts as seen; one
+    /// kept after the summary, in a kept turn or in `kept`, the running
+    /// turn's messages after the cut, still does. A provider's block keeps
+    /// the copy it was sent with, a turn that captured its own copy keeps it,
+    /// and a summary that saved none changes nothing. `history` is the
+    /// history after the summary, the summary first. Returns null when the
+    /// copy stays; otherwise the update note to add at this boundary, as
+    /// `refresh` returns it.
     pub fn restartAfterSummary(
         self: *State,
         arena: Allocator,
         scratch: Allocator,
         history: []const types.HistoryTurn,
+        kept: []const ChatMessage,
         current: []const ChatMessage,
     ) Allocator.Error!?Restart {
         if (self.captured != null) return null;
@@ -136,8 +138,9 @@ pub const State = struct {
         if (try compactor.providerBlock(arena, summary)) |block| {
             if (block.runtime_context.len > 0) return null;
         }
-        const next = try State.init(arena, history, null);
+        var next = try State.init(arena, history, null);
         if (next.frozen == null) return null;
+        if (newestUpdateIn(kept)) |note| next.known_update = note;
         self.* = next;
         return .{ .update = try self.refresh(arena, scratch, current) };
     }
@@ -186,6 +189,19 @@ fn newestUpdate(execution: types.ExecutionMemory) ?[]const u8 {
     while (index > 0) {
         index -= 1;
         const text = execution.context_notes[index].text;
+        if (std.mem.startsWith(u8, text, update_open_tag)) return text;
+    }
+    return null;
+}
+
+/// The newest update note among `messages`, the running turn's messages a
+/// compaction kept.
+fn newestUpdateIn(messages: []const ChatMessage) ?[]const u8 {
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        if (!messages[index].context_note) continue;
+        const text = messages[index].content orelse continue;
         if (std.mem.startsWith(u8, text, update_open_tag)) return text;
     }
     return null;
@@ -405,7 +421,7 @@ test "fx's own summary in a turn that sent an earlier turn's copy sends the copy
     try std.testing.expect(state.known_update != null);
 
     const after = [_]types.HistoryTurn{summaryTurn(claude_summary)};
-    const restart = (try state.restartAfterSummary(arena, arena, &after, &claude)).?;
+    const restart = (try state.restartAfterSummary(arena, arena, &after, &.{}, &claude)).?;
     try std.testing.expect(restart.update == null);
     try std.testing.expect(state.known_update == null);
     // The summary holds the copy, so the turn saves none of its own.
@@ -428,7 +444,7 @@ test "an update kept after fx's own summary still counts, so a turn that takes t
 
     const summary = "fx-compactor-v1\n{\"runtime_context\":[\"Runtime context: permission mode is full access.\"]}";
     const after = [_]types.HistoryTurn{ summaryTurn(summary), assistantTurn(.{ .context_notes = &notes }) };
-    const restart = (try state.restartAfterSummary(arena, arena, &after, &full)).?;
+    const restart = (try state.restartAfterSummary(arena, arena, &after, &.{}, &full)).?;
     try std.testing.expect(std.mem.endsWith(u8, restart.update.?, "\nRuntime context: permission mode is full access.\n</fx-context-update>"));
     try std.testing.expectEqualStrings(full[0].content.?, state.messages()[0].content.?);
     try std.testing.expect(state.captured == null);
@@ -446,20 +462,70 @@ test "a provider's block, a turn's own copy, and a summary that saved none keep 
 
     var borrowed = try State.init(arena, &before, null);
     const note = (try borrowed.refresh(arena, arena, &current)).?;
-    try std.testing.expect(try borrowed.restartAfterSummary(arena, arena, &.{summaryTurn(block)}, &current) == null);
+    try std.testing.expect(try borrowed.restartAfterSummary(arena, arena, &.{summaryTurn(block)}, &.{}, &current) == null);
     try std.testing.expectEqualStrings("ctx", borrowed.messages()[0].content.?);
     try std.testing.expectEqualStrings(note, borrowed.known_update.?);
     try std.testing.expect(borrowed.captured == null);
 
     // A summary written before the copy was saved with it, or by a host
     // that passed none, leaves the turn as it was; the next turn captures.
-    try std.testing.expect(try borrowed.restartAfterSummary(arena, arena, &.{summaryTurn("fx-compactor-v1\n{\"earlier\":\"e\"}")}, &current) == null);
+    try std.testing.expect(try borrowed.restartAfterSummary(arena, arena, &.{summaryTurn("fx-compactor-v1\n{\"earlier\":\"e\"}")}, &.{}, &current) == null);
     try std.testing.expectEqualStrings("ctx", borrowed.messages()[0].content.?);
     try std.testing.expect(borrowed.captured == null);
 
     var own = try State.init(arena, &.{}, null);
     _ = try own.refresh(arena, arena, &systemMessages(&.{"Runtime context: permission mode is ask."}));
-    try std.testing.expect(try own.restartAfterSummary(arena, arena, &.{summaryTurn(claude_summary)}, &current) == null);
+    try std.testing.expect(try own.restartAfterSummary(arena, arena, &.{summaryTurn(claude_summary)}, &.{}, &current) == null);
     try std.testing.expectEqualStrings("Runtime context: permission mode is ask.", own.captured.?[0]);
     try std.testing.expectEqualStrings("Runtime context: permission mode is ask.", own.messages()[0].content.?);
+}
+
+test "a turn kept after fx's own summary with its own copy keeps sending it, and the summary's copy goes unused" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Turn K captured A and is kept after the summary; the running turn
+    // sent A too and noted the change to B.
+    var saved = [_][]u8{@constCast("Runtime context: permission mode is ask.")};
+    const auto = systemMessages(&.{"Runtime context: permission mode is auto."});
+    const kept_turn = assistantTurn(.{ .runtime_context = &saved });
+    var state = try State.init(arena, &.{kept_turn}, null);
+    try std.testing.expect(state.captured == null);
+    _ = (try state.refresh(arena, arena, &auto)).?;
+
+    const summary = "fx-compactor-v1\n{\"runtime_context\":[\"Runtime context: permission mode is auto.\"]}";
+    const after = [_]types.HistoryTurn{ summaryTurn(summary), kept_turn };
+    const restart = (try state.restartAfterSummary(arena, arena, &after, &.{}, &auto)).?;
+    // The requests after the summary and every later turn send A, which
+    // the kept turn was sent with; the change to B is noted again, since
+    // the cut removed the earlier note.
+    try std.testing.expectEqualStrings(saved[0], state.messages()[0].content.?);
+    try std.testing.expect(std.mem.endsWith(u8, restart.update.?, "\nRuntime context: permission mode is auto.\n</fx-context-update>"));
+    var later = try State.init(arena, &after, null);
+    try std.testing.expectEqualStrings(saved[0], later.messages()[0].content.?);
+    try std.testing.expect((try later.refresh(arena, arena, &auto)) != null);
+}
+
+test "an update the running turn kept after fx's own summary is not noted again" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var saved = [_][]u8{@constCast("Runtime context: permission mode is ask.")};
+    const auto = systemMessages(&.{"Runtime context: permission mode is auto."});
+    const kept_turn = assistantTurn(.{ .runtime_context = &saved });
+    var state = try State.init(arena, &.{kept_turn}, null);
+    const note = (try state.refresh(arena, arena, &auto)).?;
+
+    // The note this step queued comes after the steps the cut summarized,
+    // so the request after the summary still sends it.
+    const kept = [_]ChatMessage{
+        .{ .role = .tool, .content = "result of a kept step" },
+        .{ .role = .system, .content = note, .context_note = true },
+    };
+    const summary = "fx-compactor-v1\n{\"runtime_context\":[\"Runtime context: permission mode is auto.\"]}";
+    const after = [_]types.HistoryTurn{ summaryTurn(summary), kept_turn };
+    const restart = (try state.restartAfterSummary(arena, arena, &after, &kept, &auto)).?;
+    try std.testing.expect(restart.update == null);
+    try std.testing.expectEqualStrings(note, state.known_update.?);
+    try std.testing.expect(try state.refresh(arena, arena, &auto) == null);
 }

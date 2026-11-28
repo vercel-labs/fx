@@ -138,6 +138,76 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
+/** The `<fx-turn-context>` system message a request sends. */
+function turnContextOf(body: Body): string {
+  const message = body.prompt.slice(0, leadingSystem(body.prompt)).find((one) => JSON.stringify(one.content).includes("<fx-turn-context>"));
+  return JSON.stringify(message?.content ?? null);
+}
+
+/** Turn 4 runs a shell call; every turn answers "Turn N done.". */
+function terminalStep(request: { body: Body }) {
+  const turn = Number(lastUserText(request.body).match(/TURN (\d+)/)?.[1] ?? 0);
+  if (turn === 4 && request.body.prompt.at(-1)?.role !== "tool") return { kind: "tool" as const };
+  return { kind: "final" as const, text: `Turn ${turn} done.` };
+}
+
+/**
+ * fx's terminal on `model` through the fake gateway, one terminal for the
+ * whole session: the terminal's instructions differ from fx ask's. The
+ * gateway's evidence is kept when `body` fails.
+ */
+async function withTerminal(model: string, options: Partial<ProviderGatewayOptions>, body: (terminal: InstanceType<typeof TmuxSession>, gateway: Gateway) => Promise<void>) {
+  const { root, home, cwd } = fixture(model);
+  const started = startProviderGateway({
+    models: [{ id: model, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }],
+    defaultModel: model,
+    step: terminalStep,
+    compaction: () => ({ kind: "block" }),
+    ...options,
+  });
+  const { gateway, edits, observed, counts } = started;
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+    AI_GATEWAY_API_KEY: "synthetic-provider-compaction", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+    FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model, FX_TRACE_LOG: join(root, "trace.log"),
+    FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_WORKSPACE_TRUST: "1",
+    ...sanitizerOptions(),
+    FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  const command = `/usr/bin/env -i ${Object.entries(env).map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)} --full-access`;
+  const terminal = await TmuxSession.create({ cmd: command, cwd, env: { HOME: home, FX_SOUND: "0" }, isolated: true, stderrPath: join(root, "tui.stderr"), width: 100, height: 32, startupWaitMs: 0 });
+  let passed = false;
+  try {
+    await terminal.waitForStableComposer(20_000);
+    await body(terminal, started);
+    passed = true;
+  } finally {
+    await terminal.kill();
+    gateway.stop();
+    if (passed) rmSync(root, { recursive: true, force: true });
+    else {
+      writeFileSync(join(root, "requests.json"), JSON.stringify(observed.map((request) => request.body), null, 1));
+      console.error(`provider compaction evidence retained: ${root} edits=${JSON.stringify(edits)} counts=${JSON.stringify(counts)}`);
+    }
+  }
+}
+
+async function runTurns(terminal: InstanceType<typeof TmuxSession>, from: number, to: number) {
+  for (let turn = from; turn <= to; turn += 1) {
+    await terminal.sendText(`TURN ${turn} Continue.`);
+    await terminal.waitForText(`Turn ${turn} done.`, 30_000);
+    await terminal.waitForStableComposer(10_000);
+  }
+}
+
+async function switchModel(terminal: InstanceType<typeof TmuxSession>, model: string) {
+  await terminal.sendText(`/model ${model}`);
+  await terminal.waitForText(`Switched to ${model}`, 15_000);
+  await terminal.waitForStableComposer(10_000);
+}
+
 function trace(root: string): string {
   return existsSync(join(root, "trace.log")) ? readFileSync(join(root, "trace.log"), "utf8") : "";
 }
@@ -359,6 +429,61 @@ describe("provider compaction", () => {
         console.error(`provider compaction evidence retained: ${root} edits=${JSON.stringify(edits)} counts=${JSON.stringify(counts)}`);
       }
     }
+  }, 240_000);
+
+  test.skipIf(!tmuxAvailable())("a manual /compact between turns with fx's summary lets the next turn capture the current turn context, and the turn after sends it unchanged", async () => {
+    // Neither model has provider compaction, so /compact writes fx's summary
+    // at once and saves no copy with it. Nothing is sent between the summary
+    // and turn 7, so turn 7 captures the current turn context, after the
+    // switch, and needs no update note.
+    const first = "google/gemini-3-pro", second = "xai/grok-5";
+    const models = [first, second].map((id) => ({ id, type: "language", tags: ["tool-use"], context_window: 400_000, max_tokens: 8192 }));
+    await withTerminal(first, { models }, async (terminal, { observed, counts, edits }) => {
+      await runTurns(terminal, 1, 6);
+      await switchModel(terminal, second);
+      const before = observed.length;
+      await terminal.sendText("/compact");
+      // These short turns fit, so fx writes the summary without a request.
+      await terminal.waitForText("Context compacted", 30_000);
+      await terminal.waitForStableComposer(15_000);
+      await runTurns(terminal, 7, 8);
+      expect(counts.provider).toBe(0);
+      const seventh = agentRequestFor(observed, before, 7)!;
+      const eighth = agentRequestFor(observed, before, 8)!;
+      expect(isFxSummary(conversationOf(seventh)[0]!)).toBe(true);
+      expect(turnContextOf(seventh)).toContain(`model: ${second}`);
+      expect(JSON.stringify(conversationOf(seventh))).not.toContain("fx-context-update>");
+      expect(eighth.prompt.slice(0, seventh.prompt.length).map(withoutCacheMarkers)).toEqual(seventh.prompt.map(withoutCacheMarkers));
+      expect(edits).toEqual([]);
+    });
+  }, 240_000);
+
+  test.skipIf(!tmuxAvailable())("a manual /compact after a switch from GPT-6 to Claude keeps the turn context the kept turns were sent with", async () => {
+    // Claude compacts with the provider, so /compact waits for turn 7 and
+    // runs inside it: the block keeps the copy turns 4 to 6 were sent with,
+    // and the switch rides on turn 7's message.
+    const models = Object.values(FAMILIES).map((family) => ({ id: family.model, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }));
+    const gpt = FAMILIES.openai.model, claude = FAMILIES.anthropic.model;
+    await withTerminal(gpt, { models }, async (terminal, { observed, counts, edits }) => {
+      await runTurns(terminal, 1, 6);
+      const sixth = observed.at(-1)!.body;
+      await switchModel(terminal, claude);
+      const before = observed.length;
+      await terminal.sendText("/compact");
+      await terminal.waitForText("Context will be compacted before your next message.", 15_000);
+      await runTurns(terminal, 7, 8);
+      expect(counts.provider).toBe(1);
+      const compaction = observed.slice(before).find((request) => request.kind === "compaction")!;
+      expect(compaction.model).toBe(claude);
+      const seventh = agentRequestFor(observed, before, 7)!;
+      const eighth = agentRequestFor(observed, before, 8)!;
+      expect(blockKeyOf(conversationOf(seventh)[0]!)).toBe(compaction.block!);
+      expect(turnContextOf(sixth)).toContain(`model: ${gpt}`);
+      expect(turnContextOf(seventh)).toBe(turnContextOf(sixth));
+      expect(JSON.stringify(conversationOf(seventh))).toContain(`model: ${claude}`);
+      expect(eighth.prompt.slice(0, seventh.prompt.length).map(withoutCacheMarkers)).toEqual(seventh.prompt.map(withoutCacheMarkers));
+      expect(edits).toEqual([]);
+    });
   }, 240_000);
 
   test("a model without provider compaction keeps fx's own compactor, with the newest turns after its summary", async () => {

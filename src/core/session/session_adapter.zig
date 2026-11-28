@@ -12385,6 +12385,38 @@ test "a turn's runtime context comes back on resume, saved once right after its 
     try testing.expect(restored.history[1].assistant.execution.runtime_context == null);
 }
 
+test "a turn stopped right after fx's summary cut it comes back with its runtime context, and the summary with the copy it saved (D94)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    try s.commitTurn(assistantTurn("one", "1"), types.ConversationLanguage.default());
+    var captured = [_][]u8{@constCast("<fx-turn-context>\nmodel: anthropic/claude-fable-5.2\n</fx-turn-context>")};
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    // The turn's first save carries its copy, before its first request.
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..2], .runtime_context = &captured }, .{});
+    // The summary inside the turn is one write, with the copy it saved; the
+    // process stops before the turn's next save.
+    var summary = "fx-compactor-v1\n{\"earlier\":\"e\",\"runtime_context\":[\"<fx-turn-context>\\nmodel: anthropic/claude-fable-5.2\\n</fx-turn-context>\"]}".*;
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, true, .{ .turns = 1, .tool_steps = 1 });
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings(&summary, restored.history[0].compacted_summary.summary);
+    const execution = restored.history[1].interrupted.execution;
+    try testing.expectEqual(@as(usize, 1), execution.runtime_context.?.len);
+    try testing.expectEqualStrings(captured[0], execution.runtime_context.?[0]);
+}
+
 test "a turn's model call records come back on resume at their steps, each saved once" {
     var t: TestHome = undefined;
     try t.init();
