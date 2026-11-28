@@ -1,4 +1,10 @@
-# libfx examples
+# Examples
+
+## CLI examples
+
+- [MCP deploy gate](mcp-deploy-gate): check an MCP tool result in CI with fx.
+
+## libfx examples
 
 Small applications built with [libfx](https://fx.sh/docs/lib). Each example keeps
 the agent calls in its entry point. Start with the one that matches your runtime.
@@ -12,7 +18,7 @@ Use Node.js 24 and an [AI Gateway API key](https://vercel.com/docs/ai-gateway/au
 The examples pin libfx 0.0.18 and use `createFxEngine()` for one conversation.
 They do not use the CLI's built-in tools.
 
-## Run an example
+### Run an example
 
 Clone this repository, then open the example directory:
 
@@ -45,7 +51,7 @@ WebAssembly needs a browser with [JSPI support](https://fx.sh/docs/lib/webassemb
 Keep the sibling `shared/` directory when copying a web example. It contains the
 public-demo model and transport policy, not another agent framework.
 
-## Deploy a public demo
+### Deploy a public demo
 
 Create a Vercel project for each example, with its directory as the project root.
 Enable **Include source files outside of the Root Directory in the Build Step**
@@ -65,7 +71,7 @@ boundary; the last in-flight requests may finish after it is reached.
 These guards protect anonymous demos. Replace them with your app's authentication
 and usage policy when adapting the examples.
 
-## Tests
+### Tests
 
 From the repository root:
 
