@@ -620,6 +620,36 @@ test.skipIf(!tmuxAvailable())("an image path pasted over the open /effort menu s
   await quit(current);
 }, TIMEOUT);
 
+test.skipIf(!tmuxAvailable())("Ctrl+Y over the open /effort menu yanks no killed image into its query", async () => {
+  const current = await launch();
+  const { session, gateway } = current;
+  const image = join(current.root, "workspace", "i.png");
+  writeFileSync(image, Buffer.from(ONE_PIXEL_PNG, "base64"));
+  await bracketPaste(session, image);
+  await session.waitForPane((pane) => /^┃ \[Image 1\]/m.test(pane), 5_000);
+  // Ctrl+U kills the image token, and its image, into the kill ring.
+  await session.sendKeys("C-u");
+  await session.waitForPane((pane) => /^┃ *$/m.test(pane), 5_000);
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendKeys("C-y");
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ *$/m.test(pane), 5_000);
+  // Enter on the empty composer starts nothing; the next prompt carries no image.
+  await session.sendKeys("Enter");
+  await session.sendText("hello");
+  await session.waitForText("ANSWER", 10_000);
+  await session.waitForComposer(10_000);
+  const chats = gateway.requests.filter((request) => request.body.includes("\"prompt\""));
+  expect(chats.some((request) => request.body.includes("hello"))).toBe(true);
+  expect(chats.every((request) => userImages(request.body) === 0)).toBe(true);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("yank skipped reason=menu_borrows_composer images=1");
+}, TIMEOUT);
+
 test.skipIf(!tmuxAvailable())("Space after a model name in the /effort query switches no model", async () => {
   const current = await launch();
   const { session } = current;

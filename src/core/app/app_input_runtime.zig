@@ -532,6 +532,13 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 .yank => {
+                    // A killed image yanked into a menu's query would outlive
+                    // the query, as a pasted one would (`modelPickerBorrowsComposer`).
+                    const killed_images = app.input_runtime.kill_ring.images.items.len;
+                    if (killed_images > 0 and paste_rt.modelPickerBorrowsComposer(app)) {
+                        debug_trace.logf("input", "yank skipped reason=menu_borrows_composer images={d}", .{killed_images});
+                        return;
+                    }
                     const first_image_id = app.peekNextImageId(agent);
                     switch (try app.input_runtime.killRingState(&agent.pending_images).yank(
                         app.alloc,
