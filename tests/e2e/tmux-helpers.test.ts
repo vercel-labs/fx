@@ -869,6 +869,8 @@ test("fxChildEnv drops every name on the unset list and keeps the caller's own",
     VERCEL_OIDC_TOKEN: "stale-vercel_oidc_token",
     VERCEL_TOKEN: "stale-vercel_token",
   });
+  expect(DEFAULT_UNSET_ENV_KEYS).toContain("FX_TEST_RECOVERY_RETRY_BUDGET_MS");
+  expect(fxChildEnv({ FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500" }, { inherited }).FX_TEST_RECOVERY_RETRY_BUDGET_MS).toBe("1500");
   expect(inherited.FX_TEST_SHELL_YIELD_HELD).toBe("stale-fx_test_shell_yield_held");
 });
 
