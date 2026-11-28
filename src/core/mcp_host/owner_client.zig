@@ -1052,6 +1052,7 @@ test "an owner that exits with LockBusy gives EOF and does not wait for the dead
     try testing.expect(client.stream != null);
     try testing.expect(Harness.eof_observed.load(.acquire));
     try testing.expectEqual(@as(?Client.ReadyOutcome, .eof), Harness.observed_outcome);
+    Harness.cleanup();
     try testing.expectEqual(@as(?anyerror, error.LockBusy), Harness.busy_err);
 
     var trace_file = try std.Io.Dir.openFileAbsolute(testing.io, trace_path, .{});
