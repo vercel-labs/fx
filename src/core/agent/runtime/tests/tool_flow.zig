@@ -35,6 +35,7 @@ const runtime_tool_presentation = @import("../tool_presentation.zig");
 const runtime_telemetry = @import("../telemetry.zig");
 const recovery = @import("../../../recovery/recovery.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
+const shell_snapshot = @import("../../../terminal/shell_snapshot.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const auto_classifier_context = @import("../../../permissions/auto_classifier_context.zig");
@@ -1778,7 +1779,7 @@ test "shell lifecycle resolves one display target before execution" {
             return .{
                 .decision = .once,
                 .execution_authority = .ordinary,
-                .human_approval = .once,
+                .human_approval = .{ .kind = .once, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() },
             };
         }
     };
@@ -6714,6 +6715,7 @@ test "initial session grants follow active registry metadata" {
         "/tmp/workspace",
         .{ .id = "provider-glob", .name = "provider_glob", .arguments_json = "{\"pattern\":\"*\"}" },
         "/tmp/workspace/src",
+        shell_snapshot.processOwner().approvalEpoch(),
     );
 
     try std.testing.expectEqual(@as(usize, 4), local_grants.items.len);
@@ -8375,6 +8377,7 @@ test "child live authority refresh denies the next tool action before execution"
         const allowed_tools = [_][]const u8{"read_file"};
         const integrations = [_][]const u8{"mcp_fixture"};
         var grants = [_]PermissionGrant{.{
+            .shell_epoch = 0,
             .tool_name = @constCast("read_file"),
             .target_path = @constCast("/tmp/workspace/first"),
         }};
@@ -8623,7 +8626,7 @@ test "child live authority allow to ask requires current approval before effect"
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     hooks.permission_decisions = &.{ .once, .once };
-    hooks.permission_human_approvals = &.{ .none, .once };
+    hooks.permission_human_approvals = &.{ command_admission.no_human_approval, .{ .kind = .once, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() } };
     hooks.permission_wait_index = 1;
     hooks.exec_plans = &.{.{ .result = .{ .model_output = "approved result" } }};
 
@@ -8819,6 +8822,34 @@ test "a subagent's always approval of a file change stores the session grant" {
 
 test "a subagent's always approval of a command stores the session grant" {
     try expectChildAlwaysStoresGrant(.command);
+}
+
+test "an always answer to a shell command stores the epoch it was answered in when a refresh lands first" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_always", "shell", "{\"command\":\"zig fmt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.always};
+    hooks.refresh_before_record = true;
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.propagated_grants.items.len);
+    const stored = hooks.propagated_grants.items[0];
+    try std.testing.expectEqual(@as(u64, 0), stored.shell_epoch);
+    try std.testing.expect(!permissions.sessionGrantAllowed(hooks.propagated_grants.items, "run_command", stored.target_path));
 }
 
 /// What a subagent's approval of a call that reads an image kept, as the turn

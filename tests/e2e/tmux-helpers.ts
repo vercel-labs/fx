@@ -683,9 +683,17 @@ export function startUpgradeServer(
   argvLogPath: string,
   options: {
     revision?: string;
+    /** The dev release's build number in dev.json; left out when unset. */
+    build?: number;
     relaunchEnv?: Record<string, string>;
   } = {},
-): { baseUrl: string; setRevision: (revision: string) => void; stop: () => void } {
+): {
+  baseUrl: string;
+  setRevision: (revision: string, build?: number) => void;
+  /** How many times fx has read dev.json. */
+  devChecks: () => number;
+  stop: () => void;
+} {
   const relaunchExports = Object.entries(options.relaunchEnv ?? {})
     .map(([name, value]) => {
       if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) throw new Error(`relaunchEnv name ${name} is not a shell variable name`);
@@ -722,6 +730,8 @@ ${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
 
   const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
   let revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
+  let build = options.build;
+  let devChecks = 0;
   const stableRevision = revision;
   archiveFor(revision);
   const stableArchiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
@@ -733,7 +743,8 @@ ${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
       const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
       if (path === "/latest.txt") return new Response("v9.9.9\n");
       if (path === "/dev.json") {
-        return Response.json({ version: "9.9.9", commit: revision });
+        devChecks += 1;
+        return Response.json(build === undefined ? { version: "9.9.9", commit: revision } : { version: "9.9.9", commit: revision, build });
       }
       if (path === stableArchiveRoute) return new Response(archiveFor(stableRevision).archive);
       if (path === devArchiveRoute) return new Response(archiveFor(revision).archive);
@@ -744,10 +755,12 @@ ${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
   });
   return {
     baseUrl: `http://127.0.0.1:${server.port}`,
-    setRevision: (next: string) => {
+    setRevision: (next: string, nextBuild?: number) => {
       archiveFor(next);
       revision = next;
+      build = nextBuild;
     },
+    devChecks: () => devChecks,
     stop: () => server.stop(true),
   };
 }
