@@ -30,6 +30,8 @@
 (* process: a grant recorded by any session stamps the command, so another  *)
 (* session's older grant admits a call without a question. All commands     *)
 (* here are one command text.                                               *)
+(* "record_older_epoch" lets a late record write its older epoch over a     *)
+(* newer grant, so the grant moves back and revives a retired approval.     *)
 (* "reload_per_command" is the behavior without a snapshot: dotfiles run   *)
 (* on every call.                                                           *)
 (* The two-session configs run at MaxGen 2. With one session and two       *)
@@ -52,7 +54,8 @@ ASSUME Mutation \in {"none", "no_single_flight", "free_while_leased",
                      "stale_grant", "reload_per_command", "notice_repeat",
                      "use_partial", "clear_dirty_late", "keep_broken",
                      "shared_command_epoch", "recheck_restamps",
-                     "store_stamps_current", "stamp_at_answer"}
+                     "store_stamps_current", "stamp_at_answer",
+                     "record_older_epoch"}
 
 Gens    == 1..MaxGen
 NoGen   == 0
@@ -69,6 +72,10 @@ RestampRecheck == Mutation = "recheck_restamps"
 
 \* Commands in FirstSession belong to session "s1"; the others belong to "s2".
 SessOf(c) == IF c \in FirstSession THEN "s1" ELSE "s2"
+
+\* The epoch a remembered grant holds after a record of epoch `e`: a record moves
+\* the grant forward only, never back to an older epoch.
+Newer(g, e) == IF e > g THEN e ELSE g
 
 VARIABLES
     owner,        \* "empty" | "capturing" | "ready" | "failed"
@@ -209,12 +216,14 @@ Answer(c) ==
 
 \* A remembered answer is written to its session's grant in a later step, not
 \* with the answer, so a refresh can land in between. The write keeps the epoch
-\* the answer was given under. The store bug writes the epoch current at the
-\* write instead.
+\* the answer was given under, unless the grant already holds a newer epoch. The
+\* store bug writes the epoch current at the write instead. The record_older_epoch
+\* bug writes the answer's epoch even over a newer grant.
 Record(c) ==
     /\ pending[c]
     /\ LET e == IF Mutation = "store_stamps_current" THEN epoch ELSE answered[c]
-       IN  /\ grant' = [grant EXCEPT ![SessOf(c)] = e]
+           s == SessOf(c)
+       IN  /\ grant' = [grant EXCEPT ![s] = IF Mutation = "record_older_epoch" THEN e ELSE Newer(grant[s], e)]
            /\ sharedEpoch' = e
     /\ pending' = [pending EXCEPT ![c] = FALSE]
     /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, pc, auth, authEpoch, answered, asked, cgen, runEpoch>>
@@ -452,10 +461,16 @@ ApprovalMatchesAnswer ==
             => runEpoch[c] = asked[c]
 
 \* A remembered answer is written to its grant with the epoch the answer was
-\* given under. (An action property: it is checked on every step.)
+\* given under, or the newer epoch the grant already holds. (An action property:
+\* it is checked on every step.)
 StoredGrantMatchesAnswer ==
     [][\A c \in Cmds :
-          (pending[c] /\ ~pending'[c]) => grant'[SessOf(c)] = answered[c]]_vars
+          (pending[c] /\ ~pending'[c]) => grant'[SessOf(c)] = Newer(grant[SessOf(c)], answered[c])]_vars
+
+\* A remembered grant never moves back to an older epoch, so a late record cannot
+\* revive an approval that a refresh retired. (An action property.)
+GrantNeverMovesBack ==
+    [][\A s \in Sessions : grant[s] # NoGrant => grant'[s] >= grant[s]]_vars
 
 \* The fallback notice appears at most once per failure episode.
 NoticeOncePerEpisode == notices <= failEpisodes
