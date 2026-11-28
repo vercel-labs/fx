@@ -16,7 +16,7 @@
 // Needs tmux, Java with tla2tools.jar, and a built fx (FX_BIN or zig-out/bin/fx).
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseValue } from "../graph.mjs";
@@ -28,7 +28,7 @@ const CLOSE_RECORDED_MARK = "fx-close-recorded";
 const FULL_TRANSCRIPT_FOOTER = "esc close · pgup/pgdn scroll";
 const SIGNALS = ["INT", "TERM", "HUP"] as const;
 const SIGNUM: Record<string, number> = { INT: 2, TERM: 15, HUP: 1 };
-const PHASES = ["idle", "turn", "alt", "turnalt"] as const;
+const PHASES = ["idle", "turn", "alt", "turnalt", "shut_idle", "shut_turn", "err_shut"] as const;
 const PHASE_PROMPT = (sig: string, phase: string) => `Close ${sig} during ${phase}.`;
 
 type Model = Record<string, any>;
@@ -36,14 +36,22 @@ type Edge = { from: string; to: string; label: string };
 type Phase = (typeof PHASES)[number];
 type Observed = { tty: "cooked" | "raw"; screen: "normal" | "alt"; rec: "clean" | "none"; endCause: "signal" | "other"; status: number | null };
 
-// The model's run states that a real run can be put into: the closer is up and
-// nothing is closing, the loop is not blocked, and the phase is one of PHASES.
+// The model states that a real run can be put into: either the steady event
+// loop (run + ready) or the shutdown window held before disableRawMode
+// (shut/errshut + release_modes), with the closer thread running and idle.
 function runPhase(s: Model): Phase | null {
-  if (s.phase !== "run" || s.closing || s.closeRuns !== 0 || !s.closerUp || s.loopBlocked || s.setup !== "ready") return null;
-  const turn = s.req === "running";
-  const alt = s.screen === "alt";
-  if (turn) return alt ? "turnalt" : "turn";
-  return alt ? "alt" : "idle";
+  if (s.closing || s.closeRuns !== 0 || !s.closerUp) return null;
+  if (s.phase === "run") {
+    if (s.loopBlocked || s.setup !== "ready") return null;
+    const turn = s.req === "running";
+    const alt = s.screen === "alt";
+    if (turn) return alt ? "turnalt" : "turn";
+    return alt ? "alt" : "idle";
+  }
+  if (s.stage !== "release_modes") return null;
+  if (s.phase === "shut") return s.req === "running" ? "shut_turn" : "shut_idle";
+  if (s.phase === "errshut" && s.req === "none") return "err_shut";
+  return null;
 }
 
 async function loadGraph(dir: string) {
@@ -77,23 +85,52 @@ async function loadGraph(dir: string) {
   return { states, next, prev, inits };
 }
 
-// One close chain of the model: a close edge from a run state, its closing
-// state when the closer has two steps, and the ended state it reaches.
+// One close chain of the model: a close edge from a run or shutdown-window
+// state, its closing state when the closer has two steps, and the ended state it
+// reaches; plus the graceful completion path when SIGINT is ignored during /exit.
 type Chain = { run: string; closing: string | null; ended: string; sig: string; phase: Phase | null };
+
+function shutdownCompletionEnds(graph: Awaited<ReturnType<typeof loadGraph>>, start: string): string[] {
+  const ends: string[] = [];
+  const seen = new Set<string>([start]);
+  const queue = [start];
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    const s = graph.states.get(id)!;
+    if (s.phase === "ended" && s.endCause === "user") {
+      ends.push(id);
+      continue;
+    }
+    for (const edge of graph.next.get(id) ?? []) {
+      if (!["DisableRaw", "Persist", "UninstallAfterPersist", "Finish"].includes(edge.label)) continue;
+      if (!seen.has(edge.to)) {
+        seen.add(edge.to);
+        queue.push(edge.to);
+      }
+    }
+  }
+  return ends;
+}
 
 function closeChains(graph: Awaited<ReturnType<typeof loadGraph>>): Chain[] {
   const chains: Chain[] = [];
   const state = (id: string) => graph.states.get(id)!;
   for (const [from, edges] of graph.next) {
+    const phase = runPhase(state(from));
     for (const edge of edges) {
       if (edge.label === "CloseNow") {
-        chains.push({ run: from, closing: null, ended: edge.to, sig: state(edge.to).closeSig, phase: runPhase(state(from)) });
+        chains.push({ run: from, closing: null, ended: edge.to, sig: state(edge.to).closeSig, phase });
       }
       if (edge.label === "CloseStart") {
         for (const finish of graph.next.get(edge.to) ?? []) {
           if (finish.label !== "CloseFinish") continue;
-          chains.push({ run: from, closing: edge.to, ended: finish.to, sig: state(edge.to).closeSig, phase: runPhase(state(from)) });
+          chains.push({ run: from, closing: edge.to, ended: finish.to, sig: state(edge.to).closeSig, phase });
         }
+      }
+    }
+    if ((phase === "shut_idle" || phase === "shut_turn") && state(from).intDisp === "ign") {
+      for (const ended of shutdownCompletionEnds(graph, from)) {
+        chains.push({ run: from, closing: null, ended, sig: "INT", phase });
       }
     }
   }
@@ -116,6 +153,28 @@ function within<T>(event: Promise<T>, label: string): Promise<T> {
     AbortSignal.timeout(TIMEOUT).addEventListener("abort", () => reject(new Error(`timed out waiting for ${label}`)));
   });
   return Promise.race([event, expired]);
+}
+
+function waitForFile(path: string): Promise<void> {
+  if (existsSync(path)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const dir = join(path, "..");
+    const signal = AbortSignal.timeout(TIMEOUT);
+    const watcher = watch(dir, () => {
+      if (existsSync(path)) {
+        watcher.close();
+        resolve();
+      }
+    });
+    signal.addEventListener("abort", () => {
+      watcher.close();
+      reject(new Error(`timed out waiting for ${path} (exists=${existsSync(path)})`));
+    });
+    if (existsSync(path)) {
+      watcher.close();
+      resolve();
+    }
+  });
 }
 
 // The last clean-close flag saved in any session of `home`. A record that a
@@ -157,7 +216,13 @@ async function realRun(helpers: any, saved: any, sig: string, phase: Phase): Pro
   const stderrPath = join(root, "stderr.log");
   const ttyAfter = join(root, "tty-after.txt");
   const statusPath = join(root, "status.txt");
+  const heldPath = join(root, "shutdown.held");
+  const releasePath = join(root, "shutdown.release");
   const wrapper = join(root, "wrapper.sh");
+  const isShutPhase = phase === "shut_idle" || phase === "shut_turn" || phase === "err_shut";
+  if (phase === "err_shut") {
+    writeFileSync(join(home, ".fx", "recordings"), "not-a-directory");
+  }
   writeFileSync(stderrPath, "");
   writeFileSync(
     wrapper,
@@ -186,6 +251,13 @@ async function realRun(helpers: any, saved: any, sig: string, phase: Phase): Pro
       FX_MODEL: helpers.FAKE_GATEWAY_MODEL,
       FX_AUTO_UPGRADE: "0",
       NO_COLOR: "1",
+      ...(isShutPhase
+        ? {
+            FX_TEST_SHUTDOWN_RELEASE_HELD: heldPath,
+            FX_TEST_SHUTDOWN_RELEASE_RELEASE: releasePath,
+          }
+        : {}),
+      ...(phase === "err_shut" ? { FX_DEBUG_RECORD: "1" } : {}),
     },
     stderrPath,
     width: 100,
@@ -193,8 +265,10 @@ async function realRun(helpers: any, saved: any, sig: string, phase: Phase): Pro
     remainOnExit: true,
   });
   try {
-    await session.waitForComposer(TIMEOUT);
-    if (phase === "turn" || phase === "turnalt") {
+    if (phase !== "err_shut") {
+      await session.waitForComposer(TIMEOUT);
+    }
+    if (phase === "turn" || phase === "turnalt" || phase === "shut_turn") {
       await session.sendText(prompt);
       await within(held, "the held request");
     }
@@ -202,11 +276,23 @@ async function realRun(helpers: any, saved: any, sig: string, phase: Phase): Pro
       await session.sendKeys("C-o");
       await session.waitForText(FULL_TRANSCRIPT_FOOTER, TIMEOUT);
     }
+    if (phase === "shut_idle" || phase === "shut_turn") {
+      await session.sendText("/exit");
+    }
+    if (isShutPhase) {
+      await waitForFile(heldPath);
+    }
     const wrapperPid = session.processPid();
     const children = execFileSync("pgrep", ["-P", String(wrapperPid)], { encoding: "utf8" }).trim().split("\n");
     if (children.length !== 1) throw new Error(`expected one child of wrapper ${wrapperPid}, saw ${children.length}`);
     process.kill(Number(children[0]), `SIG${sig}` as NodeJS.Signals);
-    await session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
+    if ((phase === "shut_idle" || phase === "shut_turn") && sig === "INT") {
+      writeFileSync(releasePath, "go");
+    }
+    await Promise.race([
+      waitForFile(statusPath),
+      session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT).then(() => waitForFile(statusPath)),
+    ]);
     const ttyText = readFileSync(ttyAfter, "utf8");
     const tty = enabledTtyFlags(ttyText).length === 3 ? "cooked" : "raw";
     const screen = alternateScreenOn(session) ? "alt" : "normal";
@@ -246,25 +332,34 @@ test.skipIf(!isTmux())("every reachable close of design-a is run or listed, and 
     if (!endedChains.has(chain.ended)) endedChains.set(chain.ended, []);
     endedChains.get(chain.ended)!.push(chain);
   }
-  const shutReason = "the normal shutdown: it lasts a few milliseconds after the terminal is released, and no hook holds it, so no signal can be timed into it from outside";
+  const shutStageReason = (s: Model): string => {
+    if (!s.closerUp) return "the closer thread did not start, so the in-handler fallback runs; that needs thread creation to fail, which a signal cannot cause";
+    if (s.stage === "release") return "leaveAlternateScreens runs before the FX_TEST_SHUTDOWN_RELEASE_* hold; no external signal can pause inside it";
+    if (s.stage === "persist") return "persistence finalization after disableRawMode runs too fast to time a signal without a separate hold";
+    if (s.stage === "release_uninst" || s.stage === "done") return "the tail of shutdown after persistence has no hold hook";
+    return "unclassified shutdown state";
+  };
   const classify = (id: string): Verdict => {
     const s = state(id);
     if (s.phase === "ended") {
       const runs = (endedChains.get(id) ?? []).filter((chain) => chain.phase && SIGNALS.includes(chain.sig as any));
       if (runs.length > 0) return { kind: "run", key: `${runs[0]!.sig} ${runs[0]!.phase}` };
-      if (s.endCause === "user") return { kind: "listed", reason: "a normal exit with /exit, not a signal close; this driver sends no /exit" };
-      if (s.endCause === "error") return { kind: "listed", reason: "the run failed; a model error cannot be caused from outside" };
+      if (s.endCause === "error") return { kind: "listed", reason: "error shutdown completed without a signal; this driver sends a signal at the hold" };
       const from = endedChains.get(id)?.[0]?.run;
       if (from) {
         const source = classify(from);
         if (source.kind === "listed") return source;
       }
-      return { kind: "listed", reason: "a signal after the terminal is released: the handlers are removed and the default action ends fx; only the shutdown window reaches it" };
+      if (s.endCause === "user") return { kind: "listed", reason: "normal /exit without closerUp or from an unheld stage" };
+      return { kind: "listed", reason: "a signal after handlers were removed at the end of shutdown: tty is already cooked and request settled" };
     }
     if (s.closing) return { kind: "listed", reason: "the closer has taken its first step and has not finished; the end is the only state the driver sees" };
     if (s.phase === "setup") return { kind: "listed", reason: "startup before the first frame: the handlers and raw mode are not both in place, and no signal can be timed there" };
-    if (s.phase === "shut") return { kind: "listed", reason: shutReason };
-    if (s.phase === "errshut") return { kind: "listed", reason: "the error shutdown: a run error cannot be forced from outside" };
+    if (s.phase === "shut" || s.phase === "errshut") {
+      const shutKey = runPhase(s);
+      if (shutKey) return { kind: "run", key: shutKey };
+      return { kind: "listed", reason: shutStageReason(s) };
+    }
     const key = runPhase(s);
     if (key) return { kind: "run", key: `${key}` };
     const reason = reasonOfRun(s);
@@ -272,7 +367,7 @@ test.skipIf(!isTmux())("every reachable close of design-a is run or listed, and 
     return { kind: "listed", reason: "unclassified run state" };
   };
   for (const id of graph.states.keys()) verdicts.set(id, classify(id));
-  const unclassified = [...verdicts].filter(([, verdict]) => verdict.kind === "listed" && verdict.reason === "unclassified run state");
+  const unclassified = [...verdicts].filter(([, verdict]) => verdict.kind === "listed" && (verdict.reason === "unclassified run state" || verdict.reason === "unclassified shutdown state"));
   expect(unclassified.map(([id]) => id)).toEqual([]);
 
   // Each key a run covers must have model ends, and all model ends for one key
@@ -309,7 +404,8 @@ test.skipIf(!isTmux())("every reachable close of design-a is run or listed, and 
         continue;
       }
       const real = await realRun(helpers, saved, sig, phase);
-      const want = { tty: model.tty, screen: model.screen, rec: model.rec, endCause: model.endCause, status: 128 + SIGNUM[sig]! };
+      const wantStatus = model.endCause === "signal" ? 128 + SIGNUM[sig]! : 0;
+      const want = { tty: model.tty, screen: model.screen, rec: model.rec, endCause: model.endCause, status: wantStatus };
       const got = { tty: real.tty, screen: real.screen, rec: real.rec, endCause: real.endCause, status: real.status };
       runs[key] = { model: want, real: got, modelStates: model.states, tty: real.ttyText };
       if (JSON.stringify(want) !== JSON.stringify(got)) failures.push(`${key}: model ${JSON.stringify(want)}, fx ${JSON.stringify(got)}`);
