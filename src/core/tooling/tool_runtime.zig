@@ -1293,9 +1293,11 @@ fn bridgeRequestRefusal(
             const target = pathing.resolveWorkspaceOrExternalPath(arena, ctx.workspace_root, path) catch |err| {
                 return tool_admission.permissionTargetResolutionFailureMessage(arena, call, err);
             };
-            _ = std.Io.Dir.cwd().statFile(io_mod.getIo(), target, .{}) catch |err| {
+            const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), target, .{}) catch |err| {
                 return tool_admission.permissionTargetResolutionFailureMessage(arena, call, err);
             };
+            // A folder or a FIFO is not an image, and a FIFO would block the read, so view refuses it here.
+            if (stat.kind != .file) return try arena.print("{f} is not a regular file. view takes an image file; list a folder with ls or rg --files.", .{text_utils.terminalSafe(path)});
             return null;
         },
         else => return null,
@@ -1868,7 +1870,12 @@ fn runBridgeView(
     const rich = switch (result) {
         .rich => |value| value,
         .failure => |text| return .{ .status = .tool_error, .bytes = try arena.dupe(u8, text) },
-        .success => return .{ .status = .tool_error, .bytes = view_not_image_text },
+        // read_file answers an image it cannot attach, over the byte or pixel limit, as success text.
+        // view gives that image its own reason and no read_file markup; anything else is not an image.
+        .success => return .{
+            .status = .tool_error,
+            .bytes = (try imageNotAttachedText(ctx, arena, path)) orelse view_not_image_text,
+        },
     };
     if (rich.images.len == 0) return .{ .status = .tool_error, .bytes = try arena.dupe(u8, rich.text) };
     const image = rich.images[0];
@@ -1885,6 +1892,39 @@ fn runBridgeView(
         .status = .ok,
         .bytes = try arena.print("viewed {f} ({s}, {d} bytes)", .{ text_utils.terminalSafe(path), image.mime_type, size }),
     };
+}
+
+/// The longest magic number the image module checks ends within this many bytes.
+const image_probe_bytes = 16;
+
+/// The reason view gives for an image that read_file would not attach: the MIME type, the
+/// size, and the one reason read_file's reason function gives. Null when the file is not an
+/// image, or when it can attach. The file is read at the path the read resolves, under the
+/// read's own open rule, and at most the read's byte limit. A file that cannot be read here
+/// gives null: read_file has already reported why, and view says it is not an image.
+fn imageNotAttachedText(ctx: Context, arena: Allocator, path: []const u8) Allocator.Error!?[]const u8 {
+    const target = pathing.resolveWorkspaceOrExternalPath(arena, ctx.workspace_root, path) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return null;
+    };
+    const zio = io_mod.getIo();
+    var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), target, .no_follow) catch return null;
+    defer file.close(zio);
+    const stat = file.stat(zio) catch return null;
+    var header: [image_probe_bytes]u8 = undefined;
+    const header_len = file.readPositional(zio, &.{&header}, 0) catch return null;
+    const mime_type = image_data.detectMediaTypeFromBytes(header[0..header_len]) orelse return null;
+    const read_len: usize = @intCast(@min(stat.size, read_file_impl.max_snapshot_file_bytes));
+    const bytes = try arena.alloc(u8, read_len);
+    const got = file.readPositionalAll(zio, bytes, 0) catch return null;
+    const incomplete = stat.size > read_file_impl.max_snapshot_file_bytes;
+    const reason = read_file_impl.imageNotAttachedReason(bytes[0..got], incomplete) orelse return null;
+    return try arena.print("{f}: image not attached ({s}, {d} bytes): {s}. Save a smaller copy with an image tool, then view the copy.", .{
+        text_utils.terminalSafe(path),
+        mime_type,
+        stat.size,
+        reason,
+    });
 }
 
 /// Runs a bridged `web` request as the direct web_fetch tool runs it: the same
@@ -3074,6 +3114,174 @@ test "a bridged view of a missing file answers Path not found before its permiss
     try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
     try std.testing.expect(std.mem.find(u8, outcome.bytes, "Path not found") != null);
     try std.testing.expectEqual(@as(usize, 0), images.images.items.items.len);
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+/// Runs one bridged `view` of `path` in `workspace` as the bash tool's call does, and
+/// returns its outcome. The bridge's images go to `images`; the outcome lives in `arena`.
+fn runBridgeViewOfPath(
+    alloc: Allocator,
+    arena: Allocator,
+    workspace: []const u8,
+    path: []const u8,
+    images: *BridgeImages,
+) !mcp_call_capability.CallOutcome {
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .yolo, .nested_tool_registry = test_builtin_tools.registry };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true, .images = images };
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-80", .{ .view = .{ .path = path } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    return runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-80", "read_file", "", allowed, &cancel);
+}
+
+test "a bridged view of a folder is refused before its read, with view's own text and the next step" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/folder");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var images = BridgeImages{ .images = .{ .alloc = alloc } };
+    defer images.deinit();
+
+    const outcome = try runBridgeViewOfPath(alloc, arena, workspace, "folder", &images);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+    try std.testing.expectEqualStrings("folder is not a regular file. view takes an image file; list a folder with ls or rg --files.", outcome.bytes);
+    try std.testing.expectEqual(@as(usize, 0), images.images.items.items.len);
+}
+
+test "a bridged view of a FIFO is refused before its read, and never blocks on it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const fifo_path = try alloc.printSentinel("{s}/pipe.fifo", .{workspace}, 0);
+    defer alloc.free(fifo_path);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(fifo_path.ptr, 0o600));
+    var images = BridgeImages{ .images = .{ .alloc = alloc } };
+    defer images.deinit();
+
+    const outcome = try runBridgeViewOfPath(alloc, arena, workspace, "pipe.fifo", &images);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+    try std.testing.expectEqualStrings("pipe.fifo is not a regular file. view takes an image file; list a folder with ls or rg --files.", outcome.bytes);
+    try std.testing.expectEqual(@as(usize, 0), images.images.items.items.len);
+}
+
+test "a bridged view of a symlink to an image still attaches the image" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const header = image_data.testPngHeader(16, 16);
+    try writeBridgeTestFile(tmp, "workspace/photo.png", &header);
+    try tmp.dir.symLink(io_mod.getIo(), "photo.png", "workspace/link.png", .{});
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var images = BridgeImages{ .images = .{ .alloc = alloc } };
+    defer images.deinit();
+
+    const outcome = try runBridgeViewOfPath(alloc, arena, workspace, "link.png", &images);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "viewed ") != null);
+    try std.testing.expectEqual(@as(usize, 1), images.images.items.items.len);
+}
+
+test "a bridged view of an image over the encoded cap gives read_file's own limit text" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    // A PNG header followed by zeros: about 4 MiB, over the 5 MiB encoded attach limit once base64 encoded.
+    const big = try alloc.alloc(u8, 4 * 1024 * 1024);
+    defer alloc.free(big);
+    const header = image_data.testPngHeader(100, 100);
+    @memcpy(big[0..header.len], &header);
+    @memset(big[header.len..], 0);
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "workspace/big.png", .data = big });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var images = BridgeImages{ .images = .{ .alloc = alloc } };
+    defer images.deinit();
+
+    const outcome = try runBridgeViewOfPath(alloc, arena, workspace, "big.png", &images);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+    try std.testing.expectEqualStrings(
+        "big.png: image not attached (image/png, 4194304 bytes): the image exceeds the 5 MiB encoded attach limit. Save a smaller copy with an image tool, then view the copy.",
+        outcome.bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 0), images.images.items.items.len);
+}
+
+test "a bridged view of an image over 8000 pixels per side gives read_file's own pixel text" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const header = image_data.testPngHeader(8001, 1);
+    try writeBridgeTestFile(tmp, "workspace/wide.png", &header);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var images = BridgeImages{ .images = .{ .alloc = alloc } };
+    defer images.deinit();
+
+    const outcome = try runBridgeViewOfPath(alloc, arena, workspace, "wide.png", &images);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+    try std.testing.expectEqualStrings(
+        "wide.png: image not attached (image/png, 24 bytes): the image exceeds 8000 pixels per side. Save a smaller copy with an image tool, then view the copy.",
+        outcome.bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 0), images.images.items.items.len);
+}
+
+test "a bridged view's over-limit error names the path terminal-safely, with no tool name or markup" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const header = image_data.testPngHeader(8001, 1);
+    try writeBridgeTestFile(tmp, "workspace/wi\x1bde.png", &header);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var images = BridgeImages{ .images = .{ .alloc = alloc } };
+    defer images.deinit();
+
+    const outcome = try runBridgeViewOfPath(alloc, arena, workspace, "wi\x1bde.png", &images);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "\x1b") == null);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "image not attached (image/png, 24 bytes)") != null);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "read_file") == null);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "<path>") == null);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "<content>") == null);
 }
 
 test "images taken from a bridged view stay valid after its BridgeImages is deinitialized" {
