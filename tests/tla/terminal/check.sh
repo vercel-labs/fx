@@ -13,6 +13,18 @@
 # (about 8,000 states, a few seconds). TerminalLifecycle-full.cfg has two
 # (about 486,000 states, a few minutes) and runs here, with the planted
 # mutants, which keep two terminals and are rejected with one as well.
+# ShellSnapshotCapture: what one capture keeps (`_` helpers, not completion
+# functions or fx's own names) and which startup-file edits make it stale,
+# ZDOTDIR moves included (src/core/terminal/shell_resolver.zig and
+# shell_snapshot.zig). A capture takes time, and an edit can land inside it.
+# Its runs are bounded, so its checks skip deadlock checking. old_filter is fx
+# before it kept `_` helpers; old_watch and old_restore are fx before the
+# ZDOTDIR change; old_stamp is fx before the capture-start rule for the moved
+# folder; old_failed is fx before the failed state compared like with like;
+# old_unbounded is fx before the bound on the captures one command starts;
+# zero_bound is a bound that never captures; full_witness is not a rule: it
+# shows a command does run with the full startup once the bound is reached;
+# tests/tla/drivers/terminal/capture.ts runs the built binary along it.
 #
 # Each design config must pass every invariant and liveness property with
 # deadlock checking on. Each <Model>-<mutation>.cfg enables one broken rule,
@@ -61,4 +73,17 @@ TerminalLifecycle TerminalLifecycle-end_at_return NoIndexBeforeStartReturns -dea
 TerminalLifecycle TerminalLifecycle-record_once NoHolderAfterCleanExit -deadlock
 TerminalLifecycle TerminalLifecycle-launcher_wait NoHolderAfterCleanExit -deadlock
 TerminalLifecycle TerminalLifecycle-early_reap NoHolderAfterCleanExit -deadlock
+ShellSnapshotCapture ShellSnapshotCapture - -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-old_filter HelpersCallable -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-old_watch FreshAfterEdit -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-old_restore ZdotdirAsLogin -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-old_stamp CurrentIsFresh -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-old_failed FailedChangeIsReal -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-keep_completion CompletionStaysOut -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-keep_private FxPrivateOut -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-no_restore ZdotdirAsLogin -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-restore_exported ZdotdirAsLogin -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-old_unbounded CapturesBounded -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-zero_bound FullOnlyAfterRecapture -deadlock
+ShellSnapshotCapture ShellSnapshotCapture-full_witness NoFullRun -deadlock
 EOF
