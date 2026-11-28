@@ -17,6 +17,7 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const command_lex = @import("../shell_command/command_lex.zig");
 
 const testing = std.testing;
 const test_server = @import("vercel/test_server.zig");
@@ -145,6 +146,16 @@ pub fn callFor(
         .responder = responder,
         .cancel = cancel,
     };
+}
+
+/// The running fx as one shell word for the fix commands that refusal texts
+/// and the `/sandbox setup` prompt give the agent: in single quotes when a
+/// shell would split or expand the path, with terminal control bytes made
+/// visible, and `fx` when the path is empty. The caller owns the result.
+pub fn fxCommandWord(alloc: std.mem.Allocator, fx_bin: []const u8) std.mem.Allocator.Error![]u8 {
+    const word = try command_lex.quoteWord(alloc, if (fx_bin.len > 0) fx_bin else "fx");
+    defer alloc.free(word);
+    return alloc.print("{f}", .{text_utils.terminalSafe(word)});
 }
 
 pub fn runningBinaryPath(arena: std.mem.Allocator) []const u8 {
@@ -697,7 +708,7 @@ fn copySchema(arena: std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
 }
 
 fn refusalText(arena: std.mem.Allocator, fx_bin: []const u8, refusal: setup.Refusal) std.mem.Allocator.Error![]const u8 {
-    const bin = text_utils.terminalSafe(if (fx_bin.len > 0) fx_bin else "fx");
+    const bin = try fxCommandWord(arena, fx_bin);
     return switch (refusal) {
         .no_login => e5_text,
         .login_expired => e6_text,
@@ -710,7 +721,7 @@ fn refusalText(arena: std.mem.Allocator, fx_bin: []const u8, refusal: setup.Refu
         .workspace_unresolved => |text| text,
         .no_team => |missing| noTeamText(arena, fx_bin, missing),
         .project_not_found => |missing| arena.print(
-            "fx did not run this command: Vercel project `{f}` (from `{s}`) was not found on team `{f}`. Ask the person for a project name and run `{f} config set {s} <name>`.",
+            "fx did not run this command: Vercel project `{f}` (from `{s}`) was not found on team `{f}`. Ask the person for a project name and run `{s} config set {s} <name>`.",
             .{ text_utils.terminalSafe(missing.name), project_setting_key, text_utils.terminalSafe(missing.team.slug), bin, project_setting_key },
         ),
         .project_create_failed => |failure| projectCreateFailedText(arena, fx_bin, failure),
@@ -719,7 +730,7 @@ fn refusalText(arena: std.mem.Allocator, fx_bin: []const u8, refusal: setup.Refu
 }
 
 fn noTeamText(arena: std.mem.Allocator, fx_bin: []const u8, missing: setup.TeamMissing) std.mem.Allocator.Error![]const u8 {
-    const bin = text_utils.terminalSafe(if (fx_bin.len > 0) fx_bin else "fx");
+    const bin = try fxCommandWord(arena, fx_bin);
     var slugs: std.Io.Writer.Allocating = .init(arena);
     const limit = @min(missing.available.len, vercel.max_team_hints);
     for (missing.available[0..limit], 0..) |team, index| {
@@ -729,36 +740,36 @@ fn noTeamText(arena: std.mem.Allocator, fx_bin: []const u8, missing: setup.TeamM
     if (missing.setting_slug) |slug| {
         if (limit > 0) {
             return arena.print(
-                "fx did not run this command: Vercel team `{f}` (from `{s}`) was not found. Available teams: {s}. Ask the person which one to use and run `{f} config set {s} <slug>`.",
+                "fx did not run this command: Vercel team `{f}` (from `{s}`) was not found. Available teams: {s}. Ask the person which one to use and run `{s} config set {s} <slug>`.",
                 .{ text_utils.terminalSafe(slug), team_setting_key, slugs.written(), bin, team_setting_key },
             );
         }
         return arena.print(
-            "fx did not run this command: Vercel team `{f}` (from `{s}`) was not found, and no teams were listed for this login. Ask the person which team slug to use and run `{f} config set {s} <slug>`.",
+            "fx did not run this command: Vercel team `{f}` (from `{s}`) was not found, and no teams were listed for this login. Ask the person which team slug to use and run `{s} config set {s} <slug>`.",
             .{ text_utils.terminalSafe(slug), team_setting_key, bin, team_setting_key },
         );
     }
     if (limit > 0) {
         return arena.print(
-            "fx did not run this command: no Vercel team is selected. Available teams: {s}. Ask the person which one to use and run `{f} config set {s} <slug>`.",
+            "fx did not run this command: no Vercel team is selected. Available teams: {s}. Ask the person which one to use and run `{s} config set {s} <slug>`.",
             .{ slugs.written(), bin, team_setting_key },
         );
     }
     return arena.print(
-        "fx did not run this command: no Vercel team was found for this login. Ask the person which team slug to use and run `{f} config set {s} <slug>`.",
+        "fx did not run this command: no Vercel team was found for this login. Ask the person which team slug to use and run `{s} config set {s} <slug>`.",
         .{ bin, team_setting_key },
     );
 }
 
 fn projectCreateFailedText(arena: std.mem.Allocator, fx_bin: []const u8, failure: vercel.Failure) std.mem.Allocator.Error![]const u8 {
-    const bin = text_utils.terminalSafe(if (fx_bin.len > 0) fx_bin else "fx");
+    const bin = try fxCommandWord(arena, fx_bin);
     var buffer: [256]u8 = undefined;
     const detail: []const u8 = switch (failure.reason) {
         .status => |code| std.mem.print(&buffer, "HTTP {d}", .{code}) catch "HTTP error",
         else => vercel.describe(&buffer, failure),
     };
     return arena.print(
-        "fx did not run this command: could not create project `{s}` ({s}). Ask the person for a project name and run `{f} config set {s} <name>`.",
+        "fx did not run this command: could not create project `{s}` ({s}). Ask the person for a project name and run `{s} config set {s} <name>`.",
         .{ vercel.sandbox_project_name, detail, bin, project_setting_key },
     );
 }
@@ -1488,4 +1499,20 @@ test "refusal text builders use the provided fx binary path and runningBinaryPat
 
     const create_msg = try projectCreateFailedText(a, custom, .{ .step = "create project", .reason = .{ .status = 403 } });
     try testing.expect(std.mem.find(u8, create_msg, "/opt/custom/bin/fx config set " ++ project_setting_key ++ " <name>") != null);
+}
+
+test "the fx command word quotes a path a shell would split, and keeps a plain path bare" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("/opt/custom/bin/fx", try fxCommandWord(a, "/opt/custom/bin/fx"));
+    try testing.expectEqualStrings("'/Users/example/My Tools/fx'", try fxCommandWord(a, "/Users/example/My Tools/fx"));
+    try testing.expectEqualStrings("fx", try fxCommandWord(a, ""));
+
+    const proj_msg = try refusalText(a, "/Users/example/My Tools/fx", .{ .project_not_found = .{
+        .team = .{ .id = "team_1", .slug = "acme", .name = "Acme" },
+        .name = "web",
+    } });
+    try testing.expect(std.mem.find(u8, proj_msg, "`'/Users/example/My Tools/fx' config set " ++ project_setting_key ++ " <name>`") != null);
 }

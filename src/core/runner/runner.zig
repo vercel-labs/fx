@@ -26,7 +26,8 @@ pub const SetupPromptContext = struct {
 /// Builds the `/sandbox setup` prompt as the user's turn from the current settings,
 /// the last saved destination, and the running fx binary path. Pure (no I/O).
 pub fn setupPrompt(alloc: std.mem.Allocator, ctx: SetupPromptContext) std.mem.Allocator.Error![]u8 {
-    const bin = text_utils.terminalSafe(if (ctx.fx_bin.len > 0) ctx.fx_bin else "fx");
+    const bin = try setup_host.fxCommandWord(alloc, ctx.fx_bin);
+    defer alloc.free(bin);
     const team_value = text_utils.terminalSafe(ctx.sandbox_team orelse "not set");
     const project_value = text_utils.terminalSafe(ctx.sandbox_project orelse "not set");
     var last_buf: [512]u8 = undefined;
@@ -48,7 +49,7 @@ pub fn setupPrompt(alloc: std.mem.Allocator, ctx: SetupPromptContext) std.mem.Al
         \\1. Show my current choice from the facts above.
         \\2. If the Vercel CLI is installed, list my choices: `vercel teams ls`, then `vercel project ls --scope <team>`.
         \\3. Ask me with the ask tool which team and project to use, with keeping the current choice as one option.
-        \\4. Save my answer with `{f} config set {s} <slug>` and `{f} config set {s} <name>`, or go back to the defaults with `{f} config unset {s}` and `{f} config unset {s}`.
+        \\4. Save my answer with `{s} config set {s} <slug>` and `{s} config set {s} <name>`, or go back to the defaults with `{s} config unset {s}` and `{s} config unset {s}`.
         \\fx asks me again before it first copies a repository to a team or project I have not used.
     ,
         .{
@@ -151,4 +152,12 @@ test "setupPrompt includes fx path, settings, last destination, and no-guess rul
     try std.testing.expect(std.mem.find(u8, configured, "sandbox_team: acme") != null);
     try std.testing.expect(std.mem.find(u8, configured, "sandbox_project: my-proj") != null);
     try std.testing.expect(std.mem.find(u8, configured, "Last destination used: old-team / fx-sandbox") != null);
+}
+
+test "setupPrompt quotes an fx path that a shell would split" {
+    const alloc = std.testing.allocator;
+    const prompt = try setupPrompt(alloc, .{ .fx_bin = "/Users/example/My Tools/fx" });
+    defer alloc.free(prompt);
+    try std.testing.expect(std.mem.find(u8, prompt, "`'/Users/example/My Tools/fx' config set sandbox_team <slug>`") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "`'/Users/example/My Tools/fx' config unset sandbox_project`") != null);
 }
