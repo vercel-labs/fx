@@ -1191,7 +1191,7 @@ describe("mod preview, update confirmation, and live TUI refresh", () => {
       writeFile(folder, "bin/auth-v1", "#!/bin/sh\necho tok-1-tampered\n", true);
       const tampered = await fxMod(f, ["update", "glm"]);
       expect(tampered.code).toBe(1);
-      expect(tampered.stderr).toContain("This update changes the files of a mod that runs a sign-in command.");
+      expect(tampered.stderr).toContain("This update changes the files of a mod that runs a program.");
       expect(tampered.stderr).toContain("--yes");
       expect((await listJson(f)).mods[0]).toMatchObject({ version: "1.0.0" });
 
@@ -1200,7 +1200,7 @@ describe("mod preview, update confirmation, and live TUI refresh", () => {
       const refused = await fxMod(f, ["update", "glm"]);
       expect(refused.code).toBe(1);
       expect(refused.stderr).toContain("This update adds or changes a sign-in command.");
-      expect(refused.stderr).toContain("This update changes the files of a mod that runs a sign-in command.");
+      expect(refused.stderr).toContain("This update changes the files of a mod that runs a program.");
       expect(refused.stderr).toContain("--yes");
       expect((await listJson(f)).mods[0]).toMatchObject({ version: "1.0.0" });
 
@@ -1497,4 +1497,129 @@ describe("mod MCP servers", () => {
       f.close();
     }
   }, 90000);
+});
+
+describe("mod MCP servers in the install screen and update question", () => {
+  test("the install screen and fx mod show --json list each server's transport, program, URL, variables, and headers", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    try {
+      const folder = makeModFolder(
+        f,
+        "fs-pack",
+        {
+          name: "fs-pack",
+          version: "1.0.0",
+          description: "Files and remote tools",
+          mcp: {
+            fs: { command: ["bin/fs-server", "--stdio"], env: { LOG_LEVEL: "${FS_LOG:-warn}" } },
+            remote: {
+              type: "http",
+              url: "https://mcp.example.com/mcp",
+              headers: { "X-Team": "static" },
+              header_env: { "X-Route": "ROUTE_ENV" },
+              bearer_token_env: "MCP_TOKEN",
+            },
+          },
+        },
+        { "bin/fs-server": "#!/bin/sh\necho ok\n" },
+        ["bin/fs-server"],
+      );
+
+      const preview = await fxMod(f, ["add", folder]);
+      expect(preview.code).toBe(1);
+      expect(preview.stderr).toContain("  mcp          2\n");
+      // LOG_LEVEL is set by the mod; fx reads only FS_LOG from your environment.
+      expect(preview.stderr).toContain("    fs  stdio  bin/fs-server --stdio\n      uses $FS_LOG\n");
+      expect(preview.stderr).toContain(
+        "    remote  http  https://mcp.example.com/mcp\n      uses $ROUTE_ENV, $MCP_TOKEN\n      header X-Team\n      header X-Route from $ROUTE_ENV\n",
+      );
+      expect(preview.stderr).not.toContain("static");
+
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+      const shown = await fxMod(f, ["show", "fs-pack", "--json"]);
+      expect(shown.code, shown.stderr).toBe(0);
+      expect(JSON.parse(shown.stdout).mcp).toEqual([
+        {
+          name: "fs",
+          transport: "stdio",
+          command: "bin/fs-server",
+          args: ["--stdio"],
+          url: null,
+          variables: ["FS_LOG"],
+          headers: [],
+        },
+        {
+          name: "remote",
+          transport: "http",
+          command: null,
+          args: [],
+          url: "https://mcp.example.com/mcp",
+          variables: ["ROUTE_ENV", "MCP_TOKEN"],
+          headers: [
+            { name: "X-Team", env: null },
+            { name: "X-Route", env: "ROUTE_ENV" },
+          ],
+        },
+      ]);
+    } finally {
+      f.close();
+    }
+  }, 60000);
+
+  test("an update that changes a server's command is refused without a terminal, keeps the old version, and updates with --yes", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    try {
+      const folder = makeModFolder(
+        f,
+        "tools",
+        { name: "tools", version: "1.0.0", description: "Tool server", mcp: { tools: { command: ["bin/tools-v1"] } } },
+        { "bin/tools-v1": "#!/bin/sh\necho v1\n", "bin/tools-v2": "#!/bin/sh\necho v2\n" },
+        ["bin/tools-v1", "bin/tools-v2"],
+      );
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+
+      writeFile(
+        folder,
+        "mod.json",
+        JSON.stringify({ name: "tools", version: "2.0.0", description: "Tool server", mcp: { tools: { command: ["bin/tools-v2"] } } }),
+      );
+      const refused = await fxMod(f, ["update", "tools"]);
+      expect(refused.code).toBe(1);
+      expect(refused.stderr).toContain("This update adds or changes an MCP server.\n");
+      expect(refused.stderr).toContain("This update changes the files of a mod that runs a program.\n");
+      expect(refused.stderr).toContain("--yes");
+      expect((await listJson(f)).mods[0]).toMatchObject({ version: "1.0.0" });
+
+      const forced = await fxMod(f, ["update", "tools", "--yes"]);
+      expect(forced.code, forced.stderr).toBe(0);
+      expect(forced.stdout).toContain("Updated tools from folder.");
+      expect((await listJson(f)).mods[0]).toMatchObject({ version: "2.0.0" });
+    } finally {
+      f.close();
+    }
+  }, 60000);
+
+  test("a changed byte in a stdio server's program is refused without a terminal, and the old version stays", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    try {
+      const folder = makeModFolder(
+        f,
+        "tools",
+        { name: "tools", version: "1.0.0", description: "Tool server", mcp: { tools: { command: ["bin/tools"] } } },
+        { "bin/tools": "#!/bin/sh\necho v1\n" },
+        ["bin/tools"],
+      );
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+
+      writeFile(folder, "bin/tools", "#!/bin/sh\necho tampered\n", true);
+      const tampered = await fxMod(f, ["update", "tools"]);
+      expect(tampered.code).toBe(1);
+      expect(tampered.stderr).toContain("This update changes the files of a mod that runs a program.\n");
+      expect(tampered.stderr).not.toContain("adds or changes an MCP server");
+      expect(tampered.stderr).toContain("--yes");
+      expect((await listJson(f)).mods[0]).toMatchObject({ version: "1.0.0" });
+    } finally {
+      f.close();
+    }
+  }, 60000);
 });

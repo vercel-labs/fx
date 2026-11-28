@@ -169,10 +169,16 @@ pub const PreparedUpdate = struct {
     new_commit: ?[]const u8 = null,
     files_changed: bool = true,
     old_providers: ?configured_provider.Registry = null,
+    /// The servers of the installed version and of the new one, parsed under the
+    /// folders they run from, so an update can tell what it adds or changes.
+    old_mcp: std.ArrayList(mcp_config.McpServerConfig) = .empty,
+    new_mcp: std.ArrayList(mcp_config.McpServerConfig) = .empty,
     install: PreparedInstall,
 
     pub fn discard(self: *PreparedUpdate, alloc: std.mem.Allocator) void {
         if (self.old_providers) |*reg| reg.deinit(alloc);
+        mcp_config.deinitConfigs(alloc, &self.old_mcp);
+        mcp_config.deinitConfigs(alloc, &self.new_mcp);
         self.install.discard(alloc);
         self.* = undefined;
     }
@@ -375,6 +381,14 @@ pub fn prepareUpdate(
             const owned = p.arena.allocator();
             const old_commit_copy = if (record.commit) |c| try owned.dupe(u8, c) else null;
             const old_state = readInstalledState(alloc, root_path, name, old_on, old_path_copy);
+            var old_mcp = old_state.mcp;
+            errdefer mcp_config.deinitConfigs(alloc, &old_mcp);
+            var new_mcp = (try parseServers(alloc, p.manifest.mcp, name, p.dir)) orelse {
+                mcp_config.deinitConfigs(alloc, &old_mcp);
+                p_mut.discard(alloc);
+                return .{ .refused = .{ .invalid = .bad_manifest } };
+            };
+            errdefer mcp_config.deinitConfigs(alloc, &new_mcp);
             const new_digest = store.treeDigest(alloc, io_mod.getIo(), p.dir);
             const files_changed = if (old_state.digest != null and new_digest != null)
                 !std.mem.eql(u8, &old_state.digest.?, &new_digest.?)
@@ -387,6 +401,8 @@ pub fn prepareUpdate(
                 .new_commit = p.commit,
                 .files_changed = files_changed,
                 .old_providers = old_state.providers,
+                .old_mcp = old_mcp,
+                .new_mcp = new_mcp,
                 .install = p,
             } };
         },
@@ -403,7 +419,24 @@ pub fn prepareUpdate(
 const InstalledState = struct {
     providers: ?configured_provider.Registry = null,
     digest: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
+    mcp: std.ArrayList(mcp_config.McpServerConfig) = .empty,
 };
+
+const ServerList = std.ArrayList(mcp_config.McpServerConfig);
+
+/// The servers of a mod's `mcp` map under `dir`. Null when the map is invalid,
+/// which `prepareFrom` already refuses for the same folder.
+fn parseServers(alloc: std.mem.Allocator, raw: ?std.json.Value, name: []const u8, dir: []const u8) !?ServerList {
+    const value = raw orelse return ServerList.empty;
+    return switch (try mcp_config.parse(alloc, value, .{ .name = name, .dir = dir })) {
+        .ok => |configs| configs,
+        .invalid => |bad| {
+            var failure = bad;
+            failure.deinit(alloc);
+            return null;
+        },
+    };
+}
 
 fn readInstalledState(
     alloc: std.mem.Allocator,
@@ -434,16 +467,21 @@ fn readInstalledState(
         .ok => |m| m,
         .missing, .bad => return .{ .digest = digest },
     };
-    const providers_val = decoded.providers orelse return .{ .digest = digest };
-    const canonical_link = std.Io.Dir.path.join(scratch, &.{ root_path, name }) catch return .{ .digest = digest };
+    // A server map that cannot be read leaves no old servers, so every new server asks again.
+    var state: InstalledState = .{
+        .digest = digest,
+        .mcp = (parseServers(alloc, decoded.mcp, name, read_dir) catch null) orelse ServerList.empty,
+    };
+    const providers_val = decoded.providers orelse return state;
+    const canonical_link = std.Io.Dir.path.join(scratch, &.{ root_path, name }) catch return state;
     var at: configured_provider.FailurePath = .{};
-    const reg = configured_provider.Registry.parse_located_for_mod(
+    state.providers = configured_provider.Registry.parse_located_for_mod(
         alloc,
         providers_val,
         &at,
         .{ .name = name, .dir = canonical_link },
     ) catch null;
-    return .{ .providers = reg, .digest = digest };
+    return state;
 }
 
 /// Commits a prepared update into the store under its lock.

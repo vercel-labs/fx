@@ -889,10 +889,29 @@ pub const ModProfileView = struct {
     permission_mode_ignored: bool = false,
 };
 
+pub const ModMcpHeader = struct {
+    name: []const u8,
+    /// The environment variable the header's value comes from, or null for a fixed value.
+    env: ?[]const u8 = null,
+};
+
+pub const ModMcpView = struct {
+    name: []const u8,
+    transport: []const u8,
+    /// A stdio server's program as the mod wrote it, relative to the mod folder.
+    command: ?[]const u8 = null,
+    args: []const []const u8 = &.{},
+    url: ?[]const u8 = null,
+    /// Each environment variable the server reads, once.
+    variables: []const []const u8 = &.{},
+    headers: []const ModMcpHeader = &.{},
+};
+
 pub const ModAssetsView = struct {
     skills: []const []const u8 = &.{},
     profiles: []const ModProfileView = &.{},
     themes: []const []const u8 = &.{},
+    mcp: []const ModMcpView = &.{},
 };
 
 pub const max_mod_preview_assets: usize = 32;
@@ -1222,6 +1241,44 @@ fn writeModAssetsText(w: *std.Io.Writer, arena: Allocator, assets: ModAssetsView
         if (assets.profiles.len > shown) try w.print("    and {d} more\n", .{assets.profiles.len - shown});
     }
     try writeModAssetNameList(w, arena, "  themes       ", assets.themes);
+    try writeModMcpText(w, arena, assets.mcp);
+}
+
+fn writeModMcpText(w: *std.Io.Writer, arena: Allocator, servers: []const ModMcpView) !void {
+    if (servers.len == 0) return;
+    try w.print("  mcp          {d}\n", .{servers.len});
+    const shown = @min(servers.len, max_mod_preview_assets);
+    for (servers[0..shown]) |server| {
+        try w.print("    {s}  {s}  ", .{
+            (try text_utils.encodeTerminalSafeInline(arena, server.name, 128)).bytes,
+            server.transport,
+        });
+        if (server.command) |command| {
+            try w.print("{s}", .{(try text_utils.encodeTerminalSafeInline(arena, command, 1024)).bytes});
+            for (server.args) |arg| try w.print(" {s}", .{(try text_utils.encodeTerminalSafeInline(arena, arg, 1024)).bytes});
+        } else if (server.url) |url| {
+            try w.print("{s}", .{(try text_utils.encodeTerminalSafeInline(arena, url, 1024)).bytes});
+        }
+        try w.writeByte('\n');
+        if (server.variables.len > 0) {
+            try w.writeAll("      uses ");
+            const names = @min(server.variables.len, max_mod_preview_assets);
+            for (server.variables[0..names], 0..) |name, index| {
+                if (index > 0) try w.writeAll(", ");
+                try w.print("${s}", .{(try text_utils.encodeTerminalSafeInline(arena, name, 128)).bytes});
+            }
+            if (server.variables.len > names) try w.print(", and {d} more", .{server.variables.len - names});
+            try w.writeByte('\n');
+        }
+        const headers = @min(server.headers.len, max_mod_preview_assets);
+        for (server.headers[0..headers]) |header| {
+            try w.print("      header {s}", .{(try text_utils.encodeTerminalSafeInline(arena, header.name, 128)).bytes});
+            if (header.env) |env| try w.print(" from ${s}", .{(try text_utils.encodeTerminalSafeInline(arena, env, 128)).bytes});
+            try w.writeByte('\n');
+        }
+        if (server.headers.len > headers) try w.print("      and {d} more headers\n", .{server.headers.len - headers});
+    }
+    if (servers.len > shown) try w.print("    and {d} more\n", .{servers.len - shown});
 }
 
 fn writeModAssetNameList(w: *std.Io.Writer, arena: Allocator, label: []const u8, items: []const []const u8) !void {
@@ -1250,6 +1307,40 @@ fn writeModAssetsJson(jw: *std.json.Stringify, assets: ModAssetsView) !void {
     try jw.endArray();
     try jw.objectField("themes");
     try jw.write(assets.themes);
+    try writeModMcpJson(jw, assets.mcp);
+}
+
+fn writeModMcpJson(jw: *std.json.Stringify, servers: []const ModMcpView) !void {
+    try jw.objectField("mcp");
+    try jw.beginArray();
+    for (servers) |server| {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(server.name);
+        try jw.objectField("transport");
+        try jw.write(server.transport);
+        try jw.objectField("command");
+        try jw.write(server.command);
+        try jw.objectField("args");
+        try jw.write(server.args);
+        try jw.objectField("url");
+        try jw.write(server.url);
+        try jw.objectField("variables");
+        try jw.write(server.variables);
+        try jw.objectField("headers");
+        try jw.beginArray();
+        for (server.headers) |header| {
+            try jw.beginObject();
+            try jw.objectField("name");
+            try jw.write(header.name);
+            try jw.objectField("env");
+            try jw.write(header.env);
+            try jw.endObject();
+        }
+        try jw.endArray();
+        try jw.endObject();
+    }
+    try jw.endArray();
 }
 
 pub const StatusSnapshot = struct {
@@ -5340,4 +5431,42 @@ test "ModListSnapshot, ModShowSnapshot, and ModInstallPreviewSnapshot render ter
     try std.testing.expect(std.mem.find(u8, bounded_preview, "and 2 more\n") != null);
     try std.testing.expect(std.mem.find(u8, bounded_preview, "helper  (fx ignores its permission_mode)\n") != null);
     try std.testing.expect(std.mem.find(u8, bounded_preview, "themes       1\n") != null);
+}
+
+test "ModAssetsView lists mod MCP servers after the other assets, in text and json" {
+    const alloc = std.testing.allocator;
+    const no_servers_text = try (ModInstallPreviewSnapshot{ .name = "glm", .version = "1.0.0", .source = "/tmp/glm" }).renderText(alloc);
+    defer alloc.free(no_servers_text);
+    try std.testing.expect(std.mem.find(u8, no_servers_text, "mcp") == null);
+
+    const args = [_][]const u8{"--stdio"};
+    const variables = [_][]const u8{"GLM_TOKEN"};
+    const headers = [_]ModMcpHeader{ .{ .name = "X-Static" }, .{ .name = "X-Team", .env = "GLM_TEAM" } };
+    const servers = [_]ModMcpView{
+        .{ .name = "glm-tools", .transport = "stdio", .command = "bin/glm\x1b[31m", .args = &args, .variables = &variables },
+        .{ .name = "remote", .transport = "http", .url = "https://mcp.example.com/mcp", .headers = &headers },
+    };
+    const preview = try (ModInstallPreviewSnapshot{
+        .name = "glm",
+        .version = "1.0.0",
+        .source = "/tmp/glm",
+        .assets = .{ .skills = &.{"review"}, .mcp = &servers },
+    }).renderText(alloc);
+    defer alloc.free(preview);
+    try std.testing.expect(std.mem.findScalar(u8, preview, '\x1b') == null);
+    try std.testing.expect(std.mem.find(u8, preview, "  mcp          2\n") != null);
+    try std.testing.expect(std.mem.find(u8, preview, "    glm-tools  stdio  bin/glm\\x1b[31m --stdio\n      uses $GLM_TOKEN\n") != null);
+    try std.testing.expect(std.mem.find(u8, preview, "    remote  http  https://mcp.example.com/mcp\n      header X-Static\n      header X-Team from $GLM_TEAM\n") != null);
+    try std.testing.expect(std.mem.find(u8, preview, "  skills       1\n") != null);
+    try std.testing.expect(std.mem.find(u8, preview, "review\n  mcp") != null);
+
+    const remote_only = [_]ModMcpView{servers[1]};
+    const show_json = try (ModShowSnapshot{
+        .name = "glm",
+        .status = "on",
+        .on = true,
+        .assets = .{ .mcp = &remote_only },
+    }).render(alloc, .json);
+    defer alloc.free(show_json);
+    try std.testing.expect(std.mem.find(u8, show_json, "\"mcp\":[{\"name\":\"remote\",\"transport\":\"http\",\"command\":null,\"args\":[],\"url\":\"https://mcp.example.com/mcp\",\"variables\":[],\"headers\":[{\"name\":\"X-Static\",\"env\":null},{\"name\":\"X-Team\",\"env\":\"GLM_TEAM\"}]}]") != null);
 }

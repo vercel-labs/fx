@@ -12,6 +12,7 @@ const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 pub const McpServerConfig = mcp_contract.McpServerConfig;
+pub const McpAuthConfig = mcp_contract.McpAuthConfig;
 
 pub const ModMcpClash = struct {
     server: []u8,
@@ -60,6 +61,62 @@ pub const ParseResult = union(enum) {
 
 pub fn deinitConfigs(alloc: Allocator, configs: *std.ArrayList(McpServerConfig)) void {
     project_config.deinitConfigs(alloc, configs);
+}
+
+/// The stdio command as the mod wrote it. `parse` resolves a command under the
+/// mod folder and records that folder as `cwd`, so a command inside it comes back
+/// relative to the folder. Any other command is returned unchanged.
+pub fn writtenCommand(config: *const McpServerConfig) ?[]const u8 {
+    const command = config.command orelse return null;
+    const dir = std.mem.trimEnd(u8, config.cwd orelse return command, "/");
+    if (command.len <= dir.len + 1 or command[dir.len] != '/') return command;
+    if (!std.mem.eql(u8, command[0..dir.len], dir)) return command;
+    return command[dir.len + 1 ..];
+}
+
+/// The names of the person's environment variables that fx reads for a mod
+/// server, each once and in order: `${NAME}` and `${NAME:-default}` in its
+/// command, arguments, env values, and header values, then each header
+/// environment name, the bearer token name, and the OAuth client secret name.
+/// An env key is not one of them: it names a variable the mod sets for its
+/// server. Every name borrows from `config`.
+pub fn variableNames(alloc: Allocator, config: *const McpServerConfig) Allocator.Error![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    if (writtenCommand(config)) |command| try templateNames(alloc, &names, command);
+    for (config.args) |argument| try templateNames(alloc, &names, argument);
+    for (config.env) |entry| try templateNames(alloc, &names, entry.value);
+    for (config.headers) |header| try templateNames(alloc, &names, header.value);
+    for (config.header_env) |header| try addName(alloc, &names, header.env);
+    if (config.bearer_token_env) |name| try addName(alloc, &names, name);
+    if (config.auth) |auth| if (auth.client_secret_env) |name| try addName(alloc, &names, name);
+    return names.items;
+}
+
+/// Reads the names of `${...}` expressions the way `project_config`'s template
+/// check does: a `$${` is an escape, and `:-` ends the name.
+fn templateNames(alloc: Allocator, names: *std.ArrayList([]const u8), input: []const u8) Allocator.Error!void {
+    var cursor: usize = 0;
+    while (cursor < input.len) {
+        const relative_start = std.mem.find(u8, input[cursor..], "${") orelse return;
+        const start = cursor + relative_start;
+        if (start > cursor and input[start - 1] == '$') {
+            cursor = start + 2;
+            continue;
+        }
+        const expression_start = start + 2;
+        const relative_end = std.mem.findScalar(u8, input[expression_start..], '}') orelse return;
+        const expression = input[expression_start .. expression_start + relative_end];
+        const name = if (std.mem.find(u8, expression, ":-")) |marker| expression[0..marker] else expression;
+        try addName(alloc, names, name);
+        cursor = expression_start + relative_end + 1;
+    }
+}
+
+fn addName(alloc: Allocator, names: *std.ArrayList([]const u8), name: []const u8) Allocator.Error!void {
+    for (names.items) |existing| {
+        if (std.mem.eql(u8, existing, name)) return;
+    }
+    try names.append(alloc, name);
 }
 
 /// Strictly parses a mod's `"mcp"` map using `project_config.parseProfileServerMap`
@@ -307,6 +364,57 @@ pub fn loadFromPinned(
         .configs = kept,
         .clashes = clashes_slice,
     };
+}
+
+test "variableNames lists each name a mod server reads once, and writtenCommand keeps the command as written" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mod_dir = "/tmp/fx-home/mods/.store/glm-0123456789abcdef";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{
+        \\  "glm":{"command":"bin/glm","args":["--token","${GLM_TOKEN:-none}"],"env":{"TEAM":"${GLM_TEAM}"}},
+        \\  "remote":{"type":"http","url":"https://mcp.example.com/mcp","headers":{"X-Key":"${GLM_TOKEN}"},"header_env":{"X-Team":"GLM_TEAM"},"bearer_token_env":"MCP_TOKEN"},
+        \\  "signin":{"type":"http","url":"https://auth.example.com/mcp","oauth":{"client_id":"fx-mod","client_secret_env":"MCP_CLIENT_SECRET"}}
+        \\}
+    , .{ .duplicate_field_behavior = .@"error" });
+    defer parsed.deinit();
+
+    var configs = switch (try parse(alloc, parsed.value, .{ .name = "glm", .dir = mod_dir })) {
+        .ok => |c| c,
+        .invalid => return error.TestUnexpectedResult,
+    };
+    defer deinitConfigs(alloc, &configs);
+
+    const Find = struct {
+        fn byName(items: []const McpServerConfig, name: []const u8) !*const McpServerConfig {
+            for (items) |*item| if (std.mem.eql(u8, item.name, name)) return item;
+            return error.TestUnexpectedResult;
+        }
+    };
+    const glm = try Find.byName(configs.items, "glm");
+    const remote = try Find.byName(configs.items, "remote");
+    const signin = try Find.byName(configs.items, "signin");
+    try std.testing.expectEqualStrings("bin/glm", writtenCommand(glm).?);
+    try std.testing.expect(writtenCommand(remote) == null);
+
+    // `TEAM` is the env key the mod sets, so only the variable its value reads counts.
+    const glm_names = try variableNames(arena, glm);
+    try std.testing.expectEqual(@as(usize, 2), glm_names.len);
+    try std.testing.expectEqualStrings("GLM_TOKEN", glm_names[0]);
+    try std.testing.expectEqualStrings("GLM_TEAM", glm_names[1]);
+
+    const remote_names = try variableNames(arena, remote);
+    try std.testing.expectEqual(@as(usize, 3), remote_names.len);
+    try std.testing.expectEqualStrings("GLM_TOKEN", remote_names[0]);
+    try std.testing.expectEqualStrings("GLM_TEAM", remote_names[1]);
+    try std.testing.expectEqualStrings("MCP_TOKEN", remote_names[2]);
+
+    // fx reads the OAuth client secret from the person's environment and sends it.
+    const signin_names = try variableNames(arena, signin);
+    try std.testing.expectEqual(@as(usize, 1), signin_names.len);
+    try std.testing.expectEqualStrings("MCP_CLIENT_SECRET", signin_names[0]);
 }
 
 test "parse accepts valid stdio and http mod servers, resolves relative command, and sets cwd and mod_name" {

@@ -16,6 +16,7 @@ const sort_utils = @import("../shared/sort_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const shared_theme = @import("../shared/theme.zig");
 const mods = @import("mods.zig");
+const mcp_config = mods.mcp_config;
 
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -624,7 +625,7 @@ noinline fn runSingleUpdate(
 
             const old_views = try providerViews(arena, prep.old_providers);
             const new_views = try providerViews(arena, prep.install.providers);
-            const diff = diffUpdateSafety(old_views, new_views, prep.files_changed);
+            const diff = diffUpdateSafety(old_views, new_views, prep.old_mcp.items, prep.new_mcp.items, prep.files_changed);
 
             if (diff.needsConfirm()) {
                 const preview = try buildInstallPreview(arena, &prep.install);
@@ -822,7 +823,8 @@ noinline fn runRemove(c: Context, root: []const u8, name: []const u8) !u8 {
 
 fn buildInstallPreview(arena: Allocator, prep: *const mods.PreparedInstall) !output_contracts.ModInstallPreviewSnapshot {
     const providers = try providerViews(arena, prep.providers);
-    const assets = scanModAssets(arena, prep.dir);
+    var assets = scanModAssets(arena, prep.dir);
+    assets.mcp = try mcpViewsFromRaw(arena, prep.manifest.mcp, prep.manifest.name, prep.dir);
     return .{
         .name = prep.manifest.name,
         .version = prep.manifest.version,
@@ -834,19 +836,58 @@ fn buildInstallPreview(arena: Allocator, prep: *const mods.PreparedInstall) !out
     };
 }
 
+/// The MCP server views of one mod's `mcp` map under its folder, in the order
+/// the map lists them.
+fn mcpViews(arena: Allocator, configs: []const mcp_config.McpServerConfig) ![]const output_contracts.ModMcpView {
+    const views = try arena.alloc(output_contracts.ModMcpView, configs.len);
+    for (configs, views) |*config, *view| {
+        view.* = .{
+            .name = config.name,
+            .transport = @tagName(config.transport),
+            .command = mcp_config.writtenCommand(config),
+            .args = config.args,
+            .url = config.url,
+            .variables = try mcp_config.variableNames(arena, config),
+            .headers = try mcpHeaders(arena, config),
+        };
+    }
+    return views;
+}
+
+fn mcpHeaders(arena: Allocator, config: *const mcp_config.McpServerConfig) ![]const output_contracts.ModMcpHeader {
+    var list: std.ArrayList(output_contracts.ModMcpHeader) = .empty;
+    for (config.headers) |header| try list.append(arena, .{ .name = header.name });
+    for (config.header_env) |header| try list.append(arena, .{ .name = header.name, .env = header.env });
+    return list.items;
+}
+
+/// The views of a mod's `mcp` map, read with the same strict parser that `fx mod
+/// add` and `update` run. An invalid map shows no servers, because those commands
+/// refuse it before a screen is drawn.
+fn mcpViewsFromRaw(arena: Allocator, raw: ?std.json.Value, name: []const u8, dir: []const u8) ![]const output_contracts.ModMcpView {
+    const value = raw orelse return &.{};
+    return switch (try mcp_config.parse(arena, value, .{ .name = name, .dir = dir })) {
+        .ok => |configs| try mcpViews(arena, configs.items),
+        .invalid => &.{},
+    };
+}
+
 pub const UpdateSafetyDiff = struct {
     command: bool = false,
+    mcp: bool = false,
     files: bool = false,
     sends: bool = false,
 
     pub fn needsConfirm(self: UpdateSafetyDiff) bool {
-        return self.command or self.files or self.sends;
+        return self.command or self.mcp or self.files or self.sends;
     }
 };
 
 pub fn diffUpdateSafety(
     old_providers: []const output_contracts.ModProviderView,
     new_providers: []const output_contracts.ModProviderView,
+    old_servers: []const mcp_config.McpServerConfig,
+    new_servers: []const mcp_config.McpServerConfig,
     files_changed: bool,
 ) UpdateSafetyDiff {
     var diff: UpdateSafetyDiff = .{};
@@ -872,10 +913,75 @@ pub fn diffUpdateSafety(
             if (!known) diff.sends = true;
         }
     }
-    if (files_changed and has_any_command) {
+    var has_stdio_server = false;
+    for (new_servers) |*new_server| {
+        if (new_server.transport == .stdio) has_stdio_server = true;
+        const unchanged = if (findServer(old_servers, new_server.name)) |old_server|
+            sameServer(old_server, new_server)
+        else
+            false;
+        if (!unchanged) diff.mcp = true;
+    }
+    if (files_changed and (has_any_command or has_stdio_server)) {
         diff.files = true;
     }
     return diff;
+}
+
+fn findServer(servers: []const mcp_config.McpServerConfig, name: []const u8) ?*const mcp_config.McpServerConfig {
+    for (servers) |*server| {
+        if (std.mem.eql(u8, server.name, name)) return server;
+    }
+    return null;
+}
+
+/// Whether two versions of one server run and reach the same things: transport,
+/// program and arguments as written, URL, environment, headers, bearer token, and
+/// OAuth settings. Timeouts and the enabled flag do not count.
+fn sameServer(old: *const mcp_config.McpServerConfig, new: *const mcp_config.McpServerConfig) bool {
+    if (old.transport != new.transport) return false;
+    if (!optionalTextEql(mcp_config.writtenCommand(old), mcp_config.writtenCommand(new))) return false;
+    if (!textsEql(old.args, new.args)) return false;
+    if (!optionalTextEql(old.url, new.url)) return false;
+    if (old.env.len != new.env.len or old.headers.len != new.headers.len or old.header_env.len != new.header_env.len) return false;
+    for (old.env, new.env) |o, n| {
+        if (!std.mem.eql(u8, o.key, n.key) or !std.mem.eql(u8, o.value, n.value)) return false;
+    }
+    for (old.headers, new.headers) |o, n| {
+        if (!std.mem.eql(u8, o.name, n.name) or !std.mem.eql(u8, o.value, n.value)) return false;
+    }
+    for (old.header_env, new.header_env) |o, n| {
+        if (!std.mem.eql(u8, o.name, n.name) or !std.mem.eql(u8, o.env, n.env)) return false;
+    }
+    if (!optionalTextEql(old.bearer_token_env, new.bearer_token_env)) return false;
+    return sameAuth(old.auth, new.auth);
+}
+
+fn sameAuth(old: ?mcp_config.McpAuthConfig, new: ?mcp_config.McpAuthConfig) bool {
+    const a = old orelse return new == null;
+    const b = new orelse return false;
+    return optionalTextEql(a.resource, b.resource) and
+        optionalTextEql(a.issuer, b.issuer) and
+        optionalTextEql(a.client_id, b.client_id) and
+        optionalTextEql(a.client_secret_env, b.client_secret_env) and
+        optionalTextEql(a.client_metadata_url, b.client_metadata_url) and
+        textsEql(a.scopes, b.scopes) and
+        a.scopes_configured == b.scopes_configured and
+        a.callback_port == b.callback_port;
+}
+
+fn optionalTextEql(a: ?[]const u8, b: ?[]const u8) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    return std.mem.eql(u8, x, y);
+}
+
+fn textsEql(a: anytype, b: anytype) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!std.mem.eql(u8, x, y)) return false;
+    }
+    return true;
 }
 
 fn findProviderView(providers: []const output_contracts.ModProviderView, name: []const u8) ?output_contracts.ModProviderView {
@@ -902,7 +1008,8 @@ fn hasSend(sends: []const output_contracts.ModProviderSend, target: output_contr
 
 fn writeUpdateChanges(w: *Writer, diff: UpdateSafetyDiff) !void {
     if (diff.command) try w.writeAll("This update adds or changes a sign-in command.\n");
-    if (diff.files) try w.writeAll("This update changes the files of a mod that runs a sign-in command.\n");
+    if (diff.mcp) try w.writeAll("This update adds or changes an MCP server.\n");
+    if (diff.files) try w.writeAll("This update changes the files of a mod that runs a program.\n");
     if (diff.sends) try w.writeAll("This update changes what the mod sends, or where it sends it.\n");
 }
 
@@ -949,12 +1056,13 @@ const ModDetails = struct {
 };
 
 fn readModDetails(arena: Allocator, root: []const u8, name: []const u8, link_path: []const u8) ModDetails {
-    const assets = scanModAssets(arena, link_path);
+    var assets = scanModAssets(arena, link_path);
     const io = io_mod.getIo();
     var dir = std.Io.Dir.cwd().openDir(io, link_path, .{}) catch return .{ .assets = assets };
     defer dir.close(io);
     const bytes = dir.readFileAlloc(io, "mod.json", arena, .limited(mods.manifest.max_bytes + 1)) catch return .{ .assets = assets };
     const decoded = mods.manifest.decode(arena, bytes) catch return .{ .assets = assets };
+    assets.mcp = mcpViewsFromRaw(arena, decoded.mcp, name, link_path) catch &.{};
     const providers_val = decoded.providers orelse return .{ .description = decoded.description, .assets = assets };
 
     const canonical_link = std.Io.Dir.path.join(arena, &.{ root, name }) catch return .{ .description = decoded.description, .assets = assets };
@@ -1361,6 +1469,7 @@ test "mods verbs exercise cli and shell add preview, list, show, on/off, update,
 }
 
 test "diffUpdateSafety detects command, file, send, and URL additions or changes only" {
+    const no_servers: []const mcp_config.McpServerConfig = &.{};
     const cmd_a = [_][]const u8{ "/mods/glm/bin/a", "--ok" };
     const cmd_b = [_][]const u8{ "/mods/glm/bin/b", "--ok" };
     const send_a = [_]output_contracts.ModProviderSend{.{ .env = "KEY_A", .header = "Authorization" }};
@@ -1378,7 +1487,7 @@ test "diffUpdateSafety detects command, file, send, and URL additions or changes
     }};
 
     // 1. Version-only (identical providers and unchanged files) does not ask.
-    try std.testing.expect(!diffUpdateSafety(&base, &base, false).needsConfirm());
+    try std.testing.expect(!diffUpdateSafety(&base, &base, no_servers, no_servers, false).needsConfirm());
 
     // 2. Changed argv asks.
     const changed_cmd = [_]output_contracts.ModProviderView{.{
@@ -1388,7 +1497,7 @@ test "diffUpdateSafety detects command, file, send, and URL additions or changes
         .command = &cmd_b,
         .sends = &send_a,
     }};
-    const d_cmd = diffUpdateSafety(&base, &changed_cmd, false);
+    const d_cmd = diffUpdateSafety(&base, &changed_cmd, no_servers, no_servers, false);
     try std.testing.expect(d_cmd.needsConfirm() and d_cmd.command and !d_cmd.files and !d_cmd.sends);
 
     // 3. New provider with a command asks.
@@ -1396,7 +1505,7 @@ test "diffUpdateSafety detects command, file, send, and URL additions or changes
         base[0],
         .{ .name = "p2", .protocol = "openai-chat-completions", .base_url = "https://a.example/v1", .command = &cmd_a },
     };
-    try std.testing.expect(diffUpdateSafety(&base, &new_with_cmd, false).command);
+    try std.testing.expect(diffUpdateSafety(&base, &new_with_cmd, no_servers, no_servers, false).command);
 
     // 4. New sent variable asks.
     const new_send = [_]output_contracts.ModProviderView{.{
@@ -1406,7 +1515,7 @@ test "diffUpdateSafety detects command, file, send, and URL additions or changes
         .command = &cmd_a,
         .sends = &send_ab,
     }};
-    const d_send = diffUpdateSafety(&base, &new_send, false);
+    const d_send = diffUpdateSafety(&base, &new_send, no_servers, no_servers, false);
     try std.testing.expect(d_send.needsConfirm() and !d_send.command and d_send.sends);
 
     // 5. Changed URL for a sent variable asks.
@@ -1417,7 +1526,7 @@ test "diffUpdateSafety detects command, file, send, and URL additions or changes
         .command = &cmd_a,
         .sends = &send_a,
     }};
-    const d_url = diffUpdateSafety(&base, &changed_url, false);
+    const d_url = diffUpdateSafety(&base, &changed_url, no_servers, no_servers, false);
     try std.testing.expect(d_url.needsConfirm() and d_url.sends);
 
     // 6. Changed URL on a command provider without explicit `sends` asks (token goes to base_url).
@@ -1433,27 +1542,100 @@ test "diffUpdateSafety detects command, file, send, and URL additions or changes
         .base_url = "https://b.example/v1",
         .command = &cmd_a,
     }};
-    const d_cmd_url = diffUpdateSafety(&cmd_only_old, &cmd_only_new_url, true);
+    const d_cmd_url = diffUpdateSafety(&cmd_only_old, &cmd_only_new_url, no_servers, no_servers, true);
     try std.testing.expect(d_cmd_url.needsConfirm() and !d_cmd_url.command and d_cmd_url.files and d_cmd_url.sends);
 
     // 7. Files changed plus a command asks; files changed without any command does not ask.
-    try std.testing.expect(diffUpdateSafety(&cmd_only_old, &cmd_only_old, true).files);
+    try std.testing.expect(diffUpdateSafety(&cmd_only_old, &cmd_only_old, no_servers, no_servers, true).files);
     const no_cmd = [_]output_contracts.ModProviderView{.{
         .name = "p1",
         .protocol = "openai-chat-completions",
         .base_url = "https://a.example/v1",
     }};
-    try std.testing.expect(!diffUpdateSafety(&no_cmd, &no_cmd, true).needsConfirm());
+    try std.testing.expect(!diffUpdateSafety(&no_cmd, &no_cmd, no_servers, no_servers, true).needsConfirm());
 
     // 8. Removed provider does not ask.
-    try std.testing.expect(!diffUpdateSafety(&base, &.{}, false).needsConfirm());
+    try std.testing.expect(!diffUpdateSafety(&base, &.{}, no_servers, no_servers, false).needsConfirm());
 
     // 9. New provider that sends nothing and runs nothing does not ask.
     const new_harmless = [_]output_contracts.ModProviderView{
         base[0],
         .{ .name = "p2", .protocol = "openai-chat-completions", .base_url = "https://b.example/v1" },
     };
-    try std.testing.expect(!diffUpdateSafety(&base, &new_harmless, false).needsConfirm());
+    try std.testing.expect(!diffUpdateSafety(&base, &new_harmless, no_servers, no_servers, false).needsConfirm());
+}
+
+test "diffUpdateSafety asks for MCP server additions and changes, and for files only with a program" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mod_dir = "/tmp/fx-home/mods/.store/glm-0123456789abcdef";
+
+    const old_text =
+        \\{"fs":{"command":"bin/fs","args":["--stdio"]},"web":{"type":"http","url":"https://a.example/mcp","headers":{"X-Team":"one"}}}
+    ;
+    var old_servers = std.ArrayList(mcp_config.McpServerConfig).empty;
+    const old_value = try std.json.parseFromSliceLeaky(std.json.Value, arena, old_text, .{});
+    switch (try mcp_config.parse(arena, old_value, .{ .name = "glm", .dir = mod_dir })) {
+        .ok => |configs| old_servers = configs,
+        .invalid => return error.TestUnexpectedResult,
+    }
+
+    // Each case: the new map, whether the files changed, and what the diff must say.
+    const cases = [_]struct { text: []const u8, files_changed: bool, asks_files: bool, asks_mcp: bool }{
+        .{ .text = old_text, .files_changed = false, .asks_files = false, .asks_mcp = false },
+        .{ .text = "{\"fs\":{\"command\":\"bin/fs\",\"args\":[\"--stdio\"]},\"web\":{\"type\":\"http\",\"url\":\"https://a.example/mcp\",\"headers\":{\"X-Team\":\"one\"}},\"new\":{\"type\":\"http\",\"url\":\"https://b.example/mcp\"}}", .files_changed = false, .asks_files = false, .asks_mcp = true },
+        .{ .text = "{\"fs\":{\"command\":\"bin/fs2\",\"args\":[\"--stdio\"]},\"web\":{\"type\":\"http\",\"url\":\"https://a.example/mcp\",\"headers\":{\"X-Team\":\"one\"}}}", .files_changed = false, .asks_files = false, .asks_mcp = true },
+        .{ .text = "{\"fs\":{\"command\":\"bin/fs\",\"args\":[\"--stdio\"]},\"web\":{\"type\":\"http\",\"url\":\"https://c.example/mcp\",\"headers\":{\"X-Team\":\"one\"}}}", .files_changed = false, .asks_files = false, .asks_mcp = true },
+        .{ .text = "{\"fs\":{\"command\":\"bin/fs\",\"args\":[\"--stdio\"]},\"web\":{\"type\":\"http\",\"url\":\"https://a.example/mcp\",\"headers\":{\"X-Team\":\"two\"}}}", .files_changed = false, .asks_files = false, .asks_mcp = true },
+        .{ .text = "{\"fs\":{\"command\":\"bin/fs\",\"args\":[\"--stdio\"]}}", .files_changed = false, .asks_files = false, .asks_mcp = false },
+        .{ .text = old_text, .files_changed = true, .asks_files = true, .asks_mcp = false },
+        .{ .text = "{\"web\":{\"type\":\"http\",\"url\":\"https://a.example/mcp\",\"headers\":{\"X-Team\":\"one\"}}}", .files_changed = true, .asks_files = false, .asks_mcp = false },
+    };
+    for (cases) |case| {
+        const new_value = try std.json.parseFromSliceLeaky(std.json.Value, arena, case.text, .{});
+        const new_configs = switch (try mcp_config.parse(arena, new_value, .{ .name = "glm", .dir = mod_dir })) {
+            .ok => |configs| configs,
+            .invalid => return error.TestUnexpectedResult,
+        };
+        const d = diffUpdateSafety(&.{}, &.{}, old_servers.items, new_configs.items, case.files_changed);
+        try std.testing.expectEqual(case.asks_mcp, d.mcp);
+        try std.testing.expectEqual(case.asks_files, d.files);
+    }
+
+    // A server that only comes back under the new folder is the same server: the program
+    // is compared as written, not as the absolute path under each folder.
+    const moved_text = "{\"fs\":{\"command\":\"bin/fs\",\"args\":[\"--stdio\"]},\"web\":{\"type\":\"http\",\"url\":\"https://a.example/mcp\",\"headers\":{\"X-Team\":\"one\"}}}";
+    const moved_value = try std.json.parseFromSliceLeaky(std.json.Value, arena, moved_text, .{});
+    const moved = switch (try mcp_config.parse(arena, moved_value, .{ .name = "glm", .dir = "/tmp/fx-home/mods/glm" })) {
+        .ok => |configs| configs,
+        .invalid => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!diffUpdateSafety(&.{}, &.{}, old_servers.items, moved.items, false).needsConfirm());
+
+    var with_stdio_only = std.ArrayList(mcp_config.McpServerConfig).empty;
+    const stdio_text = "{\"fs\":{\"command\":\"bin/fs\"}}";
+    const stdio_value = try std.json.parseFromSliceLeaky(std.json.Value, arena, stdio_text, .{});
+    switch (try mcp_config.parse(arena, stdio_value, .{ .name = "glm", .dir = mod_dir })) {
+        .ok => |configs| with_stdio_only = configs,
+        .invalid => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(diffUpdateSafety(&.{}, &.{}, &.{}, with_stdio_only.items, true).files);
+}
+
+test "writeUpdateChanges lists sign-in command, MCP server, files, and sends in that order" {
+    const alloc = std.testing.allocator;
+    var out: Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeUpdateChanges(&out.writer, .{ .command = true, .mcp = true, .files = true, .sends = true });
+    try std.testing.expectEqualStrings(
+        "This update adds or changes a sign-in command.\n" ++
+            "This update adds or changes an MCP server.\n" ++
+            "This update changes the files of a mod that runs a program.\n" ++
+            "This update changes what the mod sends, or where it sends it.\n",
+        out.written(),
+    );
 }
 
 test "mods update confirmation paths cover no-tty, tty yes/no, --yes, batch skip, and TUI hint" {
@@ -1507,7 +1689,7 @@ test "mods update confirmation paths cover no-tty, tty yes/no, --yes, batch skip
     try std.testing.expectEqual(@as(u8, 1), try runTestVerbs(alloc, .cli, home, &.{ "update", "alpha" }, &prompt, &out, &err));
     try std.testing.expect(!prompt.asked);
     try std.testing.expect(std.mem.find(u8, err.items, "This update adds or changes a sign-in command.\n") != null);
-    try std.testing.expect(std.mem.find(u8, err.items, "This update changes the files of a mod that runs a sign-in command.\n") != null);
+    try std.testing.expect(std.mem.find(u8, err.items, "This update changes the files of a mod that runs a program.\n") != null);
     try std.testing.expect(std.mem.find(u8, err.items, "--yes") != null);
 
     // 2. CLI TTY answer `n`: asks `Update alpha? [y/N]` and cancels, keeping 1.0.0.
