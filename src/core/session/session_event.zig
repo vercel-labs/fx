@@ -142,11 +142,14 @@ pub const ConversationToolResult = struct {
     /// Never in the piece, which an older fx reads strictly: a v2 session
     /// saves it as a `subagent_started` item right after it (D101).
     subagent_started: bool = false,
+    /// Never in the piece either: a v2 session saves it as an
+    /// `opened_record` item right after it (D104).
+    opened_record: ?types.OpenedRecord = null,
 
     pub fn jsonStringify(self: ConversationToolResult, writer: *std.json.Stringify) !void {
         try writer.beginObject();
         inline for (@typeInfo(ConversationToolResult).@"struct".field_names) |field_name| {
-            const written = if (comptime std.mem.eql(u8, field_name, "subagent_started"))
+            const written = if (comptime std.mem.eql(u8, field_name, "subagent_started") or std.mem.eql(u8, field_name, "opened_record"))
                 false
             else
                 !std.mem.eql(u8, field_name, "review_feedback") or self.review_feedback;
@@ -815,6 +818,7 @@ pub fn appendExecutionConversationEvents(
                 .command_process_presentation = result.command_process_presentation,
                 .terminal_action_presentation = result.terminal_action_presentation,
                 .subagent_started = result.subagent_started,
+                .opened_record = result.opened_record,
             } });
         }
         const completed_steps = step_index + 1;

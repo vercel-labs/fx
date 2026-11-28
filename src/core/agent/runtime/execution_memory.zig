@@ -1360,6 +1360,7 @@ pub fn applyToolResultMemory(
     prepared.terminal_action_presentation = source_memory.terminal_action_presentation;
     prepared.quiet_crossing = source_memory.quiet_crossing;
     prepared.subagent_started = source_memory.subagent_started;
+    prepared.opened_record = source_memory.opened_record;
     prepared.command_placement = source_memory.command_placement;
     const source_covers_full_file =
         source_memory.model_view_covers_full_file orelse return;

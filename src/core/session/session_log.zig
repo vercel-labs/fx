@@ -1481,6 +1481,17 @@ pub const ConversationTurnBuilder = struct {
         return true;
     }
 
+    /// Gives the `read_tool_result` result of `call_id`, already appended in
+    /// this turn, what the saved call it reopened did (D104). Copies
+    /// `record`. False, keeping nothing, when the turn has no such result or
+    /// it already has one.
+    pub fn attachOpenedRecord(self: *ConversationTurnBuilder, call_id: []const u8, record: types.OpenedRecord) !bool {
+        const result = self.findResult(call_id) orelse return false;
+        if (!std.mem.eql(u8, result.tool_name, "read_tool_result") or result.opened_record != null) return false;
+        result.opened_record = try types.dupeOpenedRecord(self.alloc, record);
+        return true;
+    }
+
     /// The result of `call_id` in the open step or in a step this turn
     /// already finished.
     fn findResult(self: *ConversationTurnBuilder, call_id: []const u8) ?*types.PersistedToolResult {
@@ -2063,6 +2074,7 @@ fn dupeConversationToolResult(
         usize,
         value.output_bytes orelse value.stored_bytes,
     ) orelse return error.ConversationSizeOverflow;
+    const opened_record = try types.dupeOpenedRecord(alloc, value.opened_record);
     return .{
         .tool_call_id = call_id,
         .tool_name = tool_name,
@@ -2083,6 +2095,7 @@ fn dupeConversationToolResult(
         .command_process_presentation = value.command_process_presentation,
         .terminal_action_presentation = value.terminal_action_presentation,
         .subagent_started = value.subagent_started,
+        .opened_record = opened_record,
     };
 }
 
@@ -2105,6 +2118,7 @@ fn freeConversationToolResult(
     if (result.command_output_replay) |replay| {
         types.freeCommandOutputReplay(alloc, replay);
     }
+    types.freeOpenedRecord(alloc, result.opened_record);
 }
 
 fn latestConversationCheckpointIndex(history: []const session.HistoryTurn) usize {

@@ -2832,6 +2832,7 @@ fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResul
         .command_process_presentation = result.command_process_presentation,
         .terminal_action_presentation = result.terminal_action_presentation,
         .subagent_started = result.subagent_started,
+        .opened_record = result.opened_record,
     };
 }
 

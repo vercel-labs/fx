@@ -1100,6 +1100,62 @@ fn toolFile(alloc: Allocator, tool: PendingTool) Allocator.Error![]u8 {
     return text.toOwnedSlice(alloc);
 }
 
+/// A tool call as its saved record holds it. Both slices point into the
+/// record's text.
+pub const RecordedToolCall = struct {
+    tool: []const u8,
+    /// The arguments as the call sent them.
+    arguments: []const u8,
+};
+
+const recorded_arguments_start = "\n\nArguments:\n";
+const recorded_result_start = "\n\nResult:\n";
+
+/// The tool call a `T<n>` record holds, read from the start of its file as
+/// `toolFile` writes it. Null when `head` is not the start of such a record,
+/// holds no arguments, or ends before they do, as a head cut short may.
+pub fn recordedToolCall(head: []const u8) ?RecordedToolCall {
+    const line_end = std.mem.findScalar(u8, head, '\n') orelse return null;
+    const line = head[0..line_end];
+    if (line.len < 2 or line[0] != 'T') return null;
+    const number_end = std.mem.findScalar(u8, line, ' ') orelse return null;
+    if (number_end == 1) return null;
+    for (line[1..number_end]) |byte| if (!std.ascii.isDigit(byte)) return null;
+    const named = line[number_end + 1 ..];
+    const tool = named[0 .. std.mem.find(u8, named, ": ") orelse named.len];
+    if (tool.len == 0) return null;
+    const rest = head[line_end..];
+    const arguments_at = std.mem.find(u8, rest, recorded_arguments_start) orelse return null;
+    const arguments = rest[arguments_at + recorded_arguments_start.len ..];
+    // Arguments are JSON, which holds no raw line break inside a string, so
+    // the first result marker ends them.
+    const arguments_end = std.mem.find(u8, arguments, recorded_result_start) orelse return null;
+    return .{ .tool = tool, .arguments = arguments[0..arguments_end] };
+}
+
+test "a saved tool call reads back from the head of its record" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const arguments = "{\"action\":\"run\",\"command\":\"git log\\n--oneline\"}";
+    const file = try toolFile(arena, .{
+        .number = 51,
+        .name = "shell",
+        .call = .{ .id = "call-1", .name = "shell", .arguments = arguments },
+        .result = .{ .call_id = "call-1", .name = "shell", .output = "Result:\nab12 fix" },
+    });
+    const call = recordedToolCall(file).?;
+    try testing.expectEqualStrings("shell", call.tool);
+    try testing.expectEqualStrings(arguments, call.arguments);
+    // A head cut before the arguments end names no call, nor does any other
+    // record or a call saved without its arguments.
+    try testing.expect(recordedToolCall(file[0..std.mem.find(u8, file, "--oneline").?]) == null);
+    try testing.expect(recordedToolCall("M3 turn: hello\nUser 3:\nhello\n") == null);
+    try testing.expect(recordedToolCall("T5 read_file\nCall ID: orphan\n\nArguments: (not recorded)\n\nResult:\nx\n") == null);
+    try testing.expect(recordedToolCall("T read_file: a\nCall ID: c\n\nArguments:\n{}\n\nResult:\n") == null);
+    try testing.expect(recordedToolCall("") == null);
+}
+
 /// The saved file for one turn: an index line with the start of its first
 /// user message, then the whole turn word for word, tool calls by ID.
 fn turnFile(alloc: Allocator, turn: Prepared) Allocator.Error![]u8 {

@@ -2416,6 +2416,9 @@ const StoryRowKind = enum {
     /// Every call of the same MCP tool in the group, wherever it is: one row
     /// that counts them.
     mcp,
+    /// Reads of records compaction saved, one right after the other: one row
+    /// that counts them (`reopenedRowPhrase`).
+    reopened,
 };
 
 const StoryIdentity = struct {
@@ -3411,22 +3414,109 @@ fn savedOutputRowTarget(scratch: std.mem.Allocator, identity: StoryIdentity) ![]
 /// A read of saved output in its finished row's words from the moment its
 /// arguments arrive: its verb for whether it still runs, then what it reads,
 /// with the source by its short name, such as "Searching github.com output
-/// for "npx"", "Read more output from SKILL.md", "Opened tool call T5", or
-/// "Cancelled github.com output for "npx"". Core's row names the call's
-/// handle while the call streams in, and says "earlier" before a record,
-/// which the compact row leaves out. Null for any other row.
+/// for "npx"", "Read more output from SKILL.md", or "Cancelled github.com
+/// output for "npx"". Core's row names the call's handle while the call
+/// streams in. A reopened record's row says what its saved call did
+/// (`reopenedRowPhrase`). Null for any other row.
 fn savedReadRowPhrase(scratch: std.mem.Allocator, row: *const StoryRow) !?[]const u8 {
     const record = row.detail orelse return null;
+    if (try reopenedRowPhrase(scratch, row)) |phrase| return phrase;
     const words = try savedReadWords(scratch, record) orelse return null;
     const target = switch (row.identity.kind) {
         .more_output, .output_search => try savedOutputRowTarget(scratch, row.identity),
-        .single => if (row.identity.key.len > 0)
-            row.identity.key
-        else
-            try read_tool_result_presentation.openedRecordName(scratch, record.arguments_json.?) orelse words.target,
+        .single => if (row.identity.key.len > 0) row.identity.key else words.target,
         else => return null,
     };
     return try std.mem.concat(scratch, u8, &.{ words.verb, " ", target });
+}
+
+/// A call that reopens a record compaction saved, by its ID, a search of it,
+/// or a later page, and the record's ID, such as "T51".
+const ReopenedCall = struct { phrase: []const u8, id: []const u8 };
+
+/// A reopened record as its row names it while no saved call does.
+fn reopenedRecordNoun(kind: read_tool_result_presentation.OpenedRecordId.Kind) []const u8 {
+    return switch (kind) {
+        .tool_call => "an earlier tool call",
+        .turn => "an earlier turn",
+        .compaction => "an earlier summary",
+    };
+}
+
+/// What a saved call did, from the record a later call reopened (D104), in
+/// the short forms its own row uses: "read of client.rs", "search for
+/// "ws.ping"", or "run of git log". Null when the target names nothing a row
+/// can show, such as a path with no file name. Terminal-safe.
+fn reopenedCallWords(scratch: std.mem.Allocator, saved: types.OpenedRecord) !?[]const u8 {
+    const target = saved.target;
+    return switch (saved.kind) {
+        .read => try reopenedFileWords(scratch, "read of ", target),
+        .edit => try reopenedFileWords(scratch, "edit of ", target),
+        .write => try reopenedFileWords(scratch, "write of ", target),
+        .search => try std.mem.concat(scratch, u8, &.{
+            "search for ",
+            try rowQuotedQuery(scratch, try std.mem.concat(scratch, u8, &.{ "\"", try terminalSafeText(scratch, target), "\"" })),
+        }),
+        .run => try std.mem.concat(scratch, u8, &.{ "run of ", try shortCommand(scratch, target) orelse try terminalSafeText(scratch, target) }),
+        .fetch => try std.mem.concat(scratch, u8, &.{ "fetch of ", try fetchTargetText(scratch, target) }),
+        .mcp => try std.mem.concat(scratch, u8, &.{ "use of ", try mcpToolWords(scratch, target, "") orelse unnamed_mcp_tool }),
+    };
+}
+
+/// "read of client.rs": what a saved call did to a file, by the file's name.
+/// Null for a path with no file name.
+fn reopenedFileWords(scratch: std.mem.Allocator, action: []const u8, path: []const u8) !?[]const u8 {
+    const name = pathFileName(path) orelse return null;
+    return try std.mem.concat(scratch, u8, &.{ action, try terminalSafeText(scratch, name) });
+}
+
+/// A `read_tool_result` call that reopens a saved record, in its own row's
+/// words: "Reopened earlier read of client.rs" when core named the saved
+/// call, else "Reopened an earlier tool call", "an earlier turn", or "an
+/// earlier summary"; "Reopening …" while it runs, "Couldn't reopen …" when it
+/// failed, and "Cancelled reopening …". Only Ctrl+O names the record's ID.
+/// Null for any other call, and for one denied or held, whose row core words.
+fn reopenedCall(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?ReopenedCall {
+    if (!std.mem.eql(u8, record.tool_name, "read_tool_result")) return null;
+    const opened = try read_tool_result_presentation.openedRecordId(scratch, record.arguments_json orelse return null) orelse return null;
+    const noun = reopenedRecordNoun(opened.kind);
+    const phrase = if (storyCallFailed(record))
+        try std.mem.concat(scratch, u8, &.{ "Couldn't reopen ", noun })
+    else if (record.outcome) |outcome| switch (outcome) {
+        .completed => named: {
+            if (opened.kind == .tool_call) if (record.opened_record) |saved| if (try reopenedCallWords(scratch, saved)) |words| {
+                break :named try std.mem.concat(scratch, u8, &.{ "Reopened earlier ", words });
+            };
+            break :named try std.mem.concat(scratch, u8, &.{ "Reopened ", noun });
+        },
+        .cancelled => try std.mem.concat(scratch, u8, &.{ cancelled_label, " reopening ", noun }),
+        else => return null,
+    } else try std.mem.concat(scratch, u8, &.{ "Reopening ", noun });
+    return .{ .phrase = phrase, .id = opened.id };
+}
+
+/// A reopened record's row: its call's words (`reopenedCall`), or for reads
+/// of records next to each other, which share one row, how many there are.
+/// Null for any other row.
+fn reopenedRowPhrase(scratch: std.mem.Allocator, row: *const StoryRow) !?[]const u8 {
+    const record = row.detail orelse return null;
+    if (row.identity.kind == .reopened and row.count > 1) {
+        if (record.outcome == null) return try countNote(scratch, "Re-reading ", row.count, " earlier results");
+        return try countNote(scratch, "Re-read ", row.count, " earlier results from before compaction");
+    }
+    return if (try reopenedCall(scratch, record)) |call| call.phrase else null;
+}
+
+/// Reads of records compaction saved share one row with the read right
+/// before them when it reads one too, so a run of them shows as one row
+/// (`reopenedRowPhrase`). One that failed, was denied, or was cancelled keeps
+/// its own row, so what happened to it shows.
+fn reopenedRecordIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord, identity: StoryIdentity) !StoryIdentity {
+    const record = detail orelse return identity;
+    if (!std.mem.eql(u8, record.tool_name, "read_tool_result") or storyCallFailed(detail)) return identity;
+    if (record.outcome) |outcome| if (outcome != .completed) return identity;
+    _ = try read_tool_result_presentation.openedRecordId(scratch, record.arguments_json orelse return identity) orelse return identity;
+    return .{ .kind = .reopened };
 }
 
 /// A web page an earlier turn fetched and saved behind a handle, which the
@@ -3661,8 +3751,9 @@ test "a look into saved output has its finished row's words and name from the mo
         .{ .phrase = "● Reading " ++ replay ++ "\n", .arguments = "{\"handle\":\"" ++ replay ++ "\",\"query\":\"FUZZ_\"}", .outcome = null, .row = "● Searching command output for \"FUZZ_\"" },
         .{ .phrase = "● Searching command output for \"FUZZ_\"\n", .arguments = "{\"handle\":\"" ++ replay ++ "\",\"query\":\"FUZZ_\"}", .outcome = null, .row = "● Searching command output for \"FUZZ_\"" },
         .{ .phrase = "● Searched command output for \"FUZZ_\"\n", .arguments = "{\"handle\":\"" ++ replay ++ "\",\"query\":\"FUZZ_\"}", .outcome = .completed, .row = "● Searched command output for \"FUZZ_\"" },
-        .{ .phrase = "● Reading T5\n", .arguments = "{\"handle\":\"T5\"}", .outcome = null, .row = "● Opening tool call T5" },
-        .{ .phrase = "● Opened earlier tool call T5\n", .arguments = "{\"handle\":\"T5\"}", .outcome = .completed, .row = "● Opened tool call T5" },
+        // A record with no saved call's name says what the record is.
+        .{ .phrase = "● Reading T5\n", .arguments = "{\"handle\":\"T5\"}", .outcome = null, .row = "● Reopening an earlier tool call" },
+        .{ .phrase = "● Opened earlier tool call T5\n", .arguments = "{\"handle\":\"T5\"}", .outcome = .completed, .row = "● Reopened an earlier tool call" },
         .{ .phrase = "● Reading result-14acc.txt\n", .arguments = "{\"handle\":\"result-14acc.txt\",\"start_byte\":4096}", .outcome = null, .row = "● Reading more output from github.com" },
     };
     for (cases) |case| {
@@ -3705,7 +3796,7 @@ test "a cancelled look into saved output names what it read as its running row d
     const Case = struct { handle: []const u8, arguments: []const u8, row: []const u8 };
     const cases = [_]Case{
         .{ .handle = "result-14acc.txt", .arguments = "{\"handle\":\"result-14acc.txt\",\"start_byte\":4096}", .row = "Cancelled more output from github.com" },
-        .{ .handle = "T5", .arguments = "{\"handle\":\"T5\"}", .row = "Cancelled tool call T5" },
+        .{ .handle = "T5", .arguments = "{\"handle\":\"T5\"}", .row = "Cancelled reopening an earlier tool call" },
     };
     for (cases) |case| {
         const phrase = try std.mem.concat(alloc, u8, &.{ "▪ Cancelled ", case.handle, cancellation_follow_up });
@@ -3724,6 +3815,224 @@ test "a cancelled look into saved output names what it read as its running row d
         defer alloc.free(notice);
         try std.testing.expect(std.mem.startsWith(u8, std.mem.trimStart(u8, row, "\n"), header));
         try std.testing.expect(std.mem.find(u8, row, notice) != null);
+    }
+}
+
+/// A `read_tool_result` call that reopens a record, with what core read of
+/// the saved call when it completed (D104).
+fn reopenForTest(entry_id: u32, arguments: []const u8, outcome: ?types.ToolOutcomeKind, saved: ?types.OpenedRecord) ToolDetailRecord {
+    return .{ .entry_id = entry_id, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast(arguments), .outcome = outcome, .opened_record = saved };
+}
+
+fn reopenEntryForTest(id: u32, status: []const u8) TranscriptEntry {
+    return .{ .raw_bytes = .{ .id = id, .bytes = status, .class = .tool_status } };
+}
+
+test "reads of saved calls next to each other share one row, and each names what its saved call did" {
+    const alloc = std.testing.allocator;
+    // From a session that compacted: the model reopened two saved calls at
+    // once, which rows used to show as "Opened tool call T2270" and
+    // "Opened tool call T2271".
+    const entries = [_]TranscriptEntry{
+        reopenEntryForTest(1, "● Opened earlier tool call T2270\n"),
+        reopenEntryForTest(2, "● Opened earlier tool call T2271\n"),
+    };
+    var details = [_]ToolDetailRecord{
+        reopenForTest(1, "{\"handle\":\"T2270\"}", .completed, .{ .kind = .read, .target = "src/client.rs" }),
+        reopenForTest(2, "{\"handle\":\"T2271\"}", .completed, .{ .kind = .search, .target = "ws.ping" }),
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("● Re-read 2 earlier results from before compaction", std.mem.trim(u8, text, "\n"));
+
+    // Ctrl+O names each call, then its record.
+    var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, 120, null);
+    defer projection.deinit(alloc);
+    try std.testing.expectEqualStrings("● Reopened earlier read of client.rs (T2270)", projection.entry_actions.items[0].override.bytes);
+    try std.testing.expectEqualStrings("● Reopened earlier search for \"ws.ping\" (T2271)", projection.entry_actions.items[1].override.bytes);
+
+    // Each alone keeps a row that names its saved call.
+    for (entries, details, [_][]const u8{ "● Reopened earlier read of client.rs", "● Reopened earlier search for \"ws.ping\"" }) |entry, detail, row| {
+        const one = try groupTextForTest(alloc, &[_]TranscriptEntry{entry}, &[_]ToolDetailRecord{detail});
+        defer alloc.free(one);
+        try std.testing.expectEqualStrings(row, std.mem.trim(u8, one, "\n"));
+    }
+
+    // While the newer one still runs, the row says so.
+    const running_entries = [_]TranscriptEntry{ entries[0], reopenEntryForTest(2, "● Opening earlier tool call T2271\n") };
+    details[1].outcome = null;
+    details[1].opened_record = null;
+    const running = try groupTextForTest(alloc, &running_entries, &details);
+    defer alloc.free(running);
+    try std.testing.expectEqualStrings("● Re-reading 2 earlier results", std.mem.trim(u8, running, "\n"));
+}
+
+test "reads of saved calls apart keep their own rows, and a failed one keeps its own" {
+    const alloc = std.testing.allocator;
+    const read = [_]TranscriptEntry{reopenEntryForTest(2, "● Read notes.md\n")};
+    const read_detail = ToolDetailRecord{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"notes.md\"}"), .outcome = .completed };
+    const entries = [_]TranscriptEntry{
+        reopenEntryForTest(1, "● Opened earlier tool call T51\n"),
+        read[0],
+        reopenEntryForTest(3, "● Opened earlier tool call T51\n"),
+        reopenEntryForTest(4, "● Failed earlier tool call T52: read_tool_result failed for handle compacted-T52.txt: ResultHandleNotFound\n"),
+        reopenEntryForTest(5, "● Opened earlier turn M3\n"),
+    };
+    const saved: types.OpenedRecord = .{ .kind = .read, .target = "src/client.rs" };
+    const details = [_]ToolDetailRecord{
+        reopenForTest(1, "{\"handle\":\"T51\"}", .completed, saved),
+        read_detail,
+        reopenForTest(3, "{\"handle\":\"T51\"}", .completed, saved),
+        reopenForTest(4, "{\"handle\":\"T52\"}", .failed, null),
+        reopenForTest(5, "{\"handle\":\"M3\"}", .completed, null),
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    // The same saved call twice, apart, is two rows; the failed read breaks
+    // the run, so the turn after it has its own row too.
+    const rows = std.mem.trim(u8, text, "\n");
+    for ([_][]const u8{
+        "├ Reopened earlier read of client.rs\n",
+        "├ Read notes.md\n",
+        "├ Reopened earlier read of client.rs\n",
+        "├ Couldn't reopen an earlier tool call\n",
+        "└ Reopened an earlier turn",
+    }) |row| try std.testing.expect(std.mem.find(u8, rows, row) != null);
+    try std.testing.expect(std.mem.find(u8, rows, "T5") == null);
+    try std.testing.expect(std.mem.find(u8, rows, "M3") == null);
+}
+
+test "a reopened record's row names its saved call in its own row's words, and Ctrl+O adds the record's ID" {
+    const alloc = std.testing.allocator;
+    const Case = struct { arguments: []const u8, outcome: ?types.ToolOutcomeKind, saved: ?types.OpenedRecord = null, row: []const u8, id: []const u8 };
+    const cases = [_]Case{
+        .{ .arguments = "{\"handle\":\"T51\"}", .outcome = .completed, .saved = .{ .kind = .read, .target = "src/client.rs" }, .row = "Reopened earlier read of client.rs", .id = "T51" },
+        // By a search of the record and by a later page, the same.
+        .{ .arguments = "{\"handle\":\"t7\",\"query\":\"ping\"}", .outcome = .completed, .saved = .{ .kind = .search, .target = "ws.ping" }, .row = "Reopened earlier search for \"ws.ping\"", .id = "T7" },
+        .{ .arguments = "{\"request\":{\"handle\":\"T9\",\"start_byte\":4097}}", .outcome = .completed, .saved = .{ .kind = .run, .target = "git log" }, .row = "Reopened earlier run of git log", .id = "T9" },
+        .{ .arguments = "{\"handle\":\"T11\"}", .outcome = .completed, .saved = .{ .kind = .fetch, .target = "https://agentclientprotocol.com/protocol/v1/prompt-turn" }, .row = "Reopened earlier fetch of prompt-turn · agentclientprotocol.com", .id = "T11" },
+        .{ .arguments = "{\"handle\":\"T12\"}", .outcome = .completed, .saved = .{ .kind = .edit, .target = "src/client.rs" }, .row = "Reopened earlier edit of client.rs", .id = "T12" },
+        .{ .arguments = "{\"handle\":\"T13\"}", .outcome = .completed, .saved = .{ .kind = .write, .target = "src/new.rs" }, .row = "Reopened earlier write of new.rs", .id = "T13" },
+        .{ .arguments = "{\"handle\":\"T14\"}", .outcome = .completed, .saved = .{ .kind = .mcp, .target = "mcp_linear_getIssue" }, .row = "Reopened earlier use of Linear to get issue", .id = "T14" },
+        // An alias that could be another server's tool names none.
+        .{ .arguments = "{\"handle\":\"T15\"}", .outcome = .completed, .saved = .{ .kind = .mcp, .target = "mcp_team_notes_search" }, .row = "Reopened earlier use of an MCP tool", .id = "T15" },
+        // Nothing core could name, a target a row cannot show, a turn, and
+        // an earlier compaction.
+        .{ .arguments = "{\"handle\":\"T16\"}", .outcome = .completed, .row = "Reopened an earlier tool call", .id = "T16" },
+        .{ .arguments = "{\"handle\":\"T17\"}", .outcome = .completed, .saved = .{ .kind = .read, .target = "/" }, .row = "Reopened an earlier tool call", .id = "T17" },
+        .{ .arguments = "{\"handle\":\"m3\"}", .outcome = .completed, .row = "Reopened an earlier turn", .id = "M3" },
+        .{ .arguments = "{\"handle\":\"L2\"}", .outcome = .completed, .row = "Reopened an earlier summary", .id = "L2" },
+        // A turn's record never names a saved call.
+        .{ .arguments = "{\"handle\":\"M4\"}", .outcome = .completed, .saved = .{ .kind = .read, .target = "src/client.rs" }, .row = "Reopened an earlier turn", .id = "M4" },
+        .{ .arguments = "{\"handle\":\"T18\"}", .outcome = null, .row = "Reopening an earlier tool call", .id = "T18" },
+        .{ .arguments = "{\"handle\":\"L3\"}", .outcome = null, .row = "Reopening an earlier summary", .id = "L3" },
+        .{ .arguments = "{\"handle\":\"T19\"}", .outcome = .failed, .row = "Couldn't reopen an earlier tool call", .id = "T19" },
+        .{ .arguments = "{\"handle\":\"M5\"}", .outcome = .failed, .row = "Couldn't reopen an earlier turn", .id = "M5" },
+    };
+    for (cases) |case| {
+        const entries = [_]TranscriptEntry{reopenEntryForTest(1, if (case.outcome == .failed) "● Failed earlier tool call X: not found\n" else "● Opened earlier tool call X\n")};
+        const details = [_]ToolDetailRecord{reopenForTest(1, case.arguments, case.outcome, case.saved)};
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        const row = try std.mem.concat(alloc, u8, &.{ "● ", case.row });
+        defer alloc.free(row);
+        try std.testing.expectEqualStrings(row, std.mem.trim(u8, text, "\n"));
+        var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, 120, null);
+        defer projection.deinit(alloc);
+        const full = try std.mem.concat(alloc, u8, &.{ case.row, " (", case.id, ")" });
+        defer alloc.free(full);
+        try std.testing.expect(std.mem.endsWith(u8, projection.entry_actions.items[0].override.bytes, full));
+    }
+}
+
+test "a reopened run names its command by the short form the command's own row shows" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "git log --oneline",
+        "cd /repo && zig build test 2>&1 | tail -20",
+        "cat > notes.md <<'EOF'\nThe model's notes\nEOF\nwc -l notes.md",
+    }) |command| {
+        const arguments = try std.json.Stringify.valueAlloc(alloc, .{ .action = "run", .command = command }, .{});
+        defer alloc.free(arguments);
+        // Core's row folds the command onto one line.
+        const display = try alloc.dupe(u8, command);
+        defer alloc.free(display);
+        std.mem.replaceScalar(u8, display, '\n', ' ');
+        const status = try std.mem.concat(alloc, u8, &.{ "● Ran ", display, "\n" });
+        defer alloc.free(status);
+        var live_details = [_]ToolDetailRecord{storyCommandDetail(1, arguments, 0, null)};
+        live_details[0].command_display = display;
+        const live = try groupTextForTest(alloc, &[_]TranscriptEntry{reopenEntryForTest(1, status)}, &live_details);
+        defer alloc.free(live);
+        // The command's row ends with how it exited, which a reopened row
+        // does not repeat.
+        const live_row = withoutSuffix(std.mem.trim(u8, live, "\n"), " ✓") orelse return error.TestExpectedExitMark;
+        const short = withoutPrefix(live_row, "● Ran ") orelse return error.TestExpectedRanRow;
+
+        const details = [_]ToolDetailRecord{reopenForTest(1, "{\"handle\":\"T3\"}", .completed, .{ .kind = .run, .target = command })};
+        const text = try groupTextForTest(alloc, &[_]TranscriptEntry{reopenEntryForTest(1, "● Opened earlier tool call T3\n")}, &details);
+        defer alloc.free(text);
+        const row = try std.mem.concat(alloc, u8, &.{ "● Reopened earlier run of ", short });
+        defer alloc.free(row);
+        try std.testing.expectEqualStrings(row, std.mem.trim(u8, text, "\n"));
+    }
+}
+
+test "a reopened record's saved call reaches its row terminal-safe" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{reopenEntryForTest(1, "● Opened earlier tool call T1\n")};
+    for ([_]types.OpenedRecord{
+        .{ .kind = .read, .target = "src/\x1b[31mred\x07.rs" },
+        .{ .kind = .search, .target = "\x1b]8;;x\x1b\\\"quoted\" ping\r\n" },
+        .{ .kind = .run, .target = "printf '\x1b[2J'; ls" },
+        .{ .kind = .mcp, .target = "mcp_\x1b[0m_x" },
+    }) |saved| {
+        const details = [_]ToolDetailRecord{reopenForTest(1, "{\"handle\":\"T1\"}", .completed, saved)};
+        const painted = try paintedGroupForTest(alloc, &entries, &details, 120);
+        defer alloc.free(painted);
+        var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, 120, null);
+        defer projection.deinit(alloc);
+        for ([_][]const u8{ painted, projection.entry_actions.items[0].override.bytes }) |shown| {
+            try std.testing.expect(std.mem.find(u8, shown, "Reopened earlier ") != null);
+            for ([_][]const u8{ "\x1b[31m", "\x07", "\x1b]8", "\x1b\\", "\x1b[2J", "\x1b[0m_", "\r" }) |sequence| {
+                try std.testing.expect(std.mem.find(u8, shown, sequence) == null);
+            }
+        }
+    }
+}
+
+test "a reopened record's row fits a narrow terminal, with wide and combining characters" {
+    const alloc = std.testing.allocator;
+    const fold_entries = [_]TranscriptEntry{
+        reopenEntryForTest(1, "● Opened earlier tool call T2270\n"),
+        reopenEntryForTest(2, "● Opened earlier tool call T2271\n"),
+    };
+    const fold_details = [_]ToolDetailRecord{
+        reopenForTest(1, "{\"handle\":\"T2270\"}", .completed, .{ .kind = .read, .target = "src/日本語ファイル.rs" }),
+        reopenForTest(2, "{\"handle\":\"T2271\"}", .completed, .{ .kind = .search, .target = "cafe\u{301} ws.ping" }),
+    };
+    const fold_row = "● Re-read 2 earlier results from before compaction";
+    for ([_]u16{ 120, 40, 24 }) |cols| {
+        for ([_]struct { entries: []const TranscriptEntry, details: []const ToolDetailRecord, row: []const u8 }{
+            .{ .entries = &fold_entries, .details = &fold_details, .row = fold_row },
+            .{ .entries = fold_entries[0..1], .details = fold_details[0..1], .row = "● Reopened earlier read of 日本語ファイル.rs" },
+            .{ .entries = fold_entries[1..], .details = fold_details[1..], .row = "● Reopened earlier search for \"cafe\u{301} ws.ping\"" },
+        }) |case| {
+            const painted = try paintedGroupForTest(alloc, case.entries, case.details, cols);
+            defer alloc.free(painted);
+            // Painting checks that each row fits in `cols`, so nothing wraps.
+            const lines = try visibleLinesForTest(alloc, painted, cols);
+            defer alloc.free(lines);
+            const shown = firstLineForTest(lines);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(shown));
+            if (display_width.visibleWidthIgnoringAnsi(case.row) <= cols) {
+                try std.testing.expectEqualStrings(case.row, shown);
+            } else {
+                // Cut at the edge with an ellipsis, never inside a character.
+                const kept = withoutSuffix(shown, "…") orelse return error.TestExpectedEllipsis;
+                try std.testing.expect(std.mem.startsWith(u8, case.row, std.mem.trimEnd(u8, kept, " ")));
+            }
+        }
     }
 }
 
@@ -5120,7 +5429,7 @@ fn collectStoryRows(
             try unshown.put(scratch, entry_id, {});
             continue :calls;
         };
-        const identity = try savedOutputIdentity(scratch, entry, detail, details, output_sources, try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try statusFileIdentity(scratch, entry, detail, try fetchIdentity(scratch, entry, detail, try storyIdentity(scratch, detail))))));
+        const identity = try reopenedRecordIdentity(scratch, detail, try savedOutputIdentity(scratch, entry, detail, details, output_sources, try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try statusFileIdentity(scratch, entry, detail, try fetchIdentity(scratch, entry, detail, try storyIdentity(scratch, detail)))))));
         // A call whose arguments have not arrived yet waits in the row it
         // will most likely join, and shows once they arrive.
         if (identity.kind == .single) if (detail) |record| if (record.outcome == null and (!storyHasArgs(record) or joinsByArgument(record))) {
@@ -5134,11 +5443,12 @@ fn collectStoryRows(
             }
         };
 
-        // A repeated command joins only the row right before it; the other
-        // kinds join the first row they share, wherever it is.
+        // A repeated command and a reopened record join only the row right
+        // before them; the other kinds join the first row they share,
+        // wherever it is.
         const candidates: []StoryRow = switch (identity.kind) {
             .single, .commands => rows.items[0..0],
-            .command => rows.items[rows.items.len -| 1..],
+            .command, .reopened => rows.items[rows.items.len -| 1..],
             else => rows.items,
         };
         const target = for (candidates) |*row| {
@@ -5261,7 +5571,9 @@ fn repeatKey(scratch: std.mem.Allocator, row: *const StoryRow) !?[]const u8 {
     const record = row.detail orelse return null;
     if (record.activity_kind == .subagent and !isSubagentMessage(scratch, record)) return null;
     switch (row.identity.kind) {
-        .read, .more_output, .search, .fetch, .edit, .subagent_wait => return null,
+        // Reopened records share a row only when one comes right after the
+        // other.
+        .read, .more_output, .search, .fetch, .edit, .subagent_wait, .reopened => return null,
         // A command, read, search, or change whose arguments do not name
         // what it ran or touched may not be the same call, so it keeps its
         // own row, and so does any call with no usable arguments.
@@ -5390,7 +5702,7 @@ fn sessionRunRow(rows: []StoryRow, follow_up: *const ToolDetailRecord) ?*StoryRo
 fn sharesStoryRow(row: StoryIdentity, identity: StoryIdentity) bool {
     if (row.kind != identity.kind) return false;
     return switch (identity.kind) {
-        .read, .more_output => true,
+        .read, .more_output, .reopened => true,
         .search => std.mem.eql(u8, storySearchTool(row.key), storySearchTool(identity.key)),
         .output_search => std.mem.eql(u8, outputSearchSource(row.key), outputSearchSource(identity.key)),
         .fetch => std.mem.eql(u8, fetchKeyHost(row.key), fetchKeyHost(identity.key)),
@@ -5524,7 +5836,8 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         // One page fetched again, which a joined row counts the same way.
         .fetch => try countNote(scratch, " · ", row.count, " calls"),
         .edit => try countNote(scratch, " · ", row.count, if (row.writes == 0) " edits" else if (row.writes == row.count) " writes" else " changes"),
-        .single, .subagent, .subagent_wait, .commands => "",
+        // A row of reopened records says how many it holds in its phrase.
+        .single, .subagent, .subagent_wait, .commands, .reopened => "",
     };
     return .{
         .display = if (suffix.len == 0) display else try std.mem.concat(scratch, u8, &.{ display, suffix }),
@@ -7948,9 +8261,14 @@ fn formatExpandedChild(
         raw_phrase,
         detail,
     ) orelse raw_phrase;
+    // A reopened record keeps its row's words and adds the record's ID.
+    const reopened = if (detail) |record| try reopenedCall(scratch, record) else null;
     // Expanded rows carry no ambient text style, so tokens highlight over the
     // terminal default foreground.
-    const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, "") orelse phrase;
+    const display_phrase = if (reopened) |call|
+        try std.mem.concat(scratch, u8, &.{ call.phrase, " (", call.id, ")" })
+    else
+        try highlightCommandPhrase(scratch, phrase, detail, "") orelse phrase;
     const marker = statusMarker(entry);
     // A colored mark ends its color before the phrase.
     const marker_reset = if (findByte(marker, 0x1b) != null and

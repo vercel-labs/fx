@@ -310,7 +310,7 @@ manager:
   `context_note` (D93), `runtime_context` (D94), `toolbox_menu` and
   `toolbox_noted` (D103), `model_call` (D96),
   `mcp_bridge_call` (D99), `cancelled_command` (D100), `subagent_started`
-  (D101), `cancelled_wait` (D102), `turn_end` (files
+  (D101), `cancelled_wait` (D102), `opened_record` (D104), `turn_end` (files
   and turn summary), `interruption` (reason detail, partial text, command
   refs, origin), `recovery`, `model_recovery` (a model request's recovery
   status, for reading the log), `workspace_capture` (D98) and `continues`.
@@ -2290,6 +2290,40 @@ cached prompt prefix):
   **Alternative:** keep the menu only in memory, which every resume, `fx ask
   --resume` and ACP `session/load` rebuild; or derive what a change note told
   from its text, which the note does not hold in full.
+
+Settled for reopened records (2026-11-28, so a resumed row names a saved call
+as the live row did):
+- **D104 Decision:** when a `read_tool_result` call reopens a tool call
+  record that compaction saved (`T<n>`), by its ID, a search of it, or a
+  later page, the turn saves an `opened_record` item right after the call's
+  `tool_result`: `{"call_id":…,"kind":"read","target":"src/client.rs"}`, what
+  the saved call did and the one argument that names it. A resume then reads
+  the call's row as live, `Reopened earlier read of client.rs`.
+  - **Write:** the tool reads the head of the same record, at most 8 KiB, to
+    find the saved call's tool and arguments, and reports the kind and target
+    beside its result; the result the model reads keeps its bytes. The item
+    goes out in the same batch as the `tool_result` it follows, so it takes
+    the session's lock with it (`tests/tla/session/SessionWrite.tla`). Every
+    host saves it. A head with no whole arguments, a call no row names, or a
+    target over 1 KiB saves no item.
+  - **Reading:** the replay gives the item to the turn's `read_tool_result`
+    result of that call. An item it can't read, with a kind it does not
+    know, or one that names no such result of the turn, is left out with a
+    trace line, and the row reads `Reopened an earlier tool call`.
+  - **Older sessions:** a session saved before D104 has no item, so its rows
+    read `Reopened an earlier tool call`; fx reads no record on resume.
+  - **Not in the journal or checkpoints:** their codec rejects a key it
+    does not know, as for D102.
+  - **Older fx:** an fx from before D104 leaves the item out (D17).
+
+  **Why:** the result the model reads holds the record's first line only
+  when the read starts at its first byte, and that line joins every argument
+  into one, so neither a resume nor a later page could name the saved call.
+  **Alternative:** a new field in the `tool_result` piece, which an older
+  fx's strict reader rejects with the whole session; reading the record
+  again on resume, which reads the disk for every reopened record before
+  the transcript shows; or the record's first line alone, which reads `run
+  git log /repo` for a shell call and `ws.ping src` for a search.
 
 ## Design Risks And Failure Behavior
 

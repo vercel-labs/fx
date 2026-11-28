@@ -3366,6 +3366,53 @@ test "a subagent message's start mark reaches its detail live and on resume" {
     try std.testing.expect(runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.subagent_started);
 }
 
+test "what a reopened record's saved call did reaches its detail live and on resume (D104)" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const call: types.ToolCall = .{ .id = "resumed-open", .name = "read_tool_result", .arguments_json = "{\"handle\":\"T51\"}" };
+    for ([_]?types.OpenedRecord{ .{ .kind = .read, .target = "src/client.rs" }, null }) |saved| {
+        const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Opened earlier tool call T51", true);
+        try runtime.attachHistoricalToolDetail(alloc, entry_id, call, .read, .{
+            .tool_call_id = @constCast("resumed-open"),
+            .tool_name = @constCast("read_tool_result"),
+            .status = .success,
+            .output = @constCast("T51 read_file: src/client.rs"),
+            .output_bytes = 28,
+            .stored_output_bytes = 28,
+            .opened_record = saved,
+        });
+        const restored = runtime.toolDetailForEntry(entry_id).?.opened_record;
+        if (saved) |value| {
+            try std.testing.expectEqual(value.kind, restored.?.kind);
+            try std.testing.expectEqualStrings(value.target, restored.?.target);
+            // A copy, which the detail owns.
+            try std.testing.expect(restored.?.target.ptr != value.target.ptr);
+        } else try std.testing.expect(restored == null);
+    }
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "live-open" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_tool_result",
+        .activity_kind = .read,
+        .arguments_json = "{\"handle\":\"T52\"}",
+    } });
+    try std.testing.expect(runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.opened_record == null);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Opened earlier tool call T52" },
+        .result = "T52 shell: run git log",
+        .result_memory = .{ .opened_record = .{ .kind = .run, .target = "git log" } },
+    } });
+    const live = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.opened_record.?;
+    try std.testing.expectEqual(types.OpenedRecord.Kind.run, live.kind);
+    try std.testing.expectEqualStrings("git log", live.target);
+}
+
 /// The file a saved call read or changed, as its result names it with
 /// symlinks followed: a committed change's (`changedPathOfResult`), or a
 /// completed read_file's (`readPathOfResult`). Null for any other call. A
@@ -4874,6 +4921,7 @@ const PendingToolDetailTerminal = struct {
     command_output_entry_id: ?u32 = null,
     command_process_entry: ?PendingCommandProcessEntry = null,
     subagent_started: bool = false,
+    opened_record: ?types.OpenedRecord = null,
     command_placement: ?types.CommandPlacement = null,
 
     fn deinit(self: *PendingToolDetailTerminal, alloc: Allocator) void {
@@ -4885,6 +4933,7 @@ const PendingToolDetailTerminal = struct {
             types.freeCommandOutputReplay(alloc, replay);
         }
         if (self.command_process_entry) |*entry| entry.deinit(alloc);
+        types.freeOpenedRecord(alloc, self.opened_record);
         self.* = .{};
     }
 };
@@ -7036,6 +7085,7 @@ pub const TranscriptRuntime = struct {
                 .command_process_presentation = result.command_process_presentation,
                 .terminal_action_presentation = result.terminal_action_presentation,
                 .subagent_started = result.subagent_started,
+                .opened_record = result.opened_record,
             },
             command_artifact_handle,
             if (deferred or permission_denied) null else command_output_entry_id,
@@ -7379,6 +7429,7 @@ pub const TranscriptRuntime = struct {
         else
             null;
         pending.subagent_started = if (result_memory) |memory| memory.subagent_started else false;
+        pending.opened_record = try types.dupeOpenedRecord(alloc, if (result_memory) |memory| memory.opened_record else null);
         pending.command_placement = if (result_memory) |memory| memory.command_placement else null;
         pending.command_output_entry_id = if (activity_kind == .command)
             command_output_entry_id_override orelse
@@ -7443,6 +7494,11 @@ pub const TranscriptRuntime = struct {
         }
         detail.command_process_presentation = pending.command_process_presentation;
         detail.subagent_started = pending.subagent_started;
+        if (pending.opened_record) |owned| {
+            types.freeOpenedRecord(alloc, detail.opened_record);
+            detail.opened_record = owned;
+            pending.opened_record = null;
+        }
         if (pending.command_placement) |placement| detail.command_placement = placement;
         if (activity_kind == .command) {
             detail.command_output_entry_id = pending.command_output_entry_id;

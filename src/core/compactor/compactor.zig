@@ -91,6 +91,11 @@ pub fn recordFile(buffer: *RecordFileBuffer, text: []const u8) ?[]const u8 {
     return records.fileName(buffer, records.parseId(text) orelse return null);
 }
 
+/// The tool call a saved `T<n>` record holds, from the first bytes of its
+/// file, or null for any other record or a head cut short.
+pub const RecordedToolCall = summarize.RecordedToolCall;
+pub const recordedToolCall = summarize.recordedToolCall;
+
 /// Searches every saved turn, tool call and earlier compaction, and older
 /// conversation archives, for 1 to `max_search_phrases` phrases. Caller owns
 /// the text.

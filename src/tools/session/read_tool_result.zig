@@ -9,6 +9,7 @@ const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const compactor = @import("../../core/compactor/compactor.zig");
 const read_result_presentation = @import("../../core/tooling/read_tool_result_presentation.zig");
+const types = @import("../../core/shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -24,6 +25,9 @@ pub const Input = struct {
         /// context compaction.
         search: [][]u8,
     } = .{ .range = .{} },
+    /// `handle` is the file of a record compaction saved, which `validate`
+    /// found for its ID.
+    opens_record: bool = false,
 
     pub fn deinit(self: *Input, alloc: Allocator) void {
         alloc.free(self.handle);
@@ -143,6 +147,7 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
         const owned = try ctx.allocator.dupe(u8, file);
         ctx.allocator.free(input.handle);
         input.handle = owned;
+        input.opens_record = true;
         return null;
     }
     if (normalization.suffix.len > 0 or !std.mem.eql(u8, input.handle, normalization.trimmed)) {
@@ -192,7 +197,40 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     const output = readOutput(ctx, input) catch |err| {
         return .{ .failure = try formatReadFailure(ctx.allocator, input.handle, err) };
     };
+    errdefer ctx.allocator.free(output);
+    if (input.opens_record) if (ctx.session_child_capability) |capability| try reportOpenedRecord(ctx, capability, input.handle);
     return .{ .success = output };
+}
+
+/// The most bytes of a record `reportOpenedRecord` reads: its index line, the
+/// call's id, and arguments of any common call.
+const max_record_head_bytes = 8 * 1024;
+
+/// Reports what the saved call a record holds did, read from the record's
+/// head, so the call's row can say it live and after a resume (D104). The
+/// result the model reads does not change. A head that names no call, or
+/// one fx cannot read, leaves the row without a name.
+fn reportOpenedRecord(
+    ctx: tool_dispatch.DispatchContext,
+    capability: *session_child_store.SessionChildCapability,
+    file: []const u8,
+) Allocator.Error!void {
+    if (ctx.tool_result_memory_sink == null) return;
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const head = result_store.compactorStore(capability).read(arena, file, max_record_head_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // The record was just read whole, so this is rare, and the store
+        // traces a failure other than a missing file. The row only goes
+        // without the saved call's name.
+        else => return,
+    };
+    const record = try read_result_presentation.openedRecord(arena, head) orelse return;
+    tool_dispatch.reportToolResultMemory(ctx, .{ .opened_record = .{
+        .kind = record.kind,
+        .target = try ctx.allocator.dupe(u8, record.target),
+    } });
 }
 
 fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
@@ -431,6 +469,7 @@ const max_fuzz_request_text_bytes: usize = 16 * 1024;
 fn fuzzRequestText(_: void, smith: *std.testing.Smith) !void {
     var buffer: [max_fuzz_request_text_bytes + 1]u8 = undefined;
     const text = buffer[0..smith.slice(&buffer)];
+    try expectBoundedOpenedRecord(text);
     // Text that is not UTF-8 fails the argument parse before request is read.
     if (!std.unicode.utf8ValidateSlice(text)) return;
 
@@ -513,8 +552,22 @@ test "read_tool_result requests sent as JSON text decode and label alike" {
             "{\"handle\":\"t5\",\"x\":1,\"x\":2}",
             "{\"h\\u0061ndle\":\"result-\\u0078\",\"query\":\"e\"}",
             "{\"handle\":\"" ++ text_utils.repeat("\\u0078", 1030) ++ "\"}",
+            // Heads of saved records a call reopens (D104).
+            "T51 grep_files: ws.ping src\nCall ID: c\n\nArguments:\n{\"pattern\":\"ws.ping\",\"path\":\"src\"}\n\nResult:\nx",
+            "T9 toolbox: web_fetch\nCall ID: c\n\nArguments:\n{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"https://example.com\"}}\n\nResult:\n",
         }) ++ @import("fuzz_corpus").read_tool_result_request_text.*),
     });
+}
+
+/// The same bytes read as the head of a saved record a call reopens
+/// (D104): a call it names is one the head holds, named by a target within
+/// the limit a saved session keeps.
+fn expectBoundedOpenedRecord(head: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const record = try read_result_presentation.openedRecord(arena_state.allocator(), head) orelse return;
+    try std.testing.expect(compactor.recordedToolCall(head) != null);
+    try std.testing.expect(types.OpenedRecord.validTarget(record.target));
 }
 
 test "read_tool_result treats exact empty legacy query as range" {
@@ -848,4 +901,85 @@ test "read_tool_result opens and searches turns and tool calls saved by compacti
             return error.TestExpectedDecodeFailure;
         },
     };
+}
+
+/// Runs one `read_tool_result` call through decode, validate, and call, and
+/// returns its text with the memory it reported. Free both.
+fn runForTest(ctx: tool_dispatch.DispatchContext, args: []const u8) !struct { text: []u8, memory: ?types.ToolResultMemory } {
+    const alloc = ctx.allocator;
+    var memory: ?types.ToolResultMemory = null;
+    var with_sink = ctx;
+    with_sink.tool_result_memory_sink = &memory;
+    const input = switch (try decode(with_sink, args)) {
+        .input => |value| value,
+        .failure => |text| {
+            alloc.free(text);
+            return error.TestUnexpectedDecodeFailure;
+        },
+    };
+    defer input.deinit(alloc);
+    if (try validate(with_sink, input)) |text| {
+        alloc.free(text);
+        return error.TestUnexpectedValidationFailure;
+    }
+    return switch (try call(with_sink, input)) {
+        .success => |text| .{ .text = text, .memory = memory },
+        else => |result| {
+            result.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+}
+
+test "a reopened tool call record reports what the saved call did, and the model reads the same text (D104)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, dir, .tool_results, .writable);
+    defer capability.deinit();
+    const saved = [_]struct { []const u8, []const u8 }{
+        .{ "T2270", "T2270 read_file: src/client.rs\nCall ID: c1\n\nArguments:\n{\"path\":\"src/client.rs\"}\n\nResult:\nfn keepalive() { ws.ping(); }\n" },
+        .{ "T2271", "T2271 grep_files: ws.ping src\nCall ID: c2\n\nArguments:\n{\"pattern\":\"ws.ping\",\"path\":\"src\"}\n\nResult:\nsrc/client.rs:1: ws.ping\n" },
+        .{ "T9", "T9 subagent: message scout\nCall ID: c3\n\nArguments:\n{\"action\":\"message\",\"agent\":\"scout\"}\n\nResult:\nsent\n" },
+        .{ "M3", "M3 turn: run the tests\nUser 3:\nrun the tests\n\nAssistant, final reply:\nThey pass.\n" },
+    };
+    for (saved) |record| {
+        const id, const content = record;
+        var name: compactor.RecordFileBuffer = undefined;
+        var entry = try capability.atomicReplace(alloc, .tool_results, compactor.recordFile(&name, id).?, content);
+        entry.deinit(alloc);
+    }
+    const ctx: tool_dispatch.DispatchContext = .{ .allocator = alloc, .session_child_capability = &capability };
+    const Case = struct { args: []const u8, kind: ?types.OpenedRecord.Kind = null, target: []const u8 = "" };
+    const cases = [_]Case{
+        .{ .args = "{\"handle\":\"T2270\"}", .kind = .read, .target = "src/client.rs" },
+        .{ .args = "{\"handle\":\"t2271\",\"query\":\"ws.ping\"}", .kind = .search, .target = "ws.ping" },
+        // A later page does not hold the record's first line.
+        .{ .args = "{\"request\":{\"handle\":\"T2270\",\"start_byte\":40}}", .kind = .read, .target = "src/client.rs" },
+        .{ .args = "{\"handle\":\"T9\"}" },
+        .{ .args = "{\"handle\":\"M3\"}" },
+    };
+    for (cases) |case| {
+        const reported = try runForTest(ctx, case.args);
+        defer alloc.free(reported.text);
+        defer if (reported.memory) |memory| types.freeToolResultMemory(alloc, memory);
+        if (case.kind) |kind| {
+            const memory = reported.memory orelse return error.TestExpectedResultMemory;
+            const opened = memory.opened_record orelse return error.TestExpectedOpenedRecord;
+            try std.testing.expectEqual(kind, opened.kind);
+            try std.testing.expectEqualStrings(case.target, opened.target);
+        } else {
+            try std.testing.expect(reported.memory == null);
+        }
+        // Without a sink the call reports nothing and the text is the same.
+        const decoded = try decode(ctx, case.args);
+        const input = decoded.input;
+        defer input.deinit(alloc);
+        try std.testing.expect(try validate(ctx, input) == null);
+        const plain = try call(ctx, input);
+        defer plain.deinit(alloc);
+        try std.testing.expectEqualStrings(plain.success, reported.text);
+    }
 }

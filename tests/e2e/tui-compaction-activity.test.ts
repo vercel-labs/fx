@@ -1658,3 +1658,216 @@ describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live
     }
   }, 300_000);
 });
+
+// After a compaction the model reopens saved calls by their IDs. Each row
+// says what the saved call did, from the record's head, and never its ID,
+// which only Ctrl+O shows.
+const REOPEN_HANDOFF = "Facts:\nF1: REOPEN_ROWS_HANDOFF_3f0b: the user seeded three saved calls.";
+type ReopenCall = { id: string; name: string; input: Record<string, unknown> };
+type ReopenTurn = { prompt: string; done: string; calls: ReopenCall[]; rows: string[]; full: string[] };
+const REOPEN_SEED: ReopenTurn = {
+  prompt: "Seed the saved calls.", done: "SEED_ROWS_DONE_0a1", rows: [], full: [],
+  calls: [
+    { id: "seed-read", name: "read_file", input: { path: "src/client.rs" } },
+    { id: "seed-grep", name: "grep_files", input: { pattern: "ws.ping", path: "src" } },
+    { id: "seed-log", name: "shell", input: { action: "run", command: "git log --oneline" } },
+    // Large outputs, so the compaction cannot keep the turn. No later turn
+    // opens them, so Ctrl+O's last pages stay short.
+    { id: "seed-bulk-1", name: "read_file", input: { path: "bulk-1.txt" } },
+    { id: "seed-bulk-2", name: "read_file", input: { path: "bulk-2.txt" } },
+  ],
+};
+// A compaction keeps the newest turn, so the seed turn needs one after it.
+const REOPEN_NOTE: ReopenTurn = { prompt: "Note the seed.", done: "NOTE_ROWS_DONE_5f6", rows: [], full: [], calls: [] };
+const REOPEN_TURNS: ReopenTurn[] = [
+  {
+    // Two reads next to each other share one row; Ctrl+O names each.
+    prompt: "Reopen two.", done: "FOLD_ROWS_DONE_1b2",
+    calls: [
+      { id: "fold-read", name: "read_tool_result", input: { handle: "T1" } },
+      { id: "fold-grep", name: "read_tool_result", input: { handle: "T2" } },
+    ],
+    rows: ["● Re-read 2 earlier results from before compaction"],
+    full: ["● Reopened earlier read of client.rs (T1)", "● Reopened earlier search for \"ws.ping\" (T2)"],
+  },
+  {
+    prompt: "Reopen by query.", done: "QUERY_ROWS_DONE_2c3",
+    calls: [{ id: "query-grep", name: "read_tool_result", input: { handle: "T2", query: "ws.ping" } }],
+    rows: ["● Reopened earlier search for \"ws.ping\""],
+    full: ["● Reopened earlier search for \"ws.ping\" (T2)"],
+  },
+  {
+    // A later page does not hold the record's first line.
+    prompt: "Reopen a later page.", done: "PAGE_ROWS_DONE_3d4",
+    calls: [{ id: "page-log", name: "read_tool_result", input: { handle: "T3", start_byte: 30 } }],
+    // The command's short form, as its own row showed it: "Ran git log --oneline".
+    rows: ["● Reopened earlier run of git log --oneline"],
+    full: ["● Reopened earlier run of git log --oneline (T3)"],
+  },
+  {
+    prompt: "Reopen the turn.", done: "TURN_ROWS_DONE_4e5",
+    calls: [{ id: "turn-open", name: "read_tool_result", input: { handle: "M1" } }],
+    rows: ["● Reopened an earlier turn"],
+    full: ["● Reopened an earlier turn (M1)"],
+  },
+];
+
+/// The rows between a turn's prompt and its reply.
+function reopenTurnRows(text: string, turn: ReopenTurn): string[] {
+  const rows = text.split("\n").map((row) => row.trimEnd()).filter((row) => row !== "");
+  const start = rows.findLastIndex((row) => row === `┃ ${turn.prompt}`);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const end = rows.findIndex((row, index) => index > start && row.includes(turn.done));
+  expect(end).toBeGreaterThan(start);
+  return rows.slice(start + 1, end);
+}
+
+/// `row` as a terminal `cols` wide shows it: whole, or cut short with an
+/// ellipsis.
+function expectRowFits(shown: string, row: string, cols: number) {
+  expect(shown.length).toBeLessThanOrEqual(cols);
+  if (shown === row) return;
+  expect(shown.endsWith("…")).toBe(true);
+  expect(row.startsWith(shown.slice(0, -1).trimEnd())).toBe(true);
+}
+
+async function reopenSavedCalls(cols: number) {
+  const root = mkdtempSync(join(tmpdir(), "fx-reopen-rows-"));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(workspace, "src"), { recursive: true });
+  writeFileSync(join(workspace, "src", "client.rs"), "fn keepalive() { ws.ping(); }\n");
+  const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=Example", "-c", "user.email=example@example.com", ...args], { cwd: workspace, stdio: "ignore" });
+  git("init", "-q");
+  git("commit", "-q", "--allow-empty", "-m", "Add the client");
+  for (const name of ["bulk-1.txt", "bulk-2.txt"]) {
+    writeFileSync(join(workspace, name), "history alpha beta gamma delta sample line and some more words here\n".repeat(390));
+  }
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false, sandbox: "none" }));
+  const seedReply = REOPEN_SEED.done;
+  const turns = [REOPEN_SEED, REOPEN_NOTE, ...REOPEN_TURNS];
+  const gateway = startDynamicFakeGateway((raw) => {
+    const request = JSON.parse(raw);
+    const summary = (request.toolChoice?.type === "none" && request.tools?.length === 0) ||
+      raw.includes("Write the compaction notes") || raw.includes("Your notes on the turns above left some out");
+    if (summary) return fakeGatewayFinalText(REOPEN_HANDOFF);
+    // Each prompt comes after the one before, so the newest one the request
+    // holds is the turn it is for.
+    const turn = turns.findLast((candidate) => raw.includes(candidate.prompt));
+    if (!turn) return new Response("unexpected request", { status: 500 });
+    if (turn.calls.length > 0 && !raw.includes(`"${turn.calls[0]!.id}"`)) {
+      return fakeGatewaySse([
+        ...turn.calls.map((call) => ({ type: "tool-call", toolCallId: call.id, toolName: call.name, input: call.input })),
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]);
+    }
+    // No reply reports usage, since fx would scale its size estimates by it
+    // and then find nothing to compact.
+    return fakeGatewaySse([
+      { type: "text-delta", id: "answer_1", delta: turn === REOPEN_SEED ? seedReply : turn.done },
+      { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+    ]);
+  // A window small enough that the seed turn does not fit in what a
+  // compaction keeps, so its calls become records.
+  }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
+  const env = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+    TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-reopen-key",
+    FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_WORKSPACE_TRUST: "1", FX_PERMISSION_MODE: "full-access",
+    FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
+    FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  const stderrPaths: string[] = [];
+  let terminal: InstanceType<typeof TmuxSession> | undefined;
+  async function launch(args: string) {
+    const stderrPath = join(root, `terminal-${stderrPaths.length + 1}.stderr`);
+    stderrPaths.push(stderrPath);
+    const command = `/usr/bin/env -i ${Object.entries(env).map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)} ${args}`;
+    terminal = await TmuxSession.create({
+      cmd: command, cwd: workspace, env: { HOME: home, FX_SOUND: "0" }, isolated: true,
+      stderrPath, width: cols, height: 90, startupWaitMs: 0,
+    });
+    await terminal.waitForStableComposer(20_000);
+    return terminal;
+  }
+  // A turn has ended once its summary line shows after its reply.
+  const settled = (done: string) => (pane: string) => pane.includes(done) && hasEmptyComposer(pane) && turnSettled(pane) &&
+    /^  (?:[^\n]* · )?\d+s(?: \(↑[^\n]*\))?$/m.test(pane.slice(pane.lastIndexOf(done)));
+  let passed = false;
+  try {
+    const live = await launch("");
+    await live.sendText(REOPEN_SEED.prompt);
+    await live.waitForPane(settled(REOPEN_SEED.done), 20_000);
+    await live.sendText(REOPEN_NOTE.prompt);
+    await live.waitForPane(settled(REOPEN_NOTE.done), 20_000);
+    await live.sendText("/compact");
+    await live.waitForPane((pane) => compactedSeconds(pane).length === 1 && hasEmptyComposer(pane), 20_000);
+    for (const turn of REOPEN_TURNS) {
+      await live.sendText(turn.prompt);
+      await live.waitForPane(settled(turn.done), 20_000);
+    }
+    const liveText = await live.captureFullScrollback();
+    await live.sendKeys("C-o");
+    await live.waitForText("esc close", 5000);
+    await live.sendKeys("End");
+    const last = REOPEN_TURNS.at(-1)!.done;
+    let page = await live.waitForPane((pane) => pane.includes(last) && pane.includes("esc close"), 5000);
+    // Page up from the end until the first reopening turn's prompt shows.
+    const pages = [page];
+    while (!page.includes(`┃ ${REOPEN_TURNS[0]!.prompt}`) && pages.length < 40) {
+      await live.sendKeys("PageUp");
+      const before = page;
+      page = await live.waitForPane((pane) => pane !== before, 5000);
+      pages.unshift(page);
+    }
+    const full = pages.join("\n").replace(/\s+/g, " ");
+    await live.sendKeys("C-o");
+    await live.waitForComposer(5000);
+    await live.sendText("/quit");
+    expect(await live.waitForSessionEnd(10_000)).toBe(true);
+    await live.kill();
+
+    const resumed = await launch("--resume last");
+    await resumed.waitForPane(settled(last), 20_000);
+    const resumedText = await resumed.captureFullScrollback();
+    await resumed.sendText("/quit");
+    expect(await resumed.waitForSessionEnd(10_000)).toBe(true);
+    for (const path of stderrPaths) expect(readFileSync(path, "utf8")).toBe("");
+    const rows = REOPEN_TURNS.map((turn) => ({
+      turn, live: reopenTurnRows(liveText, turn), resumed: reopenTurnRows(resumedText, turn),
+    }));
+    passed = true;
+    return { rows, full };
+  } finally {
+    if (!passed) {
+      if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
+      console.error(`reopened record rows evidence retained: ${root}`);
+    }
+    await terminal?.kill();
+    gateway.stop();
+    if (passed) rmSync(root, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!tmuxAvailable())("tui: saved calls reopened after a compaction", () => {
+  for (const cols of [120, 40]) {
+    test(`at ${cols} columns each row says what the saved call did, live and after resume, and Ctrl+O adds its ID`, async () => {
+      const { rows, full } = await reopenSavedCalls(cols);
+      for (const { turn, live, resumed } of rows) {
+        console.log(`${cols} cols, ${turn.prompt}: live ${JSON.stringify(live)} resumed ${JSON.stringify(resumed)}`);
+      }
+      console.log(`${cols} cols, Ctrl+O: ${JSON.stringify(full.match(/● (?:Opened|Opening|Reopened|Reopening|Re-read)[^●┃]*/g))}`);
+      for (const { turn, live, resumed } of rows) {
+        expect(live).toHaveLength(turn.rows.length);
+        live.forEach((shown, index) => expectRowFits(shown, turn.rows[index]!, cols));
+        expect(resumed).toEqual(live);
+        for (const line of turn.full) expect(full).toContain(line);
+      }
+      expect(full).not.toContain("tool call T");
+    }, 120_000);
+  }
+});
