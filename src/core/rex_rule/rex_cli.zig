@@ -98,13 +98,13 @@ pub const Cli = struct {
             .deadline_at_ms = io_mod.awakeMilliTimestamp() +| budget_ms,
             .cancel = self.cancel,
         };
-        var watcher = std.Thread.spawn(.{}, Watch.run, .{&watch}) catch |err| {
-            traceFailure("watch thread", err);
+        var watcher = io.concurrent(Watch.run, .{&watch}) catch |err| {
+            traceFailure("watch task", err);
             return null;
         };
         const bytes = readBounded(io, stdout, out);
         watch.done.store(true, .release);
-        watcher.join();
+        watcher.await(io);
 
         killGroup(pid);
         const captured = bytes orelse return null;
@@ -120,7 +120,7 @@ pub const Cli = struct {
 };
 
 /// Kills the child's process group when the deadline passes or the cancel flag
-/// turns true. It runs on its own thread, and the caller joins it before the
+/// turns true. It runs as its own task, and the caller awaits it before the
 /// group is killed again, so no pid is signalled after it was reaped.
 const Watch = struct {
     pid: std.process.Child.Id,

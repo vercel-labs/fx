@@ -1,4 +1,4 @@
-//! Runs the Rex resume rule once per process, on a background thread, and
+//! Runs the Rex resume rule once per process, as a background task, and
 //! hands back its outcome when the app asks for it. `start` does no disk work.
 
 const std = @import("std");
@@ -23,9 +23,10 @@ const trace_scope = "rex_rule";
 
 pub const Installer = struct {
     started: bool = false,
-    /// Set when the attempt ends with no thread, such as a failed environment check.
+    /// Set when the attempt ends with no task, such as a failed environment check.
     immediate: ?apply.Outcome = null,
     job: ?*Job = null,
+    future: ?std.Io.Future(void) = null,
     taken: bool = false,
 
     /// Starts the attempt once; later calls do nothing. Copies what it needs from `args`.
@@ -47,8 +48,8 @@ pub const Installer = struct {
             self.immediate = .none;
             return;
         };
-        job.thread = std.Thread.spawn(.{}, Job.run, .{job}) catch |err| {
-            debug_trace.logf(trace_scope, "installer thread did not start error={s}", .{@errorName(err)});
+        self.future = io_mod.getIo().concurrent(Job.run, .{job}) catch |err| {
+            debug_trace.logf(trace_scope, "installer task did not start error={s}", .{@errorName(err)});
             job.destroy();
             self.immediate = .none;
             return;
@@ -67,14 +68,14 @@ pub const Installer = struct {
         return outcome;
     }
 
-    /// Cancels the attempt, kills a running `rex` child, and joins the thread. Fast.
+    /// Cancels the attempt, kills a running `rex` child, and waits for the task to end. Fast.
     pub fn stopForProcessExit(self: *Installer) void {
         if (comptime builtin.single_threaded) return;
         const job = self.job orelse return;
         job.cancel.store(true, .release);
-        if (job.thread) |thread| {
-            thread.join();
-            job.thread = null;
+        if (self.future) |*future| {
+            future.await(io_mod.getIo());
+            self.future = null;
         }
     }
 
@@ -86,9 +87,9 @@ pub const Installer = struct {
     }
 };
 
-/// One attempt. Its arena owns every copy and every path. The attempt thread is
+/// One attempt. Its arena owns every copy and every path. The attempt task is
 /// the only user of the arena while it runs, and the starting thread frees the
-/// job only after that thread has been joined.
+/// job only after the attempt has been awaited.
 const Job = struct {
     alloc: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -102,9 +103,8 @@ const Job = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     finished: std.atomic.Value(bool) = .init(false),
     outcome: apply.Outcome = .none,
-    thread: ?std.Thread = null,
 
-    /// Null when the environment check fails. No thread runs then.
+    /// Null when the environment check fails. No task runs then.
     fn create(alloc: std.mem.Allocator, args: StartArgs) !?*Job {
         const job = try alloc.create(Job);
         job.* = .{

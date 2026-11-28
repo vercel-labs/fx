@@ -25,10 +25,11 @@
 (*  - A compare that finds init.lua changed since the observation stops the *)
 (*    attempt at once: nothing else changes (no rollback, added and fx.lua *)
 (*    stay as they are), except fx.lua written by this attempt is deleted.  *)
-(*  - A failed check or reload, or a verify that is not trusted, rolls back: *)
-(*    take out the line this attempt wrote (never put one back), delete     *)
-(*    fx.lua if this attempt created it, reload. Verify sets gave_up on     *)
-(*    no_rule or untrusted, not on no answer.                              *)
+(*  - A failed check, or a verify that is not trusted, rolls back and sets *)
+(*    gave_up. A failed reload rolls back without it, and so does a verify *)
+(*    with no answer. A rollback takes out the line this attempt wrote     *)
+(*    (never puts one back), deletes fx.lua if this attempt created it,    *)
+(*    and reloads.                                                         *)
 (*                                                                         *)
 (* Setting snapshot: the setting is read once, when the lock is taken, and *)
 (* the branch stays fixed for the whole attempt. A flip affects only       *)
@@ -227,10 +228,13 @@ CheckPass(p) ==
     /\ pc' = [pc EXCEPT ![p] = "rld"]
     /\ UNCHANGED <<owner, created, vSeen, vFile, vBk, vRex, vFlags>>
 
+\* A failed check after the write rolls back and sets gave_up, as a decided
+\* untrusted verify does.
 CheckFail(p) ==
     /\ pc[p] = "chk" /\ Faults
+    /\ gaveUp' = TRUE
     /\ pc' = [pc EXCEPT ![p] = FirstRb]
-    /\ UNCHANGED <<owner, created, vSeen, vFile, vBk, vRex, vFlags>>
+    /\ UNCHANGED <<owner, created, vSeen, vFile, vBk, vRex, added, stranded, setting>>
 
 Reload(p) ==
     /\ pc[p] = "rld"

@@ -33,6 +33,7 @@ pub const Paths = struct {
 const record_wait_attempts: usize = 10;
 const record_wait_ms: u64 = 200;
 const max_small_file_bytes: usize = 64 * 1024;
+const max_backup_suffix: usize = 100;
 
 const trace_scope = "rex_rule";
 const init_name = "init.lua";
@@ -363,6 +364,8 @@ const Edit = struct {
     original: ?[]const u8,
     fx_lua_created: bool = false,
     init_written: bool = false,
+    /// This attempt's backup of init.lua, if it made one.
+    backup_path: ?[]const u8 = null,
 };
 
 fn addRule(
@@ -391,13 +394,15 @@ fn addRuleEdits(edit: *Edit, paths: Paths, pid: u32, observed: Observed, state: 
     if (try observeFxLua(a, files.fx_lua_path) != observed.fx_lua) {
         return traced(.skipped, "fx.lua changed while fx worked");
     }
-    edit.fx_lua_created = observed.fx_lua == .missing;
     try writeFxLua(a, files, paths);
-    if (edit.original) |bytes| try writeBackup(a, files.state_dir, bytes);
+    edit.fx_lua_created = observed.fx_lua == .missing;
+    if (edit.original) |bytes| edit.backup_path = try writeBackup(a, files.state_dir, bytes);
 
     const unchanged = try initUnchanged(a, files.init_path, edit.original);
     if (!unchanged) {
-        if (edit.fx_lua_created) deleteOwnFxLua(a, files.fx_lua_path, "undo fx.lua");
+        if (edit.fx_lua_created) _ = deleteOwnFxLua(a, files.fx_lua_path, "undo fx.lua");
+        // fx did not write init.lua, so this attempt's backup is not needed.
+        if (edit.backup_path) |path| deleteIfPresent(path) catch |err| traceStep("delete backup", err);
         return traced(.skipped, "init.lua changed while fx worked");
     }
 
@@ -409,6 +414,7 @@ fn addRuleEdits(edit: *Edit, paths: Paths, pid: u32, observed: Observed, state: 
 
     if (!edit.rex.check(edit.rex.ctx, files.init_path)) {
         rollback(edit);
+        try markGaveUp(a, files, state);
         return traced(.rolled_back, "rex config check failed after the edit");
     }
     if (!edit.rex.reload(edit.rex.ctx)) {
@@ -416,9 +422,9 @@ fn addRuleEdits(edit: *Edit, paths: Paths, pid: u32, observed: Observed, state: 
         return traced(.rolled_back, "rex config reload failed");
     }
 
+    // A cancel at exit keeps the rule in place, as after a crash; the next start checks it.
     const verdict = (try waitForRecord(a, edit.rex, pid, isTrusted)) orelse {
-        rollback(edit);
-        return traced(.rolled_back, "cancelled while Rex verified the rule");
+        return traced(.none, "cancelled while Rex verified the rule");
     };
     var next_state = state;
     switch (verdict) {
@@ -437,23 +443,40 @@ fn addRuleEdits(edit: *Edit, paths: Paths, pid: u32, observed: Observed, state: 
         },
         .no_rule, .other => {
             rollback(edit);
-            next_state.gave_up = try withEntry(a, state.gave_up, files.config_dir);
-            saveStateLogged(a, files.state_path, next_state);
+            try markGaveUp(a, files, state);
             return traced(.rolled_back, "record not trusted after reload");
         },
     }
 }
 
+/// Records that Rex did not trust fx's rule, so later starts skip this config folder.
+fn markGaveUp(a: std.mem.Allocator, files: Files, state: State) !void {
+    var next_state = state;
+    next_state.gave_up = try withEntry(a, state.gave_up, files.config_dir);
+    saveStateLogged(a, files.state_path, next_state);
+}
+
 /// Undoes the add path's changes. Each step is best effort: the run has already failed.
 /// init.lua is not restored from the backup, because the person may have edited it
 /// during the attempt. Only fx's line is taken out of the text that is there now.
+/// When the file steps all work, the attempt's backup goes too. A failed reload is
+/// only logged, so it does not keep the backup.
 fn rollback(edit: *Edit) void {
+    var files_restored = true;
     if (edit.init_written) {
         const fx_created_init = edit.original == null;
-        removeOwnLine(edit.alloc, edit.files.init_path, fx_created_init) catch |err| traceStep("remove our line", err);
+        removeOwnLine(edit.alloc, edit.files.init_path, fx_created_init) catch |err| {
+            traceStep("remove our line", err);
+            files_restored = false;
+        };
     }
-    if (edit.fx_lua_created) deleteOwnFxLua(edit.alloc, edit.files.fx_lua_path, "delete fx.lua");
+    if (edit.fx_lua_created and !deleteOwnFxLua(edit.alloc, edit.files.fx_lua_path, "delete fx.lua")) {
+        files_restored = false;
+    }
     _ = reloadRex(edit.rex, "rollback");
+    if (files_restored) {
+        if (edit.backup_path) |path| deleteIfPresent(path) catch |err| traceStep("delete backup", err);
+    }
 }
 
 /// Takes fx's line out of init.lua as it is now. Leaves the file alone when the
@@ -494,7 +517,8 @@ fn removeRuleEdits(
     fx_lua: plan.FxLuaState,
     state: State,
 ) !Outcome {
-    try writeBackup(a, files.state_dir, original);
+    // The removal keeps its backup: only a rollback deletes one.
+    _ = try writeBackup(a, files.state_dir, original);
     const unchanged = try initUnchanged(a, files.init_path, original);
     if (!unchanged) return traced(.skipped, "init.lua changed while fx worked");
 
@@ -511,7 +535,7 @@ fn removeRuleEdits(
         }
     }
 
-    if (fx_lua == .ours) deleteOwnFxLua(a, files.fx_lua_path, "delete fx.lua");
+    if (fx_lua == .ours) _ = deleteOwnFxLua(a, files.fx_lua_path, "delete fx.lua");
     _ = reloadRex(rex, "after the removal");
     var next_state = state;
     next_state.added = try withoutEntry(a, state.added, files.config_dir);
@@ -533,14 +557,32 @@ fn writeFxLua(a: std.mem.Allocator, files: Files, paths: Paths) !void {
     try io_mod.writeFileAtomic(a, files.fx_lua_path, text);
 }
 
-/// Copies init.lua's bytes to a new, private file. An existing backup is an
-/// error, so a run never overwrites one.
-fn writeBackup(a: std.mem.Allocator, state_dir: []const u8, bytes: []const u8) !void {
+/// Copies init.lua's bytes to a new, private file and returns its path.
+fn writeBackup(a: std.mem.Allocator, state_dir: []const u8, bytes: []const u8) ![]const u8 {
+    return writeBackupAt(a, state_dir, bytes, io_mod.milliTimestamp());
+}
+
+/// Names the backup `init.lua.backup-<ms>`. A name already taken, such as by a
+/// backup in the same millisecond, gets `-1`, `-2`, ... up to `max_backup_suffix`,
+/// so a run never overwrites a backup.
+fn writeBackupAt(a: std.mem.Allocator, state_dir: []const u8, bytes: []const u8, ms: i64) ![]const u8 {
     const io = io_mod.getIo();
-    const name = try a.print("{s}{d}", .{ backup_name_prefix, io_mod.milliTimestamp() });
-    const path = try std.Io.Dir.path.join(a, &.{ state_dir, name });
-    (try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .permissions = private_file_mode })).close(io);
-    try io_mod.writeFileAtomic(a, path, bytes);
+    var suffix: usize = 0;
+    while (suffix <= max_backup_suffix) : (suffix += 1) {
+        const name = if (suffix == 0)
+            try a.print("{s}{d}", .{ backup_name_prefix, ms })
+        else
+            try a.print("{s}{d}-{d}", .{ backup_name_prefix, ms, suffix });
+        const path = try std.Io.Dir.path.join(a, &.{ state_dir, name });
+        const file = std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .permissions = private_file_mode }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        file.close(io);
+        try io_mod.writeFileAtomic(a, path, bytes);
+        return path;
+    }
+    return error.TooManyBackups;
 }
 
 /// Replaces a file that fx owns and keeps private: it is created private first,
@@ -552,14 +594,18 @@ fn writeReplacingPrivate(a: std.mem.Allocator, path: []const u8, bytes: []const 
 }
 
 /// Deletes fx.lua only while it is still fx's own. The person may have written
-/// their own file over it since fx wrote or last read it.
-fn deleteOwnFxLua(a: std.mem.Allocator, path: []const u8, step: []const u8) void {
+/// their own file over it since fx wrote or last read it. False when the delete failed.
+fn deleteOwnFxLua(a: std.mem.Allocator, path: []const u8, step: []const u8) bool {
     const still_ours = (observeFxLua(a, path) catch .foreign) == .ours;
     if (!still_ours) {
         debug_trace.logf(trace_scope, "kept fx.lua: it is no longer fx's own step={s}", .{step});
-        return;
+        return true;
     }
-    deleteIfPresent(path) catch |err| traceStep(step, err);
+    deleteIfPresent(path) catch |err| {
+        traceStep(step, err);
+        return false;
+    };
+    return true;
 }
 
 fn deleteIfPresent(path: []const u8) !void {
@@ -598,19 +644,22 @@ const FakeRex = struct {
     before: plan.RecordState,
     after: plan.RecordState,
     check_mode: CheckMode = .always_ok,
-    /// A user edit the next check makes to init.lua once it has read fx's line.
+    /// A user edit the next check makes to init.lua once it has read fx's line,
+    /// or, for `append_line_before_edit`, while fx's line is not there yet.
     user_edit: UserEdit = .none,
     /// A path where the next check writes the person's own fx.lua, once.
     foreign_fx_lua_at: ?[]const u8 = null,
     null_answers: NullAnswers = .never,
     reload_ok: bool = true,
+    /// Makes each pause after a successful reload report a cancel.
+    pause_cancels_after_reload: bool = false,
     reloaded: bool = false,
     check_calls: usize = 0,
     reload_calls: usize = 0,
     pause_calls: usize = 0,
 
     const CheckMode = enum { always_ok, always_fail, fail_on_broken_text, fail_on_our_line };
-    const UserEdit = enum { none, append_line, remove_our_line };
+    const UserEdit = enum { none, append_line, append_line_before_edit, remove_our_line };
     /// When Rex gives no answer: never, always, or only after a successful reload.
     const NullAnswers = enum { never, always, after_reload };
 
@@ -658,14 +707,17 @@ const FakeRex = struct {
         return verdict;
     }
 
-    /// Plays the user edit once, after the check has read fx's line, so the verdict
-    /// is about fx's text and the file changes while the check runs.
+    /// Plays the user edit once, while the check runs. Most edits wait for a check
+    /// that has read fx's line, so the verdict is about fx's text;
+    /// `append_line_before_edit` plays in observe's check, before fx's edit.
     fn editDuringCheck(self: *FakeRex, init_path: []const u8, text: []const u8) void {
-        if (self.user_edit == .none or std.mem.find(u8, text, plan.require_line) == null) return;
+        if (self.user_edit == .none) return;
+        const has_our_line = std.mem.find(u8, text, plan.require_line) != null;
+        if (has_our_line == (self.user_edit == .append_line_before_edit)) return;
         var out: [16 * 1024]u8 = undefined;
         const edited: []const u8 = switch (self.user_edit) {
             .none => return,
-            .append_line => std.mem.print(&out, "{s}{s}", .{ text, user_line }) catch @panic("user edit does not fit"),
+            .append_line, .append_line_before_edit => std.mem.print(&out, "{s}{s}", .{ text, user_line }) catch @panic("user edit does not fit"),
             .remove_our_line => plan.removeLine(text, &out),
         };
         writeTestFile(init_path, edited) catch @panic("user edit failed to write");
@@ -681,8 +733,9 @@ const FakeRex = struct {
     }
 
     fn pauseFn(ctx: *anyopaque, _: u64) bool {
-        from(ctx).pause_calls += 1;
-        return true;
+        const self = from(ctx);
+        self.pause_calls += 1;
+        return !(self.pause_cancels_after_reload and self.reloaded);
     }
 };
 
@@ -893,7 +946,8 @@ test "rex apply: a rule line the user removed during the attempt is not added ba
     try testing.expectEqual(Outcome.rolled_back, run(a, rex_state.rex(), p, test_pid, true));
     try expectFile(a, init, original_text);
     try testing.expect(!fileExists(fx_lua));
-    try testing.expect(!fileExists(state));
+    try testing.expect(!try stateLists(a, state, added_key, p.config_dir));
+    try testing.expect(try stateLists(a, state, gave_up_key, p.config_dir));
 }
 
 test "rex apply: a record that stays no_rule rolls back and gives up" {
@@ -1236,4 +1290,135 @@ test "rex apply: CRLF init.lua without a final newline comes back as it was" {
     try expectFile(a, init, crlf_text ++ "\r\n" ++ plan.require_line);
     try testing.expectEqual(Outcome.removed, run(a, rex_state.rex(), p, test_pid, false));
     try expectFile(a, init, crlf_text);
+}
+
+/// Counts the files in `dir_path` whose names start with the backup prefix.
+fn countBackups(dir_path: []const u8) !usize {
+    const io = io_mod.getIo();
+    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var count: usize = 0;
+    var entries = dir.iterate();
+    while (try entries.next(io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, backup_name_prefix)) count += 1;
+    }
+    return count;
+}
+
+test "rex apply: a backup name taken in the same millisecond gets a numbered suffix" {
+    var fx = try Fixture.create();
+    defer fx.deinit();
+    const a = fx.alloc();
+    const state_dir = fx.paths.state_dir;
+    try makeDir(state_dir);
+    const ms: i64 = 1_700_000_000_000;
+    const taken = try pathIn(a, state_dir, try a.print("{s}{d}", .{ backup_name_prefix, ms }));
+    try writeTestFile(taken, "taken\n");
+
+    const path = try writeBackupAt(a, state_dir, original_text, ms);
+    try testing.expectEqualStrings(try pathIn(a, state_dir, try a.print("{s}{d}-1", .{ backup_name_prefix, ms })), path);
+    try expectFile(a, path, original_text);
+    try expectFile(a, taken, "taken\n");
+}
+
+test "rex apply: a check that fails after fx's edit gives up and keeps no backup" {
+    var fx = try Fixture.create();
+    defer fx.deinit();
+    const a = fx.alloc();
+    const p = fx.paths;
+    const init = try pathIn(a, p.config_dir, init_name);
+    const state = try pathIn(a, p.state_dir, state_name);
+    try makeDir(p.config_dir);
+    try writeTestFile(init, original_text);
+    var rex_state: FakeRex = .{ .pid = test_pid, .before = .no_rule, .after = .trusted, .check_mode = .fail_on_our_line };
+
+    try testing.expectEqual(Outcome.rolled_back, run(a, rex_state.rex(), p, test_pid, true));
+    try expectFile(a, init, original_text);
+    try testing.expect(try stateLists(a, state, gave_up_key, p.config_dir));
+    try testing.expectEqual(@as(usize, 0), try countBackups(p.state_dir));
+
+    const checks_before = rex_state.check_calls;
+    const reloads_before = rex_state.reload_calls;
+    try testing.expectEqual(Outcome.skipped, run(a, rex_state.rex(), p, test_pid, true));
+    try testing.expectEqual(checks_before, rex_state.check_calls);
+    try testing.expectEqual(reloads_before, rex_state.reload_calls);
+}
+
+test "rex apply: a reload that fails twice rolls back without giving up or keeping a backup" {
+    var fx = try Fixture.create();
+    defer fx.deinit();
+    const a = fx.alloc();
+    const p = fx.paths;
+    const init = try pathIn(a, p.config_dir, init_name);
+    const fx_lua = try pathIn(a, p.config_dir, fx_lua_name);
+    const state = try pathIn(a, p.state_dir, state_name);
+    try makeDir(p.config_dir);
+    try writeTestFile(init, original_text);
+    var rex_state: FakeRex = .{ .pid = test_pid, .before = .no_rule, .after = .trusted, .reload_ok = false };
+
+    for (0..2) |_| {
+        try testing.expectEqual(Outcome.rolled_back, run(a, rex_state.rex(), p, test_pid, true));
+        try expectFile(a, init, original_text);
+        try testing.expect(!fileExists(fx_lua));
+        try testing.expectEqual(@as(usize, 0), try countBackups(p.state_dir));
+        if (fileExists(state)) try testing.expect(!try stateLists(a, state, gave_up_key, p.config_dir));
+    }
+    try testing.expectEqual(@as(usize, 4), rex_state.reload_calls);
+}
+
+test "rex apply: a cancel during verify keeps the rule in place and does not roll back" {
+    var fx = try Fixture.create();
+    defer fx.deinit();
+    const a = fx.alloc();
+    const p = fx.paths;
+    const init = try pathIn(a, p.config_dir, init_name);
+    const fx_lua = try pathIn(a, p.config_dir, fx_lua_name);
+    try makeDir(p.config_dir);
+    try writeTestFile(init, original_text);
+    var rex_state: FakeRex = .{ .pid = test_pid, .before = .no_rule, .after = .none, .pause_cancels_after_reload = true };
+
+    try testing.expectEqual(Outcome.none, run(a, rex_state.rex(), p, test_pid, true));
+    try expectFile(a, init, original_text ++ plan.require_line ++ "\n");
+    var buf: [1024]u8 = undefined;
+    try expectFile(a, fx_lua, plan.fxLua(&buf, p.exe_path, p.sessions_dir).?);
+    try testing.expectEqual(@as(usize, 1), rex_state.reload_calls);
+}
+
+test "rex apply: init.lua changed before fx's edit skips the run and keeps no backup" {
+    var fx = try Fixture.create();
+    defer fx.deinit();
+    const a = fx.alloc();
+    const p = fx.paths;
+    const init = try pathIn(a, p.config_dir, init_name);
+    const fx_lua = try pathIn(a, p.config_dir, fx_lua_name);
+    try makeDir(p.config_dir);
+    try writeTestFile(init, original_text);
+    // The person edits init.lua during observe's check, before fx writes anything to it.
+    var rex_state: FakeRex = .{ .pid = test_pid, .before = .no_rule, .after = .trusted, .user_edit = .append_line_before_edit };
+
+    try testing.expectEqual(Outcome.skipped, run(a, rex_state.rex(), p, test_pid, true));
+    try expectFile(a, init, original_text ++ user_line);
+    try testing.expect(!fileExists(fx_lua));
+    try testing.expectEqual(@as(usize, 0), try countBackups(p.state_dir));
+    try testing.expectEqual(@as(usize, 0), rex_state.reload_calls);
+}
+
+test "rex apply: an fx.lua that cannot be written skips the run without a reload" {
+    var fx = try Fixture.create();
+    defer fx.deinit();
+    const a = fx.alloc();
+    var p = fx.paths;
+    const init = try pathIn(a, p.config_dir, init_name);
+    const fx_lua = try pathIn(a, p.config_dir, fx_lua_name);
+    try makeDir(p.config_dir);
+    try writeTestFile(init, original_text);
+    const long_exe = try a.alloc(u8, max_small_file_bytes + 1);
+    @memset(long_exe, 'x');
+    p.exe_path = long_exe;
+    var rex_state: FakeRex = .{ .pid = test_pid, .before = .no_rule, .after = .trusted };
+
+    try testing.expectEqual(Outcome.skipped, run(a, rex_state.rex(), p, test_pid, true));
+    try expectFile(a, init, original_text);
+    try testing.expect(!fileExists(fx_lua));
+    try testing.expectEqual(@as(usize, 0), rex_state.reload_calls);
 }
