@@ -96,7 +96,7 @@ jobs:
       - name: Model-check terminal hang-up
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/terminal_hangup/check.sh design-a design-b
       - name: Model-check how the TUI ends on an outside signal
-        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/tui_close/check.sh design-a design-b
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/tui_close/check.sh design-a design-b mutant-a-early-uninstall mutant-a-minimal-handler
 
       - name: Model-check CLI hang-up
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/cli_hangup/check.sh design-a design-b
