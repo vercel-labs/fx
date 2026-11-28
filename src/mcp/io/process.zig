@@ -48,6 +48,13 @@ pub fn signalAllForExit(io: std.Io) void {
     }
 }
 
+/// Test builds only: clears the process-wide exit flag after a test
+/// exercises `signalAllForExit`.
+pub fn clearExitForTest() void {
+    if (comptime !@import("builtin").is_test) @compileError("clearExitForTest is test-only");
+    everyone.exiting.store(false, .seq_cst);
+}
+
 /// The helper that stops what is left of the servers once the program is
 /// gone, by exit or by crash. It hears
 /// each group that starts ("+") and each one that is reaped ("-"). When its

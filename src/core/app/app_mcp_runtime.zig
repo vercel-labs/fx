@@ -1918,6 +1918,7 @@ test "deinitForProcessExit waits for an in-flight toggle to save mcp.json" {
         state.toggle_group.await(io_mod.getIo()) catch |err| std.debug.panic("toggle await failed in test cleanup: {s}", .{@errorName(err)});
         state.process_exiting.store(false, .release);
         state.deinit();
+        mcp_host.clearServerExitForTest();
     }
     try state.loadHost(ToggleTestLoader.load, alloc, home, root, registry, .{});
 

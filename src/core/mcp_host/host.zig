@@ -22,6 +22,7 @@ pub const Notify = runtime_mod.Notify;
 pub const Notice = runtime_mod.Notice;
 pub const Status = runtime_mod.Status;
 pub const signalServersForExit = runtime_mod.signalServersForExit;
+pub const clearServerExitForTest = runtime_mod.clearServerExitForTest;
 pub const waitRetired = runtime_mod.waitRetired;
 pub const menu = @import("menu.zig");
 

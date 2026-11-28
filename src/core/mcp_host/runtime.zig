@@ -64,6 +64,14 @@ pub fn signalServersForExit() void {
     mcp.stdio.signalAllForExit(io_mod.getIo());
 }
 
+/// Test builds only: clears the stdio process-wide exit flag after a test
+/// exercises `signalServersForExit`.
+pub fn clearServerExitForTest() void {
+    if (comptime !@import("builtin").is_test) @compileError("clearServerExitForTest is test-only");
+    if (comptime host_target.is_wasm) return;
+    mcp.stdio.clearExitForTest();
+}
+
 /// Retired runtimes, in the whole program, from when they were replaced until
 /// their servers are gone: still in use by calls that began on them, or
 /// stopping on a thread of their own (`Host.stop`). Until then, no other
