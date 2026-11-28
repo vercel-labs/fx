@@ -680,6 +680,7 @@ pub const Runtime = struct {
         try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log }, .{
             .client = .{ .info = .{ .name = "fx", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
             .gate = mcp.core.engine.limitsFor(options.idle_ms),
+            .judge = dropped_tools.judge(&r.gpa),
         }, local_engine.items);
         errdefer r.engine.deinit();
         try r.publish();
@@ -3610,6 +3611,30 @@ test "tools fx leaves out of a list show in the status by reason, and a later li
     }
     try testing.expectEqual(@as(u32, 0), status.dropped.total());
     try testing.expectEqual(@as(usize, 1), status.tools);
+}
+
+test "a tool the host's reading refuses takes no name: a later good tool of the name is listed, counted, and kept" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = @import("fake_server.zig").meaningless_first_script, .flags = .{ .permissions = .executable_file } });
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const listed = (try r.tools(a, "fake", null)).tools;
+    try testing.expectEqual(@as(usize, 1), listed.len);
+    try testing.expectEqualStrings("echo", listed[0].name);
+    try testing.expect(std.mem.find(u8, listed[0].raw, "Echoes") != null);
+    const status = (try r.statuses(a))[0];
+    try testing.expectEqual(State.ready, status.state);
+    try testing.expectEqual(@as(usize, 1), status.tools);
+    try testing.expectEqual(@as(u32, 1), status.dropped.total());
+    try testing.expectEqual(@as(u32, 1), status.dropped.counts[@backingInt(mcp.tools.Drop.unusable)]);
 }
 
 test "a refused tool list shows in the status beside the older list still served, and a good list clears it" {

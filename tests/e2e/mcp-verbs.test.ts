@@ -406,6 +406,66 @@ describe("fx mcp", () => {
     }, 90_000);
   }
 
+  // A tool whose `inputSchema` is an object passes the engine, but the host's reading refuses one it can't use, such as an
+  // `inputSchema` of `{}`. A name is taken only by a tool that passes both: the first one of a name that does is kept, the
+  // others are left out as "a name is used by two tools", and a tool the reading refuses keeps its own reason.
+  const meaninglessA = '{"name":"a","description":"the meaningless one","inputSchema":{}}';
+  const firstGoodA = '{"name":"a","description":"the first good one","inputSchema":{"type":"object"}}';
+  const secondGoodA = '{"name":"a","description":"the second good one","inputSchema":{"type":"object"}}';
+  const meaningLeft = { text: "1 tool: a definition can't be used", reason: "a definition can't be used", count: 1 };
+  const bothLeft = { text: "2 tools: more than one reason", reason: "more than one reason", count: 2 };
+  const sameNameOrders = [
+    { form: "a meaningless tool first", tools: [meaninglessA, firstGoodA], ...meaningLeft },
+    { form: "a meaningless tool second", tools: [firstGoodA, meaninglessA], ...meaningLeft },
+    { form: "a meaningless tool, then two good ones", tools: [meaninglessA, firstGoodA, secondGoodA], ...bothLeft },
+    { form: "a good tool, a meaningless one, then another good one", tools: [firstGoodA, meaninglessA, secondGoodA], ...bothLeft },
+  ];
+  for (const { form, tools, text: leftOut, reason, count } of sameNameOrders) {
+    test(`a name is settled after the host's reading, ${form}: show says ready, 1 tool, and the model's call reaches the server`, async () => {
+      const root = createRoot();
+      const wireLog = join(root.home, "wire.log");
+      const reply = `"result":{"resultType":"complete","tools":[${tools.join(",")}]}`;
+      writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: reply, FX_MCP_WIRE_LOG: wireLog } }) } }));
+      const text = await mcp(root, "show", "fixture");
+      expect(text.stderr).toBe("");
+      expect(text.code).toBe(0);
+      expect(text.stdout).toContain("  status     ready, 1 tool\n");
+      expect(text.stdout).toContain(`  left out   ${leftOut}\n`);
+      const shown = JSON.parse((await mcp(root, "show", "fixture", "--json")).stdout);
+      expect(shown).toMatchObject({ status: "ready", tools_left_out: { count, reason } });
+      // The first tool that passes both checks is the one kept.
+      expect(shown.tools).toEqual([{ name: "a", description: "the first good one" }]);
+
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("list_fixture", "shell", { action: "run", command: `"${FX_BIN}" mcp call list fixture` }),
+        fakeGatewayToolCall("run_a", "toolbox", { run: "mcp_fixture_a", arguments: {} }),
+        fakeGatewayFinalText("TOOL_A_GIVEN"),
+      ], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+      gateway = activeGateway;
+      const asked = await runFx(["ask", "--json", "--full-access", "--no-save", "Use tool a."], {
+        cwd: root.workspace,
+        env: { ...root.env, FX_GATEWAY_BASE_URL: activeGateway.baseUrl, FX_GATEWAY_CHAT_URL: activeGateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+        timeoutMs: 60_000,
+      });
+      expect(asked.code).toBe(0);
+      const told = activeGateway.requests[2]?.body ?? "";
+      expect(told).toContain("mcp_fixture_a");
+      expect(told).toContain("the first good one");
+      expect(told).not.toContain("the meaningless one");
+      expect(told).not.toContain("the second good one");
+      expect(told).toContain("MODERN_MCP_TOOL_RESULT");
+      expect(told).not.toContain("No tool named mcp_fixture_a");
+
+      // The server got the model's call, by the name `a`.
+      const calls = readFileSync(wireLog, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line).message)
+        .filter((message) => message.method === "tools/call");
+      expect(calls.map((call) => call.params.name)).toEqual(["a"]);
+    }, 90_000);
+  }
+
   test("show says when fx refused the tool list of an HTTP server too", async () => {
     const upstream = startModernMcpHttpFixture("list_refused");
     try {

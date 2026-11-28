@@ -48,6 +48,9 @@ pub const Options = struct {
     timeouts: request.Timeouts = .{},
     /// Listen for tool list changes on 2026 servers.
     listen_tools: bool = true,
+    /// The host's reading of each tool that passes the structure check: a tool it refuses is left out and takes no name,
+    /// so a later tool of the name can be kept. With none, the engine keeps every such tool.
+    judge: ?tools.Judge = null,
     trace: ?*trace.Writer = null,
 };
 
@@ -641,6 +644,7 @@ pub const Engine = struct {
             .era = e.options.era,
             .auth = slot.config.auth,
             .listen_tools = e.options.listen_tools,
+            .judge = e.options.judge,
             .timeouts = slot.config.timeouts orelse e.options.timeouts,
             .trace = tracer,
         });

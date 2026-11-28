@@ -47,7 +47,7 @@ afterEach(async () => {
  */
 function createRoot(
   label: string,
-  options: { shared?: boolean; callDelayMs?: number; mode?: string; profileServer?: boolean } = {},
+  options: { shared?: boolean; callDelayMs?: number; mode?: string; profileServer?: boolean; listReply?: string } = {},
 ): Root {
   const root = mkdtempSync(join("/tmp", `fxs-${label}-`));
   cleanupRoot = root;
@@ -76,6 +76,8 @@ function createRoot(
               FX_MCP_PID_PATH: pid,
               FX_MCP_CALL_DELAY_MS: String(options.callDelayMs ?? 0),
               FX_MCP_MODE: options.mode ?? "normal",
+              // The raw `"result":{...}` the server lists its tools with, when a test gives one.
+              ...(options.listReply === undefined ? {} : { FX_MCP_LIST_REPLY: options.listReply }),
             },
           },
         },
@@ -251,6 +253,64 @@ describe("shared MCP servers", () => {
 
     // Both sessions are gone: the server stops and the owner exits.
     await expectExited([serverPid!, ...seenOwners]);
+  }, 120_000);
+
+  test("a tool the host's reading refuses takes no name through the owner: the good tool of that name reaches the model and the server", async () => {
+    // The first `a` has an `inputSchema` of `{}`, which the engine of the owner keeps and the host's reading refuses.
+    const meaningless = '{"name":"a","description":"the meaningless one","inputSchema":{}}';
+    const good = '{"name":"a","description":"the good one","inputSchema":{"type":"object"}}';
+    const root = createRoot("same-name", { callDelayMs: 2_000, listReply: `"result":{"resultType":"complete","tools":[${meaningless},${good}]}` });
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("select_a", "toolbox", { open: "mcp_fixture_a" }),
+      fakeGatewayToolCall("call_a", "toolbox", { run: "mcp_fixture_a", arguments: {} }),
+      fakeGatewayFinalText("SAME_NAME_DONE"),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    gateways.push(gateway);
+    const owners = watchOwners(root.fxHome);
+    const asked = ask(root, gateway, "Call tool a.");
+    await waitFor("the server", () => serverPids(root.wire).length >= 1);
+    const [serverPid] = serverPids(root.wire);
+    cleanupPids.add(serverPid!);
+    // The server runs under the owner, so the session read the list the owner sent.
+    const runningOwners = ownerPids(root.fxHome);
+    expect(runningOwners).toHaveLength(1);
+    expect(parentOf(serverPid!)).toBe(runningOwners[0]!);
+
+    const result = await asked;
+    const seenOwners = owners.stop();
+    expect(result.code, result.stderr || result.stdout).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("SAME_NAME_DONE");
+    // The model was shown the good tool and got its result.
+    expect(gateway.requests[1]?.body ?? "").toContain("the good one");
+    expect(gateway.requests[1]?.body ?? "").not.toContain("the meaningless one");
+    expect(toolResultText(gateway.requests[2]?.body ?? "", "call_a")).toContain("MODERN_MCP_TOOL_RESULT");
+    // The server got the model's call, by the name `a`.
+    expect(toolCalls(root.wire).map((entry) => (entry.message as { params?: { name?: string } }).params?.name)).toEqual(["a"]);
+    await expectExited([serverPid!, ...seenOwners]);
+  }, 120_000);
+
+  test("a tool the host's reading refuses takes no name in the session's own engine too: shared false still gives the model the good tool", async () => {
+    const meaningless = '{"name":"a","description":"the meaningless one","inputSchema":{}}';
+    const good = '{"name":"a","description":"the good one","inputSchema":{"type":"object"}}';
+    const root = createRoot("same-name-private", { shared: false, listReply: `"result":{"resultType":"complete","tools":[${meaningless},${good}]}` });
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("select_a", "toolbox", { open: "mcp_fixture_a" }),
+      fakeGatewayToolCall("call_a", "toolbox", { run: "mcp_fixture_a", arguments: {} }),
+      fakeGatewayFinalText("SAME_NAME_PRIVATE_DONE"),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    gateways.push(gateway);
+    const owners = watchOwners(root.fxHome);
+    const result = await ask(root, gateway, "Call tool a.");
+    const seenOwners = owners.stop();
+    expect(result.code, result.stderr || result.stdout).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("SAME_NAME_PRIVATE_DONE");
+    // No owner ran: the session's own engine read the list.
+    expect(seenOwners).toEqual([]);
+    expect(gateway.requests[1]?.body ?? "").toContain("the good one");
+    expect(gateway.requests[1]?.body ?? "").not.toContain("the meaningless one");
+    expect(toolResultText(gateway.requests[2]?.body ?? "", "call_a")).toContain("MODERN_MCP_TOOL_RESULT");
+    expect(toolCalls(root.wire).map((entry) => (entry.message as { params?: { name?: string } }).params?.name)).toEqual(["a"]);
+    await expectExited(serverPids(root.wire));
   }, 120_000);
 
   test("a project server in two repos starts one copy per repo", async () => {

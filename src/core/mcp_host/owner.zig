@@ -22,6 +22,7 @@ const core = @import("owner_core.zig");
 const owner_test_controls = @import("owner_test_controls.zig");
 const wire = @import("owner_wire.zig");
 const idle_control = @import("idle_control.zig");
+const dropped_tools = @import("dropped_tools.zig");
 
 const Allocator = std.mem.Allocator;
 const engine = mcp.engine;
@@ -964,6 +965,7 @@ fn ownerLoop(owner: *Owner) void {
     engine_value.init(io, gpa, .{ .context = owner, .allow = allowAll, .log = logStderr }, .{
         .client = .{ .info = .{ .name = "fx", .version = owner.client_version }, .capabilities = "{\"elicitation\":{\"form\":{},\"url\":{}}}" },
         .gate = mcp.core.engine.limitsFor(idle_control.idleMs()),
+        .judge = dropped_tools.judge(&owner.gpa),
     }, &.{}) catch |err| {
         debug_trace.logf("mcp-owner", "owner engine did not start err={s}", .{@errorName(err)});
         owner.stop.store(true, .release);
@@ -2413,6 +2415,57 @@ test "a registered client hears connecting and ready before the tool list" {
                     stop.store(true, .release);
                     thread.join();
                     joined = true;
+                    return;
+                },
+                else => {},
+            },
+            .client => {},
+        }
+    }
+    return error.NoToolsFrame;
+}
+
+test "the owner's list holds the first tool that passes both checks, and its count has the tool the reading refused" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    // The server lists a tool named `echo` that the host's reading refuses, then a good `echo`.
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = fake_server.meaningless_first_script, .flags = .{ .permissions = .executable_file } });
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    defer {
+        stop.store(true, .release);
+        thread.join();
+    }
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+
+    var client = try TestClient.connect(path);
+    defer client.close();
+    try registerFor(&client, fixture.server);
+    try client.send(.{ .need = .{ .key = test_key } });
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 10_000;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        const message = client.receive(arena.allocator(), 200) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        switch (message) {
+            .owner => |owner| switch (owner) {
+                .tools => |page| {
+                    // The frame has the one tool the session lists, and the other is counted by its own reason, so a
+                    // session of an older build that reads this frame lists and counts the same.
+                    try testing.expect(page.ok);
+                    try testing.expect(std.mem.find(u8, page.tools, "Echoes") != null);
+                    try testing.expect(std.mem.find(u8, page.tools, "meaningless") == null);
+                    try testing.expectEqual(@as(u32, 1), page.dropped.total());
+                    try testing.expectEqual(@as(u32, 1), page.dropped.counts[@backingInt(mcp.tools.Drop.unusable)]);
                     return;
                 },
                 else => {},
