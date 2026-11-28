@@ -2557,21 +2557,19 @@ pub fn appendExecutionMemoryChatMessages(
             .standalone_response = step.tool_calls.len == 0,
         });
         for (step.tool_results) |result| {
+            const ran_tool = try savedRanToolName(scratch_state.allocator(), step.tool_calls, result);
+            const memory = toolResultMemory(result);
             try messages.append(alloc, .{
                 .role = .tool,
                 .content = result.output,
                 .tool_call_id = result.tool_call_id,
                 .tool_name = result.tool_name,
                 .tool_result_status = result.status,
-                .tool_result_memory = toolResultMemory(result),
+                .tool_result_memory = memory,
                 // A turn resumed from its checkpoint keeps each result's time.
                 .tool_result_created_at_ms = if (result.created_at_ms > 0) result.created_at_ms else null,
-                .user_answer = try core_types.isUserAnswer(
-                    scratch_state.allocator(),
-                    try savedRanToolName(scratch_state.allocator(), step.tool_calls, result),
-                    result.status,
-                    result.output,
-                ),
+                .user_answer = try core_types.isUserAnswer(scratch_state.allocator(), ran_tool, result.status, result.output),
+                .stored_user_answer = core_types.isStoredUserAnswer(ran_tool, result.status, memory),
             });
         }
         for (step.tool_results) |result| {
@@ -2654,6 +2652,70 @@ test "a rebuilt turn marks the user's answers by the call that ran, as the live 
     for (messages.items[1..], results, user_answers) |rebuilt, result, user_answer| {
         try std.testing.expectEqualStrings(result.tool_name, rebuilt.tool_name.?);
         try std.testing.expectEqual(user_answer, rebuilt.user_answer);
+    }
+}
+
+test "a rebuilt turn marks stored answers by the call that ran, as the live turn did" {
+    const alloc = std.testing.allocator;
+    const preview = "[{\"question\":\"Batch decision 01?\",\"answer\":\"Yes\"}";
+    const answers = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    const cancelled = "(user cancelled the question)";
+    const direct_args = "{\"questions\":[]}";
+    const toolbox_args = "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}";
+    const large_bytes: usize = 16 * 1024 + 128;
+    const saved = struct {
+        fn result(
+            id: []const u8,
+            name: []const u8,
+            status: core_types.PersistedToolStatus,
+            output: []const u8,
+            handle: ?[]const u8,
+            bytes: usize,
+            truncated: bool,
+        ) core_types.PersistedToolResult {
+            return .{
+                .tool_call_id = @constCast(id),
+                .tool_name = @constCast(name),
+                .status = status,
+                .output = @constCast(output),
+                .output_bytes = bytes,
+                .stored_output_bytes = bytes,
+                .output_handle = if (handle) |value| @constCast(value) else null,
+                .truncated = truncated,
+            };
+        }
+    }.result;
+    var calls = [_]core_types.ToolCall{
+        .{ .id = "stored", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "stored-toolbox", .name = "toolbox", .arguments_json = toolbox_args },
+        .{ .id = "stored-failed", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "kept-whole", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "small", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "cancelled", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "stored-read", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
+    };
+    var results = [_]core_types.PersistedToolResult{
+        saved("stored", "ask_user_question", .success, preview, "answers-1", large_bytes, true),
+        saved("stored-toolbox", "toolbox", .success, preview, "answers-2", large_bytes, true),
+        saved("stored-failed", "ask_user_question", .failure, preview, "answers-3", large_bytes, true),
+        saved("kept-whole", "ask_user_question", .success, answers, "answers-5", answers.len, false),
+        saved("small", "ask_user_question", .success, answers, null, answers.len, false),
+        saved("cancelled", "ask_user_question", .success, cancelled, null, cancelled.len, false),
+        saved("stored-read", "read_file", .success, preview, "answers-4", large_bytes, true),
+    };
+    const stored_answer = [_]bool{ true, true, false, false, false, false, false };
+    var steps = [_]core_types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+
+    try appendExecutionMemoryChatMessages(alloc, &messages, .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqual(@as(usize, 1 + stored_answer.len), messages.items.len);
+    for (messages.items[1..], results, stored_answer) |rebuilt, result, expected| {
+        try std.testing.expectEqual(expected, rebuilt.stored_user_answer);
+        if (expected) {
+            try std.testing.expectEqualStrings(result.output_handle.?, rebuilt.tool_result_memory.?.output_handle.?);
+        }
     }
 }
 

@@ -306,6 +306,7 @@ fn causeRejectsLayer(cause: @FieldType(config_runtime.ConfigDiagnostic, "cause")
             .invalid_skill_symlink_authorities,
             => return true,
             .invalid_additional_directories,
+            .invalid_shortcuts,
             .ignored_project_user_only_setting,
             .legacy_workspace_preferences,
             .manual_backup_available,

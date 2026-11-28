@@ -83,6 +83,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/session/session_adapter.zig", "expectLines", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/workspace/turn_capture.zig", "runGit", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/trace_report.zig", "(?:parse|nth|fieldProblem|expectStartsWith|expectEndsWith|expectNotIn)", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/subagent/tool_host.zig", "(?:waitForRuns|startBlocked|finish|waitInSettleGap|expectEndedWithoutReport)", /debug_print/, "tests", "test diagnostics"),
 ];
 
 function rule(

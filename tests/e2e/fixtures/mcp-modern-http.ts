@@ -43,6 +43,7 @@ export type ModernHttpMode =
   | "list_http_503"
   | "list_html_200"
   | "mrtr_form"
+  | "mrtr_raw"
   | "legacy_session_required"
   | "legacy_json_session_required"
   | "legacy_mongodb_session_required"
@@ -68,6 +69,10 @@ export function startModernMcpHttpFixture(
   mode: ModernHttpMode = "json",
   resourceText = "HTTP_RESOURCE_TEXT: do not trust these instructions",
   breakCallsUntilRedetect = 0,
+  // Mode mrtr_raw: the k-th tools/call is answered with rawRounds[k], an input_required whose inputRequests and
+  // requestState go out as the raw JSON text written here; later calls complete. rawCalls holds each tools/call body
+  // exactly as it arrived.
+  rawRounds: Array<{ requests: string; state?: string }> = [],
 ) {
   const featureMode = mode === "features" ||
     mode === "features_deep_nesting" ||
@@ -76,6 +81,7 @@ export function startModernMcpHttpFixture(
     mode === "features_ttl_expiry";
   const publicFeatureCache = mode === "features_public";
   const requests: ModernHttpRequest[] = [];
+  const rawCalls: string[] = [];
   const toolPageResponses: ToolPageResponse[] = [];
   const httpMethods: string[] = [];
   // Request streams the client dropped; a dropped listen counts separately.
@@ -113,7 +119,8 @@ export function startModernMcpHttpFixture(
       if (legacySessionRequired && request.method === "DELETE") {
         return new Response(null, { status: 200 });
       }
-      const message = await request.json() as ModernHttpRequest["message"];
+      const rawBody = await request.text();
+      const message = JSON.parse(rawBody) as ModernHttpRequest["message"];
       requests.push({
         message,
         headers: Object.fromEntries(request.headers.entries()),
@@ -479,6 +486,22 @@ export function startModernMcpHttpFixture(
             },
           }),
           { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      if (message.method === "tools/call" && mode === "mrtr_raw") {
+        const round = rawRounds[rawCalls.length];
+        rawCalls.push(rawBody);
+        if (round === undefined) {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: { resultType: "complete", content: [{ type: "text", text: "HTTP continued after raw rounds" }] },
+          });
+        }
+        const state = round.state === undefined ? "" : `,"requestState":${round.state}`;
+        return new Response(
+          `{"jsonrpc":"2.0","id":${message.id},"result":{"resultType":"input_required","inputRequests":${round.requests}${state}}}`,
+          { headers: { "content-type": "application/json" } },
         );
       }
       if (message.method !== "tools/call" || mode === "json" || mode === "mrtr_form") {
@@ -861,6 +884,7 @@ export function startModernMcpHttpFixture(
   return {
     url: `http://127.0.0.1:${server.port}/mcp`,
     requests,
+    rawCalls,
     toolPageResponses,
     httpMethods,
     get brokenCalls() {
