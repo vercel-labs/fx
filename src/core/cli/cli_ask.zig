@@ -2423,13 +2423,16 @@ fn maybeStartAskTitleTask(
     return task;
 }
 
-/// Gives the title task a short grace after the turn, then installs the
-/// generated title unless the session already carries a user-set title. A
-/// title still pending after the grace is dropped, and the session keeps the
-/// title derived from its first prompt.
+/// `fx ask` exits as soon as its turn ends without waiting for title generation.
+const title_exit_grace_ms: u32 = 0;
+
+/// Installs a generated title if the task finished before the turn ended, and
+/// otherwise cancels it immediately with no exit wait. A pending title is
+/// dropped and traced, and the session keeps the title derived from its first
+/// prompt.
 fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) void {
     defer task.destroy();
-    task.joinOrCancel(ctx.cancelFlag(), session_title_generation.after_turn_grace_ms);
+    task.joinOrCancel(ctx.cancelFlag(), title_exit_grace_ms);
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -5762,6 +5765,37 @@ test "fx ask's report sink queues a report as its subagent's message" {
     try std.testing.expect(std.mem.find(u8, queued.prompt, "looks good") != null);
     // No turn is running, so it waits for the ask's next turn.
     try std.testing.expect(queued.delivery == .continuation);
+}
+
+test "completeAskTitleTask drops a pending title at exit without waiting" {
+    const alloc = std.testing.allocator;
+    const Wait = struct {
+        fn stream(_: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) anyerror!agent_stream_provider.Result {
+            try request.admission.admit();
+            while (!request.cancel_flag.load(.seq_cst)) io_mod.sleep(5 * std.time.ns_per_ms);
+            return error.Cancelled;
+        }
+    };
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
+    defer ctx.deinit();
+
+    const task = try session_title_generation.Task.create(.{
+        .session_id = "ask-exit-no-wait",
+        .model = "test/title",
+        .prompt_excerpt = "fix the renderer",
+        .api_key = "key",
+        .stream_provider = .{ .stream_fn = Wait.stream },
+    });
+    errdefer task.destroy();
+    try task.spawn();
+
+    const started = io_mod.milliTimestamp();
+    completeAskTitleTask(&ctx, task);
+    try std.testing.expect(io_mod.milliTimestamp() - started < 1_000);
 }
 
 test "fx ask deps validate malformed registered calls" {

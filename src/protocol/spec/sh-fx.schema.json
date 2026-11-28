@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "sh.fx extensions to the Agent Client Protocol, version 1",
+  "description": "Draft. The types that sh-fx.md defines. The standard ACP types are in acp/v1/schema.json.",
+  "$defs": {}
+}
