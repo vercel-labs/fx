@@ -11,7 +11,9 @@
 //! header ever goes in (RULES.md R4.8): a reason is a fixed word.
 //!
 //! The runtime writes the events (`Runtime.signInEnded`) and `/trace` reads
-//! them. TLA+ model: `tests/tla/mcp_host/SignIn.tla` `FailureLeavesEvent`.
+//! them. A login has one end, the host's first: the engine's late failure after the host's
+//! own end records nothing. TLA+ model: `tests/tla/mcp_host/SignIn.tla` `FailureLeavesEvent`,
+//! `OneEndOneEvent` and `ProblemNamesTheEnd`.
 
 const std = @import("std");
 const mcp = @import("../../mcp/mcp.zig");

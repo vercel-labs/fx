@@ -70,14 +70,21 @@
 \*
 \* A login that ends in failure leaves an event in the process's sign-in log
 \* (src/core/mcp_host/sign_in_events.zig), read by `/trace` whether or not FX_TRACE is
-\* on. `logged` is the logins whose failure was recorded: each action that ends a login
-\* in failure adds it, in the same step that sends its `.sign_in_failed` notice, and
-\* FailureLeavesEvent says none ended without one. The log belongs to the process, not
-\* the host, so a host's end (Release, Replace) records the failures it causes too.
+\* on. `events` is what the log holds for each login: each action that
+\* ends a login in failure adds its event, in the same step that sends its `.sign_in_failed`
+\* notice, and FailureLeavesEvent says none ended without one. The log belongs to the
+\* process, not the host, so a host's end (Release, Replace) records the failures it causes too.
+\*
+\* A login has one end, its first. When the host ends it itself (the browser's deadline, a
+\* logout, a reload that drops its server, the host's end), that cancels the engine's flow,
+\* and the engine then reports the flow as cancelled: LateFailure. The host finds no login
+\* under way and records and says nothing, so OneEndOneEvent and ProblemNamesTheEnd hold:
+\* `/trace` names the host's reason, not the engine's `cancelled`. Recording it was the bug
+\* the live run found: two events for the browser's deadline, the second `cancelled`.
 \*
 \* Logins are numbered 1..MaxLogins in the order started; login k's flow has
 \* its own state, also k. A callback carries a state: 0 is one fx never made.
-EXTENDS Naturals, FiniteSets
+EXTENDS Naturals, FiniteSets, Sequences
 
 CONSTANTS
     MaxLogins,  \* logins started
@@ -142,9 +149,14 @@ VARIABLES
     gone,       \* the logins a logout cut off while they waited for their check request
     badRedeem,      \* ghost: a code was redeemed for a state not the live flow's
     foreignTaken,   \* ghost: a listener took what its kind of sign-in must refuse
-    logged          \* ghost: the logins whose failure left an event in the sign-in log
+    events          \* ghost: [Logins -> EventLists], the events the sign-in log holds for each login
 
-vars == <<cur, alive, retired, leases, phase, hostOf, got, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone, logged>>
+vars == <<cur, alive, retired, leases, phase, hostOf, got, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone, events>>
+
+\* The log with the end event of login k added.
+Recorded(ev, k) == [ev EXCEPT ![k] = Append(@, "end")]
+\* What the log may hold for a login: nothing, its end, and (a bug) the end and an event of the engine's late failure.
+EventLists == UNION {[1..n -> {"end", "late"}] : n \in 0..2}
 
 Open(k) == phase[k] \in {"open", "consumed", "redeeming"}
 \* A login under way, its check request included: the host keeps it, and the
@@ -165,7 +177,7 @@ TypeOK ==
     /\ next \in 1..(MaxLogins + 1)
     /\ badRedeem \in BOOLEAN /\ foreignTaken \in BOOLEAN
     /\ unread \in BOOLEAN /\ swapped \in BOOLEAN /\ gone \subseteq Logins
-    /\ logged \subseteq Logins
+    /\ events \in [Logins -> EventLists]
 
 Init ==
     /\ cur = 1 /\ alive = [h \in Hosts |-> h = 1] /\ retired = [h \in Hosts |-> FALSE]
@@ -180,7 +192,7 @@ Init ==
     /\ ck \in [Logins -> [srv : Answers, notified : {FALSE}, asked : {FALSE}, taken : {FALSE}]]
     /\ next = 1
     /\ badRedeem = FALSE /\ foreignTaken = FALSE
-    /\ unread = FALSE /\ swapped = FALSE /\ gone = {} /\ logged = {}
+    /\ unread = FALSE /\ swapped = FALSE /\ gone = {} /\ events = [k \in Logins |-> <<>>]
 
 \* endLogin(k): cancel its task, close its listener, forget it. No notice.
 Ended(k) == [phase EXCEPT ![k] = "closed"]
@@ -202,7 +214,7 @@ StartLogin ==
           /\ live' = [live EXCEPT ![cur] = k]
           /\ flow' = IF flow[cur] = 0 THEN [flow EXCEPT ![cur] = k] ELSE flow
           /\ next' = next + 1
-    /\ UNCHANGED <<cur, alive, retired, leases, got, shownUrl, indicator, saved, ck, badRedeem, foreignTaken, unread, swapped, gone, logged>>
+    /\ UNCHANGED <<cur, alive, retired, leases, got, shownUrl, indicator, saved, ck, badRedeem, foreignTaken, unread, swapped, gone, events>>
 
 \* The same, asked for while the host's login is under way: that login is
 \* the one asked for, and its listener and flow stay. Its address, if it
@@ -219,7 +231,7 @@ Authorize(k) ==
     /\ phase[k] = "open" /\ alive[hostOf[k]] /\ live[hostOf[k]] = k /\ ~shownUrl[k]
     /\ shownUrl' = [shownUrl EXCEPT ![k] = TRUE]
     /\ indicator' = TRUE
-    /\ UNCHANGED <<cur, alive, retired, leases, phase, hostOf, got, live, flow, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone, logged>>
+    /\ UNCHANGED <<cur, alive, retired, leases, phase, hostOf, got, live, flow, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone, events>>
 
 \* login.zig takeReturn/takeForm: what the listener takes. A non-bridged
 \* listener takes GET /callback; a bridged one takes a form only from the
@@ -233,8 +245,8 @@ Arrive(k, s, kind) ==
        THEN /\ phase' = [phase EXCEPT ![k] = "consumed"]
             /\ got' = [got EXCEPT ![k] = s]
             /\ foreignTaken' = (foreignTaken \/ kind \in {"form_foreign", "other"} \/ s # k)
-       ELSE UNCHANGED <<phase, got, foreignTaken, unread, swapped, gone, logged>>
-    /\ UNCHANGED <<cur, alive, retired, leases, hostOf, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, unread, swapped, gone, logged>>
+       ELSE UNCHANGED <<phase, got, foreignTaken, unread, swapped, gone, events>>
+    /\ UNCHANGED <<cur, alive, retired, leases, hostOf, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, unread, swapped, gone, events>>
 
 \* finishLogin: the address the browser ended on, pasted. It goes to the engine
 \* as it is, past the listener, so a wrong one fails the sign-in there.
@@ -242,7 +254,7 @@ Paste(k, s) ==
     /\ phase[k] = "open"
     /\ phase' = [phase EXCEPT ![k] = "consumed"]
     /\ got' = [got EXCEPT ![k] = s]
-    /\ UNCHANGED <<cur, alive, retired, leases, hostOf, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone, logged>>
+    /\ UNCHANGED <<cur, alive, retired, leases, hostOf, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone, events>>
 
 \* `.finish_login`: the engine checks the state against the live flow.
 Handle(k) ==
@@ -252,13 +264,13 @@ Handle(k) ==
        IN IF ok
           THEN /\ phase' = [phase EXCEPT ![k] = "redeeming"]
                /\ badRedeem' = (badRedeem \/ got[k] # flow[h])
-               /\ UNCHANGED <<live, flow, indicator, unread, swapped, gone, logged>>
+               /\ UNCHANGED <<live, flow, indicator, unread, swapped, gone, events>>
           ELSE \* `.sign_in_failed`: endLogin, then the notice clears the line.
                /\ phase' = Ended(k)
                /\ live' = [live EXCEPT ![h] = 0]
                /\ flow' = [flow EXCEPT ![h] = 0]
                /\ indicator' = FALSE
-               /\ logged' = logged \cup {k}
+               /\ events' = Recorded(events, k)
                /\ UNCHANGED badRedeem
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, saved, ck, next, foreignTaken, unread, swapped, gone>>
 
@@ -273,11 +285,11 @@ Redeemed(k, ok) ==
        IN /\ flow' = [flow EXCEPT ![h] = 0]
           /\ IF ok /\ CheckFirst
              THEN /\ phase' = [phase EXCEPT ![k] = "confirming"]
-                  /\ UNCHANGED <<live, indicator, saved, ck, unread, swapped, gone, logged>>
+                  /\ UNCHANGED <<live, indicator, saved, ck, unread, swapped, gone, events>>
              ELSE /\ phase' = Ended(k)
                   /\ live' = [live EXCEPT ![h] = 0]
                   /\ indicator' = FALSE
-                  /\ logged' = IF ok THEN logged ELSE logged \cup {k}
+                  /\ events' = IF ok THEN events ELSE Recorded(events, k)
                   /\ saved' = IF ok THEN saved \cup {k} ELSE saved
                   /\ ck' = IF ok THEN [ck EXCEPT ![k].notified = TRUE] ELSE ck
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, next, badRedeem, foreignTaken, unread, swapped, gone>>
@@ -299,7 +311,7 @@ Confirm(k) ==
           /\ live' = [live EXCEPT ![h] = 0]
           /\ indicator' = FALSE
           /\ saved' = IF a \notin Refusals THEN saved \cup {k} ELSE saved
-          /\ logged' = IF a \in Refusals THEN logged \cup {k} ELSE logged
+          /\ events' = IF a \in Refusals THEN Recorded(events, k) ELSE events
           /\ ck' = [ck EXCEPT ![k].asked = TRUE, ![k].notified = (a \notin Refusals)]
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, flow, shownUrl, next, badRedeem, foreignTaken, unread, swapped, gone>>
 
@@ -324,7 +336,7 @@ ExpireCheck(k) ==
           /\ live' = [live EXCEPT ![h] = 0]
           /\ indicator' = FALSE
           /\ saved' = IF ~refused THEN saved \cup {k} ELSE saved
-          /\ logged' = IF refused THEN logged \cup {k} ELSE logged
+          /\ events' = IF refused THEN Recorded(events, k) ELSE events
           /\ ck' = [ck EXCEPT ![k].asked = TRUE, ![k].notified = ~refused]
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, flow, shownUrl, next, badRedeem, foreignTaken, unread, swapped, gone>>
 
@@ -332,14 +344,14 @@ ExpireCheck(k) ==
 PickUp(k) ==
     /\ k \in saved /\ ~ck[k].taken
     /\ ck' = [ck EXCEPT ![k].taken = TRUE]
-    /\ UNCHANGED <<cur, alive, retired, leases, phase, hostOf, got, live, flow, shownUrl, indicator, saved, next, badRedeem, foreignTaken, unread, swapped, gone, logged>>
+    /\ UNCHANGED <<cur, alive, retired, leases, phase, hostOf, got, live, flow, shownUrl, indicator, saved, next, badRedeem, foreignTaken, unread, swapped, gone, events>>
 
 \* The host's read of the store of saved logins failed (restoreCredentials at the
 \* start, adoptSaved for a server a reload added): `store_unread`.
 StoreUnreadable ==
     /\ alive[cur] /\ ~unread
     /\ unread' = TRUE
-    /\ UNCHANGED <<cur, alive, retired, leases, phase, hostOf, got, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, foreignTaken, swapped, gone, logged>>
+    /\ UNCHANGED <<cur, alive, retired, leases, phase, hostOf, got, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, foreignTaken, swapped, gone, events>>
 
 \* The host reads the store again and takes a saved login (pickUpLogin, from the
 \* `.auth_required` branch for an unreadable store, a tool request, a call, or a
@@ -349,7 +361,7 @@ Reread ==
     /\ alive[cur] /\ ~SigningIn(cur)
     /\ unread' \in {unread, FALSE}
     /\ swapped' = (swapped \/ SigningIn(cur))
-    /\ UNCHANGED <<cur, alive, retired, leases, phase, hostOf, got, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, foreignTaken, gone, logged>>
+    /\ UNCHANGED <<cur, alive, retired, leases, phase, hostOf, got, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, foreignTaken, gone, events>>
 
 \* `/mcp logout NAME` (PR #1794 says how the revocation went; this is about the login): the
 \* engine's tokens are signed out and revoked, and a login that waits for its check request goes
@@ -363,9 +375,17 @@ Logout ==
             /\ phase' = Ended(live[cur])
             /\ live' = [live EXCEPT ![cur] = 0]
             /\ indicator' = FALSE
-            /\ logged' = logged \cup {live[cur]}
-       ELSE UNCHANGED <<gone, phase, live, indicator, logged>>
+            /\ events' = Recorded(events, live[cur])
+       ELSE UNCHANGED <<gone, phase, live, indicator, events>>
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, flow, shownUrl, saved, ck, next, badRedeem, foreignTaken, unread, swapped>>
+
+\* The engine's late `.sign_in_failed` (`cancelled`) for a login that ended. The host finds no
+\* login under way for it (`loginFor(i) == null`) and keeps the end it recorded. In fx it follows
+\* the host's own cancel (the browser's deadline, a logout, a dropped server); the model lets it
+\* follow any end, which only asks more of the host.
+LateFailure(k) ==
+    /\ Len(events[k]) = 1
+    /\ UNCHANGED vars
 
 \* expireLogins: the browser didn't come back in 5 minutes.
 Expire(k) ==
@@ -375,7 +395,7 @@ Expire(k) ==
           /\ live' = [live EXCEPT ![h] = 0]
           /\ flow' = [flow EXCEPT ![h] = 0]
           /\ indicator' = FALSE
-          /\ logged' = logged \cup {k}
+          /\ events' = Recorded(events, k)
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone>>
 
 \* A host's end: Runtime.shutdown ends its logins, each with a
@@ -383,13 +403,13 @@ Expire(k) ==
 Gone(h, ph) == [k \in Logins |-> IF hostOf[k] = h /\ Pending(k) THEN "closed" ELSE ph[k]]
 SignsIn(h) == \E k \in Logins : hostOf[k] = h /\ Pending(k)
 \* The logins that host's end ends in failure, each with its event.
-LoggedGone(h) == logged \cup {k \in Logins : hostOf[k] = h /\ Pending(k)}
+LoggedGone(h) == [k \in Logins |-> IF hostOf[k] = h /\ Pending(k) THEN Append(events[k], "end") ELSE events[k]]
 GoneIndicator(h) == IF SignsIn(h) THEN FALSE ELSE indicator
 
 Lease ==
     /\ alive[cur] /\ leases[cur] < MaxLeases
     /\ leases' = [leases EXCEPT ![cur] = @ + 1]
-    /\ UNCHANGED <<cur, alive, retired, phase, hostOf, got, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone, logged>>
+    /\ UNCHANGED <<cur, alive, retired, phase, hostOf, got, live, flow, shownUrl, indicator, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone, events>>
 
 Release(h) ==
     /\ leases[h] > 0
@@ -400,8 +420,8 @@ Release(h) ==
             /\ live' = [live EXCEPT ![h] = 0]
             /\ flow' = [flow EXCEPT ![h] = 0]
             /\ indicator' = GoneIndicator(h)
-            /\ logged' = LoggedGone(h)
-       ELSE UNCHANGED <<alive, phase, live, flow, indicator, unread, swapped, gone, logged>>
+            /\ events' = LoggedGone(h)
+       ELSE UNCHANGED <<alive, phase, live, flow, indicator, unread, swapped, gone, events>>
     /\ UNCHANGED <<cur, retired, hostOf, got, shownUrl, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone>>
 
 \* `/mcp add`, `remove`, `approve`, `reject` in the shell, applied in place,
@@ -414,8 +434,8 @@ ReloadDrops ==
        THEN /\ phase' = Ended(live[cur])
             /\ live' = [live EXCEPT ![cur] = 0]
             /\ indicator' = FALSE
-            /\ logged' = logged \cup {live[cur]}
-       ELSE UNCHANGED <<phase, live, indicator, unread, swapped, gone, logged>>
+            /\ events' = Recorded(events, live[cur])
+       ELSE UNCHANGED <<phase, live, indicator, unread, swapped, gone, events>>
     /\ flow' = [flow EXCEPT ![cur] = 0]
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone>>
 
@@ -434,13 +454,13 @@ Replace ==
           /\ live' = IF free THEN [live EXCEPT ![cur] = 0] ELSE live
           /\ flow' = IF free THEN [flow EXCEPT ![cur] = 0] ELSE flow
           /\ indicator' = IF free THEN GoneIndicator(cur) ELSE indicator
-          /\ logged' = IF free THEN LoggedGone(cur) ELSE logged
+          /\ events' = IF free THEN LoggedGone(cur) ELSE events
     /\ UNCHANGED <<leases, hostOf, got, shownUrl, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone>>
 
 Next ==
     \/ StartLogin
     \/ AgainLogin
-    \/ \E k \in Logins : Authorize(k) \/ Handle(k) \/ Expire(k) \/ Redeemed(k, TRUE) \/ Redeemed(k, FALSE) \/ Confirm(k) \/ ExpireCheck(k) \/ PickUp(k)
+    \/ \E k \in Logins : Authorize(k) \/ Handle(k) \/ Expire(k) \/ LateFailure(k) \/ Redeemed(k, TRUE) \/ Redeemed(k, FALSE) \/ Confirm(k) \/ ExpireCheck(k) \/ PickUp(k)
     \/ StoreUnreadable
     \/ Reread
     \/ Logout
@@ -530,7 +550,15 @@ LoggedOutNeverSaved == \A k \in gone : k \notin saved /\ ~ck[k].notified
 \* A login that ended in failure left an event: its sign-in's failure, the refusal of its
 \* check request, its logout, its host's end, or a reload that dropped its server. A login
 \* that was reported signed in is the one that did not fail.
-FailureLeavesEvent == \A k \in Logins : (phase[k] = "closed" /\ ~ck[k].notified) => k \in logged
+FailureLeavesEvent == \A k \in Logins : (phase[k] = "closed" /\ ~ck[k].notified) => Len(events[k]) >= 1
+
+\* A login leaves one end event, whoever reports its end first or after: the engine's late
+\* failure after the host's own end adds none.
+OneEndOneEvent == \A k \in Logins : Len(events[k]) <= 1
+
+\* The reason `/trace` gives for a login is the newest event's, and it is the end's own: the
+\* reason the login ended for, not a later `cancelled` of the engine's.
+ProblemNamesTheEnd == \A k \in Logins : Len(events[k]) >= 1 => events[k][Len(events[k])] = "end"
 
 \* ---- Liveness ----
 
