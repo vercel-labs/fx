@@ -1298,6 +1298,7 @@ pub const Runtime = struct {
             if (worker.waitForPostOrNudgeTimeout(recheck)) |wake| return wake;
         }
         if (self.nothingCanArrive(worker)) return null;
+        end_test_controls.noteWaitBlocking();
         return worker.waitForPostOrNudge();
     }
 
@@ -4077,11 +4078,14 @@ test "a wait that the upgrade's restart ends says the reports still arrive" {
     );
 }
 
+/// Release test builds turn error tracing off (`build.zig`), so without these
+/// prints a failed test says only "failed without output".
 fn waitForRuns(fixture: *MailboxFixture, count: usize) !void {
     for (0..5000) |_| {
         if (fixture.runs.load(.seq_cst) >= count) return;
         io_mod.sleep(std.time.ns_per_ms);
     }
+    std.debug.print("waitForRuns: {d} runs did not start in time\n", .{count});
     return error.Timeout;
 }
 
@@ -7627,8 +7631,8 @@ const SettleGap = struct {
     }
 };
 
-/// A trace file for the `mailbox` scope, which a test reads to see that a
-/// `wait` has looked and is about to block (`wait_begin`).
+/// A trace file for the `mailbox` scope, which the host's trace lines go to in
+/// these tests.
 const GapTrace = struct {
     tmp: std.testing.TmpDir,
     path: []u8,
@@ -7650,14 +7654,6 @@ const GapTrace = struct {
         self.tmp.cleanup();
     }
 
-    fn waitFor(self: *const GapTrace, needle: []const u8) !void {
-        for (0..5000) |_| {
-            if (self.has(needle)) return;
-            io_mod.sleep(std.time.ns_per_ms);
-        }
-        return error.Timeout;
-    }
-
     /// Reads the first 64 KiB, which holds every line a test of this scope
     /// writes. The host appends to the file while a test polls it, so this
     /// reads from offset 0 into a fixed buffer. `readFileToEnd` sizes the file
@@ -7673,15 +7669,14 @@ const GapTrace = struct {
 };
 
 /// What every gap test builds: a parent log, main's worker, a fixture that
-/// runs the children, the host, and a trace for the `mailbox` scope. Its parts
-/// point at each other, so it stays where `init` built it.
+/// runs the children, and the host. Its parts point at each other, so it stays
+/// where `init` built it.
 const GapFixture = struct {
     arena_state: std.heap.ArenaAllocator,
     parent: child_state.TestParent,
     worker: worker_runtime.WorkerRuntime,
     fixture: MailboxFixture,
     runtime: *Runtime,
-    trace: GapTrace,
     armed: bool,
 
     const Options = struct {
@@ -7706,21 +7701,17 @@ const GapFixture = struct {
         errdefer self.fixture.deinit();
         self.runtime = try mailboxRuntime(alloc, &self.fixture, &self.parent);
         errdefer self.runtime.deinit();
-        try self.trace.init(alloc);
-        errdefer self.trace.deinit(alloc);
         self.armed = false;
         if (options.armed) self.arm();
     }
 
-    /// Releases a held host first, so the runtime can join it, and keeps the
-    /// trace until the runtime's threads are gone.
+    /// Releases a held host first, so the runtime can join it.
     fn deinit(self: *GapFixture) void {
         const alloc = std.testing.allocator;
         SettleGap.go.set(io_mod.getIo());
         if (self.armed) SettleGap.disarm();
         self.runtime.deinit();
         self.fixture.deinit();
-        self.trace.deinit(alloc);
         self.worker.deinit(alloc);
         self.parent.deinit();
         self.arena_state.deinit();
@@ -7764,6 +7755,25 @@ const GapFixture = struct {
     }
 };
 
+/// Set once a `wait` has found that something can still arrive and is about
+/// to block (`end_test_controls.noteWaitBlocking`).
+const WaitBlocking = struct {
+    var blocked: std.Io.Event = .unset;
+
+    fn arm() void {
+        blocked = .unset;
+        end_test_controls.test_wait_blocking = note;
+    }
+
+    fn disarm() void {
+        end_test_controls.test_wait_blocking = null;
+    }
+
+    fn note() void {
+        blocked.set(io_mod.getIo());
+    }
+};
+
 /// One `wait` call on its own thread, as main's worker makes it.
 const GapWait = struct {
     runtime: *Runtime,
@@ -7790,15 +7800,23 @@ const GapWait = struct {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    /// Starts the wait, then waits for its trace line, which it writes once it
-    /// has read that a child works and before it blocks.
-    fn startBlocked(self: *GapWait, trace: *const GapTrace) !void {
+    /// Starts the wait, and returns once it is about to block: the host has
+    /// found that something can still arrive and sends `noteWaitBlocking`
+    /// right before it blocks. On failure the wait's thread is joined first,
+    /// then the hook is disarmed, because that thread may still read the hook
+    /// until it has returned.
+    fn startBlocked(self: *GapWait) !void {
+        WaitBlocking.arm();
+        errdefer WaitBlocking.disarm();
         try self.start();
-        trace.waitFor("wait_begin") catch {
+        WaitBlocking.blocked.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
             self.worker.requestCancel();
             self.thread.join();
-            return error.WaitNeverBegan;
+            WaitBlocking.disarm();
+            std.debug.print("wait never blocked\n", .{});
+            return error.WaitNeverBlocked;
         };
+        WaitBlocking.disarm();
     }
 
     /// Joins the wait's thread and returns what it said, which the caller
@@ -7809,6 +7827,7 @@ const GapWait = struct {
         self.done.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
             self.worker.requestCancel();
             self.thread.join();
+            std.debug.print("wait stayed blocked after the end settled\n", .{});
             return error.WaitBlockedWhileNothingWorks;
         };
         self.thread.join();
@@ -7833,11 +7852,22 @@ const gap_wait_limit: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5),
 /// (`tests/tla/subagent/WaitNudge.tla`: `wait` always returns).
 fn waitInSettleGap(gap: *GapFixture) ![]u8 {
     defer SettleGap.go.set(io_mod.getIo());
-    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
+        std.debug.print("host never reached the gap\n", .{});
+        return error.HostNeverReachedTheGap;
+    };
     var waiting = GapWait{ .runtime = gap.runtime, .worker = &gap.worker };
-    try waiting.startBlocked(&gap.trace);
+    try waiting.startBlocked();
     SettleGap.go.set(io_mod.getIo());
     return waiting.finish();
+}
+
+/// Checks that `wait` said the end left no report, and prints what it said
+/// when it did not.
+fn expectEndedWithoutReport(said: []const u8) !void {
+    if (std.mem.find(u8, said, "ended without a report") != null) return;
+    std.debug.print("wait said: {s}\n", .{said});
+    return error.TestUnexpectedResult;
 }
 
 /// One `wait` call with nothing held, returning what it said, which the
@@ -7857,7 +7887,7 @@ test "a wait that starts as a subagent's work ends with nothing to report still 
     _ = try gap.call(.{ .message = .{ .agent = "quiet", .message = "go", .report = "never" } }, "call-1");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7873,7 +7903,7 @@ test "a wait that starts as the parent's stop ends a subagent's turn still retur
     _ = try gap.call(.{ .stop = .{ .agent = "reviewer" } }, "call-2");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7887,7 +7917,7 @@ test "a wait that starts as a report its owner's sink refuses is held still retu
     _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "go" } }, "call-1");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
     try std.testing.expectEqual(@as(usize, 0), gap.worker.queuedPromptCount());
@@ -7903,7 +7933,7 @@ test "a wait that starts as the parent's close ends a subagent's turn still retu
     _ = try gap.call(.{ .close = .{ .agent = "reviewer" } }, "call-2");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7924,7 +7954,7 @@ test "a wait that starts as the user's turn on a subagent ends with nothing to r
     ender.join();
     const text = try said;
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "ended without a report") != null);
+    try expectEndedWithoutReport(text);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 1), gap.fixture.reportCount());
 }
@@ -7943,7 +7973,7 @@ test "a wait that starts before and after the user's turn on a closing subagent 
     defer std.testing.allocator.free(work_id);
     // The user's turn keeps the subagent working, so this wait blocks.
     var waiting = GapWait{ .runtime = gap.runtime, .worker = &gap.worker, .child_id = child_id };
-    try waiting.startBlocked(&gap.trace);
+    try waiting.startBlocked();
     // The parent closes the subagent meanwhile, and the turn then ends.
     const closed = (try gap.runtime.closeChild(child_id, .parent)).?;
     try std.testing.expect(closed.stopped);
@@ -8565,6 +8595,7 @@ fn waitUntilQuiet(runtime: *Runtime) !void {
         if (runtime.quiet()) return;
         io_mod.sleep(std.time.ns_per_ms);
     }
+    std.debug.print("runtime did not go quiet in time\n", .{});
     return error.Timeout;
 }
 
