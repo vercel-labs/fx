@@ -10022,6 +10022,36 @@ fn processQueuedPromptLoop(
                         debug_trace.logf("agent", "provider_resolved event dropped err=OutOfMemory", .{});
                     }
                 }
+                if (completion.resolved_model) |resolved_model| {
+                    if (std.heap.c_allocator.dupe(u8, resolved_model)) |owned| {
+                        // Display-only provenance event; dropping on queue pressure never affects the turn.
+                        deps.push_event(deps.ctx, .{ .model_resolved = owned }) catch {};
+                    } else |_| {}
+                    if (job.provider == .configured and !std.mem.eql(u8, resolved_model, gateway_model)) {
+                        debug_trace.logf(
+                            "agent",
+                            "resolved_model_mismatch requested={s} resolved={s}",
+                            .{ gateway_model, resolved_model },
+                        );
+                        if (deps.push_session_notice) |push| {
+                            // Both model names may come from the command line or server,
+                            // so escape control bytes before showing them (RULES.md R4.6).
+                            const shown_requested = try arena.print("{f}", .{text_utils.terminalSafe(gateway_model)});
+                            const shown_provider = try arena.print("{f}", .{text_utils.terminalSafe(job.provider.label())});
+                            const shown_resolved = try arena.print("{f}", .{text_utils.terminalSafe(resolved_model)});
+                            const notice = try std.mem.concat(arena, u8, &.{
+                                "Requested model ",
+                                shown_requested,
+                                ", but ",
+                                shown_provider,
+                                " answered with ",
+                                shown_resolved,
+                                ".",
+                            });
+                            try push(deps.ctx, notice);
+                        }
+                    }
+                }
                 completion.tool_calls = try normalize_terminal_request_tool_calls(
                     arena,
                     deps.tool_registry,

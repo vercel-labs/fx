@@ -889,6 +889,7 @@ fn freeOpenAICodexTestCompletion(completion: types.ModelCompletion) void {
     if (completion.content) |value| std.testing.allocator.free(@constCast(value));
     types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
     if (completion.generation_id) |value| std.testing.allocator.free(@constCast(value));
+    if (completion.resolved_model) |value| std.testing.allocator.free(@constCast(value));
     if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
 }
 

@@ -967,10 +967,13 @@ pub const Reducer = struct {
         const generation_id = self.generation_id;
         self.generation_id = null;
         errdefer if (generation_id) |id| self.alloc.free(id);
+        const resolved_model = self.response_model;
+        self.response_model = null;
+        errdefer if (resolved_model) |model| self.alloc.free(model);
         const owned_calls = try calls.toOwnedSlice(self.alloc);
         self.phase = .closed;
         return .{ .completed = .{
-            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .finish_reason = reason, .usage = self.usage, .provider_state_json = provider_state },
+            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .resolved_model = resolved_model, .finish_reason = reason, .usage = self.usage, .provider_state_json = provider_state },
             .ownership = .owned,
         } };
     }
@@ -3074,4 +3077,24 @@ test "chat completions prose resembling a call stays prose and cancellation afte
     try test_accept(&cancelled, test_stop);
     try test_accept(&cancelled, "[DONE]");
     try std.testing.expectError(error.Cancelled, cancelled.finish(true));
+}
+
+test "chat completions completion carries the server's reported model id" {
+    const alloc = std.testing.allocator;
+    {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, "{\"id\":\"chat-1\",\"model\":\"served-model-AAA\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}");
+        var result = try test_finish(&reducer, "{\"id\":\"chat-1\",\"model\":\"served-model-AAA\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}");
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings("served-model-AAA", result.completed.completion.resolved_model.?);
+    }
+    {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, "{\"id\":\"chat-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}");
+        var result = try test_finish(&reducer, test_stop);
+        defer result.deinit(alloc);
+        try std.testing.expect(result.completed.completion.resolved_model == null);
+    }
 }

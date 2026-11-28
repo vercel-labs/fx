@@ -577,6 +577,9 @@ pub const WorkerEvent = union(enum) {
     model_call: types.ModelCallRecord,
     route_recovery_status: types.RouteRecoveryStatus,
     clear_route_recovery_status,
+    /// The model ID a provider reported in its reply (display/JSON provenance,
+    /// last value wins). Owned by the event; the consumer frees it.
+    model_resolved: []u8,
     /// The gateway provider that served a request in this turn (display-only,
     /// last value wins). Owned by the event; the consumer frees it.
     provider_resolved: []u8,
@@ -5618,6 +5621,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .model_call => |record| .{ .model_call = try types.dupeModelCallRecord(alloc, record) },
         .route_recovery_status => |status| .{ .route_recovery_status = status },
         .clear_route_recovery_status => .clear_route_recovery_status,
+        .model_resolved => |model| .{ .model_resolved = try alloc.dupe(u8, model) },
         .provider_resolved => |slug| .{ .provider_resolved = try alloc.dupe(u8, slug) },
         .api_status_text => |text| .{ .api_status_text = try alloc.dupe(u8, text) },
         .credential_refreshed => |credential| .{
@@ -5713,6 +5717,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .model_call => |record| types.freeModelCallRecordStrings(alloc, record),
         .route_recovery_status => {},
         .clear_route_recovery_status => {},
+        .model_resolved => |model| alloc.free(model),
         .provider_resolved => |slug| alloc.free(slug),
         .api_status_text => |text| alloc.free(text),
         .credential_refreshed => |credential| {

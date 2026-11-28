@@ -347,6 +347,9 @@ pub const PromptRunResult = struct {
     output_write_failed: bool = false,
     output_reader_gone: bool = false,
     model: []u8 = &.{},
+    /// Owned model ID the server reported in its reply; empty when the server
+    /// did not send one.
+    resolved_model: []u8 = &.{},
     session_id: []u8 = &.{},
     tool_calls: []ToolCallRecord = &.{},
     step_count: usize = 0,
@@ -368,6 +371,7 @@ pub const PromptRunResult = struct {
         if (self.final_output.len > 0) alloc.free(self.final_output);
         if (self.final_source.len > 0) alloc.free(self.final_source);
         if (self.model.len > 0) alloc.free(self.model);
+        if (self.resolved_model.len > 0) alloc.free(self.resolved_model);
         if (self.resolved_provider.len > 0) alloc.free(self.resolved_provider);
         if (self.session_id.len > 0) alloc.free(self.session_id);
         freeToolCallRecords(alloc, self.tool_calls);
@@ -692,6 +696,8 @@ const AskContext = struct {
     /// backing memory.
     provider_order: []const []const u8 = &.{},
     provider_strict: bool = false,
+    /// Owned model ID the server reported for the latest request this run.
+    resolved_model: ?[]u8 = null,
     /// Owned slug of the provider that served the latest gateway request this
     /// run, reported by the gateway's routing metadata.
     resolved_provider: ?[]u8 = null,
@@ -867,6 +873,7 @@ const AskContext = struct {
             freeToolCallRecord(self.alloc, record);
         }
         self.tool_call_records.deinit(self.alloc);
+        if (self.resolved_model) |model| self.alloc.free(model);
         if (self.resolved_provider) |provider| self.alloc.free(provider);
         self.loaded_skills.deinit(self.alloc);
     }
@@ -2393,6 +2400,11 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     errdefer if (final_source.len > 0) alloc.free(final_source);
     const model = try alloc.dupe(u8, ctx.model);
     errdefer alloc.free(model);
+    const resolved_model: []u8 = if (ctx.resolved_model) |served|
+        try alloc.dupe(u8, served)
+    else
+        @constCast(&.{});
+    errdefer if (resolved_model.len > 0) alloc.free(resolved_model);
     const resolved_provider: []u8 = if (ctx.resolved_provider) |provider|
         try alloc.dupe(u8, provider)
     else
@@ -2418,6 +2430,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .output_write_failed = ctx.output_write_failed,
         .output_reader_gone = ctx.output_reader_gone,
         .model = model,
+        .resolved_model = resolved_model,
         .resolved_provider = resolved_provider,
         .session_id = session_id,
         .tool_calls = tool_calls,
@@ -3561,6 +3574,10 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
             ctx.last_recovery_status = null;
             ctx.last_recovery_notice_kind = null;
         },
+        .model_resolved => |model| {
+            if (ctx.resolved_model) |old| ctx.alloc.free(old);
+            ctx.resolved_model = try ctx.alloc.dupe(u8, model);
+        },
         .provider_resolved => |slug| {
             if (ctx.resolved_provider) |old| ctx.alloc.free(old);
             ctx.resolved_provider = try ctx.alloc.dupe(u8, slug);
@@ -4626,6 +4643,10 @@ fn writeFinalJsonFields(writer: *std.Io.Writer, result: PromptRunResult) !void {
     try writer.print(",\"exit_code\":{d}", .{result.exit_code});
     try writer.writeAll(",\"model\":");
     try std.json.Stringify.value(result.model, .{}, writer);
+    if (result.resolved_model.len > 0) {
+        try writer.writeAll(",\"resolved_model\":");
+        try std.json.Stringify.value(result.resolved_model, .{}, writer);
+    }
     try writer.writeAll(",\"resolved_provider\":");
     if (result.resolved_provider.len > 0) {
         try std.json.Stringify.value(result.resolved_provider, .{}, writer);
@@ -7976,6 +7997,21 @@ test "final ask json reports the resolved provider or null" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, routed_json, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("bedrock", parsed.value.object.get("resolved_provider").?.string);
+    try std.testing.expect(parsed.value.object.get("resolved_model") == null);
+
+    const substituted = PromptRunResult{
+        .exit_code = 0,
+        .assistant_output = try alloc.dupe(u8, "ok"),
+        .model = try alloc.dupe(u8, "Qwen3.8-27B"),
+        .resolved_model = try alloc.dupe(u8, "served-model-AAA"),
+    };
+    defer substituted.deinit(alloc);
+    const substituted_json = try renderFinalJsonResult(alloc, substituted);
+    defer alloc.free(substituted_json);
+    var parsed_substituted = try std.json.parseFromSlice(std.json.Value, alloc, substituted_json, .{});
+    defer parsed_substituted.deinit();
+    try std.testing.expectEqualStrings("Qwen3.8-27B", parsed_substituted.value.object.get("model").?.string);
+    try std.testing.expectEqualStrings("served-model-AAA", parsed_substituted.value.object.get("resolved_model").?.string);
 
     const unrouted = PromptRunResult{
         .exit_code = 0,

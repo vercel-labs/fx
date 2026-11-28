@@ -4414,6 +4414,7 @@ fn stringifyJsonValueOwned(alloc: std.mem.Allocator, value: std.json.Value) ![]u
 fn deinitGatewayCompletion(alloc: std.mem.Allocator, completion: *types.ModelCompletion) void {
     if (completion.content) |content| alloc.free(content);
     if (completion.generation_id) |id| alloc.free(id);
+    if (completion.resolved_model) |model| alloc.free(@constCast(model));
     if (completion.resolved_provider) |provider| alloc.free(@constCast(provider));
     for (completion.tool_calls) |call| {
         alloc.free(call.id);

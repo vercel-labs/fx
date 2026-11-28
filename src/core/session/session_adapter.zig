@@ -7954,7 +7954,7 @@ fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
     }
     if (decodeModelCall(arena_state.allocator(), buffer[0..len])) |record| {
         try std.testing.expect(types.validModelCallText(record.provider) and types.validModelCallText(record.model));
-        inline for (.{ record.served_by, record.generation_id, record.finish, record.failure }) |text| {
+        inline for (.{ record.resolved_model, record.served_by, record.generation_id, record.finish, record.failure }) |text| {
             if (text) |value| try std.testing.expect(types.validModelCallText(value));
         }
     }
