@@ -4,6 +4,8 @@
 
 const std = @import("std");
 const settings_keys = @import("settings_keys.zig");
+const settings_store = @import("settings_store.zig");
+const shortcut_rules = @import("../shortcuts/shortcuts.zig");
 
 pub const File = enum {
     /// The profile `settings.json`.
@@ -48,6 +50,8 @@ pub fn write(writer: *std.Io.Writer, file: File) !void {
         try field(&jw, "description", "Settings for one workspace. fx reads the workspace's directories and project MCP approvals here, and any other preference it holds.");
         try writeObjectBody(&jw, .workspace);
         try jw.endObject();
+        try jw.objectField("shortcut");
+        try writeShortcutDef(&jw);
         try jw.endObject();
     }
     try jw.endObject();
@@ -148,6 +152,26 @@ fn writeKey(jw: *std.json.Stringify, key: settings_keys.Key) !void {
             try jw.write(false);
         },
         .object => try field(jw, "type", "object"),
+        .shortcuts => {
+            // Chord names are not listed here: the key grammar decides which are valid,
+            // and fx checks each name when it loads the profile.
+            try field(jw, "type", "object");
+            try jw.objectField("propertyNames");
+            try jw.beginObject();
+            try field(jw, "type", "string");
+            try jw.objectField("minLength");
+            try jw.write(@as(usize, 1));
+            try jw.objectField("maxLength");
+            try jw.write(shortcut_rules.max_key_bytes);
+            try field(jw, "description", shortcut_rules.key_grammar_description);
+            try jw.endObject();
+            try jw.objectField("maxProperties");
+            try jw.write(shortcut_rules.max_entries);
+            try jw.objectField("additionalProperties");
+            try jw.beginObject();
+            try field(jw, "$ref", "#/$defs/shortcut");
+            try jw.endObject();
+        },
         .workspaces => {
             try field(jw, "type", "object");
             try jw.objectField("additionalProperties");
@@ -168,6 +192,59 @@ fn writeKey(jw: *std.json.Stringify, key: settings_keys.Key) !void {
 fn field(jw: *std.json.Stringify, name: []const u8, value: []const u8) !void {
     try jw.objectField(name);
     try jw.write(value);
+}
+
+/// One `shortcuts` value: an fx command line as a string, or a saved model
+/// preset object with exactly the four preset fields.
+fn writeShortcutDef(jw: *std.json.Stringify) !void {
+    try jw.beginObject();
+    try field(jw, "description", "One personal key shortcut: an fx command line as a string, such as \"/fast\", or a saved model preset object.");
+    try jw.objectField("oneOf");
+    try jw.beginArray();
+    try jw.beginObject();
+    try field(jw, "type", "string");
+    try jw.objectField("minLength");
+    try jw.write(@as(usize, 2));
+    try jw.objectField("maxLength");
+    try jw.write(shortcut_rules.max_command_bytes);
+    try field(jw, "pattern", "^/");
+    try field(jw, "description", "One fx slash command and its arguments on one line, such as \"/fast\" or \"/effort low\". fx runs it through its own command router, never a shell.");
+    try jw.endObject();
+    try jw.beginObject();
+    try field(jw, "type", "object");
+    try jw.objectField("properties");
+    try jw.beginObject();
+    try jw.objectField("provider");
+    try jw.beginObject();
+    try field(jw, "type", "string");
+    try jw.objectField("minLength");
+    try jw.write(@as(usize, 1));
+    try jw.endObject();
+    try jw.objectField("model");
+    try jw.beginObject();
+    try field(jw, "type", "string");
+    try jw.objectField("minLength");
+    try jw.write(@as(usize, 1));
+    try jw.objectField("maxLength");
+    try jw.write(settings_store.max_model_bytes);
+    try jw.endObject();
+    try jw.objectField("effort");
+    try jw.beginObject();
+    try field(jw, "type", "string");
+    try jw.endObject();
+    try jw.objectField("fast_mode");
+    try jw.beginObject();
+    try field(jw, "type", "boolean");
+    try jw.endObject();
+    try jw.endObject();
+    try jw.objectField("required");
+    try jw.write(&[_][]const u8{ "provider", "model", "effort", "fast_mode" });
+    try jw.objectField("additionalProperties");
+    try jw.write(false);
+    try field(jw, "description", "A saved model preset: the provider, model, effort, and fast mode that the shortcut selects.");
+    try jw.endObject();
+    try jw.endArray();
+    try jw.endObject();
 }
 
 fn parseSchema(alloc: std.mem.Allocator, file: File) !std.json.Parsed(std.json.Value) {
@@ -204,6 +281,27 @@ test "the settings.json schema lists every key fx reads there and nothing else" 
     try std.testing.expect(properties.get("statusLine") == null);
     try std.testing.expect(properties.get("model").?.object.get("deprecated").?.bool);
     try std.testing.expect(properties.get("skill_match_fuzzy").?.object.contains("not"));
+}
+
+test "the settings.json schema bounds shortcuts by count and key length, with a command or a preset" {
+    const parsed = try parseSchema(std.testing.allocator, .profile);
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const shortcuts = root.get("properties").?.object.get("shortcuts").?.object;
+    try std.testing.expectEqual(@as(i64, shortcut_rules.max_entries), shortcuts.get("maxProperties").?.integer);
+    try std.testing.expectEqualStrings("#/$defs/shortcut", shortcuts.get("additionalProperties").?.object.get("$ref").?.string);
+    const names = shortcuts.get("propertyNames").?.object;
+    try std.testing.expectEqual(@as(i64, shortcut_rules.max_key_bytes), names.get("maxLength").?.integer);
+    try std.testing.expect(names.get("description") != null);
+    const shortcut = root.get("$defs").?.object.get("shortcut").?.object;
+    const variants = shortcut.get("oneOf").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), variants.len);
+    try std.testing.expectEqualStrings("string", variants[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("^/", variants[0].object.get("pattern").?.string);
+    const preset = variants[1].object;
+    try std.testing.expectEqual(@as(usize, 4), preset.get("required").?.array.items.len);
+    try std.testing.expect(!preset.get("additionalProperties").?.bool);
+    try std.testing.expect(!preset.get("properties").?.object.contains("action"));
 }
 
 test "the .fx.json schema lists only the project-safe keys" {

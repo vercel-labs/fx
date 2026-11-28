@@ -41,6 +41,8 @@ pub const Kind = enum {
     object,
     /// The `workspaces` map from a workspace path to its overrides.
     workspaces,
+    /// The `shortcuts` object: each key is a chord, each value a command or a preset.
+    shortcuts,
     /// A key fx refuses to load, so a file that has it fails.
     refused,
 };
@@ -99,8 +101,9 @@ const status_line_child_descriptions = [_][]const u8{
     "Show the session title in the footer",
     "Show the workspace path and Git branch in the footer",
 };
-const experimental_children = [_][]const u8{"workspace_capture"};
+const experimental_children = [_][]const u8{ "sandbox_execution", "workspace_capture" };
 const experimental_child_descriptions = [_][]const u8{
+    "Run shell commands in a Vercel Sandbox as rules in ~/.fx/sandbox/config.json say",
     "Record the repository's state at each turn's start and end in the session, for evals",
 };
 const retired_description = "No longer used; fx ignores it";
@@ -141,12 +144,13 @@ pub const keys = [_]Key{
     .{ .name = "review_model", .where = .profile, .kind = .string, .description = "The AI Gateway model that reviews actions in auto mode" },
     .{ .name = "sandbox", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "session_titles", .where = .profile, .kind = .boolean, .description = "Name each session from its first prompt" },
+    .{ .name = "shortcuts", .where = .profile, .kind = .shortcuts, .map = true, .top_level_only = true, .description = "Personal key shortcuts: a key chord such as ctrl+1 or alt+m runs one fx command line, such as \"/fast\", or a saved model preset" },
     // Retired, but still read so that fx can explain the migration.
     .{ .name = "skill_match_fuzzy", .where = .profile, .kind = .refused, .description = "No longer supported; fx refuses a file that sets it, so remove it" },
     .{ .name = "skill_symlink_authorities", .where = .profile, .kind = .strings, .description = "Absolute directories that symlinked skills may resolve into" },
     .{ .name = "slash_menu_categories", .where = .profile, .kind = .boolean, .description = "Show command categories and skill sources in slash menu results" },
     .{ .name = "sound", .where = .profile, .kind = .switches, .children = &sound_children, .child_descriptions = &sound_child_descriptions, .description = "Sounds" },
-    .{ .name = "startup_scrollback", .where = .profile, .kind = .boolean, .description = "Restore terminal output at startup" },
+    .{ .name = "startup_scrollback", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "status_line", .where = .profile, .kind = .switches, .children = &status_line_children, .child_descriptions = &status_line_child_descriptions, .description = "What the footer shows" },
     .{ .name = "theme", .where = .profile, .kind = .string, .description = "light, dark, or the name of a theme file in ~/.fx/themes" },
     .{ .name = "tool_placement", .where = .profile, .kind = .string_map, .map = true, .values = &.{ "direct", "toolbox" }, .description = "Where each built-in tool is offered: \"direct\" sends it with the tools, \"toolbox\" lists it in the toolbox menu" },
@@ -299,6 +303,7 @@ test "project files ignore profile keys but not project-safe or retired ones" {
     try std.testing.expect(ignoredInProject("model"));
     try std.testing.expect(ignoredInProject("workspaces"));
     try std.testing.expect(ignoredInProject("enabledMcpjsonServers"));
+    try std.testing.expect(ignoredInProject("shortcuts"));
     try std.testing.expect(!ignoredInProject("max_agent_steps"));
     try std.testing.expect(!ignoredInProject("provider_order"));
     try std.testing.expect(!ignoredInProject("maxxing_mode"));
