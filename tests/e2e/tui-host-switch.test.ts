@@ -4885,11 +4885,15 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   // once `broken` and `fine` have ended and `cut` still works.
   async function withEndedSubagents(
     run: (session: TmuxSession, context: Run, gates: { cut: ReturnType<typeof held>; again: ReturnType<typeof held>; againSteps: () => number }, reports: () => ReportSeen[], trace: () => string) => Promise<void>,
-    options: { trace?: boolean } = {},
+    options: { trace?: boolean; earlyReport?: boolean } = {},
   ) {
     let againSteps = 0;
     let unexpectedMainReplies = 0;
     const gates = { cut: held(), again: held(), againSteps: () => againSteps };
+    const fifoDir = options.earlyReport ? mkdtempSync(join(tmpdir(), "fx-fifo-early-")) : "";
+    const fifoPath = fifoDir ? join(fifoDir, "hold.fifo") : "";
+    if (fifoPath) Bun.spawnSync(["mkfifo", fifoPath]);
+    const fineGatewayDone = held();
     // With `trace`, fx writes its trace log, which `run` reads as its last argument.
     let tracePath = "";
     const env: Record<string, string> = {};
@@ -4923,6 +4927,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             await gates.cut.promise;
             return text("cut_done", "ENDED_CUT_DONE");
           }
+          fineGatewayDone.release();
           return text("fine_done", "ENDED_FINE_DONE");
         }
         for (const report of reportsIn(body)) reported.set(report.workId, report);
@@ -4930,6 +4935,15 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text("main_again", "ENDED_MAIN_AGAIN");
         }
         if (!body.includes('"ended_broken"')) {
+          if (options.earlyReport) {
+            return fakeGatewaySse([
+              { type: "tool-call", toolCallId: "ended_broken", toolName: "subagent", input: { request: { action: "message", agent: "broken", message: "ENDED_BROKEN run the bench" } } },
+              { type: "tool-call", toolCallId: "ended_cut", toolName: "subagent", input: { request: { action: "message", agent: "cut", message: "ENDED_CUT work slowly" } } },
+              { type: "tool-call", toolCallId: "ended_fine", toolName: "subagent", input: { request: { action: "message", agent: "fine", message: "ENDED_FINE say hello" } } },
+              { type: "tool-call", toolCallId: "ended_hold", toolName: "shell", input: { request: { action: "run", command: `cat ${fifoPath}` } } },
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+            ]);
+          }
           return messageSteps([
             { id: "ended_broken", agent: "broken", message: "ENDED_BROKEN run the bench" },
             { id: "ended_cut", agent: "cut", message: "ENDED_CUT work slowly" },
@@ -4954,6 +4968,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_unexpected", "ENDED_MAIN_UNEXPECTED");
       }, async (session, context) => {
         await session.sendText("SWITCH_USER start the team");
+        if (options.earlyReport) {
+          await fineGatewayDone.promise;
+          // Wait until the host main loop has actually posted the report into
+          // main's worker mailbox (not just queued it from the child thread)
+          // before unblocking the FIFO-held shell call.
+          await until("fine report posted to main", () => trace().includes("child_delivery_posted"));
+          writeFileSync(fifoPath, "go\n");
+        }
         // Main's turn is over once the three are started; the reports of
         // `broken` and `fine` come after it.
         await session.waitForText("ENDED_MAIN_WAITING", 60_000);
@@ -4964,15 +4986,18 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         }
         await session.waitForComposer(30_000);
         await run(session, context, gates, () => [...reported.values()], trace);
-        expect(unexpectedMainReplies).toBe(0);
       }, (home) => {
-        if (!options.trace) return;
+        if (!options.trace && !options.earlyReport) return;
         tracePath = join(home, "fx-trace.log");
         env.FX_TRACE_LOG = tracePath;
+        if (options.earlyReport) env.FX_TRACE_SCOPES = "host,input";
       }, false, env);
+      expect(unexpectedMainReplies).toBe(0);
     } finally {
       gates.cut.release();
       gates.again.release();
+      fineGatewayDone.release();
+      if (fifoDir) rmSync(fifoDir, { recursive: true, force: true });
     }
   }
 
@@ -5113,6 +5138,27 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await showAgent(session, "fine");
         await session.waitForPane((pane) => pane.includes("fine \u00b7 done"), 10_000);
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the footer on a subagent's own screen still says failed, stopped, or done when a subagent report joins before ENDED_MAIN_WAITING",
+    async () => {
+      await withEndedSubagents(async (session, context, gates) => {
+        expect(context.requests.some((request) =>
+          isMainRequest(request.body) &&
+          !request.body.includes("ENDED_MAIN_WAITING") &&
+          latestUserText(request.body).includes('"child_id"'))).toBe(true);
+        expect(await session.capturePane()).toContain("ENDED_MAIN_WAITING");
+        await stopCut(session);
+        await session.waitForPane((pane) => pane.includes("cut \u00b7 stopped"), 10_000);
+        await showAgent(session, "broken");
+        await session.waitForPane((pane) => pane.includes("broken \u00b7 failed"), 10_000);
+        await showAgent(session, "fine");
+        await session.waitForPane((pane) => pane.includes("fine \u00b7 done"), 10_000);
+        expect(gates.againSteps()).toBe(0);
+      }, { earlyReport: true });
     },
     TIMEOUT,
   );
