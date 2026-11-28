@@ -541,12 +541,17 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   "OSC7577_TOKEN",
   // fx reads its test holds in release builds, so a hold left there would
   // stop every test's fx at it. A test that sets one passes it itself.
+  // A forced approval-screen failure left there would deny the next approval
+  // of every test's fx.
+  "FX_TEST_APPROVAL_SCREEN_FAIL",
   "FX_TEST_REPORT_DELIVERY_HELD",
   "FX_TEST_REPORT_DELIVERY_RELEASE",
   "FX_TEST_SESSION_WRITE_HELD",
   "FX_TEST_SESSION_WRITE_RELEASE",
   "FX_TEST_SHELL_YIELD_HELD",
   "FX_TEST_SHELL_YIELD_RELEASE",
+  "FX_TEST_SHUTDOWN_RELEASE_HELD",
+  "FX_TEST_SHUTDOWN_RELEASE_RELEASE",
   "FX_TEST_SUBAGENT_CLOSE_HELD",
   "FX_TEST_SUBAGENT_CLOSE_RELEASE",
   "FX_TEST_SUBAGENT_END_HELD",
