@@ -1,0 +1,24 @@
+{
+  "covers": [
+    "AC-9"
+  ],
+  "title": "A background remote run is stopped: the remote kill goes out before the runner exits 143.",
+  "run": {
+    "events": [
+      "push_ok",
+      "send_ran",
+      "id_arrives",
+      "stop_requested",
+      "kill_sent",
+      "stop_exit",
+      "exit_143"
+    ]
+  },
+  "tamper": {
+    "run": "exit-without-kill"
+  },
+  "drive": {
+    "command": "sleep 300",
+    "stop": true
+  }
+}

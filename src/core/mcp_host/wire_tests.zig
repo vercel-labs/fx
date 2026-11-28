@@ -6,6 +6,7 @@ const std = @import("std");
 const mcp = @import("../../mcp/mcp.zig");
 
 const wire = mcp.wire;
+const core_mrtr = @import("../mcp/mrtr.zig");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
@@ -19,6 +20,131 @@ test "the engine reads an object's field names as std.json decodes them" {
     try testing.fuzz({}, fuzzMemberNames, .{
         .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_object_fields.*),
     });
+}
+
+test "a round the engine read gets the answer the text form gets, with its keys and state as written" {
+    try testing.fuzz({}, fuzzInputRound, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"inputRequests\":{\"a\":{\"method\":\"roots/list\"}}}",
+            "{\"inputRequests\":{\"a\":{\"method\":\"elicitation/create\",\"params\":{\"message\":\"m\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}},\"b\\u0062\":{\"method\":\"sampling/createMessage\"}},\"requestState\":\"s\\n\\ud83d\\ude00\"}",
+            "{\"inputRequests\":{\"a\":{\"method\":\"elicitation/create\",\"params\":{\"x\":{\"a\":0,\"a\":1}}}}}",
+        }) ++ @import("fuzz_corpus").mcp_input_round.*),
+    });
+}
+
+/// More than the round's own limit (128 KiB) and a key, so a saved input at that edge fits.
+const max_fuzz_round_bytes = 144 * 1024;
+
+/// The engine reads a round into slices of its bytes. Core's reader of those slices must refuse or accept as the
+/// tree path does for the same round written as `{key:request,...}`, with the same reason, and an accepted round
+/// keeps each key as the engine's slice, and the state is the engine's slice too.
+fn fuzzInputRound(_: void, smith: *testing.Smith) !void {
+    var buffer: [max_fuzz_round_bytes]u8 = undefined;
+    var generated: std.ArrayList(u8) = .empty;
+    defer generated.deinit(testing.allocator);
+    const given = buffer[0..smith.slice(&buffer)];
+    // Bytes given are the round as written. With none, the round is built around one member at a bound, so a search
+    // reaches the limits that fuzzed bytes almost never spell.
+    const bytes = if (given.len > 0) given else try generateRound(smith, &generated);
+    var round: mcp.mrtr.Round = undefined;
+    mcp.mrtr.parse(bytes, &round) catch return;
+    if (round.state) |state| {
+        try expectWithin(bytes, state);
+        try testing.expect(state.len >= 2 and state[0] == '"' and state[state.len - 1] == '"');
+    }
+    // The question UI is never asked about a round with no request.
+    if (round.count == 0) return;
+
+    var raw: [mcp.mrtr.max_requests]core_mrtr.RawRequest = undefined;
+    var text: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer text.deinit();
+    try text.writer.writeByte('{');
+    for (round.slice(), raw[0..round.count], 0..) |request, *out, index| {
+        try expectWithin(bytes, request.key);
+        try expectWithin(bytes, request.raw);
+        out.* = .{
+            .key = request.key,
+            .kind = switch (request.kind) {
+                .elicitation => .elicitation,
+                .sampling => .sampling,
+                .roots => .roots,
+            },
+            .raw = request.raw,
+            .params = request.params,
+        };
+        if (index > 0) try text.writer.writeByte(',');
+        try text.writer.print("{s}:{s}", .{ request.key, request.raw });
+    }
+    try text.writer.writeByte('}');
+
+    const alloc = testing.allocator;
+    const via_text = core_mrtr.parseRequestJsonForWire(alloc, text.written(), .modern_mcp, .{});
+    const text_answer = if (via_text) |requests| blk: {
+        freeInputRequests(alloc, requests);
+        break :blk "ok";
+    } else |err| @errorName(err);
+    const via_slices = core_mrtr.readRequests(alloc, raw[0..round.count], "", .modern_mcp, .{});
+    if (via_slices) |requests| {
+        defer freeInputRequests(alloc, requests);
+        try testing.expectEqualStrings(text_answer, "ok");
+        try testing.expectEqual(@as(usize, round.count), requests.len);
+        for (requests, round.slice()) |kept, read| try testing.expectEqualStrings(read.key, kept.key);
+    } else |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => try testing.expectEqualStrings(text_answer, @errorName(err)),
+    }
+}
+
+const round_head = "{\"inputRequests\":{\"a\":{\"method\":\"elicitation/create\",\"params\":{\"message\":\"Continue?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}";
+const fuzz_string_bound = 64 * 1024;
+
+/// One request whose params hold a member of a kind and a size that straddles the limit for it: nesting depth, the
+/// bytes of a string decoded from escapes, items, members, or the bytes of a name.
+fn generateRound(smith: *testing.Smith, out: *std.ArrayList(u8)) ![]const u8 {
+    const alloc = testing.allocator;
+    try out.appendSlice(alloc, round_head);
+    switch (smith.valueRangeAtMost(u8, 0, 4)) {
+        0 => {
+            const depth = smith.valueRangeAtMost(u8, 0, 40);
+            try out.appendSlice(alloc, ",\"x\":");
+            try out.appendNTimes(alloc, '[', depth);
+            try out.append(alloc, '0');
+            try out.appendNTimes(alloc, ']', depth);
+        },
+        1 => {
+            try out.appendSlice(alloc, ",\"x\":\"");
+            try out.appendNTimes(alloc, 's', fuzz_string_bound - 2000);
+            for (0..smith.valueRangeAtMost(u16, 995, 1005)) |_| try out.appendSlice(alloc, "\\u00e9");
+            try out.append(alloc, '"');
+        },
+        2 => {
+            try out.appendSlice(alloc, ",\"x\":[0");
+            for (1..smith.valueRangeAtMost(u16, 250, 262)) |_| try out.appendSlice(alloc, ",0");
+            try out.append(alloc, ']');
+        },
+        3 => {
+            try out.appendSlice(alloc, ",\"x\":{\"k0\":0");
+            for (1..smith.valueRangeAtMost(u16, 250, 262)) |index| try out.print(alloc, ",\"k{d}\":0", .{index});
+            try out.append(alloc, '}');
+        },
+        else => {
+            try out.appendSlice(alloc, ",\"x\":{\"");
+            try out.appendNTimes(alloc, 'k', smith.valueRangeAtMost(u16, 250, 262));
+            try out.appendSlice(alloc, "\":0}");
+        },
+    }
+    try out.appendSlice(alloc, "}}}}");
+    return out.items;
+}
+
+fn freeInputRequests(alloc: Allocator, requests: []core_mrtr.InputRequest) void {
+    for (requests) |*request| request.deinit(alloc);
+    alloc.free(requests);
+}
+
+fn expectWithin(outer: []const u8, inner: []const u8) !void {
+    const start = @intFromPtr(inner.ptr);
+    try testing.expect(start >= @intFromPtr(outer.ptr) and start + inner.len <= @intFromPtr(outer.ptr) + outer.len);
 }
 
 const fuzz_keys = [_][]const u8{

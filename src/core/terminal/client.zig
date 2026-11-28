@@ -21,6 +21,8 @@ const json_decode = @import("../shared/json_decode.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
+const process_identity = @import("../execution/process_identity.zig");
+const process_tree = @import("../execution/process_tree.zig");
 const ui_projection = @import("ui_projection.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1755,9 +1757,9 @@ test "a full worker table refuses one more request, and the next request runs on
 const idle_signalling_command = "printf x > ./" ++ LaunchSignal.name ++ "; exec sleep 30";
 
 /// A start request for a terminal that stays idle until the fixture ends it.
-/// A test that ends with the fixture waits for the launch signal first: an
-/// exit close that comes while the shell is still starting can leave the
-/// launcher alive (see "What this does not fix" in the PR).
+/// A test that ends with the fixture waits for the launch signal first, so
+/// the exit close never comes while the shell is still starting, where it
+/// waits out its whole grace.
 fn idleStart(fixture: *LiveTerminalFixture, retain_in_flight: bool) contracts.ActionRequest {
     return .{ .start = .{
         .cwd = fixture.home,
@@ -1922,4 +1924,603 @@ test "closing owned terminals for exit leaves no orphan and records them ended" 
     } });
     defer refused.deinit(alloc);
     try std.testing.expect(refused.view() == .failure);
+}
+
+/// A named pipe the exit close writes one byte to, so a terminal's command can
+/// wait for it with `read -r _ < ./go`. The test holds both ends open, as
+/// `LaunchSignal` does, so the command's open never blocks.
+const GoSignal = struct {
+    const name = "go";
+
+    read_fd: std.posix.fd_t,
+    write_fd: std.posix.fd_t,
+
+    fn init(signal: *GoSignal, dir: []const u8) !void {
+        var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+        const fifo = try std.mem.printSentinel(&path_buf, "{s}/" ++ name, .{dir}, 0);
+        if (LaunchSignal.fifo_c.mkfifo(fifo, 0o600) != 0) return error.TestGoSignalFailed;
+        signal.read_fd = std.c.open(fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+        if (signal.read_fd < 0) return error.TestGoSignalFailed;
+        errdefer _ = std.c.close(signal.read_fd);
+        signal.write_fd = std.c.open(fifo, .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        if (signal.write_fd < 0) return error.TestGoSignalFailed;
+    }
+
+    fn deinit(signal: *GoSignal) void {
+        _ = std.c.close(signal.write_fd);
+        _ = std.c.close(signal.read_fd);
+    }
+
+    fn send(signal: *GoSignal) !void {
+        if (std.c.write(signal.write_fd, "x\n", 2) != 2) return error.TestGoSignalFailed;
+    }
+};
+
+const real_process_provider = @import("../../tools/shell/process_provider.zig").provider;
+
+/// A named pipe that a process holds open for writing. The test reads the end
+/// of the pipe to learn that the process is gone: its files close when it
+/// dies, so no wait on a clock or a process state is needed. A terminal's late
+/// child holds it as its standard output and writes one byte when it starts.
+const LifeSignal = struct {
+    const late_child = "alive";
+    const daemon = "daemon-alive";
+
+    read_fd: std.posix.fd_t,
+
+    fn init(signal: *LifeSignal, dir: []const u8, name: []const u8) !void {
+        var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+        const fifo = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ dir, name }, 0);
+        if (LaunchSignal.fifo_c.mkfifo(fifo, 0o600) != 0) return error.TestLifeSignalFailed;
+        signal.read_fd = std.c.open(fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+        if (signal.read_fd < 0) return error.TestLifeSignalFailed;
+    }
+
+    fn deinit(signal: *LifeSignal) void {
+        _ = std.c.close(signal.read_fd);
+    }
+
+    /// Blocks until the child's byte arrives, for at most `timeout_ms`.
+    fn waitStarted(signal: *LifeSignal, timeout_ms: i32) !void {
+        var fds = [_]std.posix.pollfd{.{ .fd = signal.read_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        if ((try std.posix.poll(&fds, timeout_ms)) == 0) return error.TestLifeSignalTimedOut;
+        var byte: [1]u8 = undefined;
+        if ((try std.posix.read(signal.read_fd, &byte)) != 1) return error.TestLifeSignalFailed;
+    }
+
+    /// Blocks until the process is gone, for at most `timeout_ms`.
+    fn waitGone(signal: *LifeSignal, timeout_ms: i32) !void {
+        if (!try readableOrAtEnd(signal.read_fd, timeout_ms)) return error.TestProcessStillRuns;
+        var byte: [1]u8 = undefined;
+        if ((try std.posix.read(signal.read_fd, &byte)) != 0) return error.TestLifeSignalFailed;
+    }
+};
+
+/// Whether `fd`, the read end of a named pipe, holds data or has reached its
+/// end within `timeout_ms`. On macOS only `select` says that the last writer
+/// of a named pipe has gone; `poll` and `kqueue` stay silent.
+fn readableOrAtEnd(fd: std.posix.fd_t, timeout_ms: i32) !bool {
+    if (comptime builtin.target.os.tag != .macos) {
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        return (try std.posix.poll(&fds, timeout_ms)) != 0;
+    }
+    const system = struct {
+        const FdSet = extern struct { bits: [32]u32 };
+        extern "c" fn select(
+            count: c_int,
+            read_set: *FdSet,
+            write_set: ?*FdSet,
+            error_set: ?*FdSet,
+            timeout: *std.c.timeval,
+        ) c_int;
+    };
+    var read_set: system.FdSet = .{ .bits = @splat(0) };
+    const index: usize = @intCast(@divFloor(fd, 32));
+    read_set.bits[index] |= @as(u32, 1) << @intCast(@mod(fd, 32));
+    var timeout: std.c.timeval = .{
+        .sec = @divFloor(timeout_ms, 1000),
+        .usec = @mod(timeout_ms, 1000) * 1000,
+    };
+    const ready = system.select(fd + 1, &read_set, null, null, &timeout);
+    if (ready < 0) return error.TestSelectFailed;
+    return ready > 0;
+}
+
+/// A process a test started, with the identity it had, so the test ends it by
+/// pid only while it is still that process.
+const TestProcess = struct {
+    pid: std.posix.pid_t,
+    token: ?process_identity.ProcessInstanceToken,
+
+    fn init(pid: std.posix.pid_t) TestProcess {
+        var buffer: [32]u8 = undefined;
+        const text = std.mem.print(&buffer, "{d}", .{pid}) catch return .{ .pid = pid, .token = null };
+        return .{
+            .pid = pid,
+            .token = real_process_provider.captureToken(
+                std.testing.allocator,
+                text,
+            ) catch null,
+        };
+    }
+
+    fn isSame(process: TestProcess) bool {
+        var buffer: [32]u8 = undefined;
+        const text = std.mem.print(&buffer, "{d}", .{process.pid}) catch return false;
+        const token = process.token orelse return false;
+        return real_process_provider.matchToken(
+            std.testing.allocator,
+            text,
+            token,
+        ) == .matched;
+    }
+
+    /// Whether it still runs. A zombie, which only waits to be reaped, does not.
+    fn isRunning(process: TestProcess) bool {
+        if (!process.isSame()) return false;
+        return process_tree.processIsAlive(std.testing.allocator, process.pid) catch true;
+    }
+
+    fn end(process: TestProcess) void {
+        if (!process.isRunning()) return;
+        // Cleanup: it may have ended between the check and the signal.
+        std.posix.kill(process.pid, std.posix.SIG.KILL) catch {};
+    }
+};
+
+/// What the host does with a terminal's launcher, as `native_session.zig`
+/// reports it. A test arms it before it starts the one terminal it watches.
+const LauncherWatch = struct {
+    var pid: std.atomic.Value(std.posix.pid_t) = .init(0);
+    var kept: std.atomic.Value(usize) = .init(0);
+    var collected: std.atomic.Value(usize) = .init(0);
+    var kept_seen: std.Io.Event = .unset;
+    var collected_seen: std.Io.Event = .unset;
+    var decided: std.Io.Event = .unset;
+
+    fn arm() void {
+        pid.store(0, .release);
+        kept.store(0, .release);
+        collected.store(0, .release);
+        kept_seen = .unset;
+        collected_seen = .unset;
+        decided = .unset;
+        native_session.test_launcher_event = &observe;
+    }
+
+    fn disarm() void {
+        native_session.test_launcher_event = null;
+    }
+
+    fn observe(
+        event: native_session.LauncherEvent,
+        _: []const u8,
+        launcher_pid: std.posix.pid_t,
+    ) void {
+        const zio = io_mod.getIo();
+        switch (event) {
+            .started => pid.store(launcher_pid, .release),
+            .kept => {
+                _ = kept.fetchAdd(1, .acq_rel);
+                kept_seen.set(zio);
+                decided.set(zio);
+            },
+            .collected => {
+                _ = collected.fetchAdd(1, .acq_rel);
+                collected_seen.set(zio);
+                decided.set(zio);
+            },
+        }
+    }
+
+    /// Blocks until `event` is set, for at most `timeout_ms`. A wait that ends
+    /// early without the event is not a timeout: `Event.waitTimeout` reports a
+    /// spurious wake-up as one.
+    fn waitFor(event: *std.Io.Event, timeout_ms: i64) !void {
+        const deadline = io_mod.milliTimestamp() + timeout_ms;
+        while (!event.isSet()) {
+            const left_ms = deadline - io_mod.milliTimestamp();
+            if (left_ms <= 0) return error.TestLauncherEventTimedOut;
+            event.waitTimeout(io_mod.getIo(), .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(left_ms),
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return err,
+            };
+        }
+    }
+};
+
+/// What a late-fork test holds while the exit close runs: the pipe that lets
+/// the terminal's command go on once the close has recorded its process tree,
+/// the pipes that command answers on once it has started its late child, and
+/// the launcher that the close reported.
+const ExitGate = struct {
+    var go: ?*GoSignal = null;
+    var forked: ?*LaunchSignal = null;
+    var alive: ?*LifeSignal = null;
+    var session_id: [128]u8 = undefined;
+    var session_id_len: usize = 0;
+    /// The first error a hook met, which the test returns.
+    var failure: ?anyerror = null;
+    var launcher: ?TestProcess = null;
+    /// Holds the close before it ends the terminal's session until the host
+    /// has decided what to do with the ended launcher, so the close cannot run
+    /// first and hide whether the launcher was kept for it.
+    var wait_for_launcher_decision = false;
+
+    fn arm(
+        go_signal: ?*GoSignal,
+        forked_signal: ?*LaunchSignal,
+        alive_signal: ?*LifeSignal,
+        id: []const u8,
+    ) void {
+        go = go_signal;
+        forked = forked_signal;
+        alive = alive_signal;
+        session_id_len = @min(id.len, session_id.len);
+        @memcpy(session_id[0..session_id_len], id[0..session_id_len]);
+        failure = null;
+        launcher = null;
+        wait_for_launcher_decision = false;
+        native_session.test_after_exit_record = &afterRecord;
+        native_session.test_before_session_end = &beforeSessionEnd;
+    }
+
+    fn disarm() void {
+        native_session.test_after_exit_record = null;
+        native_session.test_before_session_end = null;
+        go = null;
+        forked = null;
+        alive = null;
+    }
+
+    fn afterRecord(id: []const u8, launcher_pid: ?std.posix.pid_t) void {
+        if (!std.mem.eql(u8, id, session_id[0..session_id_len])) return;
+        if (launcher_pid) |pid| launcher = TestProcess.init(pid);
+        const go_signal = go orelse return;
+        go_signal.send() catch |err| {
+            failure = err;
+            return;
+        };
+        const forked_signal = forked orelse return;
+        forked_signal.wait(15_000) catch |err| {
+            failure = err;
+            return;
+        };
+        const alive_signal = alive orelse return;
+        alive_signal.waitStarted(15_000) catch |err| {
+            failure = err;
+        };
+    }
+
+    fn beforeSessionEnd(id: []const u8) void {
+        if (!wait_for_launcher_decision) return;
+        if (!std.mem.eql(u8, id, session_id[0..session_id_len])) return;
+        LauncherWatch.waitFor(&LauncherWatch.decided, 15_000) catch |err| {
+            failure = err;
+        };
+    }
+
+    fn endLauncher() void {
+        if (launcher) |process| process.end();
+    }
+};
+
+/// The late child starts after the exit close recorded the process tree, so
+/// the record misses it: the command waits for `go`, starts the child in its
+/// own process group with the `alive` pipe as its output, detaches it from the
+/// shell's job table, and tells the close that it did. The child still holds
+/// the terminal as its input and error output.
+const late_fork_command = "read -r _ < ./" ++ GoSignal.name ++
+    "; ( printf x; exec sleep 30 ) > ./" ++ LifeSignal.late_child ++
+    " & echo $! > ./late.pid; disown; printf x > ./" ++ LaunchSignal.name ++
+    "; exec sleep 60";
+const launched_byte = "printf x > ./" ++ LaunchSignal.name ++ "; ";
+
+/// The late child no tree kill can reach: `late.py` forks it and exits at once,
+/// so its parent is gone and no process of the recorded tree or the shell's
+/// lineage leads to it. It leads its own process group, ignores the hangup,
+/// and holds the terminal as its input and error output. Only the sweep of the
+/// terminal's session can end it. It says that it started on the `alive` pipe.
+const orphaned_late_command = "read -r _ < ./" ++ GoSignal.name ++
+    "; python3 ./late.py ./" ++ LifeSignal.late_child ++
+    "; printf x > ./" ++ LaunchSignal.name ++ "; exec sleep 60";
+
+fn writeLateScript(fixture: *LiveTerminalFixture) !void {
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "late.py", .data =
+        \\import os, signal, sys
+        \\if os.fork() == 0:
+        \\    os.setpgid(0, 0)
+        \\    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        \\    open("late.pid", "w").write(str(os.getpid()))
+        \\    life = os.open(sys.argv[1], os.O_WRONLY)
+        \\    os.write(life, b"x")
+        \\    signal.alarm(30); signal.pause()
+        \\    os._exit(0)
+    });
+}
+
+fn readPid(fixture: *LiveTerminalFixture, name: []const u8) !std.posix.pid_t {
+    const bytes = try fixture.tmp.dir.readFileAlloc(
+        std.testing.io,
+        name,
+        std.testing.allocator,
+        .limited(64),
+    );
+    defer std.testing.allocator.free(bytes);
+    return std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, bytes, " \n"), 10);
+}
+
+test "closing owned terminals for exit ends a child the shell started after the process tree was recorded" {
+    try expectExitEndsLateChild(.drains_first, .forked);
+}
+
+test "closing owned terminals for exit ends a late child when the terminal's output ended first" {
+    try expectExitEndsLateChild(.ends_first, .forked);
+}
+
+test "closing owned terminals for exit ends an orphaned late child that ignores the hangup" {
+    try expectExitEndsLateChild(.drains_first, .orphaned);
+}
+
+test "closing owned terminals for exit ends an orphaned late child when the terminal's output ended first" {
+    try expectExitEndsLateChild(.ends_first, .orphaned);
+}
+
+/// Where the terminal's output ends relative to the late child. macOS ends it
+/// when the shell exits, while the late child still holds the PTY, and Linux
+/// only when the PTY has no holder left. `ends_first` has Linux do what macOS
+/// does.
+const OutputEnds = enum { drains_first, ends_first };
+
+/// `forked`: the shell starts it in its own process group, and a tree kill
+/// that reads the tree again can find it. `orphaned`: no tree kill can.
+const LateChild = enum { forked, orphaned };
+
+fn expectExitEndsLateChild(output: OutputEnds, late_child: LateChild) !void {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    native_session.test_end_before_drain = output == .ends_first;
+    defer native_session.test_end_before_drain = false;
+    LauncherWatch.arm();
+    defer LauncherWatch.disarm();
+
+    var go: GoSignal = undefined;
+    try go.init(fixture.home);
+    defer go.deinit();
+    var forked: LaunchSignal = undefined;
+    try forked.init(fixture.home);
+    defer forked.deinit();
+    var alive: LifeSignal = undefined;
+    try alive.init(fixture.home, LifeSignal.late_child);
+    defer alive.deinit();
+
+    const session_id = switch (late_child) {
+        .forked => try fixture.start(late_fork_command),
+        .orphaned => blk: {
+            try writeLateScript(&fixture);
+            break :blk try fixture.start(orphaned_late_command);
+        },
+    };
+    defer alloc.free(session_id);
+    ExitGate.arm(&go, &forked, &alive, session_id);
+    defer ExitGate.disarm();
+    ExitGate.wait_for_launcher_decision = output == .ends_first;
+
+    fixture.runtime.closeOwnedTerminals();
+    // The hook ran after the shell's tree was recorded and waited for the child.
+    if (ExitGate.failure) |err| return err;
+    const late = TestProcess.init(try readPid(&fixture, "late.pid"));
+    // Past the failed assertions, so the test never leaves its child behind.
+    defer late.end();
+    if (!fixture.runtime.backend_drained) return error.TestBackendNotDrained;
+    try alive.waitGone(2_000);
+    // The host collected the launcher once, after the close ended its session.
+    try std.testing.expectEqual(@as(usize, 1), LauncherWatch.collected.load(.acquire));
+    if (process_tree.exitedChildIsUncollected(LauncherWatch.pid.load(.acquire))) {
+        return error.TestLauncherNotCollected;
+    }
+}
+
+test "a launcher is collected as soon as its terminal ends with nothing left in its session" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    LauncherWatch.arm();
+    defer LauncherWatch.disarm();
+    var go: GoSignal = undefined;
+    try go.init(fixture.home);
+    defer go.deinit();
+    const session_id = try fixture.start("read -r _ < ./" ++ GoSignal.name ++ "; exit 3");
+    defer alloc.free(session_id);
+
+    try go.send();
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome{ .exited = 3 },
+        try fixture.waitForExit(session_id),
+    );
+    try LauncherWatch.waitFor(&LauncherWatch.collected_seen, 15_000);
+    try std.testing.expect(!process_tree.exitedChildIsUncollected(LauncherWatch.pid.load(.acquire)));
+    try std.testing.expectEqual(@as(usize, 0), LauncherWatch.kept.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), LauncherWatch.collected.load(.acquire));
+}
+
+test "closing a terminal collects the launcher that was kept for its session" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    // The terminal's output ends before its last process does, as on macOS.
+    native_session.test_end_before_drain = true;
+    defer native_session.test_end_before_drain = false;
+    LauncherWatch.arm();
+    defer LauncherWatch.disarm();
+    var go: GoSignal = undefined;
+    try go.init(fixture.home);
+    defer go.deinit();
+    var launched: LaunchSignal = undefined;
+    try launched.init(fixture.home);
+    defer launched.deinit();
+    // A process the shell started stays in its session after the shell ends.
+    const session_id = try fixture.start("sleep 30 & echo $! > ./late.pid; disown; printf x > ./" ++
+        LaunchSignal.name ++ "; read -r _ < ./" ++ GoSignal.name ++ "; exit 0");
+    defer alloc.free(session_id);
+    try launched.wait(15_000);
+    const late = TestProcess.init(try readPid(&fixture, "late.pid"));
+    defer late.end();
+
+    try go.send();
+    try LauncherWatch.waitFor(&LauncherWatch.kept_seen, 15_000);
+    const launcher_pid = LauncherWatch.pid.load(.acquire);
+    try std.testing.expect(process_tree.exitedChildIsUncollected(launcher_pid));
+    try std.testing.expectEqual(@as(usize, 0), LauncherWatch.collected.load(.acquire));
+
+    // The last process of the session ends, and closing the terminal collects the launcher.
+    late.end();
+    var closed = try fixture.run(.{ .close = .{
+        .session_id = session_id,
+        .policy = .force,
+        .authority = fixture.claim(),
+    } });
+    defer closed.deinit(alloc);
+    try std.testing.expect(closed.view() == .success);
+    try std.testing.expectEqual(@as(usize, 1), LauncherWatch.collected.load(.acquire));
+    try std.testing.expect(!process_tree.exitedChildIsUncollected(launcher_pid));
+}
+
+test "closing owned terminals for exit ends a launcher that still waits to release its command" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    // The shell has told the launcher that its command starts, and the host
+    // never releases it. The hangup ends the shell, and the launcher waits
+    // for a release that cannot come until it closes the PTY, which the
+    // backend waits for.
+    native_session.test_hold_release = true;
+    defer native_session.test_hold_release = false;
+    const session_id = try fixture.start("sleep 30");
+    defer alloc.free(session_id);
+    ExitGate.arm(null, null, null, session_id);
+    defer ExitGate.disarm();
+    defer ExitGate.endLauncher();
+
+    fixture.runtime.closeOwnedTerminals();
+    try std.testing.expect(ExitGate.launcher != null);
+    try std.testing.expect(fixture.runtime.backend_drained);
+}
+
+test "a terminal whose shell ends while its release is held reports how it ended" {
+    try expectEndsWhileReleaseIsHeld(.shell_only);
+}
+
+test "a terminal whose shell and helper both end while its release is held reports how it ended" {
+    try expectEndsWhileReleaseIsHeld(.whole_group);
+}
+
+const EndedProcesses = enum { shell_only, whole_group };
+
+/// The shell has told the launcher that its command starts, and the host
+/// never releases it. The shell ends (the whole group, as a hangup of the
+/// terminal ends it, takes the helper that told the launcher with it), and
+/// the launcher must report that end, not a failed start.
+fn expectEndsWhileReleaseIsHeld(ended: EndedProcesses) !void {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    native_session.test_hold_release = true;
+    defer native_session.test_hold_release = false;
+    const session_id = try fixture.start("sleep 30");
+    defer alloc.free(session_id);
+    const shell = TestProcess.init(try fixture.shellPid(session_id));
+    defer shell.end();
+
+    // The shell leads its own process group, so its pid names the group.
+    const target = switch (ended) {
+        .shell_only => shell.pid,
+        .whole_group => -shell.pid,
+    };
+    try std.posix.kill(target, std.posix.SIG.KILL);
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome{ .signal = @intCast(@backingInt(std.posix.SIG.KILL)) },
+        try fixture.waitForExit(session_id),
+    );
+}
+
+test "closing owned terminals for exit leaves a setsid program and another runtime's terminal running" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    // A terminal of another runtime, as a second fx process owns its own.
+    var sibling: LiveTerminalFixture = undefined;
+    try sibling.init();
+    defer sibling.deinit();
+    const sibling_id = try sibling.start("printf 'UP%s\\n' NOW; exec sleep 30");
+    defer alloc.free(sibling_id);
+    try sibling.waitForMatch(sibling_id, "UPNOW");
+    const sibling_shell = TestProcess.init(try sibling.shellPid(sibling_id));
+    defer sibling_shell.end();
+
+    // The daemon leaves the terminal's session before the late child starts,
+    // and closes its terminal files, so only the late child holds the PTY.
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "daemon.py", .data =
+        \\import os, signal, sys
+        \\ready_r, ready_w = os.pipe()
+        \\if os.fork() == 0:
+        \\    os.setsid()
+        \\    null = os.open(os.devnull, os.O_RDWR)
+        \\    for fd in (0, 1, 2):
+        \\        os.dup2(null, fd)
+        \\    life = os.open(sys.argv[1], os.O_WRONLY)
+        \\    open("daemon.pid", "w").write(str(os.getpid()))
+        \\    os.write(ready_w, b"x")
+        \\    signal.alarm(30); signal.pause()
+        \\    os._exit(0)
+        \\os.read(ready_r, 1)
+    });
+    var go: GoSignal = undefined;
+    try go.init(fixture.home);
+    defer go.deinit();
+    var forked: LaunchSignal = undefined;
+    try forked.init(fixture.home);
+    defer forked.deinit();
+    var alive: LifeSignal = undefined;
+    try alive.init(fixture.home, LifeSignal.late_child);
+    defer alive.deinit();
+    var daemon_life: LifeSignal = undefined;
+    try daemon_life.init(fixture.home, LifeSignal.daemon);
+    defer daemon_life.deinit();
+    const session_id = try fixture.start("python3 ./daemon.py " ++ LifeSignal.daemon ++ "; " ++ launched_byte ++ late_fork_command);
+    defer alloc.free(session_id);
+    // The first byte says the daemon has left, and the second the late child has started.
+    try forked.wait(15_000);
+    const daemon = TestProcess.init(try readPid(&fixture, "daemon.pid"));
+    defer daemon.end();
+    ExitGate.arm(&go, &forked, &alive, session_id);
+    defer ExitGate.disarm();
+
+    fixture.runtime.closeOwnedTerminals();
+    if (ExitGate.failure) |err| return err;
+    const late = TestProcess.init(try readPid(&fixture, "late.pid"));
+    defer late.end();
+    try std.testing.expect(fixture.runtime.backend_drained);
+    try alive.waitGone(2_000);
+    try std.testing.expect(daemon.isRunning());
+    try std.testing.expect(sibling_shell.isRunning());
+    // The test leaves nothing running: the daemon is gone when it returns.
+    daemon.end();
+    try daemon_life.waitGone(5_000);
 }
