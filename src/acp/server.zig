@@ -308,7 +308,7 @@ pub const ActiveSessionState = struct {
         for (self.session_grants) |*grant| {
             if (!std.mem.eql(u8, grant.tool_name, tool_name) or
                 !std.mem.eql(u8, grant.target_path, target_path)) continue;
-            if (!permissions.grantAppliesInShellEpoch(grant.*, shell_epoch)) grant.shell_epoch = shell_epoch;
+            permissions.advanceGrantShellEpoch(grant, shell_epoch);
             return;
         }
 

@@ -4290,7 +4290,7 @@ fn dupePendingBatchSnapshot(alloc: std.mem.Allocator, pending: OwnedQuestionBatc
 fn appendGrantToQueuedPrompt(alloc: std.mem.Allocator, prompt: *QueuedPrompt, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
     for (prompt.grants) |*grant| {
         if (!std.mem.eql(u8, grant.tool_name, tool_name) or !std.mem.eql(u8, grant.target_path, target_path)) continue;
-        if (!permissions.grantAppliesInShellEpoch(grant.*, shell_epoch)) grant.shell_epoch = shell_epoch;
+        permissions.advanceGrantShellEpoch(grant, shell_epoch);
         return;
     }
     const tool_name_dup = try alloc.dupe(u8, tool_name);
