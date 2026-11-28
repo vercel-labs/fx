@@ -2,6 +2,7 @@ const std = @import("std");
 const agent_steps = @import("agent_steps.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const host_target = @import("../hosts/target.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const compactor = @import("../compactor/compactor.zig");
@@ -2094,9 +2095,12 @@ fn parseProfileOnlyFields(
                 if (value != .bool) return error.InvalidExperimentalSandboxExecutionType;
                 settings.experimental_sandbox_execution = value.bool;
             }
-            if (experimental_value.object.get("monitor")) |value| {
-                if (value != .bool) return error.InvalidExperimentalMonitorType;
-                settings.experimental_monitor = value.bool;
+            // The browser build has no monitor tool, so it reads no such setting.
+            if (comptime !host_target.is_wasm) {
+                if (experimental_value.object.get("monitor")) |value| {
+                    if (value != .bool) return error.InvalidExperimentalMonitorType;
+                    settings.experimental_monitor = value.bool;
+                }
             }
         }
     }
