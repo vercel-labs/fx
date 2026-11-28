@@ -2182,7 +2182,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Notes the request the newest turn left unfinished, if a crash or a
         /// close ended it (`tests/tla/recovery/Resume.tla` AutoResumes).
-        fn noteInterruptedRequest(agent: *AppAgent, v2: *session_adapter.Session) void {
+        pub fn noteInterruptedRequest(agent: *AppAgent, v2: *session_adapter.Session) void {
             agent.session_persistence.pending_request_resume = null;
             agent.session_persistence.pending_resume_yielded = false;
             const found = (v2.interruptedRequest() catch |err| {
@@ -2239,7 +2239,7 @@ pub fn Runtime(comptime App: type) type {
         /// and the next turn says it continues the stopped one, so a later replay
         /// joins the two (`session_adapter.Session.setContinuesYielded`). A libfx
         /// terminal session saves whole snapshots and needs no base.
-        fn continueStoppedTurn(app: *App, agent: *AppAgent, resumed: types.RecoveryResume, stop: continuation.Stop) !void {
+        pub fn continueStoppedTurn(app: *App, agent: *AppAgent, resumed: types.RecoveryResume, stop: continuation.Stop) !void {
             if (comptime !@hasDecl(App, "queueContinuedTurn")) return error.ContinuedTurnUnsupported;
             if (agent.session_persistence.v2 == null and agent.session_persistence.js_host_session == null) {
                 return error.SessionPersistenceUnavailable;
@@ -5931,7 +5931,12 @@ pub fn Runtime(comptime App: type) type {
                 children,
                 subagentAuthorityResolver(app),
                 if (comptime @hasDecl(App, "runSubagentChild"))
-                    .{ .context = app, .bind_fn = App.bindSubagentWorker, .run_fn = App.runSubagentChild }
+                    .{
+                        .context = app,
+                        .bind_fn = App.bindSubagentWorker,
+                        .run_fn = App.runSubagentChild,
+                        .restarting_fn = if (comptime runtime_profile.allows(App, .auto_upgrade) and @hasDecl(App, "subagentRestarting")) App.subagentRestarting else null,
+                    }
                 else
                     .{},
             ) catch |err| {
@@ -5950,6 +5955,13 @@ pub fn Runtime(comptime App: type) type {
                 // and its children are as deep as fx nests.
                 host.owner_has_parent = agent.role == .subagent;
                 host.authority_resolver.children_nest = agent.role != .subagent;
+                if (comptime runtime_profile.allows(App, .auto_upgrade)) {
+                    // Saves the continuations before the reports below, so
+                    // the fold skips the works they replace. Their slots start
+                    // from the main loop (`takePosts`): this can run inside
+                    // `App.init`, before the app moves.
+                    host.continueYieldedWorks();
+                }
                 // What a restart left owed reaches this agent now.
                 host.resumeReports(v2);
             }

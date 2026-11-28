@@ -185,7 +185,7 @@ test.skipIf(!tmuxAvailable())(
       session = await launchFx(fixture, gateway, TOKEN);
       await session.waitForStableComposer(15_000);
       await session.sendText(FIRST_PROMPT);
-      await session.waitForPane((pane) => pane.includes(FIRST_ANSWER) && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd(FIRST_ANSWER, TIMEOUT);
       await session.sendKeys("C-o");
       await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await session.waitForText(PROBE_EXIT_LINE, TIMEOUT);
