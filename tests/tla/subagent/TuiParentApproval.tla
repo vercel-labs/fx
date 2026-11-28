@@ -52,7 +52,10 @@
 (* (app_agents_runtime.zig:1278-1307), and `PersonAnswerMain` is           *)
 (* submitPermissionChoice on a lent copy, whose prompt clears in the same  *)
 (* step (input_approval_runtime.zig:257-269). `PersonAnswerChild` is the   *)
-(* same call on the child's own screen. `MainAnswer` is answerApproval     *)
+(* same call on the child's own screen. `ScreenFails` is failApprovalScreen *)
+(* (app_render_runtime.zig): the screen could not open, so fx denies the   *)
+(* request, and the deny goes to the worker that owns it, which is the     *)
+(* subagent's even while its copy is lent. `MainAnswer` is answerApproval  *)
 (* (tool_host.zig:2175-2291): approve runs the exact call through main's   *)
 (* own check (tool_runtime.zig:2937-2974), which allows or refuses.        *)
 (* `Stop` is stopChild and closeNamed (tool_host.zig:404-408,              *)
@@ -76,7 +79,7 @@ ASSUME Design \in {"trial", "a", "a2", "b", "c"}
 ASSUME FailedNote \in {"refuse", "person"}
 ASSUME RegistryFull \in BOOLEAN
 ASSUME Mutant \in {"none", "lend_routed", "no_withdraw", "note_typed",
-                   "free_anyway", "b_note_keeps_prompt"}
+                   "free_anyway", "b_note_keeps_prompt", "screen_worker"}
 
 VARIABLES
   kid,        \* each: "working", "waiting", "ran", "refused", "stopped", "cancelled"
@@ -95,10 +98,12 @@ VARIABLES
   lent,       \* the kid whose request main's screen holds a copy of, or "none"
   authorized, \* kids whose action main's check or the person allowed
   noPending,  \* kids a later answer told it no longer waits
-  lost        \* kids whose main answer found no live request
+  lost,       \* kids whose main answer found no live request
+  screen_took \* for an answer a screen submitted, the worker it reached:
+              \* "none", "owner" (the request's own) or "screen" (any other)
 
 vars == <<kid, req, decision, answers, shown, freed, queued, policy, typed, mail,
-          posted, seen, main, lent, authorized, noPending, lost>>
+          posted, seen, main, lent, authorized, noPending, lost, screen_took>>
 
 \* A request the registry holds, which main's answer can find. It outlives the
 \* run it belongs to unless an answer or the person took it away.
@@ -156,6 +161,7 @@ TypeOK ==
   /\ authorized \subseteq Kids
   /\ noPending \subseteq Kids
   /\ lost \subseteq Kids
+  /\ screen_took \in [Kids -> {"none", "owner", "screen"}]
 
 Init ==
   /\ kid = [k \in Kids |-> "working"]
@@ -175,6 +181,7 @@ Init ==
   /\ authorized = {}
   /\ noPending = {}
   /\ lost = {}
+  /\ screen_took = [k \in Kids |-> "none"]
 
 \* `requestChildPermission` and `registerApproval`: the subagent's call needs
 \* approval. A run the parent started registers the exact call, and the request
@@ -191,7 +198,8 @@ Ask(k) ==
        THEN req' = [req EXCEPT ![k] = "registered"]
        ELSE req' = req
   /\ UNCHANGED <<decision, answers, shown, freed, queued, policy, typed, mail,
-                 posted, seen, main, lent, authorized, noPending, lost>>
+                 posted, seen, main, lent, authorized, noPending, screen_took,
+                 lost>>
 
 \* `registerTool` refuses at max_pending, so `requestChildPermission` answers
 \* the child with a deny and the reason: the action does not run.
@@ -202,7 +210,8 @@ RegisterFailsFull(k) ==
   /\ req[k] = "none"
   /\ kid' = [kid EXCEPT ![k] = "refused"]
   /\ UNCHANGED <<req, decision, answers, shown, freed, queued, policy, typed,
-                 mail, posted, seen, main, lent, authorized, noPending, lost>>
+                 mail, posted, seen, main, lent, authorized, screen_took,
+                 noPending, lost>>
 
 \* `noteChildApproval`: one note to main, posted only after the request is
 \* registered and while it still waits. A note for a request that already
@@ -213,8 +222,9 @@ PostNote(k) ==
   /\ k \notin posted
   /\ posted' = posted \cup {k}
   /\ mail' = mail \cup {k}
-  /\ UNCHANGED <<kid, req, decision, answers, shown, freed, queued, policy, typed,
-                 seen, main, lent, authorized, noPending, lost>>
+  /\ UNCHANGED <<kid, req, decision, answers, shown, freed, queued, policy,
+                 typed, seen, main, lent, authorized, noPending, lost,
+                 screen_took>>
 
 \* `markNoted`: the note went out, so the binding counts as noted. It is marked
 \* only while the request still waits, and a mark for a request that ended does
@@ -226,7 +236,8 @@ MarkNoted(k) ==
   /\ req' = [req EXCEPT ![k] = "noted"]
   /\ posted' = posted \ {k}
   /\ UNCHANGED <<kid, decision, answers, shown, freed, queued, policy, typed,
-                 mail, seen, main, lent, authorized, noPending, lost>>
+                 mail, seen, main, lent, authorized, noPending, screen_took,
+                 lost>>
 
 \* A note that cannot be posted. Part 1's rule refuses the request at once
 \* (execution.zig:530-534): the worker takes a deny, and the loop clears the
@@ -249,9 +260,9 @@ NoteFails(k) ==
                       /\ lent' = lent
        ELSE /\ req' = [req EXCEPT ![k] = "none"]
             /\ posted' = posted \ {k}
-            /\ UNCHANGED <<decision, answers, shown, lent>>
-  /\ UNCHANGED <<kid, freed, queued, policy, typed, mail, seen, main, authorized,
-                 noPending, lost>>
+            /\ UNCHANGED <<decision, answers, shown, lent, screen_took>>
+  /\ UNCHANGED <<kid, freed, queued, policy, typed, mail, seen, main,
+                 authorized, noPending, lost, screen_took>>
 
 \* `lendPrompt` and `lendApproval`: the instance on screen borrows the child's
 \* prompt, which swaps it away from the child's own screen
@@ -265,7 +276,8 @@ Lend(k) ==
   /\ lent' = k
   /\ shown' = [shown EXCEPT ![k] = "none"]
   /\ UNCHANGED <<kid, req, decision, answers, freed, queued, policy, typed,
-                 mail, posted, seen, main, authorized, noPending, lost>>
+                 mail, posted, seen, main, authorized, noPending, screen_took,
+                 lost>>
 
 \* `returnApproval` and `keepLentApproval` (app_agents_runtime.zig:1278-1307):
 \* the copy goes back when its subagent stops waiting, or when the person opens
@@ -275,7 +287,8 @@ ReturnLend ==
   /\ lent' = "none"
   /\ shown' = [k \in Kids |-> IF lent = k THEN ShownFromWorker(k) ELSE shown[k]]
   /\ UNCHANGED <<kid, req, decision, answers, freed, queued, policy, typed,
-                 mail, posted, seen, main, authorized, noPending, lost>>
+                 mail, posted, seen, main, authorized, noPending, screen_took,
+                 lost>>
 
 \* `syncState` (app_worker_runtime.zig:809-830): the loop reads the child's
 \* worker and shows or clears the child's own prompt. It runs a pass behind
@@ -284,7 +297,8 @@ Sync(k) ==
   /\ shown[k] # ShownFromWorker(k)
   /\ shown' = [shown EXCEPT ![k] = ShownFromWorker(k)]
   /\ UNCHANGED <<kid, req, decision, answers, freed, queued, policy, typed,
-                 mail, posted, seen, main, lent, authorized, noPending, lost>>
+                 mail, posted, seen, main, lent, authorized, screen_took,
+                 noPending, lost>>
 
 \* Main takes the notes waiting as mail in its turn (postAgentMessage,
 \* src/main.zig:2156).
@@ -295,7 +309,8 @@ TakeMail ==
   /\ seen' = seen \cup mail
   /\ mail' = {}
   /\ UNCHANGED <<kid, req, decision, answers, shown, freed, queued, policy,
-                 typed, posted, lent, authorized, noPending, lost>>
+                 typed, posted, lent, authorized, noPending, lost,
+                 screen_took>>
 
 \* `answerApproval` on main's thread: approve runs the subagent's exact call
 \* through main's own check (tool_runtime.zig:2937-2974), which allows or
@@ -330,10 +345,11 @@ MainAnswer(k, d) ==
      \/ /\ req[k] = "none"
         /\ WaitingOnWorker(k)
         /\ lost' = lost \cup {k}
-        /\ UNCHANGED <<req, decision, answers, authorized, noPending>>
+        /\ UNCHANGED <<req, decision, answers, authorized, screen_took,
+                       noPending>>
   /\ posted' = posted \ {k}
   /\ UNCHANGED <<kid, shown, freed, queued, policy, typed, mail, seen, main,
-                 lent>>
+                 lent, screen_took>>
 
 \* Design b: main's answer is handed to the loop, which is the one writer of
 \* every prompt. Nothing changes for the child's worker here.
@@ -345,8 +361,9 @@ MainPost(k, d) ==
   /\ kid[k] = "waiting"
   /\ queued[k] = "none"
   /\ queued' = [queued EXCEPT ![k] = d]
-  /\ UNCHANGED <<kid, req, decision, answers, shown, freed, policy, typed, mail,
-                 posted, seen, main, lent, authorized, noPending, lost>>
+  /\ UNCHANGED <<kid, req, decision, answers, shown, freed, policy, typed,
+                 mail, posted, seen, main, lent, authorized, noPending,
+                 screen_took, lost>>
 
 \* Design b: the loop takes that answer and clears the child's prompt and any
 \* lent copy in the same step as the submit, so no screen is left showing a
@@ -370,7 +387,8 @@ LoopApply(k) ==
   /\ shown' = [shown EXCEPT ![k] = "none"]
   /\ lent' = IF lent = k THEN "none" ELSE lent
   /\ posted' = posted \ {k}
-  /\ UNCHANGED <<kid, freed, policy, typed, mail, seen, main, lost>>
+  /\ UNCHANGED <<kid, freed, policy, typed, mail, seen, main, screen_took,
+                 lost>>
 
 \* The person's answer in a and a2 takes the binding away a step later, so
 \* main's thread may resolve it in between. In b the person's own step does it.
@@ -382,7 +400,8 @@ Withdraw(k) ==
   /\ req' = [req EXCEPT ![k] = "none"]
   /\ posted' = posted \ {k}
   /\ UNCHANGED <<kid, decision, answers, shown, freed, queued, policy, typed,
-                 mail, seen, main, lent, authorized, noPending, lost>>
+                 mail, seen, main, lent, authorized, noPending, screen_took,
+                 lost>>
 
 \* `submitPermissionChoice` on the child's own screen: the loop clears that
 \* prompt and the answer reaches the child's worker in one step, as
@@ -396,6 +415,7 @@ PersonAnswerChild(k, d) ==
   /\ decision' = [decision EXCEPT ![k] = d]
   /\ answers' = [answers EXCEPT ![k] = 1]
   /\ authorized' = IF d = "allow" THEN authorized \cup {k} ELSE authorized
+  /\ screen_took' = [screen_took EXCEPT ![k] = "owner"]
   /\ IF Withdraws /\ Design = "b"
        THEN /\ req' = [req EXCEPT ![k] = "none"]
             /\ posted' = posted \ {k}
@@ -415,6 +435,7 @@ PersonAnswerMain(k, d) ==
   /\ decision' = [decision EXCEPT ![k] = d]
   /\ answers' = [answers EXCEPT ![k] = 1]
   /\ authorized' = IF d = "allow" THEN authorized \cup {k} ELSE authorized
+  /\ screen_took' = [screen_took EXCEPT ![k] = "owner"]
   /\ IF Withdraws /\ Design = "b"
        THEN /\ req' = [req EXCEPT ![k] = "none"]
             /\ posted' = posted \ {k}
@@ -423,6 +444,35 @@ PersonAnswerMain(k, d) ==
   /\ UNCHANGED <<kid, freed, queued, policy, typed, mail, seen, main, noPending,
                  lost>>
 
+\* `failApprovalScreen` (app_render_runtime.zig): the screen showing this
+\* request could not open, so fx denies it without asking the person. The deny
+\* is submitted to the worker that owns the request, the subagent's own even
+\* while its copy is lent to an instance's screen, so the subagent reads the
+\* reason and its call does not run. `screen_worker` plants the defect of
+\* submitting through the screen's worker instead: that worker has no such
+\* request, so it drops the answer (`.no_pending`) and the subagent keeps
+\* waiting, or, with an id it waits on itself, it takes the answer for its own
+\* request (`worker_runtime.zig` allocatePermissionRequestIdLocked).
+ScreenFails(k) ==
+  /\ WaitingOnWorker(k)
+  /\ \/ lent = k
+     \/ shown[k] = "prompt"
+  /\ IF Mutant = "screen_worker"
+       THEN /\ screen_took' = [screen_took EXCEPT ![k] = "screen"]
+            /\ UNCHANGED <<kid, decision, answers, shown, lent, req, posted>>
+       ELSE /\ screen_took' = [screen_took EXCEPT ![k] = "owner"]
+            /\ decision' = [decision EXCEPT ![k] = "deny"]
+            /\ answers' = [answers EXCEPT ![k] = 1]
+            /\ shown' = [shown EXCEPT ![k] = "none"]
+            /\ lent' = "none"
+            /\ IF Withdraws /\ Design = "b"
+                 THEN /\ req' = [req EXCEPT ![k] = "none"]
+                      /\ posted' = posted \ {k}
+                 ELSE /\ req' = req
+                      /\ posted' = posted
+  /\ UNCHANGED <<kid, freed, queued, policy, typed, mail, seen, main,
+                 authorized, noPending, lost>>
+
 \* The child's worker resumes: an allowed action runs, a denied one does not.
 Resume(k) ==
   /\ kid[k] = "waiting"
@@ -430,7 +480,8 @@ Resume(k) ==
   /\ kid' = [kid EXCEPT ![k] = IF decision[k] = "allow" THEN "ran" ELSE "refused"]
   /\ decision' = [decision EXCEPT ![k] = "none"]
   /\ UNCHANGED <<req, answers, shown, freed, queued, policy, typed, mail,
-                 posted, seen, main, lent, authorized, noPending, lost>>
+                 posted, seen, main, lent, authorized, noPending, screen_took,
+                 lost>>
 
 \* The tool call goes on and lets go of the review memory its prompt borrowed
 \* (tool_admission.zig:1967-1980, approval_prompt.zig:53). The trial and a free
@@ -441,8 +492,9 @@ Free(k) ==
   /\ ~freed[k]
   /\ FreesWhenDone(k)
   /\ freed' = [freed EXCEPT ![k] = TRUE]
-  /\ UNCHANGED <<kid, req, decision, answers, shown, queued, policy, typed, mail,
-                 posted, seen, main, lent, authorized, noPending, lost>>
+  /\ UNCHANGED <<kid, req, decision, answers, shown, queued, policy, typed,
+                 mail, posted, seen, main, lent, authorized, noPending,
+                 screen_took, lost>>
 
 \* `stopChild` and `closeNamed` end a waiting child and drop its request
 \* (tool_host.zig:404-408, managed_owner.zig:795); the lend goes back first
@@ -458,7 +510,7 @@ Stop(k) ==
   /\ queued' = [queued EXCEPT ![k] = "none"]
   /\ noPending' = IF queued[k] = "none" THEN noPending ELSE noPending \cup {k}
   /\ UNCHANGED <<decision, answers, shown, freed, policy, typed, seen, main,
-                 authorized, lost>>
+                 authorized, lost, screen_took>>
 
 \* The child's turn ends or is cancelled (RULES.md R2.4): its request is
 \* withdrawn and its review memory freed (worker_runtime.zig:978-995).
@@ -472,14 +524,15 @@ ChildTurnEnds(k) ==
   /\ queued' = [queued EXCEPT ![k] = "none"]
   /\ noPending' = IF queued[k] = "none" THEN noPending ELSE noPending \cup {k}
   /\ UNCHANGED <<decision, answers, shown, freed, policy, typed, seen, main,
-                 authorized, lost>>
+                 authorized, lost, screen_took>>
 
 \* Main ends its turn.
 EndTurn ==
   /\ main = "turn"
   /\ main' = "idle"
-  /\ UNCHANGED <<kid, req, decision, answers, shown, freed, queued, policy, typed,
-                 mail, posted, seen, lent, authorized, noPending, lost>>
+  /\ UNCHANGED <<kid, req, decision, answers, shown, freed, queued, policy,
+                 typed, mail, posted, seen, lent, authorized, noPending,
+                 screen_took, lost>>
 
 \* Every subagent is settled and main has no mail: the behavior is over.
 Finished ==
@@ -493,6 +546,7 @@ Next ==
        Ask(k) \/ RegisterFailsFull(k) \/ PostNote(k) \/ MarkNoted(k)
        \/ NoteFails(k) \/ Resume(k) \/ Free(k) \/ Stop(k) \/ ChildTurnEnds(k)
        \/ Lend(k) \/ ReturnLend \/ Sync(k) \/ LoopApply(k) \/ Withdraw(k)
+       \/ ScreenFails(k)
   \/ \E k \in Kids, d \in {"allow", "deny"} :
        MainAnswer(k, d) \/ MainPost(k, d) \/ PersonAnswerChild(k, d)
        \/ PersonAnswerMain(k, d)
@@ -535,5 +589,10 @@ NoLostApprove == lost = {}
 \* turn the person typed may be lent. The trial lent any waiting request.
 NoPersonPromptForParentRouted ==
   Design = "trial" \/ (\A k \in Kids : lent = k => k \in typed)
+
+\* A screen that cannot open denies its request on the worker that owns it. The
+\* screen's own worker may hold a different request, or none, so an answer
+\* there is dropped or denies an innocent request (`ScreenFails`).
+NoAnswerToNonOwner == \A k \in Kids : screen_took[k] # "screen"
 
 =============================================================================
