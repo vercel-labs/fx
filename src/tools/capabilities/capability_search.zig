@@ -70,9 +70,9 @@ fn searchMcp(
     max_bytes: usize,
 ) tool_dispatch.DispatchError!tool_mcp_runtime.SearchResult {
     const runtime_context = ctx.mcp_ctx orelse
-        return .{ .model_output = try ctx.allocator.dupe(u8, "{\"tools\":[],\"count\":0,\"state\":\"unavailable\"}") };
+        return .{ .model_output = try ctx.allocator.dupe(u8, tool_mcp_runtime.unavailable_search_output) };
     const search_tools = ctx.mcp_search_tools orelse
-        return .{ .model_output = try ctx.allocator.dupe(u8, "{\"tools\":[],\"count\":0,\"state\":\"unavailable\"}") };
+        return .{ .model_output = try ctx.allocator.dupe(u8, tool_mcp_runtime.unavailable_search_output) };
     var limits = ctx.context_limits;
     if (max_bytes < limits.mcp_search_result_bytes.effectiveBytes()) {
         limits.mcp_search_result_bytes.value = .{ .bytes = max_bytes };

@@ -15,6 +15,7 @@ import { createFxAgent, createFxEngine, memory } from "../node.js";
 import { createFxEngine as createWasmEngine } from "../fx-sdk.js";
 import { foldSessionLog } from "../durable.js";
 import { holdWrites } from "./hold-writes.mjs";
+import { slowChunkWrites } from "./ui-order-fixtures.mjs";
 import { testHooks } from "./hooks-fixture.mjs";
 
 const durabilityKind = process.argv[2] || "memory";
@@ -28,6 +29,9 @@ const { local } = durabilityKind === "memory" ? {} : await import("../durable/lo
 const { vercelStorage } = durabilityKind === "vercel" ? await import("./vercel-storage.mjs") : {};
 // "world": the app's own World through world(); see app-world.mjs.
 const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("./app-world.mjs") : {};
+// "world" also restarts an app whose World recovers its runs at startup; see
+// restarted-world.mjs.
+const { restartedWorldAt } = durabilityKind === "world" ? await import("./restarted-world.mjs") : {};
 // Vercel's World is a round trip away, so its tests wait longer for a
 // stream's next chunk, give a function more time, and run longer.
 const remote = durabilityKind === "vercel";
@@ -94,6 +98,7 @@ function framesFor(prompt) {
     return answer(`done: ${JSON.stringify(turnResults.at(-1).output)}`);
   }
   if (text === "stall") return null;
+  if (text === "burst reply") return burstReply;
   if (text === "slow reply") return slowReply;
   if (text === "stalled reply") return stalledReply;
   if (text === "slow tool call") return slowToolCall;
@@ -103,6 +108,12 @@ function framesFor(prompt) {
   }
   return answer(`echo: ${text}`);
 }
+
+// A reply that arrives all at once: `burstWords` words, each its own text
+// delta, so the engine's events and the session's lines come in a burst.
+const burstWords = 40;
+const burstWord = (index) => `b${String(index).padStart(2, "0")} `;
+const burstReply = [...Array.from({ length: burstWords }, (_, index) => ({ type: "text-delta", id: "answer", delta: burstWord(index) })), finish("stop")];
 
 // A long reply: `slowFrames` words, one every 40 ms. Each request for one
 // records how many words it sent.
@@ -513,6 +524,36 @@ test("a prompt streams its turn, and the session replays from any cursor", async
   assert.equal(later[0].type, "turn_end");
   await agent.close();
 });
+
+if (durabilityKind === "local") {
+  // world-local 5.1.1 lands the chunks of a batch in parallel, and its live
+  // reader shows any chunk file it finds, so a chunk that lands late showed
+  // after the ones behind it. local() writes its lines one chunk at a time.
+  test("a reply that arrives in a burst shows its words in order on local() when chunk writes are slow", async () => {
+    // Every fifth word's chunk lands 250 ms late.
+    const slow = slowChunkWrites((text) => {
+      const word = /"delta":"b(\d+) "/.exec(text);
+      return word && Number(word[1]) % 5 === 1 ? 250 : 0;
+    });
+    try {
+      const agent = createFxAgent(agentOptions(await durabilityFor()));
+      const turn = agent.prompt("burst reply");
+      const { sessionId } = await turn.accepted;
+      const live = readLines(agent.session(sessionId).stream(0), burstWords + 2, 3000);
+      const { text, result } = await collect(turn);
+      assert.equal(result.stopReason, "end_turn");
+      const reply = Array.from({ length: burstWords }, (_, index) => burstWord(index)).join("");
+      assert.equal(text, reply, "the turn's own events show the reply in order");
+      const lines = await live;
+      assert.equal(lines.filter((line) => line.type === "text_delta").map((line) => line.delta).join(""), reply, "a reader open from the start shows the reply in order");
+      assert.ok(slow.delayed.length > 0, "chunk writes were slow");
+      assert.equal(lines.at(-1).type, "turn_end");
+      await agent.close();
+    } finally {
+      slow.restore();
+    }
+  });
+}
 
 test("each session's stream holds only its own turns", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor()));
@@ -1694,6 +1735,49 @@ if (durabilityKind !== "memory") {
     assert.equal(result.stopReason, "end_turn", "the accepted prompt was in the log");
     assert.equal(text, "echo: hello");
     await agent.close();
+  });
+}
+
+if (durabilityKind === "world") {
+  // The app shares its World with the Workflow SDK, and the World recovers
+  // its runs as the restarted app starts it: the session goes back to
+  // libfx's queue, not to the Workflow SDK's, which would fail it
+  // (`tests/tla/sdk/QueueRecovery.tla` LibfxRunsNotFailed).
+  test("a crash mid-turn, then a World that recovers its runs at startup: the session is not failed, and its turn ends", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-recovery-"));
+    dirs.push(dir);
+    const child = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), durabilityKind, engineBackend, "--child", dir, "lookup"], {
+      stdio: ["ignore", "pipe", "inherit"], env: { ...process.env },
+    });
+    const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    try {
+      await until(() => output.includes("\n"), "the child to start its tool", testTimeoutMs / 2);
+    } finally {
+      child.kill("SIGKILL");
+      await exited;
+    }
+    const { sessionId } = JSON.parse(output.trim().split("\n")[0]);
+    const restarted = await restartedWorldAt(dir);
+    try {
+      const agent = createFxAgent(agentOptions(restarted.durability));
+      // It takes the World's deliveries before the World starts.
+      await agent.newSessionId();
+      await restarted.start();
+      const ofSession = () => restarted.deliveries.filter((delivery) => delivery.runId === sessionId);
+      await until(() => ofSession().length > 0, "recovery to deliver the session's run");
+      assert.deepEqual(await restarted.run(sessionId), { status: "running", namespace: "libfx" }, "the session's run is not failed");
+      assert.deepEqual(ofSession().map(({ consumer, attempt, status }) => ({ consumer, attempt, status })), [{ consumer: "libfx", attempt: 1, status: 200 }], "libfx's route took the session's run and acked it");
+      const requestsBefore = requests.length;
+      const { result } = await collect(agent.session(sessionId).resume());
+      assert.equal(result.stopReason, "end_turn", "the turn the crash left open ends");
+      assert.ok(requests.length > requestsBefore, "the resumed turn's model requests reached the fake gateway");
+      assert.equal((await restarted.run(sessionId)).status, "running");
+      await agent.close();
+    } finally {
+      await restarted.close();
+    }
   });
 }
 

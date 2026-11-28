@@ -20,6 +20,8 @@
 #   cannot-ask-resends  fx ask resends a request that needs the user       CannotAskEnds
 #   asking-host-resends the TUI resends without the user's answer          AskingHostWaits
 #   filter-answer-keeps-count  the user's answer keeps the blocks' count  AnswerGivesResends
+#   budget-on-unbudgeted  a non-budgeted host ends on the retry budget     BudgetOnlyForBudgeted
+#   budget-never-ends   a budgeted host keeps retrying past its budget     BudgetEnds
 #
 # RecoveryTimed.tla adds a discrete clock. recovery-timed.cfg must pass, and
 # each of its mutations plants one defect:
@@ -50,18 +52,38 @@
 #   cancel-unsaved      a held turn sends with its clean record            CrashLoopAsks
 #
 # RestartWait.tla models one process's main loop against the workers it
-# asks to stop for the restart, and the cancel. restart-wait.cfg is the
-# design and must pass, with its WaitEnds liveness; restart-wait-current.cfg
-# is fx before the cancel, whose turn stops for good at its boundary
-# (NoStopWhileCancellable). Each restart-wait-mutation-*.cfg plants one
-# defect:
+# asks to stop, subagents included, for the restart, and the cancel.
+# restart-wait.cfg is the design and must pass, with its WaitEnds liveness;
+# restart-wait-current.cfg is fx before the cancel, whose turn stops for good
+# at its boundary (NoStopWhileCancellable); restart-wait-subagents-not-asked.cfg
+# is fx before this change, which asks only the agents that are not
+# subagents, so a subagent's turn passes its boundary while the restart waits
+# (NoTurnPassesBoundaryWhileWaiting). Each restart-wait-mutation-*.cfg plants
+# one defect:
 #
 #   hold-ignores-flag   a turn holds after a cancel cleared its request    HeldOnlyWhileRestartWaits
 #   cancel-while-releasing  a cancel after the release strands a turn   NoStopWhileCancellable
 #   release-early       the release closes the cancel while a turn runs    NoUncancellableWait
+#   cancel-skips-subagents  a cancel leaves a held subagent held         HeldOnlyWhileRestartWaits
 #
 # The two restart-wait-simulate-*.cfg run random behaviors with and
 # without faults.
+#
+# ChildResume.tla models how a subagent's work continues across a Ctrl+G
+# restart. The child's turn yields and holds at a step boundary, the restart's
+# exit leaves its work open and cancelled, and the next launch repairs what was
+# left open, saves one continuation work that names the work it replaces, and
+# delivers the owed reports that no later work replaces. childresume.cfg is
+# the design without crashes and must pass, with its TaskReported liveness;
+# childresume-crash.cfg is the design with crashes, and childresume-simulate.cfg
+# runs random behaviors with crashes. childresume-current.cfg is fx today, which
+# saves no continuation, so the yielded turn is never resumed
+# (YieldedTurnKeptOpen). Each childresume-mutation-*.cfg plants one defect:
+#
+#   no-replaces       the continuation does not name the work it replaces   OneReport
+#   reports-first     owed reports go out before the continuation is saved  NoReplacedReport
+#   double            a second continuation for the same yielded turn       OneContinuation
+#   start-in-open     the open starts the slot before the app is in place   BindReachesLoop
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -94,6 +116,8 @@ Recovery recovery-mutation-filter-asks-early FilterBounded
 Recovery recovery-mutation-cannot-ask-resends CannotAskEnds
 Recovery recovery-mutation-asking-host-resends AskingHostWaits
 Recovery recovery-mutation-filter-answer-keeps-count AnswerGivesResends
+Recovery recovery-mutation-budget-on-unbudgeted BudgetOnlyForBudgeted
+Recovery recovery-mutation-budget-never-ends temporal
 RecoveryTimed recovery-timed -
 RecoveryTimed recovery-mutation-unbounded-wait WaitBounded
 RecoveryTimed recovery-mutation-frozen-countdown StatusFresh
@@ -119,9 +143,19 @@ Resume resume-mutation-cancel-keeps-relaunch CancelledRestartStays
 Resume resume-mutation-cancel-unsaved CrashLoopAsks
 RestartWait restart-wait -
 RestartWait restart-wait-current NoStopWhileCancellable
+RestartWait restart-wait-subagents-not-asked NoTurnPassesBoundaryWhileWaiting
 RestartWait restart-wait-mutation-hold-ignores-flag HeldOnlyWhileRestartWaits
 RestartWait restart-wait-mutation-cancel-while-releasing NoStopWhileCancellable
 RestartWait restart-wait-mutation-release-early NoUncancellableWait
+RestartWait restart-wait-mutation-cancel-skips-subagents HeldOnlyWhileRestartWaits
 RestartWait restart-wait-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
 RestartWait restart-wait-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
+ChildResume childresume -
+ChildResume childresume-crash -
+ChildResume childresume-current YieldedTurnKeptOpen
+ChildResume childresume-mutation-no-replaces OneReport
+ChildResume childresume-mutation-reports-first NoReplacedReport
+ChildResume childresume-mutation-double OneContinuation
+ChildResume childresume-mutation-start-in-open BindReachesLoop
+ChildResume childresume-simulate simulate -simulate num=20000 -depth 40 -seed 1
 EOF
