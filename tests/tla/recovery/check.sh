@@ -147,6 +147,9 @@ RestartWait restart-wait-current NoStopWhileCancellable
 RestartWait restart-wait-subagents-not-asked NoTurnPassesBoundaryWhileWaiting
 RestartWait restart-wait-mutation-hold-ignores-flag HeldOnlyWhileRestartWaits
 RestartWait restart-wait-mutation-cancel-while-releasing NoStopWhileCancellable
+RestartWait restart-wait-idle -
+RestartWait restart-wait-mutation-submit-keeps-asks IdleWaitHoldsNothing
+RestartWait restart-wait-mutation-idle-exit-early ExitOnlyWhenStopped
 RestartWait restart-wait-mutation-release-early NoUncancellableWait
 RestartWait restart-wait-mutation-cancel-skips-subagents HeldOnlyWhileRestartWaits
 RestartWait restart-wait-mutation-auto-ignores-draft AutoRestartOnlyWhenIdle

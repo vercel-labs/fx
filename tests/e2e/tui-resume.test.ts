@@ -6269,6 +6269,153 @@ test.skipIf(!tmuxAvailable())(
   TIMEOUT * 5,
 );
 
+// What the person sends while Ctrl+G waits for a working subagent. A prompt
+// goes out at once and fx restarts once the subagent is done; `/new` leaves
+// the subagent's session, so fx restarts into the new one at once; `/launch`
+// after the prompt opens another instance, and fx still restarts into the
+// conversation Ctrl+G asked for.
+for (const sent of ["prompt", "/new", "/launch"] as const) {
+  test.skipIf(!tmuxAvailable())(
+    sent === "prompt"
+      ? "upgrade ctrl-g sends a prompt typed while a subagent works at once, and restarts only when idle"
+      : sent === "/new"
+        ? "upgrade ctrl-g after /new while a subagent works restarts into the new session"
+        : "upgrade ctrl-g after /launch while a subagent works restarts into the conversation it asked for",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-send-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const installDir = join(root, "install");
+      const stderrPath = join(root, "stderr.log");
+      const argvLogPath = join(root, "upgrade-argv.log");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      mkdirSync(installDir);
+      const workspaceRoot = realpathSync(workspace);
+      const installedFx = join(installDir, "fx");
+      copyFileSync(FX_BIN, installedFx);
+      chmodSync(installedFx, 0o755);
+
+      let active: TmuxSession | null = null;
+      let soloAsked = () => {};
+      const soloAskedModel = new Promise<void>((resolve) => { soloAsked = resolve; });
+      let releaseSolo = () => {};
+      const soloReleased = new Promise<void>((resolve) => { releaseSolo = resolve; });
+      const gateway = startDynamicFakeGateway(async (body) => {
+        // The subagent's own request carries its task but not main's call.
+        if (body.includes("SOLO_TASK") && !body.includes('"main_solo"')) {
+          soloAsked();
+          await soloReleased;
+          return fakeGatewayFinalText("SOLO_DONE");
+        }
+        if (body.includes("AFTER_RELAUNCH")) return fakeGatewayFinalText("ANSWER_AFTER_RELAUNCH");
+        if (body.includes("SOLO_DONE")) return fakeGatewayFinalText("MAIN_SAW_REPORT");
+        if (body.includes("SEND_NOW_PROMPT")) return fakeGatewayFinalText("SENT_AT_ONCE");
+        if (!body.includes('"main_solo"')) {
+          return fakeGatewayToolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK" } });
+        }
+        return fakeGatewayFinalText("MAIN_DONE");
+      });
+      const release = startUpgradeServer(root, argvLogPath);
+      const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+      const promptRequests = () => gateway.requests.filter((request) => request.body.includes("SEND_NOW_PROMPT") && !request.body.includes("SOLO_DONE")).length;
+
+      try {
+        writeFileSync(stderrPath, "");
+        active = await TmuxSession.create({
+          cmd: shellQuote(installedFx),
+          cwd: workspaceRoot,
+          env: {
+            ...gatewayEnv(home, gateway),
+            FX_AUTO_UPGRADE: "1",
+            FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+            FX_PERMISSION_MODE: "full-access",
+          },
+          stderrPath,
+          width: 110,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+
+        // Main's turn ends while its subagent still works, so Ctrl+G waits.
+        await active.sendText("UPGRADE_MAIN start solo");
+        await active.waitForPane((pane) => pane.includes("MAIN_DONE") && turnSettled(pane), TIMEOUT);
+        await soloAskedModel;
+        await active.waitForComposer(TIMEOUT);
+        await active.sendHexBytes(["07"]);
+        await active.waitForText("restart pending · ctrl+g cancel", TIMEOUT);
+        const version = (await runFx(["--version"])).stdout.trim();
+
+        if (sent !== "/new") {
+          // A prompt sent now goes out at once: the pending restart never holds it.
+          await active.sendText("SEND_NOW_PROMPT");
+          const answered = await active.waitForPane(
+            (pane) => pane.includes("SENT_AT_ONCE") || pane.includes("send this after"),
+            TIMEOUT,
+          );
+          expect(answered).not.toContain("send this after");
+          await active.waitForPane((pane) => pane.includes("SENT_AT_ONCE") && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
+          expect(promptRequests()).toBe(1);
+
+          // The footer shows the pending restart, and the subagent still
+          // works, so fx does not restart yet.
+          await active.waitForText("update ready · restarts when idle · ctrl+g cancels", TIMEOUT);
+          expect(relaunched()).toBe(false);
+
+          if (sent === "/launch") {
+            // Another instance comes on screen while the restart waits.
+            await active.sendText("/launch");
+            await active.waitForPane((pane) => pane.includes("fx 2"), TIMEOUT);
+          }
+
+          // Once the subagent finishes and main reads its report, fx is idle
+          // and restarts on its own. The prompt is not sent again.
+          releaseSolo();
+        } else {
+          // `/new` runs at once and leaves the working subagent behind, so fx
+          // is idle and restarts into the new session with its handoff.
+          await active.sendText("/new");
+        }
+        await active.waitForText(`✓ fx has been updated to v${version} (notes)`, TIMEOUT);
+        expect(relaunched()).toBe(true);
+        expect(promptRequests()).toBe(sent === "/new" ? 0 : 1);
+        const stderr = readFileSync(stderrPath, "utf8");
+        expect(stderr).not.toContain("relaunch failed");
+        expect(stderr).not.toContain("no validated resume handoff");
+
+        if (sent === "/launch") {
+          // The relaunch reopened main's conversation: the next prompt carries
+          // the prompt sent during the wait.
+          await active.waitForComposer(TIMEOUT);
+          await active.sendText("AFTER_RELAUNCH");
+          await active.waitForText("ANSWER_AFTER_RELAUNCH", TIMEOUT);
+          const after = gateway.requests.find((request) => request.body.includes("AFTER_RELAUNCH"));
+          expect(after?.body).toContain("SEND_NOW_PROMPT");
+        }
+
+        await active.waitForComposer(TIMEOUT);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd()).toBe(true);
+        await active.kill();
+        active = null;
+      } finally {
+        releaseSolo();
+        if (active) {
+          try {
+            await active.sendText("/quit");
+          } catch {}
+          await active.kill();
+        }
+        release.stop();
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    UPGRADE_TIMEOUT * 2,
+  );
+}
+
 test("manual upgrade output links stable notes and dev changes", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-upgrade-links-")));
   const argvLogPath = join(root, "upgrade-argv.log");

@@ -47,7 +47,7 @@ ASSUME /\ Subagents \subseteq Agents
 
 \* What the main loop does about the restart. "waiting" can be cancelled;
 \* "releasing" has let the held turns return.
-Waits == {"none", "waiting", "releasing", "exited"}
+Waits == {"none", "waiting", "releasing", "exited", "when_idle"}
 
 \* What each agent's turn is doing. "check" has read the stop request at a
 \* boundary and saves before it holds; "stopped" returned for the restart.
@@ -142,14 +142,15 @@ Esc(a) ==
     /\ st' = [st EXCEPT ![a] = "idle"]
     /\ UNCHANGED <<wait, asked, released, passed, draft, autoStarted>>
 
-\* The person types or clears a draft in the composer while idle or between restarts.
+\* The person types or clears a draft in the composer while idle, or while a
+\* restart put off by a prompt waits for idle.
 TypeDraft ==
-    /\ wait = "none" /\ ~draft
+    /\ wait \in {"none", "when_idle"} /\ ~draft
     /\ draft' = TRUE
     /\ UNCHANGED <<wait, st, asked, released, passed, autoStarted>>
 
 ClearDraft ==
-    /\ wait = "none" /\ draft
+    /\ wait \in {"none", "when_idle"} /\ draft
     /\ draft' = FALSE
     /\ UNCHANGED <<wait, st, asked, released, passed, autoStarted>>
 
@@ -217,18 +218,66 @@ Done ==
     /\ wait = "exited"
     /\ UNCHANGED vars
 
+\* The person sends a prompt while the restart waits. A pending restart
+\* never holds it: it goes out at once, so the requests clear, each held
+\* turn goes on, and fx restarts at the next idle moment (Start stays open).
+\* Once the release starts, the held turns stopped for the relaunch, so a
+\* prompt then stays in the composer until fx restarts
+\* (input_submit_runtime.zig submit, app_upgrade_runtime.zig
+\* restartWhenIdleForPrompt).
+Submit ==
+    /\ wait = "waiting"
+    /\ wait' = "when_idle"
+    /\ asked' = None
+    /\ released' = None
+    /\ st' = [a \in Agents |-> IF st[a] = "held" THEN "run" ELSE st[a]]
+    /\ UNCHANGED <<passed, draft, autoStarted>>
+
+\* Planted defect, fx before prompts went out at once: the turns stay asked
+\* and held, so the prompt waits behind them. A config plants it with
+\* Submit <- SubmitKeepsAsks.
+SubmitKeepsAsks ==
+    /\ wait = "waiting"
+    /\ wait' = "when_idle"
+    /\ UNCHANGED <<st, asked, released, passed, draft, autoStarted>>
+
+\* A tick once no turn runs and no draft holds Idle after a Submit: fx
+\* exits for the relaunch. In fx the tick also waits for subagents, open
+\* menus, and anything Ctrl+G refuses for, the same rule as AutoRestart
+\* (app_upgrade_runtime.zig idleForRestart, nothingWaitsOnPerson).
+IdleExit ==
+    /\ wait = "when_idle"
+    /\ ~draft
+    /\ \A a \in Agents : st[a] = "idle"
+    /\ wait' = "exited"
+    /\ UNCHANGED <<st, asked, released, passed, draft, autoStarted>>
+
+\* Planted defect: fx exits while a turn still runs. A config plants it
+\* with IdleExit <- IdleExitEarly.
+IdleExitEarly ==
+    /\ wait = "when_idle"
+    /\ wait' = "exited"
+    /\ UNCHANGED <<st, asked, released, passed, draft, autoStarted>>
+
+\* Ctrl+G while the restart waits for idle cancels it.
+CancelWhenIdle ==
+    /\ wait = "when_idle"
+    /\ wait' = "none"
+    /\ UNCHANGED <<st, asked, released, passed, draft, autoStarted>>
+
 Next ==
     \/ \E a \in Agents :
           \/ Start(a) \/ End(a) \/ Boundary(a) \/ Hold(a) \/ SaveFails(a)
           \/ Return(a) \/ Esc(a)
     \/ TypeDraft \/ ClearDraft
     \/ CtrlG \/ AutoRestart \/ Release \/ Exit \/ Cancel \/ Done
+    \/ Submit \/ IdleExit \/ CancelWhenIdle
 
 \* fx's own steps happen; the person's (Start, Esc, CtrlG, Cancel) and a
 \* turn's own end may not.
 Fairness ==
     /\ \A a \in Agents : WF_vars(Boundary(a)) /\ SF_vars(Hold(a)) /\ WF_vars(Return(a))
-    /\ WF_vars(Release) /\ WF_vars(Exit)
+    /\ WF_vars(Release) /\ WF_vars(Exit) /\ WF_vars(IdleExit)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
@@ -261,7 +310,19 @@ ExitOnlyWhenStopped ==
 AutoRestartOnlyWhenIdle ==
     autoStarted => (~draft /\ \A a \in Agents : st[a] \in {"idle", "stopped"})
 
-\* A waiting restart ends: fx restarts, or the person cancels it.
-WaitEnds == (wait = "waiting") ~> (wait \in {"none", "exited"})
+\* A waiting restart ends: fx restarts, the person cancels it, or a prompt
+\* puts it off until idle.
+WaitEnds == (wait = "waiting") ~> (wait \in {"none", "exited", "when_idle"})
+
+\* While the restart waits for idle, nothing holds a turn or its queued
+\* work, so the prompt that put it off runs at once.
+IdleWaitHoldsNothing ==
+    wait = "when_idle" => \A a \in Agents : ~asked[a] /\ st[a] # "held"
+
+\* The restart put off until idle comes once every turn has ended: fx
+\* exits, or the person cancels it, starts another turn, or keeps a draft.
+IdleWaitEnds ==
+    (wait = "when_idle" /\ \A a \in Agents : st[a] = "idle")
+        ~> (wait \in {"none", "exited"} \/ draft \/ \E a \in Agents : st[a] # "idle")
 
 =============================================================================

@@ -130,13 +130,128 @@ pub fn Runtime(comptime App: type) type {
                     debug_trace.logf("upgrade", "event=restart_releases_held_turns", .{});
                 },
                 .releasing => {},
+                .when_idle => if (!idleForRestart(app)) return,
             }
             if (app.anyTurnRunning() or draftPending(app)) return;
+            if (terminalInputWaiting(app)) {
+                debug_trace.logf("upgrade", "event=restart_waits_for_typed_input", .{});
+                return;
+            }
+            if (app.upgrader.restart == .when_idle and !handOffForIdleRestart(app)) return;
             app.upgrader.restart = .none;
             if (comptime @hasDecl(App, "logHeldWorkForRestart")) app.logHeldWorkForRestart();
             debug_trace.logf("upgrade", "event=restart_after_yield", .{});
             if (comptime @hasField(App, "should_exit")) app.should_exit = true;
             requestFooterRender(app);
+        }
+
+        /// A prompt sent while the restart waits goes out at once, so a
+        /// pending restart never holds it: the held turns go on, and fx
+        /// restarts at the next idle moment (`finishWaitingRestart`) with the
+        /// relaunch and handoffs Ctrl+G prepared. Returns false only once the
+        /// held turns were let go, since they stopped for the relaunch
+        /// (`tests/tla/recovery/RestartWait.tla` Submit).
+        pub fn restartWhenIdleForPrompt(app: *App) bool {
+            switch (app.upgrader.restart) {
+                .none, .when_idle => return true,
+                .releasing => return false,
+                .waiting => {
+                    if (comptime @hasDecl(App, "cancelTurnYields")) app.cancelTurnYields();
+                    app.upgrader.restart = .when_idle;
+                    debug_trace.logf("upgrade", "event=restart_waits_for_idle reason=prompt_sent", .{});
+                    requestFooterRender(app);
+                    return true;
+                },
+            }
+        }
+
+        /// Whether keys the person typed wait to be read. The exit puts the
+        /// terminal back with a flush that drops unread input, so the restart
+        /// waits a tick and the loop reads them first: as a draft or a sent
+        /// prompt, they then hold the restart as any other does.
+        fn terminalInputWaiting(app: *App) bool {
+            if (comptime !@hasField(App, "terminal")) return false;
+            if (comptime @hasField(App, "terminal_input_runtime")) {
+                if (app.terminal_input_runtime.hasPendingTerminalInput()) return true;
+            }
+            const state = app.terminal.pollInput(0) catch |err| {
+                debug_trace.logf("upgrade", "event=restart_input_poll_failed err={s}", .{@errorName(err)});
+                return false;
+            };
+            return state.readable;
+        }
+
+        /// Whether a restart put off by a prompt can run now: it loses no
+        /// draft or queued work, closes no menu, and asks for no answer, the
+        /// same rule as the automatic restart (`isIdleForAutoRestart`).
+        fn idleForRestart(app: *App) bool {
+            return nothingWaitsOnPerson(app, agents.screenAgentOf(app));
+        }
+
+        /// What both idle restarts wait for: nothing Ctrl+G refuses for, no
+        /// draft anywhere, no open menu, no agent waiting for an answer, and
+        /// no queued work elsewhere.
+        fn nothingWaitsOnPerson(app: *App, agent: *AppAgent) bool {
+            if (upgradeUnavailableNotice(app, agent) != null) return false;
+            if (anyDraftNonEmpty(app, agent)) return false;
+            if (menuOrPickerActive(app, agent)) return false;
+            var name_buf: [32]u8 = undefined;
+            if (comptime @hasDecl(App, "needsUserElsewhere")) {
+                if (app.needsUserElsewhere(&name_buf) != null) return false;
+            }
+            if (comptime @hasDecl(App, "queuedWorkElsewhere")) {
+                if (app.queuedWorkElsewhere(&name_buf) != null) return false;
+            }
+            return true;
+        }
+
+        /// Keeps the resume handoff Ctrl+G asked for while some agent still
+        /// holds it. What ran while the restart waited for idle can have
+        /// closed that session (`/new`, `/resume`), which drops the handoff;
+        /// then the agent on screen is asked again, as Ctrl+G does. When it
+        /// cannot hand off, the restart is cancelled with a notice rather than
+        /// relaunching without one.
+        fn handOffForIdleRestart(app: *App) bool {
+            if (anyAgentHoldsUpgradeHandoff(app)) return true;
+            const agent = agents.screenAgentOf(app);
+            app.prepareResumeHandoffForUpgrade(agent) catch |err| {
+                app.upgrader.cancelRestart();
+                debug_trace.logf("upgrade", "event=restart_cancelled reason=handoff_unavailable err={s}", .{@errorName(err)});
+                const notice = app.alloc.print(
+                    "restart for the update cancelled because this conversation is not safely resumable: {s}; press Ctrl+G to try again",
+                    .{@errorName(err)},
+                ) catch return false;
+                defer app.alloc.free(notice);
+                // The notice only explains the cancel; the restart is already off.
+                writeUpgradeNotice(app, .@"error", notice) catch |notice_err| {
+                    debug_trace.logf("upgrade", "event=notice_unavailable err={s}", .{@errorName(notice_err)});
+                };
+                return false;
+            };
+            app.requestResumeHandoffForUpgrade(agent);
+            return true;
+        }
+
+        fn anyAgentHoldsUpgradeHandoff(app: *App) bool {
+            if (holdsUpgradeHandoff(&app.main_agent)) return true;
+            if (comptime @hasField(App, "child_agents")) {
+                for (app.child_agents.items) |child| {
+                    if (holdsUpgradeHandoff(&child.agent)) return true;
+                }
+            }
+            return false;
+        }
+
+        /// Whether `agent` holds the handoff an upgrade asked for
+        /// (`requestResumeHandoffForUpgrade`). The test app keeps it as a flag.
+        fn holdsUpgradeHandoff(agent: *const AppAgent) bool {
+            if (comptime @hasField(AppAgent, "upgrade_handoff")) return agent.upgrade_handoff;
+            if (comptime @hasField(AppAgent, "session_persistence") and
+                @hasField(@FieldType(AppAgent, "session_persistence"), "resume_handoff_intent"))
+            {
+                return agent.session_persistence.resume_handoff_intent == .upgrade_requested;
+            }
+            return false;
         }
 
         /// What the composer holds that exiting would lose, as the notice
@@ -192,12 +307,13 @@ pub fn Runtime(comptime App: type) type {
                 try writeUpgradeNotice(app, .neutral, "auto-upgrade is disabled");
                 return .not_ready;
             }
-            // A second Ctrl+G while the restart waits cancels it. Once the
-            // held turns are let go, the restart is under way.
+            // A second Ctrl+G while the restart waits, for its turns or for
+            // idle, cancels it. Once the held turns are let go, the restart
+            // is under way.
             if (comptime supportsYield(App)) {
                 switch (app.upgrader.restart) {
                     .none => {},
-                    .waiting => {
+                    .waiting, .when_idle => {
                         try cancelWaitingRestart(app);
                         return .restart_cancelled;
                     },
@@ -487,17 +603,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime agents.hasAgentField(App, "stream")) {
                 if (agent.stream.active) return false;
             }
-            if (upgradeUnavailableNotice(app, agent) != null) return false;
-            if (anyDraftNonEmpty(app, agent)) return false;
-            if (menuOrPickerActive(app, agent)) return false;
-            if (comptime @hasDecl(App, "needsUserElsewhere")) {
-                var name_buf: [32]u8 = undefined;
-                if (app.needsUserElsewhere(&name_buf) != null) return false;
-            }
-            if (comptime @hasDecl(App, "queuedWorkElsewhere")) {
-                var queue_name_buf: [32]u8 = undefined;
-                if (app.queuedWorkElsewhere(&queue_name_buf) != null) return false;
-            }
+            if (!nothingWaitsOnPerson(app, agent)) return false;
             if (hasRunningShellOrTtySession(app)) return false;
             return idleRestartQuietElapsed(app, now_ms, quiet_ms);
         }
@@ -593,6 +699,7 @@ const TestWorker = struct {
 
 const TestTerminalInputRuntime = struct {
     terminal_action_pending: bool = false,
+    input_pending: bool = false,
     inner: ui_input_runtime.Runtime = .{},
 
     fn deinit(self: *TestTerminalInputRuntime, alloc: std.mem.Allocator) void {
@@ -601,6 +708,10 @@ const TestTerminalInputRuntime = struct {
 
     fn hasPendingTerminalAction(self: *const TestTerminalInputRuntime) bool {
         return self.terminal_action_pending;
+    }
+
+    fn hasPendingTerminalInput(self: *const TestTerminalInputRuntime) bool {
+        return self.input_pending;
     }
 
     pub fn hasDeferredSessionInput(self: *const TestTerminalInputRuntime) bool {
@@ -669,9 +780,14 @@ const TestSubagents = struct {
 
 const TestTerminal = struct {
     full_transcript_active: bool = false,
+    readable: bool = false,
 
     pub fn fullTranscriptScreenActive(self: *const TestTerminal) bool {
         return self.full_transcript_active;
+    }
+
+    fn pollInput(self: TestTerminal, _: i32) !struct { readable: bool } {
+        return .{ .readable = self.readable };
     }
 };
 
@@ -2125,4 +2241,134 @@ test "app_upgrade_runtime auto-restart holds while any stashed or off-screen dra
             }
         }.clear);
     }
+}
+
+test "app_upgrade_runtime lets a prompt sent while the restart waits go on, and restarts at the next idle moment" {
+    const alloc = std.testing.allocator;
+    var app = TestApp{ .alloc = alloc };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+    _ = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(auto_upgrade.RestartWait.waiting, app.upgrader.restart);
+
+    // The prompt goes out: the held turns go on, and the relaunch and the
+    // handoff Ctrl+G prepared stay.
+    try std.testing.expect(Runtime(TestApp).restartWhenIdleForPrompt(&app));
+    try std.testing.expectEqual(auto_upgrade.RestartWait.when_idle, app.upgrader.restart);
+    try std.testing.expectEqual(@as(usize, 1), app.cancel_yield_count);
+    try std.testing.expectEqual(@as(usize, 0), app.cancel_handoff_count);
+    try std.testing.expect(app.agent().upgrade_handoff);
+    try std.testing.expect(Runtime(TestApp).restartWhenIdleForPrompt(&app));
+    try std.testing.expectEqual(@as(usize, 1), app.cancel_yield_count);
+
+    // Nothing is released while it waits for idle, and each thing Ctrl+G
+    // refuses for holds the restart.
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 0), app.release_count);
+    app.turn_running = false;
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "typed");
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.input_runtime.edit_state.input.clearRetainingCapacity();
+    app.agent().submission.pending = 1;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.agent().submission.pending = null;
+    app.agent().worker.queued_count = 1;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.agent().worker.queued_count = 0;
+    app.queued_elsewhere = "fx 2";
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.queued_elsewhere = null;
+    app.needs_user_elsewhere = .{ .name = "fx 2", .doing = .needs_approval };
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.needs_user_elsewhere = null;
+    // Keys typed but not yet read hold it too: the exit's terminal flush
+    // would drop them, so the loop reads them first.
+    app.terminal.readable = true;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.terminal.readable = false;
+    app.terminal_input_runtime.input_pending = true;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.terminal_input_runtime.input_pending = false;
+
+    // Idle: the handoff Ctrl+G asked for still holds, so it is kept, and fx
+    // exits for the relaunch.
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 1), app.request_handoff_count);
+    try std.testing.expect(app.agent().upgrade_handoff);
+}
+
+test "app_upgrade_runtime asks the agent on screen for the handoff again when a session switch dropped it" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+    _ = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expect(Runtime(TestApp).restartWhenIdleForPrompt(&app));
+
+    // `/new` closed the session Ctrl+G asked, which drops its handoff.
+    app.turn_running = false;
+    app.agent().upgrade_handoff = false;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(@as(usize, 2), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 2), app.request_handoff_count);
+    try std.testing.expect(app.agent().upgrade_handoff);
+}
+
+test "app_upgrade_runtime cancels a restart put off until idle when the session on screen cannot hand off" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+    _ = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expect(Runtime(TestApp).restartWhenIdleForPrompt(&app));
+
+    // A session switch while it waited, such as `/new`, closed the session
+    // Ctrl+G asked; the one on screen now cannot hand off.
+    app.turn_running = false;
+    app.agent().upgrade_handoff = false;
+    app.prepare_error = error.SessionPersistenceUnavailable;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
+    try std.testing.expectEqual(@as(usize, 1), app.upgrader.cancel_count);
+    try std.testing.expect(!app.agent().upgrade_handoff);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "restart for the update cancelled because this conversation is not safely resumable") != null);
+}
+
+test "app_upgrade_runtime cancels a restart put off until idle on Ctrl+G, and keeps a prompt only once the held turns were let go" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+    _ = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expect(Runtime(TestApp).restartWhenIdleForPrompt(&app));
+
+    const cancelled = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.restart_cancelled, cancelled);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
+    try std.testing.expect(!app.agent().upgrade_handoff);
+    app.turn_running = false;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+
+    app.upgrader.restart = .releasing;
+    try std.testing.expect(!Runtime(TestApp).restartWhenIdleForPrompt(&app));
+    try std.testing.expectEqual(auto_upgrade.RestartWait.releasing, app.upgrader.restart);
 }

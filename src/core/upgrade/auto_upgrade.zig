@@ -113,6 +113,10 @@ pub fn isDevelopmentBuildPath(path: []const u8) bool {
 /// only (`tests/tla/recovery/RestartWait.tla`).
 pub const RestartWait = enum {
     none,
+    /// A prompt was sent while the restart waited, so the turns go on: fx
+    /// restarts at the next moment Ctrl+G would restart at once. Ctrl+G
+    /// cancels.
+    when_idle,
     /// The running turns stop at their next step boundary and hold there;
     /// a second Ctrl+G cancels.
     waiting,
@@ -262,6 +266,7 @@ pub const AutoUpgrade = struct {
 
     pub fn statusLabel(self: *AutoUpgrade, buf: []u8) []const u8 {
         if (self.restart == .waiting) return restart_wait_label;
+        if (self.restart == .when_idle) return "update ready · restarts when idle · ctrl+g cancels";
         const state = self.getState();
         switch (state) {
             .downloading => {
@@ -753,6 +758,15 @@ test "statusLabel waiting returns empty" {
     var buf: [64]u8 = undefined;
     const label = au.statusLabel(&buf);
     try std.testing.expectEqual(@as(usize, 0), label.len);
+}
+
+test "a restart a prompt put off until idle says so, and an exit before it drops its relaunch" {
+    var au = AutoUpgrade{};
+    var buf: [64]u8 = undefined;
+    try au.requestRelaunch("/tmp/fx-upgraded");
+    au.restart = .when_idle;
+    try std.testing.expectEqualStrings("update ready · restarts when idle · ctrl+g cancels", au.statusLabel(&buf));
+    try std.testing.expect(au.takeRelaunchRequest() == null);
 }
 
 test "statusLabel checking returns empty" {
