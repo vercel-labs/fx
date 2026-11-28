@@ -758,6 +758,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .shell, .command = "/shell", .help_entry = "/shell reload", .completion_description = "reload shell startup files for commands", .presentation_category = .workspace, .has_args = true, .requires_args = true, .accepts_payload = true },
+    .{ .kind = .sandbox, .command = "/sandbox", .help_entry = "/sandbox setup", .completion_description = "choose the Vercel team and project for remote commands", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };
@@ -871,6 +872,7 @@ test "built-in slash commands register exact active order" {
         "/sound",
         "/workspace",
         "/shell",
+        "/sandbox",
         "/version",
         "/quit",
     };

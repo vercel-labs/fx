@@ -21,6 +21,7 @@ const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const runner = @import("../runner/runner.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const editor_state = @import("../input/editor_state.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
@@ -171,6 +172,32 @@ fn handleShellCommand(app: anytype, rest: []const u8) !void {
         .tone = .neutral,
         .body = "The next command reloads your shell startup files. Remembered command approvals were reset.",
     }, true);
+}
+
+fn handleSandboxCommand(app: anytype, rest: []const u8) !void {
+    if (!std.mem.eql(u8, std.mem.trim(u8, rest, " \t"), "setup")) {
+        try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /sandbox setup" }, true);
+        return;
+    }
+    // The profile is read now, not at startup, so `fx config set` takes effect without a restart.
+    var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch {
+        try app.writeDomainNotice(.{
+            .topic = "sandbox",
+            .tone = .@"error",
+            .body = "fx could not read its settings, so /sandbox setup did not run.",
+        }, true);
+        return;
+    };
+    defer settings.deinit(app.alloc);
+    if (!(settings.experimental_sandbox_execution orelse false)) {
+        try app.writeDomainNotice(.{
+            .topic = "sandbox",
+            .tone = .neutral,
+            .body = "Remote commands are off. Turn them on with `fx config set experimental.sandbox_execution true`.",
+        }, true);
+        return;
+    }
+    try app.submitUserPrompt(runner.setup_prompt);
 }
 
 fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
@@ -330,6 +357,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
                 .handle_shell = commandHandleShell,
+                .handle_sandbox = commandHandleSandbox,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
             };
@@ -1474,6 +1502,11 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleShell(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleShellCommand(app, rest);
+        }
+
+        fn commandHandleSandbox(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleSandboxCommand(app, rest);
         }
 
         fn commandHandleWorkspace(ctx: *anyopaque, rest: []const u8) !void {

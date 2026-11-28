@@ -44,6 +44,7 @@ pub const ParsedCommand = union(enum) {
     notifications: []const u8,
     workspace: []const u8,
     shell: []const u8,
+    sandbox: []const u8,
     version,
     unknown,
 };
@@ -151,6 +152,7 @@ pub const CommandHandlers = struct {
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_shell: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_sandbox: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
@@ -200,6 +202,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
         .shell => .{ .shell = payload },
+        .sandbox => .{ .sandbox = payload },
         .version => .version,
     };
 }
@@ -266,6 +269,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
         .shell => |rest| try handlers.handle_shell(handlers.ctx, rest),
+        .sandbox => |rest| try handlers.handle_sandbox(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
@@ -609,6 +613,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
         .handle_shell = unexpectedPayload,
+        .handle_sandbox = unexpectedPayload,
         .show_version = unexpectedNoPayload,
         .unknown = unexpectedPayload,
     };
@@ -623,6 +628,45 @@ test "route passes shell payload" {
 
     try std.testing.expectEqualStrings("shell", ctx.called);
     try std.testing.expectEqualStrings("reload", ctx.payload);
+}
+
+fn recordSandbox(ctx: *anyopaque, value: []const u8) anyerror!void {
+    const test_context = testContext(ctx);
+    test_context.called = "sandbox";
+    test_context.payload = value;
+}
+
+test "route passes sandbox setup payload" {
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.handle_sandbox = recordSandbox;
+
+    try route(testSlashRegistry(), &handlers, "/sandbox setup");
+
+    try std.testing.expectEqualStrings("sandbox", ctx.called);
+    try std.testing.expectEqualStrings("setup", ctx.payload);
+}
+
+test "route passes an empty sandbox payload when no word follows" {
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.handle_sandbox = recordSandbox;
+
+    try route(testSlashRegistry(), &handlers, "/sandbox");
+
+    try std.testing.expectEqualStrings("sandbox", ctx.called);
+    try std.testing.expectEqualStrings("", ctx.payload);
+}
+
+test "route passes an unknown sandbox word to the handler for its usage notice" {
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.handle_sandbox = recordSandbox;
+
+    try route(testSlashRegistry(), &handlers, "/sandbox other");
+
+    try std.testing.expectEqualStrings("sandbox", ctx.called);
+    try std.testing.expectEqualStrings("other", ctx.payload);
 }
 
 test "removed /setup names /provider, and other commands get no removed notice" {

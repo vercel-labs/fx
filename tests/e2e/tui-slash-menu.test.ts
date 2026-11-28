@@ -318,6 +318,48 @@ function gatewayPromptText(body: string): string {
   return request.prompt.map((message) => nestedText(message.content)).join("\n");
 }
 
+const SANDBOX_SETUP_PROMPT = [
+  "Help me choose where fx runs remote shell commands: the Vercel team and project of fx's remote runner.",
+  "1. Show my current choice: run `fx config get sandbox_team` and `fx config get sandbox_project`. When a value is empty, fx uses the Vercel CLI's current team (or my account's default team) and the project fx-sandbox.",
+  "2. If the Vercel CLI is installed, list my choices: `vercel teams ls`, then `vercel project ls --scope <team>`.",
+  "3. Ask me with the ask tool which team and project to use, with keeping the defaults as one option.",
+  "4. Save my answer with `fx config set sandbox_team <slug>` and `fx config set sandbox_project <name>`, or go back to the defaults with `fx config unset sandbox_team` and `fx config unset sandbox_project`.",
+  "fx asks me again before it first copies a repository to a team or project I have not used.",
+].join("\n");
+
+// Starts fx in a fresh profile whose settings set experimental.sandbox_execution
+// to `sandboxExecution`, and points it at the module's `gateway`.
+async function launchSandboxSession(sandboxExecution: boolean): Promise<string> {
+  const root = mkdtempSync(join(tmpdir(), "fx-sandbox-setup-"));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace);
+  writeFileSync(
+    join(home, ".fx", "settings.json"),
+    JSON.stringify({ experimental: { sandbox_execution: sandboxExecution } }),
+  );
+  session = await TmuxSession.create({
+    cwd: workspace,
+    env: {
+      HOME: home,
+      AI_GATEWAY_API_KEY: "fake-sandbox-setup-key",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_GATEWAY_BASE_URL: gateway!.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway!.chatUrl,
+      FX_MODEL: FAKE_GATEWAY_MODEL,
+      FX_AUTO_UPGRADE: "0",
+    },
+    width: 160,
+    height: 40,
+    stderrPath,
+  });
+  await session.waitForComposer(10_000);
+  return stderrPath;
+}
+
 function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
@@ -993,6 +1035,60 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
+    "sandbox setup sends the setup prompt as the user's message",
+    async () => {
+      gateway = startFakeGateway([fakeGatewayFinalText("SANDBOX_SETUP_SENT")]);
+      const stderrPath = await launchSandboxSession(true);
+
+      await session!.sendText("/sandbox setup");
+      await session!.waitForReplyAndTurnEnd("SANDBOX_SETUP_SENT", 10_000);
+
+      expect(gateway.requests).toHaveLength(1);
+      expect(gatewayPromptText(gateway.requests[0]!.body)).toContain(SANDBOX_SETUP_PROMPT);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await session!.sendText("/quit");
+      expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "sandbox setup with remote commands off names the setting and sends no turn",
+    async () => {
+      gateway = startFakeGateway([]);
+      await launchSandboxSession(false);
+
+      await session!.sendText("/sandbox setup");
+      await session!.waitForText("Remote commands are off", 5_000);
+      await session!.waitForText("fx config set experimental.sandbox_execution true", 5_000);
+
+      expect(gateway.requests).toHaveLength(0);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "sandbox without a known word shows its usage and sends no turn",
+    async () => {
+      gateway = startFakeGateway([]);
+      await launchSandboxSession(true);
+
+      await session!.sendText("/sandbox");
+      await session!.waitForText("usage: /sandbox setup", 5_000);
+      await session!.sendText("/sandbox other");
+      await session!.waitForPane(
+        (pane) => countOccurrences(pane, "usage: /sandbox setup") >= 2,
+        5_000,
+      );
+
+      expect(gateway.requests).toHaveLength(0);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "linked skill metadata is visible and usable from the skills menu",
     async () => {
       const fixture = createLinkedMetadataSkillsMenuFixture();
@@ -1417,7 +1513,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ).toBe(69);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 40", 5_000);
+      await session.waitForText("Commands 41", 5_000);
       const afterSlash = await capture("after-slash");
       expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
       expect(composerRow(afterSlash)).toBe(64);
@@ -1942,7 +2038,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 40);
+      let grid = await waitForHelpMenu(session, 41);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("Run /help for commands");
@@ -1958,7 +2054,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await waitForHelpMenu(session, 5);
       expect(grid.join("\n")).toContain("[General]");
       await session.sendKeys("BTab");
-      grid = await waitForHelpMenu(session, 40);
+      grid = await waitForHelpMenu(session, 41);
       expect(grid.join("\n")).toContain("[All]");
 
       await session.sendLiteralText("clipboard");
@@ -1969,11 +2065,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 41);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 40"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 41"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1982,7 +2078,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 41);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1999,7 +2095,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 41);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -2577,7 +2673,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
 
       await session.sendText("/help");
-      grid = await waitForHelpMenu(session, 40);
+      grid = await waitForHelpMenu(session, 41);
       expect(grid.join("\n")).toContain("Run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
@@ -4763,7 +4859,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 40", 5_000);
+      await session.waitForText("Commands 41", 5_000);
 
       for (let i = 0; i < 5; i += 1) {
         await session.sendKeys("Down");

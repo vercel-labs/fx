@@ -2043,6 +2043,10 @@ const App = struct {
         try InputSubmitRuntime.request_context_compaction(self, agent);
     }
 
+    pub fn submitUserPrompt(self: *App, text: []const u8) !void {
+        try InputSubmitRuntime.submitUserPrompt(self, text);
+    }
+
     pub fn enqueueContextCompaction(self: *App, agent: *agents.Agent, operation_id: @import("core/output/compaction_activity.zig").OperationId) !bool {
         if (agent.worker.isProcessing() or agent.worker.queuedPromptCount() > 0) return false;
         const model = try std.heap.c_allocator.dupe(u8, provider_runtime.modelOf(self, agent));

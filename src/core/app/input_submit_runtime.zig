@@ -1041,6 +1041,28 @@ pub fn SubmitRuntime(comptime App: type) type {
             return app.slashRegistry().lookup(text[0..command_end]);
         }
 
+        /// Sends `text` as the user's next prompt, the way Enter sends plain
+        /// composer text: a turn that is already running queues it. The
+        /// composer has already cleared its draft, so a refused prompt gets a
+        /// notice rather than vanishing. Only `/sandbox setup` calls this.
+        pub fn submitUserPrompt(app: *App, text: []const u8) !void {
+            if (app.subagentOnScreen()) {
+                try app.writeDomainNotice(.{
+                    .topic = "subagent",
+                    .tone = .neutral,
+                    .body = "This command works on main's screen. Go back to main to run it.",
+                }, true);
+                return;
+            }
+            const admission = try enqueuePromptForSubmit(app, agents.screenAgentOf(app), text, &.{});
+            if (admission != .rejected) return;
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .@"error",
+                .body = "Your message wasn't sent. Run the command again to retry.",
+            }, true);
+        }
+
         /// Whether the composer holds exactly `/quit` (or an alias of it),
         /// which still runs while fx waits to restart for an upgrade.
         fn submitsQuit(app: *App) bool {

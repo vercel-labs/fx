@@ -11,6 +11,17 @@ pub const runBuiltin = runner_main.runBuiltin;
 /// The exit code of a run that did not start (spec L6).
 pub const exit_did_not_run = runner_main.exit_did_not_run;
 
+/// The message `/sandbox setup` sends as the user's turn. The agent runs its
+/// steps, and fx sends it unchanged.
+pub const setup_prompt =
+    \\Help me choose where fx runs remote shell commands: the Vercel team and project of fx's remote runner.
+    \\1. Show my current choice: run `fx config get sandbox_team` and `fx config get sandbox_project`. When a value is empty, fx uses the Vercel CLI's current team (or my account's default team) and the project fx-sandbox.
+    \\2. If the Vercel CLI is installed, list my choices: `vercel teams ls`, then `vercel project ls --scope <team>`.
+    \\3. Ask me with the ask tool which team and project to use, with keeping the defaults as one option.
+    \\4. Save my answer with `fx config set sandbox_team <slug>` and `fx config set sandbox_project <name>`, or go back to the defaults with `fx config unset sandbox_team` and `fx config unset sandbox_project`.
+    \\fx asks me again before it first copies a repository to a team or project I have not used.
+;
+
 pub const Policy = policy.Policy;
 pub const PlaceError = policy.PlaceError;
 pub const Refusal = policy.Refusal;
