@@ -3373,6 +3373,42 @@ describe("slice 7: fx tool web and search", () => {
     expect((JSON.parse(toolResultText(bashBody, "b_search_killed")) as { value: string }).value).toContain("exit=124");
   }, TIMEOUT);
 
+  test("fx tool search with no redirect ends its output with the notice, after every result", async () => {
+    const root = createRoot();
+    // The search shows at most 10 of these results.
+    const results = Array.from({ length: 20 }, (_, index) => ({
+      title: `Zig result ${index + 1} with a title long enough to fill the buffer`,
+      url: `https://ziglang.org/result-${index + 1}/`,
+    }));
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("b_search_many", "bash", {
+        command: `${JSON.stringify(FX_BIN)} tool search "zig release notes"; echo "exit=$?"`,
+      }),
+      fakeGatewaySse([
+        { type: "tool-call", toolCallId: "search_worker_1", toolName: "exa_search", input: { query: "zig release notes" }, providerExecuted: true },
+        { type: "tool-result", toolCallId: "search_worker_1", result: { results } },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: { inputTokens: { total: 5 }, outputTokens: { total: 7 } } },
+      ]),
+      fakeGatewayFinalText("Searched.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Search for zig release notes."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const bashBody = gateway.requests.find((request) => request.body.includes('"toolCallId":"b_search_many"'))!.body;
+    const out = (JSON.parse(toolResultText(bashBody, "b_search_many")) as { value: string }).value;
+    expect(out).toContain("Zig result 10 ");
+    const lastResult = out.indexOf("Zig result 10 ");
+    const notice = out.indexOf("10 results.");
+    expect(notice).toBeGreaterThan(lastResult);
+    expect(out.indexOf("exit=0")).toBeGreaterThan(notice);
+  }, TIMEOUT);
+
   test("fx tool search with no Gateway search backend exits 6 with the next step", async () => {
     // The configured local provider is not the AI Gateway, so it has no search backend.
     let calls = 0;

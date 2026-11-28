@@ -1530,7 +1530,7 @@ fn runBridgeBashToolCall(
     usage: ?*BridgeUsage,
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
-    const info = try bashToolRowInfo(arena, operation);
+    const info = try bashToolRowInfo(arena, ctx.nested_tool_registry orelse ctx.tool_registry, operation);
     const row = BridgeCallRow.startAction(ctx, arena, request_id, info.tool, tool_call.arguments_json, info.action);
     if (cancel.load(.acquire)) {
         if (row) |value| value.finishAction(arena, .cancelled);
@@ -1557,7 +1557,22 @@ fn runBridgeBashToolCall(
     return outcome;
 }
 
-fn bashToolRowInfo(arena: Allocator, operation: mcp_call_capability.BashToolRequest) !struct {
+/// A bridged web call's row: the web tool's own running and done labels, from its
+/// registered spec, so it reads as a direct call's row does. Its failed label is
+/// the one every non-subagent failed call uses, so the transcript writes the verb
+/// once, as "Couldn't fetch <target>".
+fn webRowAction(arena: Allocator, specs: tool_dispatch.Registry, name: []const u8, target: []const u8) !BridgeCallRow.ActionRow {
+    const spec = specs.lookup(name);
+    return .{
+        .activity_kind = .read,
+        .running_label = if (spec) |tool| tool.action_label else "",
+        .done_label = if (spec) |tool| tool.completed_action_label else "",
+        .failed_label = try tool_presentation.subagentFailureLabel(arena, .{ .id = "", .name = name, .arguments_json = "" }, ""),
+        .target = target,
+    };
+}
+
+fn bashToolRowInfo(arena: Allocator, specs: tool_dispatch.Registry, operation: mcp_call_capability.BashToolRequest) !struct {
     tool: []const u8,
     action: BridgeCallRow.ActionRow,
 } {
@@ -1634,23 +1649,11 @@ fn bashToolRowInfo(arena: Allocator, operation: mcp_call_capability.BashToolRequ
         },
         .web_fetch => |req| .{
             .tool = "web_fetch",
-            .action = .{
-                .activity_kind = .read,
-                .running_label = "Fetching",
-                .done_label = "Fetched",
-                .failed_label = "Failed fetch",
-                .target = try rowPath(arena, req.url),
-            },
+            .action = try webRowAction(arena, specs, "web_fetch", try rowPath(arena, req.url)),
         },
         .web_search => |req| .{
             .tool = "web_search",
-            .action = .{
-                .activity_kind = .read,
-                .running_label = "Searching",
-                .done_label = "Searched",
-                .failed_label = "Failed search",
-                .target = try rowPath(arena, req.query),
-            },
+            .action = try webRowAction(arena, specs, "web_search", try rowPath(arena, req.query)),
         },
     };
 }
@@ -3822,20 +3825,59 @@ test "bridged web rows show Fetching or Searching with the url or the query, and
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const fetch = try bashToolRowInfo(arena, .{ .web_fetch = .{ .url = "https://example.com/page" } });
+    const fetch = try bashToolRowInfo(arena, test_builtin_tools.registry, .{ .web_fetch = .{ .url = "https://example.com/page" } });
     try std.testing.expectEqualStrings("web_fetch", fetch.tool);
     try std.testing.expect(fetch.action.activity_kind == .read);
     try std.testing.expectEqualStrings("Fetching", fetch.action.running_label);
     try std.testing.expectEqualStrings("Fetched", fetch.action.done_label);
-    try std.testing.expectEqualStrings("Failed fetch", fetch.action.failed_label);
+    try std.testing.expectEqualStrings("Failed", fetch.action.failed_label);
     try std.testing.expectEqualStrings("https://example.com/page", fetch.action.target);
-    const search = try bashToolRowInfo(arena, .{ .web_search = .{ .query = "zig release notes" } });
+    const search = try bashToolRowInfo(arena, test_builtin_tools.registry, .{ .web_search = .{ .query = "zig release notes" } });
     try std.testing.expectEqualStrings("web_search", search.tool);
     try std.testing.expect(search.action.activity_kind == .read);
     try std.testing.expectEqualStrings("Searching", search.action.running_label);
     try std.testing.expectEqualStrings("Searched", search.action.done_label);
-    try std.testing.expectEqualStrings("Failed search", search.action.failed_label);
+    try std.testing.expectEqualStrings("Failed", search.action.failed_label);
     try std.testing.expectEqualStrings("zig release notes", search.action.target);
+}
+
+test "a failed bridged web row says Failed once with its target terminal-safe, and runs under the web tool's own labels" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .nested_tool_registry = test_builtin_tools.registry };
+    defer rt.deinit(alloc);
+    var rows = RowRecorder{ .alloc = alloc };
+    defer rows.deinit();
+    var ctx = rt.context();
+    ctx.nested_tool_lifecycle = .{ .context = @ptrCast(&rows), .push_fn = RowRecorder.push, .save_bridge_call_fn = RowRecorder.save };
+    ctx.output_chunk_lifecycle_id = .{ .turn_id = 5, .call_id = "shell-call-2" };
+    var state = McpCallBridgeState{ .runtime = ctx, .file_ops = true };
+
+    // A private address is refused before any fetch, so its row fails at once.
+    const fetch_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-90", .{ .web_fetch = .{ .url = "http://10.0.0.1/\x1b[31mX" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    _ = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-90", "web_fetch", "", fetch_allowed, &cancel);
+    // With no search backend, a search fails at once.
+    const search_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-91", .{ .web_search = .{ .query = "zig\x1b[31m release" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    _ = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-91", "web_search", "", search_allowed, &cancel);
+
+    try std.testing.expectEqual(@as(usize, 6), rows.lines.items.len);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[1], "Fetching") != null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[2], "● Failed\x1b[0m ") != null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[2], "Failed fetch") == null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[2], "\x1b[31m") == null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[4], "Searching") != null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[5], "● Failed\x1b[0m ") != null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[5], "Failed search") == null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[5], "\x1b[31m") == null);
 }
 
 test "bridged web_fetch under a domain deny rule is refused when the bash session's registry lacks web_fetch" {

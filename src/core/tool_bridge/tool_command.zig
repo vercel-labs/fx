@@ -566,7 +566,13 @@ fn printReply(arena: Allocator, out: *Writer, err: *Writer, command: Command, re
                 .edit, .write => try out.writeByte('\n'),
                 else => if (reply.bytes.len > 0 and reply.bytes[reply.bytes.len - 1] != '\n') try out.writeByte('\n'),
             }
-            if (reply.header.notice) |notice| try client.writeSafeLine(arena, err, notice);
+            if (reply.header.notice) |notice| {
+                // The data reaches stdout before the notice is written, so the notice
+                // never lands inside the data when both streams share a terminal.
+                try out.flush();
+                try client.writeSafeLine(arena, err, notice);
+                try err.flush();
+            }
             return client.exit.ok;
         },
         .tool_error => return refusal(arena, err, command, reply.bytes, client.exit.tool_error),
@@ -1004,6 +1010,60 @@ test "fx tool prints a reply's notice on stderr, after its data on stdout" {
     try std.testing.expectEqual(client.exit.ok, code);
     try std.testing.expectEqualStrings("zig\tZig help\n", out.written());
     try std.testing.expectEqualStrings("outside text\n", err.written());
+}
+
+/// A buffered writer whose flushes append to one shared log, as stdout and stderr
+/// do on a terminal, so the order their bytes reach the log shows.
+const LogWriter = struct {
+    interface: Writer,
+    log: *std.ArrayList(u8),
+    alloc: Allocator,
+
+    fn init(buffer: []u8, log: *std.ArrayList(u8), alloc: Allocator) LogWriter {
+        return .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer }, .log = log, .alloc = alloc };
+    }
+
+    fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const self: *LogWriter = @alignCast(@fieldParentPtr("interface", w));
+        try self.append(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try self.append(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            try self.append(last);
+            n += last.len;
+        }
+        return n;
+    }
+
+    fn append(self: *LogWriter, bytes: []const u8) Writer.Error!void {
+        self.log.appendSlice(self.alloc, bytes) catch return error.WriteFailed;
+    }
+};
+
+test "fx tool writes the notice after all of the data when stdout and stderr are both buffered" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(alloc);
+    var out_buffer: [16]u8 = undefined;
+    var err_buffer: [16]u8 = undefined;
+    var out = LogWriter.init(&out_buffer, &log, alloc);
+    var err = LogWriter.init(&err_buffer, &log, alloc);
+    const page = "line one of the page\nline two of the page, which runs past the buffer";
+    var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = page.len, .notice = "the notice, which is longer than the buffer" }, .bytes = page } };
+
+    const code = try send(arena, std.testing.io, &out.interface, &err.interface, .{ .web_fetch = .{ .url = "https://example.com/a" } }, "", test_bridge, fake.caller());
+    try out.interface.flush();
+    try err.interface.flush();
+    try std.testing.expectEqual(client.exit.ok, code);
+    try std.testing.expectEqualStrings(page ++ "\nthe notice, which is longer than the buffer\n", log.items);
 }
 
 test "parse reads skill and agent verbs with options, and rejects bad usage" {
