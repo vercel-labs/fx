@@ -3275,6 +3275,55 @@ fn preparedFileMutationTargetMatches(
     };
 }
 
+const PreparedCallFreshness = enum {
+    fresh,
+    target_changed,
+    target_unavailable,
+    file_mutation_target_changed,
+    non_file_mutation,
+    file_mutation_decode_failed,
+};
+
+fn fileMutationAdmissionFreshness(
+    admission: tooling_tool_admission.FileMutationExecutionPreparation,
+    preparation: ?*tool_preparation.Result,
+) PreparedCallFreshness {
+    return switch (admission) {
+        .tool_failure => .file_mutation_decode_failed,
+        .target_resolution_failure => .target_unavailable,
+        .not_file_mutation => .non_file_mutation,
+        .prepared => |prepared| if (preparedFileMutationTargetMatches(preparation, prepared))
+            .fresh
+        else
+            .file_mutation_target_changed,
+    };
+}
+
+fn preparedCallApplicableTargetsFreshness(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    call: ToolCall,
+    maybe_preparation: ?*tool_preparation.Result,
+) Allocator.Error!PreparedCallFreshness {
+    const preparation = maybe_preparation orelse return .fresh;
+    return switch (preparation.*) {
+        .terminal => .fresh,
+        .candidate => |*candidate| switch (try tool_preparation.ordinaryApplicableTargetFreshnessInScope(
+            arena,
+            call,
+            deps.tool_registry,
+            config.workspace_root,
+            config.access_scope,
+            candidate,
+        )) {
+            .fresh => .fresh,
+            .target_changed => .target_changed,
+            .target_unavailable => .target_unavailable,
+        },
+    };
+}
+
 fn preparedCallApplicableTargetsFresh(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
@@ -3282,24 +3331,23 @@ fn preparedCallApplicableTargetsFresh(
     call: ToolCall,
     maybe_preparation: ?*tool_preparation.Result,
 ) Allocator.Error!bool {
-    const preparation = maybe_preparation orelse return true;
-    return switch (preparation.*) {
-        .terminal => true,
-        .candidate => |*candidate| tool_preparation.ordinaryApplicableTargetsFreshInScope(
-            arena,
-            call,
-            deps.tool_registry,
-            config.workspace_root,
-            config.access_scope,
-            candidate,
-        ),
-    };
+    return (try preparedCallApplicableTargetsFreshness(
+        arena,
+        deps,
+        config,
+        call,
+        maybe_preparation,
+    )) == .fresh;
 }
 
 const LateTargetResolution = enum {
     may_run,
     scoped_instructions_pending,
-    stale,
+    target_changed,
+    target_unavailable,
+    file_mutation_target_changed,
+    non_file_mutation,
+    file_mutation_decode_failed,
 };
 
 const NotExecutedReason = struct {
@@ -3314,10 +3362,37 @@ fn lateTargetNotExecutedReason(resolution: LateTargetResolution) ?NotExecutedRea
             .result_kind = "scoped_instructions_pending",
             .model_output = types.scoped_instructions_pending_tool_result_output,
         },
-        .stale => .{
+        .target_changed => .{
             .result_kind = "applicable_targets_changed",
+            .model_output = types.target_changed_tool_result_output,
+        },
+        .target_unavailable => .{
+            .result_kind = "applicable_targets_unavailable",
+            .model_output = types.target_unavailable_tool_result_output,
+        },
+        .file_mutation_target_changed => .{
+            .result_kind = "file_mutation_target_changed",
+            .model_output = types.file_mutation_target_changed_tool_result_output,
+        },
+        .non_file_mutation => .{
+            .result_kind = "not_file_mutation",
+            .model_output = types.non_file_mutation_tool_result_output,
+        },
+        .file_mutation_decode_failed => .{
+            .result_kind = "file_mutation_decode_failed",
             .model_output = types.deferred_tool_result_output,
         },
+    };
+}
+
+fn staleLateTargetResolution(freshness: PreparedCallFreshness) LateTargetResolution {
+    return switch (freshness) {
+        .fresh => unreachable,
+        .target_changed => .target_changed,
+        .target_unavailable => .target_unavailable,
+        .file_mutation_target_changed => .file_mutation_target_changed,
+        .non_file_mutation => .non_file_mutation,
+        .file_mutation_decode_failed => .file_mutation_decode_failed,
     };
 }
 
@@ -3339,11 +3414,13 @@ fn lateTargetResolution(
     step_ctx: TraceContext,
     tool_call: ToolCall,
     maybe_preparation: ?tool_preparation.Result,
+    stale_freshness: PreparedCallFreshness,
 ) !LateTargetResolution {
-    const context_registry = deps.context_registry orelse return .stale;
-    const preparation = maybe_preparation orelse return .stale;
+    const stale = staleLateTargetResolution(stale_freshness);
+    const context_registry = deps.context_registry orelse return stale;
+    const preparation = maybe_preparation orelse return stale;
     const stale_candidate = switch (preparation) {
-        .terminal => return .stale,
+        .terminal => return stale,
         .candidate => |*candidate| candidate,
     };
     const late_targets = (try tool_preparation.lateResolvedApplicableTargets(
@@ -3353,7 +3430,7 @@ fn lateTargetResolution(
         config.workspace_root,
         config.access_scope,
         stale_candidate,
-    )) orelse return .stale;
+    )) orelse return stale;
     // The probe is only a question to the registry.
     var resolved_candidate: tool_preparation.Candidate = .{
         .kind = .registered,
@@ -12918,10 +12995,10 @@ fn processQueuedPromptLoop(
             var prepared_file_mutation: ?tooling_tool_admission.PreparedFileMutationCall = null;
             defer if (prepared_file_mutation) |*prepared| prepared.deinit(arena);
 
-            const applicable_targets_fresh = if (is_file_mutation and
+            const call_freshness: PreparedCallFreshness = if (is_file_mutation and
                 preparation_batch.preparations[tool_call_index] != null)
             fresh: {
-                const admission = tooling_tool_admission.prepareFileMutationCall(
+                const admission = tooling_tool_admission.prepareFileMutationCallForExecution(
                     arena,
                     tool_call,
                     .{
@@ -12940,24 +13017,18 @@ fn processQueuedPromptLoop(
                         err,
                     );
                 };
+                const maybe_prep = if (preparation_batch.preparations[tool_call_index]) |*preparation|
+                    preparation
+                else
+                    null;
+                const freshness = fileMutationAdmissionFreshness(admission, maybe_prep);
                 switch (admission) {
-                    .tool_failure => break :fresh false,
-                    // A host tool reuses a reserved mutation name; it has no
-                    // builtin mutation targets to keep fresh.
-                    .not_file_mutation => break :fresh false,
-                    .prepared => |prepared| {
-                        prepared_file_mutation = prepared;
-                        break :fresh preparedFileMutationTargetMatches(
-                            if (preparation_batch.preparations[tool_call_index]) |*preparation|
-                                preparation
-                            else
-                                null,
-                            prepared,
-                        );
-                    },
+                    .prepared => |prepared| prepared_file_mutation = prepared,
+                    .target_resolution_failure, .tool_failure, .not_file_mutation => {},
                 }
+                break :fresh freshness;
             } else if (preparation_batch.preparations[tool_call_index]) |*preparation|
-                preparedCallApplicableTargetsFresh(
+                preparedCallApplicableTargetsFreshness(
                     arena,
                     deps,
                     config,
@@ -12975,8 +13046,8 @@ fn processQueuedPromptLoop(
                     );
                 }
             else
-                true;
-            const late_resolution: LateTargetResolution = if (applicable_targets_fresh)
+                .fresh;
+            const late_resolution: LateTargetResolution = if (call_freshness == .fresh)
                 .may_run
             else
                 lateTargetResolution(
@@ -12987,6 +13058,7 @@ fn processQueuedPromptLoop(
                     step_ctx,
                     tool_call,
                     preparation_batch.preparations[tool_call_index],
+                    call_freshness,
                 ) catch |err| {
                     return settleFailedContextGate(
                         deps,
@@ -14748,4 +14820,98 @@ test "eb03: UserTurn carries job.input_id in turn-piece writes, checkpoints, and
     try std.testing.expectEqual(@as(usize, 1), notice_fake.history_turns.items.len);
     try std.testing.expectEqual(@as(?u64, 64), notice_fake.history_turns.items[0].assistant.user.input_id);
     try std.testing.expectEqual(@as(?u64, 64), notice_fake.finish_user_input_id);
+}
+
+test "file mutation execution freshness gives true reasons for host tools and decode failures" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const builtin_registry: tool_dispatch.Registry = .{
+        .tools = &.{ builtin_tools.write_file, builtin_tools.edit_file },
+    };
+    const HostHooks = struct {
+        fn deinitInput(_: *anyopaque, _: Allocator) void {}
+        fn decode(_: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+            return .{ .input = .{ .ptr = @ptrFromInt(1), .deinit_fn = deinitInput } };
+        }
+        fn call(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+            return error.InvalidToolArguments;
+        }
+        fn readsOnly(_: tool_dispatch.ToolInput) bool {
+            return false;
+        }
+        fn irreversible(_: tool_dispatch.ToolInput) bool {
+            return false;
+        }
+    };
+    const host_tools = [_]tool_dispatch.Tool{.{
+        .name = "write_file",
+        .description = "",
+        .model_schema = .{ .name = "write_file", .description = "" },
+        .model_visible = false,
+        .executor_kind = .host,
+        .activity_kind = .command,
+        .action_label = "Running",
+        .completed_action_label = "Ran",
+        .decode = HostHooks.decode,
+        .call = HostHooks.call,
+        .reads_only_fn = HostHooks.readsOnly,
+        .irreversible_fn = HostHooks.irreversible,
+    }};
+
+    const host_admission = try tooling_tool_admission.prepareFileMutationCallForExecution(arena, .{
+        .id = "host_write",
+        .name = "write_file",
+        .arguments_json = "{\"path\":\"ignored.txt\"}",
+    }, .{
+        .tool_registry = .{ .tools = &host_tools },
+        .workspace_root = workspace,
+    });
+    const host_reason = lateTargetNotExecutedReason(
+        staleLateTargetResolution(fileMutationAdmissionFreshness(host_admission, null)),
+    ).?;
+    try std.testing.expectEqualStrings(
+        types.non_file_mutation_tool_result_output,
+        host_reason.model_output,
+    );
+
+    const parse_admission = try tooling_tool_admission.prepareFileMutationCallForExecution(arena, .{
+        .id = "bad_json",
+        .name = "write_file",
+        .arguments_json = "{",
+    }, .{
+        .tool_registry = builtin_registry,
+        .workspace_root = workspace,
+    });
+    const parse_reason = lateTargetNotExecutedReason(
+        staleLateTargetResolution(fileMutationAdmissionFreshness(parse_admission, null)),
+    ).?;
+    try std.testing.expectEqualStrings(
+        types.deferred_tool_result_output,
+        parse_reason.model_output,
+    );
+
+    const missing_admission = try tooling_tool_admission.prepareFileMutationCallForExecution(arena, .{
+        .id = "missing_edit",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"missing.txt\",\"old_string\":\"a\",\"new_string\":\"b\"}",
+    }, .{
+        .tool_registry = builtin_registry,
+        .workspace_root = workspace,
+    });
+    const missing_reason = lateTargetNotExecutedReason(
+        staleLateTargetResolution(fileMutationAdmissionFreshness(missing_admission, null)),
+    ).?;
+    try std.testing.expectEqualStrings(
+        types.target_unavailable_tool_result_output,
+        missing_reason.model_output,
+    );
 }
