@@ -10,7 +10,8 @@
 # not landed. AcpSessionState: session state, session/status, and list
 # change hints, likewise not landed. AcpSharedSession: what the clients of
 # one session see of each other's prompts, approvals, cancels, and presence,
-# likewise not landed. Their Today configs show fx now, and each
+# likewise not landed. AcpSubagents: child sessions in the shape of ACP's
+# Subagent Sessions, likewise not landed. Their Today configs show fx now, and each
 # must fail on the rule it names. The other configs must pass.
 #
 # The planted bugs and the runs of the real `fx acp` binary are in
@@ -25,6 +26,7 @@
 #   bun ../drivers/acp/session_state/check-spec.ts
 #   bun ../drivers/acp/session_state/driver.ts   # today's fx acp; --model rules fails until the rules land
 #   bun ../drivers/acp/shared_session/check-spec.ts
+#   bun ../drivers/acp/subagents/check-spec.ts
 #
 # With --ci it also runs every ../drivers/acp/*/driver.ts against
 # zig-out/bin/fx, as CI does; the planted bugs stay local, since they measure
@@ -74,6 +76,13 @@ MCAcpSharedSession AcpSharedSessionToday-prompts EchoComplete
 MCAcpSharedSession AcpSharedSessionToday-clients RosterCurrent
 MCAcpSharedSession AcpSharedSessionToday-cancel CancelStops
 MCAcpSharedSession AcpSharedSessionToday-stop StopEffect
+MCAcpSubagents MCAcpSubagents -
+MCAcpSubagents AcpSubagentsToday-ids WorkReachesClient
+MCAcpSubagents AcpSubagentsToday-replay ReplayComplete
+MCAcpSubagents AcpSubagentsToday-stop ParentStopStopsChildren
+MCAcpSubagents AcpSubagentsToday-request RequestShown
+MCAcpSubagents AcpSubagentsToday-cancel ChildCancelWorks
+MCAcpSubagents AcpSubagentsToday-prompt ChildPromptsWork
 EOF
 
 if [ "$ci" = true ]; then
