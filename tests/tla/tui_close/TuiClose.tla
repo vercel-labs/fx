@@ -65,7 +65,7 @@ CONSTANTS
     Ideal     \* TRUE: the closer is one step and the loop never blocks
 
 Designs == {"current", "a", "b"}
-Bugs == {"none", "no_tty", "int_uninstall", "no_once", "cancel", "no_guard"}
+Bugs == {"none", "no_tty", "int_uninstall", "no_once", "cancel", "no_guard", "early_uninstall", "minimal_handler"}
 
 ASSUME Design \in Designs /\ Bug \in Bugs /\ Ideal \in BOOLEAN
 
@@ -84,7 +84,8 @@ VARIABLES
     closing,     \* the closer has started and has not finished
     closeRuns,   \* closer runs started in this process
     closeSig,    \* the signal the closer runs for
-    stage,       \* shutdown stage: "none", "release", "persist", "done"
+    stage,       \* shutdown stage: "none", "release", "release_modes", "release_tty", "persist", "release_uninst", "done"
+    minimal,     \* planted defect minimal_handler: TERM/HUP restore tty/screen without saving the request
     exitWanted,  \* design b: a graceful SIGINT waits for the loop
     loopBlocked, \* design b: the loop cannot take the request now
     endCause,    \* "none", "signal", "graceful_sig", "user", "error"
@@ -92,7 +93,7 @@ VARIABLES
     cut          \* a SIGINT ended fx while the normal shutdown was running
 
 vars == <<phase, setup, closerUp, handled, intDisp, tty, screen, req, rec,
-          closing, closeRuns, closeSig, stage, exitWanted, loopBlocked,
+          closing, closeRuns, closeSig, stage, minimal, exitWanted, loopBlocked,
           endCause, sigWithReq, cut>>
 
 -----------------------------------------------------------------------------
@@ -126,7 +127,7 @@ Init ==
     /\ tty = "cooked" /\ screen = "normal"
     /\ req = "none" /\ rec = "none"
     /\ closing = FALSE /\ closeRuns = 0 /\ closeSig = "none"
-    /\ stage = "none"
+    /\ stage = "none" /\ minimal = FALSE
     /\ exitWanted = FALSE /\ loopBlocked = FALSE
     /\ endCause = "none" /\ sigWithReq = FALSE /\ cut = FALSE
 
@@ -139,7 +140,8 @@ TypeOK ==
     /\ req \in {"none", "running"} /\ rec \in {"none", "clean"}
     /\ closing \in BOOLEAN /\ closeRuns \in 0..2
     /\ closeSig \in {"none", "INT", "TERM", "HUP"}
-    /\ stage \in {"none", "release", "persist", "done"}
+    /\ stage \in {"none", "release", "release_modes", "release_tty", "persist", "release_uninst", "done"}
+    /\ minimal \in BOOLEAN
     /\ exitWanted \in BOOLEAN /\ loopBlocked \in BOOLEAN
     /\ endCause \in {"none", "signal", "graceful_sig", "user", "error"}
     /\ sigWithReq \in BOOLEAN /\ cut \in BOOLEAN
@@ -156,7 +158,7 @@ EarlyInstall ==
     /\ handled' = TRUE
     /\ intDisp' = IF Design = "a" THEN "closer" ELSE "graceful"
     /\ UNCHANGED <<phase, tty, screen, req, rec, closing, closeRuns, closeSig,
-                   stage, exitWanted, loopBlocked, endCause, sigWithReq, cut>>
+                   stage, minimal, exitWanted, loopBlocked, endCause, sigWithReq, cut>>
 
 \* Raw mode on: current first, then (after its window) its handlers; a and b
 \* after their handlers.
@@ -170,7 +172,7 @@ RawOn ==
           /\ phase' = "run"
     /\ tty' = "raw"
     /\ UNCHANGED <<closerUp, handled, intDisp, screen, req, rec, closing,
-                   closeRuns, closeSig, stage, exitWanted, loopBlocked,
+                   closeRuns, closeSig, stage, minimal, exitWanted, loopBlocked,
                    endCause, sigWithReq, cut>>
 
 \* Current design: its close handlers go in after raw mode.
@@ -181,7 +183,7 @@ CurrentInstall ==
     /\ closerUp' \in BOOLEAN
     /\ handled' = TRUE
     /\ UNCHANGED <<intDisp, tty, screen, req, rec, closing, closeRuns, closeSig,
-                   stage, exitWanted, loopBlocked, endCause, sigWithReq, cut>>
+                   stage, minimal, exitWanted, loopBlocked, endCause, sigWithReq, cut>>
 
 -----------------------------------------------------------------------------
 (* The event loop: screens and requests.                                   *)
@@ -190,28 +192,28 @@ OpenAlt ==
     /\ phase = "run" /\ screen = "normal" /\ ~closing
     /\ screen' = "alt"
     /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, tty, req, rec,
-                   closing, closeRuns, closeSig, stage, exitWanted,
+                   closing, closeRuns, closeSig, stage, minimal, exitWanted,
                    loopBlocked, endCause, sigWithReq, cut>>
 
 CloseAlt ==
     /\ phase = "run" /\ screen = "alt" /\ ~closing
     /\ screen' = "normal"
     /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, tty, req, rec,
-                   closing, closeRuns, closeSig, stage, exitWanted,
+                   closing, closeRuns, closeSig, stage, minimal, exitWanted,
                    loopBlocked, endCause, sigWithReq, cut>>
 
 StartReq ==
     /\ phase = "run" /\ req = "none" /\ ~closing
     /\ req' = "running"
     /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, tty, screen, rec,
-                   closing, closeRuns, closeSig, stage, exitWanted,
+                   closing, closeRuns, closeSig, stage, minimal, exitWanted,
                    loopBlocked, endCause, sigWithReq, cut>>
 
 FinishReq ==
     /\ phase = "run" /\ req = "running"
     /\ req' = "none" /\ rec' = "none"
     /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, tty, screen,
-                   closing, closeRuns, closeSig, stage, exitWanted,
+                   closing, closeRuns, closeSig, stage, minimal, exitWanted,
                    loopBlocked, endCause, sigWithReq, cut>>
 
 \* The loop stops taking requests for a while (design b's graceful path
@@ -220,14 +222,14 @@ Block ==
     /\ ~Ideal /\ phase = "run" /\ ~loopBlocked
     /\ loopBlocked' = TRUE
     /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, tty, screen, req,
-                   rec, closing, closeRuns, closeSig, stage, exitWanted,
+                   rec, closing, closeRuns, closeSig, stage, minimal, exitWanted,
                    endCause, sigWithReq, cut>>
 
 Unblock ==
     /\ ~Ideal /\ loopBlocked
     /\ loopBlocked' = FALSE
     /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, tty, screen, req,
-                   rec, closing, closeRuns, closeSig, stage, exitWanted,
+                   rec, closing, closeRuns, closeSig, stage, minimal, exitWanted,
                    endCause, sigWithReq, cut>>
 
 -----------------------------------------------------------------------------
@@ -235,7 +237,8 @@ Unblock ==
 (* handler table.                                                          *)
 
 \* No handler: the signal kills fx at once. Nothing is restored, saved, or
-\* ended cleanly. A SIGINT that lands in the shutdown cuts it.
+\* ended cleanly. With minimal_handler (Design B), TERM/HUP restore tty/screen
+\* in the shutdown window without saving an active request.
 SigKill(s) ==
     /\ Alive /\ ~closing
     /\ \/ (s = "INT" /\ IntDo = "default")
@@ -244,8 +247,10 @@ SigKill(s) ==
     /\ endCause' = "signal"
     /\ sigWithReq' = (req = "running")
     /\ cut' = (cut \/ (s = "INT" /\ phase = "shut"))
-    /\ UNCHANGED <<setup, closerUp, handled, intDisp, tty, screen, req, rec,
-                   closing, closeRuns, closeSig, stage, exitWanted, loopBlocked>>
+    /\ tty' = IF s \in {"TERM", "HUP"} /\ minimal THEN "cooked" ELSE tty
+    /\ screen' = IF s \in {"TERM", "HUP"} /\ minimal THEN "normal" ELSE screen
+    /\ UNCHANGED <<setup, closerUp, handled, intDisp, req, rec,
+                   closing, closeRuns, closeSig, stage, minimal, exitWanted, loopBlocked>>
 
 \* The closer as one step: the in-handler fallback, or Ideal.
 CloseNow(s) ==
@@ -262,7 +267,7 @@ CloseNow(s) ==
     /\ closeSig' = s
     /\ cut' = (cut \/ (s = "INT" /\ phase = "shut"))
     /\ UNCHANGED <<setup, closerUp, handled, intDisp, req, closing, stage,
-                   exitWanted, loopBlocked>>
+                   minimal, exitWanted, loopBlocked>>
 
 \* The closer's first step, with the thread running: the main thread may act
 \* until CloseFinish. A second close signal is absorbed while it runs, except
@@ -274,7 +279,7 @@ CloseStart(s) ==
     /\ closeRuns' = closeRuns + 1
     /\ closeSig' = s
     /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, tty, screen, req,
-                   rec, stage, exitWanted, loopBlocked, endCause, sigWithReq,
+                   rec, stage, minimal, exitWanted, loopBlocked, endCause, sigWithReq,
                    cut>>
 
 CloseFinish ==
@@ -288,7 +293,7 @@ CloseFinish ==
     /\ endCause' = "signal"
     /\ cut' = (cut \/ (closeSig = "INT" /\ phase = "shut"))
     /\ UNCHANGED <<setup, closerUp, handled, intDisp, req, closeRuns, closeSig,
-                   stage, exitWanted, loopBlocked>>
+                   stage, minimal, exitWanted, loopBlocked>>
 
 \* Design b: a graceful SIGINT while the loop runs asks it to exit. A second
 \* SIGINT before the loop acts takes the closer route (IntDo).
@@ -296,7 +301,7 @@ GracefulInt ==
     /\ phase = "run" /\ intDisp = "graceful" /\ ~exitWanted /\ ~closing
     /\ exitWanted' = TRUE
     /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, tty, screen, req,
-                   rec, closing, closeRuns, closeSig, stage, loopBlocked,
+                   rec, closing, closeRuns, closeSig, stage, minimal, loopBlocked,
                    endCause, sigWithReq, cut>>
 
 \* The loop reads the request, saves the request in flight clean (except the
@@ -311,57 +316,94 @@ LoopExit ==
     /\ rec' = IF req = "running" /\ Bug # "cancel" THEN "clean" ELSE rec
     /\ req' = "none"
     /\ UNCHANGED <<setup, closerUp, handled, tty, screen, closing, closeRuns,
-                   closeSig, loopBlocked, cut>>
+                   closeSig, minimal, loopBlocked, cut>>
 
 -----------------------------------------------------------------------------
 (* Exits by the program itself.                                            *)
 
-\* The user quits (/exit). Today's Quit cancels the request, so nothing resumes.
+\* The user quits (/exit or double Ctrl-C). A running request stays active
+\* until shutdownForProcessExit finishes persistence (main.zig:1003-1049).
 ExitUser ==
     /\ phase = "run" /\ ~closing /\ ~exitWanted
     /\ phase' = "shut" /\ stage' = "release"
     /\ intDisp' = IF Bug = "no_guard" THEN intDisp ELSE "ign"
     /\ endCause' = "user"
-    /\ req' = "none"
-    /\ UNCHANGED <<setup, closerUp, handled, tty, screen, rec, closing,
-                   closeRuns, closeSig, exitWanted, loopBlocked, sigWithReq,
+    /\ UNCHANGED <<setup, closerUp, handled, tty, screen, req, rec, closing,
+                   closeRuns, closeSig, minimal, exitWanted, loopBlocked, sigWithReq,
                    cut>>
 
-\* The run fails. The shutdown after it has no guard.
+\* The run fails. The shutdown after it has no SIGINT guard.
 RunError ==
     /\ phase = "run" /\ ~closing
     /\ phase' = "errshut" /\ stage' = "release"
     /\ endCause' = "error"
     /\ req' = "none"
     /\ UNCHANGED <<setup, closerUp, handled, intDisp, tty, screen, rec, closing,
-                   closeRuns, closeSig, exitWanted, loopBlocked, sigWithReq,
+                   closeRuns, closeSig, minimal, exitWanted, loopBlocked, sigWithReq,
                    cut>>
 
-\* releaseTerminal: the tty and screen come back; the close handlers come off
-\* (TERM and HUP only; SIGINT's disposition is left as it is, except in the
-\* planted defect int_uninstall).
-Release ==
+\* Step 1 of releaseTerminal (leaveAlternateScreens).
+ReleaseAlt ==
     /\ phase \in {"shut", "errshut"} /\ stage = "release" /\ ~closing
-    /\ tty' = "cooked" /\ screen' = "normal"
-    /\ handled' = FALSE
-    /\ intDisp' = IF Bug = "int_uninstall" /\ Design = "a" THEN "default" ELSE intDisp
-    /\ stage' = "persist"
-    /\ UNCHANGED <<phase, setup, closerUp, req, rec, closing, closeRuns, closeSig,
-                   exitWanted, loopBlocked, endCause, sigWithReq, cut>>
+    /\ screen' = "normal"
+    /\ stage' = "release_modes"
+    /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, tty, req, rec,
+                   closing, closeRuns, closeSig, minimal, exitWanted, loopBlocked,
+                   endCause, sigWithReq, cut>>
 
+\* Current code & planted defects (early_uninstall, minimal_handler) remove the
+\* close handlers BEFORE disableRawMode turns raw mode off.
+UninstallBeforeRaw ==
+    /\ phase \in {"shut", "errshut"} /\ stage = "release_modes" /\ ~closing
+    /\ (Design = "current" \/ Bug \in {"early_uninstall", "minimal_handler"})
+    /\ handled' = FALSE
+    /\ minimal' = (Bug = "minimal_handler")
+    /\ intDisp' = IF Bug = "int_uninstall" /\ Design = "a" THEN "default" ELSE intDisp
+    /\ stage' = "release_tty"
+    /\ UNCHANGED <<phase, setup, closerUp, tty, screen, req, rec, closing,
+                   closeRuns, closeSig, exitWanted, loopBlocked, endCause,
+                   sigWithReq, cut>>
+
+\* normalExitRestoreSequence + disableRawMode: restores cooked tty.
+DisableRaw ==
+    /\ phase \in {"shut", "errshut"} /\ ~closing
+    /\ \/ (stage = "release_tty" /\ (Design = "current" \/ Bug \in {"early_uninstall", "minimal_handler"}))
+       \/ (stage = "release_modes" /\ Design \in {"a", "b"} /\ Bug \notin {"early_uninstall", "minimal_handler"})
+    /\ tty' = "cooked"
+    /\ minimal' = FALSE
+    /\ stage' = "persist"
+    /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, screen, req, rec,
+                   closing, closeRuns, closeSig, exitWanted, loopBlocked,
+                   endCause, sigWithReq, cut>>
+
+\* Persist (shutdownForProcessExit): finishes stopping/settling any active
+\* request; user /exit cancels it once Persist finishes, whereas a TERM/HUP
+\* arriving before Persist saved it via closerMain (CloseSavesRequest).
 Persist ==
     /\ phase \in {"shut", "errshut"} /\ stage = "persist" /\ ~closing
+    /\ req' = "none"
+    /\ stage' = IF Design \in {"a", "b"} /\ Bug \notin {"early_uninstall", "minimal_handler"}
+                THEN "release_uninst" ELSE "done"
+    /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, tty, screen, rec,
+                   closing, closeRuns, closeSig, minimal, exitWanted, loopBlocked,
+                   endCause, sigWithReq, cut>>
+
+\* Design a & b: uninstall close handlers AFTER tty is cooked and persistence finished.
+UninstallAfterPersist ==
+    /\ phase \in {"shut", "errshut"} /\ stage = "release_uninst" /\ ~closing
+    /\ handled' = FALSE
+    /\ intDisp' = IF Bug = "int_uninstall" /\ Design = "a" THEN "default" ELSE intDisp
     /\ stage' = "done"
-    /\ UNCHANGED <<phase, setup, closerUp, handled, intDisp, tty, screen, req,
-                   rec, closing, closeRuns, closeSig, exitWanted, loopBlocked,
+    /\ UNCHANGED <<phase, setup, closerUp, tty, screen, req, rec, closing,
+                   closeRuns, closeSig, minimal, exitWanted, loopBlocked,
                    endCause, sigWithReq, cut>>
 
 Finish ==
     /\ phase \in {"shut", "errshut"} /\ stage = "done" /\ ~closing
     /\ phase' = "ended"
     /\ UNCHANGED <<setup, closerUp, handled, intDisp, tty, screen, req, rec,
-                   closing, closeRuns, closeSig, stage, exitWanted, loopBlocked,
-                   endCause, sigWithReq, cut>>
+                   closing, closeRuns, closeSig, stage, minimal, exitWanted,
+                   loopBlocked, endCause, sigWithReq, cut>>
 
 Done == phase = "ended" /\ UNCHANGED vars
 
@@ -372,7 +414,7 @@ Next ==
     \/ OpenAlt \/ CloseAlt \/ StartReq \/ FinishReq
     \/ Block \/ Unblock
     \/ GracefulInt \/ LoopExit
-    \/ ExitUser \/ RunError \/ Release \/ Persist \/ Finish
+    \/ ExitUser \/ RunError \/ ReleaseAlt \/ UninstallBeforeRaw \/ DisableRaw \/ Persist \/ UninstallAfterPersist \/ Finish
     \/ CloseFinish
     \/ \E s \in Sigs : SigKill(s) \/ CloseNow(s) \/ CloseStart(s)
     \/ Done

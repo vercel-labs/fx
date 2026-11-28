@@ -27,7 +27,6 @@ import {
   TmuxSession,
   tmuxAvailable,
   tokenPassCatalog,
-  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -2609,7 +2608,7 @@ describe("lean auto mode reliability", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Initialize the saved allow session.");
-      await activeSession.waitForPane((pane) => pane.includes("allow session initialized") && turnSettled(pane), TIMEOUT);
+      await activeSession.waitForReplyAndTurnEnd("allow session initialized", TIMEOUT);
       await activeSession.sendText(
         `/permissions remember allow shell ${JSON.stringify({ action: "run", timeout_ms: 600_000, command: allowedCommand })}`,
       );
@@ -2722,7 +2721,7 @@ describe("lean auto mode reliability", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Initialize this saved session.");
-      await activeSession.waitForPane((pane) => pane.includes("session initialized") && turnSettled(pane), TIMEOUT);
+      await activeSession.waitForReplyAndTurnEnd("session initialized", TIMEOUT);
       await activeSession.sendText(
         `/permissions remember deny shell ${JSON.stringify({ action: "run", timeout_ms: 600_000, command: blockedCommand })}`,
       );
@@ -2736,7 +2735,7 @@ describe("lean auto mode reliability", () => {
       const ruleId = idMatch![1];
 
       await activeSession.sendText("Complete the configured action safely.");
-      await activeSession.waitForPane((pane) => pane.includes("saved deny replan complete") && turnSettled(pane), TIMEOUT);
+      await activeSession.waitForReplyAndTurnEnd("saved deny replan complete", TIMEOUT);
       expect(existsSync(blockedMarker)).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(0);
 
@@ -2946,7 +2945,7 @@ describe("lean auto mode reliability", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the marker command.");
-      await activeSession.waitForPane((pane) => pane.includes("retried review traced") && turnSettled(pane), TIMEOUT);
+      await activeSession.waitForReplyAndTurnEnd("retried review traced", TIMEOUT);
       expect(existsSync(marker)).toBe(true);
 
       const report = await runTrace(activeSession, root.root);

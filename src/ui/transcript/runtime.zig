@@ -4851,6 +4851,7 @@ const PendingToolDetailStart = struct {
     /// Set for a provisional start, whose arguments still stream in. Every
     /// other start clears it.
     streaming: bool = false,
+    command_placement: ?types.CommandPlacement = null,
 
     fn deinit(self: *PendingToolDetailStart, alloc: Allocator) void {
         const tool_name = self.tool_name;
@@ -4865,6 +4866,7 @@ const PendingToolDetailStart = struct {
 
 const PendingToolDetailTerminal = struct {
     result: ?[]u8 = null,
+    notice: ?[]u8 = null,
     result_handle: ?[]u8 = null,
     command_artifact_handle: ?[]u8 = null,
     command_output_replay: ?types.CommandOutputReplay = null,
@@ -4872,9 +4874,11 @@ const PendingToolDetailTerminal = struct {
     command_output_entry_id: ?u32 = null,
     command_process_entry: ?PendingCommandProcessEntry = null,
     subagent_started: bool = false,
+    command_placement: ?types.CommandPlacement = null,
 
     fn deinit(self: *PendingToolDetailTerminal, alloc: Allocator) void {
         if (self.result) |value| alloc.free(value);
+        if (self.notice) |value| alloc.free(value);
         if (self.result_handle) |value| alloc.free(value);
         if (self.command_artifact_handle) |value| alloc.free(value);
         if (self.command_output_replay) |replay| {
@@ -5825,6 +5829,7 @@ pub const TranscriptRuntime = struct {
                 started.activity_kind,
                 started.arguments_json,
                 started.place_after_current_transcript,
+                started.command_placement,
             ),
             .progress => |progress| self.applyProgressLifecycle(
                 alloc,
@@ -6354,6 +6359,7 @@ pub const TranscriptRuntime = struct {
         activity_kind: types.ToolActivityKind,
         arguments_json: ?[]const u8,
         place_after_current_transcript: bool,
+        command_placement: ?types.CommandPlacement,
     ) !?types.ToolActivityKind {
         if (!admitLifecycleStart(&self.notebook.lifecycle_state, id)) return null;
 
@@ -6393,6 +6399,7 @@ pub const TranscriptRuntime = struct {
                     arguments_json,
                 );
                 defer detail_start.deinit(alloc);
+                detail_start.command_placement = command_placement;
                 try self.notebook.lifecycle_state.ensureRecordCapacity(alloc);
                 const owned_call_id = try alloc.dupe(u8, id.call_id);
                 errdefer alloc.free(owned_call_id);
@@ -6438,6 +6445,7 @@ pub const TranscriptRuntime = struct {
                 arguments_json,
             );
             defer detail_start.deinit(alloc);
+            detail_start.command_placement = command_placement;
             const owned_tool_name = try alloc.dupe(u8, tool_name);
             errdefer alloc.free(owned_tool_name);
             const line = try lifecycleStartLine(alloc, tool_name);
@@ -6476,6 +6484,7 @@ pub const TranscriptRuntime = struct {
             arguments_json,
         );
         defer detail_start.deinit(alloc);
+        detail_start.command_placement = command_placement;
         const entry_id = try self.createToolActivity(
             alloc,
             id,
@@ -7210,6 +7219,7 @@ pub const TranscriptRuntime = struct {
             pending.tool_name = null;
             if (pending.captured_command) |value| detail.captured_command = value;
             if (pending.activity_kind) |kind| detail.activity_kind = kind;
+            if (pending.command_placement) |placement| detail.command_placement = placement;
             detail.streaming = pending.streaming;
             if (pending.arguments_json) |arguments_json| {
                 if (detail.arguments_json) |old| alloc.free(old);
@@ -7233,6 +7243,7 @@ pub const TranscriptRuntime = struct {
             .arguments_json = pending.arguments_json,
             .lifecycle_id = pending.lifecycle_id,
             .streaming = pending.streaming,
+            .command_placement = pending.command_placement,
         };
         if (search.index == self.notebook.tool_details.items.len) {
             self.notebook.tool_details.appendAssumeCapacity(detail);
@@ -7344,6 +7355,9 @@ pub const TranscriptRuntime = struct {
         var pending: PendingToolDetailTerminal = .{};
         errdefer pending.deinit(alloc);
         if (result) |value| pending.result = try alloc.dupe(u8, value);
+        if (result_memory) |memory| {
+            if (memory.notice) |text| pending.notice = try alloc.dupe(u8, text);
+        }
         const result_handle = if (result_memory) |memory| memory.output_handle else null;
         if (result_handle) |handle| pending.result_handle = try alloc.dupe(u8, handle);
         if (command_artifact_handle) |handle| {
@@ -7359,6 +7373,7 @@ pub const TranscriptRuntime = struct {
         else
             null;
         pending.subagent_started = if (result_memory) |memory| memory.subagent_started else false;
+        pending.command_placement = if (result_memory) |memory| memory.command_placement else null;
         pending.command_output_entry_id = if (activity_kind == .command)
             command_output_entry_id_override orelse
                 self.commandOutputEntryIdForLifecycle(lifecycle_id)
@@ -7398,6 +7413,11 @@ pub const TranscriptRuntime = struct {
             detail.result = owned;
             pending.result = null;
         }
+        if (pending.notice) |owned| {
+            if (detail.notice) |old| alloc.free(old);
+            detail.notice = owned;
+            pending.notice = null;
+        }
         if (pending.result_handle) |owned| {
             if (detail.result_handle) |old| alloc.free(old);
             detail.result_handle = owned;
@@ -7417,6 +7437,7 @@ pub const TranscriptRuntime = struct {
         }
         detail.command_process_presentation = pending.command_process_presentation;
         detail.subagent_started = pending.subagent_started;
+        if (pending.command_placement) |placement| detail.command_placement = placement;
         if (activity_kind == .command) {
             detail.command_output_entry_id = pending.command_output_entry_id;
         }
@@ -9701,7 +9722,14 @@ pub const TranscriptRuntime = struct {
             target_total_visual_rows > anchor.total_visual_rows;
         const width_stable = self.committed_frame_layout.terminal_cols == 0 or
             self.committed_frame_layout.terminal_cols == self.layout.cols;
-        const geometry_rebase = footer_reservation_changed and
+        // A pending resume can change the transcript area without changing the
+        // footer, so its own area change also rebases the geometry.
+        const pending_resume_geometry_rebase = self.notebook.pending_resume_source != null and
+            !std.meta.eql(
+                self.committed_frame_layout.transcript_area,
+                prepared.projectionArea(),
+            );
+        const geometry_rebase = (footer_reservation_changed or pending_resume_geometry_rebase) and
             width_stable and
             self.resize_history_row_delta == null;
         const displaced_history_replay = if (geometry_rebase and
@@ -15427,6 +15455,116 @@ test "a line fx wrote marks the text entry that shows it, and nothing else" {
     var copy = try transcript_store.cloneEntryForSnapshot(alloc, runtime.notebook.entries.items[1]);
     defer copy.deinit(alloc);
     try std.testing.expect(copy.assistant_turn.operational);
+}
+
+test "pending resume publication rebases when the candidate gains one transcript row" {
+    const alloc = std.testing.allocator;
+    const layout: Layout = .{
+        .rows = 73,
+        .cols = 80,
+        .content_bottom = 69,
+        .divider_top_row = 70,
+        .input_row = 71,
+        .divider_bottom_row = 72,
+        .hint_row = 73,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .has_painted_transcript = true,
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 73 },
+            .body_area = .{ .top = 1, .bottom = 68 },
+            .transcript_area = .{ .top = 1, .bottom = 68 },
+            .footer_area = .{ .top = 69, .bottom = 73 },
+            .solved_frame_height = 73,
+            .terminal_rows = 73,
+            .terminal_cols = 80,
+        },
+    };
+    defer runtime.deinit(alloc);
+
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+    for (0..980) |_| try flow.appendSlice(alloc, "row\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try flow.toOwnedSlice(alloc),
+    );
+    const source = &runtime.notebook.pending_resume_source.?;
+
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        source,
+        .{ .top = 1, .bottom = 69 },
+    );
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 980), prepared.sourceTotalVisualRows());
+    try std.testing.expectEqual(@as(u32, 911), prepared.sourceVisualOffset());
+
+    runtime.transcript_commit_state = .{ .stable = .{
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 68,
+            .start_line = 912,
+            .partial_skip_rows = 0,
+            .line_count = 980,
+            .last_visible_row = 68,
+        },
+        .visual_offset = 912,
+        .history_visual_offset = 0,
+        .total_visual_rows = 980,
+        .flow = try alloc.dupe(u8, source.bytes),
+        .cursor_row = 68,
+        .cursor_col = 1,
+        .occupied_last_row = 68,
+        .occupied_last_row_blank = false,
+        .layout_id = 17,
+    } };
+
+    const facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        source,
+        &prepared,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(@as(u32, 911), facts.target_visual_offset);
+
+    const target_layout: render_engine.frame_layout.CommittedLayoutSnapshot = .{
+        .layout_id = 18,
+        .owned_top = 1,
+        .owned_band = .{ .top = 1, .bottom = 73 },
+        .body_area = .{ .top = 1, .bottom = 69 },
+        .transcript_area = .{ .top = 1, .bottom = 69 },
+        .footer_area = .{ .top = 70, .bottom = 73 },
+        .solved_frame_height = 73,
+        .terminal_rows = 73,
+        .terminal_cols = 80,
+    };
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    _ = try runtime.resolveTranscriptTransitionTargetForFrame(
+        alloc,
+        source,
+        &prepared,
+        target_layout,
+        scroll_plan,
+        facts,
+        false,
+        false,
+    );
+    try std.testing.expect(facts.geometry_rebase);
 }
 
 test "pending resume publication yields after a bounded row batch" {

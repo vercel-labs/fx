@@ -1,8 +1,13 @@
 const std = @import("std");
 
+/// When a process started, as a macOS token records it.
+pub const MacOSStart = struct { seconds: u64, microseconds: u64 };
+
 pub const ProcessInstanceToken = struct {
     bytes: [128]u8 = undefined,
     len: u8 = 0,
+    /// Set for a macOS token and null for any other.
+    macos_start: ?MacOSStart = null,
 
     pub fn parse(text: []const u8) !ProcessInstanceToken {
         if (text.len == 0 or text.len > 128) {
@@ -16,6 +21,7 @@ pub const ProcessInstanceToken = struct {
                 return error.InvalidProcessInstanceToken;
             }
         }
+        var macos_start: ?MacOSStart = null;
         var parts = std.mem.splitScalar(u8, text, ':');
         const platform = parts.next() orelse
             return error.InvalidProcessInstanceToken;
@@ -43,10 +49,14 @@ pub const ProcessInstanceToken = struct {
             {
                 return error.InvalidProcessInstanceToken;
             }
+            macos_start = .{
+                .seconds = try std.fmt.parseInt(u64, start_sec, 10),
+                .microseconds = try std.fmt.parseInt(u64, start_usec, 10),
+            };
         } else {
             return error.InvalidProcessInstanceToken;
         }
-        var token = ProcessInstanceToken{};
+        var token = ProcessInstanceToken{ .macos_start = macos_start };
         @memcpy(token.bytes[0..text.len], text);
         token.len = @intCast(text.len);
         return token;
@@ -138,4 +148,18 @@ test "process instance tokens are canonical and require exact match" {
             "linux:00112233445566778899AABBCCDDEEFF:12345",
         ),
     );
+}
+
+test "a macOS token carries its start time and a Linux token carries none" {
+    const mac = try ProcessInstanceToken.parse(
+        "macos:00112233445566778899aabbccddeeff:1795769402:695677",
+    );
+    try std.testing.expectEqual(
+        @as(?MacOSStart, .{ .seconds = 1795769402, .microseconds = 695677 }),
+        mac.macos_start,
+    );
+    const linux = try ProcessInstanceToken.parse(
+        "linux:00112233445566778899aabbccddeeff:12345",
+    );
+    try std.testing.expectEqual(@as(?MacOSStart, null), linux.macos_start);
 }
