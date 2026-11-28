@@ -1257,6 +1257,8 @@ test "a configure and a snapshot share the runtime's own copy" {
     var intact = std.atomic.Value(usize).init(0);
     var failures = std.atomic.Value(usize).init(0);
     const configurer = try std.Thread.spawn(.{}, Threads.configure, .{ &runtime, alloc, &configures });
+    // A failed second spawn must not free the runtime the configurer writes.
+    errdefer configurer.join();
     const snapshotter = try std.Thread.spawn(.{}, Threads.snapshot, .{ &runtime, alloc, &intact, &failures });
     configurer.join();
     snapshotter.join();
