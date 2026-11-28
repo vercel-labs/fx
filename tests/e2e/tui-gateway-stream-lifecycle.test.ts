@@ -10496,3 +10496,152 @@ test.skipIf(!tmuxAvailable())("cache_warming: false sends no pings", async () =>
   expect(requests().filter(isPing)).toHaveLength(0);
   expect(readFileSync(trace, "utf8")).not.toContain("event=armed");
 }, 60_000);
+
+test.skipIf(!tmuxAvailable())("a message submitted while a turn runs stays visible on every frame across tool boundary, skill handoff, and queued order", async () => {
+  root = realpathSync(mkdtempSync(join(tmpdir(), "fx-steer-visible-")));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const skillDir = join(home, ".fx", "skills", "my-skill");
+  const trace = join(root, "trace.log");
+  const tape = join(root, "tape.fxtp");
+  const stderr = join(root, "stderr.log");
+  const started1 = join(workspace, "started1");
+  const gate1 = join(workspace, "gate1");
+  const started2 = join(workspace, "started2");
+  const gate2 = join(workspace, "gate2");
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ model: MODEL }));
+  writeFileSync(
+    join(skillDir, "SKILL.md"),
+    "---\nname: my-skill\ndescription: Skill fixture for visibility test.\n---\nSkill body.\n",
+  );
+
+  let reqCount = 0;
+  const host = startDynamicFakeGateway(async (raw) => {
+    if (raw.includes("Generate a short title")) return fakeGatewayFinalText("title");
+    reqCount += 1;
+    if (reqCount === 1) {
+      const cmd = `touch ${started1}; i=0; while [ ! -f ${gate1} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; echo SHELL_1_DONE`;
+      return fakeGatewayToolCall("shell_1", "shell", { action: "run", command: cmd });
+    }
+    if (reqCount === 2) {
+      expect(raw).toContain("SKILL_2");
+      const cmd2 = `touch ${started2}; i=0; while [ ! -f ${gate2} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; echo SHELL_2_DONE`;
+      return fakeGatewayToolCall("shell_2", "shell", { action: "run", command: cmd2 });
+    }
+    if (reqCount === 3) {
+      return fakeGatewayFinalText("TURN_2_SKILL_DONE");
+    }
+    if (reqCount === 4) {
+      expect(raw).toContain("SKILL_3");
+      return fakeGatewayFinalText("TURN_3_SKILL_DONE");
+    }
+    expect(raw).toContain("FOURTH_ORDINARY");
+    return fakeGatewayFinalText("TURN_4_VISIBLE_DONE");
+  });
+  gateway = host;
+  session = await TmuxSession.create({
+    cwd: workspace,
+    stderrPath: stderr,
+    width: 120,
+    height: 60,
+    env: {
+      HOME: home,
+      AI_GATEWAY_API_KEY: "fake-steer-visible",
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_SOUND: "0",
+      FX_MODEL: MODEL,
+      FX_PERMISSION_MODE: "full-access",
+      FX_GATEWAY_BASE_URL: host.baseUrl,
+      FX_GATEWAY_CHAT_URL: host.chatUrl,
+      FX_TEST_GATEWAY_CHAT_URL: host.chatUrl,
+      FX_RECORD: tape,
+      FX_TRACE_LOG: trace,
+      FX_TRACE_SCOPES: "worker,frame_schedule,input",
+    },
+  });
+
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("TURN_1_START");
+  await waitForCondition(() => existsSync(started1), "shell_1 started");
+
+  const sendSkillPrompt = async (label: string) => {
+    await session!.sendLiteralText("$my-skill");
+    await session!.waitForPane((pane) => pane.includes("my-skill"), 5_000);
+    await session!.sendKeys("Enter");
+    await session!.sendLiteralText(` ${label}`);
+    await session!.sendKeys("Enter");
+  };
+
+  // Queue two $my-skill prompts while shell_1 is running; once gate1 releases,
+  // Turn 1 hands off to SKILL_2 while SKILL_3 remains .continuation behind it.
+  await sendSkillPrompt("SKILL_2");
+  await session.waitForPane((pane) => pane.includes("SKILL_2") && hasEmptyComposer(pane), 10_000);
+  await sendSkillPrompt("SKILL_3");
+  await session.waitForPane((pane) => pane.includes("SKILL_3") && hasEmptyComposer(pane), 10_000);
+  writeFileSync(gate1, "");
+
+  await waitForCondition(() => existsSync(started2), "shell_2 started");
+
+  // While shell_2 runs with SKILL_3 still waiting (.continuation -> older_waits),
+  // submit another $my-skill prompt (admitted as .ordinary). It must be visible
+  // immediately while shell_2 is still blocked on gate2, and stay visible on
+  // every capture and every frame through TURN_4_VISIBLE_DONE.
+  await sendSkillPrompt("FOURTH_ORDINARY");
+  await session.waitForPane((pane) => hasEmptyComposer(pane), 5_000);
+
+  const visibleWhileBlocked = await session.capturePane();
+  const seenBeforeGate2 = visibleWhileBlocked.includes("FOURTH_ORDINARY");
+  writeFileSync(gate2, "");
+
+  await session.waitForPane(
+    (pane) => pane.includes("TURN_4_VISIBLE_DONE") && hasEmptyComposer(pane) && !pane.includes("Thinking (") && !pane.includes("Generating ("),
+    TIMEOUT,
+  );
+  expect(seenBeforeGate2).toBe(true);
+
+  const fullScrollback = await session.captureFullScrollback();
+  const pos2 = fullScrollback.indexOf("SKILL_2");
+  const pos3 = fullScrollback.indexOf("SKILL_3");
+  const pos4 = fullScrollback.indexOf("FOURTH_ORDINARY");
+  expect(pos2).toBeGreaterThanOrEqual(0);
+  expect(pos3).toBeGreaterThan(pos2);
+  expect(pos4).toBeGreaterThan(pos3);
+
+  await session.sendText("/quit");
+  expect(await session.waitForSessionEnd(10_000)).toBe(true);
+  session = null;
+
+  const framesText = new TextDecoder().decode(
+    Bun.spawnSync([FX_BIN, "replay", tape, "--frames"], { stdout: "pipe", stderr: "pipe" }).stdout,
+  );
+  const frames = framesText.split(/^--- frame \d+ .*$/m).filter((chunk) => chunk.trim().length > 0);
+  expect(frames.length).toBeGreaterThan(5);
+  const windows = [
+    { label: "SKILL_2", until: "TURN_2_SKILL_DONE" },
+    { label: "SKILL_3", until: "TURN_3_SKILL_DONE" },
+    { label: "FOURTH_ORDINARY", until: "TURN_4_VISIBLE_DONE" },
+  ];
+  for (const { label, until } of windows) {
+    const firstSeen = frames.findIndex((f) => f.includes(label));
+    const settledAt = frames.findIndex((f, idx) => idx >= firstSeen && f.includes(until));
+    expect(firstSeen).toBeGreaterThanOrEqual(0);
+    expect(settledAt).toBeGreaterThanOrEqual(firstSeen);
+    const windowFrames = frames.slice(firstSeen, settledAt + 1);
+    const missing = windowFrames.filter((f) => !f.includes(label));
+    const doubled = windowFrames.filter((f) => (f.match(new RegExp(label, "g")) ?? []).length !== 1);
+    expect({
+      label,
+      missingCount: missing.length,
+      doubledCount: doubled.length,
+      sample: missing[0] ?? doubled[0] ?? "",
+    }).toEqual({
+      label,
+      missingCount: 0,
+      doubledCount: 0,
+      sample: "",
+    });
+  }
+}, 60_000);

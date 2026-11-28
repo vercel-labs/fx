@@ -376,14 +376,29 @@ fn pendingCardTerminalWireBytes(
     return wire;
 }
 
+fn pendingTailReservedRows(
+    preview: render_engine.frame_layout.TranscriptFlowPreview,
+    card: PendingCardProjection,
+    pending_submission_card: bool,
+    activity_visible: bool,
+) u16 {
+    const trailing_gap: u16 = if (!pending_submission_card and card.leading_advance_rows == 0)
+        @max(preview.trailing_boundary_blank_rows, preview.footer_boundary_gap_rows)
+    else
+        0;
+    const activity_gap: u16 = @intFromBool(activity_visible and card.paint_row_count > 1);
+    return card.row_count +| trailing_gap +| activity_gap;
+}
+
 fn previewWithPendingCard(
     preview: render_engine.frame_layout.TranscriptFlowPreview,
     pending: ?PendingCardProjection,
+    reserved_rows: u16,
 ) render_engine.frame_layout.TranscriptFlowPreview {
-    const card = pending orelse return preview;
+    if (pending == null) return preview;
     var next = preview;
-    next.natural_visual_rows +|= card.row_count;
-    next.cursor_row +|= card.row_count;
+    next.natural_visual_rows +|= reserved_rows;
+    next.cursor_row +|= reserved_rows;
     next.cursor_col = 1;
     next.replaceable_row = next.cursor_row;
     next.tail_kind = .user_turn;
@@ -1463,10 +1478,6 @@ pub fn Runtime(comptime App: type) type {
                         .cursor_col = presentation_shell.cursor_col,
                         .replaceable_row = presentation_shell.replaceable_row,
                     };
-                const transcript_preview = previewWithPendingCard(
-                    canonical_transcript_preview,
-                    pending_card,
-                );
                 const neutral_footer = if (footer_measurement) |*measurement|
                     measurement.frameLayoutMeasurement()
                 else
@@ -1482,6 +1493,20 @@ pub fn Runtime(comptime App: type) type {
                         .assistant_turn,
                     ) -| 1;
                 }
+                const pending_tail_reserved_rows: u16 = if (pending_card) |card|
+                    pendingTailReservedRows(
+                        canonical_transcript_preview,
+                        card,
+                        pending_submission_card,
+                        frame_activity != .none,
+                    )
+                else
+                    0;
+                const transcript_preview = previewWithPendingCard(
+                    canonical_transcript_preview,
+                    pending_card,
+                    pending_tail_reserved_rows,
+                );
                 const target_activity_projection: activity_runtime.ActivityProjection = if (footer_measurement) |*measurement|
                     measurement.activity_projection
                 else
@@ -1515,7 +1540,10 @@ pub fn Runtime(comptime App: type) type {
                     else
                         footer_frame.paint.invalidation,
                     .attempt_invalidations = attempt_invalidations,
-                    .pending_tail_rows = if (pending_card) |card| card.row_count else 0,
+                    .pending_tail_rows = pending_tail_reserved_rows,
+                    .pending_tail_paint_rows = if (pending_card) |card| card.paint_row_count else 0,
+                    .pending_submission_card = pending_submission_card,
+                    .pending_submission_leading_rows = if (pending_card) |card| card.leading_advance_rows else 0,
                 };
                 const fixed_point = try presentation_shell.solveFrameWithFooterCloseReset(
                     &app.metrics,
@@ -2293,6 +2321,9 @@ fn FixedPointTranscriptContext(comptime App: type) type {
         base_invalidation: render_engine.paint_plan.FrameInvalidationSet,
         attempt_invalidations: render_engine.paint_plan.FrameInvalidationSet,
         pending_tail_rows: u16 = 0,
+        pending_tail_paint_rows: u16 = 0,
+        pending_submission_card: bool = false,
+        pending_submission_leading_rows: u16 = 0,
         scroll_facts: ?transcript_runtime.TranscriptScrollFacts = null,
 
         fn prepareCandidate(
@@ -2331,14 +2362,21 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 self.replay_displaced_footer_history,
             );
             self.scroll_facts = scroll_facts;
-            const canonical_occupied_rows = if (prepared.selection.last_visible_row >= canonical_area.top)
-                prepared.selection.last_visible_row - canonical_area.top + 1
-            else
-                0;
+            const occupied_rows = occupiedTranscriptRowsWithPendingTail(
+                canonical_area.top,
+                prepared.selection.last_visible_row,
+                prepared.cursor.cursor_row,
+                prepared.cursor.cursor_col,
+                self.pending_tail_rows,
+                self.pending_tail_paint_rows,
+                self.pending_submission_card,
+                self.pending_submission_leading_rows,
+                self.frame_activity != .none,
+            );
             return .{
                 .inline_advance_rows = scroll_facts.planned_rows,
                 .occupied_transcript_rows = @min(
-                    canonical_occupied_rows +| self.pending_tail_rows,
+                    occupied_rows,
                     candidate.transcript_area.height(),
                 ),
             };
@@ -2407,12 +2445,50 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 activity == .overlay_entry,
             );
             self.resolved_target.* = target;
+            const occupied_rows = occupiedTranscriptRowsWithPendingTail(
+                target.target_layout.transcript_area.top,
+                target.target.selection.last_visible_row,
+                target.target.cursor_row,
+                target.target.cursor_col,
+                self.pending_tail_rows,
+                self.pending_tail_paint_rows,
+                self.pending_submission_card,
+                self.pending_submission_leading_rows,
+                activity != .none,
+            );
             return .{ .occupied_transcript_rows = @min(
-                target.occupiedTranscriptRows() +| self.pending_tail_rows,
+                occupied_rows,
                 candidate.transcript_area.height(),
             ) };
         }
     };
+}
+
+fn occupiedTranscriptRowsWithPendingTail(
+    area_top: u16,
+    last_visible_row: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+    pending_tail_rows: u16,
+    pending_tail_paint_rows: u16,
+    pending_submission_card: bool,
+    pending_submission_leading_rows: u16,
+    activity_visible: bool,
+) u16 {
+    const canonical_occupied_rows = if (last_visible_row >= area_top)
+        last_visible_row - area_top + 1
+    else
+        0;
+    if (pending_tail_paint_rows == 0) return canonical_occupied_rows;
+    const leading = if (pending_submission_card)
+        pending_submission_leading_rows
+    else
+        pendingCardLeadingAdvanceRows(cursor_col);
+    const start_row = @max(cursor_row +| leading, area_top);
+    const tail_end_row = start_row +| pending_tail_paint_rows -| 1 +| @intFromBool(activity_visible and pending_tail_paint_rows > 1);
+    const total_end_row = @max(last_visible_row, tail_end_row);
+    const tail_occupied_rows = if (total_end_row >= area_top) total_end_row - area_top + 1 else 0;
+    return @max(canonical_occupied_rows +| pending_tail_rows, tail_occupied_rows);
 }
 
 fn transcriptAreaBeforePendingTail(
@@ -2808,6 +2884,44 @@ test "pending steering cards preserve feedback order and tool waiting placement"
         shell.layout.cols = cols;
         try std.testing.expect((try buildPendingSteeringCardProjection(alloc, &shell, steering, null)) == null);
     }
+}
+
+test "occupiedTranscriptRowsWithPendingTail preserves pending card rows past trailing separator" {
+    const single_rows = occupiedTranscriptRowsWithPendingTail(1, 8, 10, 1, 1, 1, false, 0, false);
+    try std.testing.expectEqual(@as(u16, 10), single_rows);
+    const stacked_rows = occupiedTranscriptRowsWithPendingTail(1, 19, 21, 1, 4, 3, false, 0, false);
+    try std.testing.expectEqual(@as(u16, 23), stacked_rows);
+    const active_rows = occupiedTranscriptRowsWithPendingTail(1, 19, 21, 1, 5, 3, false, 0, true);
+    try std.testing.expectEqual(@as(u16, 24), active_rows);
+    // Mid-line full-screen endpoint keeps canonical + reserved height (`17 + 3 = 20`).
+    const full_rows = occupiedTranscriptRowsWithPendingTail(1, 17, 17, 20, 3, 1, true, 2, false);
+    try std.testing.expectEqual(@as(u16, 20), full_rows);
+
+    const paint = PendingCardPaintContext.init(
+        .{ .bytes = @constCast("a\nb\nc"), .row_count = 3, .paint_row_count = 3, .leading_advance_rows = 0 },
+        .{ .top = 1, .bottom = stacked_rows, .owner = .transcript },
+        21,
+        false,
+    ).?;
+    try std.testing.expectEqual(@as(u16, 21), paint.row);
+    try std.testing.expectEqual(@as(u16, 3), paint.max_rows);
+
+    const base_preview: render_engine.frame_layout.TranscriptFlowPreview = .{
+        .natural_visual_rows = 19,
+        .trailing_boundary_blank_rows = 1,
+        .cursor_row = 21,
+        .cursor_col = 1,
+    };
+    const stacked_card: PendingCardProjection = .{
+        .bytes = @constCast("a\nb\nc"),
+        .row_count = 3,
+        .paint_row_count = 3,
+        .leading_advance_rows = 0,
+    };
+    const reserved = pendingTailReservedRows(base_preview, stacked_card, false, true);
+    try std.testing.expectEqual(@as(u16, 5), reserved);
+    const preview = previewWithPendingCard(base_preview, stacked_card, reserved);
+    try std.testing.expectEqual(@as(u16, 24), preview.natural_visual_rows);
 }
 
 test "pending prompt at an occupied band bottom preserves the summary through adoption" {
