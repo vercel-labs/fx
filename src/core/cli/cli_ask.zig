@@ -1261,6 +1261,101 @@ fn traceDroppedStreamResult(stream_events: bool, err: anyerror) void {
     }
 }
 
+fn writeAskPlainErrorMessage(alloc: Allocator, deps: RunDeps, err: anyerror) !void {
+    debug_trace.logf("cli_ask", "ask error err={s}", .{@errorName(err)});
+    if (config_runtime.configuredProviderMessage(alloc, err) catch null) |message| {
+        defer alloc.free(message);
+        try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
+        try deps.write_stderr(deps.stderr_ctx, message);
+        try deps.write_stderr(deps.stderr_ctx, "\n");
+        return;
+    }
+    var words: [128]u8 = undefined;
+    try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
+    try deps.write_stderr(
+        deps.stderr_ctx,
+        config_runtime.modelNotSelectedMessage(err) orelse types.plainErrorText(@errorName(err), &words),
+    );
+    try deps.write_stderr(deps.stderr_ctx, "\n");
+}
+
+fn handleParseAskError(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+    cfg: Config,
+    deps: RunDeps,
+    problem: AskUsageProblem,
+    err: anyerror,
+) !u8 {
+    const mode = parseErrorModeFromArgs(args);
+    return writeParseAskErrorResponse(alloc, cfg, deps, problem, mode, err) catch |write_err| {
+        traceDroppedStreamResult(mode == .stream_events, write_err);
+        return write_err;
+    };
+}
+
+fn writeParseAskErrorResponse(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+    problem: AskUsageProblem,
+    mode: ParseErrorMode,
+    err: anyerror,
+) !u8 {
+    const spec: struct {
+        code: u8,
+        err_name: []const u8,
+        stderr_msg: ?[]const u8 = null,
+        write_usage: bool = false,
+        use_problem: bool = false,
+    } = switch (err) {
+        error.MissingPrompt => .{
+            .code = output_contracts.usage_exit_code,
+            .err_name = @errorName(err),
+            .stderr_msg = "fx ask: missing prompt\n",
+            .write_usage = true,
+        },
+        error.NoSaveResumeConflict => .{
+            .code = output_contracts.usage_exit_code,
+            .err_name = "InvalidAskArgs",
+            .stderr_msg = "fx ask: --no-save cannot be used with --resume\n",
+            .write_usage = true,
+        },
+        error.PromptResourceLimitExceeded => .{
+            .code = 1,
+            .err_name = @errorName(err),
+            .stderr_msg = "fx ask: prompt exceeds the local input safety limit\n",
+        },
+        error.PromptInputReadFailed => .{
+            .code = 1,
+            .err_name = @errorName(err),
+            .stderr_msg = "fx ask: failed to read prompt from stdin\n",
+        },
+        error.InvalidAskArgs => .{
+            .code = output_contracts.usage_exit_code,
+            .err_name = @errorName(err),
+            .use_problem = true,
+            .write_usage = true,
+        },
+        error.InvalidPromptText => .{
+            .code = 1,
+            .err_name = @errorName(err),
+            .stderr_msg = "fx ask: prompt must be valid UTF-8 and contain no NUL bytes\n",
+        },
+        else => return err,
+    };
+
+    if (mode != .json) {
+        if (spec.use_problem) try writeAskUsageProblem(alloc, deps, problem);
+        if (spec.stderr_msg) |msg| try deps.write_stderr(deps.stderr_ctx, msg);
+        if (spec.write_usage) try writeAskUsage(deps, cfg.command_usage);
+    }
+    if (mode != .text) {
+        try writeErrorResultOutput(alloc, deps, mode == .stream_events, spec.err_name, spec.code);
+    }
+    return spec.code;
+}
+
 fn writeErrorResultOutput(
     alloc: Allocator,
     deps: RunDeps,
@@ -1321,91 +1416,28 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
 
     var problem: AskUsageProblem = .none;
     var options = parseAskOptions(alloc, args, deps.stdin_source, &problem) catch |err| {
-        const emit_json = hasJsonFlag(args);
-        const emit_stream = hasStandaloneStreamEventsFlag(args);
-        switch (err) {
-            error.MissingPrompt => {
-                if (!emit_json) {
-                    try deps.write_stderr(deps.stderr_ctx, "fx ask: missing prompt\n");
-                    try writeAskUsage(deps, cfg.command_usage);
-                }
-                if (emit_json or emit_stream) {
-                    try writeErrorResultOutput(alloc, deps, emit_stream, @errorName(err), output_contracts.usage_exit_code);
-                }
-                return output_contracts.usage_exit_code;
-            },
-            error.NoSaveResumeConflict => {
-                if (!emit_json) {
-                    try deps.write_stderr(deps.stderr_ctx, "fx ask: --no-save cannot be used with --resume\n");
-                    try writeAskUsage(deps, cfg.command_usage);
-                }
-                if (emit_json or emit_stream) {
-                    try writeErrorResultOutput(alloc, deps, emit_stream, "InvalidAskArgs", output_contracts.usage_exit_code);
-                }
-                return output_contracts.usage_exit_code;
-            },
-            error.OutputModeConflict => {
-                if (emit_json) {
-                    try writeErrorResultOutput(alloc, deps, false, "InvalidAskArgs", output_contracts.usage_exit_code);
-                    return output_contracts.usage_exit_code;
-                }
-                try deps.write_stderr(deps.stderr_ctx, "fx ask: --stream-events cannot be used with --json or --quiet\n");
-                try writeAskUsage(deps, cfg.command_usage);
-                if (hasFlagBeforeSeparator(args, "--stream-events")) {
-                    try writeErrorResultOutput(alloc, deps, true, "InvalidAskArgs", output_contracts.usage_exit_code);
-                }
-                return output_contracts.usage_exit_code;
-            },
-            error.PromptResourceLimitExceeded => {
-                if (!emit_json) {
-                    try deps.write_stderr(deps.stderr_ctx, "fx ask: prompt exceeds the local input safety limit\n");
-                }
-                if (emit_json or emit_stream) {
-                    try writeErrorResultOutput(alloc, deps, emit_stream, @errorName(err), 1);
-                }
-                return 1;
-            },
-            error.PromptInputReadFailed => {
-                if (!emit_json) {
-                    try deps.write_stderr(deps.stderr_ctx, "fx ask: failed to read prompt from stdin\n");
-                }
-                if (emit_json or emit_stream) {
-                    try writeErrorResultOutput(alloc, deps, emit_stream, @errorName(err), 1);
-                }
-                return 1;
-            },
-            error.InvalidAskArgs => {
-                if (!emit_json) {
-                    try writeAskUsageProblem(alloc, deps, problem);
-                    try writeAskUsage(deps, cfg.command_usage);
-                }
-                if (emit_json or emit_stream) {
-                    try writeErrorResultOutput(alloc, deps, emit_stream, @errorName(err), output_contracts.usage_exit_code);
-                }
-                return output_contracts.usage_exit_code;
-            },
-            error.InvalidPromptText => {
-                if (!emit_json) {
-                    try deps.write_stderr(deps.stderr_ctx, "fx ask: prompt must be valid UTF-8 and contain no NUL bytes\n");
-                }
-                if (emit_json or emit_stream) {
-                    try writeErrorResultOutput(alloc, deps, emit_stream, @errorName(err), 1);
-                }
-                return 1;
-            },
-            else => {
-                traceDroppedStreamResult(hasFlagBeforeSeparator(args, "--stream-events") and !emit_json, err);
-                return err;
-            },
-        }
+        return handleParseAskError(alloc, args, cfg, deps, problem, err);
     };
     defer options.deinit(alloc);
 
+    return runWithParsedOptions(alloc, &options, cfg, deps, &interrupt_scope) catch |err| {
+        traceDroppedStreamResult(options.stream_events, err);
+        return err;
+    };
+}
+
+fn runWithParsedOptions(
+    alloc: Allocator,
+    options: *AskOptions,
+    cfg: Config,
+    deps: RunDeps,
+    interrupt_scope: anytype,
+) !u8 {
     if (interrupt_scope.requested()) return interruptStreamResultExitCode(options.stream_events);
     if (options.image_paths.items.len > 0) {
         const workspace_root = try io_mod.realpathAlloc(alloc, ".");
         defer alloc.free(workspace_root);
-        if (!try preflightAskImages(alloc, workspace_root, &options, deps)) return 1;
+        if (!try preflightAskImages(alloc, workspace_root, options, deps)) return 1;
     }
     if (interrupt_scope.requested()) return interruptStreamResultExitCode(options.stream_events);
 
@@ -1445,9 +1477,9 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         if (err == error.OutOfMemory or
             err == error.TerminalHungUp or
             err == error.TerminalInputClosed or
-            err == error.OutputReaderGone)
+            err == error.OutputReaderGone or
+            err == error.OutputWriteFailed)
         {
-            traceDroppedStreamResult(options.stream_events, err);
             return err;
         }
         // The reason is on stderr already; JSON keeps the code it always had.
@@ -1491,9 +1523,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
                 try deps.write_stderr(deps.stderr_ctx, notice);
                 try deps.write_stderr(deps.stderr_ctx, "\n");
             } else if (options.stream_events) {
-                try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
-                try deps.write_stderr(deps.stderr_ctx, @errorName(err));
-                try deps.write_stderr(deps.stderr_ctx, "\n");
+                try writeAskPlainErrorMessage(alloc, deps, err);
             } else {
                 return err;
             }
@@ -1509,14 +1539,8 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         return interruptStreamResultExitCode(options.stream_events);
     }
     // The answer is in the saved session, but the reader never got it.
-    if (result.output_reader_gone) {
-        traceDroppedStreamResult(options.stream_events, error.OutputReaderGone);
-        return error.OutputReaderGone;
-    }
-    if (result.output_write_failed) {
-        traceDroppedStreamResult(options.stream_events, error.OutputWriteFailed);
-        return error.OutputWriteFailed;
-    }
+    if (result.output_reader_gone) return error.OutputReaderGone;
+    if (result.output_write_failed) return error.OutputWriteFailed;
 
     if (options.json_output or options.stream_events) {
         const encoded = try renderResultObject(alloc, result, options.stream_events);
@@ -4196,8 +4220,14 @@ fn parseAskOptions(alloc: Allocator, args: []const [:0]const u8, stdin: StdinSou
                 if (opts.system_prompt_override) |old| alloc.free(old);
                 opts.system_prompt_override = owned_prompt;
             },
-            .json => opts.json_output = true,
-            .stream_events => opts.stream_events = true,
+            .json => {
+                opts.json_output = true;
+                opts.stream_events = false;
+            },
+            .stream_events => {
+                opts.stream_events = true;
+                opts.json_output = false;
+            },
             .quiet => opts.quiet = true,
             .prompt_permissions => opts.prompt_permissions = true,
             .timeout => opts.timeout_ms = parseTimeoutMs(value) orelse
@@ -4229,7 +4259,6 @@ fn parseAskOptions(alloc: Allocator, args: []const [:0]const u8, stdin: StdinSou
     }
     if (!text_utils.isModelSafeText(opts.prompt)) return error.InvalidPromptText;
     if (opts.no_save and opts.resume_target != null) return error.NoSaveResumeConflict;
-    if (opts.stream_events and (opts.json_output or opts.quiet)) return error.OutputModeConflict;
 
     return opts;
 }
@@ -4296,22 +4325,19 @@ fn persistYoloAcknowledgmentDefault(alloc: Allocator) config_runtime.CommitAttem
     );
 }
 
-fn hasFlagBeforeSeparator(args: []const [:0]const u8, flag: []const u8) bool {
+const ParseErrorMode = enum { text, json, stream_events };
+
+fn parseErrorModeFromArgs(args: []const [:0]const u8) ParseErrorMode {
+    var mode: ParseErrorMode = .text;
     for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--")) return false;
-        if (std.mem.eql(u8, arg, flag)) return true;
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--json")) {
+            mode = .json;
+        } else if (std.mem.eql(u8, arg, "--stream-events")) {
+            mode = .stream_events;
+        }
     }
-    return false;
-}
-
-fn hasJsonFlag(args: []const [:0]const u8) bool {
-    return hasFlagBeforeSeparator(args, "--json");
-}
-
-fn hasStandaloneStreamEventsFlag(args: []const [:0]const u8) bool {
-    return hasFlagBeforeSeparator(args, "--stream-events") and
-        !hasFlagBeforeSeparator(args, "--json") and
-        !hasFlagBeforeSeparator(args, "--quiet");
+    return mode;
 }
 
 fn parseTimeoutMs(raw: []const u8) ?usize {
@@ -4463,10 +4489,6 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     return renderResultObject(alloc, result, false);
 }
 
-fn renderFinalStreamEventResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
-    return renderResultObject(alloc, result, true);
-}
-
 fn writeFinalJsonFields(writer: *std.Io.Writer, result: PromptRunResult) !void {
     try writer.writeAll("\"output\":");
     try std.json.Stringify.value(result.assistant_output, .{}, writer);
@@ -4580,16 +4602,6 @@ fn writeUsageJson(writer: *std.Io.Writer, usage: types.Usage) !void {
     if (usage.cache_read_tokens) |tokens| try writer.print(",\"cache_read_tokens\":{d}", .{tokens});
     if (usage.cache_write_tokens) |tokens| try writer.print(",\"cache_write_tokens\":{d}", .{tokens});
     try writer.writeAll("}");
-}
-
-/// `exit_code` is the status the process exits with, so the JSON field and the
-/// real exit status agree: 2 for a usage error, 1 otherwise.
-fn renderErrorJsonResult(alloc: Allocator, err_name: []const u8, exit_code: u8) ![]u8 {
-    return renderFinalJsonResult(alloc, .{
-        .exit_code = exit_code,
-        .assistant_output = &.{},
-        .error_code = err_name,
-    });
 }
 
 fn toCoreReasoningEffort(effort: types.ReasoningEffort) types.ReasoningEffort {
@@ -6271,14 +6283,14 @@ test "stdin prompt reader propagates allocation failure" {
 
 test "stdin prompt errors keep exact structured names" {
     const alloc = std.testing.allocator;
-    const overflow = try renderErrorJsonResult(alloc, "PromptResourceLimitExceeded", 1);
+    const overflow = try renderResultObject(alloc, .{ .exit_code = 1, .assistant_output = &.{}, .error_code = "PromptResourceLimitExceeded" }, false);
     defer alloc.free(overflow);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptResourceLimitExceeded\"}\n",
         overflow,
     );
 
-    const read_failure = try renderErrorJsonResult(alloc, "PromptInputReadFailed", 1);
+    const read_failure = try renderResultObject(alloc, .{ .exit_code = 1, .assistant_output = &.{}, .error_code = "PromptInputReadFailed" }, false);
     defer alloc.free(read_failure);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
@@ -6295,7 +6307,7 @@ test "image preparation failure has stable text and JSON contracts" {
     try std.testing.expect(askErrorNotice(error.Cancelled) == null);
     try std.testing.expect(askErrorNotice(error.TimedOut) == null);
 
-    const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed), 1);
+    const json = try renderResultObject(alloc, .{ .exit_code = 1, .assistant_output = &.{}, .error_code = @errorName(error.ImagePreparationFailed) }, false);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\"}\n",
@@ -6308,7 +6320,7 @@ test "an mcp.json fx can't read gets words in text and keeps its name in JSON" {
     try std.testing.expectEqualStrings(mcp_verbs.describe(error.McpConfigTooLarge), askErrorNotice(error.McpConfigTooLarge).?);
     try std.testing.expect(askErrorNotice(error.StreamTooLong) == null);
 
-    const json = try renderErrorJsonResult(alloc, @errorName(error.McpConfigTooLarge), 1);
+    const json = try renderResultObject(alloc, .{ .exit_code = 1, .assistant_output = &.{}, .error_code = @errorName(error.McpConfigTooLarge) }, false);
     defer alloc.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"error\":\"McpConfigTooLarge\"") != null);
 }
@@ -6320,11 +6332,11 @@ test "unresolved image capability has actionable text and stable JSON code" {
         askErrorNotice(error.ModelImageCapabilityUnavailable).?,
     );
 
-    const json = try renderErrorJsonResult(
-        alloc,
-        @errorName(error.ModelImageCapabilityUnavailable),
-        1,
-    );
+    const json = try renderResultObject(alloc, .{
+        .exit_code = 1,
+        .assistant_output = &.{},
+        .error_code = @errorName(error.ModelImageCapabilityUnavailable),
+    }, false);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ModelImageCapabilityUnavailable\"}\n",
@@ -10125,52 +10137,56 @@ test "cli ask output classifier maps closed TestPty EIO to TerminalHungUp and pr
     try std.testing.expectEqual(@as(anyerror, error.TerminalHungUp), classifyRealOutputError(slave.handle, error.InputOutput, error.OutputWriteFailed));
 }
 
-test "parse options accepts --stream-events and rejects conflicts with --json, --quiet, and --raw" {
+test "parse options applies last flag wins for --stream-events, --json, and --quiet" {
     const alloc = std.testing.allocator;
     var ok = try parseOptionsWithStdin(alloc, &.{ "--stream-events", "hello" }, .tty);
     defer ok.deinit(alloc);
     try std.testing.expect(ok.stream_events);
+    try std.testing.expect(!ok.json_output);
 
-    try std.testing.expectError(error.OutputModeConflict, parseOptionsWithStdin(alloc, &.{ "--stream-events", "--json", "hello" }, .tty));
-    try std.testing.expectError(error.OutputModeConflict, parseOptionsWithStdin(alloc, &.{ "--json", "--stream-events", "hello" }, .tty));
-    try std.testing.expectError(error.OutputModeConflict, parseOptionsWithStdin(alloc, &.{ "--stream-events", "--quiet", "hello" }, .tty));
-    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--stream-events", "--raw", "hello" }, .tty));
+    var json_wins = try parseOptionsWithStdin(alloc, &.{ "--stream-events", "--json", "hello" }, .tty);
+    defer json_wins.deinit(alloc);
+    try std.testing.expect(json_wins.json_output);
+    try std.testing.expect(!json_wins.stream_events);
+
+    var stream_wins = try parseOptionsWithStdin(alloc, &.{ "--json", "--stream-events", "hello" }, .tty);
+    defer stream_wins.deinit(alloc);
+    try std.testing.expect(stream_wins.stream_events);
+    try std.testing.expect(!stream_wins.json_output);
+
+    var stream_quiet = try parseOptionsWithStdin(alloc, &.{ "--stream-events", "--quiet", "hello" }, .tty);
+    defer stream_quiet.deinit(alloc);
+    try std.testing.expect(stream_quiet.stream_events);
+    try std.testing.expect(stream_quiet.quiet);
 
     var stdout_capture = TestCapture{};
     defer stdout_capture.deinit(alloc);
     var stderr_capture = TestCapture{};
     defer stderr_capture.deinit(alloc);
     try std.testing.expectEqual(
-        output_contracts.usage_exit_code,
+        @as(u8, 0),
         try runWithDeps(alloc, &.{ "--stream-events", "--quiet", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup)),
     );
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "--stream-events") != null);
-    {
-        var parsed_conflict = try std.json.parseFromSlice(
-            std.json.Value,
-            alloc,
-            std.mem.trimEnd(u8, stdout_capture.bytes.items, "\n"),
-            .{},
-        );
-        defer parsed_conflict.deinit();
-        try std.testing.expectEqualStrings("result", parsed_conflict.value.object.get("type").?.string);
-        try std.testing.expectEqual(@as(i64, output_contracts.usage_exit_code), parsed_conflict.value.object.get("exit_code").?.integer);
-        try std.testing.expectEqualStrings("InvalidAskArgs", parsed_conflict.value.object.get("error").?.string);
-    }
+    try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"turn_start\"") != null);
+    try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"result\"") != null);
 
     stdout_capture.bytes.clearRetainingCapacity();
     stderr_capture.bytes.clearRetainingCapacity();
     try std.testing.expectEqual(
-        output_contracts.usage_exit_code,
+        @as(u8, 0),
         try runWithDeps(alloc, &.{ "--stream-events", "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup)),
     );
+    try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"turn_start\"") == null);
+    try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"result\"") == null);
 
     stdout_capture.bytes.clearRetainingCapacity();
     stderr_capture.bytes.clearRetainingCapacity();
     try std.testing.expectEqual(
-        output_contracts.usage_exit_code,
-        try runWithDeps(alloc, &.{ "--stream-events", "--raw", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup)),
+        @as(u8, 0),
+        try runWithDeps(alloc, &.{ "--json", "--stream-events", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup)),
     );
+    try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"turn_start\"") != null);
+    try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"result\"") != null);
 }
 
 test "stream event JSON lines encode turn_start, tool_start, tool_end, and result on single lines" {
@@ -10219,7 +10235,7 @@ test "stream event JSON lines encode turn_start, tool_start, tool_end, and resul
     defer sample_result.deinit(alloc);
     const json_out = try renderFinalJsonResult(alloc, sample_result);
     defer alloc.free(json_out);
-    const stream_result = try renderFinalStreamEventResult(alloc, sample_result);
+    const stream_result = try renderResultObject(alloc, sample_result, true);
     defer alloc.free(stream_result);
     try std.testing.expect(std.mem.startsWith(u8, stream_result, "{\"type\":\"result\","));
     try std.testing.expectEqualStrings(json_out[1..], stream_result["{\"type\":\"result\",".len..]);
@@ -10298,6 +10314,19 @@ fn testFailStartupTerminalHungUp(
     _: []const config_runtime.SettingOverride,
 ) !app_lifecycle.StartupState {
     return error.TerminalHungUp;
+}
+
+fn testFailStartupInvalidProfile(
+    _: Allocator,
+    _: oauth_transport.Provider,
+    _: host.SecretStore,
+    _: []const u8,
+    _: usize,
+    _: ?model_provider.ProviderId,
+    _: ?[]const u8,
+    _: []const config_runtime.SettingOverride,
+) !app_lifecycle.StartupState {
+    return error.InvalidProfileConfiguration;
 }
 
 fn testProcessQueuedPromptOutputReaderGone(
@@ -10383,6 +10412,25 @@ test "stream-events error exits emit result line on stdout with stderr diagnosti
     const reader_gone_deps = testPromptRunDepsWithProcess(&stdout_capture, &stderr_capture, testProcessQueuedPromptOutputReaderGone);
     try std.testing.expectError(error.OutputReaderGone, runWithDeps(alloc, &.{ "--stream-events", "hello" }, testConfig(), reader_gone_deps));
     try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"result\"") == null);
+
+    // Non-notice errors write plain words on stderr (raw error name stays in trace and JSON).
+    stdout_capture.bytes.clearRetainingCapacity();
+    stderr_capture.bytes.clearRetainingCapacity();
+    const profile_fail_deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testFailStartupInvalidProfile);
+    const profile_code = try runWithDeps(alloc, &.{ "--stream-events", "hello" }, testConfig(), profile_fail_deps);
+    try std.testing.expectEqual(@as(u8, 1), profile_code);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "invalid profile configuration") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "InvalidProfileConfiguration") == null);
+    {
+        var parsed_profile = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            std.mem.trimEnd(u8, stdout_capture.bytes.items, "\n"),
+            .{},
+        );
+        defer parsed_profile.deinit();
+        try std.testing.expectEqualStrings("InvalidProfileConfiguration", parsed_profile.value.object.get("error").?.string);
+    }
 
     if (comptime supports_headless_interrupt) {
         const previous_action: std.posix.Sigaction = .{

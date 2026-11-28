@@ -14,6 +14,7 @@ import {
   rmSync,
   symlinkSync,
   utimesSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import { homedir, platform, tmpdir } from "node:os";
@@ -8223,7 +8224,9 @@ describe("fx login Token Pass status", () => {
     },
     TIMEOUT,
   );
+});
 
+describe("cli: ask stream events", () => {
   test(
     "fx ask --stream-events emits turn_start, tool_start, tool_end, result in order and leaves --json byte-identical",
     async () => {
@@ -8322,15 +8325,36 @@ describe("fx login Token Pass status", () => {
           }) + "\n",
         );
 
-        // Conflicting output flags exit 2.
-        for (const conflictArgs of [
-          ["ask", "--stream-events", "--json", "hi"],
-          ["ask", "--stream-events", "--quiet", "hi"],
-          ["ask", "--stream-events", "--raw", "hi"],
-        ]) {
-          const bad = await runFx(conflictArgs, { cwd: workspace, env, timeoutMs: TIMEOUT });
-          expect(bad.code).toBe(2);
-        }
+        // Last flag wins between --json and --stream-events; --quiet preserves stream stdout.
+        step = 1;
+        const streamWins = await runFx(
+          ["ask", "--json", "--stream-events", "--no-save", "--full-access", "--model", FAKE_GATEWAY_MODEL, "hi"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(streamWins.code, streamWins.stderr).toBe(0);
+        const streamWinsLines = streamWins.stdout.trimEnd().split("\n").map((l) => JSON.parse(l));
+        expect(streamWinsLines.map((l) => l.type)).toEqual(["turn_start", "result"]);
+        expect(streamWinsLines[1].final_output).toBe("DONE_STREAM_EVENTS");
+
+        step = 1;
+        const jsonWins = await runFx(
+          ["ask", "--stream-events", "--json", "--no-save", "--full-access", "--model", FAKE_GATEWAY_MODEL, "hi"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(jsonWins.code, jsonWins.stderr).toBe(0);
+        const jsonWinsParsed = JSON.parse(jsonWins.stdout);
+        expect("type" in jsonWinsParsed).toBe(false);
+        expect(jsonWinsParsed.final_output).toBe("DONE_STREAM_EVENTS");
+
+        step = 1;
+        const streamQuiet = await runFx(
+          ["ask", "--stream-events", "--quiet", "--no-save", "--full-access", "--model", FAKE_GATEWAY_MODEL, "hi"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(streamQuiet.code, streamQuiet.stderr).toBe(0);
+        const streamQuietLines = streamQuiet.stdout.trimEnd().split("\n").map((l) => JSON.parse(l));
+        expect(streamQuietLines.map((l) => l.type)).toEqual(["turn_start", "result"]);
+        expect(streamQuietLines[1].final_output).toBe("DONE_STREAM_EVENTS");
       } finally {
         gateway.stop();
         cleanupIsolatedTestHome(home);
@@ -8345,6 +8369,7 @@ describe("fx login Token Pass status", () => {
       const home = createIsolatedTestHome();
       const workspace = join(home, "workspace");
       mkdirSync(workspace, { recursive: true });
+      const tracePath = join(home, "sigterm-trace.log");
       const gateway = startFakeGateway([
         fakeGatewaySse([
           {
@@ -8369,6 +8394,7 @@ describe("fx login Token Pass status", () => {
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
             FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TRACE_LOG: tracePath,
           }),
           stdout: "pipe",
           stderr: "pipe",
@@ -8410,6 +8436,7 @@ describe("fx login Token Pass status", () => {
         const exitCode = await proc.exited;
         expect(exitCode).toBe(143);
         expect(proc.signalCode).toBe("SIGTERM");
+        expect(readFileSync(tracePath, "utf8")).toContain("stream result dropped reason=interrupted exit=143");
       } finally {
         proc.kill("SIGKILL");
         gateway.stop();
@@ -8442,14 +8469,6 @@ describe("fx login Token Pass status", () => {
         expect(unknownLines).toHaveLength(1);
         expect(unknownLines[0]).toMatchObject({ type: "result", exit_code: 2, error: "InvalidAskArgs" });
 
-        // Output mode conflict (--stream-events --quiet) exits 2 with stderr diagnostic and stream result line.
-        const quietConflict = await runFx(["ask", "--stream-events", "--quiet", "hi"], { cwd: workspace, env, timeoutMs: TIMEOUT });
-        expect(quietConflict.code).toBe(2);
-        expect(quietConflict.stderr).toContain("--stream-events");
-        const quietLines = quietConflict.stdout.trim().split("\n").map((l) => JSON.parse(l));
-        expect(quietLines).toHaveLength(1);
-        expect(quietLines[0]).toMatchObject({ type: "result", exit_code: 2, error: "InvalidAskArgs" });
-
         // Missing prompt exits 2 with stderr diagnostic and stream result line.
         const missingPrompt = await runFx(["ask", "--stream-events"], { cwd: workspace, env, timeoutMs: TIMEOUT });
         expect(missingPrompt.code).toBe(2);
@@ -8457,6 +8476,14 @@ describe("fx login Token Pass status", () => {
         const missingLines = missingPrompt.stdout.trim().split("\n").map((l) => JSON.parse(l));
         expect(missingLines).toHaveLength(1);
         expect(missingLines[0]).toMatchObject({ type: "result", exit_code: 2, error: "MissingPrompt" });
+
+        // Missing prompt with --stream-events --quiet also writes the stream result line.
+        const missingQuiet = await runFx(["ask", "--stream-events", "--quiet"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(missingQuiet.code).toBe(2);
+        expect(missingQuiet.stderr).toContain("missing prompt");
+        const missingQuietLines = missingQuiet.stdout.trim().split("\n").map((l) => JSON.parse(l));
+        expect(missingQuietLines).toHaveLength(1);
+        expect(missingQuietLines[0]).toMatchObject({ type: "result", exit_code: 2, error: "MissingPrompt" });
 
         // Runtime failure (MissingCredentials) exits 1 with stderr diagnostic and stream result matching --json fields.
         const noAuthStream = await runFx(
@@ -8479,6 +8506,140 @@ describe("fx login Token Pass status", () => {
         expect(streamRest).toEqual(JSON.parse(noAuthJson.stdout));
       } finally {
         cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --stream-events traces dropped results on closed stdout pipe and full stdout",
+    async () => {
+      // Case 1: `| head -n 1` closes stdout after turn_start, so final result fails with OutputReaderGone.
+      {
+        const home = createIsolatedTestHome();
+        const workspace = join(home, "workspace");
+        mkdirSync(workspace, { recursive: true });
+        const tracePath = join(home, "pipe-trace.log");
+        const headOutPath = join(home, "head.out");
+        const headDonePath = join(home, "head.done");
+        const errPath = join(home, "fx.err");
+        const statusPath = join(home, "fx.status");
+        const gateway = startDynamicFakeGateway(async () => {
+          if (!existsSync(headDonePath)) {
+            await new Promise<void>((resolve, reject) => {
+              const signal = AbortSignal.timeout(5000);
+              const watcher = watch(home, () => {
+                if (existsSync(headDonePath)) {
+                  watcher.close();
+                  resolve();
+                }
+              });
+              signal.addEventListener("abort", () => {
+                watcher.close();
+                reject(new Error("Timed out waiting for head.done"));
+              }, { once: true });
+              if (existsSync(headDonePath)) {
+                watcher.close();
+                resolve();
+              }
+            });
+          }
+          return fakeGatewayFinalText("DONE_AFTER_HEAD");
+        });
+        try {
+          const env = {
+            ...fxChildEnv({
+              HOME: home,
+              AI_GATEWAY_API_KEY: "fake-head-key",
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_TRACE_LOG: tracePath,
+              FX_ERR_PATH: errPath,
+              FX_STATUS_PATH: statusPath,
+              FX_HEAD_OUT: headOutPath,
+              FX_HEAD_DONE: headDonePath,
+            }),
+          };
+          const proc = Bun.spawn(
+            [
+              "sh",
+              "-c",
+              '("$0" "$@" 2>"$FX_ERR_PATH"; echo $? > "$FX_STATUS_PATH") | (head -n 1 > "$FX_HEAD_OUT"; touch "$FX_HEAD_DONE")',
+              FX_BIN,
+              "ask",
+              "--stream-events",
+              "--no-save",
+              "--full-access",
+              "--model",
+              FAKE_GATEWAY_MODEL,
+              "hello",
+            ],
+            { cwd: workspace, env, stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+          );
+          await proc.exited;
+          expect(Number(readFileSync(statusPath, "utf8").trim())).toBe(141);
+          const headLine = JSON.parse(readFileSync(headOutPath, "utf8").trim());
+          expect(headLine.type).toBe("turn_start");
+          const trace = readFileSync(tracePath, "utf8");
+          expect(trace).toContain("stream result dropped reason=OutputReaderGone");
+        } finally {
+          gateway.stop();
+          cleanupIsolatedTestHome(home);
+        }
+      }
+
+      // Case 2: `> /dev/full` fails turn_start with OutputWriteFailed and logs one drop line.
+      if (existsSync("/dev/full")) {
+        const home = createIsolatedTestHome();
+        const workspace = join(home, "workspace");
+        mkdirSync(workspace, { recursive: true });
+        const tracePath = join(home, "full-trace.log");
+        const errPath = join(home, "full.err");
+        const statusPath = join(home, "full.status");
+        const gateway = startFakeGateway([fakeGatewayFinalText("UNREACHABLE")]);
+        try {
+          const env = {
+            ...fxChildEnv({
+              HOME: home,
+              AI_GATEWAY_API_KEY: "fake-full-key",
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_TRACE_LOG: tracePath,
+              FX_ERR_PATH: errPath,
+              FX_STATUS_PATH: statusPath,
+            }),
+          };
+          const proc = Bun.spawn(
+            [
+              "sh",
+              "-c",
+              '"$0" "$@" >/dev/full 2>"$FX_ERR_PATH"; echo $? > "$FX_STATUS_PATH"',
+              FX_BIN,
+              "ask",
+              "--stream-events",
+              "--no-save",
+              "--full-access",
+              "--model",
+              FAKE_GATEWAY_MODEL,
+              "hello",
+            ],
+            { cwd: workspace, env, stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+          );
+          await proc.exited;
+          expect(Number(readFileSync(statusPath, "utf8").trim())).toBe(1);
+          const stderr = readFileSync(errPath, "utf8");
+          expect(stderr).not.toContain("OutputWriteFailed");
+          expect(stderr).toContain("couldn't write the output");
+          const trace = readFileSync(tracePath, "utf8");
+          expect(trace.match(/stream result dropped reason=OutputWriteFailed/g)?.length).toBe(1);
+        } finally {
+          gateway.stop();
+          cleanupIsolatedTestHome(home);
+        }
       }
     },
     TIMEOUT,
