@@ -26,14 +26,14 @@ pub fn waitWithDeadline(
 /// outlives the caller. `Child.kill` sends SIGTERM and then waits without a
 /// bound, so a child that ignores SIGTERM would block forever. SIGKILL cannot
 /// be ignored, so the blocking wait below returns.
-pub fn killAndReap(child: *std.process.Child) void {
+pub fn killAndReap(child: *std.process.Child, label: []const u8) void {
     const pid = child.id orelse return;
     std.posix.kill(pid, std.posix.SIG.KILL) catch |err| switch (err) {
         // ESRCH: no such process, so nothing is left to kill and waitpid returns at once.
         error.ProcessNotFound => {},
         // Any other failure could leave the wait blocked forever, so the child is not waited for.
         else => {
-            debug_trace.logf("process", "child kill failed pid={d} err={s}", .{ pid, @errorName(err) });
+            debug_trace.logf("process", "{s} child kill failed pid={d} err={s}", .{ label, pid, @errorName(err) });
             return;
         },
     };
@@ -76,7 +76,7 @@ test "killAndReap stops a child that ignores SIGTERM" {
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    defer killAndReap(&child);
+    defer killAndReap(&child, "test child");
 
     const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
         .clock = .awake,
@@ -84,7 +84,7 @@ test "killAndReap stops a child that ignores SIGTERM" {
     });
     const started_ms = io_mod.milliTimestamp();
     try std.testing.expectError(error.Timeout, waitWithDeadline(&child, deadline));
-    killAndReap(&child);
+    killAndReap(&child, "test child");
     const elapsed_ms = io_mod.milliTimestamp() - started_ms;
     try std.testing.expect(elapsed_ms < 2000);
     try std.testing.expect(child.id == null);
@@ -98,7 +98,7 @@ test "waitWithDeadline times out a slow child" {
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    defer killAndReap(&child);
+    defer killAndReap(&child, "test child");
 
     const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
         .clock = .awake,
@@ -118,7 +118,7 @@ test "waitWithDeadline returns the exit status of a finished child" {
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    defer killAndReap(&child);
+    defer killAndReap(&child, "test child");
 
     const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
         .clock = .awake,

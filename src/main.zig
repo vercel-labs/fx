@@ -5970,6 +5970,7 @@ test {
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");
     _ = @import("core/hosts/host.zig");
+    _ = @import("core/hosts/native.zig");
     _ = @import("core/hooks/common.zig");
     _ = @import("core/hooks/definitions.zig");
     _ = @import("core/hooks/prompt.zig");

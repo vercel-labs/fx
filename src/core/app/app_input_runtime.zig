@@ -247,6 +247,45 @@ pub fn Runtime(comptime App: type) type {
         pub const installPromptHistory = history_rt.installPromptHistory;
         pub const loadAndInstallPromptHistory = history_rt.loadAndInstallPromptHistory;
 
+        fn readClipboardText(app: *App) !?[]u8 {
+            // Test apps supply a fake reader so tests never read the real clipboard.
+            if (comptime @hasDecl(App, "readClipboardText")) return app.readClipboardText(app.alloc);
+            if (comptime @hasDecl(App, "clipboard")) return app.clipboard().readText(app.alloc);
+            return null;
+        }
+
+        /// The notice for a clipboard read that failed. A failed read is not an empty clipboard.
+        fn clipboardReadFailureBody(err: anyerror) []const u8 {
+            return switch (err) {
+                error.ReadTimedOut => "couldn't read the clipboard: it took too long",
+                error.ReadTooLarge => "clipboard text is larger than fx can paste",
+                else => "couldn't read the clipboard text",
+            };
+        }
+
+        /// Ctrl+V found no image: paste the clipboard text, or say why it could not.
+        fn pasteClipboardTextOrNotice(app: *App, agent: *AppAgent, max_input_len: usize) !void {
+            const maybe_text = readClipboardText(app) catch |err| {
+                debug_trace.logf("input", "ctrl+v clipboard read failed err={s}", .{@errorName(err)});
+                return app.writeDomainNotice(.{
+                    .topic = "images",
+                    .tone = .@"error",
+                    .body = clipboardReadFailureBody(err),
+                }, true);
+            };
+            defer if (maybe_text) |owned| app.alloc.free(owned);
+            const text: []const u8 = maybe_text orelse "";
+            if (text.len == 0) {
+                debug_trace.logf("input", "ctrl+v clipboard empty", .{});
+                try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image or text found on clipboard" }, true);
+                return;
+            }
+            debug_trace.logf("input", "ctrl+v clipboard text bytes={d}", .{text.len});
+            try paste_rt.insertClipboardText(app, agent, text, max_input_len);
+            syncCatalogMenus(app, agent);
+            settleModelPickerDraft(app);
+        }
+
         fn insertComposerSliceBounded(
             app: *App,
             agent: *AppAgent,
@@ -1637,7 +1676,10 @@ pub fn Runtime(comptime App: type) type {
                         debug_trace.logf("input", "image attach skipped reason=model_picker_borrows_composer", .{});
                         return;
                     }
-                    try image_commands.Commands(App).attachClipboard(app);
+                    switch (try image_commands.Commands(App).attachClipboardImage(app)) {
+                        .attached, .handled => {},
+                        .no_image => try pasteClipboardTextOrNotice(app, agent, max_input_len),
+                    }
                 },
                 24 => {
                     return;
@@ -4154,6 +4196,9 @@ const RoutingFakeApp = struct {
     suspend_count: usize = 0,
     workspace_access: app_workspace_runtime.Access = .{},
     clipboard_image_reads: usize = 0,
+    clipboard_text: ?[]const u8 = null,
+    clipboard_text_reads: usize = 0,
+    clipboard_text_error: ?anyerror = null,
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -4166,6 +4211,13 @@ const RoutingFakeApp = struct {
     pub fn loadClipboardImageAttachment(self: *RoutingFakeApp) !image_attachments.ClipboardImageAttachment {
         self.clipboard_image_reads += 1;
         return error.NoClipboardImage;
+    }
+
+    pub fn readClipboardText(self: *RoutingFakeApp, alloc: std.mem.Allocator) !?[]u8 {
+        self.clipboard_text_reads += 1;
+        if (self.clipboard_text_error) |err| return err;
+        const text = self.clipboard_text orelse return null;
+        return try alloc.dupe(u8, text);
     }
 
     fn init(alloc: std.mem.Allocator) !RoutingFakeApp {
@@ -10706,6 +10758,142 @@ test "app_input_runtime ctrl+v reads the clipboard through the app's reader" {
     try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
 }
 
+test "app_input_runtime ctrl+v pastes clipboard text when the clipboard has no image" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.clipboard_text = "hello";
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    try std.testing.expectEqualStrings("hello", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_text_reads);
+}
+
+test "app_input_runtime ctrl+v pastes long clipboard text as a pasted block" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const long_text = try alloc.alloc(u8, paste_blocks.large_paste_char_threshold + 1);
+    defer alloc.free(long_text);
+    for (long_text, 0..) |*byte, index| byte.* = if (index % 100 == 99) '\n' else 'x';
+    app.clipboard_text = long_text;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    const blocks = app.input_runtime.entities.pasted_blocks.items;
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings(long_text, blocks[0].text);
+    const input = app.input_runtime.edit_state.input.items;
+    try std.testing.expect(std.mem.find(u8, input, "[Pasted text #") != null);
+    try std.testing.expect(input.len < long_text.len);
+}
+
+test "app_input_runtime ctrl+v with an empty clipboard shows one notice" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const notices_before = app.notice_write_count;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_text_reads);
+    try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+}
+
+test "app_input_runtime ctrl+v filters control bytes like a bracketed paste" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.clipboard_text = "a\x1b[31mb";
+    const notices_before = app.notice_write_count;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    try std.testing.expectEqualStrings("a[31mb", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(notices_before, app.notice_write_count);
+}
+
+test "app_input_runtime ctrl+v rejects clipboard text with invalid utf-8" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.clipboard_text = "a\xffb";
+    const notices_before = app.notice_write_count;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+    try std.testing.expectEqualStrings(
+        "Pasted text contains unsupported bytes and was not added to the draft.",
+        app.notice_body.items,
+    );
+}
+
+test "app_input_runtime ctrl+v keeps the clipboard untouched while the model picker borrows the composer" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.clipboard_text = "clip";
+    try enterRoutingShortcutEffortStage(&app, "draft", "draft".len);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_text_reads);
+}
+
+test "app_input_runtime ctrl+v reports a failed clipboard read, not an empty clipboard" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const cases = [_]struct { err: anyerror, body: []const u8 }{
+        .{ .err = error.ReadTimedOut, .body = "couldn't read the clipboard: it took too long" },
+        .{ .err = error.ReadTooLarge, .body = "clipboard text is larger than fx can paste" },
+        .{ .err = error.ReadFailed, .body = "couldn't read the clipboard text" },
+    };
+    for (cases) |case| {
+        app.clipboard_text_error = case.err;
+        const notices_before = app.notice_write_count;
+
+        try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+        try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+        try std.testing.expectEqualStrings(case.body, app.notice_body.items);
+    }
+}
+
+test "app_input_runtime clipboard text traces an allocation failure while copying" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "clipboard-alloc-failed.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+
+    const paste = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
+    try std.testing.expectError(error.OutOfMemory, paste.insertClipboardText(&app, (&app).agent(), "hello", 4096));
+    debug_trace.shutdown();
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "composer paste dropped bytes=5 reason=alloc_failed") != null);
+}
+
 test "app_input_runtime decision paste start clears pending ctrl-c and esc gestures" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
@@ -16717,6 +16905,315 @@ test "app input bridge loads the most recent durable history in chronological or
     try std.testing.expectEqual(@as(usize, 100), app.input_runtime.composer_history.count());
     try std.testing.expectEqualStrings("prompt-1", app.input_runtime.composer_history.entryText(0).?);
     try std.testing.expectEqualStrings("prompt-100", app.input_runtime.composer_history.entryText(99).?);
+}
+
+fn pendingManualCodeDecodedTestPoll(
+    _: ?*anyopaque,
+    _: std.mem.Allocator,
+    _: @import("../auth/oauth_transport.zig").Provider,
+    _: @import("../auth/oauth.zig").Metadata,
+    _: []const u8,
+    _: []const u8,
+    _: *std.atomic.Value(bool),
+    _: std.Io.Clock.Timestamp,
+) !@import("../auth/oauth.zig").PollResult {
+    return .pending;
+}
+
+fn acceptManualCodeDecodedTest(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) !void {}
+
+fn enterPendingDecodedTestSignIn(app: *RoutingFakeApp, alloc: std.mem.Allocator) !void {
+    const login_flow = @import("../auth/login_flow.zig");
+    const prepared: login_flow.PreparedLogin = .{
+        .metadata = .{
+            .issuer = try alloc.dupe(u8, "https://issuer.test"),
+            .device_authorization_endpoint = try alloc.dupe(u8, "https://issuer.test/authorize"),
+            .token_endpoint = try alloc.dupe(u8, "https://issuer.test/token"),
+        },
+        .device = .{
+            .device_code = try alloc.dupe(u8, "device-code"),
+            .user_code = try alloc.dupe(u8, ""),
+            .verification_uri = try alloc.dupe(u8, "https://issuer.test/authorize"),
+            .expires_in = 300,
+            .interval = 1,
+        },
+        .client_id = try alloc.dupe(u8, "client-id"),
+    };
+    try std.testing.expect(try app.auth.sign_in_flow.startPrepared(alloc, prepared, .{
+        .poll = .{ .poll_device_token = pendingManualCodeDecodedTestPoll },
+        .submit_manual_code = acceptManualCodeDecodedTest,
+    }));
+    app.auth.picker_active = true;
+    app.auth.picker_stage = .sign_in;
+    app.auth.sign_in_source = .grok_subscription;
+}
+
+test "app_input_runtime decoded paste matches bracketed paste in composer for short and long text" {
+    const alloc = std.testing.allocator;
+    const paste_rt = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
+
+    // Short text
+    {
+        var bracketed = try RoutingFakeApp.init(alloc);
+        defer bracketed.deinit();
+        var decoded = try RoutingFakeApp.init(alloc);
+        defer decoded.deinit();
+
+        const short_text = "hello\r\nworld\t!";
+        const framed = try std.mem.concat(alloc, u8, &.{ "\x1b[200~", short_text, "\x1b[201~" });
+        defer alloc.free(framed);
+        try feedRoutingBytes(&bracketed, framed);
+
+        const target = paste_rt.pasteCaptureTarget(&decoded, (&decoded).agent(), RoutingFakeApp.input_byte_limit);
+        try paste_rt.pasteDecodedText(&decoded, (&decoded).agent(), target, short_text, RoutingFakeApp.input_byte_limit);
+
+        try std.testing.expectEqualStrings(bracketed.input_runtime.edit_state.input.items, decoded.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(bracketed.input_runtime.entities.pasted_blocks.items.len, decoded.input_runtime.entities.pasted_blocks.items.len);
+        try std.testing.expectEqual(@as(usize, 0), decoded.input_runtime.entities.pasted_blocks.items.len);
+    }
+
+    // Long multi-line text
+    {
+        var bracketed = try RoutingFakeApp.init(alloc);
+        defer bracketed.deinit();
+        var decoded = try RoutingFakeApp.init(alloc);
+        defer decoded.deinit();
+
+        const long_text = try alloc.alloc(u8, paste_blocks.large_paste_char_threshold + 1);
+        defer alloc.free(long_text);
+        for (long_text, 0..) |*byte, index| byte.* = if (index % 80 == 79) '\n' else 'x';
+
+        const framed = try std.mem.concat(alloc, u8, &.{ "\x1b[200~", long_text, "\x1b[201~" });
+        defer alloc.free(framed);
+        try feedRoutingBytes(&bracketed, framed);
+
+        const target = paste_rt.pasteCaptureTarget(&decoded, (&decoded).agent(), RoutingFakeApp.input_byte_limit);
+        try paste_rt.pasteDecodedText(&decoded, (&decoded).agent(), target, long_text, RoutingFakeApp.input_byte_limit);
+
+        try std.testing.expectEqualStrings(bracketed.input_runtime.edit_state.input.items, decoded.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(@as(usize, 1), bracketed.input_runtime.entities.pasted_blocks.items.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.input_runtime.entities.pasted_blocks.items.len);
+        try std.testing.expectEqualStrings(
+            bracketed.input_runtime.entities.pasted_blocks.items[0].text,
+            decoded.input_runtime.entities.pasted_blocks.items[0].text,
+        );
+    }
+}
+
+test "app_input_runtime decoded paste keeps embedded end marker except esc unlike bracketed paste" {
+    const alloc = std.testing.allocator;
+    const paste_rt = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
+    const payload = "before\x1b[201~after";
+
+    var bracketed = try RoutingFakeApp.init(alloc);
+    defer bracketed.deinit();
+    const framed = "\x1b[200~" ++ payload ++ "\x1b[201~";
+    try feedRoutingBytes(&bracketed, framed);
+    try std.testing.expectEqualStrings("before", bracketed.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), bracketed.notice_write_count);
+
+    var decoded = try RoutingFakeApp.init(alloc);
+    defer decoded.deinit();
+    const target = paste_rt.pasteCaptureTarget(&decoded, (&decoded).agent(), RoutingFakeApp.input_byte_limit);
+    try paste_rt.pasteDecodedText(&decoded, (&decoded).agent(), target, payload, RoutingFakeApp.input_byte_limit);
+
+    try std.testing.expectEqualStrings("before[201~after", decoded.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), decoded.notice_write_count);
+    try std.testing.expectEqual(paste_framing.Owner.none, decoded.input_runtime.paste.owner);
+}
+
+test "app_input_runtime decoded paste routes to question freeform and approval amendment" {
+    const alloc = std.testing.allocator;
+    const paste_rt = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
+
+    // Question freeform: tabs become spaces
+    {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        const opts = [_]types.QuestionOption{
+            .{ .label = "Alpha", .description = null },
+            .{ .label = "Beta", .description = null },
+        };
+        const entries = [_]types.QuestionBatchEntry{
+            .{ .question = "Continue?", .options = &opts },
+        };
+        try app.agent().question_prompt.syncFrom(alloc, &entries);
+        app.agent().question_prompt.moveChoice(-1);
+
+        const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+        try std.testing.expectEqual(paste_framing.Owner.question_freeform, target.owner);
+        try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "first\rsecond\tvalue\x03", RoutingFakeApp.input_byte_limit);
+
+        try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+        try std.testing.expectEqualStrings("first\nsecond value", app.agent().question_prompt.entries.items[0].freeform_buffer.items);
+        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+        try std.testing.expect(app.shell.render_requests.hasReason(.modal));
+    }
+
+    // Approval amendment
+    {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
+        try feedRoutingBytes(&app, "\t");
+        try std.testing.expect(app.agent().approval_prompt.isAmending());
+
+        const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+        try std.testing.expectEqual(paste_framing.Owner.approval_amendment, target.owner);
+        try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "line1\r\nline2\t\x1b[201~tail\x03", RoutingFakeApp.input_byte_limit);
+
+        try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+        try std.testing.expectEqualStrings("line1 line2 [201~tail", app.agent().approval_prompt.decision.selectedDraft());
+        try std.testing.expect(app.shell.render_requests.hasReason(.modal));
+    }
+}
+
+test "app_input_runtime decoded paste with decision prompt open drops with trace and leaves prompt open" {
+    const alloc = std.testing.allocator;
+    const paste_rt = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "decoded-decision-paste.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
+
+    const payload = "typing\t\r\n\x03";
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+    try std.testing.expectEqual(paste_framing.Owner.decision_prompt, target.owner);
+    try paste_rt.pasteDecodedText(&app, (&app).agent(), target, payload, RoutingFakeApp.input_byte_limit);
+
+    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+    try std.testing.expect(app.agent().approval_prompt.isActive());
+    try std.testing.expect(app.agent().worker.submitted_permission == null);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+    debug_trace.shutdown();
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    const needle = try alloc.print("decision prompt paste dropped bytes={d} reason=decision_prompt_active", .{payload.len});
+    defer alloc.free(needle);
+    try std.testing.expect(std.mem.find(u8, trace, needle) != null);
+}
+
+test "app_input_runtime decoded paste over composer limit shows limit notice and preserves draft" {
+    const alloc = std.testing.allocator;
+    const paste_rt = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "keep");
+
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), 6);
+    try std.testing.expectEqual(paste_framing.Owner.composer, target.owner);
+    try std.testing.expectEqual(@as(usize, 2), target.buffer_limit);
+    try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "xyz", 6);
+
+    try std.testing.expectEqualStrings("keep", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+    try std.testing.expectEqualStrings("input", app.notice_topic.items);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.notice_tone);
+    try std.testing.expectEqualStrings(
+        "That edit exceeds the local prompt safety limit and was not applied.",
+        app.notice_body.items,
+    );
+}
+
+test "app_input_runtime decoded paste reaches auth code input and zeroes paste buffer" {
+    const alloc = std.testing.allocator;
+    const paste_rt = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try enterPendingDecodedTestSignIn(&app, alloc);
+    try std.testing.expect(app.auth.toggleSignInCodeEntry());
+    try std.testing.expect(app.auth.signInCodeEntryActive());
+
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+    try std.testing.expectEqual(paste_framing.Owner.auth_code, target.owner);
+    try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "secret-auth-code", RoutingFakeApp.input_byte_limit);
+
+    try std.testing.expectEqualStrings("secret-auth-code", app.auth.sign_in_code_input.items);
+    try std.testing.expectEqual(@as(usize, 16), app.auth.pickerView().sign_in_code_mask_count);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+    try std.testing.expect(app.input_runtime.paste.buffer.capacity > 0);
+    for (app.input_runtime.paste.buffer.allocatedSlice()) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+}
+
+test "app_input_runtime decoded paste empty traces without opening paste or reading clipboard" {
+    const alloc = std.testing.allocator;
+    const paste_rt = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "decoded-empty-paste.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+    try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "", RoutingFakeApp.input_byte_limit);
+
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
+    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+    debug_trace.shutdown();
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "decoded paste empty") != null);
+}
+
+test "app_input_runtime decoded paste with only control bytes skips clipboard check and shows notice" {
+    const alloc = std.testing.allocator;
+    const paste_rt = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+    try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "\x01\x1b", RoutingFakeApp.input_byte_limit);
+
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+    try std.testing.expectEqualStrings(
+        "Pasted text contains unsupported bytes and was not added to the draft.",
+        app.notice_body.items,
+    );
+}
+
+test "app_input_runtime decoded paste zeroes auth code paste buffer on invalid input" {
+    const alloc = std.testing.allocator;
+    const paste_rt = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try enterPendingDecodedTestSignIn(&app, alloc);
+    try std.testing.expect(app.auth.toggleSignInCodeEntry());
+
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+    try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "bad code", RoutingFakeApp.input_byte_limit);
+
+    try std.testing.expectEqual(@as(usize, 0), app.auth.sign_in_code_input.items.len);
+    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+    try std.testing.expect(app.input_runtime.paste.buffer.capacity > 0);
+    for (app.input_runtime.paste.buffer.allocatedSlice()) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
 }
 
 test "app_input_runtime mouse and paste ingress update the idle upgrade quiet timestamp" {

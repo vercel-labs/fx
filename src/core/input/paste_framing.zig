@@ -67,6 +67,19 @@ const Finish = struct {
     dropped_suffix_bytes: usize,
 };
 
+/// Whether a paste owned by `owner` keeps `byte`. Other bytes are dropped
+/// silently, so every paste path shares one rule for control bytes.
+pub fn acceptsPastedByte(owner: Owner, byte: u8) bool {
+    const is_printable = byte >= 32 and byte != 127;
+    return switch (owner) {
+        .composer => byte == '\r' or byte == '\n' or byte == '\t' or is_printable,
+        .question_freeform => byte == '\r' or byte == '\n' or is_printable,
+        .approval_amendment => byte == '\r' or byte == '\n' or byte == '\t' or is_printable,
+        .auth_code => is_printable,
+        .none, .decision_prompt => false,
+    };
+}
+
 pub const State = struct {
     owner: Owner = .none,
     boundary: BoundaryState = .capturing,
@@ -94,6 +107,18 @@ pub const State = struct {
         self.buffer_limit = max_buffer_len;
     }
 
+    pub fn ingestDecodedSlice(
+        self: *State,
+        alloc: Allocator,
+        bytes: []const u8,
+    ) Allocator.Error!void {
+        std.debug.assert(self.boundary == .capturing);
+        if (self.owner == .none) return;
+        for (bytes) |byte| {
+            try self.captureByte(alloc, byte);
+        }
+    }
+
     pub fn consumeByte(
         self: *State,
         alloc: Allocator,
@@ -109,33 +134,15 @@ pub const State = struct {
 
         switch (self.owner) {
             .none => return,
-            .decision_prompt => self.decision_bytes +|= 1,
+            .decision_prompt => {},
             .composer, .question_freeform, .approval_amendment, .auth_code => {
                 if (byte == 0x1b) {
                     self.end_candidate_buffer_len = self.buffer.items.len;
                     self.end_candidate_overflow_bytes = self.overflow_bytes;
                 }
-                const captured_byte: u8 = if (self.owner == .question_freeform and byte == '\t')
-                    ' '
-                else
-                    byte;
-                const is_printable = captured_byte >= 32 and captured_byte != 127;
-                const accepts_byte = switch (self.owner) {
-                    .composer => captured_byte == '\r' or captured_byte == '\n' or captured_byte == '\t' or is_printable,
-                    .question_freeform => captured_byte == '\r' or captured_byte == '\n' or is_printable,
-                    .approval_amendment => captured_byte == '\r' or captured_byte == '\n' or captured_byte == '\t' or is_printable,
-                    .auth_code => is_printable,
-                    .none, .decision_prompt => false,
-                };
-                if (accepts_byte) {
-                    if (self.buffer.items.len < self.buffer_limit) {
-                        try self.buffer.append(alloc, captured_byte);
-                    } else {
-                        self.overflow_bytes +|= 1;
-                    }
-                }
             },
         }
+        try self.captureByte(alloc, byte);
 
         if (!self.advanceEndMatcher(byte)) return;
 
@@ -294,6 +301,30 @@ pub const State = struct {
         self.buffer_limit = std.math.maxInt(usize);
         self.decision_bytes = 0;
         self.buffer.clearRetainingCapacity();
+    }
+
+    fn captureByte(
+        self: *State,
+        alloc: Allocator,
+        byte: u8,
+    ) Allocator.Error!void {
+        switch (self.owner) {
+            .none => return,
+            .decision_prompt => self.decision_bytes +|= 1,
+            .composer, .question_freeform, .approval_amendment, .auth_code => {
+                const captured_byte: u8 = if (self.owner == .question_freeform and byte == '\t')
+                    ' '
+                else
+                    byte;
+                if (acceptsPastedByte(self.owner, captured_byte)) {
+                    if (self.buffer.items.len < self.buffer_limit) {
+                        try self.buffer.append(alloc, captured_byte);
+                    } else {
+                        self.overflow_bytes +|= 1;
+                    }
+                }
+            },
+        }
     }
 
     fn advanceEndMatcher(self: *State, byte: u8) bool {
@@ -666,6 +697,106 @@ test "deinit traces an active capture once" {
     defer alloc.free(trace);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "decision prompt paste dropped bytes=0 reason=shutdown"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "composer paste dropped bytes=7 reason=shutdown"));
+}
+
+test "paste_framing ingest decoded slice keeps embedded end marker bytes except esc and shares owner rules" {
+    const alloc = std.testing.allocator;
+
+    var composer: State = .{};
+    defer composer.deinit(alloc);
+    composer.begin(.composer, 64);
+    try composer.ingestDecodedSlice(alloc, "before\x1b[201~after\t\r\n\x01");
+    try std.testing.expectEqualStrings("before[201~after\t\r\n", composer.buffer.items);
+    try std.testing.expectEqual(BoundaryState.capturing, composer.boundary);
+    try std.testing.expectEqual(@as(usize, 0), composer.overflow_bytes);
+
+    var question: State = .{};
+    defer question.deinit(alloc);
+    question.begin(.question_freeform, 64);
+    try question.ingestDecodedSlice(alloc, "one\t\x1b[201~two\r\x03");
+    try std.testing.expectEqualStrings("one [201~two\r", question.buffer.items);
+
+    var amendment: State = .{};
+    defer amendment.deinit(alloc);
+    amendment.begin(.approval_amendment, 64);
+    try amendment.ingestDecodedSlice(alloc, "a\t\r\n\x1b[201~b\x03");
+    try std.testing.expectEqualStrings("a\t\r\n[201~b", amendment.buffer.items);
+
+    var decision: State = .{};
+    defer decision.deinit(alloc);
+    decision.begin(.decision_prompt, std.math.maxInt(usize));
+    const decision_payload = "abc" ++ paste_end_marker ++ "xyz";
+    try decision.ingestDecodedSlice(alloc, decision_payload);
+    try std.testing.expectEqual(decision_payload.len, decision.decision_bytes);
+    try std.testing.expectEqual(BoundaryState.capturing, decision.boundary);
+
+    var limited: State = .{};
+    defer limited.deinit(alloc);
+    limited.begin(.composer, 3);
+    try limited.ingestDecodedSlice(alloc, "abcd\x01");
+    try std.testing.expectEqualStrings("abc", limited.buffer.items);
+    try std.testing.expectEqual(@as(usize, 1), limited.overflow_bytes);
+    try std.testing.expectEqual(@as(usize, 4), limited.attemptedBytes());
+
+    var secret: State = .{};
+    defer secret.deinit(alloc);
+    secret.begin(.auth_code, 64);
+    try secret.ingestDecodedSlice(alloc, "code\t\r\n-1\x1b[201~");
+    try std.testing.expectEqualStrings("code-1[201~", secret.buffer.items);
+    secret.beginHandling();
+    secret.finishSecretHandled();
+    for (secret.buffer.allocatedSlice()) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+const fuzz_input_bytes = 4096;
+const fuzz_composer_limit_bytes = 8;
+const fuzz_prompt_limit_bytes = 64;
+
+fn expectKeptBytesAccepted(owner: Owner, state: *const State) !void {
+    try std.testing.expect(state.buffer.items.len <= state.buffer_limit);
+    for (state.buffer.items) |byte| {
+        try std.testing.expect(acceptsPastedByte(owner, byte));
+    }
+}
+
+// Each path gets its own State: ingestDecodedSlice asserts that no byte of a
+// paste is still waiting on an end marker.
+fn expectOwnerLawsOnInput(owner: Owner, buffer_limit: usize, input: []const u8) !void {
+    const alloc = std.testing.allocator;
+
+    var consumed: State = .{};
+    defer consumed.deinit(alloc);
+    consumed.begin(owner, buffer_limit);
+    for (input) |byte| {
+        try consumed.consumeByte(alloc, byte);
+        try expectKeptBytesAccepted(owner, &consumed);
+    }
+
+    var ingested: State = .{};
+    defer ingested.deinit(alloc);
+    ingested.begin(owner, buffer_limit);
+    try ingested.ingestDecodedSlice(alloc, input);
+    try expectKeptBytesAccepted(owner, &ingested);
+}
+
+fn fuzzPasteFraming(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [fuzz_input_bytes]u8 = undefined;
+    const input = input_buffer[0..@intCast(smith.slice(&input_buffer))];
+    try expectOwnerLawsOnInput(.composer, fuzz_composer_limit_bytes, input);
+    try expectOwnerLawsOnInput(.question_freeform, fuzz_prompt_limit_bytes, input);
+    try expectOwnerLawsOnInput(.approval_amendment, fuzz_prompt_limit_bytes, input);
+    try expectOwnerLawsOnInput(.auth_code, fuzz_prompt_limit_bytes, input);
+    try expectOwnerLawsOnInput(.decision_prompt, fuzz_prompt_limit_bytes, input);
+}
+
+test "paste_framing keeps its laws on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzPasteFraming, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "plain text\n",
+            "before\x1b[201~after",
+            "one\r\ntwo\r\n",
+        }) ++ @import("fuzz_corpus").paste_framing.*),
+    });
 }
 
 fn readTraceFileForTest(alloc: Allocator, path: []const u8) ![]u8 {

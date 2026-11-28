@@ -2084,7 +2084,7 @@ fn runClipboardScript(
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    defer child_wait.killAndReap(&child);
+    defer child_wait.killAndReap(&child, "clipboard image read");
 
     const term = child_wait.waitWithDeadline(&child, deadline) catch |err| switch (err) {
         error.Timeout => return error.ClipboardReadTimedOut,

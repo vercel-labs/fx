@@ -18,6 +18,11 @@ const render_request = @import("../../ui/render_request.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 
+pub const PasteCaptureTarget = struct {
+    owner: paste_framing.Owner,
+    buffer_limit: usize,
+};
+
 fn normalizeApprovalAmendmentPasteInPlace(bytes: []u8) []u8 {
     const normalized = text_utils.normalizeLineEndingsInPlace(bytes);
     for (normalized) |*byte| {
@@ -105,7 +110,30 @@ pub fn PasteEditRuntime(comptime App: type) type {
             return app.auth.signInCodeEntryActive();
         }
 
-        pub fn beginPaste(app: *App, agent: *AppAgent, max_input_len: usize) void {
+        fn captureTargetForOwner(
+            app: *App,
+            agent: *AppAgent,
+            owner: paste_framing.Owner,
+            max_input_len: usize,
+        ) PasteCaptureTarget {
+            const buffer_limit = switch (owner) {
+                .composer => app.input_runtime.replacementState(&agent.pending_images).availableBytesForSelectionOrInsertion(max_input_len),
+                .auth_code => login_flow.max_manual_code_bytes,
+                .none, .decision_prompt, .question_freeform, .approval_amendment => max_input_len,
+            };
+            return .{
+                .owner = owner,
+                .buffer_limit = buffer_limit,
+            };
+        }
+
+        pub fn composerTarget(app: *App, agent: *AppAgent, max_input_len: usize) PasteCaptureTarget {
+            return captureTargetForOwner(app, agent, .composer, max_input_len);
+        }
+
+        /// The capture target for a paste that starts now: whichever prompt or
+        /// the auth code entry owns input, otherwise the composer.
+        pub fn pasteCaptureTarget(app: *App, agent: *AppAgent, max_input_len: usize) PasteCaptureTarget {
             const owner: paste_framing.Owner = if (agent.question_prompt.isActive())
                 if (agent.question_prompt.isFreeformSelected()) .question_freeform else .decision_prompt
             else if (agent.approval_prompt.isAmending())
@@ -116,17 +144,15 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .auth_code
             else
                 .composer;
-            const buffer_limit = switch (owner) {
-                .composer => app.input_runtime.replacementState(&agent.pending_images).availableBytesForSelectionOrInsertion(max_input_len),
-                .auth_code => login_flow.max_manual_code_bytes,
-                .none, .decision_prompt, .question_freeform, .approval_amendment => max_input_len,
-            };
+            return captureTargetForOwner(app, agent, owner, max_input_len);
+        }
 
+        fn openPasteCapture(app: *App, capture: PasteCaptureTarget) void {
             input_reset.resetPendingTextScalarWithTrace(
                 &app.input_runtime.text_scalar,
                 "paste_started",
             );
-            app.input_runtime.paste.begin(owner, buffer_limit);
+            app.input_runtime.paste.begin(capture.owner, capture.buffer_limit);
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
 
             const gesture_reset = gesture_state.reset(app.input_runtime.gestures);
@@ -164,6 +190,53 @@ pub fn PasteEditRuntime(comptime App: type) type {
             );
         }
 
+        pub fn beginPaste(app: *App, agent: *AppAgent, max_input_len: usize) void {
+            openPasteCapture(app, pasteCaptureTarget(app, agent, max_input_len));
+        }
+
+        pub fn pasteDecodedText(
+            app: *App,
+            agent: *AppAgent,
+            capture: PasteCaptureTarget,
+            text: []const u8,
+            max_input_len: usize,
+        ) !void {
+            if (text.len == 0) {
+                debug_trace.logf("input", "decoded paste empty", .{});
+                return;
+            }
+
+            openPasteCapture(app, capture);
+            app.input_runtime.paste.ingestDecodedSlice(app.alloc, text) catch |err| {
+                debug_trace.logf("input", "{s} paste dropped bytes={d} reason=alloc_failed", .{ @tagName(capture.owner), text.len });
+                if (capture.owner == .auth_code) {
+                    app.input_runtime.paste.resetSecretWithTrace(.{ .finalize_failed = .{
+                        .owner = .auth_code,
+                        .error_name = @errorName(err),
+                    } });
+                    return err;
+                }
+                return failPaste(app, capture.owner, err);
+            };
+
+            // Never let all-control-byte decoded composer text reach
+            // finalizePastedBlock, which treats an empty buffer as a clipboard image check.
+            if (capture.owner == .composer and
+                app.input_runtime.paste.overflow_bytes == 0 and
+                app.input_runtime.paste.buffer.items.len == 0)
+            {
+                try rejectUnsupportedPaste(app, .footer);
+                return;
+            }
+
+            debug_trace.logf(
+                "input",
+                "paste end owner={s} bytes={d}",
+                .{ @tagName(capture.owner), app.input_runtime.paste.byteCount() },
+            );
+            try finishPaste(app, agent, max_input_len);
+        }
+
         pub fn handleActivePasteByte(app: *App, byte: u8) !void {
             try app.input_runtime.paste.consumeByte(app.alloc, byte);
         }
@@ -198,6 +271,17 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 }, true);
             }
             return true;
+        }
+
+        /// Drops the paste whose bytes fx cannot keep, and says so.
+        fn rejectUnsupportedPaste(app: *App, render_reason: render_request.Reason) !void {
+            app.input_runtime.paste.resetWithTrace(.invalid_utf8);
+            app.shell.render_requests.request(render_reason);
+            try app.writeDomainNotice(.{
+                .topic = "input",
+                .tone = .@"error",
+                .body = "Pasted text contains unsupported bytes and was not added to the draft.",
+            }, true);
         }
 
         /// Resets the paste after `owner` failed to take it and returns `err`.
@@ -258,13 +342,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     .question_freeform, .approval_amendment => .modal,
                     else => .footer,
                 };
-                app.input_runtime.paste.resetWithTrace(.invalid_utf8);
-                app.shell.render_requests.request(render_reason);
-                try app.writeDomainNotice(.{
-                    .topic = "input",
-                    .tone = .@"error",
-                    .body = "Pasted text contains unsupported bytes and was not added to the draft.",
-                }, true);
+                try rejectUnsupportedPaste(app, render_reason);
                 return;
             }
 
@@ -339,10 +417,16 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     if (comptime @hasField(App, "auth") and
                         @hasDecl(@TypeOf(app.auth), "replaceSignInCodeInput"))
                     {
-                        const accepted = try app.auth.replaceSignInCodeInput(
+                        const accepted = app.auth.replaceSignInCodeInput(
                             app.alloc,
                             app.input_runtime.paste.buffer.items,
-                        );
+                        ) catch |err| {
+                            app.input_runtime.paste.resetSecretWithTrace(.{ .finalize_failed = .{
+                                .owner = .auth_code,
+                                .error_name = @errorName(err),
+                            } });
+                            return err;
+                        };
                         if (!accepted) {
                             app.input_runtime.paste.resetSecretWithTrace(.session_reset);
                             try app.writeDomainNotice(.{
@@ -464,6 +548,19 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 app.input_runtime.historyBoundary(app.alloc);
             }
             app.input_runtime.paste.buffer.clearRetainingCapacity();
+        }
+
+        /// Pastes clipboard text the way a composer paste lands, for Ctrl+V with no
+        /// clipboard image.
+        pub fn insertClipboardText(app: *App, agent: *AppAgent, text: []const u8, max_input_len: usize) !void {
+            // Cannot happen from key input: routeActivePasteByte hands every byte to
+            // an open paste before handleByte runs, so Ctrl+V never arrives while one
+            // is open. Kept so a future caller cannot reset a live capture.
+            if (app.input_runtime.paste.owner != .none) {
+                debug_trace.logf("input", "clipboard text dropped bytes={d} reason=paste_in_progress", .{text.len});
+                return;
+            }
+            try pasteDecodedText(app, agent, composerTarget(app, agent, max_input_len), text, max_input_len);
         }
 
         pub fn handlePastedBytes(app: *App, agent: *AppAgent, bytes: []const u8, max_input_len: usize) !void {

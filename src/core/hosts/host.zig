@@ -190,7 +190,15 @@ fn unavailableSecretStoreInteractiveWrite(
     return false;
 }
 
-pub const ClipboardError = error{CopyFailed};
+/// A failed read is an error, never an empty clipboard: `readText` returns null
+/// only when the host has no reader or the read gave no text.
+pub const ClipboardError = error{
+    CopyFailed,
+    ReadFailed,
+    ReadTimedOut,
+    ReadTooLarge,
+    OutOfMemory,
+};
 
 pub const unavailable_clipboard = Clipboard{
     .copy_fn = copyUnavailable,
@@ -204,6 +212,10 @@ fn copy_file_unavailable(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) Cl
     return false;
 }
 
+fn read_text_unavailable(_: ?*anyopaque, _: std.mem.Allocator) ClipboardError!?[]u8 {
+    return null;
+}
+
 pub const Clipboard = struct {
     context: ?*anyopaque = null,
     copy_fn: *const fn (
@@ -215,6 +227,10 @@ pub const Clipboard = struct {
         std.mem.Allocator,
         []const u8,
     ) ClipboardError!bool = copy_file_unavailable,
+    read_text_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+    ) ClipboardError!?[]u8 = read_text_unavailable,
 
     /// Borrows `text` for this call. The caller retains ownership. Returns
     /// `false` when the host has no clipboard implementation.
@@ -233,6 +249,17 @@ pub const Clipboard = struct {
         path: []const u8,
     ) ClipboardError!bool {
         return self.copy_file_fn(self.context, alloc, path);
+    }
+
+    /// Returns the clipboard text, owned by the caller. Returns null when the host
+    /// has no clipboard reader, or when the read worked and found no text (the
+    /// native host maps xclip's "target STRING not available" to this). A failed
+    /// read returns an error instead, so it is never taken for an empty clipboard.
+    pub fn readText(
+        self: Clipboard,
+        alloc: std.mem.Allocator,
+    ) ClipboardError!?[]u8 {
+        return self.read_text_fn(self.context, alloc);
     }
 };
 

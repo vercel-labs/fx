@@ -102,4 +102,5 @@ test {
     _ = @import("core/runner/vercel/exec.zig");
     _ = @import("core/runner/vercel/isolated.zig");
     _ = @import("core/runner/vercel/sandbox.zig");
+    _ = @import("core/input/paste_framing.zig");
 }
