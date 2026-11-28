@@ -10,7 +10,6 @@ const elicitation = @import("../mcp/elicitation.zig");
 const runtime_mod = @import("runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const model = @import("model.zig");
-const mods = if (build_options.libfx) struct {} else @import("../mods/mods.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -112,8 +111,8 @@ pub const Host = struct {
         configs: []const mcp_contract.McpServerConfig,
         inherited: *const std.process.Environ.Map,
         notes: []const []const u8,
-        mod_pins: if (build_options.libfx) struct {} else ?*mods.ModPins,
-        mods_root: if (build_options.libfx) struct {} else ?[]const u8,
+        mod_pins: runtime_mod.ModPinsArg,
+        mods_root: runtime_mod.ModsRootArg,
     ) !void {
         h.notes_mutex.lockUncancelable(h.runtime.io);
         const old = h.notes;

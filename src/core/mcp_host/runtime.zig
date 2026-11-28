@@ -225,6 +225,10 @@ pub const Notify = struct {
     notice: *const fn (context: *anyopaque, notice: Notice) void,
 };
 
+const LibfxNone = struct {};
+pub const ModPinsArg = if (build_options.libfx) LibfxNone else ?*mods.ModPins;
+pub const ModsRootArg = if (build_options.libfx) LibfxNone else ?[]const u8;
+
 pub const Options = struct {
     client_version: []const u8,
     /// Where sign-in credentials are kept. `.detect` names the home whose
@@ -250,8 +254,8 @@ pub const Options = struct {
     /// Null runs every server here, as before.
     share: ?Share = null,
     /// Enabled mod pins held by the runtime while loaded or serving (`tests/tla/mods/ModServe.tla` ServersPinned).
-    mod_pins: if (build_options.libfx) struct {} else ?*mods.ModPins = if (build_options.libfx) .{} else null,
-    mods_root: if (build_options.libfx) struct {} else ?[]const u8 = if (build_options.libfx) .{} else null,
+    mod_pins: ModPinsArg = if (build_options.libfx) .{} else null,
+    mods_root: ModsRootArg = if (build_options.libfx) .{} else null,
 };
 
 /// Where this session's shared servers come from.
@@ -355,8 +359,8 @@ const Request = struct {
         reload: struct {
             configs: []const mcp_contract.McpServerConfig,
             inherited: *const std.process.Environ.Map,
-            mod_pins: if (build_options.libfx) struct {} else ?*mods.ModPins = if (build_options.libfx) .{} else null,
-            mods_root: if (build_options.libfx) struct {} else ?[]const u8 = if (build_options.libfx) .{} else null,
+            mod_pins: ModPinsArg = if (build_options.libfx) .{} else null,
+            mods_root: ModsRootArg = if (build_options.libfx) .{} else null,
         },
 
         /// Whether handling it could start a server.
@@ -556,9 +560,9 @@ pub const Runtime = struct {
         fn deinit(_: *@This(), _: Allocator) void {}
         fn releaseAll(_: *@This(), _: Allocator) void {}
         fn onSlotDestroyed(_: *@This(), _: Allocator, _: u64) void {}
-        fn prepare(_: *@This(), _: Allocator, _: std.Io, _: struct {}, _: struct {}, _: []mcp.engine.Config, _: []const usize, _: []const config.Server, _: ?*const mcp.engine.Engine) !void {}
+        fn prepare(_: *@This(), _: Allocator, _: std.Io, _: ModPinsArg, _: ModsRootArg, _: []mcp.engine.Config, _: []const usize, _: []const config.Server, _: ?*const mcp.engine.Engine) !void {}
         fn rollback(_: *@This(), _: Allocator) void {}
-        fn commit(_: *@This(), _: Allocator, _: struct {}) void {}
+        fn commit(_: *@This(), _: Allocator, _: ModPinsArg) void {}
     } else struct {
         io: std.Io = undefined,
         mods_root: ?[]u8 = null,
@@ -1069,8 +1073,8 @@ pub const Runtime = struct {
         r: *Runtime,
         configs: []const mcp_contract.McpServerConfig,
         inherited: *const std.process.Environ.Map,
-        mod_pins: if (build_options.libfx) struct {} else ?*mods.ModPins,
-        mods_root: if (build_options.libfx) struct {} else ?[]const u8,
+        mod_pins: ModPinsArg,
+        mods_root: ModsRootArg,
     ) Error!Reloaded {
         var req: Request = .{ .kind = .{ .reload = .{ .configs = configs, .inherited = inherited, .mod_pins = mod_pins, .mods_root = mods_root } }, .alloc = r.gpa };
         try r.submit(&req, null);
@@ -2330,8 +2334,8 @@ pub const Runtime = struct {
         r: *Runtime,
         configs: []const mcp_contract.McpServerConfig,
         inherited: *const std.process.Environ.Map,
-        mod_pins: if (build_options.libfx) struct {} else ?*mods.ModPins,
-        mods_root: if (build_options.libfx) struct {} else ?[]const u8,
+        mod_pins: ModPinsArg,
+        mods_root: ModsRootArg,
     ) !Reloaded {
         var scratch: std.heap.ArenaAllocator = .init(r.gpa);
         defer scratch.deinit();
