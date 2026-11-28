@@ -419,12 +419,17 @@ pub fn run(c: Context, args: []const []const u8) u8 {
     const arena = arena_state.allocator();
     const code = runParsed(c, arena, args) catch |err| code: {
         debug_trace.logf("mcp", "MCP verb failed args0={s} err={s}", .{ if (args.len > 0) args[0] else "", @errorName(err) });
-        c.err.print("{s}: {s}\n", .{ c.surface.prog(), describe(err) }) catch {};
-        break :code 1;
+        break :code reportFailure(c.err, c.surface, err);
     };
     c.out.flush() catch {};
     c.err.flush() catch {};
     return code;
+}
+
+/// The exit code for a verb that failed, after saying why on `err_writer`.
+fn reportFailure(err_writer: *Writer, surface: Surface, err: anyerror) u8 {
+    err_writer.print("{s}: {s}\n", .{ surface.prog(), describe(err) }) catch {};
+    return 1;
 }
 
 /// `fx mcp list --json` and `show --json` report a usage error as the JSON
@@ -1478,6 +1483,20 @@ pub fn isValidServerName(name: []const u8) bool {
         return false;
     }
     return true;
+}
+
+test "a verb that ends on a hang-up exits 129 and says nothing" {
+    var err: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+    try testing.expectEqual(@as(u8, 129), reportFailure(&err.writer, .cli, error.TerminalHungUp));
+    try testing.expectEqualStrings("", err.written());
+}
+
+test "a verb that fails for another reason says it in fx's words and exits 1" {
+    var err: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+    try testing.expectEqual(@as(u8, 1), reportFailure(&err.writer, .cli, error.OutOfMemory));
+    try testing.expectEqualStrings("fx mcp: out of memory\n", err.written());
 }
 
 test "a server name is letters, digits, underscores, and hyphens" {
