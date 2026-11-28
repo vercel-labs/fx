@@ -5,7 +5,7 @@
 // `fx replay`, and the highlight from the bytes fx wrote for it, so these
 // tests check what the terminal showed, not the live pane alone.
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
@@ -450,6 +450,58 @@ test.skipIf(!tmuxAvailable())("Tab over the open /effort menu leaves its query a
   expect(rows.filter((row) => /^┃ \/model \S/.test(row))).toEqual([]);
 }, TIMEOUT);
 
+test.skipIf(!tmuxAvailable())("the /effort menu sets an image draft aside while its query filters, and gives it back on Esc", async () => {
+  const current = await launch();
+  const { session } = current;
+  const image = join(current.root, "workspace", "i.png");
+  writeFileSync(image, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64"));
+  await session.sendHexBytes([...Buffer.from(`\x1b[200~${image}\x1b[201~`)].map((byte) => byte.toString(16).padStart(2, "0")));
+  await session.waitForPane((pane) => /^┃ \[Image 1\]/m.test(pane), 5_000);
+  await session.sendLiteral("/effort");
+  await session.sendKeys("Enter");
+  await waitForEffortMenu(current);
+  // The query starts empty: the image waits outside the composer.
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ \[Image 1\]/m.test(pane), 5_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await session.sendKeys("C-u");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=escape query_bytes=1 pasted_blocks=0 image_tokens=0 skill_tokens=0 draft_restored=true");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("a failed prompt that fx gives back closes the open /effort menu and stays in the composer", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let attempts = 0;
+  const current = await launch({
+    respond: (body) => {
+      if (!body.includes("first question")) return fakeGatewayFinalText("ANSWER");
+      attempts += 1;
+      // A dropped stream, which fx resends, then a reply no retry can fix,
+      // so the turn stops and gives the prompt back.
+      if (attempts === 1) return held.then(() => new Response("", { headers: { "content-type": "text/event-stream" } }));
+      return new Response(`data: ${"[".repeat(300)}${"]".repeat(300)}\n\n`, { headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  const { session } = current;
+  await session.sendText("first question");
+  await session.waitForText("Thinking", 10_000);
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  release();
+  await session.waitForPane((pane) => /^┃ first question$/m.test(pane) && !pane.includes("Effort "), 20_000);
+  expect(attempts).toBe(2);
+  expect(savedEffort(current)).toBeUndefined();
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await session.sendKeys("C-u");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=failed_prompt_restored query_bytes=1");
+}, TIMEOUT);
+
 test.skipIf(!tmuxAvailable())("switching models from the out-of-credits card closes the open /effort menu, and the prompt, not its query, comes back as the draft", async () => {
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
@@ -479,7 +531,9 @@ test.skipIf(!tmuxAvailable())("switching models from the out-of-credits card clo
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
   await session.sendKeys("C-u");
   await quit(current);
-  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=worker_model_picker query_bytes=1");
+  // The card gives the prompt back before it opens the picker, and that
+  // closes the menu first.
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=failed_prompt_restored query_bytes=1");
 }, TIMEOUT);
 
 test.skipIf(!tmuxAvailable())("a level the model does not offer, or a malformed one, changes nothing and names the levels", async () => {
