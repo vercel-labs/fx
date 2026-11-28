@@ -7089,23 +7089,23 @@ test "a review gets a reader for stored answers only when a result store exists"
     try std.testing.expect((try storedResultsFor(input, arena_state.allocator())) != null);
 }
 
-fn gateRetargetFixture(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+fn retargetWorkspaceFixture(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     try tmp.dir.createDirPath(std.testing.io, "workspace/a");
     try tmp.dir.createDirPath(std.testing.io, "workspace/b");
     try tmp.dir.symLink(std.testing.io, "a", "workspace/link", .{ .is_directory = true });
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
 }
 
-fn gateRetarget(tmp: *std.testing.TmpDir) !void {
+fn retargetWorkspaceLink(tmp: *std.testing.TmpDir) !void {
     try tmp.dir.deleteFile(std.testing.io, "workspace/link");
     try tmp.dir.symLink(std.testing.io, "b", "workspace/link", .{ .is_directory = true });
 }
 
-test "gate 2582: a once approval of a/ never covers b/ after a looser-policy recheck (yolo then ask)" {
+test "a once approval of a/ never covers b/ after a looser-policy recheck (yolo then ask)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const workspace = try gateRetargetFixture(alloc, &tmp);
+    const workspace = try retargetWorkspaceFixture(alloc, &tmp);
     defer alloc.free(workspace);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -7117,13 +7117,13 @@ test "gate 2582: a once approval of a/ never covers b/ after a looser-policy rec
     input.workspace_root = workspace;
     input.permission_prompter = recording.prompter();
     const call: ToolCall = .{
-        .id = "gate-retarget",
+        .id = "retarget-write",
         .name = "write_file",
         .arguments_json = try arena.print("{{\"path\":\"{s}/link/note.txt\",\"content\":\"x\\n\"}}", .{workspace}),
     };
     const initial = try requestPermissionOutcome(input, arena, call, .ask, &.{});
     try std.testing.expectEqual(@as(usize, 1), recording.calls);
-    try gateRetarget(&tmp);
+    try retargetWorkspaceLink(&tmp);
     const first = try revalidateLiveActionPermissionOutcome(input, arena, call, .yolo, &.{}, initial.execution_authority.?, .once);
     try std.testing.expect(!first.decision.isDenied());
     const second = try revalidateLiveActionPermissionOutcome(input, arena, call, .ask, &.{}, first.execution_authority.?, .once);
@@ -7132,7 +7132,7 @@ test "gate 2582: a once approval of a/ never covers b/ after a looser-policy rec
     try std.testing.expectEqual(@as(usize, 2), recording.calls);
 }
 
-test "gate 2582: no-op write under a read ask rule keeps once approval across one recheck" {
+test "no-op write under a read ask rule keeps once approval across one recheck" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
