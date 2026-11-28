@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
+import { startFakeIssuer, writeFxLogin } from "./fx-login-fakes";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -342,7 +343,7 @@ async function saveGroup(home: string, workspace: string): Promise<string[]> {
         await session.waitForComposer(15_000);
       }
       await session.sendText(`HOST_${letter} first run`);
-      await session.waitForPane((pane) => pane.includes(`HOST_ANSWER_${letter}`) && turnSettled(pane), 30_000);
+      await session.waitForReplyAndTurnEnd(`HOST_ANSWER_${letter}`, 30_000);
     }
     await quitWith(session, "/exit");
   });
@@ -566,6 +567,14 @@ function sameTurn(base: (body: string) => Response, gates: { later?: Gate; child
 }
 
 // Whether the trace log at `path` holds `text` yet.
+async function until(what: string, done: () => boolean, ms = 30_000) {
+  const deadline = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await Bun.sleep(50);
+  }
+}
+
 function traceHas(path: string, text: string): boolean {
   return existsSync(path) && readFileSync(path, "utf8").includes(text);
 }
@@ -805,7 +814,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         expect(shownAnswers(launched)).toEqual([]);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_D launched");
-        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_D") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("HOST_ANSWER_D", 30_000);
 
         // Closing it leaves the others running; the row above it, fx 2,
         // comes on screen, not the first.
@@ -921,7 +930,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       await withHost(answerByLetter, { instances: 2 }, async ({ session }) => {
         await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
         await session.sendText("HOST_A first");
-        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("HOST_ANSWER_A", 30_000);
 
         // Down shows fx 2, which has no conversation yet.
         await session.sendKeys("C-x");
@@ -956,7 +965,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       await withHost(answerByLetter, { instances: 2 }, async ({ session }) => {
         await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
         await session.sendText("HOST_A first");
-        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("HOST_ANSWER_A", 30_000);
 
         // The list opens on the first instance, the one on screen.
         await session.sendKeys("C-x");
@@ -990,7 +999,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_B before new");
-        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_B") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("HOST_ANSWER_B", 30_000);
 
         // A session command runs on any instance, as on the first.
         await session.sendText("/new");
@@ -1130,7 +1139,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // So does main, which is in ask mode itself.
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_3 RUN[${command}]`);
-        await session.waitForPane((pane) => pane.includes("GRANT_DONE_3") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("GRANT_DONE_3", 30_000);
         expect(countLines(log)).toBe(5);
 
         // The grant shows in the session's permissions.
@@ -1165,7 +1174,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
         await session.waitForComposer(15_000);
         await showNamedAgent(session, "main");
         await session.sendText("GRANT_3 FILE[grant-main]");
-        await session.waitForPane((pane) => pane.includes("GRANT_DONE_3") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("GRANT_DONE_3", 30_000);
         expect(existsSync(join(workspace, "grant-main.txt"))).toBe(true);
 
         await session.sendText("/permissions");
@@ -1242,7 +1251,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
         // So does main, which is in ask mode itself.
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_3 RUN[${command}]`);
-        await session.waitForPane((pane) => pane.includes("GRANT_DONE_3") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("GRANT_DONE_3", 30_000);
         expect(countLines(log)).toBe(5);
 
         await session.sendText("/permissions");
@@ -1313,7 +1322,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
         await session.sendText(`GRANT_2 RUN[${command}]`);
         await waitShows(session, "main's command prompt", (pane) => asking(pane, "") && !pane.includes("Subagent"));
         await session.sendKeys("1");
-        await session.waitForPane((pane) => pane.includes("GRANT_DONE_2") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("GRANT_DONE_2", 30_000);
 
         await session.sendText("/permissions");
         await waitShows(session, "no session grants", (pane) => /^ {2}Session grants {2,}none/m.test(pane), 15_000);
@@ -1713,12 +1722,12 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
       await withHost(answerByLetter, { instances: 3 }, async ({ home, session }) => {
         await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
         await session.sendText("HOST_A first");
-        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("HOST_ANSWER_A", 30_000);
         await switchAgent(session, "next");
         await session.waitForPane((pane) => pane.includes("fx 2/3"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_B second");
-        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_B") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("HOST_ANSWER_B", 30_000);
 
         // Close the first: the second takes over as fx 1, as it was.
         await switchAgent(session, 1);
@@ -1886,7 +1895,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
       try {
         await withHost(answerByLetter, { remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
           await session.sendText("HOST_A alone");
-          await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
+          await session.waitForReplyAndTurnEnd("HOST_ANSWER_A", 30_000);
           expect(hostRecords(home)).toEqual([]);
           await session.sendText("/launch");
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
@@ -2066,7 +2075,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("CLOSE_USER start a slow helper");
-          await session.waitForPane((pane) => pane.includes("CLOSE_MAIN_FINAL") && turnSettled(pane), 45_000);
+          await session.waitForReplyAndTurnEnd("CLOSE_MAIN_FINAL", 45_000);
           await session.waitForPane(() => releases.length > 0 && hostRecords(home).some((ids) => ids.length === 2), 15_000);
           closedId = hostRecords(home).find((ids) => ids.length === 2)![1]!;
           // Closed while slowpoke still works.
@@ -2136,7 +2145,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("SWITCH_USER start a slow helper");
-          await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL") && turnSettled(pane), 45_000);
+          await session.waitForReplyAndTurnEnd("SWITCH_MAIN_FINAL", 45_000);
           await session.waitForPane(() => releases.length > 0 && hostRecords(home).some((ids) => ids.length === 2), 15_000);
           oldId = hostRecords(home).find((ids) => ids.length === 2)![1]!;
           // A new session in fx 2 while slowpoke still works.
@@ -2144,7 +2153,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
           await session.waitForText("stopped 1 running subagent task", 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("AFTER_NEW go on");
-          await session.waitForPane((pane) => pane.includes("AFTER_NEW_ANSWER") && turnSettled(pane), 30_000);
+          await session.waitForReplyAndTurnEnd("AFTER_NEW_ANSWER", 30_000);
           // fx 2 moved to its new session, and fx 1 kept its own.
           await session.waitForPane(() => hostRecords(home).some((ids) => ids.length === 2 && ids[1] !== oldId), 15_000);
           await session.sendText("/exit");
@@ -2191,7 +2200,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("KEEP_USER start a keeper");
-          await session.waitForPane((pane) => pane.includes("KEEP_MAIN_REPORTED") && turnSettled(pane), 45_000);
+          await session.waitForReplyAndTurnEnd("KEEP_MAIN_REPORTED", 45_000);
           await session.sendText("/exit");
           await session.waitForSessionEnd(15_000);
         });
@@ -2246,7 +2255,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
         await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("TREE_USER_PLAIN start a plain helper");
-        await session.waitForPane((pane) => pane.includes("TREE_PLAIN_FINAL") && turnSettled(pane), 45_000);
+        await session.waitForReplyAndTurnEnd("TREE_PLAIN_FINAL", 45_000);
         await session.waitForComposer(15_000);
         await session.sendText("TREE_USER_BUILDER start a builder");
         await session.waitForText("TREE_BUILDER_FINAL", 45_000);
@@ -2993,7 +3002,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
         // fx 1 runs in main, and fx 2 is launched in `limited`.
         await withHost(answerByLetter, { remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
           await session.sendText("HOST_A first run");
-          await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
+          await session.waitForReplyAndTurnEnd("HOST_ANSWER_A", 30_000);
           await session.waitForComposer(15_000);
           await session.sendText("/launch limited");
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
@@ -3142,12 +3151,12 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
       const bodies = await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
         await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
         await session.sendText("HOST_A first");
-        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("HOST_ANSWER_A", 30_000);
         await switchAgent(session, 2);
         await session.waitForPane((pane) => pane.includes("fx 2/3"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_B second");
-        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_B") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("HOST_ANSWER_B", 30_000);
         await switchAgent(session, 1);
         await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
         await session.waitForComposer(15_000);
@@ -3273,6 +3282,90 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
   );
 
   test(
+    "an instance launched after another closed still says its sign-in refresh failed",
+    async () => {
+      // A failure's notice shows once on each screen. An instance launched in
+      // place of a closed one is a new screen, even when it takes the same
+      // memory, so its prompt says why it waits instead of only "Thinking".
+      const issuer = startFakeIssuer({ refresh: () => new Response("unavailable", { status: 500 }) });
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-instances-")));
+      const trace = join(home, "fx-trace.log");
+      const awaiting = () => (existsSync(trace) ? readFileSync(trace, "utf8") : "").split("pending_prompt_awaiting_auth").length - 1;
+      const notices = (pane: string) => pane.split("credential refresh failed").length - 1;
+      writeFxLogin(home, issuer.issuerUrl, "seeded-token");
+      try {
+        await withHost(answerByLetter, {
+          reuse: { home, workspace },
+          settings: { credential_source: "fx_login" },
+          env: {
+            // Empty counts as unset, so the saved fx login is the credential.
+            AI_GATEWAY_API_KEY: "",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+            FX_TRACE_LOG: trace,
+            FX_TRACE_SCOPES: "input",
+          },
+        }, async ({ session }) => {
+          // One answered prompt first takes the credential fx refreshed at
+          // startup, so the prompts below refresh the saved login again.
+          await session.sendText("HOST_A warm up");
+          await session.waitForReplyAndTurnEnd("HOST_ANSWER_A", 30_000);
+          await session.sendText("/launch");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await switchAgent(session, 1);
+          await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+
+          // The saved login is past its refresh deadline, and the issuer
+          // cannot refresh it: fx 1 and then fx 2 each show the failure.
+          writeFxLogin(home, issuer.issuerUrl, "seeded-token", { expiresAtMs: Date.now() - 120_000 });
+          let before = awaiting();
+          await session.sendText("NOTICE_ON_FX1");
+          await until("fx 1's prompt waits", () => awaiting() > before);
+          expect(notices(await session.waitForPane((pane) => notices(pane) > 0, 15_000))).toBe(1);
+          await session.sendKeys("C-c");
+
+          await switchAgent(session, 2);
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          before = awaiting();
+          await session.sendText("NOTICE_ON_FX2");
+          await until("fx 2's prompt waits", () => awaiting() > before);
+          expect(notices(await session.waitForPane((pane) => notices(pane) > 0, 15_000))).toBe(1);
+          await session.sendKeys("C-c");
+          await session.waitForComposer(15_000);
+
+          // Close fx 2 from the agent list, then launch a new one while the
+          // same failure is still recorded.
+          await session.sendKeys("Down");
+          await waitForSelected(session, "fx 2");
+          await session.sendKeys("BSpace");
+          await session.waitForText("press delete again to close this instance", 10_000);
+          await session.sendKeys("BSpace");
+          await session.waitForPane((pane) => !instanceRow(2).test(pane) && pane.includes(LIST_HINT), 15_000);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+          await session.sendText("/launch");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+
+          before = awaiting();
+          await session.sendText("NOTICE_ON_NEW_FX2");
+          await until("the new fx 2's prompt waits", () => awaiting() > before);
+          const shown = await session.waitForPane((pane) => pane.includes("NOTICE_ON_NEW_FX2") && notices(pane) > 0, 15_000);
+          expect(notices(shown)).toBe(1);
+          expect(shown).toContain("press enter to retry. Your prompt is saved.");
+        });
+      } finally {
+        issuer.stop();
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "closing the shown instance from the agent list shows the row above it, one row at a time",
     async () => {
       await withHost(answerByLetter, { instances: 4 }, async ({ session }) => {
@@ -3285,7 +3378,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
           }
           await session.waitForComposer(15_000);
           await session.sendText(`HOST_${letter} hello`);
-          await session.waitForPane((pane) => pane.includes(`HOST_ANSWER_${letter}`) && turnSettled(pane), 30_000);
+          await session.waitForReplyAndTurnEnd(`HOST_ANSWER_${letter}`, 30_000);
         }
         await switchAgent(session, 4);
         await session.waitForPane((pane) => pane.includes("fx 4/4"), 15_000);
@@ -3367,7 +3460,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
         await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("LIST_USER start a helper");
-        await session.waitForPane((pane) => pane.includes("LIST_MAIN_FINAL") && turnSettled(pane), 30_000);
+        await session.waitForReplyAndTurnEnd("LIST_MAIN_FINAL", 30_000);
         await session.waitForComposer(15_000);
         // fx 1's subagent comes right after it when switching.
         await switchAgent(session, "next");

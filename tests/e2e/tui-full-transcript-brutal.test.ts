@@ -1325,7 +1325,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Read saved.txt completely.");
-      await active.waitForPane((pane) => pane.includes("Saved read complete.") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("Saved read complete.", TIMEOUT);
       for (const width of [100, 80]) {
         await active.resizeWindow(width, 32);
         await active.sendHexBytes(CTRL_O);
@@ -1391,7 +1391,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Build a tall transcript.");
-      await active.waitForPane((pane) => pane.includes(tallTail) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(tallTail, TIMEOUT);
       await active.sendHexBytes(CTRL_O);
       const full = await active.waitForText(FULL_FOOTER, TIMEOUT);
       const rows = full.split("\n");
