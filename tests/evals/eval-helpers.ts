@@ -524,6 +524,8 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   "FX_TEST_GATEWAY_CREDITS_URL",
   "FX_TEST_UPGRADE_BASE_URL",
   "FX_PERMISSION_MODE",
+  // A developer's provider choice would send a test to a login it did not set up.
+  "FX_PROVIDER",
   "FX_HOME",
   // A developer's terminal recording would start on every test's fx, and the
   // bridge of the fx session that started their tmux server would point
