@@ -45,54 +45,19 @@ import {
 } from "./tmux-helpers";
 
 const tmuxTest = test.skipIf(!tmuxAvailable());
-const ISOLATED_KEYS = [
-  "AI_GATEWAY_API_KEY",
-  "VERCEL_OIDC_TOKEN",
-  "VERCEL_TOKEN",
-  "FX_TEST_GATEWAY_CHAT_URL",
-  "FX_TEST_GATEWAY_MODELS_URL",
-  "FX_TEST_GATEWAY_CREDITS_URL",
-  "FX_PROVIDER",
-  // A developer's terminal recording and the bridge of the fx session that
-  // started their tmux server must not reach a test's fx.
-  "FX_DEBUG_RECORD",
-  "FX_DEBUG_RECORD_SILENT_BANNER",
-  "FX_RECORD",
-  "FX_RECORD_INPUT",
-  "FX_MCP_CALL_SOCKET",
-  "FX_MCP_CALL_TOKEN",
-  // A terminal's program resume token must not reach a test's fx.
-  "OSC7577_TOKEN",
-  // A test hold left there would stop every test's fx at it.
-  "FX_TEST_REPORT_DELIVERY_HELD",
-  "FX_TEST_REPORT_DELIVERY_RELEASE",
-  "FX_TEST_SESSION_WRITE_HELD",
-  "FX_TEST_SESSION_WRITE_RELEASE",
-  "FX_TEST_SHELL_YIELD_HELD",
-  "FX_TEST_SHELL_YIELD_RELEASE",
-  "FX_TEST_SHUTDOWN_RELEASE_HELD",
-  "FX_TEST_SHUTDOWN_RELEASE_RELEASE",
-  "FX_TEST_SUBAGENT_CLOSE_HELD",
-  "FX_TEST_SUBAGENT_CLOSE_RELEASE",
-  "FX_TEST_SUBAGENT_END_HELD",
-  "FX_TEST_SUBAGENT_END_RELEASE",
-  "FX_TEST_SUBAGENT_PUBLISH_HELD",
-  "FX_TEST_SUBAGENT_PUBLISH_RELEASE",
-  "FX_TEST_SUBAGENT_SETTLE_HELD",
-  "FX_TEST_SUBAGENT_SETTLE_RELEASE",
-  "FX_TEST_SUBAGENT_START_HELD",
-  "FX_TEST_SUBAGENT_START_RELEASE",
-  "FX_TEST_WORKSPACE_CAPTURE_START_HELD",
-  "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE",
-  "FX_TEST_WEB_FETCH_DNS_READY",
-  "FX_TEST_WEB_FETCH_DNS_RELEASE",
-  "FX_TEST_GREP_RELEASE",
-  "FX_TEST_ACP_PROMPT_TERMINAL_READY",
-  "FX_TEST_ACP_PROMPT_REAP_READY",
-  "FX_TEST_ACP_PROMPT_RELEASE",
-  "FX_TEST_ACP_PERMISSION_READY",
-  "FX_TEST_ACP_PERMISSION_RELEASE",
-] as const;
+const TMUX_DEFAULT_TEST_SWITCHES = new Set<string>([
+  "FX_TEST_SKIP_ONBOARDING",
+  "FX_TEST_SKIP_WORKSPACE_TRUST",
+  "FX_TEST_INPUT_LOOP_NETWORK_GUARD",
+]);
+const UNIT_ONLY_TEST_ENV_KEYS = new Set<string>([
+  "FX_TEST_AI_GATEWAY_API_KEY",
+  "FX_TEST_C04_STREAM_ANSI_OSC8_FIXTURE",
+  "FX_TEST_MCP_OAUTH_CREDENTIALS_V1",
+  "FX_TEST_SHELL_PARITY_ALL_SHELLS",
+  "FX_TEST_SNAPSHOT_MARKER",
+  "FX_TEST_TERM",
+]);
 const tmuxFxTest = test.skipIf(!tmuxAvailable() || !existsSync(FX_BIN));
 const HELD_ENV_REPLY = "NO_HOLD_REACHED_FX";
 const HELD_ENV_WAIT_MS = 15_000;
@@ -390,10 +355,10 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
   const probePath = join(root, "probe.mjs");
   const resultPath = join(root, "result.json");
   const originalValues = new Map(
-    ISOLATED_KEYS.map((key) => [key, process.env[key]] as const),
+    DEFAULT_UNSET_ENV_KEYS.map((key) => [key, process.env[key]] as const),
   );
   const staleValues = Object.fromEntries(
-    ISOLATED_KEYS.map((key) => [key, `stale-${key.toLowerCase()}`]),
+    DEFAULT_UNSET_ENV_KEYS.map((key) => [key, `stale-${key.toLowerCase()}`]),
   );
   const seedEnv = {
     ...process.env,
@@ -408,14 +373,14 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
       { env: seedEnv, stdio: "pipe" },
     );
 
-    for (const key of ISOLATED_KEYS) delete process.env[key];
+    for (const key of DEFAULT_UNSET_ENV_KEYS) delete process.env[key];
 
     const explicitCredential = "explicit-auth-sentinel";
     const explicitRecordInput = "explicit-record-input-sentinel";
     writeFileSync(
       probePath,
       `await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({\n` +
-        ISOLATED_KEYS.map((key) =>
+        DEFAULT_UNSET_ENV_KEYS.map((key) =>
           `  ${JSON.stringify(key)}: process.env[${JSON.stringify(key)}] ?? null,\n`
         ).join("") +
         "}));\nawait Bun.sleep(5_000);\n",
@@ -442,9 +407,13 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
     // never a stale one.
     expect(observed.FX_RECORD_INPUT).toBe(explicitRecordInput);
     expect(observed.FX_TEST_GATEWAY_CREDITS_URL).toBe(localCreditsEnv({}).FX_TEST_GATEWAY_CREDITS_URL);
-    for (const key of ISOLATED_KEYS) {
+    for (const key of DEFAULT_UNSET_ENV_KEYS) {
       if (key === "AI_GATEWAY_API_KEY" || key === "FX_RECORD_INPUT" || key === "FX_TEST_GATEWAY_CREDITS_URL") continue;
-      expect(observed[key], `${key} reached the pane`).toBeNull();
+      if (TMUX_DEFAULT_TEST_SWITCHES.has(key)) {
+        expect(observed[key], `${key} should use tmux default`).toBe("1");
+      } else {
+        expect(observed[key], `${key} reached the pane`).toBeNull();
+      }
     }
 
     const startCommand = execFileSync(
@@ -486,17 +455,21 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
   }
 });
 
-test("every test hold fx reads is in the tmux launch's isolated keys", () => {
+test("every runtime FX_TEST_* switch fx reads is in DEFAULT_UNSET_ENV_KEYS", () => {
   const src = join(REPO_ROOT, "src");
-  const holds = new Set<string>();
+  const switches = new Set<string>();
   for (const file of readdirSync(src, { recursive: true, encoding: "utf8" })) {
     if (!file.endsWith(".zig")) continue;
     const text = readFileSync(join(src, file), "utf8");
-    for (const match of text.matchAll(/"(FX_TEST_[A-Z0-9_]+_(?:HELD|RELEASE))"/g)) holds.add(match[1]!);
+    for (const match of text.matchAll(/\b(FX_TEST_[A-Z0-9_]+)\b/g)) {
+      if (!UNIT_ONLY_TEST_ENV_KEYS.has(match[1]!)) switches.add(match[1]!);
+    }
   }
-  expect(holds).toContain("FX_TEST_REPORT_DELIVERY_HELD");
-  const isolated = new Set<string>(ISOLATED_KEYS);
-  expect([...holds].filter((name) => !isolated.has(name))).toEqual([]);
+  expect(switches).toContain("FX_TEST_REPORT_DELIVERY_HELD");
+  expect(switches).toContain("FX_TEST_SHELL_QUIET_NOTICE_MS");
+  expect(switches).toContain("FX_TEST_MCP_IDLE_MS");
+  const unset = new Set<string>(DEFAULT_UNSET_ENV_KEYS);
+  expect([...switches].filter((name) => !unset.has(name)).sort()).toEqual([]);
 });
 
 /// The phases of the `workspace_capture` items that the profile's sessions
@@ -874,18 +847,39 @@ test("fxChildEnv drops every name on the unset list and keeps the caller's own",
   expect(inherited.FX_TEST_SHELL_YIELD_HELD).toBe("stale-fx_test_shell_yield_held");
 });
 
-test("buildEvalProcessEnv drops the inherited FX_HOME", () => {
-  const previous = process.env.FX_HOME;
+test("buildEvalProcessEnv drops inherited test switches while keeping credentials and explicit overrides", () => {
+  const prevFxHome = process.env.FX_HOME;
+  const prevBudget = process.env.FX_TEST_RECOVERY_RETRY_BUDGET_MS;
+  const prevQuiet = process.env.FX_TEST_SHELL_QUIET_NOTICE_MS;
+  const prevKey = process.env.AI_GATEWAY_API_KEY;
   process.env.FX_HOME = "/Users/example/profile";
+  process.env.FX_TEST_RECOVERY_RETRY_BUDGET_MS = "100";
+  process.env.FX_TEST_SHELL_QUIET_NOTICE_MS = "250";
+  process.env.AI_GATEWAY_API_KEY = "eval-credential-sentinel";
 
   try {
     const env = buildEvalProcessEnv("/tmp/fx-eval-home-test", "selected/model");
 
     expect(env).not.toHaveProperty("FX_HOME");
+    expect(env).not.toHaveProperty("FX_TEST_RECOVERY_RETRY_BUDGET_MS");
+    expect(env).not.toHaveProperty("FX_TEST_SHELL_QUIET_NOTICE_MS");
+    expect(env.AI_GATEWAY_API_KEY).toBe("eval-credential-sentinel");
     expect(env.HOME).toBe("/tmp/fx-eval-home-test");
+    expect(env.FX_MODEL).toBe("selected/model");
+
+    const explicit = buildEvalProcessEnv("/tmp/fx-eval-home-test", "selected/model", {
+      FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+    });
+    expect(explicit.FX_TEST_RECOVERY_RETRY_BUDGET_MS).toBe("1500");
   } finally {
-    if (previous === undefined) delete process.env.FX_HOME;
-    else process.env.FX_HOME = previous;
+    if (prevFxHome === undefined) delete process.env.FX_HOME;
+    else process.env.FX_HOME = prevFxHome;
+    if (prevBudget === undefined) delete process.env.FX_TEST_RECOVERY_RETRY_BUDGET_MS;
+    else process.env.FX_TEST_RECOVERY_RETRY_BUDGET_MS = prevBudget;
+    if (prevQuiet === undefined) delete process.env.FX_TEST_SHELL_QUIET_NOTICE_MS;
+    else process.env.FX_TEST_SHELL_QUIET_NOTICE_MS = prevQuiet;
+    if (prevKey === undefined) delete process.env.AI_GATEWAY_API_KEY;
+    else process.env.AI_GATEWAY_API_KEY = prevKey;
   }
 });
 
