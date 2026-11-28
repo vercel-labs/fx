@@ -401,6 +401,7 @@ fn currentBuild() update_target.CurrentBuild {
         .channel = compiled_update_channel,
         .version = version,
         .revision = build_options.git_commit,
+        .build = build_options.build_number,
     };
 }
 
