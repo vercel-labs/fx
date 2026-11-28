@@ -111,6 +111,11 @@ pub const WebSearchRequest = struct {
     blocked_domains: []const []const u8 = &.{},
 };
 
+/// `fx tool view PATH`: attach one image file, as the read_file tool attaches it.
+pub const ViewRequest = struct {
+    path: []const u8,
+};
+
 pub const BashToolRequest = union(enum) {
     skill_list,
     skill_open: SkillOpenRequest,
@@ -121,6 +126,7 @@ pub const BashToolRequest = union(enum) {
     agent_close: []const u8,
     web_fetch: WebFetchRequest,
     web_search: WebSearchRequest,
+    view: ViewRequest,
 };
 
 pub const CallStatus = enum { ok, tool_error, failed };

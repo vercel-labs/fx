@@ -563,11 +563,11 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
     // are denied as the core's deny, and the client is told why.
     const file_refused = switch (request.operation) {
         .edit, .write => registration.capability.authorize_file_fn == null,
-        .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => registration.capability.authorize_bash_tool_fn == null,
+        .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search, .view => registration.capability.authorize_bash_tool_fn == null,
         .call, .list, .search, .help => false,
     };
     const authorization: capability_mod.Authorization = if (file_refused) .{ .deny = refusalMessage(.file_tool_unavailable) } else switch (request.operation) {
-        .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => authorizeGated(io, registration, work.id, arena, request_id, request.operation),
+        .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search, .view => authorizeGated(io, registration, work.id, arena, request_id, request.operation),
         .list, .search, .help => .{ .allow = .{} },
     };
     bridge.mutex.lockUncancelable(io);
@@ -644,6 +644,7 @@ fn authorizeGated(
         .agent_close => |agent| registration.capability.authorizeBashTool(arena, request_id, .{ .agent_close = agent }),
         .web_fetch => |value| registration.capability.authorizeBashTool(arena, request_id, .{ .web_fetch = value }),
         .web_search => |value| registration.capability.authorizeBashTool(arena, request_id, .{ .web_search = value }),
+        .view => |value| registration.capability.authorizeBashTool(arena, request_id, .{ .view = value }),
         .list, .search, .help => unreachable, // lookups have no permission check
     };
     return checked catch |err| .{ .deny = arena.print("The permission check for {f} failed: {s}", .{ text_utils.terminalSafe(operation.subject()), @errorName(err) }) catch "The permission check failed." };
@@ -662,7 +663,7 @@ fn runOperation(
     return switch (operation) {
         .call => |value| capability.call(arena, request_id, value.tool, value.arguments_json, allowed, cancel),
         // A gated bash-tool operation's authority holds its call, so tool and arguments are empty.
-        .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => capability.call(arena, request_id, operation.subject(), "", allowed, cancel),
+        .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search, .view => capability.call(arena, request_id, operation.subject(), "", allowed, cancel),
         .list, .search, .help => unreachable, // answered by the lookup above
     };
 }

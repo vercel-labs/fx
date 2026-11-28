@@ -22,6 +22,7 @@ pub const max_input_bytes: usize = wire.max_request_bytes;
 pub const Command = union(enum) {
     edit: []const u8,
     write: []const u8,
+    view: []const u8,
     skill_list,
     skill_open: capability.SkillOpenRequest,
     agent_message: capability.AgentMessageRequest,
@@ -36,6 +37,7 @@ pub const Command = union(enum) {
         return switch (self) {
             .edit => "edit",
             .write => "write",
+            .view => "view",
             .skill_list => "skill list",
             .skill_open => "skill open",
             .agent_message => "agent message",
@@ -51,7 +53,7 @@ pub const Command = union(enum) {
     fn readsStdin(self: Command) bool {
         return switch (self) {
             .edit, .write => true,
-            .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => false,
+            .view, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => false,
         };
     }
 };
@@ -159,9 +161,28 @@ pub fn parse(args: []const []const u8) ParseError!Command {
         }
         return error.UnknownCommand;
     }
+    if (std.mem.eql(u8, verb, "view")) return parseView(args);
     if (std.mem.eql(u8, verb, "web")) return parseWeb(args);
     if (std.mem.eql(u8, verb, "search")) return parseSearch(args);
     return error.UnknownCommand;
+}
+
+/// `fx tool view PATH`: one image path. A `--` ends the options, so a path may start with a dash.
+fn parseView(args: []const []const u8) ParseError!Command {
+    var path: ?[]const u8 = null;
+    var positional_only = false;
+    for (args[1..]) |arg| {
+        if (!positional_only and std.mem.eql(u8, arg, "--")) {
+            positional_only = true;
+            continue;
+        }
+        if (!positional_only and arg.len > 0 and arg[0] == '-') return error.PathIsOption;
+        if (path != null) return error.TooManyArguments;
+        path = arg;
+    }
+    const value = path orelse return error.MissingPath;
+    if (value.len == 0) return error.MissingPath;
+    return .{ .view = value };
 }
 
 /// `fx tool web URL`: one URL. A `--` ends the options, so a URL may start with a dash.
@@ -291,7 +312,7 @@ fn matchOptionValue(args: []const []const u8, index: *usize, comptime flag: []co
 
 /// The words `fx tool` runs, in the order its usage lists them. The unknown-command
 /// text is built from this list, so a new word appears there without an edit.
-const verbs = [_][]const u8{ "edit", "write", "skill", "agent", "web", "search" };
+const verbs = [_][]const u8{ "edit", "write", "view", "skill", "agent", "web", "search" };
 
 /// The verbs as a sentence's list: "a, b, or c".
 const verbs_text: []const u8 = blk: {
@@ -307,6 +328,7 @@ const verbs_text: []const u8 = blk: {
 pub fn writeUsage(w: *Writer, err: ParseError, args: []const []const u8) Writer.Error!void {
     const verb = if (args.len > 0) args[0] else "";
     const sub = if (args.len > 1) args[1] else "";
+    if (std.mem.eql(u8, verb, "view")) return writeViewUsage(w, err);
     if (std.mem.eql(u8, verb, "web")) return writeWebUsage(w, err);
     if (std.mem.eql(u8, verb, "search")) return writeSearchUsage(w, err);
     if (std.mem.eql(u8, verb, "skill")) {
@@ -355,6 +377,15 @@ pub fn writeUsage(w: *Writer, err: ParseError, args: []const []const u8) Writer.
         error.UnknownCommand => try w.print("fx tool: unknown command {f}. Use {s}.\n", .{ text_utils.terminalSafe(verb), verbs_text }),
         error.MissingOptionValue, error.InvalidReport => try w.print("fx tool {s}: invalid usage.\n", .{verb}),
         error.QueryTooShort, error.InvalidQuery, error.BothDomainKinds, error.TooManyDomains => try w.print("fx tool {s}: invalid usage.\n", .{verb}),
+    }
+}
+
+fn writeViewUsage(w: *Writer, err: ParseError) Writer.Error!void {
+    switch (err) {
+        error.MissingPath => try w.writeAll("fx tool view: give the image to view, as in fx tool view PATH.\n"),
+        error.TooManyArguments => try w.writeAll("fx tool view: give one image, as in fx tool view PATH.\n"),
+        error.PathIsOption, error.UnknownOption => try w.writeAll("fx tool view: the image must be a path, not an option; put -- before a path that starts with a dash.\n"),
+        else => try w.writeAll("fx tool view: invalid usage.\n"),
     }
 }
 
@@ -435,6 +466,7 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
     const cwd = try std.process.currentPathAlloc(io, arena);
     const resolved_command: Command = switch (command) {
         .edit => |path| .{ .edit = try resolveCommandPath(arena, cwd, path) },
+        .view => |path| .{ .view = try resolveCommandPath(arena, cwd, path) },
         .write => |path| .{ .write = try resolveCommandPath(arena, cwd, path) },
         .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => command,
     };
@@ -520,6 +552,7 @@ pub fn send(
             }
             break :blk .{ .write = .{ .path = path, .content = input } };
         },
+        .view => |path| .{ .view = .{ .path = path } },
         .skill_list => .skill_list,
         .skill_open => |req| .{ .skill_open = req },
         .agent_message => |req| .{ .agent_message = req },
@@ -640,7 +673,7 @@ const FakeBridge = struct {
             .write => |write| self.written = write.content,
             .web_fetch => |value| self.fetched = value,
             .web_search => |value| self.searched = value,
-            .call, .list, .search, .help, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => {},
+            .call, .list, .search, .help, .view, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => {},
         }
         return self.reply;
     }
@@ -1034,11 +1067,12 @@ test "the unknown-command text names every word fx tool runs, and each named wor
     const arena = arena_state.allocator();
     var out: std.Io.Writer.Allocating = .init(arena);
     try writeUsage(&out.writer, error.UnknownCommand, &.{"nope"});
-    try std.testing.expect(std.mem.find(u8, out.written(), "Use edit, write, skill, agent, web, or search.") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "Use edit, write, view, skill, agent, web, or search.") != null);
 
     const words = [_][]const []const u8{
         &.{ "edit", "x" },
         &.{ "write", "x" },
+        &.{ "view", "img.png" },
         &.{ "skill", "list" },
         &.{ "agent", "wait" },
         &.{ "web", "https://a.example" },
@@ -1103,6 +1137,22 @@ test "fx tool writes the notice before all of the data when stdout and stderr ar
     try err.interface.flush();
     try std.testing.expectEqual(client.exit.ok, code);
     try std.testing.expectEqualStrings("the notice, which is longer than the buffer\n" ++ page ++ "\n", log.items);
+}
+
+test "parse reads view's one path, and -- ends its options" {
+    try std.testing.expectEqualStrings("img.png", (try parse(&.{ "view", "img.png" })).view);
+    try std.testing.expectEqualStrings("-x.png", (try parse(&.{ "view", "--", "-x.png" })).view);
+    try std.testing.expectError(error.MissingPath, parse(&.{"view"}));
+    try std.testing.expectError(error.TooManyArguments, parse(&.{ "view", "a.png", "b.png" }));
+    try std.testing.expectError(error.PathIsOption, parse(&.{ "view", "-x.png" }));
+}
+
+test "view's usage error says what to give, and the exit code is usage" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var out: std.Io.Writer.Allocating = .init(arena_state.allocator());
+    try writeUsage(&out.writer, error.MissingPath, &.{"view"});
+    try std.testing.expect(std.mem.find(u8, out.written(), "give the image to view, as in fx tool view PATH.") != null);
 }
 
 test "parse reads skill and agent verbs with options, and rejects bad usage" {

@@ -110,6 +110,12 @@ pub fn toolCall(
             try out.writer.writeByte('}');
             return .{ .id = request_id, .name = "subagent", .arguments_json = out.written() };
         },
+        .view => |req| {
+            try out.writer.writeAll("{\"path\":");
+            try std.json.Stringify.value(req.path, .{}, &out.writer);
+            try out.writer.writeByte('}');
+            return .{ .id = request_id, .name = "read_file", .arguments_json = out.written() };
+        },
         .web_fetch => |req| {
             try out.writer.writeAll("{\"url\":");
             try std.json.Stringify.value(req.url, .{}, &out.writer);
@@ -211,6 +217,15 @@ test "a web request runs as the web tool's own call, with its url, query, and do
     const blocked = [_][]const u8{"spam.example"};
     const blocked_call = try toolCall(arena, "req-4", .{ .web_search = .{ .query = "zig", .blocked_domains = &blocked } }, "");
     try std.testing.expectEqualStrings("{\"query\":\"zig\",\"blocked_domains\":[\"spam.example\"]}", blocked_call.arguments_json);
+}
+
+test "a view request runs as the read_file call with its path" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const viewed = try toolCall(arena, "req-5", .{ .view = .{ .path = "/w/img.png" } }, "");
+    try std.testing.expectEqualStrings("read_file", viewed.name);
+    try std.testing.expectEqualStrings("{\"path\":\"/w/img.png\"}", viewed.arguments_json);
 }
 
 test "bridged skill open names a missing skill and the command that lists names" {

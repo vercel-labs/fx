@@ -64,6 +64,8 @@ const file_mutation_execution = @import("file_mutation_execution.zig");
 const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
+const image_data = @import("../images/image_data.zig");
+const read_file_impl = @import("../../tools/filesystem/read_file.zig");
 const mcp_call_capability = tool_bridge.capability;
 const bash_tool_requests = @import("bash_tool_requests.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
@@ -1000,6 +1002,8 @@ fn executeRegisteredTool(
     var mcp_execution_error: ?anyerror = null;
     var dispatch_metadata: DispatchMetadata = .{};
     var bridge_usage = BridgeUsage{ .total = &dispatch_metadata.inner_usage };
+    var bridge_images = BridgeImages{};
+    defer bridge_images.deinit();
     var subagent_provider = SubagentProviderState{
         .runtime = ctx,
         .call = call,
@@ -1035,6 +1039,7 @@ fn executeRegisteredTool(
     if ((ctx.mcp_ctx != null and ctx.mcp_call_tool != null) or bash_program) {
         mcp_call_bridge.file_ops = bash_program;
         mcp_call_bridge.usage = &bridge_usage;
+        if (bash_program) mcp_call_bridge.images = &bridge_images;
         dispatch_ctx.mcp_call_capability = mcp_call_bridge.capability();
     }
     dispatch_ctx.toolbox_run = toolbox_run.capability();
@@ -1101,6 +1106,11 @@ fn executeRegisteredTool(
             execution.cancelled = true;
         }
     }
+    // The bash call has returned, so its bridge calls are finished and no handler writes the
+    // images now. A canceled call keeps them in bridge_images, which its defer frees (R3.9).
+    if (comptime tool_bridge.supported) {
+        if (bash_program) try attachBridgeImages(arena, &execution, &bridge_images);
+    }
     return execution;
 }
 
@@ -1112,6 +1122,8 @@ const McpCallBridgeState = struct {
     file_ops: bool = false,
     /// The bash call's usage total, set for the bash tool's bridge only.
     usage: ?*BridgeUsage = null,
+    /// The images the bash call's `fx tool view` requests attach to its result, set for the bash tool's bridge only.
+    images: ?*BridgeImages = null,
 
     fn capability(self: *McpCallBridgeState) mcp_call_capability.Capability {
         return .{
@@ -1144,6 +1156,49 @@ const BridgeUsage = struct {
     }
 };
 
+/// The images a bash call's `fx tool view` requests attach to the call's result. The
+/// bridge adds them on its own thread while the bash call's thread may allocate from the
+/// call's arena, which is not thread-safe, so the images live in page_allocator and every
+/// use is under `lock`. The bash call copies them out after `unregister` returns.
+const BridgeImages = struct {
+    lock: std.Io.Mutex = .init,
+    images: image_data.ImageList = .{ .alloc = std.heap.page_allocator },
+
+    fn add(self: *BridgeImages, data: []const u8, mime_type: []const u8) image_data.Error!void {
+        const io = io_mod.getIo();
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        try self.images.append(data, mime_type);
+    }
+
+    /// Copies the images into `alloc`, the bash call's arena, which outlives this struct.
+    fn take(self: *BridgeImages, alloc: Allocator) ![]types.ToolImage {
+        const io = io_mod.getIo();
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        return types.dupeToolImages(alloc, self.images.items.items);
+    }
+
+    fn deinit(self: *BridgeImages) void {
+        self.images.deinit();
+    }
+};
+
+/// Attaches the images a bash call's `fx tool view` requests read to the call's result,
+/// once the call has returned. A canceled call's images are dropped, and the drop is
+/// logged (R3.8). The images stay in `images` until its deinit frees them (R3.9).
+fn attachBridgeImages(alloc: Allocator, execution: *ToolExecutionResult, images: *BridgeImages) !void {
+    const count = images.images.items.items.len;
+    if (count == 0) return;
+    if (execution.cancelled) {
+        debug_trace.logf("mcp-call", "dropped {d} viewed images of a canceled bash call: they are not attached", .{count});
+        return;
+    }
+    var memory = execution.tool_result_memory orelse types.ToolResultMemory{};
+    memory.tool_images = try images.take(alloc);
+    execution.tool_result_memory = memory;
+}
+
 fn authorizeBridgeBashTool(
     raw: *anyopaque,
     arena: Allocator,
@@ -1153,8 +1208,8 @@ fn authorizeBridgeBashTool(
     const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
     const ctx = state.runtime;
     const call = try bridgeBashToolCall(ctx, arena, request_id, operation);
-    // A web request this check refuses never reaches a permission prompt, as a direct web call does not.
-    if (try bridgeWebRefusal(ctx, arena, operation, call)) |text| {
+    // A request this check refuses never reaches a permission prompt, as a direct call does not.
+    if (try bridgeRequestRefusal(ctx, arena, operation, call)) |text| {
         const refused = try arena.create(BridgeAuthority);
         refused.* = .{ .bash_tool = .{ .ctx = ctx, .operation = operation, .tool_call = call, .refusal = text } };
         return .{ .allow = .{ .prepared = refused } };
@@ -1169,16 +1224,20 @@ fn authorizeBridgeBashTool(
         .operation = operation,
         .tool_call = call,
         .usage = state.usage,
+        .images = state.images,
     } };
     return .{ .allow = .{ .prepared = authority } };
 }
 
 const web_search_needs_gateway_text = "web search needs the AI Gateway provider; use web to fetch a page you know.";
 
-/// The refusal a web request gets before its permission check: what the direct
-/// web tool refuses when its decode or validation rejects the call, and a search
-/// with no backend. Null when the request may go on to its check.
-fn bridgeWebRefusal(
+/// The refusal a bridged request gets before its permission check, as the direct
+/// tool gives it: a web request its decode or validation rejects, a search with no
+/// backend, and a view whose path the read cannot find ("Path not found", the tool
+/// error a direct read_file returns). Null when the request may go on to its check.
+/// Safety holds from the permission check stay denials; this only answers what the
+/// direct tool answers before any rule or prompt.
+fn bridgeRequestRefusal(
     ctx: Context,
     arena: Allocator,
     operation: mcp_call_capability.BashToolRequest,
@@ -1205,6 +1264,24 @@ fn bridgeWebRefusal(
             };
             defer tool_input.deinit(arena);
             if (try web_search_impl.validate(dispatch_ctx, tool_input)) |reason| return reason;
+            return null;
+        },
+        .view => {
+            const decoded = try read_file_impl.decode(dispatch_ctx, call.arguments_json);
+            var tool_input = switch (decoded) {
+                .failure => |reason| return reason,
+                .input => |value| value,
+            };
+            defer tool_input.deinit(arena);
+            if (try read_file_impl.validate(dispatch_ctx, tool_input)) |reason| return reason;
+            // The path the read itself resolves, so a path it cannot find is refused as the direct read_file refuses it.
+            const path = tool_input.as(read_file_impl.Input).path;
+            const target = pathing.resolveWorkspaceOrExternalPath(arena, ctx.workspace_root, path) catch |err| {
+                return tool_admission.permissionTargetResolutionFailureMessage(arena, call, err);
+            };
+            _ = std.Io.Dir.cwd().statFile(io_mod.getIo(), target, .{}) catch |err| {
+                return tool_admission.permissionTargetResolutionFailureMessage(arena, call, err);
+            };
             return null;
         },
         else => return null,
@@ -1235,6 +1312,8 @@ const BridgeAuthority = union(enum) {
         refusal: ?[]const u8 = null,
         /// The bash call's usage total, which a bridged search adds to. Null for a refused call.
         usage: ?*BridgeUsage = null,
+        /// The bash call's images, which a bridged view adds to. Null for a refused call.
+        images: ?*BridgeImages = null,
     },
 };
 
@@ -1528,6 +1607,7 @@ fn runBridgeBashToolCall(
     tool_call: ToolCall,
     refusal: ?[]const u8,
     usage: ?*BridgeUsage,
+    images: ?*BridgeImages,
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
     const info = try bashToolRowInfo(arena, ctx.nested_tool_registry orelse ctx.tool_registry, operation);
@@ -1542,7 +1622,7 @@ fn runBridgeBashToolCall(
         debug_trace.logf("mcp-call", "request={s} refused {s} before its permission check", .{ request_id, @tagName(operation) });
         return .{ .status = .tool_error, .bytes = text };
     }
-    const outcome = executeBridgeBashToolOperation(ctx, arena, operation, tool_call, usage, cancel) catch |err| {
+    const outcome = executeBridgeBashToolOperation(ctx, arena, operation, tool_call, usage, images, cancel) catch |err| {
         if (row) |value| value.finishAction(arena, if (err == error.Cancelled or cancel.load(.acquire)) .cancelled else .failed);
         if (err == error.Cancelled) {
             debug_trace.logf("mcp-call", "request={s} dropped {s} while it ran: canceled", .{ request_id, @tagName(operation) });
@@ -1557,11 +1637,11 @@ fn runBridgeBashToolCall(
     return outcome;
 }
 
-/// A bridged web call's row: the web tool's own running and done labels, from its
+/// A bridged tool call's row: the tool's own running and done labels, from its
 /// registered spec, so it reads as a direct call's row does. Its failed label is
 /// the one every non-subagent failed call uses, so the transcript writes the verb
 /// once, as "Couldn't fetch <target>".
-fn webRowAction(arena: Allocator, specs: tool_dispatch.Registry, name: []const u8, target: []const u8) !BridgeCallRow.ActionRow {
+fn toolSpecRowAction(arena: Allocator, specs: tool_dispatch.Registry, name: []const u8, target: []const u8) !BridgeCallRow.ActionRow {
     const spec = specs.lookup(name);
     return .{
         .activity_kind = .read,
@@ -1647,13 +1727,17 @@ fn bashToolRowInfo(arena: Allocator, specs: tool_dispatch.Registry, operation: m
                 .target = try rowPath(arena, agent),
             },
         },
+        .view => |req| .{
+            .tool = "read_file",
+            .action = try toolSpecRowAction(arena, specs, "read_file", try rowPath(arena, req.path)),
+        },
         .web_fetch => |req| .{
             .tool = "web_fetch",
-            .action = try webRowAction(arena, specs, "web_fetch", try rowPath(arena, req.url)),
+            .action = try toolSpecRowAction(arena, specs, "web_fetch", try rowPath(arena, req.url)),
         },
         .web_search => |req| .{
             .tool = "web_search",
-            .action = try webRowAction(arena, specs, "web_search", try rowPath(arena, req.query)),
+            .action = try toolSpecRowAction(arena, specs, "web_search", try rowPath(arena, req.query)),
         },
     };
 }
@@ -1664,6 +1748,7 @@ fn executeBridgeBashToolOperation(
     operation: mcp_call_capability.BashToolRequest,
     tool_call: ToolCall,
     usage: ?*BridgeUsage,
+    images: ?*BridgeImages,
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
     return switch (operation) {
@@ -1672,6 +1757,57 @@ fn executeBridgeBashToolOperation(
         .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => runBridgeAgentCall(ctx, arena, tool_call, cancel),
         .web_fetch => runBridgeWebFetch(ctx, arena, tool_call, cancel),
         .web_search => runBridgeWebSearch(ctx, arena, tool_call, usage, cancel),
+        .view => |req| if (comptime tool_bridge.supported)
+            runBridgeView(ctx, arena, tool_call, req.path, images, cancel)
+        else
+            .{ .status = .failed, .bytes = mcp_call_capability.file_tool_unavailable_text },
+    };
+}
+
+const view_not_image_text = "the file is not an image fx can attach. Read text files with cat, sed, or rg.";
+
+/// Runs a bridged `view` request as the read_file tool runs it: the same decode,
+/// validation, and call. The image it reads joins the bash call's images. A result
+/// with no image is a tool error that names the next step.
+fn runBridgeView(
+    ctx: Context,
+    arena: Allocator,
+    tool_call: ToolCall,
+    path: []const u8,
+    images: ?*BridgeImages,
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
+    const sink = images orelse return .{ .status = .failed, .bytes = mcp_call_capability.file_tool_unavailable_text };
+    var dispatch_ctx = typedDispatchContextForCall(ctx, arena, tool_call);
+    dispatch_ctx.cancel_flag = cancel;
+    const decoded = try read_file_impl.decode(dispatch_ctx, tool_call.arguments_json);
+    var tool_input = switch (decoded) {
+        .failure => |reason| return .{ .status = .tool_error, .bytes = reason },
+        .input => |value| value,
+    };
+    defer tool_input.deinit(arena);
+    if (try read_file_impl.validate(dispatch_ctx, tool_input)) |reason| return .{ .status = .tool_error, .bytes = reason };
+    var result = try read_file_impl.call(dispatch_ctx, tool_input);
+    defer result.deinit(dispatch_ctx.allocator);
+    const rich = switch (result) {
+        .rich => |value| value,
+        .failure => |text| return .{ .status = .tool_error, .bytes = try arena.dupe(u8, text) },
+        .success => return .{ .status = .tool_error, .bytes = view_not_image_text },
+    };
+    if (rich.images.len == 0) return .{ .status = .tool_error, .bytes = try arena.dupe(u8, rich.text) };
+    const image = rich.images[0];
+    sink.add(image.data, image.mime_type) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ImageLimitExceeded => .{
+            .status = .tool_error,
+            .bytes = try arena.print("a bash call can show at most {d} images. Run the rest in a later bash call.", .{image_data.max_tool_images}),
+        },
+        error.InvalidImage, error.UnsupportedImageType => .{ .status = .tool_error, .bytes = view_not_image_text },
+    };
+    const size = try std.base64.standard.Decoder.calcSizeForSlice(image.data);
+    return .{
+        .status = .ok,
+        .bytes = try arena.print("viewed {f} ({s}, {d} bytes)", .{ text_utils.terminalSafe(path), image.mime_type, size }),
     };
 }
 
@@ -2116,7 +2252,7 @@ fn runBridgeCall(
             const authority: *BridgeAuthority = @ptrCast(@alignCast(prepared));
             return switch (authority.*) {
                 .file => |*file_auth| runBridgeFileCall(state.runtime, arena, request_id, file_auth, cancel),
-                .bash_tool => |*tool_auth| runBridgeBashToolCall(tool_auth.ctx, arena, request_id, tool_auth.operation, tool_auth.tool_call, tool_auth.refusal, tool_auth.usage, cancel),
+                .bash_tool => |*tool_auth| runBridgeBashToolCall(tool_auth.ctx, arena, request_id, tool_auth.operation, tool_auth.tool_call, tool_auth.refusal, tool_auth.usage, tool_auth.images, cancel),
             };
         }
     }
@@ -2688,6 +2824,234 @@ test "the bridge offers file changes only to the bash tool's programs" {
     try std.testing.expect(shell_state.capability().authorize_file_fn == null);
     var bash_state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
     try std.testing.expect(bash_state.capability().authorize_file_fn != null);
+}
+
+test "a bridged view attaches the image it reads, and answers with its type and size" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeBridgeTestFile(tmp, "workspace/img.png", &image_data.testPngHeader(4, 4));
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .yolo, .nested_tool_registry = test_builtin_tools.registry };
+    defer rt.deinit(alloc);
+    var images = BridgeImages{ .images = .{ .alloc = alloc } };
+    defer images.deinit();
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true, .images = &images };
+
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-70", .{ .view = .{ .path = "img.png" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-70", "read_file", "", allowed, &cancel);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+    try std.testing.expectEqualStrings("viewed img.png (image/png, 24 bytes)", outcome.bytes);
+    try std.testing.expectEqual(@as(usize, 1), images.images.items.items.len);
+    try std.testing.expectEqualStrings("image/png", images.images.items.items[0].mime_type);
+}
+
+test "a bridged view of a text file is a tool error with the next step, and attaches nothing" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeBridgeTestFile(tmp, "workspace/notes.txt", "plain text\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .yolo, .nested_tool_registry = test_builtin_tools.registry };
+    defer rt.deinit(alloc);
+    var images = BridgeImages{ .images = .{ .alloc = alloc } };
+    defer images.deinit();
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true, .images = &images };
+
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-71", .{ .view = .{ .path = "notes.txt" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-71", "read_file", "", allowed, &cancel);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "cat, sed, or rg") != null);
+    try std.testing.expectEqual(@as(usize, 0), images.images.items.items.len);
+}
+
+test "a bridged view past the eighth image of one bash call is a tool error, and attaches no more" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeBridgeTestFile(tmp, "workspace/img.png", &image_data.testPngHeader(4, 4));
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .yolo, .nested_tool_registry = test_builtin_tools.registry };
+    defer rt.deinit(alloc);
+    var images = BridgeImages{ .images = .{ .alloc = alloc } };
+    defer images.deinit();
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true, .images = &images };
+    var encoded: [std.base64.standard.Encoder.calcSize(24)]u8 = undefined;
+    const png = std.base64.standard.Encoder.encode(&encoded, &image_data.testPngHeader(4, 4));
+    for (0..image_data.max_tool_images) |_| try images.images.append(png, "image/png");
+
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-72", .{ .view = .{ .path = "img.png" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-72", "read_file", "", allowed, &cancel);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "8 images") != null);
+    try std.testing.expectEqual(image_data.max_tool_images, images.images.items.items.len);
+}
+
+test "a bridged view under a read_file deny rule is refused before it reads the file" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeBridgeTestFile(tmp, "workspace/img.png", &image_data.testPngHeader(4, 4));
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var deny_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("read_file"),
+        .pattern = @constCast("**"),
+        .action = .deny,
+    }};
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{
+        .workspace_root = workspace,
+        .permission_mode = .ask,
+        .cancel_flag = &cancel,
+        .permission_rules = .{ .rules = &deny_rules },
+        .nested_tool_registry = test_builtin_tools.registry,
+    };
+    defer rt.deinit(alloc);
+    var images = BridgeImages{ .images = .{ .alloc = alloc } };
+    defer images.deinit();
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true, .images = &images };
+
+    const authorization = try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-73", .{ .view = .{ .path = "img.png" } });
+    try std.testing.expect(authorization == .deny);
+    try std.testing.expectEqual(@as(usize, 0), images.images.items.items.len);
+}
+
+test "a bridged view's images are freed when the bash call never takes them" {
+    var images = BridgeImages{ .images = .{ .alloc = std.testing.allocator } };
+    var encoded: [std.base64.standard.Encoder.calcSize(24)]u8 = undefined;
+    const png = std.base64.standard.Encoder.encode(&encoded, &image_data.testPngHeader(4, 4));
+    try images.images.append(png, "image/png");
+    // std.testing.allocator fails this test if deinit leaves the image behind.
+    images.deinit();
+}
+
+test "a bridged view of a missing file answers Path not found before its permission check" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var deny_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("read_file"),
+        .pattern = @constCast("**"),
+        .action = .deny,
+    }};
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{
+        .workspace_root = workspace,
+        .permission_mode = .ask,
+        .cancel_flag = &cancel,
+        .permission_rules = .{ .rules = &deny_rules },
+        .nested_tool_registry = test_builtin_tools.registry,
+    };
+    defer rt.deinit(alloc);
+    var images = BridgeImages{ .images = .{ .alloc = alloc } };
+    defer images.deinit();
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true, .images = &images };
+
+    // The refusal comes before the permission check, so the call is not a deny.
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-74", .{ .view = .{ .path = "missing.png" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedRefusalBeforeCheck,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-74", "read_file", "", allowed, &cancel);
+
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "Path not found") != null);
+    try std.testing.expectEqual(@as(usize, 0), images.images.items.items.len);
+}
+
+test "images taken from a bridged view stay valid after its BridgeImages is deinitialized" {
+    const alloc = std.testing.allocator;
+    var images = BridgeImages{};
+    var encoded: [std.base64.standard.Encoder.calcSize(24)]u8 = undefined;
+    const png = std.base64.standard.Encoder.encode(&encoded, &image_data.testPngHeader(4, 4));
+    try images.add(png, "image/png");
+
+    const taken = try images.take(alloc);
+    defer types.freeToolImages(alloc, taken);
+    images.deinit();
+
+    try std.testing.expectEqualStrings(png, taken[0].data);
+    try std.testing.expectEqualStrings("image/png", taken[0].mime_type);
+}
+
+test "a finished bash call attaches the images its views read, and a canceled one drops them with a trace line" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "view-cancel.log" });
+    defer alloc.free(trace_path);
+    var encoded: [std.base64.standard.Encoder.calcSize(24)]u8 = undefined;
+    const png = std.base64.standard.Encoder.encode(&encoded, &image_data.testPngHeader(4, 4));
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "mcp-call");
+
+    var kept = BridgeImages{};
+    defer kept.deinit();
+    try kept.add(png, "image/png");
+    var finished = ToolExecutionResult{ .status = .success, .model_output = "" };
+    try attachBridgeImages(alloc, &finished, &kept);
+    const attached = finished.tool_result_memory orelse return error.TestExpectedAttachedImages;
+    defer types.freeToolImages(alloc, attached.tool_images);
+    try std.testing.expectEqual(@as(usize, 1), attached.tool_images.len);
+
+    var dropped = BridgeImages{};
+    defer dropped.deinit();
+    try dropped.add(png, "image/png");
+    var canceled = ToolExecutionResult{ .status = .success, .model_output = "", .cancelled = true };
+    try attachBridgeImages(alloc, &canceled, &dropped);
+    try std.testing.expect(canceled.tool_result_memory == null);
+
+    debug_trace.shutdown();
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 8192);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "dropped 1 viewed images of a canceled bash call") != null);
 }
 
 test "a bridge edit that a configured deny rule covers writes nothing" {

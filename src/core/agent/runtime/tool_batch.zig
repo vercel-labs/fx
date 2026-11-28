@@ -236,7 +236,7 @@ pub fn assembleParallelToolResults(
         // attempt-owned slices must be transferred into the history arena
         // before that deinit runs.
         prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
-        try runtime_execution_memory.retainToolImages(arena, config, original_call, &prepared);
+        try runtime_execution_memory.retainToolImages(arena, config, original_call, &prepared, hooks.tool_registry);
         const safe_tool_output = prepared.model_output;
         if (precomputed == null) {
             runtime_parallel_execution.reportInnerToolUsage(hooks, original_call.name, execution);

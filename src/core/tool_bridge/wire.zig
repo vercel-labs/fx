@@ -80,11 +80,13 @@ pub const Operation = union(enum) {
     web_fetch: capability_mod.WebFetchRequest,
     /// `fx tool search QUERY`: search the web.
     web_search: capability_mod.WebSearchRequest,
+    /// `fx tool view PATH`: attach one image file.
+    view: capability_mod.ViewRequest,
 
     /// The lookup this operation is, or null for a change or a call.
     pub fn lookup(self: Operation) ?capability_mod.Lookup {
         return switch (self) {
-            .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => null,
+            .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search, .view => null,
             .list => |server| .{ .list = server },
             .search => |query| .{ .search = query },
             .help => |tool| .{ .help = tool },
@@ -106,6 +108,7 @@ pub const Operation = union(enum) {
             .agent_close => |agent| agent,
             .web_fetch => |value| value.url,
             .web_search => |value| value.query,
+            .view => |value| value.path,
             .list, .search, .help => |text| text,
         };
     }
@@ -170,6 +173,7 @@ pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
         .agent_close => .{ .agent_close = try nonEmptyString(object, "agent") },
         .web_fetch => .{ .web_fetch = .{ .url = try nonEmptyString(object, "url") } },
         .web_search => .{ .web_search = try parseWebSearch(arena, object) },
+        .view => .{ .view = .{ .path = try nonEmptyString(object, "path") } },
     };
     return .{
         .version = @intCast(version.integer),
@@ -298,6 +302,7 @@ pub fn writeRequest(writer: *std.Io.Writer, token: mcp_call.Token, operation: Op
         },
         .agent_stop, .agent_close => |agent| try writeField(writer, "agent", agent),
         .web_fetch => |value| try writeField(writer, "url", value.url),
+        .view => |value| try writeField(writer, "path", value.path),
         .web_search => |value| {
             try writeField(writer, "query", value.query);
             if (value.allowed_domains.len > 0) try writeDomainList(writer, "allowed_domains", value.allowed_domains);
@@ -558,6 +563,32 @@ test "a web request that is not one well-formed url or query is malformed" {
     }) |line| try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
 }
 
+test "a view request round-trips with its path, and is not a lookup" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token: mcp_call.Token = @splat(0x04);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try writeRequest(&out.writer, token, .{ .view = .{ .path = "/w/shots/a b.png" } });
+    const line = out.written();
+    try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
+    const parsed = try parseRequest(arena, line[0 .. line.len - 1]);
+    try std.testing.expectEqual(Operation.view, std.meta.activeTag(parsed.operation));
+    try std.testing.expectEqualStrings("/w/shots/a b.png", parsed.operation.view.path);
+    try std.testing.expect(parsed.operation.lookup() == null);
+}
+
+test "a view request without one non-empty string path is malformed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{
+        "{\"v\":1,\"token\":\"\",\"op\":\"view\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"view\",\"path\":\"\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"view\",\"path\":3}",
+    }) |line| try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
+}
+
 test "an edit line keeps its path and its blocks in order, quotes and newlines included" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -771,6 +802,7 @@ fn expectSameOperation(want: Operation, got: Operation) !void {
         .agent_stop => |w| try std.testing.expectEqualStrings(w, got.agent_stop),
         .agent_close => |w| try std.testing.expectEqualStrings(w, got.agent_close),
         .web_fetch => |w| try std.testing.expectEqualStrings(w.url, got.web_fetch.url),
+        .view => |w| try std.testing.expectEqualStrings(w.path, got.view.path),
         .web_search => |w| {
             try std.testing.expectEqualStrings(w.query, got.web_search.query);
             try expectStringLists(w.allowed_domains, got.web_search.allowed_domains);

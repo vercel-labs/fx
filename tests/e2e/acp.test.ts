@@ -11808,6 +11808,55 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP bash runs fx tool view, and the next model request carries the image",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-bash-view-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { bash_tool: true } }));
+      const png = readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png"));
+      writeFileSync(join(root.workspace, "img.png"), png);
+      const gateway = startDynamicFakeGateway(
+        (body) => {
+          if (body.includes('"toolCallId":"acp_view"')) return finalText("ACP_VIEW_DONE");
+          if (body.includes("View the image through ACP.")) {
+            return fakeGatewayToolCall("acp_view", "bash", { command: `${JSON.stringify(FX_BIN)} tool view img.png; echo "exit=$?"` });
+          }
+          return finalText("ACP_OTHER");
+        },
+        { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["vision", "file-input", "tool-use"], context_window: 128_000 }] },
+      );
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine(); // consume session/update notification
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const run = await runPrompt(client, "View the image through ACP.", 60_000);
+        expect(run.promptResult.result.stopReason).toBe("end_turn");
+
+        const request = gateway.requests.find((entry) => entry.body.includes('"toolCallId":"acp_view"'));
+        expect(request).toBeDefined();
+        const output = acpToolResultText(request!.body, "acp_view");
+        expect(output).toContain("exit=0");
+        expect(output).toContain("img.png (image/png,");
+        expect(request!.body).toContain(png.toString("base64"));
+
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  test(
     "ACP bash runs skill list and agent status, and the result holds the skill line and the agent status",
     async () => {
       const root = createIsolatedRoot("fx-acp-bash-skill-agent-");
