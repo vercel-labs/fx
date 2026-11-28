@@ -473,11 +473,13 @@ export function startFakeVercelApi(options: FakeVercelOptions): FakeVercelApi {
   let commandCount = 0;
 
   const remotePath = (path: string) => join(fsRoot, resolve("/", path));
-  const rewrite = (arg: string) => {
-    let out = arg;
-    for (const root of macRoots) out = out.split(root).join(remotePath(root));
-    return out;
-  };
+  // One pass, longest root first, and a root must end where a path name ends:
+  // `/work/repo` must not match inside `/work/repo-b`, and a mapped path must
+  // not be mapped again.
+  const rootPattern = macRoots.length === 0
+    ? null
+    : new RegExp(`(?:${macRoots.map((root) => root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})(?![^/\\s"'\`:;,=)\\]}])`, "g");
+  const rewrite = (arg: string) => rootPattern === null ? arg : arg.replace(rootPattern, (root) => remotePath(root));
 
   /// A session takes the sandbox's size when it starts; a later resize waits
   /// for the next session.
@@ -1127,7 +1129,9 @@ async function readLines(response: Response): Promise<any[]> {
 async function selfTest(): Promise<number> {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-fake-vercel-")));
   const mac = join(root, "mac", "repo");
+  const macB = `${mac}-b`; // a second Mac root whose name starts with the first one's
   mkdirSync(mac, { recursive: true });
+  mkdirSync(macB, { recursive: true });
   writeFileSync(join(mac, "keep.txt"), "mac\n");
   const tokA = "fake-token-a";
   const tokB = "fake-token-b";
@@ -1139,7 +1143,7 @@ async function selfTest(): Promise<number> {
     teams: [{ id: "team_1", slug: "one", name: "One" }, { id: "team_2", slug: "two", name: "Two" }],
     projects: { team_1: [{ id: "prj_1", name: "web" }] },
     privateRoot: join(root, "private"),
-    macRoots: [mac],
+    macRoots: [mac, macB],
     afterRequest: (entry) => { afterRequests.push(entry.route); },
   });
   const checks: Check[] = [];
@@ -1278,6 +1282,9 @@ async function selfTest(): Promise<number> {
     check("exec stream carries stdout and stderr", output(lines, "stdout") === "hi\n" && output(lines, "stderr") === "err\n", lines);
     check("exec stream ends with the exit code", lines.at(-1)?.command?.exitCode === 7, lines.at(-1));
     check("exec ran in the mapped repository", existsSync(join(api.remotePath(mac), "made.txt")) && !existsSync(join(mac, "made.txt")));
+    const mapped = await readLines(await exec(session, `printf '%s|%s|%s' ${mac}/f ${macB}/f ${mac}x/f`));
+    check("each Mac root maps once, and a root that only starts the same is its own",
+      output(mapped, "stdout") === `${api.remotePath(mac)}/f|${api.remotePath(macB)}/f|${mac}x/f`, output(mapped, "stdout"));
 
     // A cmd without wait, then a wait on it.
     const detached = await exec(session, "sleep 0.2; exit 3", { wait: undefined });
