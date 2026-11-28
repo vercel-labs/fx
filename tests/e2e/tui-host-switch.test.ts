@@ -2353,11 +2353,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             request: { action: "message", agent: "writer", message: "SWITCH_RUN_TASK", profile: "writer" },
           });
         }
-        if (body.includes("I wait for your approval to run") && !body.includes("main_stop")) {
+        if (body.includes('"main_stop"') && !body.includes("SWITCH_MAIN_STOPPED")) {
+          return text("main_stopped", "SWITCH_MAIN_STOPPED");
+        }
+        if (body.includes("I wait for your approval to run") && !body.includes('"main_stop"')) {
           return toolCall("main_stop", "subagent", { action: "stop", agent: "writer" });
         }
-        const reportTurn = body.includes(REPORT_HEADER);
-        if (body.includes("main_stop") && !reportTurn) return text("main_stopped", "SWITCH_MAIN_STOPPED");
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session, { workspace }) => {
         await session.sendText("SWITCH_USER");
@@ -4966,7 +4967,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     const gates = { cut: held(), again: held(), againSteps: () => againSteps };
     const fifoDir = options.earlyReport ? mkdtempSync(join(tmpdir(), "fx-fifo-early-")) : "";
     const fifoPath = fifoDir ? join(fifoDir, "hold.fifo") : "";
-    if (fifoPath) Bun.spawnSync(["mkfifo", fifoPath]);
+    if (fifoPath) expect(Bun.spawnSync(["mkfifo", fifoPath]).exitCode).toBe(0);
     const fineGatewayDone = held();
     // With `trace`, fx writes its trace log, which `run` reads as its last argument.
     let tracePath = "";
