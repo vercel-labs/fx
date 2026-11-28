@@ -111,6 +111,21 @@ pub const WebSearchRequest = struct {
     blocked_domains: []const []const u8 = &.{},
 };
 
+/// The fewest and the most options an `fx tool ask` question offers, as the question tool takes them.
+pub const min_ask_options: usize = 2;
+pub const max_ask_options: usize = 6;
+
+/// `fx tool ask QUESTION --option=LABEL...`: one question with its answers, as the ask_user_question tool asks it.
+pub const AskRequest = struct {
+    question: []const u8,
+    options: []const []const u8,
+};
+
+/// `fx tool view PATH`: attach one image file, as the read_file tool attaches it.
+pub const ViewRequest = struct {
+    path: []const u8,
+};
+
 pub const BashToolRequest = union(enum) {
     skill_list,
     skill_open: SkillOpenRequest,
@@ -121,6 +136,8 @@ pub const BashToolRequest = union(enum) {
     agent_close: []const u8,
     web_fetch: WebFetchRequest,
     web_search: WebSearchRequest,
+    view: ViewRequest,
+    ask: AskRequest,
 };
 
 pub const CallStatus = enum { ok, tool_error, failed };

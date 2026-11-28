@@ -3544,6 +3544,162 @@ describe("slice 7: fx tool web and search", () => {
   }, TIMEOUT);
 });
 
+describe("slice 8: fx tool view", () => {
+  const BASH_SETTING = ["--config", "experimental.bash_tool=true"];
+  const PNG = join(import.meta.dir, "fixtures", "placeholder-logo.png");
+  const IMAGE_MODELS = [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["vision", "file-input", "tool-use"] }];
+  const TEXT_ONLY_MODELS = [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }];
+
+  test("fx tool view attaches the image, and the next model request carries it", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "img.png"), readFileSync(PNG));
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("b_view", "bash", { command: `${JSON.stringify(FX_BIN)} tool view img.png; echo "exit=$?"` }),
+        fakeGatewayFinalText("Viewed.\n"),
+      ],
+      { models: IMAGE_MODELS },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "View the image."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = toolResultText(gateway.requests[1]!.body, "b_view");
+    expect(out).toContain("exit=0");
+    expect(out).toContain("viewed ");
+    expect(out).toContain("img.png (image/png,");
+    expect(gateway.requests[1]!.body).toContain(readFileSync(PNG).toString("base64"));
+  }, TIMEOUT);
+
+  test("fx tool view on a text file exits 6 and names the next step", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "notes.txt"), "plain text\n");
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("b_view_text", "bash", {
+          command: `${JSON.stringify(FX_BIN)} tool view notes.txt; echo "exit=$?"`,
+        }),
+        fakeGatewayFinalText("Checked.\n"),
+      ],
+      { models: IMAGE_MODELS },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "View a text file."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "b_view_text")) as { value: string }).value;
+    expect(out).toContain("exit=6");
+    expect(out).toContain("cat, sed, or rg");
+  }, TIMEOUT);
+
+  test("fx tool view on a missing file exits 6", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("b_view_missing", "bash", {
+          command: `${JSON.stringify(FX_BIN)} tool view missing.png; echo "exit=$?"`,
+        }),
+        fakeGatewayFinalText("Checked.\n"),
+      ],
+      { models: IMAGE_MODELS },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "View a missing file."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "b_view_missing")) as { value: string }).value;
+    expect(out).toContain("exit=6");
+  }, TIMEOUT);
+
+  test("fx tool view under a read_file deny rule exits 5 and sends no image", async () => {
+    const root = createRoot();
+    mkdirSync(join(root.home, ".fx"), { recursive: true });
+    writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ permission: { bash: "allow", read_file: "deny" } }));
+    writeFileSync(join(root.workspace, "img.png"), readFileSync(PNG));
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("b_view_deny", "bash", { command: `${JSON.stringify(FX_BIN)} tool view img.png; echo "exit=$?"` }),
+        fakeGatewayFinalText("Denied.\n"),
+      ],
+      { models: IMAGE_MODELS },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--auto", ...BASH_SETTING, "View the image."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "b_view_deny")) as { value: string }).value;
+    expect(out).toContain("exit=5");
+    expect(gateway.requests[1]!.body).not.toContain(readFileSync(PNG).toString("base64"));
+  }, TIMEOUT);
+
+  test("on a model without image input, the viewed image is withheld with a notice that names vision", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "img.png"), readFileSync(PNG));
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("b_view_text", "bash", { command: `${JSON.stringify(FX_BIN)} tool view img.png; echo "exit=$?"` }),
+        fakeGatewayFinalText("Withheld.\n"),
+      ],
+      { models: TEXT_ONLY_MODELS },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "View the image."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    expect(gateway.requests[1]!.body).toContain("this model receives image input through the vision tool");
+    expect(gateway.requests[1]!.body).not.toContain(readFileSync(PNG).toString("base64"));
+  }, TIMEOUT);
+  test("fx tool ask on a host with no question UI exits 6 and tells the model to ask in its reply", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("b_ask_no_ui", "bash", {
+          command: `${JSON.stringify(FX_BIN)} tool ask "Which one?" --option=A --option=B; echo "exit=$?"`,
+        }),
+        fakeGatewayFinalText("Asked.\n"),
+      ],
+      { models: IMAGE_MODELS },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Ask me a question."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "b_ask_no_ui")) as { value: string }).value;
+    expect(out).toContain("exit=6");
+    expect(out).toContain("Ask in your reply instead");
+  }, TIMEOUT);
+});
+
 function walkAllFiles(dir: string): string[] {
   if (!existsSync(dir)) return [];
   const results: string[] = [];

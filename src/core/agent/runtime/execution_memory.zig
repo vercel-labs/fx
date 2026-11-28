@@ -4,6 +4,7 @@ const recovery_prompt = @import("../../shared/recovery_prompt.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const types = @import("../../shared/types.zig");
 const image_data = @import("../../images/image_data.zig");
+const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const execution_memory_helpers = @import("../execution_memory.zig");
 const result_store = @import("../../session/result_store.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
@@ -1144,8 +1145,10 @@ pub fn prepareCapturedToolModelOutput(
     };
 }
 
-/// Retains the original tool images so later requests can project a safe view.
-pub fn retainToolImages(arena: Allocator, config: Config, call: ToolCall, prepared: *result_store.PreparedResult) !void {
+/// Retains the original tool images so later requests can project a safe view. The
+/// notice names read_tool_result only when `tool_registry` has that tool, since a
+/// session without it cannot load the handle back.
+pub fn retainToolImages(arena: Allocator, config: Config, call: ToolCall, prepared: *result_store.PreparedResult, tool_registry: tool_dispatch.Registry) !void {
     const memory = &prepared.memory;
     if (memory.tool_images.len == 0 or memory.tool_image_handle != null) return;
     const capability = config.session_child_capability orelse return;
@@ -1155,7 +1158,10 @@ pub fn retainToolImages(arena: Allocator, config: Config, call: ToolCall, prepar
         return;
     };
     memory.tool_image_handle = handle;
-    const notice = try arena.print("Saved images: {s}. Use read_tool_result with this handle to load them again.\n", .{handle});
+    const notice = if (tool_registry.lookup("read_tool_result") != null)
+        try arena.print("Saved images: {s}. Use read_tool_result with this handle to load them again.\n", .{handle})
+    else
+        try arena.print("Saved images: {s}.\n", .{handle});
     const limit = config.max_tool_result_bytes -| notice.len;
     const keep = @import("../../config/context_limits.zig").utf8PrefixLength(prepared.model_output, limit);
     if (keep < prepared.model_output.len) memory.truncated = true;
@@ -1297,10 +1303,50 @@ test "retaining tool results leaves original images in history" {
     var cancel = std.atomic.Value(bool).init(false);
     const images = [_]types.ToolImage{try testPngHeaderToolImage(arena, 3420, 2224)};
     var prepared = result_store.PreparedResult{ .model_output = "source <path>frame.png</path>", .memory = .{ .tool_images = &images } };
-    try retainToolImages(arena, testImageConfig(&cancel), toolCall("call_frame", "read_file", "{}"), &prepared);
+    try retainToolImages(arena, testImageConfig(&cancel), toolCall("call_frame", "read_file", "{}"), &prepared, .{ .tools = &.{} });
     try std.testing.expectEqual(@as(usize, 1), prepared.memory.tool_images.len);
     try std.testing.expectEqualStrings(images[0].data, prepared.memory.tool_images[0].data);
     try std.testing.expectEqualStrings("source <path>frame.png</path>", prepared.model_output);
+}
+
+test "the saved-image notice names read_tool_result only when the session's registry has that tool" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io_mod.getIo(), "session", std.Io.File.Permissions.fromMode(0o700));
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{ .iterate = true, .follow_symlinks = false });
+    defer session_dir.close(io_mod.getIo());
+    const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(display_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(alloc, session_dir, display_path, .writable, .{});
+    defer capability.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    var config = testImageConfig(&cancel);
+    config.session_child_capability = &capability;
+    const images = [_]types.ToolImage{try testPngHeaderToolImage(arena, 3420, 2224)};
+
+    const no_read_back: tool_dispatch.Registry = .{ .tools = &.{} };
+    var bare = result_store.PreparedResult{ .model_output = "source", .memory = .{ .tool_images = &images } };
+    try retainToolImages(arena, config, toolCall("call_bare", "read_file", "{}"), &bare, no_read_back);
+    try std.testing.expect(std.mem.startsWith(u8, bare.model_output, "Saved images: "));
+    try std.testing.expect(std.mem.find(u8, bare.model_output, "read_tool_result") == null);
+
+    const read_back_tools = [_]tool_dispatch.Tool{.{
+        .name = "read_tool_result",
+        .description = "read_tool_result",
+        .model_schema = .{ .name = "read_tool_result", .description = "read_tool_result" },
+        .captured_command_host = .native,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    }};
+    var full = result_store.PreparedResult{ .model_output = "source", .memory = .{ .tool_images = &images } };
+    try retainToolImages(arena, config, toolCall("call_full", "read_file", "{}"), &full, .{ .tools = &read_back_tools });
+    try std.testing.expect(std.mem.find(u8, full.model_output, "Use read_tool_result with this handle to load them again.") != null);
 }
 
 test "request image notices remain bounded without mutating retained text" {

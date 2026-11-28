@@ -3857,7 +3857,7 @@ fn finishPendingParallelCancelled(
             // parallel run is deinitialized after this scope, while history
             // keeps prepared.memory.
             prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
-            try runtime_execution_memory.retainToolImages(arena, config, call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, config, call, &prepared, deps.tool_registry);
             _ = try provisional_statuses.finishExecutedCall(
                 deps,
                 provisional_alloc,
@@ -13267,7 +13267,7 @@ fn processQueuedPromptLoop(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
-            try runtime_execution_memory.retainToolImages(arena, config, tool_call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, config, tool_call, &prepared, deps.tool_registry);
             runtime_execution_memory.finalizeCommandReplay(
                 arena,
                 tool_call,

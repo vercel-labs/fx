@@ -154,6 +154,9 @@ const tool_skill_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "open NAME [FILE]", .description = "Print a skill or one of its files" },
 };
 
+const tool_ask_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--option <label>", .description = "One answer to offer; give 2 to 6" },
+};
 const tool_search_options = [_]command_specs.OptionDoc{
     .{ .flag = "--allow-domain <domain>", .description = "Only results from this domain; repeat for more" },
     .{ .flag = "--block-domain <domain>", .description = "Skip results from this domain; repeat for more" },
@@ -183,6 +186,8 @@ const tool_subcommands: []const command_specs.SubcommandDoc = if (tool_bridge.su
     .{ .usage = "write PATH", .description = "Write a whole file from stdin" },
     .{ .usage = "skill <list|open>", .description = "List or read visible skills", .subcommands = &tool_skill_subcommands },
     .{ .usage = "agent <message|wait|status|stop|close>", .description = "Message, wait for, check, stop, or close subagents", .subcommands = &tool_agent_subcommands },
+    .{ .usage = "view PATH", .description = "Attach an image file for the model to see" },
+    .{ .usage = "ask QUESTION --option LABEL...", .description = "Ask the person a question and print the answer", .options = &tool_ask_options },
     .{ .usage = "web URL", .description = "Fetch a web page as text" },
     .{ .usage = "search QUERY [--allow-domain D]... [--block-domain D]...", .description = "Search the web and print the results; give one kind of domain filter, not both", .options = &tool_search_options },
 } else &.{};
@@ -1036,7 +1041,7 @@ test "fx tool help matches tool_bridge.supported" {
         if (entry.kind == .tool) break entry;
     } else unreachable;
     if (tool_bridge.supported) {
-        try std.testing.expectEqual(@as(usize, 6), spec.subcommands.len);
+        try std.testing.expectEqual(@as(usize, 8), spec.subcommands.len);
         try std.testing.expect(spec.details.len > 0);
     } else {
         try std.testing.expectEqual(@as(usize, 0), spec.subcommands.len);
@@ -1062,6 +1067,18 @@ test "fx tool help names web URL and search QUERY, and search lists its domain o
     }
     try std.testing.expect(has_web);
     try std.testing.expect(has_search);
+}
+
+test "fx tool help names view PATH" {
+    if (!tool_bridge.supported) return error.SkipZigTest;
+    const spec = for (top_level_specs) |entry| {
+        if (entry.kind == .tool) break entry;
+    } else unreachable;
+    var has_view = false;
+    for (spec.subcommands) |sub| {
+        if (std.mem.eql(u8, sub.usage, "view PATH")) has_view = true;
+    }
+    try std.testing.expect(has_view);
 }
 
 test "fx tool help group line shows the same usage as the tool spec" {

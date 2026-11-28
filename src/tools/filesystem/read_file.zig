@@ -13,7 +13,7 @@ const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const Allocator = std.mem.Allocator;
 
 // Allow freshness snapshots for files larger than read_file can show the model.
-const max_snapshot_file_bytes: usize = 10 * 1024 * 1024;
+pub const max_snapshot_file_bytes: usize = 10 * 1024 * 1024;
 // Keep one tool result under common model input limits without a tokenizer.
 const max_model_output_bytes: usize = 256 * 1024;
 // Bound tiny-line files so one read cannot dominate a turn.
@@ -219,6 +219,22 @@ fn readIntoBuffer(reader: *std.Io.Reader, buffer: []u8) !usize {
 /// Raw image bytes that fit the encoded tool-image attach limit.
 const max_attach_image_bytes: usize = image_data.max_encoded_image_bytes / 4 * 3;
 
+/// Why read_file cannot attach an image with these bytes, or null when it can. `incomplete_read`
+/// says the bytes stop at the read limit, short of the file's end. Pure: no I/O and no
+/// allocation, so the bridged view answers with the same reason.
+pub fn imageNotAttachedReason(bytes: []const u8, incomplete_read: bool) ?[]const u8 {
+    const dimensions = image_data.imageDimensions(bytes);
+    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+    const attachable = dimensions != null and
+        encoded_len <= image_data.max_encoded_image_bytes and
+        !dimensions.?.exceeds(image_data.max_single_image_dimension);
+    if (!incomplete_read and attachable) return null;
+    if (incomplete_read) return "the file exceeds the 10 MiB read limit";
+    if (dimensions == null) return "the image dimensions could not be verified";
+    if (encoded_len > image_data.max_encoded_image_bytes) return "the image exceeds the 5 MiB encoded attach limit";
+    return "the image exceeds 8000 pixels per side";
+}
+
 /// Attaches supported images within the absolute pixel and encoded byte
 /// limits. Oversized or incompletely read images return their source path and
 /// recovery guidance. Non-image content uses the binary-omitted summary.
@@ -230,25 +246,14 @@ fn imageToolResult(
     incomplete_read: bool,
 ) tool_dispatch.DispatchError!?tool_dispatch.ToolResult {
     const mime_type = image_data.detectMediaTypeFromBytes(bytes) orelse return null;
-    const dimensions = image_data.imageDimensions(bytes);
-    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
-    if (incomplete_read or dimensions == null or encoded_len > image_data.max_encoded_image_bytes or
-        dimensions.?.exceeds(image_data.max_single_image_dimension))
-    {
+    if (imageNotAttachedReason(bytes, incomplete_read)) |reason| {
         tool_dispatch.reportToolResultMemory(ctx, .{ .model_view_covers_full_file = false });
-        const reason = if (incomplete_read)
-            "the file exceeds read_file's 10 MiB read limit"
-        else if (dimensions == null)
-            "the image dimensions could not be verified"
-        else if (encoded_len > image_data.max_encoded_image_bytes)
-            "the image exceeds the 5 MiB encoded attach limit"
-        else
-            "the image exceeds 8000 pixels per side";
         return .{ .success = try ctx.allocator.print(
             "<path>{s}</path>\n<content>image not attached: {s} ({d} bytes); {s}. Use an available image tool to save a smaller copy to a new file, then read_file the copy. If no image tool is available, ask the user before installing one.</content>",
             .{ rel, mime_type, file_size, reason },
         ) };
     }
+    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
     var text: std.Io.Writer.Allocating = .init(ctx.allocator);
     errdefer text.deinit();
     text.writer.print("<path>{s}</path>\n<content>image attached ({s}, {d} bytes)</content>", .{ rel, mime_type, file_size }) catch return error.OutOfMemory;
@@ -911,6 +916,29 @@ test "read_file keeps a byte-oversized PNG at its source path" {
     try std.testing.expect(std.mem.find(u8, result.body, "<path>") != null);
     try std.testing.expectEqual(@as(usize, 0), result.images.len);
     try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
+}
+
+test "imageNotAttachedReason gives one reason per limit, none of them naming a tool" {
+    const alloc = std.testing.allocator;
+    const small = image_data.testPngHeader(100, 100);
+    try std.testing.expectEqual(@as(?[]const u8, null), imageNotAttachedReason(&small, false));
+    try std.testing.expectEqualStrings("the image exceeds 8000 pixels per side", imageNotAttachedReason(&image_data.testPngHeader(8001, 1), false).?);
+    try std.testing.expectEqualStrings("the image dimensions could not be verified", imageNotAttachedReason("\x89PNG\r\n\x1a\n", false).?);
+    try std.testing.expectEqualStrings("the file exceeds the 10 MiB read limit", imageNotAttachedReason(&small, true).?);
+
+    const big = try alloc.alloc(u8, max_attach_image_bytes + 1);
+    defer alloc.free(big);
+    @memset(big, 0);
+    @memcpy(big[0..small.len], &small);
+    try std.testing.expectEqualStrings("the image exceeds the 5 MiB encoded attach limit", imageNotAttachedReason(big, false).?);
+
+    for ([_]?[]const u8{
+        imageNotAttachedReason(&image_data.testPngHeader(8001, 1), false),
+        imageNotAttachedReason(big, false),
+        imageNotAttachedReason(&small, true),
+    }) |reason| {
+        try std.testing.expect(std.mem.find(u8, reason.?, "read_file") == null);
+    }
 }
 
 test "read_file attaches an image exactly at the model pixel limit" {

@@ -123,6 +123,41 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     return .{ .success = output };
 }
 
+/// The text the question tool answers with for arguments it cannot take (a duplicate or
+/// reserved option label, a bad count), or null when it can take them.
+pub fn invalidArgsText(alloc: Allocator, args_json: []const u8) !?[]u8 {
+    var parse_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer parse_arena_state.deinit();
+    var position: ParsePosition = .{};
+    _ = parseQuestionBatch(parse_arena_state.allocator(), args_json, &position) catch |err| {
+        return try invalidArgsBody(alloc, err, position);
+    };
+    return null;
+}
+
+/// What a plain-text question answer is: the chosen label or typed text, a cancel, or
+/// the text for arguments the tool cannot take.
+pub const PlainAnswer = union(enum) {
+    answered: []u8,
+    cancelled,
+    invalid: []u8,
+};
+
+/// Asks one question batch and returns its first answer as plain text, for a host that
+/// prints it (`fx tool ask`). The answer is owned by `result_alloc`.
+pub fn requestPlainAnswer(result_alloc: Allocator, args_json: []const u8, requester: Requester) !PlainAnswer {
+    var parse_arena_state = std.heap.ArenaAllocator.init(result_alloc);
+    defer parse_arena_state.deinit();
+    var position: ParsePosition = .{};
+    const entries = parseQuestionBatch(parse_arena_state.allocator(), args_json, &position) catch |err| {
+        return .{ .invalid = try invalidArgsBody(result_alloc, err, position) };
+    };
+    const answers = (try requester.request(requester.ctx, requester.response_alloc, entries)) orelse return .cancelled;
+    defer freeAnswers(requester.response_alloc, answers);
+    if (answers.len == 0) return .cancelled;
+    return .{ .answered = try result_alloc.dupe(u8, answers[0]) };
+}
+
 pub fn executeWithRequester(result_alloc: Allocator, args_json: []const u8, requester: Requester) ![]u8 {
     var parse_arena_state = std.heap.ArenaAllocator.init(result_alloc);
     defer parse_arena_state.deinit();

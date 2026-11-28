@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { processAlive } from "./process-alive";
 import { execFileSync } from "node:child_process";
 import {
@@ -2377,3 +2377,232 @@ test.skipIf(!tmuxAvailable())(
   },
   60_000,
 );
+
+describe("TUI bash ask", () => {
+  // Esc must end the question, and its fx tool ask process must exit, within this bound.
+  const ASK_CANCEL_MS = 5_000;
+  const ASK_TRACE_SCOPES = "shell,terminal,terminal_client,terminal_host,tool,agent,mcp-call,subagent";
+  const ASK_WITHDRAW_LINE = "a question shown for a canceled bash call was withdrawn";
+
+  function askCommand(question: string, labels: string[]): string {
+    const options = labels.map((label) => ` --option=${label}`).join("");
+    return `${JSON.stringify(FX_BIN)} tool ask "${question}"${options}`;
+  }
+
+  function optionRow(ordinal: number, label: string) {
+    return (pane: string) => pane.includes(`${ordinal}) ${label}`);
+  }
+
+  function countOf(text: string, needle: string): number {
+    return text.split(needle).length - 1;
+  }
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI bash ask: choosing option 1 ends the question and its label is the bash output",
+    async () => {
+      const fixture = createFixture("fx-tui-bash-ask-choose-", { experimental: { bash_tool: true } });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("tui_ask_choose", "bash", {
+          command: `${askCommand("Pick a path for choose?", ["ALPHA_PATH", "BETA_PATH"])}; echo "exit=$?"`,
+        }),
+        fakeGatewayFinalText("ASK_CHOOSE_DONE"),
+      ]);
+      gateways.push(gateway);
+      const active = await launch(fixture, gateway, FX_BIN, { FX_TRACE_SCOPES: ASK_TRACE_SCOPES });
+
+      await active.sendText("Ask me which path.");
+      await active.waitForPane(optionRow(1, "ALPHA_PATH"), TIMEOUT);
+      await active.sendLiteralText("1");
+      await active.waitForText("ASK_CHOOSE_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+
+      expect(gateway.requests).toHaveLength(2);
+      const output = toolResultText(gateway.requests[1]!.body, "tui_ask_choose");
+      expect(output).toContain("ALPHA_PATH");
+      expect(output).not.toContain("BETA_PATH");
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI bash ask: the Other row takes a typed answer, and that text is the bash output",
+    async () => {
+      const fixture = createFixture("fx-tui-bash-ask-other-", { experimental: { bash_tool: true } });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("tui_ask_other", "bash", {
+          command: `${askCommand("Pick a path for other?", ["ALPHA_PATH", "BETA_PATH"])}; echo "exit=$?"`,
+        }),
+        fakeGatewayFinalText("ASK_OTHER_DONE"),
+      ]);
+      gateways.push(gateway);
+      const active = await launch(fixture, gateway, FX_BIN, { FX_TRACE_SCOPES: ASK_TRACE_SCOPES });
+
+      await active.sendText("Ask me which path, typed.");
+      await active.waitForPane(optionRow(3, "Other"), TIMEOUT);
+      await active.sendLiteralText("3");
+      await active.waitForText("type answer", TIMEOUT);
+      await active.sendLiteralText("typed answer from the person");
+      await active.sendKeys("Enter");
+      await active.waitForText("ASK_OTHER_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+
+      expect(gateway.requests).toHaveLength(2);
+      const output = toolResultText(gateway.requests[1]!.body, "tui_ask_other");
+      expect(output).toContain("typed answer from the person");
+      expect(output).not.toContain("ALPHA_PATH");
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI bash ask: Esc during the question cancels the turn, and the question and its ask process end within 5 s",
+    async () => {
+      const fixture = createFixture("fx-tui-bash-ask-esc-", { experimental: { bash_tool: true } });
+      const pidFile = join(fixture.root, "ask.pid");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("tui_ask_esc", "bash", {
+          command: `${askCommand("Pick a path for esc?", ["ALPHA_PATH", "BETA_PATH"])} & echo $! > "${pidFile}"; wait $!; echo "exit=$?"`,
+        }),
+        fakeGatewayFinalText("ASK_ESC_SHOULD_NOT_RUN"),
+      ]);
+      gateways.push(gateway);
+      const active = await launch(fixture, gateway, FX_BIN, { FX_TRACE_SCOPES: ASK_TRACE_SCOPES });
+
+      await active.sendText("Ask me which path, then cancel.");
+      await active.waitForPane(optionRow(1, "ALPHA_PATH"), TIMEOUT);
+      await active.waitForPane(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim() !== "", TIMEOUT);
+      const askPids = [Number(readFileSync(pidFile, "utf8").trim())];
+      expect(askPids[0]).toBeGreaterThan(0);
+
+      await active.sendKeys("Escape");
+      await active.waitForPane(
+        (pane) => pane.includes("▪ Cancelled") && !pane.includes("1) ALPHA_PATH"),
+        ASK_CANCEL_MS,
+      );
+      await waitUntilGone(askPids, ASK_CANCEL_MS);
+      await active.waitForComposer(ASK_CANCEL_MS);
+
+      expect(gateway.requests).toHaveLength(1);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI bash ask: a killed ask leaves the question with no key, returns without an answer, and logs the withdrawal",
+    async () => {
+      const fixture = createFixture("fx-tui-bash-ask-kill-", { experimental: { bash_tool: true } });
+      const pidFile = join(fixture.root, "ask.pid");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("tui_ask_kill", "bash", {
+          command: `${askCommand("Pick a path for kill?", ["ALPHA_PATH", "BETA_PATH"])} & echo $! > "${pidFile}"; wait $!; echo "exit=$?"`,
+        }),
+        fakeGatewayFinalText("ASK_KILL_DONE"),
+      ]);
+      gateways.push(gateway);
+      const active = await launch(fixture, gateway, FX_BIN, { FX_TRACE_SCOPES: ASK_TRACE_SCOPES });
+
+      await active.sendText("Ask me which path, then get killed.");
+      await active.waitForPane(optionRow(1, "ALPHA_PATH"), TIMEOUT);
+      await active.waitForPane(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim() !== "", TIMEOUT);
+      const askPid = Number(readFileSync(pidFile, "utf8").trim());
+      expect(askPid).toBeGreaterThan(0);
+      process.kill(askPid, "SIGTERM");
+
+      await active.waitForPane((pane) => !pane.includes("1) ALPHA_PATH"), TIMEOUT);
+      await active.waitForText("ASK_KILL_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+
+      expect(gateway.requests).toHaveLength(2);
+      const output = toolResultText(gateway.requests[1]!.body, "tui_ask_kill");
+      expect(output).toContain("exit=");
+      expect(output).not.toContain("ALPHA_PATH");
+      expect(readFileSync(fixture.tracePath, "utf8")).toContain(ASK_WITHDRAW_LINE);
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI bash ask: two asks at once show one question at a time, and each answer comes out once",
+    async () => {
+      const fixture = createFixture("fx-tui-bash-ask-pair-", { experimental: { bash_tool: true } });
+      const command = [
+        `${askCommand("Pick first?", ["FIRST_A", "FIRST_B"])} &`,
+        `${askCommand("Pick second?", ["SECOND_A", "SECOND_B"])} &`,
+        `wait; echo "exit=$?"`,
+      ].join(" ");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("tui_ask_pair", "bash", { command }),
+        fakeGatewayFinalText("ASK_PAIR_DONE"),
+      ]);
+      gateways.push(gateway);
+      const active = await launch(fixture, gateway, FX_BIN, { FX_TRACE_SCOPES: ASK_TRACE_SCOPES });
+
+      await active.sendText("Ask me two things at once.");
+      // Arrival order at the bridge decides which question shows first; either order must hold.
+      const firstPane = await active.waitForPane(
+        (pane) => pane.includes("1) FIRST_A") || pane.includes("1) SECOND_A"),
+        TIMEOUT,
+      );
+      const firstLabel = firstPane.includes("1) FIRST_A") ? "FIRST_A" : "SECOND_A";
+      const laterLabel = firstLabel === "FIRST_A" ? "SECOND_A" : "FIRST_A";
+      expect(firstPane).not.toContain(`1) ${laterLabel}`);
+
+      await active.sendLiteralText("1");
+      const laterPane = await active.waitForPane(optionRow(1, laterLabel), TIMEOUT);
+      expect(laterPane).not.toContain(`1) ${firstLabel}`);
+
+      await active.sendLiteralText("1");
+      await active.waitForText("ASK_PAIR_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+
+      expect(gateway.requests).toHaveLength(2);
+      const output = toolResultText(gateway.requests[1]!.body, "tui_ask_pair");
+      expect(countOf(output, "FIRST_A")).toBe(1);
+      expect(countOf(output, "SECOND_A")).toBe(1);
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI bash ask: a subagent child's ask is lent to the main screen under the child's name, and its answer reaches the child",
+    async () => {
+      const fixture = createFixture("fx-tui-bash-ask-child-", { experimental: { bash_tool: true } });
+      mkdirSync(join(fixture.home, ".fx", "agents", "helper"), { recursive: true });
+      writeFileSync(
+        join(fixture.home, ".fx", "agents", "helper", "profile.json"),
+        JSON.stringify({ description: "Helper agent" }),
+      );
+      let step = 0;
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes('"toolCallId":"child_ask"')) return fakeGatewayFinalText("CHILD_ASK_DONE");
+        // The child's prompt is "run bash"; the main agent only repeats that text in its spawn call.
+        if (body.includes("run bash") && !body.includes('"toolCallId":"spawn"')) {
+          return fakeGatewayToolCall("child_ask", "bash", {
+            command: `${askCommand("Pick a child path?", ["CHILD_PATH", "CHILD_OTHER"])}; echo "exit=$?"`,
+          });
+        }
+        step += 1;
+        if (step === 1) return fakeGatewayToolCall("spawn", "subagent", { action: "message", agent: "helper", message: "run bash" });
+        if (step === 2) return fakeGatewayToolCall("wait_sub", "subagent", { action: "wait" });
+        return fakeGatewayFinalText("CHILD_TUI_DONE");
+      });
+      gateways.push(gateway);
+      const active = await launch(fixture, gateway, FX_BIN, { FX_TRACE_SCOPES: ASK_TRACE_SCOPES });
+
+      await active.sendText("Ask the helper to pick a path.");
+      await active.waitForPane((pane) => pane.includes("helper asks") && pane.includes("1) CHILD_PATH"), TIMEOUT);
+      await active.sendLiteralText("1");
+      await active.waitForText("CHILD_TUI_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+
+      const childRequest = gateway.requests.find((request) => request.body.includes('"toolCallId":"child_ask"'));
+      expect(childRequest).toBeDefined();
+      const output = toolResultText(childRequest!.body, "child_ask");
+      expect(output).toContain("CHILD_PATH");
+      expect(output).not.toContain("CHILD_OTHER");
+    },
+    60_000,
+  );
+});

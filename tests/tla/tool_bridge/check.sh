@@ -29,6 +29,16 @@
 # quiet wait, a wait that ended on mail, and a wait refused after the first
 # call yielded.
 #
+# AskWait models `fx tool ask`, the slice-8 design, built in src/core/tool_bridge/bridge.zig and src/core/tooling/tool_runtime.zig. A
+# question holds the bridge's prompt lock until it ends, so one prompt shows at a
+# time, and a watch withdraws a question whose program is gone. ask-design must
+# pass. ask-mutant-watch-off removes the watch, so a gone program's bash call
+# waits for a person who may never answer. ask-mutant-admission-lock-only holds
+# the lock only for the permission check, as the bridge does today, so a second
+# question fills the session's one question slot. The ask-witness-* configs show
+# an answer, a withdrawn question, a request that gave up, Esc, a host with no
+# question UI, a refusal after the yield, and two questions in turn.
+#
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 set -eu
 
@@ -65,13 +75,26 @@ AgentWait agent-witness-canceled NeverCanceled
 AgentWait agent-witness-quiet NeverQuiet
 AgentWait agent-witness-mail NeverMailAfterWait
 AgentWait agent-witness-unavailable NeverUnavailable
+AskWait ask-design -
+AskWait ask-mutant-watch-off temporal
+AskWait ask-mutant-admission-lock-only NoCrash
+AskWait ask-witness-answered NeverAnswered
+AskWait ask-witness-withdrawn NeverWithdrawn
+AskWait ask-witness-gave-up NeverGaveUp
+AskWait ask-witness-esc NeverEsc
+AskWait ask-witness-no-ui NeverNoUi
+AskWait ask-witness-unavailable NeverUnavailable
+AskWait ask-witness-two-asked NeverTwoAsked
 EOT
 
 # The driver: the design-bridge state graph walked on the real harness,
 # code traces checked by TraceToolEdit.tla, and each planted bug in
 # mutations.json caught. The AgentWait graph is walked on the real subagent
 # wait, its traces are checked by TraceAgentWait.tla, the bridge grace is timed,
-# and each planted bug in agent-mutations.json is caught.
+# and each planted bug in agent-mutations.json is caught. The AskWait graph is
+# walked on the real bridge, runBridgeAsk, worker question slot, and managed
+# execution, its traces are checked by TraceAskWait.tla, and each planted bug
+# in ask-mutations.json is caught.
 # FX_TLA_TOOL_BRIDGE_QUICK=1 runs the quick settings.
 # FX_TLA_TOOL_BRIDGE_TLC_ONLY=1 skips the driver and keeps the TLC verdicts,
 # which every pull request checks in ci.yml.
