@@ -1756,7 +1756,13 @@ describe("@ file picker", () => {
       const refreshedDirectoryAdoption = nextFileIndexAdoption(current.tracePath);
       await active.sendKeys("Tab");
       await waitForFileText(current.tracePath, refreshedDirectoryAdoption);
-      await active.waitForText("Selection unavailable", TIMEOUT);
+      // The adopted index reaches the picker only at the next frame commit, and
+      // a Down sent before it acts on the old flip-dir/ rows. Wait until the
+      // refreshed file row is painted.
+      await active.waitForPane((pane) => {
+        const rows = pickerRows(pane.split("\n"));
+        return rows.at(-1) === "flip-dir" && !rows.some((row) => row.startsWith("flip-dir/"));
+      }, TIMEOUT);
       const refreshedDirectoryTraceOffset = readFileSync(
         current.tracePath,
         "utf8",

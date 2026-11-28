@@ -37,6 +37,8 @@ const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const current_branch = @import("../workspace/current_branch.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
+const result_store = @import("../session/result_store.zig");
+const session_child_store = @import("../session/session_child_store.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -66,6 +68,36 @@ pub const SessionPermissionStateProvider = struct {
     }
 };
 
+/// The stores a review reads a question's stored answers from: the session's
+/// managed result store first, the legacy tool-result folder second. Both are
+/// borrowed for the admission call.
+pub const ReviewResultStore = struct {
+    capability: ?*session_child_store.SessionChildCapability = null,
+    result_dir: ?[]const u8 = null,
+};
+
+/// The classifier's `read_fn` context: reads one stored answer text whole.
+const ReviewResultReader = struct {
+    store: ReviewResultStore,
+
+    fn readWhole(raw: *anyopaque, alloc: Allocator, handle: []const u8) anyerror![]u8 {
+        const self: *const ReviewResultReader = @ptrCast(@alignCast(raw));
+        if (self.store.capability) |capability| return result_store.readWholeManaged(alloc, capability, handle);
+        const dir = self.store.result_dir orelse return error.ResultHandleNotFound;
+        return result_store.readWhole(alloc, dir, handle);
+    }
+};
+
+/// The stored-answers reader for one review, or null when no store exists.
+/// The reader lives in `arena`, which lasts as long as the review request.
+fn storedResultsFor(input: Input, arena: Allocator) !?permission_auto_classifier.StoredResults {
+    const store = input.review_result_store orelse return null;
+    if (store.capability == null and store.result_dir == null) return null;
+    const reader = try arena.create(ReviewResultReader);
+    reader.* = .{ .store = store };
+    return .{ .context = reader, .read_fn = ReviewResultReader.readWhole };
+}
+
 /// Borrowed capabilities required for permission admission. The leaf never
 /// owns, persists, or extends any referenced runtime state.
 pub const Input = struct {
@@ -85,6 +117,9 @@ pub const Input = struct {
     context_limits: context_limits.Values = .{},
     auto_classifier: permission_auto_classifier.Classifier = .disabled(),
     terminal_review_context: ?terminal_managed_observer.Context = null,
+    /// Where a review reads a question's stored answers by handle. Null when
+    /// the session has no result store.
+    review_result_store: ?ReviewResultStore = null,
     host_sandbox_default: HostSandboxDefault = .none,
 };
 
@@ -801,6 +836,7 @@ fn reviewRequestForCall(
         .prior_tool_results = prior_tool_results,
         .targets = targets,
         .action = action,
+        .stored_results = try storedResultsFor(input, arena),
     };
 }
 
@@ -4581,10 +4617,12 @@ test "missing contextual review authority maps to unavailable without reviewer t
             _: []const u8,
             _: []const types.ChatMessage,
             _: []const types.ChatMessage,
+            follow_up: []const types.ChatMessage,
             _: []const u8,
             _: std.Io.Clock.Timestamp,
             _: *std.atomic.Value(bool),
         ) ![]u8 {
+            if (follow_up.len > 0) return error.ReadTurnsUnsupported;
             return alloc.dupe(u8, "{}");
         }
 
@@ -6875,4 +6913,15 @@ test "automatic trusted-root overwrite preserves configured read disclosure revi
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+}
+
+test "a review gets a reader for stored answers only when a result store exists" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    try std.testing.expect((try storedResultsFor(input, arena_state.allocator())) == null);
+    input.review_result_store = .{ .result_dir = "/tmp/fx-review-result-store" };
+    try std.testing.expect((try storedResultsFor(input, arena_state.allocator())) != null);
 }
