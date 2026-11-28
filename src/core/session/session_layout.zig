@@ -31,6 +31,25 @@ pub fn validateSessionId(session_id: []const u8) !void {
     }
 }
 
+/// The ID of the session a folder names, for `--resume <folder>`. The folder
+/// must sit directly in `sessions_v2_root`. Both paths are resolved first, so
+/// a symlink or `..` that leaves that folder is refused. The caller owns the ID.
+pub fn sessionIdFromFolder(alloc: Allocator, sessions_v2_root: []const u8, folder: []const u8) error{ NotSessionFolder, OutOfMemory }![]u8 {
+    const root = io_mod.realpathAlloc(alloc, sessions_v2_root) catch |err| return mapRealpathError(err);
+    defer alloc.free(root);
+    const real = io_mod.realpathAlloc(alloc, folder) catch |err| return mapRealpathError(err);
+    defer alloc.free(real);
+    const parent = std.Io.Dir.path.dirname(real) orelse return error.NotSessionFolder;
+    if (!std.mem.eql(u8, parent, root)) return error.NotSessionFolder;
+    const id = std.Io.Dir.path.basename(real);
+    validateSessionId(id) catch return error.NotSessionFolder;
+    return alloc.dupe(u8, id);
+}
+
+fn mapRealpathError(err: anyerror) error{ NotSessionFolder, OutOfMemory } {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.NotSessionFolder;
+}
+
 /// A fresh id: 9 random bytes as base64url. It never starts with `-`, so no
 /// command reads it as a flag, as `fx session` reads an id that starts with
 /// `--`. The caller owns the id.
@@ -137,4 +156,62 @@ test "the sessions v2 root is never a v1 session id" {
     try std.testing.expectError(error.InvalidSessionId, validateSessionId(sessions_v2_dir));
     try std.testing.expectError(error.InvalidSessionId, validateSessionId("V2"));
     try validateSessionId("v2x");
+}
+
+test "a session folder gives its id, with or without a trailing slash" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "sessions/v2/session-123");
+    const v2 = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "sessions/v2");
+    defer alloc.free(v2);
+    const folder = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "sessions/v2/session-123");
+    defer alloc.free(folder);
+
+    const id = try sessionIdFromFolder(alloc, v2, folder);
+    defer alloc.free(id);
+    try std.testing.expectEqualStrings("session-123", id);
+
+    const with_slash = try alloc.print("{s}/", .{folder});
+    defer alloc.free(with_slash);
+    const slashed = try sessionIdFromFolder(alloc, v2, with_slash);
+    defer alloc.free(slashed);
+    try std.testing.expectEqualStrings("session-123", slashed);
+}
+
+test "a folder that is not a session folder in the profile is refused" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "sessions/v2/session-123");
+    try tmp.dir.createDirPath(io_mod.getIo(), "sessions/v2/bad name");
+    try tmp.dir.createDirPath(io_mod.getIo(), "sessions/v1/session-456");
+    try tmp.dir.createDirPath(io_mod.getIo(), "outside/session-789");
+    tmp.dir.symLink(io_mod.getIo(), "../../outside/session-789", "sessions/v2/escape", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const v2 = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "sessions/v2");
+    defer alloc.free(v2);
+    const sibling = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "sessions/v1/session-456");
+    defer alloc.free(sibling);
+    const outside = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "outside/session-789");
+    defer alloc.free(outside);
+    const bad_name = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "sessions/v2/bad name");
+    defer alloc.free(bad_name);
+    const escape = try alloc.print("{s}/escape", .{v2});
+    defer alloc.free(escape);
+    const dotdot = try alloc.print("{s}/session-123/../../../outside/session-789", .{v2});
+    defer alloc.free(dotdot);
+    const missing = try alloc.print("{s}/missing-123", .{v2});
+    defer alloc.free(missing);
+
+    try std.testing.expectError(error.NotSessionFolder, sessionIdFromFolder(alloc, v2, v2));
+    try std.testing.expectError(error.NotSessionFolder, sessionIdFromFolder(alloc, v2, sibling));
+    try std.testing.expectError(error.NotSessionFolder, sessionIdFromFolder(alloc, v2, outside));
+    try std.testing.expectError(error.NotSessionFolder, sessionIdFromFolder(alloc, v2, escape));
+    try std.testing.expectError(error.NotSessionFolder, sessionIdFromFolder(alloc, v2, dotdot));
+    try std.testing.expectError(error.NotSessionFolder, sessionIdFromFolder(alloc, v2, missing));
+    try std.testing.expectError(error.NotSessionFolder, sessionIdFromFolder(alloc, v2, bad_name));
 }

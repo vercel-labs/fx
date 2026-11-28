@@ -176,24 +176,25 @@ pub const Reporter = struct {
         cwd: []const u8,
     };
 
-    pub fn update(self: *Reporter, token: []const u8, process: Process, session_id: ?[]const u8) ?[]const u8 {
+    pub fn update(self: *Reporter, token: []const u8, process: Process, session_id: ?[]const u8, resume_value: []const u8) ?[]const u8 {
         const id = session_id orelse return null;
         if (self.isLastSessionId(id)) return null;
         self.rememberSessionId(id);
         if (id.len <= max_session_id_bytes) {
-            const argv = [_][]const u8{ process.executable, resume_argument, id };
-            const command = Command{
-                .pid = process.pid,
-                .time_s = process.time_s,
-                .argv = &argv,
-                .cwd = process.cwd,
-            };
-            if (encodeReport(&self.sequence, command, token)) |sequence| {
+            if (encodeResume(&self.sequence, process, resume_value, token)) |sequence| {
                 self.reported = true;
                 return sequence;
             }
         }
         return self.clear(token, process.pid, process.time_s);
+    }
+
+    /// True when `update` can report `resume_value` for this process. Ask before
+    /// `update`: `update` records the session ID even when its report does not
+    /// fit, so a caller that falls back to the ID cannot call it again.
+    pub fn resumeValueFits(token: []const u8, process: Process, resume_value: []const u8) bool {
+        var buffer: [max_sequence_bytes]u8 = undefined;
+        return encodeResume(&buffer, process, resume_value, token) != null;
     }
 
     pub fn clear(self: *Reporter, token: []const u8, pid: u32, time_s: i64) ?[]const u8 {
@@ -221,6 +222,19 @@ pub const Reporter = struct {
         }
     }
 };
+
+/// Returns the report that resumes the session named by `resume_value`, which
+/// is the session ID or its folder. The returned slice borrows `buffer`.
+fn encodeResume(buffer: *[max_sequence_bytes]u8, process: Reporter.Process, resume_value: []const u8, token: []const u8) ?[]const u8 {
+    const argv = [_][]const u8{ process.executable, resume_argument, resume_value };
+    const command = Command{
+        .pid = process.pid,
+        .time_s = process.time_s,
+        .argv = &argv,
+        .cwd = process.cwd,
+    };
+    return encodeReport(buffer, command, token);
+}
 
 fn isReportableCommand(command: Command) bool {
     return isPidAndTimeValid(command.pid, command.time_s) and
@@ -521,45 +535,75 @@ const test_process = Reporter.Process{
     .cwd = "/home/user/project",
 };
 
+const test_session_one = "session-one-0123456789";
+const test_session_two = "session-two-0123456789";
+const test_folder_one = "/Users/example/.fx/sessions/v2/session-one-0123456789";
+const test_folder_two = "/Users/example/.fx/sessions/v2/session-two-0123456789";
+
 test "reporter reports the first session" {
     var reporter: Reporter = .{};
-    const sequence = reporter.update(test_token, test_process, "session-one-0123456789") orelse
+    const sequence = reporter.update(test_token, test_process, test_session_one, test_folder_one) orelse
         return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.startsWith(u8, sequence, prefix ++ "pid=74877:"));
     try std.testing.expect(reporter.reported);
 }
 
+test "reporter names the session folder as the third argv element" {
+    var reporter: Reporter = .{};
+    const sequence = reporter.update(test_token, test_process, test_session_one, test_folder_one) orelse
+        return error.TestUnexpectedResult;
+    const argv = [_][]const u8{ "nvim", "--resume", test_folder_one };
+    const command = Command{ .pid = 74877, .time_s = test_time_s, .argv = &argv, .cwd = "/home/user/project" };
+    var buffer: [max_sequence_bytes]u8 = undefined;
+    const expected = encodeReport(&buffer, command, test_token) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(expected, sequence);
+}
+
 test "reporter changed is true until its session is reported" {
     var reporter: Reporter = .{};
-    try std.testing.expect(reporter.changed("session-one-0123456789"));
-    _ = reporter.update(test_token, test_process, "session-one-0123456789");
-    try std.testing.expect(!reporter.changed("session-one-0123456789"));
-    try std.testing.expect(reporter.changed("session-two-0123456789"));
+    try std.testing.expect(reporter.changed(test_session_one));
+    _ = reporter.update(test_token, test_process, test_session_one, test_folder_one);
+    try std.testing.expect(!reporter.changed(test_session_one));
+    try std.testing.expect(reporter.changed(test_session_two));
 }
 
 test "reporter does not report the same session again" {
     var reporter: Reporter = .{};
-    _ = reporter.update(test_token, test_process, "session-one-0123456789");
-    try std.testing.expect(reporter.update(test_token, test_process, "session-one-0123456789") == null);
+    _ = reporter.update(test_token, test_process, test_session_one, test_folder_one);
+    try std.testing.expect(reporter.update(test_token, test_process, test_session_one, test_folder_one) == null);
 }
 
 test "reporter reports a new session again" {
     var reporter: Reporter = .{};
-    _ = reporter.update(test_token, test_process, "session-one-0123456789");
-    try std.testing.expect(reporter.update(test_token, test_process, "session-two-0123456789") != null);
+    _ = reporter.update(test_token, test_process, test_session_one, test_folder_one);
+    try std.testing.expect(reporter.update(test_token, test_process, test_session_two, test_folder_two) != null);
 }
 
 test "reporter ignores a null session and keeps its record" {
     var reporter: Reporter = .{};
-    _ = reporter.update(test_token, test_process, "session-one-0123456789");
-    try std.testing.expect(reporter.update(test_token, test_process, null) == null);
+    _ = reporter.update(test_token, test_process, test_session_one, test_folder_one);
+    try std.testing.expect(reporter.update(test_token, test_process, null, test_folder_one) == null);
     try std.testing.expect(reporter.reported);
-    try std.testing.expect(reporter.update(test_token, test_process, "session-one-0123456789") == null);
+    try std.testing.expect(reporter.update(test_token, test_process, test_session_one, test_folder_one) == null);
+}
+
+test "resume value fits reports whether a folder fits the report" {
+    const long_folder: [max_sequence_bytes]u8 = @splat('a');
+    try std.testing.expect(Reporter.resumeValueFits(test_token, test_process, test_folder_one));
+    try std.testing.expect(!Reporter.resumeValueFits(test_token, test_process, &long_folder));
+}
+
+test "reporter reports the session ID when the folder does not fit" {
+    var reporter: Reporter = .{};
+    const long_folder: [max_sequence_bytes]u8 = @splat('a');
+    const value: []const u8 = if (Reporter.resumeValueFits(test_token, test_process, &long_folder)) &long_folder else test_session_one;
+    try std.testing.expect(reporter.update(test_token, test_process, test_session_one, value) != null);
+    try std.testing.expect(reporter.reported);
 }
 
 test "reporter clear returns the clear sequence once" {
     var reporter: Reporter = .{};
-    _ = reporter.update(test_token, test_process, "session-one-0123456789");
+    _ = reporter.update(test_token, test_process, test_session_one, test_folder_one);
     try expectSequence(
         prefix ++ "pid=74877:time=1795543200:clear=1" ++
             mac_field ++ "c30603369f98fef581a4098be889175b0c74f0641e49f8b25f4326cb38f97c93" ++ terminator,
@@ -570,25 +614,25 @@ test "reporter clear returns the clear sequence once" {
 
 test "reporter clears once when a session cannot be reported" {
     var reporter: Reporter = .{};
-    _ = reporter.update(test_token, test_process, "session-one-0123456789");
+    _ = reporter.update(test_token, test_process, test_session_one, test_folder_one);
     const too_long: [max_session_id_bytes + 1]u8 = @splat('s');
     const too_long_session: []const u8 = &too_long;
-    try std.testing.expect(reporter.update(test_token, test_process, too_long_session) != null);
+    try std.testing.expect(reporter.update(test_token, test_process, too_long_session, test_folder_one) != null);
     try std.testing.expect(!reporter.reported);
-    try std.testing.expect(reporter.update(test_token, test_process, too_long_session) == null);
+    try std.testing.expect(reporter.update(test_token, test_process, too_long_session, test_folder_one) == null);
 }
 
 test "reporter reports a session ID of exactly max_session_id_bytes" {
     var reporter: Reporter = .{};
     const longest: [max_session_id_bytes]u8 = @splat('s');
     const longest_session: []const u8 = &longest;
-    try std.testing.expect(reporter.update(test_token, test_process, longest_session) != null);
+    try std.testing.expect(reporter.update(test_token, test_process, longest_session, test_folder_one) != null);
     try std.testing.expect(reporter.reported);
 }
 
 test "reporter clears when a command cannot be reported after a report" {
     var reporter: Reporter = .{};
-    _ = reporter.update(test_token, test_process, "session-one-0123456789");
+    _ = reporter.update(test_token, test_process, test_session_one, test_folder_one);
     const relative_process = Reporter.Process{
         .pid = 74877,
         .time_s = test_time_s,
@@ -598,7 +642,7 @@ test "reporter clears when a command cannot be reported after a report" {
     try expectSequence(
         prefix ++ "pid=74877:time=1795543200:clear=1" ++
             mac_field ++ "c30603369f98fef581a4098be889175b0c74f0641e49f8b25f4326cb38f97c93" ++ terminator,
-        reporter.update(test_token, relative_process, "session-two-0123456789"),
+        reporter.update(test_token, relative_process, test_session_two, test_folder_two),
     );
     try std.testing.expect(!reporter.reported);
 }

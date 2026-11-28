@@ -267,6 +267,7 @@ pub const StartupState = struct {
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
     auto_upgrade: bool = true,
+    rex_resume_rule: bool = true,
     update_channel: update_target.Channel = .stable,
     prompt_history_enabled: bool = true,
     prompt_history_store_allowed: bool = true,
@@ -624,6 +625,7 @@ pub fn loadLibfxStartupState(
         .agent_step_limit = default_agent_step_limit,
         .context_enabled = false,
         .auto_upgrade = false,
+        .rex_resume_rule = false,
         .prompt_history_enabled = false,
         .prompt_history_store_allowed = false,
     };
@@ -948,6 +950,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.collapse_tool_calls = settings.collapse_tool_calls orelse false;
     state.auto_upgrade = settings.auto_upgrade orelse true;
+    state.rex_resume_rule = settings.rex_resume_rule orelse true;
     state.update_channel = settings.update_channel orelse .stable;
     state.theme = if (settings.theme) |value| try alloc.dupe(u8, value) else null;
     state.effort = settings.effort orelse .auto;
