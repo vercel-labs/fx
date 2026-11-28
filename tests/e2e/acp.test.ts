@@ -2057,6 +2057,8 @@ describe("acp: model-independent", () => {
         sendPrompt(client, 3, "Save this chat.");
         expect((await readResponse(client, 3)).result.stopReason).toBe("end_turn");
         await client.close();
+        // The second fx's trace starts empty, without the first's wait.
+        rmSync(tracePath, { force: true });
 
         holdCredits = true;
         client = await AcpClient.create({ cwd: root.workspace, env });
