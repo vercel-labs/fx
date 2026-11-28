@@ -231,88 +231,12 @@ pub const Definition = struct {
         if (self.working_dir) |dir| hash_part(&hash, dir);
         return hash.finalResult();
     }
-
-    /// Deep-copies this definition into `owned` (typically a `Registry`'s arena).
-    pub fn clone(self: Definition, owned: Allocator) Allocator.Error!Definition {
-        const cloned_auth: Auth = switch (self.auth) {
-            .none => .none,
-            .bearer => |env| .{ .bearer = try owned.dupe(u8, env) },
-            .command => |argv| blk: {
-                const copy = try owned.alloc([]const u8, argv.len);
-                for (argv, 0..) |arg, i| copy[i] = try owned.dupe(u8, arg);
-                break :blk .{ .command = copy };
-            },
-        };
-        const cloned_headers = try owned.alloc(Header, self.headers.len);
-        for (self.headers, 0..) |header, i| {
-            cloned_headers[i] = .{
-                .name = try owned.dupe(u8, header.name),
-                .env = try owned.dupe(u8, header.env),
-            };
-        }
-        const cloned_defaults = if (self.model_defaults) |defaults| try clone_metadata(defaults, owned) else null;
-        const cloned_metadata = try owned.alloc(ModelMetadata, self.model_metadata.len);
-        for (self.model_metadata, 0..) |metadata, i| {
-            cloned_metadata[i] = try clone_metadata(metadata, owned);
-        }
-        return .{
-            .id = try owned.dupe(u8, self.id),
-            .protocol = self.protocol,
-            .base_url = try owned.dupe(u8, self.base_url),
-            .auth = cloned_auth,
-            .tool_choice_mode = self.tool_choice_mode,
-            .reviewer_model = if (self.reviewer_model) |v| try owned.dupe(u8, v) else null,
-            .title_model = if (self.title_model) |v| try owned.dupe(u8, v) else null,
-            .vision_model = if (self.vision_model) |v| try owned.dupe(u8, v) else null,
-            .headers = cloned_headers,
-            .timeouts = self.timeouts,
-            .fetch_models = self.fetch_models,
-            .model_defaults = cloned_defaults,
-            .model_metadata = cloned_metadata,
-            .working_dir = if (self.working_dir) |v| try owned.dupe(u8, v) else null,
-            .mod_name = if (self.mod_name) |v| try owned.dupe(u8, v) else null,
-        };
-    }
 };
 
 pub const ModSource = struct {
     name: []const u8,
     dir: []const u8,
 };
-
-fn clone_fragment(fragment: request_fragment.Fragment, owned: Allocator) Allocator.Error!request_fragment.Fragment {
-    const fields = try owned.alloc(request_fragment.Field, fragment.fields.len);
-    for (fragment.fields, 0..) |field, i| {
-        fields[i] = .{
-            .key = try owned.dupe(u8, field.key),
-            .value_json = try owned.dupe(u8, field.value_json),
-        };
-    }
-    return .{ .fields = fields };
-}
-
-fn clone_metadata(metadata: ModelMetadata, owned: Allocator) Allocator.Error!ModelMetadata {
-    const efforts = if (metadata.reasoning_efforts) |levels| blk: {
-        const copy = try owned.alloc(EffortLevel, levels.len);
-        for (levels, 0..) |level, i| {
-            copy[i] = .{
-                .name = try owned.dupe(u8, level.name),
-                .fields = try clone_fragment(level.fields, owned),
-            };
-        }
-        break :blk copy;
-    } else null;
-    return .{
-        .id = try owned.dupe(u8, metadata.id),
-        .context_window = metadata.context_window,
-        .max_output_tokens = metadata.max_output_tokens,
-        .supports_tool_use = metadata.supports_tool_use,
-        .supports_vision = metadata.supports_vision,
-        .output_limit_field = metadata.output_limit_field,
-        .request = if (metadata.request) |req| try clone_fragment(req, owned) else null,
-        .reasoning_efforts = efforts,
-    };
-}
 
 /// Where in the providers object a refused setting is: its keys joined with
 /// dots, such as `local.model_metadata.m.request.messages`, for the message
@@ -454,6 +378,26 @@ pub const Registry = struct {
         mod_source: ModSource,
     ) ParseError!Registry {
         return parse_located_impl(alloc, providers, at, mod_source);
+    }
+
+    /// Parses a mod's `providers` directly into the caller-owned `owned` arena.
+    pub fn parse_definitions_for_mod(
+        owned: Allocator,
+        providers: std.json.Value,
+        at: ?*FailurePath,
+        mod_source: ModSource,
+    ) ParseError![]const Definition {
+        if (providers != .object) return error.InvalidObject;
+        if (providers.object.count() > max_providers) return error.LimitExceeded;
+        const definitions = try owned.alloc(Definition, providers.object.count());
+        var iterator = providers.object.iterator();
+        var index: usize = 0;
+        while (iterator.next()) |entry| : (index += 1) {
+            enter(at, entry.key_ptr.*);
+            definitions[index] = try parse_definition(owned, entry.key_ptr.*, entry.value_ptr.*, at, mod_source);
+            leave(at);
+        }
+        return definitions;
     }
 
     fn parse_located_impl(

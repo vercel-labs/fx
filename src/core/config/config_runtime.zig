@@ -442,9 +442,33 @@ fn mergeProfileAndModProviders(
     errdefer if (settings_reg) |*reg| reg.deinit(alloc);
 
     const root_path = mods_root_path orelse return settings_reg;
-    var mod_loaded = mods.loadModProviders(alloc, root_path) catch |err| switch (err) {
+    // The merged registry keeps the settings definitions as they are, so they
+    // must live in the arena it takes over. A registry without an arena owns
+    // nothing and must be empty; a view's definitions would point into memory
+    // that another registry frees.
+    std.debug.assert(settings_reg == null or settings_reg.?.arena != null or settings_reg.?.definitions.len == 0);
+
+    var fresh_arena: ?*std.heap.ArenaAllocator = if (settings_reg != null and settings_reg.?.arena != null)
+        null
+    else blk: {
+        const a = try alloc.create(std.heap.ArenaAllocator);
+        a.* = .init(alloc);
+        break :blk a;
+    };
+    errdefer if (fresh_arena) |a| {
+        a.deinit();
+        alloc.destroy(a);
+    };
+    const target_arena = if (fresh_arena) |a| a else settings_reg.?.arena.?;
+
+    var mod_loaded = mods.loadModProvidersInto(alloc, root_path, target_arena) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
+            if (fresh_arena) |a| {
+                a.deinit();
+                alloc.destroy(a);
+                fresh_arena = null;
+            }
             if (diagnostics) |diag_list| {
                 try appendModDiagnostic(alloc, diag_list, try alloc.print("mods folder could not be read: {s}.", .{@errorName(err)}));
             }
@@ -459,21 +483,20 @@ fn mergeProfileAndModProviders(
         }
     }
 
-    if (mod_loaded.entries.len == 0) return settings_reg;
+    if (mod_loaded.entries.len == 0) {
+        if (fresh_arena) |a| {
+            a.deinit();
+            alloc.destroy(a);
+            fresh_arena = null;
+        }
+        return settings_reg;
+    }
 
     const base_reg = settings_reg orelse configured_provider.Registry{};
-    const merged_arena = try alloc.create(std.heap.ArenaAllocator);
-    merged_arena.* = .init(alloc);
-    errdefer {
-        merged_arena.deinit();
-        alloc.destroy(merged_arena);
-    }
-    const owned = merged_arena.allocator();
+    const owned = target_arena.allocator();
 
     var merged: std.ArrayList(configured_provider.Definition) = .empty;
-    for (base_reg.definitions) |def| {
-        try merged.append(owned, try def.clone(owned));
-    }
+    try merged.appendSlice(owned, base_reg.definitions);
 
     const entries = mod_loaded.entries;
     for (entries, 0..) |entry, idx| {
@@ -520,15 +543,19 @@ fn mergeProfileAndModProviders(
             continue;
         }
 
-        try merged.append(owned, try entry.definition.clone(owned));
+        try merged.append(owned, entry.definition);
     }
 
-    if (settings_reg) |*old| old.deinit(alloc);
-    settings_reg = null;
+    const definitions = try merged.toOwnedSlice(owned);
+    if (fresh_arena != null) {
+        fresh_arena = null;
+    } else {
+        settings_reg = null;
+    }
 
     return .{
-        .definitions = try merged.toOwnedSlice(owned),
-        .arena = merged_arena,
+        .definitions = definitions,
+        .arena = target_arena,
     };
 }
 

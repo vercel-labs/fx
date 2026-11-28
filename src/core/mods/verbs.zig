@@ -128,7 +128,7 @@ fn verbFlags(verb: Verb, surface: Surface) VerbFlags {
     };
 }
 
-pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Allocator.Error!Parsed {
+pub noinline fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Allocator.Error!Parsed {
     const p = surface.prog();
     if (args.len == 0) return .{ .command = .{ .list = .{ .json = false } } };
     if (isHelp(args[0]) or std.mem.eql(u8, args[0], "help")) return .{ .command = .{ .help = null } };
@@ -206,7 +206,7 @@ fn usage(arena: Allocator, verb: ?Verb, comptime fmt: []const u8, args: anytype)
     return .{ .usage = .{ .verb = verb, .message = try arena.print(fmt, args) } };
 }
 
-pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
+pub noinline fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
     const p = surface.prog();
     const json = if (surface == .cli) " [--json]" else "";
     const v = verb orelse {
@@ -224,15 +224,25 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
         , .{ p, json, json });
         return;
     };
+    try w.writeAll("usage: ");
+    try w.writeAll(p);
+    try w.writeByte(' ');
     switch (v) {
-        .list => try w.print("usage: {s} list{s}\n", .{ p, json }),
-        .show => try w.print("usage: {s} show NAME{s}\n", .{ p, json }),
-        .add => try w.print("usage: {s} add [--yes] <folder|git URL[@ref]>\n", .{p}),
-        .update => try w.print("usage: {s} update [NAME]\n", .{p}),
-        .enable => try w.print("usage: {s} enable NAME\n", .{p}),
-        .disable => try w.print("usage: {s} disable NAME\n", .{p}),
-        .remove => try w.print("usage: {s} remove NAME\n", .{p}),
+        .list => {
+            try w.writeAll("list");
+            try w.writeAll(json);
+        },
+        .show => {
+            try w.writeAll("show NAME");
+            try w.writeAll(json);
+        },
+        .add => try w.writeAll("add [--yes] <folder|git URL[@ref]>"),
+        .update => try w.writeAll("update [NAME]"),
+        .enable => try w.writeAll("enable NAME"),
+        .disable => try w.writeAll("disable NAME"),
+        .remove => try w.writeAll("remove NAME"),
     }
+    try w.writeByte('\n');
 }
 
 pub fn run(c: Context, args: []const []const u8) u8 {
@@ -307,7 +317,7 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
     };
 }
 
-fn runList(c: Context, arena: Allocator, root: []const u8, json: bool) !u8 {
+noinline fn runList(c: Context, arena: Allocator, root: []const u8, json: bool) !u8 {
     var listing = try mods.list(arena, root);
     defer listing.deinit(arena);
 
@@ -340,7 +350,7 @@ fn runList(c: Context, arena: Allocator, root: []const u8, json: bool) !u8 {
     return 0;
 }
 
-fn runShow(c: Context, arena: Allocator, root: []const u8, name: []const u8, json: bool) !u8 {
+noinline fn runShow(c: Context, arena: Allocator, root: []const u8, name: []const u8, json: bool) !u8 {
     if (!mods.manifest.validName(name)) {
         return writeShowMissing(c, arena, name, json, "Mod name must use lowercase letters, digits, and hyphens only.");
     }
@@ -352,27 +362,16 @@ fn runShow(c: Context, arena: Allocator, root: []const u8, name: []const u8, jso
 
     switch (loaded) {
         .none => return writeShowMissing(c, arena, name, json, null),
-        .bad => {
-            var listing = try mods.list(arena, root);
-            defer listing.deinit(arena);
-            var prob_msg: []const u8 = "Mod could not be loaded.";
-            var on = false;
-            for (listing.mods) |item| {
-                if (std.mem.eql(u8, item.name, name)) {
-                    on = item.on;
-                    if (item.problem) |p| prob_msg = modProblemText(p);
-                    break;
-                }
-            }
+        .bad => |bad| {
             const snapshot: output_contracts.ModShowSnapshot = .{
                 .name = name,
                 .status = "broken",
-                .on = on,
+                .on = bad.on,
                 .source = if (record) |r| r.source else null,
                 .ref = if (record) |r| r.ref else null,
                 .commit = if (record) |r| r.commit else null,
                 .pinned = if (record) |r| r.pinned else false,
-                .err = prob_msg,
+                .err = modProblemText(bad.problem),
             };
             const rendered = try snapshot.render(arena, if (json) .json else .text);
             try c.out.writeAll(rendered);
@@ -403,7 +402,7 @@ fn runShow(c: Context, arena: Allocator, root: []const u8, name: []const u8, jso
     }
 }
 
-fn writeShowMissing(c: Context, arena: Allocator, name: []const u8, json: bool, custom_msg: ?[]const u8) !u8 {
+noinline fn writeShowMissing(c: Context, arena: Allocator, name: []const u8, json: bool, custom_msg: ?[]const u8) !u8 {
     const msg = custom_msg orelse try arena.print("No mod named {f}. Run {s} list to see installed mods.", .{ text_utils.terminalSafe(name), c.surface.prog() });
     if (json) {
         const rendered = try (output_contracts.CommandFailureSnapshot{
@@ -414,20 +413,20 @@ fn writeShowMissing(c: Context, arena: Allocator, name: []const u8, json: bool, 
         try c.out.writeAll(rendered);
         try c.out.writeByte('\n');
     } else {
-        try c.err.print("{s}: {s}\n", .{ c.surface.prog(), msg });
+        try writeErrLine(c, null, msg);
     }
     return 1;
 }
 
-fn runAdd(c: Context, arena: Allocator, root: []const u8, arg: []const u8, yes: bool) !u8 {
+noinline fn runAdd(c: Context, arena: Allocator, root: []const u8, arg: []const u8, yes: bool) !u8 {
     var prep = switch (try mods.prepareInstall(arena, root, arg, c.cancel)) {
         .prepared => |p| p,
         .not_a_folder => |path| {
-            try c.err.print("{s} add: {f} is not a folder.\n", .{ c.surface.prog(), text_utils.terminalSafe(path) });
+            try writeErrSafeLine(c, "add", "", path, " is not a folder.");
             return 1;
         },
         .source_invalid => |problem| {
-            try c.err.print("{s} add: {s}\n", .{ c.surface.prog(), sourceProblemText(problem) });
+            try writeErrLine(c, "add", sourceProblemText(problem));
             return 1;
         },
         .fetch_failed => |failed| {
@@ -435,19 +434,20 @@ fn runAdd(c: Context, arena: Allocator, root: []const u8, arg: []const u8, yes: 
             return 1;
         },
         .no_manifest => {
-            try c.err.print("{s} add: mod.json is missing.\n", .{c.surface.prog()});
+            try writeErrLine(c, "add", "mod.json is missing.");
             return 1;
         },
         .bad_manifest => |err| {
-            try c.err.print("{s} add: {s}\n", .{ c.surface.prog(), mods.manifest.message(err) });
+            try writeErrLine(c, "add", mods.manifest.message(err));
             return 1;
         },
         .bad_providers => |bad| {
             const advice = configured_provider.mod_failure_advice(bad.err) orelse "could not parse providers";
+            try writeErrPrefix(c, "add");
             if (bad.path.len > 0) {
-                try c.err.print("{s} add: providers.{f}: {s}.\n", .{ c.surface.prog(), text_utils.terminalSafe(bad.path), advice });
+                try c.err.print("providers.{f}: {s}.\n", .{ text_utils.terminalSafe(bad.path), advice });
             } else {
-                try c.err.print("{s} add: providers: {s}.\n", .{ c.surface.prog(), advice });
+                try c.err.print("providers: {s}.\n", .{advice});
             }
             return 1;
         },
@@ -482,11 +482,11 @@ fn runAdd(c: Context, arena: Allocator, root: []const u8, arg: []const u8, yes: 
 
     switch (try mods.commitInstall(arena, root, &prep)) {
         .installed => |inst| {
-            try c.out.print("Installed {f} ({f}).{s}\n", .{
+            try c.out.print("Installed {f} ({f}).", .{
                 text_utils.terminalSafe(inst.name),
                 text_utils.terminalSafe(inst.version),
-                if (c.surface == .shell) shell_restart_note else "",
             });
+            try writeOutRestartEnd(c);
             return 0;
         },
         .refused => |outcome| {
@@ -497,20 +497,20 @@ fn runAdd(c: Context, arena: Allocator, root: []const u8, arg: []const u8, yes: 
     }
 }
 
-fn runUpdate(c: Context, arena: Allocator, root: []const u8, maybe_name: ?[]const u8) !u8 {
+noinline fn runUpdate(c: Context, arena: Allocator, root: []const u8, maybe_name: ?[]const u8) !u8 {
     if (maybe_name) |name| {
         if (!mods.manifest.validName(name)) {
-            try c.err.print("{s} update: invalid mod name '{f}'.\n", .{ c.surface.prog(), text_utils.terminalSafe(name) });
+            try writeErrSafeLine(c, "update", "invalid mod name '", name, "'.");
             return 1;
         }
         const res = try mods.refresh(arena, root, name, c.cancel);
-        return reportSingleRefresh(c, name, res);
+        return if (try writeRefreshResult(c, name, res, false)) 0 else 1;
     }
 
     var listing = try mods.list(arena, root);
     defer listing.deinit(arena);
     if (listing.mods.len == 0) {
-        try c.out.print("No mods installed.\n", .{});
+        try c.out.writeAll("No mods installed.\n");
         return 0;
     }
 
@@ -518,101 +518,97 @@ fn runUpdate(c: Context, arena: Allocator, root: []const u8, maybe_name: ?[]cons
     var any_changed = false;
     for (listing.mods) |item| {
         const res = try mods.refresh(arena, root, item.name, c.cancel);
-        switch (res) {
-            .updated => |u| {
-                any_changed = true;
-                try c.out.print("{f}: updated {s} -> {s}\n", .{
-                    text_utils.terminalSafe(item.name),
-                    shortCommit(u.old_commit),
-                    shortCommit(u.new_commit),
-                });
-            },
-            .folder_copied => {
-                any_changed = true;
-                try c.out.print("{f}: updated from folder\n", .{text_utils.terminalSafe(item.name)});
-            },
-            .up_to_date => try c.out.print("{f}: already up to date\n", .{text_utils.terminalSafe(item.name)}),
-            .pinned => |ref| try c.out.print("{f}: pinned at {f}, skipped\n", .{ text_utils.terminalSafe(item.name), text_utils.terminalSafe(ref) }),
-            else => {
-                any_failed = true;
-                try writeRefreshFailure(c, item.name, res);
-            },
+        if (!try writeRefreshResult(c, item.name, res, true)) {
+            any_failed = true;
+        } else if (res == .updated or res == .folder_copied) {
+            any_changed = true;
         }
     }
     if (c.surface == .shell and any_changed) {
-        try c.out.print("The change applies the next time fx starts.\n", .{});
+        try c.out.writeAll("The change applies the next time fx starts.\n");
     }
     return if (any_failed) 1 else 0;
 }
 
-fn reportSingleRefresh(c: Context, name: []const u8, res: mods.RefreshResult) !u8 {
+noinline fn writeRefreshResult(c: Context, name: []const u8, res: mods.RefreshResult, batch: bool) !bool {
+    const safe_name = text_utils.terminalSafe(name);
     switch (res) {
         .updated => |u| {
-            try c.out.print("Updated {f}: {s} -> {s}.{s}\n", .{
-                text_utils.terminalSafe(name),
-                shortCommit(u.old_commit),
-                shortCommit(u.new_commit),
-                if (c.surface == .shell) shell_restart_note else "",
-            });
-            return 0;
+            if (batch) {
+                try c.out.print("{f}: updated {s} -> {s}\n", .{ safe_name, shortCommit(u.old_commit), shortCommit(u.new_commit) });
+            } else {
+                try c.out.print("Updated {f}: {s} -> {s}.", .{ safe_name, shortCommit(u.old_commit), shortCommit(u.new_commit) });
+                try writeOutRestartEnd(c);
+            }
+            return true;
         },
         .folder_copied => {
-            try c.out.print("Updated {f} from folder.{s}\n", .{
-                text_utils.terminalSafe(name),
-                if (c.surface == .shell) shell_restart_note else "",
-            });
-            return 0;
+            if (batch) {
+                try c.out.print("{f}: updated from folder\n", .{safe_name});
+            } else {
+                try c.out.print("Updated {f} from folder.", .{safe_name});
+                try writeOutRestartEnd(c);
+            }
+            return true;
         },
         .up_to_date => {
-            try c.out.print("{f} is already up to date.\n", .{text_utils.terminalSafe(name)});
-            return 0;
+            if (batch) {
+                try c.out.print("{f}: already up to date\n", .{safe_name});
+            } else {
+                try c.out.print("{f} is already up to date.\n", .{safe_name});
+            }
+            return true;
         },
         .pinned => |ref| {
-            try c.out.print("{f} is pinned at {f}.\n", .{ text_utils.terminalSafe(name), text_utils.terminalSafe(ref) });
-            return 0;
+            const safe_ref = text_utils.terminalSafe(ref);
+            if (batch) {
+                try c.out.print("{f}: pinned at {f}, skipped\n", .{ safe_name, safe_ref });
+            } else {
+                try c.out.print("{f} is pinned at {f}.\n", .{ safe_name, safe_ref });
+            }
+            return true;
         },
         else => {
             try writeRefreshFailure(c, name, res);
-            return 1;
+            return false;
         },
     }
 }
 
-fn writeRefreshFailure(c: Context, name: []const u8, res: mods.RefreshResult) !void {
+noinline fn writeRefreshFailure(c: Context, name: []const u8, res: mods.RefreshResult) !void {
     switch (res) {
-        .not_installed => try c.err.print("{s} update: mod '{f}' is not installed.\n", .{ c.surface.prog(), text_utils.terminalSafe(name) }),
-        .bad_mod => try c.err.print("{s} update: mod '{f}' is broken.\n", .{ c.surface.prog(), text_utils.terminalSafe(name) }),
-        .no_record => try c.err.print("{s} update: mod '{f}' has no saved source record.\n", .{ c.surface.prog(), text_utils.terminalSafe(name) }),
-        .bad_record => try c.err.print("{s} update: mod '{f}' has an unreadable source record.\n", .{ c.surface.prog(), text_utils.terminalSafe(name) }),
-        .source_missing => |path| try c.err.print("{s} update: source folder for '{f}' is missing: {f}.\n", .{ c.surface.prog(), text_utils.terminalSafe(name), text_utils.terminalSafe(path) }),
+        .not_installed => try writeErrSafeLine(c, "update", "mod '", name, "' is not installed."),
+        .bad_mod => try writeErrSafeLine(c, "update", "mod '", name, "' is broken."),
+        .no_record => try writeErrSafeLine(c, "update", "mod '", name, "' has no saved source record."),
+        .bad_record => try writeErrSafeLine(c, "update", "mod '", name, "' has an unreadable source record."),
+        .source_missing => |path| {
+            try writeErrPrefix(c, "update");
+            try c.err.print("source folder for '{f}' is missing: {f}.\n", .{ text_utils.terminalSafe(name), text_utils.terminalSafe(path) });
+        },
         .fetch_failed => |failed| try writeFetchFailure(c, "update", name, failed),
         .refused => |outcome| try writeOutcomeFailure(c, "update", name, outcome),
         else => {},
     }
 }
 
-fn runSetOn(c: Context, root: []const u8, name: []const u8, on: bool) !u8 {
+noinline fn runSetOn(c: Context, root: []const u8, name: []const u8, on: bool) !u8 {
     const verb_name = if (on) "enable" else "disable";
     const outcome = try mods.setOn(c.gpa, root, name, on);
     if (outcome == .ok) {
-        try c.out.print("{s} {f}.{s}\n", .{
-            if (on) "Enabled" else "Disabled",
-            text_utils.terminalSafe(name),
-            if (c.surface == .shell) shell_restart_note else "",
-        });
+        try c.out.writeAll(if (on) "Enabled " else "Disabled ");
+        try c.out.print("{f}.", .{text_utils.terminalSafe(name)});
+        try writeOutRestartEnd(c);
         return 0;
     }
     try writeOutcomeFailure(c, verb_name, name, outcome);
     return 1;
 }
 
-fn runRemove(c: Context, root: []const u8, name: []const u8) !u8 {
+noinline fn runRemove(c: Context, root: []const u8, name: []const u8) !u8 {
     const outcome = try mods.remove(c.gpa, root, name);
     if (outcome == .ok) {
-        try c.out.print("Removed {f}.{s}\n", .{
-            text_utils.terminalSafe(name),
-            if (c.surface == .shell) shell_restart_note else "",
-        });
+        try c.out.print("Removed {f}.", .{text_utils.terminalSafe(name)});
+        try writeOutRestartEnd(c);
         return 0;
     }
     try writeOutcomeFailure(c, "remove", name, outcome);
@@ -715,32 +711,59 @@ fn sourceProblemText(problem: mods.source.Problem) []const u8 {
     };
 }
 
-fn writeFetchFailure(c: Context, verb_name: []const u8, label: []const u8, failed: mods.source.Failed) !void {
+fn writeErrPrefix(c: Context, verb_name: ?[]const u8) !void {
+    try c.err.writeAll(c.surface.prog());
+    if (verb_name) |v| {
+        try c.err.writeByte(' ');
+        try c.err.writeAll(v);
+    }
+    try c.err.writeAll(": ");
+}
+
+fn writeErrLine(c: Context, verb_name: ?[]const u8, msg: []const u8) !void {
+    try writeErrPrefix(c, verb_name);
+    try c.err.writeAll(msg);
+    try c.err.writeByte('\n');
+}
+
+fn writeErrSafeLine(c: Context, verb_name: ?[]const u8, prefix: []const u8, raw: []const u8, suffix: []const u8) !void {
+    try writeErrPrefix(c, verb_name);
+    try c.err.writeAll(prefix);
+    try c.err.print("{f}", .{text_utils.terminalSafe(raw)});
+    try c.err.writeAll(suffix);
+    try c.err.writeByte('\n');
+}
+
+fn writeOutRestartEnd(c: Context) !void {
+    if (c.surface == .shell) try c.out.writeAll(shell_restart_note);
+    try c.out.writeByte('\n');
+}
+
+noinline fn writeFetchFailure(c: Context, verb_name: []const u8, label: []const u8, failed: mods.source.Failed) !void {
     switch (failed.kind) {
-        .timed_out => try c.err.print("{s} {s}: git timed out while fetching '{f}'.\n", .{ c.surface.prog(), verb_name, text_utils.terminalSafe(label) }),
-        .cancelled => try c.err.print("{s} {s}: cancelled.\n", .{ c.surface.prog(), verb_name }),
-        .signaled => try c.err.print("{s} {s}: git exited on a signal.\n", .{ c.surface.prog(), verb_name }),
-        .too_large => try c.err.print("{s} {s}: git output was larger than fx reads.\n", .{ c.surface.prog(), verb_name }),
-        .spawn_failed => try c.err.print("{s} {s}: could not start git.\n", .{ c.surface.prog(), verb_name }),
-        .bad_commit => try c.err.print("{s} {s}: git returned an invalid commit hash.\n", .{ c.surface.prog(), verb_name }),
+        .timed_out => try writeErrSafeLine(c, verb_name, "git timed out while fetching '", label, "'."),
+        .cancelled => try writeErrLine(c, verb_name, "cancelled."),
+        .signaled => try writeErrLine(c, verb_name, "git exited on a signal."),
+        .too_large => try writeErrLine(c, verb_name, "git output was larger than fx reads."),
+        .spawn_failed => try writeErrLine(c, verb_name, "could not start git."),
+        .bad_commit => try writeErrLine(c, verb_name, "git returned an invalid commit hash."),
         .git_failed => {
             if (failed.detail.len > 0) {
-                try c.err.print("{s} {s}: git failed: {f}\n", .{ c.surface.prog(), verb_name, text_utils.terminalSafe(failed.detail) });
+                try writeErrSafeLine(c, verb_name, "git failed: ", failed.detail, "");
             } else {
-                try c.err.print("{s} {s}: git failed.\n", .{ c.surface.prog(), verb_name });
+                try writeErrLine(c, verb_name, "git failed.");
             }
         },
     }
 }
 
-fn writeOutcomeFailure(c: Context, verb_name: []const u8, name: []const u8, outcome: mods.Outcome) !void {
-    const safe_name = text_utils.terminalSafe(name);
+noinline fn writeOutcomeFailure(c: Context, verb_name: []const u8, name: []const u8, outcome: mods.Outcome) !void {
     switch (outcome) {
         .ok => {},
-        .exists => try c.err.print("{s} {s}: mod '{f}' is already installed.\n", .{ c.surface.prog(), verb_name, safe_name }),
-        .missing => try c.err.print("{s} {s}: mod '{f}' is not installed.\n", .{ c.surface.prog(), verb_name, safe_name }),
-        .busy => try c.err.print("{s} {s}: another fx is changing mod '{f}'; try again.\n", .{ c.surface.prog(), verb_name, safe_name }),
-        .invalid => |inv| try c.err.print("{s} {s}: {s}\n", .{ c.surface.prog(), verb_name, invalidText(inv) }),
+        .exists => try writeErrSafeLine(c, verb_name, "mod '", name, "' is already installed."),
+        .missing => try writeErrSafeLine(c, verb_name, "mod '", name, "' is not installed."),
+        .busy => try writeErrSafeLine(c, verb_name, "another fx is changing mod '", name, "'; try again."),
+        .invalid => |inv| try writeErrLine(c, verb_name, invalidText(inv)),
     }
 }
 

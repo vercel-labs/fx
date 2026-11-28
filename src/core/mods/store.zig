@@ -70,9 +70,14 @@ pub const Mod = struct {
     path: []const u8,
 };
 
+pub const BadMod = struct {
+    on: bool,
+    problem: ModProblem,
+};
+
 pub const Loaded = union(enum) {
     none,
-    bad,
+    bad: BadMod,
     mod: Mod,
 
     pub fn deinit(self: *Loaded, alloc: std.mem.Allocator) void {
@@ -85,6 +90,36 @@ pub const Loaded = union(enum) {
         }
         self.* = .none;
     }
+};
+
+pub const ScannedEntry = struct {
+    base: []const u8,
+    has_on: bool = false,
+    has_off: bool = false,
+    on_kind: ?std.Io.File.Kind = null,
+    off_kind: ?std.Io.File.Kind = null,
+};
+
+pub const ScanResult = struct {
+    entries: []ScannedEntry = &.{},
+    over_limit: bool = false,
+};
+
+pub const ManifestProblem = union(enum) {
+    dangling,
+    open_dir_failed: anyerror,
+    no_manifest,
+    open_file_failed: anyerror,
+    unreadable_manifest,
+    not_regular_file,
+    too_large,
+    bad_manifest: manifest.DecodeError,
+    name_mismatch,
+};
+
+pub const ManifestRead = union(enum) {
+    ok: manifest.Manifest,
+    problem: ManifestProblem,
 };
 
 pub const ListedMod = struct {
@@ -237,7 +272,7 @@ fn readBoundedRecord(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File) !
 }
 
 pub fn load(alloc: std.mem.Allocator, store: Store, name: []const u8) !Loaded {
-    if (!manifest.validName(name)) return .bad;
+    if (!manifest.validName(name)) return .{ .bad = .{ .on = false, .problem = .bad_name } };
     const io = store.ops.io;
 
     var root_dir = std.Io.Dir.cwd().openDir(io, store.root_path, .{
@@ -256,43 +291,23 @@ pub fn load(alloc: std.mem.Allocator, store: Store, name: []const u8) !Loaded {
     const off_kind = try entryKindNoFollow(root_dir, io, off_name);
 
     if (on_kind == null and off_kind == null) return .none;
-    if (on_kind != null and off_kind != null) return .bad;
+    if (on_kind != null and off_kind != null) return .{ .bad = .{ .on = false, .problem = .ambiguous } };
 
     const is_on = on_kind != null;
     const link_name = if (is_on) name else off_name;
     const link_kind = (on_kind orelse off_kind).?;
-    if (link_kind != .sym_link) return .bad;
+    if (link_kind != .sym_link) return .{ .bad = .{ .on = is_on, .problem = .not_symlink } };
 
     return switch (try inspectLinkedMod(alloc, root_dir, io, store.root_path, name, link_name, is_on)) {
         .ok => |m| .{ .mod = m },
-        .problem => .bad,
+        .problem => |prob| .{ .bad = .{ .on = is_on, .problem = prob } },
     };
 }
 
-pub fn list(alloc: std.mem.Allocator, store: Store) !Listing {
-    const io = store.ops.io;
-    var root_dir = std.Io.Dir.cwd().openDir(io, store.root_path, .{
-        .iterate = true,
-        .follow_symlinks = true,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return .{},
-        else => return err,
-    };
-    defer root_dir.close(io);
-
-    var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
-    const scratch = scratch_state.allocator();
-
-    const RawEntry = struct {
-        base: []const u8,
-        has_on: bool = false,
-        has_off: bool = false,
-        on_kind: ?std.Io.File.Kind = null,
-        off_kind: ?std.Io.File.Kind = null,
-    };
-
-    var entries: std.ArrayList(RawEntry) = .empty;
+/// Scans `<root>`, merges `<name>` and `<name>.off`, caps at `manifest.max_mods`,
+/// and sorts entries by base name using `std.sort.insertion`.
+pub fn scanEntries(scratch: std.mem.Allocator, root_dir: std.Io.Dir, io: std.Io) !ScanResult {
+    var entries: std.ArrayList(ScannedEntry) = .empty;
     var over_limit = false;
 
     var it = root_dir.iterate();
@@ -337,6 +352,35 @@ pub fn list(alloc: std.mem.Allocator, store: Store) !Listing {
         });
     }
 
+    std.sort.insertion(ScannedEntry, entries.items, {}, struct {
+        fn lessThan(_: void, a: ScannedEntry, b: ScannedEntry) bool {
+            return std.mem.order(u8, a.base, b.base) == .lt;
+        }
+    }.lessThan);
+
+    return .{
+        .entries = entries.items,
+        .over_limit = over_limit,
+    };
+}
+
+pub fn list(alloc: std.mem.Allocator, store: Store) !Listing {
+    const io = store.ops.io;
+    var root_dir = std.Io.Dir.cwd().openDir(io, store.root_path, .{
+        .iterate = true,
+        .follow_symlinks = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    defer root_dir.close(io);
+
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    const scanned = try scanEntries(scratch, root_dir, io);
+
     var result = std.ArrayList(ListedMod).empty;
     errdefer {
         for (result.items) |item| {
@@ -347,7 +391,7 @@ pub fn list(alloc: std.mem.Allocator, store: Store) !Listing {
         result.deinit(alloc);
     }
 
-    for (entries.items) |entry| {
+    for (scanned.entries) |entry| {
         const mod_name = try alloc.dupe(u8, entry.base);
         errdefer alloc.free(mod_name);
 
@@ -402,15 +446,9 @@ pub fn list(alloc: std.mem.Allocator, store: Store) !Listing {
         }
     }
 
-    std.mem.sort(ListedMod, result.items, {}, struct {
-        fn lessThan(_: void, a: ListedMod, b: ListedMod) bool {
-            return std.mem.order(u8, a.name, b.name) == .lt;
-        }
-    }.lessThan);
-
     return .{
         .mods = try result.toOwnedSlice(alloc),
-        .over_limit = over_limit,
+        .over_limit = scanned.over_limit,
     };
 }
 
@@ -799,6 +837,50 @@ const InspectedMod = union(enum) {
     problem: ModProblem,
 };
 
+pub fn readManifestAt(
+    arena: std.mem.Allocator,
+    root_dir: std.Io.Dir,
+    io: std.Io,
+    link_name: []const u8,
+    expected_name: []const u8,
+) error{OutOfMemory}!ManifestRead {
+    var mod_dir = root_dir.openDir(io, link_name, .{
+        .iterate = false,
+        .follow_symlinks = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.SymLinkLoop => return .{ .problem = .dangling },
+        else => return .{ .problem = .{ .open_dir_failed = err } },
+    };
+    defer mod_dir.close(io);
+
+    var mf_file = mod_dir.openFile(io, manifest_file_name, .{
+        .mode = .read_only,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .{ .problem = .no_manifest },
+        error.IsDir, error.NotDir, error.SymLinkLoop => return .{ .problem = .unreadable_manifest },
+        else => return .{ .problem = .{ .open_file_failed = err } },
+    };
+    defer mf_file.close(io);
+
+    const mf_stat = mf_file.stat(io) catch return .{ .problem = .unreadable_manifest };
+    if (mf_stat.kind != .file) return .{ .problem = .not_regular_file };
+
+    const bytes = readBoundedManifest(arena, io, &mf_file) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StreamTooLong => return .{ .problem = .too_large },
+        else => return .{ .problem = .unreadable_manifest },
+    };
+    const decoded = manifest.decode(arena, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .problem = .{ .bad_manifest = err } },
+    };
+    if (!std.mem.eql(u8, decoded.name, expected_name)) {
+        return .{ .problem = .name_mismatch };
+    }
+    return .{ .ok = decoded };
+}
+
 fn inspectLinkedMod(
     alloc: std.mem.Allocator,
     root_dir: std.Io.Dir,
@@ -811,48 +893,25 @@ fn inspectLinkedMod(
     var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     _ = root_dir.readLink(io, link_name, &link_buf) catch |err| switch (err) {
         error.NotLink => return .{ .problem = .not_symlink },
-        error.FileNotFound => return .{ .problem = .dangling },
-        error.SymLinkLoop => return .{ .problem = .dangling },
+        error.FileNotFound, error.SymLinkLoop => return .{ .problem = .dangling },
         else => return err,
     };
-
-    var mod_dir = root_dir.openDir(io, link_name, .{
-        .iterate = false,
-        .follow_symlinks = true,
-    }) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir, error.SymLinkLoop => return .{ .problem = .dangling },
-        else => return err,
-    };
-    defer mod_dir.close(io);
-
-    var mf_file = mod_dir.openFile(io, manifest_file_name, .{
-        .mode = .read_only,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return .{ .problem = .no_manifest },
-        error.IsDir, error.NotDir, error.SymLinkLoop => return .{ .problem = .unreadable },
-        else => return err,
-    };
-    defer mf_file.close(io);
-
-    const mf_stat = try mf_file.stat(io);
-    if (mf_stat.kind != .file) return .{ .problem = .unreadable };
 
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
 
-    const bytes = readBoundedManifest(scratch, io, &mf_file) catch |err| switch (err) {
-        error.StreamTooLong => return .{ .problem = .bad_manifest },
-        else => return err,
+    const decoded = switch (try readManifestAt(scratch, root_dir, io, link_name, expected_name)) {
+        .ok => |m| m,
+        .problem => |prob| return switch (prob) {
+            .dangling => .{ .problem = .dangling },
+            .open_dir_failed, .open_file_failed => |err| return err,
+            .no_manifest => .{ .problem = .no_manifest },
+            .unreadable_manifest, .not_regular_file => .{ .problem = .unreadable },
+            .too_large, .bad_manifest => .{ .problem = .bad_manifest },
+            .name_mismatch => .{ .problem = .name_mismatch },
+        },
     };
-    const decoded = manifest.decode(scratch, bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .problem = .bad_manifest },
-    };
-    if (!std.mem.eql(u8, decoded.name, expected_name)) {
-        return .{ .problem = .name_mismatch };
-    }
 
     const version = try alloc.dupe(u8, decoded.version);
     errdefer alloc.free(version);

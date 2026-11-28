@@ -114,17 +114,54 @@ pub const Record = struct {
 pub const RecordError = error{ BadRecord, OutOfMemory };
 
 pub fn encodeRecord(alloc: std.mem.Allocator, record: Record) std.mem.Allocator.Error![]u8 {
-    return std.json.Stringify.valueAlloc(alloc, record, .{});
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    jw.beginObject() catch return error.OutOfMemory;
+    jw.objectField("source") catch return error.OutOfMemory;
+    jw.write(record.source) catch return error.OutOfMemory;
+    jw.objectField("ref") catch return error.OutOfMemory;
+    jw.write(record.ref) catch return error.OutOfMemory;
+    jw.objectField("commit") catch return error.OutOfMemory;
+    jw.write(record.commit) catch return error.OutOfMemory;
+    jw.objectField("pinned") catch return error.OutOfMemory;
+    jw.write(record.pinned) catch return error.OutOfMemory;
+    jw.endObject() catch return error.OutOfMemory;
+    return out.toOwnedSlice();
 }
 
 /// Every slice of the result lives in `arena`. A record whose fields break
 /// their limits is refused, so a decoded record always obeys them.
 pub fn decodeRecord(arena: std.mem.Allocator, bytes: []const u8) RecordError!Record {
-    const record = std.json.parseFromSliceLeaky(Record, arena, bytes, .{
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{
         .duplicate_field_behavior = .@"error",
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.BadRecord,
+    };
+    if (root != .object) return error.BadRecord;
+    const fields = root.object;
+    if (fields.count() != 4) return error.BadRecord;
+    const source_val = fields.get("source") orelse return error.BadRecord;
+    const ref_val = fields.get("ref") orelse return error.BadRecord;
+    const commit_val = fields.get("commit") orelse return error.BadRecord;
+    const pinned_val = fields.get("pinned") orelse return error.BadRecord;
+    if (source_val != .string or pinned_val != .bool) return error.BadRecord;
+    const ref = switch (ref_val) {
+        .null => null,
+        .string => |s| s,
+        else => return error.BadRecord,
+    };
+    const commit = switch (commit_val) {
+        .null => null,
+        .string => |s| s,
+        else => return error.BadRecord,
+    };
+    const record: Record = .{
+        .source = source_val.string,
+        .ref = ref,
+        .commit = commit,
+        .pinned = pinned_val.bool,
     };
     if (!recordWithinLimits(record)) return error.BadRecord;
     return record;

@@ -453,14 +453,35 @@ pub const ModProviders = struct {
     }
 };
 
-const off_suffix = ".off";
-const manifest_file_name = "mod.json";
-
 /// Returns the parsed providers of every enabled mod under `root_path`, in mod
 /// name order, each with its mod name and link path (`<root>/<name>`).
 /// Disabled, unreadable, and invalid mods contribute nothing; broken enabled
 /// mods append a plain problem sentence naming the mod.
 pub fn loadModProviders(alloc: std.mem.Allocator, root_path: []const u8) !ModProviders {
+    const arena = try alloc.create(std.heap.ArenaAllocator);
+    arena.* = .init(alloc);
+    errdefer {
+        arena.deinit();
+        alloc.destroy(arena);
+    }
+    var loaded = try loadModProvidersInto(alloc, root_path, arena);
+    if (loaded.entries.len == 0 and loaded.problems.len == 0) {
+        arena.deinit();
+        alloc.destroy(arena);
+        return .{};
+    }
+    loaded.arena = arena;
+    return loaded;
+}
+
+/// Same as `loadModProviders`, allocating returned entries, problems, and
+/// provider definitions in the caller-owned `target_arena` (`ModProviders.arena`
+/// is left null so `ModProviders.deinit` does not free `target_arena`).
+pub fn loadModProvidersInto(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+    target_arena: *std.heap.ArenaAllocator,
+) !ModProviders {
     const io = io_mod.getIo();
     var root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{
         .iterate = true,
@@ -475,82 +496,14 @@ pub fn loadModProviders(alloc: std.mem.Allocator, root_path: []const u8) !ModPro
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
 
-    const RawMod = struct {
-        base: []const u8,
-        has_on: bool = false,
-        has_off: bool = false,
-        on_kind: ?std.Io.File.Kind = null,
-    };
+    const scanned = try store.scanEntries(scratch, root_dir, io);
+    if (scanned.entries.len == 0 and !scanned.over_limit) return .{};
 
-    var raw_mods: std.ArrayList(RawMod) = .empty;
-    var over_limit = false;
-
-    var it = root_dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.name.len == 0 or entry.name[0] == '.') continue;
-
-        const is_off = std.mem.endsWith(u8, entry.name, off_suffix);
-        const base = if (is_off) entry.name[0 .. entry.name.len - off_suffix.len] else entry.name;
-        const kind: std.Io.File.Kind = if (entry.kind != .unknown) entry.kind else blk: {
-            const st = root_dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |err| switch (err) {
-                error.FileNotFound => break :blk .unknown,
-                error.SymLinkLoop => break :blk .sym_link,
-                else => return err,
-            };
-            break :blk st.kind;
-        };
-
-        var existing_index: ?usize = null;
-        for (raw_mods.items, 0..) |item, idx| {
-            if (std.mem.eql(u8, item.base, base)) {
-                existing_index = idx;
-                break;
-            }
-        }
-
-        if (existing_index) |idx| {
-            if (is_off) {
-                raw_mods.items[idx].has_off = true;
-            } else {
-                raw_mods.items[idx].has_on = true;
-                raw_mods.items[idx].on_kind = kind;
-            }
-            continue;
-        }
-
-        if (raw_mods.items.len >= manifest.max_mods) {
-            over_limit = true;
-            continue;
-        }
-
-        try raw_mods.append(scratch, .{
-            .base = try scratch.dupe(u8, base),
-            .has_on = !is_off,
-            .has_off = is_off,
-            .on_kind = if (!is_off) kind else null,
-        });
-    }
-
-    if (raw_mods.items.len == 0 and !over_limit) return .{};
-
-    std.mem.sort(RawMod, raw_mods.items, {}, struct {
-        fn lessThan(_: void, a: RawMod, b: RawMod) bool {
-            return std.mem.order(u8, a.base, b.base) == .lt;
-        }
-    }.lessThan);
-
-    const arena = try alloc.create(std.heap.ArenaAllocator);
-    arena.* = .init(alloc);
-    errdefer {
-        arena.deinit();
-        alloc.destroy(arena);
-    }
-    const owned = arena.allocator();
-
+    const owned = target_arena.allocator();
     var entries: std.ArrayList(ModProviderEntry) = .empty;
     var problems: std.ArrayList([]u8) = .empty;
 
-    for (raw_mods.items) |item| {
+    for (scanned.entries) |item| {
         if (!manifest.validName(item.base)) {
             if (item.has_on) {
                 try problems.append(owned, try owned.print("mod {f}: invalid mod name.", .{text_utils.terminalSafe(item.base)}));
@@ -572,14 +525,14 @@ pub fn loadModProviders(alloc: std.mem.Allocator, root_path: []const u8) !ModPro
         defer mod_scratch_state.deinit();
         const mod_scratch = mod_scratch_state.allocator();
 
-        const loaded = readEnabledModManifest(mod_scratch, root_dir, io, item.base);
+        const loaded = try store.readManifestAt(mod_scratch, root_dir, io, item.base, item.base);
         const decoded = switch (loaded) {
             .ok => |m| m,
-            .problem => |msg| {
+            .problem => |prob| {
+                const msg = manifestProblemMessage(prob);
                 try problems.append(owned, try owned.print("mod {s}: {s}", .{ item.base, msg }));
                 continue;
             },
-            .oom => return error.OutOfMemory,
         };
 
         const providers_val = decoded.providers orelse continue;
@@ -587,8 +540,8 @@ pub fn loadModProviders(alloc: std.mem.Allocator, root_path: []const u8) !ModPro
         const link_path = try std.Io.Dir.path.join(owned, &.{ root_path, item.base });
 
         var at: configured_provider.FailurePath = .{};
-        var parsed_reg = configured_provider.Registry.parse_located_for_mod(
-            alloc,
+        const defs = configured_provider.Registry.parse_definitions_for_mod(
+            owned,
             providers_val,
             &at,
             .{ .name = mod_name, .dir = link_path },
@@ -611,18 +564,17 @@ pub fn loadModProviders(alloc: std.mem.Allocator, root_path: []const u8) !ModPro
                 continue;
             },
         };
-        defer parsed_reg.deinit(alloc);
 
-        for (parsed_reg.definitions) |def| {
+        for (defs) |def| {
             try entries.append(owned, .{
                 .mod_name = mod_name,
                 .link_path = link_path,
-                .definition = try def.clone(owned),
+                .definition = def,
             });
         }
     }
 
-    if (over_limit) {
+    if (scanned.over_limit) {
         try problems.append(owned, try owned.print(
             "more than {d} mods are installed; extra mods were skipped.",
             .{manifest.max_mods},
@@ -632,60 +584,21 @@ pub fn loadModProviders(alloc: std.mem.Allocator, root_path: []const u8) !ModPro
     return .{
         .entries = try entries.toOwnedSlice(owned),
         .problems = try problems.toOwnedSlice(owned),
-        .arena = arena,
+        .arena = null,
     };
 }
 
-const ManifestRead = union(enum) {
-    ok: manifest.Manifest,
-    problem: []const u8,
-    oom,
-};
-
-fn readEnabledModManifest(
-    arena: std.mem.Allocator,
-    root_dir: std.Io.Dir,
-    io: std.Io,
-    mod_name: []const u8,
-) ManifestRead {
-    var mod_dir = root_dir.openDir(io, mod_name, .{
-        .iterate = false,
-        .follow_symlinks = true,
-    }) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir, error.SymLinkLoop => return .{ .problem = "mod link is broken." },
-        else => return .{ .problem = "could not open mod directory." },
+fn manifestProblemMessage(problem: store.ManifestProblem) []const u8 {
+    return switch (problem) {
+        .dangling => "mod link is broken.",
+        .open_dir_failed => "could not open mod directory.",
+        .no_manifest => "mod.json is missing.",
+        .open_file_failed, .unreadable_manifest => "could not read mod.json.",
+        .not_regular_file => "mod.json is not a regular file.",
+        .too_large => manifest.message(error.TooLarge),
+        .bad_manifest => |err| manifest.message(err),
+        .name_mismatch => "mod.json names a different mod.",
     };
-    defer mod_dir.close(io);
-
-    var mf_file = mod_dir.openFile(io, manifest_file_name, .{
-        .mode = .read_only,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return .{ .problem = "mod.json is missing." },
-        else => return .{ .problem = "could not read mod.json." },
-    };
-    defer mf_file.close(io);
-
-    const st = mf_file.stat(io) catch return .{ .problem = "could not read mod.json." };
-    if (st.kind != .file) return .{ .problem = "mod.json is not a regular file." };
-
-    var read_buf: [8192]u8 = undefined;
-    var reader = mf_file.reader(io, &read_buf);
-    var content: std.ArrayList(u8) = .empty;
-    reader.interface.appendRemaining(arena, &content, .limited(manifest.max_bytes + 1)) catch |err| switch (err) {
-        error.OutOfMemory => return .oom,
-        error.StreamTooLong => return .{ .problem = manifest.message(error.TooLarge) },
-        else => return .{ .problem = "could not read mod.json." },
-    };
-
-    const decoded = manifest.decode(arena, content.items) catch |err| switch (err) {
-        error.OutOfMemory => return .oom,
-        else => return .{ .problem = manifest.message(err) },
-    };
-    if (!std.mem.eql(u8, decoded.name, mod_name)) {
-        return .{ .problem = "mod.json names a different mod." };
-    }
-    return .{ .ok = decoded };
 }
 
 const max_git_stdout_bytes: usize = 64 * 1024;
