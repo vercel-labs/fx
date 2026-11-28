@@ -6,7 +6,7 @@ import { onlySessionId, sessionDir } from "./saved-sessions";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
-const { FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, startFakeGateway, tmuxAvailable,
+const { FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, fakeGatewaySse, startDynamicFakeGateway, startFakeGateway, tmuxAvailable,
   turnSettled,
   hasEmptyComposer,
 } = await import("./tmux-helpers");
@@ -179,16 +179,31 @@ describe.skipIf(!tmuxAvailable())("tui: transcript window", () => {
     "a damaged line in an older cycle: Ctrl+O shows what it can read and says older history couldn't be read, also when reopened",
     async () => {
       const built = await buildSession(4, 20_000);
-      const session = built.session;
+      let session: Session | null = built.session;
       try {
-        // One byte of cycle 1's second prompt changes, so that line's
-        // checksum fails.
-        const log = join(sessionDir(built.home, onlySessionId(built.home)), "log.jsonl");
+        // Quit and resume so only cycle 3 is in memory and cycles 0..2 are
+        // read from the log, then flip one byte of cycle 1's second prompt
+        // so that line's checksum fails.
+        const id = onlySessionId(built.home);
+        const log = join(sessionDir(built.home, id), "log.jsonl");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        await session.kill();
+        session = null;
         const damaged = readFileSync(log);
         const at = damaged.indexOf(`"second turn of cycle 1"`) + 1;
         expect(at).toBeGreaterThan(0);
         damaged[at] ^= 0x01;
         writeFileSync(log, damaged);
+        session = await TmuxSession.create({
+          cmd: `${binary} --resume ${id}`,
+          cwd: built.workspace,
+          env: built.env,
+          width: 200,
+          height: 60,
+          isolated: true,
+        });
+        await session.waitForComposer(TIMEOUT);
         const walk = await walkUp(session);
         // The search for cycle 1's start stops at the damage, so Ctrl+O
         // goes from cycle 2 to the log's first cycle.
@@ -205,8 +220,152 @@ describe.skipIf(!tmuxAvailable())("tui: transcript window", () => {
         await session.sendHexBytes(["0f"]);
         await session.waitForComposer(TIMEOUT);
       } finally {
-        await session.kill();
+        await session?.kill();
         built.gateway.stop();
+      }
+    },
+    300_000,
+  );
+
+  test(
+    "resize after a 3-compaction turn and a between-turn compaction keeps the prompt and every step marker in scrollback",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-window-resize-3compact-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+        model: FAKE_GATEWAY_MODEL,
+        auto_upgrade: false,
+        startup_scrollback: false,
+        auto_compact_percent: 10,
+      }));
+      const bigWords = Array.from({ length: 800 }, () => "a b c d e f g h i j k l m n o p q r s t").join("\n");
+      for (let i = 1; i <= 10; i += 1) {
+        writeFileSync(join(workspace, `r${String(i).padStart(2, "0")}.txt`), `file-${i}\n${bigWords}\n`);
+      }
+
+      let step = 0;
+      let betweenTurnCompacted = false;
+      let turn2Done = false;
+      const gateway = startDynamicFakeGateway(
+        (raw) => {
+          const req = JSON.parse(raw);
+          const text = raw;
+          if (
+            (req.toolChoice?.type === "none" && (!req.tools || req.tools.length === 0)) ||
+            text.includes("Write the compaction notes") ||
+            text.includes("Your notes on the turns above left some out") ||
+            text.includes("Write only that now, under this heading:") ||
+            text.includes("Write only these notes.")
+          ) {
+            return fakeGatewayFinalText("Earlier:\nSummary of steps.\nFacts:\nF1: kept steps.\nDecisions:\nNone.\nFiles:\nNone.\nNext:\nContinue.");
+          }
+          if (text.includes("TURN2_AFTER_COMPACT_PROMPT")) {
+            turn2Done = true;
+            return fakeGatewayFinalText("TURN2_AFTER_COMPACT_REPLY");
+          }
+          if (text.includes("EXTRA_TURN_BEFORE_COMPACT")) {
+            return fakeGatewayFinalText("EXTRA_TURN_REPLY");
+          }
+          if (step < 10) {
+            step += 1;
+            const callId = `call-${step}`;
+            const path = `r${String(step).padStart(2, "0")}.txt`;
+            return fakeGatewaySse([
+              { type: "text-start", id: `t-${step}` },
+              { type: "text-delta", id: `t-${step}`, delta: `STEP_M_${String(step).padStart(2, "0")}\n` },
+              { type: "text-end", id: `t-${step}` },
+              { type: "tool-call", toolCallId: callId, toolName: "read_file", input: { path } },
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+            ]);
+          }
+          return fakeGatewayFinalText("TURN1_FINAL_KEEP");
+        },
+        { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] },
+      );
+
+      const env: Record<string, string | undefined> = {
+        HOME: home,
+        TERM: "xterm-256color",
+        NO_COLOR: "1",
+        AI_GATEWAY_API_KEY: "fake-transcript-window-resize-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "full-access",
+        FX_SOUND: "0",
+      };
+
+      const session = await TmuxSession.create({
+        cmd: binary,
+        cwd: workspace,
+        env,
+        width: 120,
+        height: 36,
+        isolated: true,
+        minimumHistoryLines: 20_000,
+      });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("PROMPT_THREE_COMPACTIONS");
+        await session.waitForPane(
+          (pane) => pane.includes("TURN1_FINAL_KEEP") && hasEmptyComposer(pane) && turnSettled(pane),
+          60_000,
+        );
+        const log = join(sessionDir(home, onlySessionId(home)), "log.jsonl");
+        const midCompactions = compactions(log);
+        expect(midCompactions).toBeGreaterThanOrEqual(3);
+
+        await session.resizeWindow(90, 30);
+        await session.resizeWindow(120, 36);
+        await session.waitForComposer(TIMEOUT);
+        await Bun.sleep(500);
+        const scrollback1 = await session.captureFullScrollback();
+        expect(scrollback1).toContain("PROMPT_THREE_COMPACTIONS");
+        for (let i = 1; i <= 10; i += 1) {
+          expect(scrollback1).toContain(`STEP_M_${String(i).padStart(2, "0")}`);
+        }
+        expect(scrollback1).toContain("TURN1_FINAL_KEEP");
+
+        await session.sendText("EXTRA_TURN_BEFORE_COMPACT");
+        await session.waitForPane(
+          (pane) => pane.includes("EXTRA_TURN_REPLY") && hasEmptyComposer(pane) && turnSettled(pane),
+          TIMEOUT,
+        );
+        await session.sendText("/compact");
+        await waitFor(() => compactions(log) === midCompactions + 1, "between-turn compaction in log");
+        betweenTurnCompacted = true;
+        await session.waitForPane((pane) => !/Compacting|Stopping compaction/.test(pane), TIMEOUT);
+        await session.waitForComposer(TIMEOUT);
+
+        await session.sendText("TURN2_AFTER_COMPACT_PROMPT");
+        await session.waitForPane(
+          (pane) => turn2Done && pane.includes("TURN2_AFTER_COMPACT_REPLY") && hasEmptyComposer(pane) && turnSettled(pane),
+          TIMEOUT,
+        );
+
+        await session.resizeWindow(84, 28);
+        await session.resizeWindow(120, 36);
+        await session.waitForComposer(TIMEOUT);
+        await Bun.sleep(500);
+        const scrollback2 = await session.captureFullScrollback();
+        expect(betweenTurnCompacted).toBe(true);
+        expect(scrollback2).toContain("PROMPT_THREE_COMPACTIONS");
+        for (let i = 1; i <= 10; i += 1) {
+          expect(scrollback2).toContain(`STEP_M_${String(i).padStart(2, "0")}`);
+        }
+        expect(scrollback2).toContain("TURN1_FINAL_KEEP");
+        expect(scrollback2).toContain("TURN2_AFTER_COMPACT_PROMPT");
+        expect(scrollback2).toContain("TURN2_AFTER_COMPACT_REPLY");
+      } finally {
+        await session.kill();
+        gateway.stop();
       }
     },
     300_000,

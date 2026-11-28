@@ -65,6 +65,7 @@ fn event(input: Input) error{InvalidEvent}!tw.Event {
     if (eql(u8, name, "compacted")) return .compacted;
     if (eql(u8, name, "resized")) return .resized;
     if (eql(u8, name, "reprint_tick")) return .reprint_tick;
+    if (eql(u8, name, "session_cleared")) return .session_cleared;
     if (eql(u8, name, "ctrlo_opened")) return .ctrlo_opened;
     if (eql(u8, name, "ctrlo_scrolled")) return .{ .ctrlo_scrolled = try parseDir(input.dir) };
     if (eql(u8, name, "ctrlo_closed")) return .ctrlo_closed;

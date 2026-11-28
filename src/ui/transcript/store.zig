@@ -2012,6 +2012,10 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
     errdefer if (mcp_server) |value| alloc.free(value);
     const mcp_tool = if (source.mcp_tool) |value| try alloc.dupe(u8, value) else null;
     errdefer if (mcp_tool) |value| alloc.free(value);
+    const failure_reason = if (source.failure_reason) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (failure_reason) |value| alloc.free(value);
+    const command_session_id = if (source.command_session_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (command_session_id) |value| alloc.free(value);
 
     return .{
         .entry_id = source.entry_id,
@@ -2040,6 +2044,11 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .subagent_started = source.subagent_started,
         .mcp_server = mcp_server,
         .mcp_tool = mcp_tool,
+        .failure_reason = failure_reason,
+        .command_session_id = command_session_id,
+        .stopped_question = source.stopped_question,
+        .toolbox_opened_skill = source.toolbox_opened_skill,
+        .invalid_field_count = source.invalid_field_count,
     };
 }
 

@@ -51,11 +51,11 @@ export class Recorder {
 
   record(shown: Shown, act: Act) {
     const s = shown.state;
-    const base = act.name === "Resized" || act.name === "Resumed" ? [] : this.painted;
+    const base = act.name === "Resized" || act.name === "Resumed" || act.name === "SessionCleared" ? [] : this.painted;
     this.painted = [...new Set([...base, ...paintedBy(shown.out)])].sort((a, b) => a - b);
     this.states.push({
-      cycle: s.cycle, cycleFirst: s.cycleFirst, prevFirst: s.prevFirst === -1 ? this.none : s.prevFirst,
-      nextSeq: s.nextSeq, savedThrough: s.savedThrough, live: shown.live, turnOpen: s.turnOpen, prevWaits: s.prevWaits,
+      cycle: s.cycle, cycleFirst: s.cycleFirst, heldFirst: s.heldFirst,
+      nextSeq: s.nextSeq, savedThrough: s.savedThrough, live: shown.live, turnOpen: s.turnOpen,
       paintedThrough: s.paintedThrough, reprinting: s.reprinting, coOpen: s.coOpen, coLo: s.coLo, coHi: s.coHi,
       coAtStart: s.coAtStart, pending: s.pending, pendingDir: s.pendingDir, nextToken: s.nextToken,
       out: shown.out, act, alive: true, cycleStarts: [...this.cycleStarts], painted: [...this.painted],
@@ -85,6 +85,7 @@ export class Recorder {
       case "compacted": return { name: "Compacted" };
       case "resized": return { name: "Resized" };
       case "reprint_tick": return { name: "ReprintTick" };
+      case "session_cleared": return { name: "SessionCleared" };
       case "ctrlo_opened": return { name: "CtrlOOpened" };
       case "ctrlo_scrolled": return { name: event.dir === "older" ? "CtrlOScrolledOlder" : "CtrlOScrolledNewer" };
       case "ctrlo_closed": return { name: "CtrlOClosed" };
@@ -104,15 +105,22 @@ export async function runTrace(bin: string, config: Config, steps: Step[], none:
     for (const { event } of steps) {
       const before = harness.last;
       if (event.event === "crash" || event.event === "resume") {
-        if (event.event === "crash") {
-          await harness.crash();
-          recorder.crashed();
-        }
         const saved = before.state.savedThrough;
         recorder.cycleStarts = recorder.cycleStarts.filter((start) => start <= saved);
         const last = Math.max(...recorder.cycleStarts);
-        const shown = await harness.send({ event: "resumed", cycle: before.state.cycle, cycle_first: last, next_seq: saved });
-        recorder.record(shown, { name: "Resumed" });
+        if (event.event === "crash") {
+          await harness.crash();
+          recorder.crashed();
+          const shown = await harness.send({ event: "resumed", cycle: before.state.cycle, cycle_first: last, next_seq: saved });
+          recorder.record(shown, { name: "Resumed" });
+        } else {
+          const cleared = await harness.send({ event: "session_cleared" });
+          recorder.cycleStarts = [0];
+          recorder.record(cleared, { name: "SessionCleared" });
+          recorder.cycleStarts = last === 0 ? [0] : [0, last];
+          const shown = await harness.send({ event: "resumed", cycle: last === 0 ? 0 : 1, cycle_first: last, next_seq: saved });
+          recorder.record(shown, { name: "Resumed" });
+        }
         continue;
       }
       const shown = await harness.send(event as Event);
@@ -126,6 +134,7 @@ export async function runTrace(bin: string, config: Config, steps: Step[], none:
         recorder.repeat();
         continue;
       }
+      if (event.event === "session_cleared") recorder.cycleStarts = [0];
       if (event.event === "compacted" && !recorder.cycleStarts.includes(before.state.nextSeq)) recorder.cycleStarts.push(before.state.nextSeq);
       recorder.record(shown, recorder.actFor(event as Event, shown));
     }
@@ -160,6 +169,7 @@ async function randomTrace(bin: string, config: Config, seed: number, length: nu
       [0.6, () => ({ event: "compacted" })],
       [0.8, () => ({ event: "resized" })],
       [s.reprinting ? 5 : 0.2, () => ({ event: "reprint_tick" })],
+      [0.25, () => ({ event: "session_cleared" })],
       [s.coOpen ? 0.2 : 1.5, () => ({ event: "ctrlo_opened" })],
       [s.coOpen ? 3 : 0.2, () => ({ event: "ctrlo_scrolled", dir: "older" })],
       [s.coOpen ? 1.5 : 0.1, () => ({ event: "ctrlo_scrolled", dir: "newer" })],
@@ -182,11 +192,19 @@ async function randomTrace(bin: string, config: Config, seed: number, length: nu
     if (event.event === "crash" || event.event === "resume") {
       const saved = s.savedThrough;
       cycleStarts = cycleStarts.filter((start) => start <= saved);
-      if (event.event === "crash") await shadow.crash();
-      await shadow.send({ event: "resumed", cycle: s.cycle, cycle_first: Math.max(...cycleStarts), next_seq: saved });
+      const last = Math.max(...cycleStarts);
+      if (event.event === "crash") {
+        await shadow.crash();
+        await shadow.send({ event: "resumed", cycle: s.cycle, cycle_first: last, next_seq: saved });
+      } else {
+        await shadow.send({ event: "session_cleared" });
+        cycleStarts = last === 0 ? [0] : [0, last];
+        await shadow.send({ event: "resumed", cycle: last === 0 ? 0 : 1, cycle_first: last, next_seq: saved });
+      }
       lastToken = 0;
       continue;
     }
+    if (event.event === "session_cleared") cycleStarts = [0];
     if (event.event === "compacted" && !cycleStarts.includes(s.nextSeq)) cycleStarts.push(s.nextSeq);
     const shown = await shadow.send(event as Event);
     const issued = shown.out.find((effect) => effect.kind === "read_log");
@@ -203,7 +221,7 @@ export function scriptedTraces(saved: boolean): { name: string; steps: Step[] }[
   const ticks = (n: number) => Array.from({ length: n }, () => E("reprint_tick"));
   const scripted = [
     {
-      name: "a compaction mid-turn keeps the live tool line and drops the old cycle at turn end",
+      name: "a compaction mid-turn keeps the live tool line and keeps all blocks across turn end and resize",
       steps: [
         E("turn_started"), E("block_opened", { id: 1 }), E("block_finished", { id: 2 }), E("block_finished", { id: 3 }),
         E("saved_through", { seq: 2 }), E("compacted"), E("block_changed", { id: 1 }), E("turn_ended"),
@@ -218,11 +236,11 @@ export function scriptedTraces(saved: boolean): { name: string; steps: Step[] }[
       ],
     },
     {
-      name: "Ctrl+O scrolls back through two dropped cycles to the start of the log",
+      name: "Ctrl+O scrolls back through two resumed-away cycles to the start of the log",
       steps: [
         E("block_finished", { id: 1 }), E("block_finished", { id: 2 }), E("saved_through", { seq: 2 }), E("compacted"),
         E("block_finished", { id: 3 }), E("block_finished", { id: 4 }), E("saved_through", { seq: 4 }), E("compacted"),
-        E("block_finished", { id: 5 }), E("ctrlo_opened"),
+        E("block_finished", { id: 5 }), E("saved_through", { seq: 5 }), E("crash"), ...ticks(2), E("ctrlo_opened"),
         ...Array.from({ length: 4 }, (_, i) => [E("ctrlo_scrolled", { dir: "older" }), E("log_read_done", { token: i + 1, count: 2 })]).flat(),
         E("ctrlo_scrolled", { dir: "older" }), E("ctrlo_scrolled", { dir: "newer" }), E("log_read_done", { token: 5, count: 9 }),
       ],
@@ -231,7 +249,8 @@ export function scriptedTraces(saved: boolean): { name: string; steps: Step[] }[
       name: "duplicate, stale, reordered and lost replies, then a close with a read in flight",
       steps: [
         E("block_finished", { id: 1 }), E("block_finished", { id: 2 }), E("block_finished", { id: 3 }), E("saved_through", { seq: 3 }),
-        E("compacted"), E("block_finished", { id: 4 }), E("ctrlo_opened"), E("ctrlo_scrolled", { dir: "older" }),
+        E("compacted"), E("block_finished", { id: 4 }), E("saved_through", { seq: 4 }), E("crash"), ...ticks(2),
+        E("ctrlo_opened"), E("ctrlo_scrolled", { dir: "older" }),
         E("log_read_done", { token: 7, count: 1 }), E("log_read_failed", { token: 1 }), E("log_read_done", { token: 1, count: 1 }),
         E("ctrlo_scrolled", { dir: "older" }), E("log_read_done", { token: 2, count: 1 }), E("log_read_done", { token: 2, count: 1 }),
         E("ctrlo_scrolled", { dir: "older" }), E("ctrlo_closed"), E("log_read_done", { token: 3, count: 1 }), E("ctrlo_opened"),
@@ -242,24 +261,25 @@ export function scriptedTraces(saved: boolean): { name: string; steps: Step[] }[
       steps: [
         E("turn_started"), E("block_finished", { id: 1 }), E("block_finished", { id: 2 }), E("saved_through", { seq: 2 }),
         E("compacted"), E("block_finished", { id: 3 }), E("block_finished", { id: 4 }), E("saved_through", { seq: 3 }),
-        E("resized"), E("reprint_tick"), E("ctrlo_opened"), E("ctrlo_scrolled", { dir: "older" }), E("ctrlo_scrolled", { dir: "older" }),
+        E("resized"), E("reprint_tick"), E("crash"), ...ticks(3), E("ctrlo_opened"), E("ctrlo_scrolled", { dir: "older" }),
         E("crash"), ...ticks(3), E("log_read_done", { token: 1, count: 1 }), E("ctrlo_opened"),
       ],
     },
     {
-      name: "a resume in the same process drops Ctrl+O, the live blocks, and the unsaved tail",
+      name: "a resume in the same process drops the old session on clear and loads the resumed cycle",
       steps: [
         E("turn_started"), E("block_opened", { id: 1 }), E("block_finished", { id: 2 }), E("block_finished", { id: 3 }),
-        E("saved_through", { seq: 1 }), E("ctrlo_opened"), E("ctrlo_scrolled", { dir: "older" }), E("resume"),
+        E("saved_through", { seq: 1 }), E("ctrlo_opened"), E("resume"),
         E("reprint_tick"), E("reprint_tick"), E("block_changed", { id: 1 }), E("log_read_done", { token: 1, count: 1 }),
       ],
     },
     {
-      name: "the --no-save shape: Ctrl+O is open while the previous cycle drops",
+      name: "the --no-save shape: Ctrl+O stays in memory across compactions and clears on session_cleared",
       steps: [
         E("turn_started"), E("block_finished", { id: 1 }), E("ctrlo_opened"), E("block_finished", { id: 2 }), E("turn_ended"),
         E("compacted"), E("turn_started"), E("block_finished", { id: 3 }), E("turn_ended"),
-        E("ctrlo_scrolled", { dir: "newer" }), E("ctrlo_scrolled", { dir: "older" }), E("saved_through", { seq: 99 }),
+        E("ctrlo_scrolled", { dir: "older" }), E("ctrlo_scrolled", { dir: "newer" }), E("saved_through", { seq: 99 }),
+        E("session_cleared"),
       ],
     },
   ];

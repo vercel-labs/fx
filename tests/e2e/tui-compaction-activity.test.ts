@@ -1101,7 +1101,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-      FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "full_transcript_cache",
+      FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "full_transcript_cache,transcript_window",
     };
     const command = `/usr/bin/env -i ${Object.entries(env)
       .map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)}`;
@@ -1122,12 +1122,12 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       await terminal.sendText("/compact");
       await until(() => logLines(home, id).some((line) => line.kind === "compacted"), "the compaction");
       await terminal.waitForPane((pane) => !/Preparing compaction|Compacting/.test(pane) && hasEmptyComposer(pane), 15_000);
-      // The turn across the compaction ends, so the window lets the older
-      // cycle go and Ctrl+O's newest page joins it from the log.
+      // The turn across the compaction ends, keeping the older cycle in memory
+      // so Ctrl+O opens without reading the session log.
       await terminal.sendText("One more turn.");
       await terminal.waitForPane((pane) => pane.includes("CTRLO_AFTER_COMPACTION_5c1") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
-      // Between turns the cycle is read in the background and kept.
-      await until(() => trace().includes("archive_loaded back=1"), "the background read of the joined cycle", 15_000);
+      expect(trace()).not.toContain("archive_loaded");
+      expect(trace()).not.toContain("dropped entries=");
       const openAt = trace().length;
       await terminal.sendKeys("C-o");
       await terminal.waitForText("esc close", 15_000);
@@ -1135,7 +1135,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const atOpen = trace().slice(openAt);
       await terminal.sendKeys("Escape");
       await terminal.waitForComposer(15_000);
-      // The open shows the older cycle without reading the log again.
+      // The open shows the older cycle without reading the log.
       expect(atOpen).not.toContain("archive_read_started");
       expect(atOpen).not.toContain("archive_loaded");
       expect(readFileSync(stderrPath, "utf8")).toBe("");

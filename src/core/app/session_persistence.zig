@@ -1356,6 +1356,9 @@ pub const Persistence = struct {
     /// Where the older compaction cycles Ctrl+O read start in the session log
     /// (`loadTranscriptArchive`).
     transcript_archive_boundaries: TranscriptArchiveBoundaries = .{},
+    /// The cursor where the resumed session's in-memory replay began, or null
+    /// when the entire current session is held in memory.
+    resumed_archive_boundary: ?session_adapter.LogCursor = null,
     /// The background read of the cycle Ctrl+O asked for.
     transcript_archive_read: TranscriptArchiveRead = .{},
     /// The deferred, off-main-thread restore of undelivered accepted prompts.
@@ -1387,7 +1390,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 40) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 41) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1419,6 +1422,7 @@ pub const Persistence = struct {
         storage.degraded_warning_emitted = false;
         storage.pending_cancelled_command = null;
         storage.transcript_archive_boundaries = .{};
+        storage.resumed_archive_boundary = null;
         storage.transcript_archive_read = .{};
         storage.pending_input_restore = .{};
         storage.image_snapshot_temp_dir = null;

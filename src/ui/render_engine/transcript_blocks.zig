@@ -102,6 +102,11 @@ pub const ToolDetailRecord = struct {
     /// name. Only the compact rows read them.
     mcp_server: ?[]u8 = null,
     mcp_tool: ?[]u8 = null,
+    failure_reason: ?[]u8 = null,
+    command_session_id: ?[]u8 = null,
+    stopped_question: bool = false,
+    toolbox_opened_skill: bool = false,
+    invalid_field_count: u16 = 0,
 
     pub fn isCapturedCommand(self: ToolDetailRecord) bool {
         // Hand-built details and restored records may predate the explicit
@@ -124,6 +129,8 @@ pub const ToolDetailRecord = struct {
         if (self.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
         if (self.mcp_server) |value| alloc.free(value);
         if (self.mcp_tool) |value| alloc.free(value);
+        if (self.failure_reason) |value| alloc.free(value);
+        if (self.command_session_id) |value| alloc.free(value);
         self.* = undefined;
     }
 };

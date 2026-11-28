@@ -66,9 +66,12 @@ pub const Shell = struct {
         return self.state.config.saved;
     }
 
-    /// Starts over, for a transcript that was cleared or replaced.
+    /// Starts over, for a transcript that was cleared or replaced (`/new`, `/clear`, `/resume`).
     pub fn reset(self: *Shell, alloc: Allocator) void {
-        _ = alloc;
+        var ignored: std.ArrayList(u32) = .empty;
+        defer ignored.deinit(alloc);
+        ignored.ensureTotalCapacity(alloc, self.finished.items.len) catch {};
+        self.apply(.session_cleared, &ignored);
         var finished = self.finished;
         finished.clearRetainingCapacity();
         var pending_drops = self.pending_drops;
@@ -204,11 +207,13 @@ pub const Shell = struct {
         self.state = out.state;
         trace(event, out.effect);
         if (out.effect) |effect| switch (effect) {
-            .drop => |range| self.drop(range, drops),
+            .drop => |range| if (event != .session_cleared) self.drop(range, drops),
             .paint_final, .repaint_block, .reprint_begin, .reprint_slice, .repaint_live, .ctrlo_show, .read_log => {},
         };
         // Block `base + i` is `finished.items[i]`, through the core's last block.
-        std.debug.assert(self.state.next_seq == self.base + self.finished.items.len);
+        if (event != .session_cleared) {
+            std.debug.assert(self.state.next_seq == self.base + self.finished.items.len);
+        }
     }
 
     fn drop(self: *Shell, range: core.Range, drops: *std.ArrayList(u32)) void {
@@ -316,7 +321,7 @@ test "the transcript window shell reports a turn's entries in list order and end
     try testing.expectEqual(@as(usize, 0), drops.items.len);
 }
 
-test "the transcript window shell drops a compaction's closed cycle at the next saved turn end, not before" {
+test "the transcript window shell keeps all blocks across mid-turn compaction and turn end and drops on reset" {
     const alloc = testing.allocator;
     var shell = Shell.init(true);
     defer shell.deinit(alloc);
@@ -334,16 +339,17 @@ test "the transcript window shell drops a compaction's closed cycle at the next 
     entries.items[4] = rawEntry(5, .tool_status, false);
     try entries.append(alloc, rawEntry(7, .turn_summary, false));
     try shell.sync(alloc, entries.items, &drops);
-    // Blocks finished before the compaction go: the first turn and the
-    // second turn's prompt. The tool line finished after it, so it stays.
-    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, drops.items);
-    try testing.expectEqualSlices(u32, &.{ 5, 6, 7 }, shell.finished.items);
-    try testing.expectEqual(@as(core.Seq, 4), shell.base);
+    try testing.expectEqual(@as(usize, 0), drops.items.len);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6, 7 }, shell.finished.items);
+    try testing.expectEqual(@as(core.Seq, 0), shell.base);
+    shell.reset(alloc);
+    try testing.expectEqual(@as(usize, 0), shell.finished.items.len);
+    try testing.expectEqual(@as(core.Seq, 0), shell.state.next_seq);
 }
 
 test "a failed allocation in a sync leaves the transcript window shell as it was" {
     // A sync that fails partway leaves the window as it was. The sync that does
-    // not fail drops the closed cycle.
+    // not fail keeps all blocks across compaction and turn end.
     var induced_failures: usize = 0;
     var fail_after: usize = 0;
     while (true) : (fail_after += 1) {
@@ -382,9 +388,9 @@ test "a failed allocation in a sync leaves the transcript window shell as it was
         failing.fail_index = std.math.maxInt(usize);
         if (!induced) {
             try result;
-            try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, drops.items);
-            try testing.expectEqualSlices(u32, &.{ 5, 6, 7 }, shell.finished.items);
-            try testing.expectEqual(@as(core.Seq, 4), shell.base);
+            try testing.expectEqual(@as(usize, 0), drops.items.len);
+            try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6, 7 }, shell.finished.items);
+            try testing.expectEqual(@as(core.Seq, 0), shell.base);
             break;
         }
         induced_failures += 1;
@@ -451,7 +457,7 @@ test "a failed allocation in a resume leaves the transcript window shell empty" 
     try testing.expect(induced_failures > 0);
 }
 
-test "the transcript window shell drops at the turn end of an unsaved session without a save" {
+test "the transcript window shell keeps an unsaved session across compactions and turn ends and drops on reset" {
     const alloc = testing.allocator;
     var shell = Shell.init(false);
     defer shell.deinit(alloc);
@@ -460,15 +466,16 @@ test "the transcript window shell drops at the turn end of an unsaved session wi
     const first = [_]TranscriptEntry{ user(1), rawEntry(2, .turn_summary, false) };
     try shell.sync(alloc, &first, &drops);
     try shell.compacted(alloc, &first, &drops);
-    // Nothing goes at the compaction itself: the closed cycle waits for the
-    // next turn end.
     try testing.expectEqual(@as(usize, 0), drops.items.len);
     const second = first ++ [_]TranscriptEntry{ user(3), rawEntry(4, .turn_summary, false) };
     try shell.sync(alloc, &second, &drops);
-    try testing.expectEqualSlices(u32, &.{ 1, 2 }, drops.items);
+    try testing.expectEqual(@as(usize, 0), drops.items.len);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, shell.finished.items);
+    shell.reset(alloc);
+    try testing.expectEqual(@as(usize, 0), shell.finished.items.len);
 }
 
-test "the transcript window shell ends a cancelled turn without confirming a save" {
+test "the transcript window shell ends a cancelled turn without confirming a save and keeps earlier blocks" {
     const alloc = testing.allocator;
     var shell = Shell.init(true);
     defer shell.deinit(alloc);
@@ -480,10 +487,8 @@ test "the transcript window shell ends a cancelled turn without confirming a sav
     try testing.expectEqual(@as(usize, 0), drops.items.len);
     const cancelled = first ++ [_]TranscriptEntry{ user(3), rawEntry(4, .turn_cancellation, false) };
     try shell.sync(alloc, &cancelled, &drops);
-    // The closed cycle is saved (the first summary), so it drops at the
-    // cancellation's turn end; the cancelled turn itself stays held.
-    try testing.expectEqualSlices(u32, &.{ 1, 2 }, drops.items);
-    try testing.expectEqualSlices(u32, &.{ 3, 4 }, shell.finished.items);
+    try testing.expectEqual(@as(usize, 0), drops.items.len);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, shell.finished.items);
     try testing.expectEqual(@as(core.Seq, 2), shell.state.saved_through);
 }
 
@@ -516,8 +521,6 @@ test "the transcript window shell never drops an unsaved or live entry on seeded
         defer drops.deinit(alloc);
         var next_id: u32 = 1;
         var turn_open = false;
-        // The highest entry id the log holds: set by each turn summary.
-        var saved_through_id: u32 = 0;
         for (0..60) |_| {
             // Sessions as the app produces them: tool lines are pinned only
             // inside a turn, and a turn's pins are released before it ends.
@@ -535,14 +538,12 @@ test "the transcript window shell never drops an unsaved or live entry on seeded
                     };
                     const summary = random.uintLessThan(u8, 4) != 0;
                     try entries.append(alloc, rawEntry(next_id, if (summary) .turn_summary else .turn_cancellation, false));
-                    if (summary) saved_through_id = next_id;
                     turn_open = false;
                 },
                 6 => {
                     const before = drops.items.len;
                     try shell.compacted(alloc, entries.items, &drops);
-                    try expectDropsSafe(&shell, entries.items, drops.items[before..], saved_through_id);
-                    removeDropped(&entries, drops.items[before..]);
+                    try testing.expectEqual(before, drops.items.len);
                     continue;
                 },
                 else => {
@@ -555,33 +556,8 @@ test "the transcript window shell never drops an unsaved or live entry on seeded
             next_id += 1;
             const before = drops.items.len;
             try shell.sync(alloc, entries.items, &drops);
-            try expectDropsSafe(&shell, entries.items, drops.items[before..], saved_through_id);
-            removeDropped(&entries, drops.items[before..]);
+            try testing.expectEqual(before, drops.items.len);
         }
-        // Every id is dropped at most once.
-        for (drops.items, 0..) |id, index| {
-            try testing.expect(std.mem.findScalar(u32, drops.items[index + 1 ..], id) == null);
-        }
+        try testing.expectEqual(@as(usize, 0), drops.items.len);
     }
-}
-
-fn expectDropsSafe(shell: *const Shell, entries: []const TranscriptEntry, dropped: []const u32, saved_through_id: u32) !void {
-    for (dropped) |id| {
-        // A saved session drops only what a turn summary saved.
-        if (shell.saved()) try testing.expect(id <= saved_through_id);
-        for (entries) |entry| {
-            if (entry.id() == id) try testing.expect(!isLive(entry));
-        }
-    }
-}
-
-/// What the runtime does with the drops: it removes those entries.
-fn removeDropped(entries: *std.ArrayList(TranscriptEntry), dropped: []const u32) void {
-    var kept: usize = 0;
-    for (entries.items) |entry| {
-        if (std.mem.findScalar(u32, dropped, entry.id()) != null) continue;
-        entries.items[kept] = entry;
-        kept += 1;
-    }
-    entries.shrinkRetainingCapacity(kept);
 }

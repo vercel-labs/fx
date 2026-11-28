@@ -1,36 +1,60 @@
 {
   "spec": [
     {
-      "id": "drop-mid-turn",
-      "bug": "The previous cycle drops while a turn is open, so a resize mid-turn loses the turn's start.",
-      "law": "DropBetweenTurns",
+      "id": "drop-on-turn-end",
+      "bug": "TurnEnded drops blocks before cycleFirst while staying in the current session.",
+      "law": "NoDropDuringSession",
       "constants": "MCTranscriptWindowSweep",
-      "find": "    /\\ ~open\n    /\\ (~Saved \\/ st >= cf)",
-      "replace": "    /\\ (~Saved \\/ st >= cf)"
+      "find": "TurnEnded ==\n    /\\ alive /\\ turnOpen /\\ live = {}     \\* A4\n    /\\ turnOpen' = FALSE /\\ out' = <<>> /\\ act' = [name |-> \"TurnEnded\"]",
+      "replace": "TurnEnded ==\n    /\\ alive /\\ turnOpen /\\ live = {}     \\* A4\n    /\\ turnOpen' = FALSE /\\ out' = <<[kind |-> \"drop\", from |-> heldFirst, to |-> nextSeq]>> /\\ act' = [name |-> \"TurnEnded\"]"
     },
     {
-      "id": "drop-unsaved",
-      "bug": "A block leaves memory before the log holds it.",
-      "law": "DropOnlySaved",
+      "id": "drop-current-session-range",
+      "bug": "SavedThrough drops held blocks of the active session instead of only SessionCleared dropping departing session blocks.",
+      "law": "DropOnlyOldSession",
       "constants": "MCTranscriptWindowSweep",
-      "find": "    /\\ (~Saved \\/ st >= cf)",
-      "replace": "    /\\ TRUE"
+      "find": "    /\\ savedThrough' = Min(through, nextSeq) /\\ out' = <<>>",
+      "replace": "    /\\ savedThrough' = Min(through, nextSeq) /\\ out' = <<[kind |-> \"drop\", from |-> heldFirst, to |-> Min(through, nextSeq)]>>"
     },
     {
-      "id": "never-drop",
-      "bug": "The previous cycle is never dropped, so memory grows with every compaction.",
-      "law": "HeldIsRecentCycles",
+      "id": "compaction-advances-held",
+      "bug": "Compacted advances heldFirst to nextSeq so earlier blocks disappear on resize.",
+      "law": "HeldIsCurrentSession",
       "constants": "MCTranscriptWindowSweep",
-      "find": "CanDrop(po, cf, open, st) ==\n    /\\ po # None",
-      "replace": "CanDrop(po, cf, open, st) ==\n    /\\ FALSE /\\ po # None"
+      "find": "    /\\ UNCHANGED <<heldFirst, nextSeq, savedThrough, live, turnOpen, paintedThrough,",
+      "replace": "    /\\ heldFirst' = nextSeq\n    /\\ UNCHANGED <<nextSeq, savedThrough, live, turnOpen, paintedThrough,"
     },
     {
-      "id": "never-drop-liveness",
-      "bug": "The same bug, seen by the liveness property.",
-      "law": "PreviousCycleDropped",
+      "id": "clear-keeps-blocks",
+      "bug": "SessionCleared forgets to drop the departing session's held blocks.",
+      "law": "OldSessionDroppedOnChange",
       "constants": "MCTranscriptWindowSweep",
-      "find": "CanDrop(po, cf, open, st) ==\n    /\\ po # None",
-      "replace": "CanDrop(po, cf, open, st) ==\n    /\\ FALSE /\\ po # None"
+      "find": "    /\\ out' = IF heldFirst < nextSeq\n                 THEN <<[kind |-> \"drop\", from |-> heldFirst, to |-> nextSeq]>>\n                 ELSE <<>>\n    /\\ cycle' = 0",
+      "replace": "    /\\ out' = <<>>\n    /\\ cycle' = 0"
+    },
+    {
+      "id": "compaction-drops-at-once",
+      "bug": "A compaction between turns drops the previous cycle immediately instead of keeping history.",
+      "law": "CompactionKeepsHistory",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ cycleFirst' = nextSeq\n    /\\ cycleStarts' = cycleStarts \\cup {nextSeq}\n    /\\ out' = <<>> /\\ act' = [name |-> \"Compacted\"]",
+      "replace": "    /\\ cycleFirst' = nextSeq\n    /\\ cycleStarts' = cycleStarts \\cup {nextSeq}\n    /\\ out' = (IF ~turnOpen /\\ heldFirst < nextSeq THEN <<[kind |-> \"drop\", from |-> heldFirst, to |-> nextSeq]>> ELSE <<>>) /\\ act' = [name |-> \"Compacted\"]"
+    },
+    {
+      "id": "drop-mid-turn-compaction",
+      "bug": "A mid-turn compaction drops the current turn's pre-compaction blocks.",
+      "law": "CompactionKeepsHistory",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ cycleFirst' = nextSeq\n    /\\ cycleStarts' = cycleStarts \\cup {nextSeq}\n    /\\ out' = <<>> /\\ act' = [name |-> \"Compacted\"]",
+      "replace": "    /\\ cycleFirst' = nextSeq\n    /\\ cycleStarts' = cycleStarts \\cup {nextSeq}\n    /\\ out' = (IF turnOpen /\\ heldFirst < nextSeq THEN <<[kind |-> \"drop\", from |-> heldFirst, to |-> nextSeq]>> ELSE <<>>) /\\ act' = [name |-> \"Compacted\"]"
+    },
+    {
+      "id": "drop-on-resize",
+      "bug": "Resized drops blocks before cycleFirst instead of reprinting the entire current session.",
+      "law": "NoDropDuringSession",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ out' = <<[kind |-> \"reprint_begin\"]>> /\\ act' = [name |-> \"Resized\"]",
+      "replace": "    /\\ out' = (IF heldFirst < cycleFirst THEN <<[kind |-> \"drop\", from |-> heldFirst, to |-> cycleFirst]>> ELSE <<[kind |-> \"reprint_begin\"]>>) /\\ act' = [name |-> \"Resized\"]"
     },
     {
       "id": "reprint-all-at-once",
@@ -54,7 +78,7 @@
       "law": "PaintedOnce",
       "constants": "MCTranscriptWindowSweep",
       "find": "          ELSE /\\ out' = <<[kind |-> \"reprint_slice\", from |-> paintedThrough,",
-      "replace": "          ELSE /\\ out' = <<[kind |-> \"reprint_slice\", from |-> IF paintedThrough > HeldFirst THEN paintedThrough - 1 ELSE paintedThrough,"
+      "replace": "          ELSE /\\ out' = <<[kind |-> \"reprint_slice\", from |-> IF paintedThrough > heldFirst THEN paintedThrough - 1 ELSE paintedThrough,"
     },
     {
       "id": "reprint-never-finishes",
@@ -70,14 +94,14 @@
       "law": "UpdateIsLocal",
       "constants": "MCTranscriptWindowSweep",
       "find": "    /\\ UNCHANGED <<core, alive, cycleStarts>>",
-      "replace": "    /\\ reprinting' = TRUE\n    /\\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live, turnOpen, prevWaits, paintedThrough, coOpen, coLo, coHi, coAtStart, pending, pendingDir, nextToken, alive, cycleStarts>>"
+      "replace": "    /\\ reprinting' = TRUE\n    /\\ UNCHANGED <<cycle, cycleFirst, heldFirst, nextSeq, savedThrough, live, turnOpen, paintedThrough, coOpen, coLo, coHi, coAtStart, pending, pendingDir, nextToken, alive, cycleStarts>>"
     },
     {
       "id": "open-reads-log",
       "bug": "Opening Ctrl+O reads the log instead of showing the newest blocks from memory.",
       "law": "OpenReadsNothing",
       "constants": "MCTranscriptWindowSweep",
-      "find": "    /\\ out' = <<[kind |-> \"ctrlo_show\",\n                 lo |-> Max(HeldFirst, IF nextSeq > Window THEN nextSeq - Window ELSE 0),\n                 hi |-> nextSeq]>>",
+      "find": "    /\\ out' = <<[kind |-> \"ctrlo_show\",\n                 lo |-> Max(heldFirst, IF nextSeq > Window THEN nextSeq - Window ELSE 0),\n                 hi |-> nextSeq]>>",
       "replace": "    /\\ out' = <<[kind |-> \"read_log\", token |-> nextToken, dir |-> \"older\", from |-> nextSeq, count |-> Step]>>"
     },
     {
@@ -109,16 +133,16 @@
       "bug": "A --no-save session asks a log it does not have for older blocks.",
       "law": "NoReadWhenUnsaved",
       "constants": "MCTranscriptWindowSweepUnsaved",
-      "find": "               ELSE /\\ coAtStart' = TRUE\n                    /\\ out' = <<>>",
-      "replace": "               ELSE /\\ coAtStart' = TRUE\n                    /\\ out' = <<[kind |-> \"read_log\", token |-> nextToken, dir |-> \"older\", from |-> coLo, count |-> Step]>>"
+      "find": "    /\\ IF coLo > heldFirst\n          THEN /\\ coLo' = coLo - 1\n               /\\ coHi' = Min(coHi, coLo - 1 + Window)\n               /\\ coAtStart' = (coLo - 1 = 0)\n               /\\ out' = <<[kind |-> \"ctrlo_show\", lo |-> coLo - 1, hi |-> Min(coHi, coLo - 1 + Window)]>>\n               /\\ UNCHANGED <<pending, pendingDir, nextToken>>\n          ELSE IF Saved",
+      "replace": "    /\\ IF FALSE\n          THEN /\\ coLo' = coLo - 1\n               /\\ coHi' = Min(coHi, coLo - 1 + Window)\n               /\\ coAtStart' = (coLo - 1 = 0)\n               /\\ out' = <<[kind |-> \"ctrlo_show\", lo |-> coLo - 1, hi |-> Min(coHi, coLo - 1 + Window)]>>\n               /\\ UNCHANGED <<pending, pendingDir, nextToken>>\n          ELSE IF TRUE"
     },
     {
       "id": "resume-keeps-unsaved",
       "bug": "Resume holds blocks the log never received.",
       "law": "RecoveredFromLog",
       "constants": "MCTranscriptWindowSweep",
-      "find": "       /\\ nextSeq' = savedThrough /\\ cycleFirst' = last",
-      "replace": "       /\\ nextSeq' = nextSeq /\\ cycleFirst' = last"
+      "find": "       /\\ nextSeq' = savedThrough /\\ cycleFirst' = last /\\ heldFirst' = last",
+      "replace": "       /\\ nextSeq' = nextSeq /\\ cycleFirst' = last /\\ heldFirst' = last"
     },
     {
       "id": "replies-misread",
@@ -129,12 +153,12 @@
       "replace": "          THEN LET n == 0"
     },
     {
-      "id": "drop-into-current-cycle",
-      "bug": "A drop frees blocks of the current cycle, which is still on screen and may be reprinted.",
+      "id": "drop-leaves-live",
+      "bug": "SessionCleared drops held blocks while leaving live blocks active.",
       "law": "LiveNeverDropped",
       "constants": "MCTranscriptWindowSweep",
-      "find": "DropEffect(from, to) == IF from < to THEN <<[kind |-> \"drop\", from |-> from, to |-> to]>> ELSE <<>>",
-      "replace": "DropEffect(from, to) == IF from < to THEN <<[kind |-> \"drop\", from |-> from, to |-> nextSeq]>> ELSE <<>>"
+      "find": "    /\\ savedThrough' = 0 /\\ live' = {} /\\ turnOpen' = FALSE",
+      "replace": "    /\\ savedThrough' = 0 /\\ live' = live /\\ turnOpen' = FALSE"
     },
     {
       "id": "paint-wrong-block",
@@ -146,11 +170,11 @@
     },
     {
       "id": "reprint-from-dropped",
-      "bug": "A resize reprints from the start of the session, below the held blocks.",
+      "bug": "A resize reprints from below the held range after a resume.",
       "law": "ReprintInOrder",
       "constants": "MCTranscriptWindowSweep",
-      "find": "    /\\ reprinting' = TRUE /\\ paintedThrough' = HeldFirst",
-      "replace": "    /\\ reprinting' = TRUE /\\ paintedThrough' = 0"
+      "find": "    /\\ reprinting' = TRUE /\\ paintedThrough' = heldFirst",
+      "replace": "    /\\ reprinting' = TRUE /\\ paintedThrough' = heldFirst + 1"
     },
     {
       "id": "reply-unbounded",
@@ -159,30 +183,29 @@
       "constants": "MCTranscriptWindowSweep",
       "find": "          THEN LET n == Min(Min(count, Step), Available(pendingDir))",
       "replace": "          THEN LET n == Min(count, Available(pendingDir))"
-    },
-    {
-      "id": "compaction-drops-at-once",
-      "bug": "A compaction between turns drops the previous cycle as soon as the log holds it, so a resize before the next turn end loses it.",
-      "law": "PreviousWaitsForTurnEnd",
-      "constants": "MCTranscriptWindowSweep",
-      "find": "          /\\ prevFirst' = po /\\ prevWaits' = TRUE\n",
-      "replace": "          /\\ prevWaits' = TRUE\n          /\\ prevFirst' = IF CanDrop(po, nextSeq, turnOpen, savedThrough) THEN None ELSE po\n"
     }
   ],
   "core": [
     {
-      "id": "core-drop-mid-turn",
-      "bug": "canDrop ignores an open turn.",
+      "id": "core-drop-on-turn-end",
+      "bug": "turn_ended drops finished blocks during the active session.",
       "sweep": "MCTranscriptWindowSweep",
-      "find": "    if (turn_open) return false;\n",
-      "replace": "    if (turn_open and false) return false;\n"
+      "find": "            var next = state;\n            next.turn_open = false;\n            return .{ .state = next };",
+      "replace": "            var next = state;\n            next.turn_open = false;\n            if (next.held_first < next.next_seq) {\n                const from = next.held_first;\n                next.held_first = next.next_seq;\n                return .{ .state = next, .effect = .{ .drop = .{ .from = from, .to = next.next_seq } } };\n            }\n            return .{ .state = next };"
     },
     {
-      "id": "core-drop-unsaved",
-      "bug": "canDrop ignores the save watermark.",
+      "id": "core-compaction-advances-held",
+      "bug": "compacted advances held_first so earlier blocks are lost on resize.",
       "sweep": "MCTranscriptWindowSweep",
-      "find": "    return !state.config.saved or saved_through >= cycle_first;",
-      "replace": "    return !state.config.saved or saved_through >= cycle_first or true;"
+      "find": "            next.cycle = state.cycle + 1;\n            next.cycle_first = state.next_seq;\n            return .{ .state = next };",
+      "replace": "            next.cycle = state.cycle + 1;\n            next.cycle_first = state.next_seq;\n            next.held_first = state.next_seq;\n            return .{ .state = next };"
+    },
+    {
+      "id": "core-clear-keeps-blocks",
+      "bug": "session_cleared forgets to emit the drop effect for the departing session.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "            return .{\n                .state = State.init(state.config),\n                .effect = if (from < to) .{ .drop = .{ .from = from, .to = to } } else null,\n            };",
+      "replace": "            _ = from;\n            _ = to;\n            return .{ .state = State.init(state.config) };"
     },
     {
       "id": "core-reprint-all-at-once",
@@ -228,10 +251,10 @@
     },
     {
       "id": "core-unsaved-reads-log",
-      "bug": "An unsaved session reads the log when scrolling newer through dropped blocks.",
+      "bug": "An unsaved session reads the log when scrolling older.",
       "sweep": "MCTranscriptWindowSweepUnsaved",
-      "find": "            if (!state.config.saved) return show(state, held_first, @min(held_first + 1, state.next_seq));\n",
-      "replace": ""
+      "find": "            if (co.lo > held_first) return show(state, co.lo - 1, @min(co.hi, co.lo - 1 + window));\n            if (state.config.saved) return issueRead(state, .older, co.lo);\n            var next = state;\n            next.ctrlo.at_start = true;\n            return .{ .state = next };",
+      "replace": "            if (co.lo > held_first and state.config.saved) return show(state, co.lo - 1, @min(co.hi, co.lo - 1 + window));\n            return issueRead(state, .older, co.lo);"
     },
     {
       "id": "core-empty-reply-not-at-start",
@@ -239,20 +262,6 @@
       "sweep": "MCTranscriptWindowSweep",
       "find": "            out.state.ctrlo.at_start = lo == 0 or n == 0;",
       "replace": "            out.state.ctrlo.at_start = lo == 0;"
-    },
-    {
-      "id": "core-compaction-counts-as-saved",
-      "bug": "A compaction marks every earlier block saved.",
-      "sweep": "MCTranscriptWindowSweep",
-      "find": "            next.cycle_first = state.next_seq;\n            return dropIfDone(next);",
-      "replace": "            next.cycle_first = state.next_seq;\n            if (state.config.saved) next.saved_through = state.next_seq;\n            return dropIfDone(next);"
-    },
-    {
-      "id": "core-held-ignores-previous",
-      "bug": "The held range forgets the previous cycle before it is dropped.",
-      "sweep": "MCTranscriptWindowSweep",
-      "find": "        return self.prev_first orelse self.cycle_first;",
-      "replace": "        _ = self.prev_first;\n        return self.cycle_first;"
     },
     {
       "id": "core-change-reprints",
@@ -267,13 +276,6 @@
       "sweep": "MCTranscriptWindowSweep",
       "find": "            next.ctrlo.open = false;\n            next.ctrlo.pending = 0;",
       "replace": "            next.ctrlo.open = false;"
-    },
-    {
-      "id": "core-compaction-drops-at-once",
-      "bug": "canDrop ignores the wait for the first turn end after a compaction.",
-      "sweep": "MCTranscriptWindowSweep",
-      "find": "    if (state.prev_waits_turn_end) return false;\n",
-      "replace": ""
     }
   ]
 }

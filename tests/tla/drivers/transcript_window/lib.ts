@@ -209,6 +209,7 @@ export function eventFor(act: Act, target: Record<string, unknown>): Event {
     case "Compacted": return { event: "compacted" };
     case "Resized": return { event: "resized" };
     case "ReprintTick": return { event: "reprint_tick" };
+    case "SessionCleared": return { event: "session_cleared" };
     case "CtrlOOpened": return { event: "ctrlo_opened" };
     case "CtrlOScrolledOlder": return { event: "ctrlo_scrolled", dir: "older" };
     case "CtrlOScrolledNewer": return { event: "ctrlo_scrolled", dir: "newer" };
@@ -222,16 +223,15 @@ export function eventFor(act: Act, target: Record<string, unknown>): Event {
 }
 
 const CORE_FIELDS = [
-  "cycle", "cycleFirst", "prevFirst", "nextSeq", "savedThrough", "turnOpen", "prevWaits", "paintedThrough", "reprinting",
+  "cycle", "cycleFirst", "heldFirst", "nextSeq", "savedThrough", "turnOpen", "paintedThrough", "reprinting",
   "coOpen", "coLo", "coHi", "coAtStart", "pending", "pendingDir", "nextToken",
 ] as const;
 
 /// What the code shows of a model state: the core's variables and the step's
-/// effects. The model's `None` (MaxSeq + 1) is the core's -1.
-export function modelView(state: Record<string, unknown>, none: number): string {
+/// effects.
+export function modelView(state: Record<string, unknown>, _none: number): string {
   const view: Record<string, unknown> = {};
   for (const field of CORE_FIELDS) view[field] = state[field];
-  if (view.prevFirst === none) view.prevFirst = -1;
   view.live = [...(state.live as number[])].sort((a, b) => a - b);
   view.out = state.out;
   return canonical(view);

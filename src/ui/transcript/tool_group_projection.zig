@@ -270,7 +270,9 @@ fn statusNamesAsk(entry: TranscriptEntry, detail: ?*const ToolDetailRecord) bool
 fn stoppedQuestionRow(alloc: std.mem.Allocator, detail: ?*const ToolDetailRecord, entry_id: u32, cols: u16, style: SummaryStyle) !?GroupBlock {
     const record = detail orelse return null;
     if (record.outcome != .failed) return null;
-    if (!std.mem.eql(u8, record.result orelse return null, session_adapter.unfinished_tool_output)) return null;
+    if (!record.stopped_question) {
+        if (!std.mem.eql(u8, record.result orelse return null, session_adapter.unfinished_tool_output)) return null;
+    }
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
@@ -1524,6 +1526,7 @@ fn toolboxOpensSkill(scratch: std.mem.Allocator, record: *const ToolDetailRecord
     if (storyArgString(scratch, record, "kind")) |kind| return std.mem.eql(u8, kind, "skill");
     const target = storyArgString(scratch, record, "open") orelse return false;
     if (std.mem.startsWith(u8, target, "skill:") or std.Io.Dir.path.isAbsolute(target)) return true;
+    if (record.toolbox_opened_skill) return true;
     const result = record.result orelse return false;
     return std.mem.startsWith(u8, result, skill_invocation.content_name_prefix);
 }
@@ -4217,6 +4220,7 @@ noinline fn storyRowCallFailed(scratch: std.mem.Allocator, detail: ?*const ToolD
 /// model's own mistake, not a command that failed, and it reads as one.
 fn shellCallNeverRan(scratch: std.mem.Allocator, record: *const ToolDetailRecord) bool {
     if (record.outcome != .failed or !isShellCommandCall(scratch, record)) return false;
+    if (record.invalid_field_count > 0) return true;
     const result = record.result orelse return false;
     const correction = tool_result_errors.inspectTerminalActionFieldCorrection(scratch, result) catch return false;
     return correction != null;
@@ -4225,9 +4229,13 @@ fn shellCallNeverRan(scratch: std.mem.Allocator, record: *const ToolDetailRecord
 /// Why a shell call never ran, as core's status says it, such as
 /// "2 invalid fields". Null when its result names no wrong field.
 fn neverRanReason(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
-    const result = record.result orelse return null;
-    const correction = tool_result_errors.inspectTerminalActionFieldCorrection(scratch, result) catch return null;
-    const count = (correction orelse return null).invalid_field_count;
+    const count: usize = if (record.invalid_field_count > 0)
+        record.invalid_field_count
+    else blk: {
+        const result = record.result orelse return null;
+        const correction = tool_result_errors.inspectTerminalActionFieldCorrection(scratch, result) catch return null;
+        break :blk (correction orelse return null).invalid_field_count;
+    };
     if (count == 0) return null;
     return try countNote(scratch, "", count, if (count == 1) " invalid field" else " invalid fields");
 }
@@ -4287,6 +4295,7 @@ const mcp_result_server_field = "{\"server\":";
 /// result that names none, such as a failure fx reported itself.
 fn mcpResultServer(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
     if (record.activity_kind != .mcp) return null;
+    if (record.mcp_server) |server| if (server.len > 0) return server;
     const result = record.result orelse return null;
     if (!std.mem.startsWith(u8, result, mcp_result_server_field)) return null;
     // A result cut short still names the server whole, since it comes first.
@@ -4298,6 +4307,49 @@ fn mcpResultServer(scratch: std.mem.Allocator, record: *const ToolDetailRecord) 
         .string => |server| if (server.len > 0) server else null,
         else => null,
     };
+}
+
+pub fn extractProjectionFlagsFromResult(alloc: std.mem.Allocator, detail: *ToolDetailRecord) void {
+    const res = detail.result orelse return;
+    if (std.mem.eql(u8, res, session_adapter.unfinished_tool_output)) {
+        detail.stopped_question = true;
+    }
+    if (std.mem.startsWith(u8, res, skill_invocation.content_name_prefix)) {
+        detail.toolbox_opened_skill = true;
+    }
+    if (detail.outcome == .completed and
+        std.mem.eql(u8, detail.tool_name, "subagent") and
+        !detail.subagent_report and
+        std.mem.find(u8, res, new_subagent_result_marker) != null)
+    {
+        detail.subagent_started = true;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const scratch = arena_state.allocator();
+    if (detail.outcome == .failed and isShellCommandCall(scratch, detail)) {
+        if (tool_result_errors.inspectTerminalActionFieldCorrection(scratch, res) catch null) |correction| {
+            detail.invalid_field_count = @intCast(@min(correction.invalid_field_count, std.math.maxInt(u16)));
+        }
+    }
+    if (detail.activity_kind == .mcp and detail.mcp_server == null) {
+        if (mcpResultServer(scratch, detail) catch null) |server| {
+            detail.mcp_server = alloc.dupe(u8, server) catch null;
+        }
+    }
+    if (detail.activity_kind == .command and detail.command_session_id == null) {
+        if (jsonField(scratch, res, "session_id")) |field| switch (field) {
+            .string => |id| if (id.len > 0) {
+                detail.command_session_id = alloc.dupe(u8, id) catch null;
+            },
+            else => {},
+        };
+    }
+    if (detail.failure_reason == null and storyCallFailed(detail)) {
+        if (storyFailureReason(scratch, detail) catch null) |reason| {
+            detail.failure_reason = alloc.dupe(u8, reason) catch null;
+        }
+    }
 }
 
 /// Whether `text` starts with `segment`, then "_" and more.
@@ -4686,6 +4738,7 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
             if (record.outcome) |outcome| if (outcome == .denied or outcome == .cancelled) return .{};
             if (shellCallNeverRan(scratch, record)) return .{};
             if (storyArgString(scratch, record, "session_id")) |id| return .{ .kind = .session, .key = id };
+            if (record.command_session_id) |id| if (id.len > 0) return .{ .kind = .session, .key = id };
             if (record.result) |result| if (jsonField(scratch, result, "session_id")) |field| switch (field) {
                 .string => |id| if (id.len > 0) return .{ .kind = .session, .key = id },
                 else => {},
@@ -5701,6 +5754,7 @@ const story_reason_max_bytes = 160;
 fn storyFailureReason(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !?[]const u8 {
     const record = detail orelse return null;
     if (!storyCallFailed(detail)) return null;
+    if (record.failure_reason) |reason| return try scratch.dupe(u8, reason);
 
     const is_command = record.activity_kind == .command;
     const line: ?[]const u8 = if (record.result) |result| blk: {

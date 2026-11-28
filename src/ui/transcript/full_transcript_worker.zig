@@ -336,6 +336,7 @@ pub fn cloneCommandBlockForPageSnapshot(
         .total_lines = source.total_lines,
         .retained_text_bytes = source.retained_text_bytes,
         .retention_overflow = source.retention_overflow,
+        .tail_trimmed = source.tail_trimmed,
         .overflow_line_index = source.overflow_line_index,
     };
     errdefer clone.deinit(alloc);
