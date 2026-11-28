@@ -174,6 +174,18 @@ fn appendConfigDiagnosticChecks(
     diagnostics: []const config_runtime.ConfigDiagnostic,
 ) !void {
     for (diagnostics) |diagnostic| {
+        if (diagnostic.cause == .mod_provider_problem) {
+            const detail = try alloc.dupe(u8, diagnostic.message orelse "mod provider problem");
+            try appendCheckOwnedFix(
+                checks,
+                alloc,
+                "config",
+                .warn,
+                detail,
+                try alloc.dupe(u8, "fix, disable, or remove that mod, then run fx doctor again"),
+            );
+            continue;
+        }
         const file = switch (diagnostic.layer) {
             .user => profile_paths.displayText("~/.fx/settings.json"),
             .project => ".fx.json",
@@ -311,6 +323,7 @@ fn causeRejectsLayer(cause: @FieldType(config_runtime.ConfigDiagnostic, "cause")
             .legacy_workspace_preferences,
             .manual_backup_available,
             .private_state_permissions_tightened,
+            .mod_provider_problem,
             => return false,
         }
     }

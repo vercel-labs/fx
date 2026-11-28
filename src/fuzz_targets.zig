@@ -14,6 +14,8 @@ test {
     _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/auth/command_helper.zig");
+    _ = @import("core/mods/manifest.zig");
+    _ = @import("core/mods/source.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
     _ = @import("core/agent/runtime/orchestrator.zig");
     _ = @import("core/agent/runtime/parallel_execution.zig");

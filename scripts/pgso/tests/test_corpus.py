@@ -60,6 +60,7 @@ VERIFICATION_E2E_TESTS = (
     "sessions.test.ts",
     "review-model-override.test.ts",
     "configured-providers.test.ts",
+    "mods.test.ts",
     "oauth-keychain-migration.test.ts",
     "mcp-verbs.test.ts",
     "mcp-subagent-bridge.test.ts",
@@ -430,7 +431,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(37, len(corpus.scenarios))
-        self.assertEqual(79, len(corpus.candidate_scenarios))
+        self.assertEqual(80, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

@@ -22,6 +22,7 @@ pub const mcp_credentials_file_name = "credentials.json";
 const settings_file_name = "settings.json";
 const mcp_config_file_name = "mcp.json";
 const managed_skills_dir_name = "skills";
+const mods_dir_name = "mods";
 const logs_dir_name = "logs";
 const trace_log_file_name = "trace.log";
 const recordings_dir_name = "recordings";
@@ -154,6 +155,10 @@ pub fn managedSkillsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{managed_skills_dir_name});
 }
 
+pub fn modsDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return rootPath(alloc, home, &.{mods_dir_name});
+}
+
 /// `managedSkillsDir` inside `root_parent`, the folder that holds fx's
 /// folder, such as the real path of `rootParent`. The caller owns the result.
 pub fn managedSkillsDirIn(alloc: Allocator, root_parent: []const u8) ![]u8 {
@@ -255,6 +260,10 @@ test "profile path helpers preserve current default locations" {
     defer alloc.free(skills);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/skills", skills);
 
+    const mods = try modsDir(alloc, "/tmp/fake-home");
+    defer alloc.free(mods);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/mods", mods);
+
     const auth = try authPath(alloc, "/tmp/fake-home");
     defer alloc.free(auth);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/auth.json", auth);
@@ -331,6 +340,9 @@ test "FX_HOME moves every profile path and how messages name it" {
     const trace = try traceLogPath(alloc, "/tmp/fake-home");
     defer alloc.free(trace);
     try std.testing.expectEqualStrings("/tmp/fx-profile/logs/trace.log", trace);
+    const mods = try modsDir(alloc, "/tmp/fake-home");
+    defer alloc.free(mods);
+    try std.testing.expectEqualStrings("/tmp/fx-profile/mods", mods);
 
     try useFxHome("/fx", null);
     try std.testing.expectEqualStrings("/", rootParent("/tmp/fake-home"));

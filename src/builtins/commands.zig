@@ -194,6 +194,25 @@ pub const mcp_approve_options = [_]command_specs.OptionDoc{
     .{ .flag = "--all", .description = "Approve every project server" },
 };
 
+pub const mod_add_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--yes", .description = "Skip the install confirmation prompt" },
+};
+pub const mod_list_options = [_]command_specs.OptionDoc{json_option};
+pub const mod_show_options = [_]command_specs.OptionDoc{json_option};
+pub const mod_options = mod_add_options ++ [_]command_specs.OptionDoc{
+    .{ .flag = "--json", .description = "Print JSON output for list or show" },
+};
+
+const mod_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "list", .description = "List installed mods", .options = &mod_list_options },
+    .{ .usage = "show NAME", .description = "Show details for an installed mod", .options = &mod_show_options },
+    .{ .usage = "add SOURCE", .description = "Install a mod from a folder or git URL[@ref]", .options = &mod_add_options },
+    .{ .usage = "update [NAME]", .description = "Update one mod, or every installed mod" },
+    .{ .usage = "enable NAME", .description = "Enable an installed mod (alias: on)" },
+    .{ .usage = "disable NAME", .description = "Disable an installed mod (alias: off)" },
+    .{ .usage = "remove NAME", .description = "Remove an installed mod" },
+};
+
 const permission_modes = [_][]const u8{ "ask", "auto", "full-access" };
 /// The built-in providers. A configured connection's name is also accepted.
 const builtin_providers = [_][]const u8{ "gateway", "codex", "grok" };
@@ -339,6 +358,15 @@ pub const top_level_specs = [_]TopLevelSpec{
         // `fx mcp -h` is the verbs' own help (`mcp_host/verbs.zig` writeUsage).
         .summary = "Manage MCP servers without opening the interactive shell",
         .subcommands = &mcp_subcommands,
+    },
+    .{
+        .kind = .mod,
+        .token = "mod",
+        .aliases = &.{"mods"},
+        .usage = "mod <list|show|add|update|enable|disable|remove> ...",
+        .summary = "Install and manage fx mods",
+        .subcommands = &mod_subcommands,
+        .options = &mod_options,
     },
     .{
         .kind = .models,
@@ -521,6 +549,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
+        .{ .kind = .mod, .usage = "mod|mods <command> ..." },
         .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
@@ -743,6 +772,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|workspace|global]|[workspace|global] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
     .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|show|add|remove|login|logout|approve|reject]", .completion_description = "manage MCP servers and their logins", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
+    .{ .kind = .mods, .command = "/mods", .help_entry = "/mods [list|show|add|update|enable|disable|remove]", .completion_description = "install and manage mods", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
@@ -856,6 +886,7 @@ test "built-in slash commands register exact active order" {
         "/allowlist",
         "/undo",
         "/mcp",
+        "/mods",
         "/skills",
         "/copy",
         "/feedback",

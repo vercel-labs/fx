@@ -163,6 +163,10 @@ pub const Definition = struct {
     /// itself, including one the settings do not declare. Its `id` is empty.
     model_defaults: ?ModelMetadata = null,
     model_metadata: []const ModelMetadata = &.{},
+    /// Helper working folder when this connection came from a mod (`<mods>/<name>`).
+    working_dir: ?[]const u8 = null,
+    /// Installed mod name when this connection came from a mod; null for settings.json.
+    mod_name: ?[]const u8 = null,
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
@@ -224,8 +228,14 @@ pub const Definition = struct {
                 for (argv) |arg| hash_part(&hash, arg);
             },
         }
+        if (self.working_dir) |dir| hash_part(&hash, dir);
         return hash.finalResult();
     }
+};
+
+pub const ModSource = struct {
+    name: []const u8,
+    dir: []const u8,
 };
 
 /// Where in the providers object a refused setting is: its keys joined with
@@ -317,6 +327,13 @@ pub fn failure_advice(err: anyerror) ?[]const u8 {
     };
 }
 
+pub fn mod_failure_advice(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.InvalidAuth => "auth is {\"type\": \"none\"}, {\"type\": \"bearer\", \"env\": \"VARIABLE\"}, or {\"type\": \"command\", \"command\": [\"program\", \"argument\"]}; a mod's program must stay inside the mod",
+        else => failure_advice(err),
+    };
+}
+
 /// The longest header value fx sends from an environment variable.
 pub const max_header_value_bytes = 16 * 1024;
 
@@ -351,6 +368,44 @@ pub const Registry = struct {
 
     /// `parse`, leaving in `at` where a refused setting is.
     pub fn parse_located(alloc: Allocator, providers: std.json.Value, at: ?*FailurePath) ParseError!Registry {
+        return parse_located_impl(alloc, providers, at, null);
+    }
+
+    pub fn parse_located_for_mod(
+        alloc: Allocator,
+        providers: std.json.Value,
+        at: ?*FailurePath,
+        mod_source: ModSource,
+    ) ParseError!Registry {
+        return parse_located_impl(alloc, providers, at, mod_source);
+    }
+
+    /// Parses a mod's `providers` directly into the caller-owned `owned` arena.
+    pub fn parse_definitions_for_mod(
+        owned: Allocator,
+        providers: std.json.Value,
+        at: ?*FailurePath,
+        mod_source: ModSource,
+    ) ParseError![]const Definition {
+        if (providers != .object) return error.InvalidObject;
+        if (providers.object.count() > max_providers) return error.LimitExceeded;
+        const definitions = try owned.alloc(Definition, providers.object.count());
+        var iterator = providers.object.iterator();
+        var index: usize = 0;
+        while (iterator.next()) |entry| : (index += 1) {
+            enter(at, entry.key_ptr.*);
+            definitions[index] = try parse_definition(owned, entry.key_ptr.*, entry.value_ptr.*, at, mod_source);
+            leave(at);
+        }
+        return definitions;
+    }
+
+    fn parse_located_impl(
+        alloc: Allocator,
+        providers: std.json.Value,
+        at: ?*FailurePath,
+        mod_source: ?ModSource,
+    ) ParseError!Registry {
         if (providers != .object) return error.InvalidObject;
         if (providers.object.count() > max_providers) return error.LimitExceeded;
         const arena = try alloc.create(std.heap.ArenaAllocator);
@@ -365,7 +420,7 @@ pub const Registry = struct {
         var index: usize = 0;
         while (iterator.next()) |entry| : (index += 1) {
             enter(at, entry.key_ptr.*);
-            definitions[index] = try parse_definition(owned, entry.key_ptr.*, entry.value_ptr.*, at);
+            definitions[index] = try parse_definition(owned, entry.key_ptr.*, entry.value_ptr.*, at, mod_source);
             leave(at);
         }
         return .{ .definitions = definitions, .arena = arena };
@@ -410,7 +465,7 @@ pub const Registry = struct {
 };
 
 /// `owned` is the registry's arena: a failure frees nothing here.
-fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at: ?*FailurePath) ParseError!Definition {
+fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at: ?*FailurePath, mod_source: ?ModSource) ParseError!Definition {
     try validate_id(id);
     try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata" }, at);
     enter(at, "protocol");
@@ -424,7 +479,7 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
     const normalized = try validate_url(url.string);
     leave(at);
     enter(at, "auth");
-    const auth = try parse_auth(owned, try required(value, "auth"), at);
+    const auth = try parse_auth(owned, try required(value, "auth"), at, if (mod_source) |src| src.dir else null);
     leave(at);
     var mode: ToolChoiceMode = .omit;
     if (value.object.get("tool_choice_mode")) |choice| {
@@ -466,6 +521,8 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         .fetch_models = fetch_models,
         .model_defaults = model_defaults,
         .model_metadata = model_metadata,
+        .working_dir = if (mod_source) |src| try owned.dupe(u8, src.dir) else null,
+        .mod_name = if (mod_source) |src| try owned.dupe(u8, src.name) else null,
     };
 }
 
@@ -479,7 +536,7 @@ fn optional_model(owned: Allocator, parent: std.json.Value, key: []const u8, at:
 }
 
 /// `owned` is the registry's arena; the returned slices live there.
-fn parse_auth(owned: Allocator, value: std.json.Value, at: ?*FailurePath) ParseError!Auth {
+fn parse_auth(owned: Allocator, value: std.json.Value, at: ?*FailurePath, mod_dir: ?[]const u8) ParseError!Auth {
     try check_fields(value, &.{ "type", "env", "command" }, at);
     const kind = try required(value, "type");
     if (kind != .string) return error.InvalidAuth;
@@ -497,33 +554,51 @@ fn parse_auth(owned: Allocator, value: std.json.Value, at: ?*FailurePath) ParseE
     if (std.mem.eql(u8, kind.string, "command")) {
         if (value.object.contains("env")) return error.InvalidAuth;
         enter(at, "command");
-        const argv = try command_argv(owned, try required(value, "command"));
+        const argv = try command_argv(owned, try required(value, "command"), mod_dir);
         leave(at);
         return .{ .command = argv };
     }
     return error.InvalidAuth;
 }
 
-/// The helper's argv, copied into `owned`. The program must be a bare name or
-/// an absolute path so a repository cannot supply it, and 0 bytes are refused.
-fn command_argv(owned: Allocator, value: std.json.Value) ParseError![]const []const u8 {
+/// The helper's argv, copied into `owned`. In settings.json, the program must be
+/// a bare name or an absolute path; inside a mod, relative paths resolve under
+/// `mod_dir` and any `..` segment is refused.
+fn command_argv(owned: Allocator, value: std.json.Value, mod_dir: ?[]const u8) ParseError![]const []const u8 {
     if (value != .array) return error.InvalidAuth;
     const items = value.array.items;
     if (items.len == 0) return error.InvalidAuth;
     if (items.len > max_command_args) return error.LimitExceeded;
     const argv = try owned.alloc([]const u8, items.len);
-    for (items, 0..) |item, index| argv[index] = try command_arg(owned, item, index == 0);
+    for (items, 0..) |item, index| argv[index] = try command_arg(owned, item, index == 0, mod_dir);
     return argv;
 }
 
-fn command_arg(owned: Allocator, value: std.json.Value, is_program: bool) ParseError![]const u8 {
+fn command_arg(owned: Allocator, value: std.json.Value, is_program: bool, mod_dir: ?[]const u8) ParseError![]const u8 {
     if (value != .string) return error.InvalidAuth;
     const arg = value.string;
     if (arg.len == 0) return error.InvalidAuth;
     if (arg.len > max_command_arg_bytes) return error.LimitExceeded;
     if (std.mem.findScalar(u8, arg, 0) != null) return error.InvalidAuth;
-    if (is_program and arg[0] != '/' and std.mem.findScalar(u8, arg, '/') != null) return error.InvalidAuth;
+    if (is_program and arg[0] != '/' and std.mem.findScalar(u8, arg, '/') != null) {
+        const base = mod_dir orelse return error.InvalidAuth;
+        if (has_dot_dot_segment(arg) or arg[arg.len - 1] == '/') return error.InvalidAuth;
+        const resolved = try std.Io.Dir.path.resolve(owned, &.{ base, arg });
+        if (resolved.len > std.Io.Dir.max_path_bytes) return error.LimitExceeded;
+        return resolved;
+    }
+    if (is_program and mod_dir != null and (std.mem.eql(u8, arg, ".") or std.mem.eql(u8, arg, ".."))) {
+        return error.InvalidAuth;
+    }
     return owned.dupe(u8, arg);
+}
+
+fn has_dot_dot_segment(path: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, path, '/');
+    while (segments.next()) |segment| {
+        if (std.mem.eql(u8, segment, "..")) return true;
+    }
+    return false;
 }
 
 /// The name of an environment variable, borrowed from `value`.
@@ -1016,11 +1091,11 @@ test "configured provider auth admits only explicit none, a portable environment
     for ([_][]const u8{ "{\"type\":\"command\",\"command\":[\"/usr/bin/x\"]}", "{\"type\":\"command\",\"command\":[\"x\"]}" }) |good| {
         var parsed_cmd = try std.json.parseFromSlice(std.json.Value, alloc, good, .{});
         defer parsed_cmd.deinit();
-        try std.testing.expectEqual(@as(usize, 1), (try parse_auth(arena.allocator(), parsed_cmd.value, null)).command.len);
+        try std.testing.expectEqual(@as(usize, 1), (try parse_auth(arena.allocator(), parsed_cmd.value, null, null)).command.len);
     }
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"bearer\",\"env\":\"_key_2\"}", .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("_key_2", (try parse_auth(arena.allocator(), parsed.value, null)).bearer);
+    try std.testing.expectEqualStrings("_key_2", (try parse_auth(arena.allocator(), parsed.value, null, null)).bearer);
 }
 
 test "configured provider command auth keeps its argv in order" {
@@ -1581,4 +1656,72 @@ fn fuzzFragments(_: void, smith: *std.testing.Smith) anyerror!void {
 fn fuzzFragment(arena: Allocator, bytes: []const u8, owned: []const []const u8) ?request_fragment.Fragment {
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_url_bytes }) catch return null;
     return request_fragment.parse(arena, value, owned) catch null;
+}
+
+test "configured provider mod parsing resolves relative commands, rejects .., and keeps identity stable across unchanged updates" {
+    const alloc = std.testing.allocator;
+    const mod_dir = "/tmp/fx-home/mods/glm";
+
+    const json =
+        \\{
+        \\  "rel":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"command","command":["bin/glm-auth","token"]}},
+        \\  "dot":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"command","command":["./bin/glm-auth"]}},
+        \\  "bare":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"command","command":["glm-auth","token"]}},
+        \\  "abs":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"command","command":["/usr/local/bin/glm-auth"]}}
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{ .duplicate_field_behavior = .@"error" });
+    defer parsed.deinit();
+
+    // Settings reject relative program paths with '/'.
+    try std.testing.expectError(error.InvalidAuth, Registry.parse(alloc, parsed.value));
+
+    var at: FailurePath = .{};
+    var reg = try Registry.parse_located_for_mod(alloc, parsed.value, &at, .{ .name = "glm", .dir = mod_dir });
+    defer reg.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), at.text().len);
+
+    const rel = reg.get("rel").?;
+    try std.testing.expectEqualStrings("/tmp/fx-home/mods/glm/bin/glm-auth", rel.auth.command[0]);
+    try std.testing.expectEqualStrings("token", rel.auth.command[1]);
+    try std.testing.expectEqualStrings(mod_dir, rel.working_dir.?);
+    try std.testing.expectEqualStrings("glm", rel.mod_name.?);
+
+    const dot = reg.get("dot").?;
+    try std.testing.expectEqualStrings("/tmp/fx-home/mods/glm/bin/glm-auth", dot.auth.command[0]);
+
+    const bare = reg.get("bare").?;
+    try std.testing.expectEqualStrings("glm-auth", bare.auth.command[0]);
+    try std.testing.expectEqualStrings(mod_dir, bare.working_dir.?);
+
+    const abs = reg.get("abs").?;
+    try std.testing.expectEqualStrings("/usr/local/bin/glm-auth", abs.auth.command[0]);
+    try std.testing.expectEqualStrings(mod_dir, abs.working_dir.?);
+
+    // Relative paths with `..` are refused with mod_failure_advice naming the mod containment rule.
+    for ([_][]const u8{ "../outside", "bin/../../outside", "bin/..", "./../outside", "..", "." }) |bad_prog| {
+        const bad_json = try alloc.print(
+            "{{\"rel\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{{\"type\":\"command\",\"command\":[\"{s}\"]}}}}}}",
+            .{bad_prog},
+        );
+        defer alloc.free(bad_json);
+        var bad_parsed = try std.json.parseFromSlice(std.json.Value, alloc, bad_json, .{ .duplicate_field_behavior = .@"error" });
+        defer bad_parsed.deinit();
+        var bad_at: FailurePath = .{};
+        try std.testing.expectError(error.InvalidAuth, Registry.parse_located_for_mod(alloc, bad_parsed.value, &bad_at, .{ .name = "glm", .dir = mod_dir }));
+        try std.testing.expect(std.mem.find(u8, mod_failure_advice(error.InvalidAuth).?, "must stay inside the mod") != null);
+    }
+
+    // Re-parsing for the same mod link yields the same binding_identity; changing provider or working_dir changes it.
+    var reg2 = try Registry.parse_located_for_mod(alloc, parsed.value, null, .{ .name = "glm", .dir = mod_dir });
+    defer reg2.deinit(alloc);
+    try std.testing.expectEqual(rel.binding_identity(), reg2.get("rel").?.binding_identity());
+
+    var moved = rel.*;
+    moved.working_dir = "/tmp/fx-home/mods/other";
+    try std.testing.expect(!std.mem.eql(u8, &rel.binding_identity(), &moved.binding_identity()));
+
+    var changed = rel.*;
+    changed.base_url = "https://other.example.com/v1";
+    try std.testing.expect(!std.mem.eql(u8, &rel.binding_identity(), &changed.binding_identity()));
 }

@@ -7376,7 +7376,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 40 · type to filter");
+    try expectGridContains(&h, "Commands 41 · type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -7397,7 +7397,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 40");
+    try expectGridNotContains(&h, "Commands 41");
     try expectGridNotContains(&h, "↑↓ navigate");
 }
 
@@ -7418,7 +7418,7 @@ test "slash main page drops categories and ellipsizes descriptions when narrow" 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 1");
+    try expectGridContains(&h, "Commands 2");
     try expectGridContains(&h, "/model");
     try expectGridContains(&h, "…");
     try expectGridNotContains(&h, "Model");

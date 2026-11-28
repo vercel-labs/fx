@@ -315,6 +315,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_usage = commandShowUsage,
                 .undo_last = commandUndoLast,
                 .handle_mcp = commandHandleMcp,
+                .handle_mods = commandHandleMods,
                 .handle_skills = commandHandleSkills,
                 .copy_last = commandCopyLast,
                 .submit_feedback = commandSubmitFeedback,
@@ -364,6 +365,16 @@ pub fn Handlers(comptime App: type) type {
             app.refreshMcpCompletion();
             app.refreshMcpHostMenu();
             app.refreshMcpHostStatus();
+        }
+
+        pub fn collectModFacts(app: *App) !void {
+            if (comptime !@hasDecl(App, "takeModNotices")) return;
+            const notices = app.takeModNotices();
+            defer {
+                for (notices) |n| std.heap.c_allocator.free(n.text);
+                std.heap.c_allocator.free(notices);
+            }
+            for (notices) |n| try app.writeDomainNotice(.{ .topic = "mods", .tone = if (n.warning) .warning else .neutral, .body = n.text }, true);
         }
 
         pub fn collectShellSnapshotFacts(app: *App) !void {
@@ -981,6 +992,20 @@ pub fn Handlers(comptime App: type) type {
             closeOtherMenusForMcp(app, agents.screenAgentOf(app));
             app.openMcpHostMenu();
             app.shell.render_requests.request(.footer);
+        }
+
+        fn commandHandleMods(ctx: *anyopaque, rest: []const u8) !void {
+            if (comptime !@hasDecl(App, "runModVerbs")) return;
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !runtime_profile.allows(App, .mods)) {
+                try app.writeDomainNotice(.{
+                    .topic = "mods",
+                    .tone = .warning,
+                    .body = "Mods are unavailable in this host because filesystem access is not provided.",
+                }, true);
+                return;
+            }
+            return app.runModVerbs(std.mem.trim(u8, rest, " \t"));
         }
 
         noinline fn commandHandleSkills(ctx: *anyopaque, rest: []const u8) !void {

@@ -869,6 +869,294 @@ pub const McpLocalSnapshot = struct {
     }
 };
 
+pub const ModProviderView = struct {
+    name: []const u8,
+    protocol: []const u8,
+    base_url: []const u8,
+    command: ?[]const []const u8 = null,
+    /// Each environment variable whose value the connection sends to
+    /// `base_url`, so the person sees which secrets a mod's provider reads.
+    sends: []const ModProviderSend = &.{},
+};
+
+pub const ModProviderSend = struct {
+    env: []const u8,
+    header: []const u8,
+};
+
+pub const ModEntrySnapshot = struct {
+    name: []const u8,
+    version: ?[]const u8 = null,
+    status: []const u8,
+    on: bool,
+    source: ?[]const u8 = null,
+    ref: ?[]const u8 = null,
+    commit: ?[]const u8 = null,
+    pinned: bool = false,
+    path: ?[]const u8 = null,
+    err: ?[]const u8 = null,
+};
+
+pub const ModListSnapshot = struct {
+    mods: []const ModEntrySnapshot,
+    over_limit: bool = false,
+    empty_hint: []const u8 = "fx mod",
+
+    pub fn render(self: ModListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: ModListSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+
+        if (self.mods.len == 0) {
+            try out.writer.print("No mods installed. Add one with: {s} add <folder|url>\n", .{self.empty_hint});
+            return try out.toOwnedSlice();
+        }
+
+        const headers = [_][]const u8{ "NAME", "VERSION", "STATUS", "SOURCE" };
+        const rows = try alloc.alloc([4][]const u8, self.mods.len);
+        defer alloc.free(rows);
+        var widths: [3]usize = .{ headers[0].len, headers[1].len, headers[2].len };
+
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        for (self.mods, rows) |entry, *row| {
+            const safe_name = (try text_utils.encodeTerminalSafeInline(arena, entry.name, 128)).bytes;
+            const safe_ver = if (entry.version) |v| (try text_utils.encodeTerminalSafeInline(arena, v, 64)).bytes else "-";
+            const safe_src = if (entry.source) |s| (try text_utils.encodeTerminalSafeInline(arena, s, 240)).bytes else "-";
+            row.* = .{ safe_name, safe_ver, entry.status, safe_src };
+            for (0..3) |k| widths[k] = @max(widths[k], text_utils.terminalSafeVisibleWidth(row[k]));
+        }
+
+        try writeAlignedRow(&out.writer, headers, widths);
+        for (rows, self.mods) |row, entry| {
+            try writeAlignedRow(&out.writer, row, widths);
+            if (entry.err) |msg| {
+                const safe_msg = (try text_utils.encodeTerminalSafeInline(arena, msg, 240)).bytes;
+                try out.writer.print("  error: {s}\n", .{safe_msg});
+            }
+        }
+        if (self.over_limit) {
+            try out.writer.writeAll("More than 32 mods are installed; extra mods were skipped.\n");
+        }
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: ModListSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write("mod_list");
+        try jw.objectField("count");
+        try jw.write(self.mods.len);
+        try jw.objectField("over_limit");
+        try jw.write(self.over_limit);
+        try jw.objectField("mods");
+        try jw.beginArray();
+        for (self.mods) |entry| {
+            try jw.beginObject();
+            try jw.objectField("name");
+            try jw.write(entry.name);
+            try jw.objectField("version");
+            try jw.write(entry.version);
+            try jw.objectField("status");
+            try jw.write(entry.status);
+            try jw.objectField("on");
+            try jw.write(entry.on);
+            try jw.objectField("source");
+            try jw.write(entry.source);
+            try jw.objectField("ref");
+            try jw.write(entry.ref);
+            try jw.objectField("commit");
+            try jw.write(entry.commit);
+            try jw.objectField("pinned");
+            try jw.write(entry.pinned);
+            try jw.objectField("path");
+            try jw.write(entry.path);
+            try jw.objectField("error");
+            try jw.write(entry.err);
+            try jw.endObject();
+        }
+        try jw.endArray();
+        try jw.endObject();
+        return try out.toOwnedSlice();
+    }
+};
+
+pub const ModShowSnapshot = struct {
+    name: []const u8,
+    version: ?[]const u8 = null,
+    status: []const u8,
+    on: bool,
+    description: []const u8 = "",
+    source: ?[]const u8 = null,
+    ref: ?[]const u8 = null,
+    commit: ?[]const u8 = null,
+    pinned: bool = false,
+    path: ?[]const u8 = null,
+    err: ?[]const u8 = null,
+    providers: []const ModProviderView = &.{},
+
+    pub fn render(self: ModShowSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: ModShowSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        try out.writer.print("{s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, self.name, 128)).bytes});
+        try out.writer.print("  status       {s}\n", .{self.status});
+        if (self.version) |v| try out.writer.print("  version      {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, v, 128)).bytes});
+        if (self.description.len > 0) try out.writer.print("  description  {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, self.description, 512)).bytes});
+        if (self.source) |s| try out.writer.print("  source       {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, s, 1024)).bytes});
+        if (self.ref) |r| try out.writer.print("  ref          {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, r, 256)).bytes});
+        if (self.commit) |c| try out.writer.print("  commit       {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, c, 64)).bytes});
+        if (self.path) |p| try out.writer.print("  path         {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, p, 1024)).bytes});
+        if (self.err) |e| try out.writer.print("  error        {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, e, 256)).bytes});
+        try writeModProvidersText(&out.writer, arena, self.providers);
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: ModShowSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write("mod_show");
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("on");
+        try jw.write(self.on);
+        try jw.objectField("description");
+        try jw.write(self.description);
+        try jw.objectField("source");
+        try jw.write(self.source);
+        try jw.objectField("ref");
+        try jw.write(self.ref);
+        try jw.objectField("commit");
+        try jw.write(self.commit);
+        try jw.objectField("pinned");
+        try jw.write(self.pinned);
+        try jw.objectField("path");
+        try jw.write(self.path);
+        try jw.objectField("error");
+        try jw.write(self.err);
+        try jw.objectField("providers");
+        try jw.beginArray();
+        for (self.providers) |p| {
+            try jw.beginObject();
+            try jw.objectField("name");
+            try jw.write(p.name);
+            try jw.objectField("protocol");
+            try jw.write(p.protocol);
+            try jw.objectField("base_url");
+            try jw.write(p.base_url);
+            try jw.objectField("command");
+            try jw.write(p.command);
+            try jw.objectField("sends");
+            try jw.beginArray();
+            for (p.sends) |send| {
+                try jw.beginObject();
+                try jw.objectField("env");
+                try jw.write(send.env);
+                try jw.objectField("header");
+                try jw.write(send.header);
+                try jw.endObject();
+            }
+            try jw.endArray();
+            try jw.endObject();
+        }
+        try jw.endArray();
+        try jw.endObject();
+        return try out.toOwnedSlice();
+    }
+};
+
+pub const ModInstallPreviewSnapshot = struct {
+    name: []const u8,
+    version: []const u8,
+    description: []const u8 = "",
+    source: []const u8,
+    commit: ?[]const u8 = null,
+    providers: []const ModProviderView = &.{},
+
+    pub fn renderText(self: ModInstallPreviewSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        try out.writer.print("Mod: {s} ({s})\n", .{
+            (try text_utils.encodeTerminalSafeInline(arena, self.name, 128)).bytes,
+            (try text_utils.encodeTerminalSafeInline(arena, self.version, 64)).bytes,
+        });
+        try out.writer.print("  source       {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, self.source, 1024)).bytes});
+        if (self.commit) |c| {
+            try out.writer.print("  commit       {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, c, 64)).bytes});
+        }
+        if (self.description.len > 0) {
+            try out.writer.print("  description  {s}\n", .{(try text_utils.encodeTerminalSafeInline(arena, self.description, 512)).bytes});
+        }
+        try writeModProvidersText(&out.writer, arena, self.providers);
+        return try out.toOwnedSlice();
+    }
+};
+
+fn writeAlignedRow(w: *std.Io.Writer, row: [4][]const u8, widths: [3]usize) !void {
+    for (0..3) |k| {
+        try w.writeAll(row[k]);
+        try w.splatByteAll(' ', widths[k] - text_utils.terminalSafeVisibleWidth(row[k]) + 2);
+    }
+    try w.print("{s}\n", .{row[3]});
+}
+
+fn writeModProvidersText(w: *std.Io.Writer, arena: Allocator, providers: []const ModProviderView) !void {
+    if (providers.len == 0) return;
+    try w.print("  providers    {d}\n", .{providers.len});
+    for (providers) |p| {
+        try w.print("    {s}  {s}  {s}\n", .{
+            (try text_utils.encodeTerminalSafeInline(arena, p.name, 128)).bytes,
+            p.protocol,
+            (try text_utils.encodeTerminalSafeInline(arena, p.base_url, 1024)).bytes,
+        });
+        if (p.command) |argv| {
+            try w.writeAll("      runs");
+            for (argv) |arg| {
+                try w.print(" {s}", .{(try text_utils.encodeTerminalSafeInline(arena, arg, 1024)).bytes});
+            }
+            try w.writeByte('\n');
+        }
+        for (p.sends) |send| {
+            try w.print("      sends ${s} in header {s}\n", .{
+                (try text_utils.encodeTerminalSafeInline(arena, send.env, 128)).bytes,
+                (try text_utils.encodeTerminalSafeInline(arena, send.header, 128)).bytes,
+            });
+        }
+    }
+}
+
 pub const StatusSnapshot = struct {
     model: []const u8,
     /// Where startup found `model`: FX_MODEL, settings, or default.
@@ -4872,4 +5160,63 @@ test "oneOffHeaderMessageStyled uses adaptive bold brand without help hint" {
     defer alloc.free(expected_plain);
     try std.testing.expectEqualStrings(expected_plain, plain);
     try std.testing.expect(std.mem.findScalar(u8, plain, '\x1b') == null);
+}
+
+test "ModListSnapshot, ModShowSnapshot, and ModInstallPreviewSnapshot render terminal-safe text and json" {
+    const alloc = std.testing.allocator;
+    const empty_text = try (ModListSnapshot{ .mods = &.{} }).render(alloc, .text);
+    defer alloc.free(empty_text);
+    try std.testing.expectEqualStrings("No mods installed. Add one with: fx mod add <folder|url>\n", empty_text);
+
+    const entries = [_]ModEntrySnapshot{.{
+        .name = "glm",
+        .version = "1.0.0",
+        .status = "on",
+        .on = true,
+        .source = "https://example.com/glm",
+        .commit = "0123456789abcdef0123456789abcdef01234567",
+        .path = "/tmp/.fx/mods/glm",
+    }};
+    const list_json = try (ModListSnapshot{ .mods = &entries }).render(alloc, .json);
+    defer alloc.free(list_json);
+    try std.testing.expect(std.mem.find(u8, list_json, "\"kind\":\"mod_list\"") != null);
+    try std.testing.expect(std.mem.find(u8, list_json, "\"count\":1") != null);
+    try std.testing.expect(std.mem.find(u8, list_json, "\"status\":\"on\"") != null);
+
+    const cmd = [_][]const u8{ "/tmp/.fx/mods/glm/bin/auth\x1b[31m", "--ok" };
+    const sends = [_]ModProviderSend{.{ .env = "GLM_TEAM", .header = "X-Team" }};
+    const providers = [_]ModProviderView{.{
+        .name = "glm",
+        .protocol = "openai-chat-completions",
+        .base_url = "https://example.com/v1",
+        .command = &cmd,
+        .sends = &sends,
+    }};
+    const preview = try (ModInstallPreviewSnapshot{
+        .name = "glm",
+        .version = "1.0.0",
+        .description = "Coding plan",
+        .source = "/tmp/glm",
+        .providers = &providers,
+    }).renderText(alloc);
+    defer alloc.free(preview);
+    try std.testing.expect(std.mem.findScalar(u8, preview, '\x1b') == null);
+    try std.testing.expect(std.mem.find(u8, preview, "Coding plan") != null);
+    try std.testing.expect(std.mem.find(u8, preview, "runs /tmp/.fx/mods/glm/bin/auth\\x1b[31m --ok") != null);
+    try std.testing.expect(std.mem.find(u8, preview, "sends $GLM_TEAM in header X-Team\n") != null);
+
+    const show_json = try (ModShowSnapshot{
+        .name = "glm",
+        .version = "1.0.0",
+        .status = "on",
+        .on = true,
+        .description = "Coding plan",
+        .source = "/tmp/glm",
+        .path = "/tmp/.fx/mods/glm",
+        .providers = &providers,
+    }).render(alloc, .json);
+    defer alloc.free(show_json);
+    try std.testing.expect(std.mem.find(u8, show_json, "\"kind\":\"mod_show\"") != null);
+    try std.testing.expect(std.mem.find(u8, show_json, "\"providers\":[{") != null);
+    try std.testing.expect(std.mem.find(u8, show_json, "\"sends\":[{\"env\":\"GLM_TEAM\",\"header\":\"X-Team\"}]") != null);
 }

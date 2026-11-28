@@ -138,7 +138,7 @@ fn commandConnection(definition: *const definitions.Definition) command_auth.Con
     return .{
         .identity = definition.binding_identity(),
         .argv = definition.auth.command,
-        .cwd = io.homeDir(),
+        .cwd = definition.working_dir orelse io.homeDir(),
     };
 }
 
@@ -1008,4 +1008,23 @@ test "configured command auth masks token and helper header values in error deta
     const detail = result.failed.detail.?;
     try std.testing.expect(std.mem.find(u8, detail, "tok-secret-123") == null);
     try std.testing.expect(std.mem.find(u8, detail, "hdr-secret-456") == null);
+}
+
+test "commandConnection uses definition working_dir when set and falls back to homeDir" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const env = try raw_answer_testing.Env.install(alloc, &.{.{ "HOME", home }});
+    defer env.deinit();
+
+    var reg = try definitions.Registry.parse_json(alloc, "{\"s\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"command\",\"command\":[\"/bin/echo\",\"hi\"]}}}");
+    defer reg.deinit(alloc);
+    const s = reg.get("s").?;
+    try std.testing.expectEqualStrings(home, commandConnection(s).cwd.?);
+
+    var mod_def = s.*;
+    mod_def.working_dir = "/tmp/mods/glm";
+    try std.testing.expectEqualStrings("/tmp/mods/glm", commandConnection(&mod_def).cwd.?);
 }
