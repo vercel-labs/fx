@@ -77,8 +77,12 @@ MCAcpSharedSession AcpSharedSessionToday-clients RosterCurrent
 MCAcpSharedSession AcpSharedSessionToday-cancel CancelStops
 MCAcpSharedSession AcpSharedSessionToday-stop StopEffect
 MCAcpSubagents MCAcpSubagents -
-MCAcpSubagents AcpSubagentsToday-ids ChildIdUsed
+MCAcpSubagents AcpSubagentsToday-ids WorkReachesClient
 MCAcpSubagents AcpSubagentsToday-replay ReplayComplete
+MCAcpSubagents AcpSubagentsToday-stop ParentStopStopsChildren
+MCAcpSubagents AcpSubagentsToday-request RequestShown
+MCAcpSubagents AcpSubagentsToday-cancel ChildCancelWorks
+MCAcpSubagents AcpSubagentsToday-prompt ChildPromptsWork
 EOF
 
 if [ "$ci" = true ]; then

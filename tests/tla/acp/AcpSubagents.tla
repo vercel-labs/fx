@@ -1,32 +1,37 @@
 --------------------------- MODULE AcpSubagents ---------------------------
 (***************************************************************************)
-(* Subagents in the sh.fx extension to ACP: the "Subagents" section of    *)
-(* src/protocol/spec/sh-fx.md, which follows ACP's Subagent Sessions and  *)
+(* Subagents in the sh.fx extension to ACP: the "Subagents" section of     *)
+(* src/protocol/spec/sh-fx.md, which follows ACP's Subagent Sessions and   *)
 (* hasn't landed in src/acp/ yet.                                          *)
 (*                                                                         *)
-(* One client, one parent session, and its children. fx writes the        *)
-(* client's messages in order, and the client reads them later (Read): a  *)
-(* child's announcement (subagent_update), an update of a child's work, a *)
-(* child's permission request or its cancellation, and the response that  *)
+(* One client, one parent session, and its children. fx writes the         *)
+(* client's messages in order, and the client reads them later (Read): a   *)
+(* child's announcement (subagent_update), an update of a child's work, a  *)
+(* child's permission request or its cancellation, and the response that   *)
 (* ends a reload. Several clients on one session are in AcpSharedSession.  *)
 (*                                                                         *)
 (* Rules (Rules = TRUE):                                                   *)
-(*  - fx announces a child before any update of its work, and every       *)
-(*    update and request of the child carries the child's id.             *)
-(*  - session/cancel of a child stops only the child; the parent's turn   *)
-(*    goes on and gets the child's result. Stopping the parent stops its  *)
+(*  - fx announces a child before any update of its work, and every        *)
+(*    update and request of the child carries the child's id.              *)
+(*  - session/cancel of a child stops only the child; the parent's turn    *)
+(*    goes on and gets the child's result. Stopping the parent stops its   *)
 (*    children. A stopped child's request is cancelled.                    *)
-(*  - A client message to a child steers it while it works, starts its    *)
-(*    work while it's idle, and runs as its next turn when its work ends  *)
-(*    or stops first. A child's report reaches the parent: it joins the   *)
-(*    parent's turn, or runs as the parent's next turn.                   *)
-(*  - A reload replays every child's announcement and history before the  *)
-(*    response, and sends a request that still waits, never a decided one.*)
+(*  - A client message to a child steers it while it works, starts its     *)
+(*    work while it's idle, and runs as its next turn when its work ends   *)
+(*    or stops first. A child's report reaches the parent: it joins the    *)
+(*    parent's turn, or runs as the parent's next turn.                    *)
+(*  - A reload replays every child's announcement and history before the   *)
+(*    response, and sends a request that still waits, never a decided one. *)
 (*                                                                         *)
-(* Today (Rules = FALSE): fx sends no announcement and sends a child's    *)
-(* work under the parent's id, so a client never learns a child's id and  *)
-(* can't cancel or prompt one (fx would answer -32002); and a reload      *)
-(* replays no child.                                                       *)
+(* Today (Rules = FALSE): fx sends the client nothing of a child: no       *)
+(* announcement, no work, and no permission request. A child's request     *)
+(* waits for an answer that no client can give. A parent session/cancel    *)
+(* stops the parent and leaves its children running. A reload replays no   *)
+(* child. A client that sends a child's id gets these refusals. A prompt   *)
+(* gets -32600 "Prompt already in progress" while the parent runs, and     *)
+(* -32602 "Session is not active" while it's idle. A cancel request gets   *)
+(* -32602 "Session is not active", and fx ignores a cancel notification.   *)
+(* The model records each refusal as a flag, not as a code.                *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -36,6 +41,7 @@ CONSTANTS
     MaxChildTurns,  \* child turns in the whole run
     MaxAsks,        \* permission requests in the whole run
     MaxSteers,      \* client messages to children in the whole run
+    MaxCancels,     \* client cancels of children in the whole run
     MaxLoads        \* reloads of the parent
 
 VARIABLES
@@ -53,11 +59,12 @@ VARIABLES
     reportsMade, \* child reports made
     reports,     \* reports waiting for the parent
     reportsTaken,\* reports the parent took
+    cancels,     \* session/cancel requests the client sent to children
     loads,       \* reloads done
     flags        \* the mistakes the properties rule out, as a set of names
 
 vars == <<parent, child, childTurns, perm, asks, shown, chan, seen, steersSent, waiting,
-          steersTaken, reportsMade, reports, reportsTaken, loads, flags>>
+          steersTaken, reportsMade, reports, reportsTaken, cancels, loads, flags>>
 
 Msg(kind, k, n) == [kind |-> kind, k |-> k, n |-> n]
 Flag(name) == flags' = flags \cup {name}
@@ -70,6 +77,13 @@ SeqOf(S) == IF S = {} THEN <<>> ELSE LET x == CHOOSE y \in S : TRUE IN <<x>> \o 
 
 RECURSIVE Cat(_)
 Cat(s) == IF s = <<>> THEN <<>> ELSE Head(s) \o Cat(Tail(s))
+
+\* What fx writes to the client about a child. Today it writes nothing.
+ToClient(msgs) == IF Rules THEN msgs ELSE <<>>
+
+\* The client knows a child's id: from its announcement or, today, from the
+\* hooks and the report.
+KnowsChild(k) == seen[k] \/ ~Rules
 
 Init ==
     /\ parent = "idle"
@@ -86,52 +100,53 @@ Init ==
     /\ reportsMade = 0
     /\ reports = 0
     /\ reportsTaken = 0
+    /\ cancels = 0
     /\ loads = 0
     /\ flags = {}
 
-\* An update of child k's work: under the child's id, or today under the parent's.
-Work(k) == IF Rules THEN Msg("work", k, 0) ELSE Msg("parent_work", k, 0)
+\* An update of child k's work, under the child's id.
+Work(k) == Msg("work", k, 0)
 
 \* The client prompts the parent.
 ParentPrompt ==
     /\ parent = "idle"
     /\ parent' = "running"
     /\ UNCHANGED <<child, childTurns, perm, asks, shown, chan, seen, steersSent, waiting,
-                   steersTaken, reportsMade, reports, reportsTaken, loads, flags>>
+                   steersTaken, reportsMade, reports, reportsTaken, cancels, loads, flags>>
 
 \* The parent's turn starts child k's first work. fx announces the child first.
 Spawn(k) ==
     /\ parent = "running" /\ child[k] = "none" /\ childTurns < MaxChildTurns
     /\ child' = [child EXCEPT ![k] = "running"]
     /\ childTurns' = childTurns + 1
-    /\ chan' = IF Rules THEN chan \o <<Msg("announce", k, 0), Work(k)>> ELSE Append(chan, Work(k))
+    /\ chan' = chan \o ToClient(<<Msg("announce", k, 0), Work(k)>>)
     /\ UNCHANGED <<parent, perm, asks, shown, seen, steersSent, waiting, steersTaken,
-                   reportsMade, reports, reportsTaken, loads, flags>>
+                   reportsMade, reports, reportsTaken, cancels, loads, flags>>
 
 \* The parent's turn gives an idle child new work.
 Reuse(k) ==
     /\ parent = "running" /\ child[k] = "idle" /\ childTurns < MaxChildTurns
     /\ child' = [child EXCEPT ![k] = "running"]
     /\ childTurns' = childTurns + 1
-    /\ chan' = Append(chan, Work(k))
+    /\ chan' = chan \o ToClient(<<Work(k)>>)
     /\ UNCHANGED <<parent, perm, asks, shown, seen, steersSent, waiting, steersTaken,
-                   reportsMade, reports, reportsTaken, loads, flags>>
+                   reportsMade, reports, reportsTaken, cancels, loads, flags>>
 
 \* More of a running child's work.
 ChildWork(k) ==
     /\ child[k] = "running"
-    /\ chan' = Append(chan, Work(k))
+    /\ chan' = chan \o ToClient(<<Work(k)>>)
     /\ UNCHANGED <<parent, child, childTurns, perm, asks, shown, seen, steersSent, waiting,
-                   steersTaken, reportsMade, reports, reportsTaken, loads, flags>>
+                   steersTaken, reportsMade, reports, reportsTaken, cancels, loads, flags>>
 
-\* A running child asks for a permission.
+\* A running child asks for a permission. Today the request stays with fx.
 ChildAsk(k) ==
     /\ child[k] = "running" /\ perm[k] = 0 /\ asks < MaxAsks
     /\ asks' = asks + 1
     /\ perm' = [perm EXCEPT ![k] = asks + 1]
-    /\ chan' = Append(chan, Msg(IF Rules THEN "req" ELSE "parent_req", k, asks + 1))
+    /\ chan' = chan \o ToClient(<<Msg("req", k, asks + 1)>>)
     /\ UNCHANGED <<parent, child, childTurns, shown, seen, steersSent, waiting, steersTaken,
-                   reportsMade, reports, reportsTaken, loads, flags>>
+                   reportsMade, reports, reportsTaken, cancels, loads, flags>>
 
 \* The client answers a request it shows.
 Answer(k, n) ==
@@ -139,7 +154,7 @@ Answer(k, n) ==
     /\ shown' = shown \ {[k |-> k, n |-> n]}
     /\ perm' = IF perm[k] = n THEN [perm EXCEPT ![k] = 0] ELSE perm
     /\ UNCHANGED <<parent, child, childTurns, asks, chan, seen, steersSent, waiting, steersTaken,
-                   reportsMade, reports, reportsTaken, loads, flags>>
+                   reportsMade, reports, reportsTaken, cancels, loads, flags>>
 
 \* A child's work takes a waiting client message at its next boundary.
 ChildTakeSteer(k) ==
@@ -147,7 +162,7 @@ ChildTakeSteer(k) ==
     /\ waiting' = [waiting EXCEPT ![k] = @ - 1]
     /\ steersTaken' = steersTaken + 1
     /\ UNCHANGED <<parent, child, childTurns, perm, asks, shown, chan, seen, steersSent,
-                   reportsMade, reports, reportsTaken, loads, flags>>
+                   reportsMade, reports, reportsTaken, cancels, loads, flags>>
 
 \* Child k's work ends or stops: its report goes to the parent, its waiting
 \* request is cancelled, and waiting messages run as its next turn.
@@ -165,40 +180,51 @@ ChildStops(k, report) ==
 ChildEnd(k) ==
     /\ child[k] = "running" /\ perm[k] = 0
     /\ ChildStops(k, TRUE)
-    /\ UNCHANGED <<parent, asks, shown, seen, steersSent, reportsTaken, loads, flags>>
+    /\ UNCHANGED <<parent, asks, shown, seen, steersSent, reportsTaken, cancels, loads, flags>>
 
-\* session/cancel with the id of a child the client knows.
+\* session/cancel with the id of a child the client knows. Today fx refuses it.
 CancelChild(k) ==
-    /\ seen[k] /\ child[k] = "running"
+    /\ KnowsChild(k) /\ child[k] = "running" /\ cancels < MaxCancels
+    /\ cancels' = cancels + 1
     /\ IF Rules
        THEN /\ ChildStops(k, TRUE)
             /\ UNCHANGED <<parent, flags>>
        ELSE /\ Flag("child_cancel_refused")
-            /\ UNCHANGED <<parent, child, childTurns, perm, chan, waiting, steersTaken, reportsMade, reports>>
+            /\ UNCHANGED <<parent, child, childTurns, perm, chan, waiting, steersTaken,
+                           reportsMade, reports>>
     /\ UNCHANGED <<asks, shown, seen, steersSent, reportsTaken, loads>>
 
-\* session/cancel of the parent stops the parent and every running child.
-\* The children's results stay on the parent's stopped tool calls, and their
-\* waiting messages run as their next turns.
+\* The sh.fx stop: session/cancel of the parent stops the parent and every
+\* running child. The children's results stay on the parent's stopped tool
+\* calls, and their waiting messages run as their next turns.
+StopChildren ==
+    LET running == {k \in Kids : child[k] = "running"}
+        stopped == SeqOf({k \in running : perm[k] # 0})
+    IN /\ parent' = "idle"
+       /\ child' = [k \in Kids |-> IF k \in running THEN (IF waiting[k] > 0 THEN "running" ELSE "idle") ELSE child[k]]
+       /\ childTurns' = childTurns + Cardinality({k \in running : waiting[k] > 0})
+       /\ steersTaken' = steersTaken + SumOver([k \in Kids |-> IF k \in running THEN waiting[k] ELSE 0], Kids)
+       /\ waiting' = [k \in Kids |-> IF k \in running THEN 0 ELSE waiting[k]]
+       /\ perm' = [k \in Kids |-> IF k \in running THEN 0 ELSE perm[k]]
+       /\ chan' = chan \o [i \in 1..Len(stopped) |-> Msg("cancel", stopped[i], perm[stopped[i]])]
+
+\* session/cancel of the parent. Today it stops the parent only: the children
+\* run on.
 CancelParent ==
     /\ parent = "running"
-    /\ LET running == {k \in Kids : child[k] = "running"}
-           stopped == SeqOf({k \in running : perm[k] # 0})
-       IN /\ parent' = "idle"
-          /\ child' = [k \in Kids |-> IF k \in running THEN (IF waiting[k] > 0 THEN "running" ELSE "idle") ELSE child[k]]
-          /\ childTurns' = childTurns + Cardinality({k \in running : waiting[k] > 0})
-          /\ steersTaken' = steersTaken + SumOver([k \in Kids |-> IF k \in running THEN waiting[k] ELSE 0], Kids)
-          /\ waiting' = [k \in Kids |-> IF k \in running THEN 0 ELSE waiting[k]]
-          /\ perm' = [k \in Kids |-> IF k \in running THEN 0 ELSE perm[k]]
-          /\ chan' = chan \o [i \in 1..Len(stopped) |-> Msg("cancel", stopped[i], perm[stopped[i]])]
-    /\ UNCHANGED <<asks, shown, seen, steersSent, reportsMade, reports, reportsTaken, loads, flags>>
+    /\ IF Rules
+       THEN StopChildren
+       ELSE /\ parent' = "idle"
+            /\ UNCHANGED <<child, childTurns, perm, chan, waiting, steersTaken>>
+    /\ UNCHANGED <<asks, shown, seen, steersSent, reportsMade, reports, reportsTaken, cancels,
+                   loads, flags>>
 
 \* The parent's turn ends on its own.
 ParentEnd ==
     /\ parent = "running"
     /\ parent' = "idle"
     /\ UNCHANGED <<child, childTurns, perm, asks, shown, chan, seen, steersSent, waiting,
-                   steersTaken, reportsMade, reports, reportsTaken, loads, flags>>
+                   steersTaken, reportsMade, reports, reportsTaken, cancels, loads, flags>>
 
 \* A child's report joins the parent's running turn, or starts its next turn.
 ParentTakeReport ==
@@ -207,11 +233,11 @@ ParentTakeReport ==
     /\ reports' = reports - 1
     /\ reportsTaken' = reportsTaken + 1
     /\ UNCHANGED <<child, childTurns, perm, asks, shown, chan, seen, steersSent, waiting,
-                   steersTaken, reportsMade, loads, flags>>
+                   steersTaken, reportsMade, cancels, loads, flags>>
 
-\* The client sends session/prompt with a known child's id.
+\* The client sends session/prompt with a known child's id. Today fx refuses it.
 SteerChild(k) ==
-    /\ seen[k] /\ child[k] # "none" /\ steersSent < MaxSteers
+    /\ KnowsChild(k) /\ child[k] # "none" /\ steersSent < MaxSteers
     /\ IF Rules
        THEN /\ steersSent' = steersSent + 1
             /\ IF child[k] = "running"
@@ -225,7 +251,8 @@ SteerChild(k) ==
             /\ UNCHANGED flags
        ELSE /\ Flag("child_prompt_refused")
             /\ UNCHANGED <<steersSent, waiting, child, childTurns, steersTaken>>
-    /\ UNCHANGED <<parent, perm, asks, shown, chan, seen, reportsMade, reports, reportsTaken, loads>>
+    /\ UNCHANGED <<parent, perm, asks, shown, chan, seen, reportsMade, reports, reportsTaken,
+                   cancels, loads>>
 
 \* The client loads the parent again. It forgets what it read, and fx replays
 \* every child's announcement and history, then each waiting request, then
@@ -236,13 +263,13 @@ Reload ==
     /\ seen' = [k \in Kids |-> FALSE]
     /\ shown' = {}
     /\ LET ordered == SeqOf({k \in Kids : child[k] # "none"})
-           replay(k) == IF Rules THEN <<Msg("announce", k, 0), Work(k)>> ELSE <<>>
-           asksOut(k) == IF perm[k] # 0 THEN <<Msg(IF Rules THEN "req" ELSE "parent_req", k, perm[k])>> ELSE <<>>
+           replay(k) == ToClient(<<Msg("announce", k, 0), Work(k)>>)
+           asksOut(k) == IF perm[k] # 0 THEN ToClient(<<Msg("req", k, perm[k])>>) ELSE <<>>
            all == Cat([i \in 1..Len(ordered) |-> replay(ordered[i])])
                   \o Cat([i \in 1..Len(ordered) |-> asksOut(ordered[i])])
        IN chan' = all \o <<[kind |-> "loaded", k |-> {k \in Kids : child[k] # "none"}, n |-> 0]>>
     /\ UNCHANGED <<parent, child, childTurns, perm, asks, steersSent, waiting, steersTaken,
-                   reportsMade, reports, reportsTaken, flags>>
+                   reportsMade, reports, reportsTaken, cancels, flags>>
 
 \* The client reads the next message fx wrote to it.
 Read ==
@@ -258,7 +285,7 @@ Read ==
                    \cup (IF m.kind \in {"parent_work", "parent_req"} THEN {"under_parent"} ELSE {})
                    \cup (IF m.kind = "loaded" /\ \E k \in m.k : ~seen[k] THEN {"replay_missing"} ELSE {})
     /\ UNCHANGED <<parent, child, childTurns, perm, asks, steersSent, waiting, steersTaken,
-                   reportsMade, reports, reportsTaken, loads>>
+                   reportsMade, reports, reportsTaken, cancels, loads>>
 
 Next ==
     \/ ParentPrompt \/ ParentEnd \/ ParentTakeReport \/ CancelParent \/ Reload \/ Read
@@ -277,6 +304,12 @@ AnnouncedFirst == "before_announce" \notin flags
 \* Every update and request of a child's work carries the child's id.
 ChildIdUsed == "under_parent" \notin flags
 
+\* Every request a child is waiting on is on the client, or on its way to it.
+RequestShown ==
+    \A k \in Kids : perm[k] # 0 =>
+        \/ [k |-> k, n |-> perm[k]] \in shown
+        \/ \E i \in 1..Len(chan) : chan[i] = Msg("req", k, perm[k])
+
 \* A request the client shows is the child's waiting one, or its
 \* cancellation is on its way.
 RequestEndsWithChild ==
@@ -288,6 +321,29 @@ ChildCancelWorks == "child_cancel_refused" \notin flags
 \* A client can send a known child messages.
 ChildPromptsWork == "child_prompt_refused" \notin flags
 
+\* Each step of a child's work goes out to the client under the child's id.
+WorkReachesClient ==
+    [][\A k \in Kids : (Spawn(k) \/ Reuse(k) \/ ChildWork(k)) =>
+        Len(chan') > 0 /\ chan'[Len(chan')] = Msg("work", k, 0)]_vars
+
+\* A child that isn't running sends no work and no request.
+NoWorkWhenStopped ==
+    [][~Reload => \A k \in Kids : child'[k] # "running" =>
+        ~\E i \in (Len(chan) + 1)..Len(chan') :
+            chan'[i].kind \in {"work", "parent_work", "req", "parent_req"} /\ chan'[i].k = k]_vars
+
+\* session/cancel of a child stops it, ends its request, and gives the parent
+\* its result.
+CancelChildStops ==
+    [][\A k \in Kids : CancelChild(k) =>
+        /\ (child'[k] = "idle" \/ waiting[k] > 0)
+        /\ perm'[k] = 0
+        /\ reportsMade' = reportsMade + 1]_vars
+
+\* Every session/cancel of a child makes its report.
+CancelReports ==
+    [][\A k \in Kids : CancelChild(k) => reportsMade' = reportsMade + 1]_vars
+
 \* After the parent stops, a child still runs only to run the messages that
 \* waited for it.
 ParentStopStopsChildren ==
@@ -295,6 +351,10 @@ ParentStopStopsChildren ==
 
 \* Stopping a child leaves the parent's turn as it was.
 ChildStopLeavesParent == [][\A k \in Kids : CancelChild(k) => parent' = parent]_vars
+
+\* A message to a child that waits when its work stops runs as its next turn.
+SteerRunsNext ==
+    [][\A k \in Kids : (ChildStops(k, TRUE) /\ waiting[k] > 0) => childTurns' = childTurns + 1]_vars
 
 \* No message to a child is lost.
 NoSteerLost == steersSent = steersTaken + SumOver(waiting, Kids)
@@ -304,4 +364,8 @@ NoReportLost == reportsMade = reports + reportsTaken
 
 \* A reload gives every child before its response.
 ReplayComplete == "replay_missing" \notin flags
+
+\* A reload replays each child's history, not only its announcement.
+ReplayHasHistory ==
+    [][Reload => \A k \in Kids : child[k] # "none" => \E i \in 1..Len(chan') : chan'[i] = Msg("work", k, 0)]_vars
 =============================================================================
