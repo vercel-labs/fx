@@ -25,6 +25,7 @@ test {
     _ = @import("core/app/app_agents_runtime.zig");
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/cli/doctor_child_status.zig");
+    _ = @import("core/upgrade/update_target.zig");
     _ = @import("core/app/trace_report.zig");
     _ = @import("core/compactor/compactor.zig");
     _ = @import("core/app/host_record.zig");

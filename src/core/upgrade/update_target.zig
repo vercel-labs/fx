@@ -402,3 +402,47 @@ test "a dev manifest ignores a build number that is not a positive whole number"
         try std.testing.expectEqual(@as(u32, 0), target.build());
     }
 }
+
+test "a dev manifest keeps the largest u32 build number and ignores one past i64" {
+    const alloc = std.testing.allocator;
+    var largest = try Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"1111111111111111111111111111111111111111\",\"build\":4294967295}");
+    defer largest.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), largest.build());
+
+    var past_i64 = try Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"1111111111111111111111111111111111111111\",\"build\":9223372036854775808}");
+    defer past_i64.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), past_i64.build());
+}
+
+fn fuzzDevManifest(_: void, smith: *std.testing.Smith) anyerror!void {
+    const alloc = std.testing.allocator;
+    var buffer: [max_manifest_bytes + 64]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    var target = Target.parseDevManifest(alloc, bytes) catch |err| switch (err) {
+        error.ManifestTooLarge => return std.testing.expect(bytes.len > max_manifest_bytes),
+        error.InvalidManifest => return std.testing.expect(bytes.len <= max_manifest_bytes),
+        else => return err,
+    };
+    defer target.deinit(alloc);
+    // What parses is a dev target whose parts a download path can use as is.
+    try std.testing.expect(bytes.len <= max_manifest_bytes);
+    const dev = target.dev;
+    try std.testing.expect(isValidVersion(dev.version));
+    try std.testing.expect(isValidRevision(dev.revision));
+    try std.testing.expect(std.mem.startsWith(u8, dev.artifact_ref, "dev/"));
+    try std.testing.expectEqualStrings(dev.revision, dev.artifact_ref["dev/".len..]);
+}
+
+test "a dev manifest parses into a safe target or is refused on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzDevManifest, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"version\":\"0.3.62\",\"commit\":\"0123456789abcdef0123456789abcdef01234567\"}",
+            "{\"version\":\"v0.0.18\",\"commit\":\"1111111111111111111111111111111111111111\",\"build\":4294967295}",
+            "{\"version\":\"0.0.18\",\"commit\":\"\\u0031111111\",\"build\":9223372036854775808}",
+            "{\"version\":\"0.3.62\",\"commit\":\"../escape\"}",
+            "[\"0.3.62\"]",
+            "{\"version\":",
+            "\xff\x00{",
+        }) ++ @import("fuzz_corpus").dev_manifest.*),
+    });
+}
