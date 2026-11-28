@@ -17,8 +17,10 @@
 (*   ObsDestOk       TRUE when the destination resolves (no team, team not  *)
 (*                   found, or a set project missing: FALSE)               *)
 (*   ObsSandbox      TRUE when fx-sandbox exists at the start              *)
+(*   ObsSandboxEnd   TRUE when fx-sandbox exists at the end                 *)
 (*   ObsRecords      repository -> its consent record at the start: "none", *)
 (*                   "dest" (this destination), or "other"                 *)
+(*   ObsRecordsEnd  repository -> its consent record at the end            *)
 (*   ObsAnswers      the user's answers to copy questions, in order: "accept" *)
 (*                   (yes), "decline" (no or dismissed), "no_answer"       *)
 (*   ObsCancels      call -> how often the user cancelled it while it      *)
@@ -123,6 +125,8 @@ AllMatched ==
     /\ loginChanged = (ObsLoginTo # "unchanged")
     /\ opened = ObsPrompts
     /\ writes = ObsWrites
+    /\ sandboxExists = ObsSandboxEnd
+    /\ rec = ObsRecordsEnd
 
 \* Sentinel: violated exactly when every observation matched.
 NotAllMatched == ~AllMatched

@@ -1,0 +1,48 @@
+{
+  "covers": [
+    "isolated-needs-consent"
+  ],
+  "title": "An isolated folder needs the same consent: the copy question, then the yes, then the run in the isolated sandbox.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "isolated",
+        "sub": false,
+        "repo": "A"
+      }
+    },
+    "surface": "interactive",
+    "login": "valid",
+    "configured": false,
+    "configValid": true,
+    "destOk": true,
+    "sandbox": true,
+    "records": {
+      "A": "none"
+    },
+    "answers": [
+      "accept"
+    ],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "isolated"
+      ]
+    },
+    "prompts": 1,
+    "writes": 1,
+    "sandboxAfter": true,
+    "recordsAfter": {
+      "A": "dest"
+    }
+  },
+  "tamper": {
+    "setup": "outcome-as-local"
+  },
+  "drive": {}
+}

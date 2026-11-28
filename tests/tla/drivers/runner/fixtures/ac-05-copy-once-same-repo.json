@@ -2,29 +2,34 @@
   "covers": [
     "AC-5"
   ],
-  "title": "No destination, two teams: one team prompt and one project prompt for two remote calls; the second waits, then both run remote after the project accept.",
+  "title": "No destination yet: one copy question for the repository, then both remote calls run, and the second call asks nothing.",
   "setup": {
     "calls": {
       "c1": {
         "req": "remote",
         "rule": "none",
         "floor": "none",
-        "sub": false
+        "sub": false,
+        "repo": "A"
       },
       "c2": {
         "req": "remote",
         "rule": "none",
         "floor": "none",
-        "sub": false
+        "sub": false,
+        "repo": "A"
       }
     },
-    "teams": "many",
     "surface": "interactive",
     "login": "valid",
     "configured": false,
     "configValid": true,
+    "destOk": true,
+    "sandbox": true,
+    "records": {
+      "A": "none"
+    },
     "answers": [
-      "team_accept",
       "accept"
     ],
     "cancels": {},
@@ -39,13 +44,15 @@
         "remote"
       ]
     },
-    "prompts": 2,
-    "writes": 1
+    "prompts": 1,
+    "writes": 1,
+    "sandboxAfter": true,
+    "recordsAfter": {
+      "A": "dest"
+    }
   },
   "tamper": {
     "setup": "extra-prompt"
   },
-  "drive": {
-    "teams": 2
-  }
+  "drive": {}
 }

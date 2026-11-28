@@ -1,0 +1,48 @@
+{
+  "covers": [
+    "AC-18"
+  ],
+  "title": "A login for another user: the config's remote names the first user, so the copy question appears again, and the call runs after the yes.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false,
+        "repo": "A"
+      }
+    },
+    "surface": "interactive",
+    "login": "other_user",
+    "configured": true,
+    "configValid": true,
+    "destOk": true,
+    "sandbox": true,
+    "records": {
+      "A": "none"
+    },
+    "answers": [
+      "accept"
+    ],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "remote"
+      ]
+    },
+    "prompts": 1,
+    "writes": 1,
+    "sandboxAfter": true,
+    "recordsAfter": {
+      "A": "dest"
+    }
+  },
+  "tamper": {
+    "setup": "extra-prompt"
+  },
+  "drive": {}
+}

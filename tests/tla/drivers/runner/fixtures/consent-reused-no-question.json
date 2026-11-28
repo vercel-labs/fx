@@ -1,0 +1,46 @@
+{
+  "covers": [
+    "consent-carries-run"
+  ],
+  "title": "A configured destination with the repository's consent: the call runs with no question.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false,
+        "repo": "A"
+      }
+    },
+    "surface": "interactive",
+    "login": "valid",
+    "configured": true,
+    "configValid": true,
+    "destOk": true,
+    "sandbox": true,
+    "records": {
+      "A": "dest"
+    },
+    "answers": [],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "remote"
+      ]
+    },
+    "prompts": 0,
+    "writes": 0,
+    "sandboxAfter": true,
+    "recordsAfter": {
+      "A": "dest"
+    }
+  },
+  "tamper": {
+    "setup": "outcome-as-local"
+  },
+  "drive": {}
+}

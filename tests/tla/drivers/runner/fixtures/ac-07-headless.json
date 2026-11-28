@@ -9,14 +9,19 @@
         "req": "remote",
         "rule": "none",
         "floor": "none",
-        "sub": false
+        "sub": false,
+        "repo": "A"
       }
     },
-    "teams": "one",
     "surface": "headless",
     "login": "valid",
     "configured": false,
     "configValid": true,
+    "destOk": true,
+    "sandbox": true,
+    "records": {
+      "A": "none"
+    },
     "answers": [],
     "cancels": {},
     "retries": {},
@@ -28,7 +33,11 @@
       ]
     },
     "prompts": 0,
-    "writes": 0
+    "writes": 0,
+    "sandboxAfter": true,
+    "recordsAfter": {
+      "A": "none"
+    }
   },
   "tamper": {
     "setup": "prompt-without-channel"

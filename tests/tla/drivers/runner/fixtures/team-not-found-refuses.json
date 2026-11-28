@@ -1,0 +1,48 @@
+{
+  "covers": [
+    "destination-team-not-found"
+  ],
+  "title": "sandbox_team names no team of this login: refused with the team list, no question, nothing written.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false,
+        "repo": "A"
+      }
+    },
+    "surface": "interactive",
+    "login": "valid",
+    "configured": false,
+    "configValid": true,
+    "destOk": false,
+    "sandbox": true,
+    "records": {
+      "A": "none"
+    },
+    "answers": [],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "refused"
+      ]
+    },
+    "prompts": 0,
+    "writes": 0,
+    "sandboxAfter": true,
+    "recordsAfter": {
+      "A": "none"
+    }
+  },
+  "tamper": {
+    "setup": "outcome-as-local"
+  },
+  "drive": {
+    "teamSetting": "no-such-team"
+  }
+}

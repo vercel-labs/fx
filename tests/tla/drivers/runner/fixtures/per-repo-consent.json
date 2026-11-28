@@ -1,0 +1,61 @@
+{
+  "covers": [
+    "per-repo-consent"
+  ],
+  "title": "Two repositories: each one asks its own copy question once, and its call runs remote after the yes, in its own session.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false,
+        "repo": "A"
+      },
+      "c2": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false,
+        "repo": "B"
+      }
+    },
+    "surface": "interactive",
+    "login": "valid",
+    "configured": false,
+    "configValid": true,
+    "destOk": true,
+    "sandbox": true,
+    "records": {
+      "A": "none",
+      "B": "none"
+    },
+    "answers": [
+      "accept",
+      "accept"
+    ],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "remote"
+      ],
+      "c2": [
+        "remote"
+      ]
+    },
+    "prompts": 2,
+    "writes": 2,
+    "sandboxAfter": true,
+    "recordsAfter": {
+      "A": "dest",
+      "B": "dest"
+    }
+  },
+  "tamper": {
+    "setup": "extra-prompt"
+  },
+  "drive": {}
+}

@@ -9,14 +9,19 @@
         "req": "remote",
         "rule": "local",
         "floor": "none",
-        "sub": false
+        "sub": false,
+        "repo": "A"
       }
     },
-    "teams": "one",
     "surface": "interactive",
     "login": "valid",
     "configured": true,
     "configValid": true,
+    "destOk": true,
+    "sandbox": true,
+    "records": {
+      "A": "dest"
+    },
     "answers": [],
     "cancels": {},
     "retries": {},
@@ -28,7 +33,11 @@
       ]
     },
     "prompts": 0,
-    "writes": 0
+    "writes": 0,
+    "sandboxAfter": true,
+    "recordsAfter": {
+      "A": "dest"
+    }
   },
   "tamper": {
     "setup": "local-as-remote"

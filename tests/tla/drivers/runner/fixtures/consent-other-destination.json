@@ -1,0 +1,48 @@
+{
+  "covers": [
+    "consent-other-destination"
+  ],
+  "title": "The repository's record is for another project: the copy question appears, and the yes writes the record for this destination.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false,
+        "repo": "A"
+      }
+    },
+    "surface": "interactive",
+    "login": "valid",
+    "configured": true,
+    "configValid": true,
+    "destOk": true,
+    "sandbox": true,
+    "records": {
+      "A": "other"
+    },
+    "answers": [
+      "accept"
+    ],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "remote"
+      ]
+    },
+    "prompts": 1,
+    "writes": 1,
+    "sandboxAfter": true,
+    "recordsAfter": {
+      "A": "dest"
+    }
+  },
+  "tamper": {
+    "setup": "extra-prompt"
+  },
+  "drive": {}
+}

@@ -1,0 +1,46 @@
+{
+  "covers": [
+    "E6-expired-login"
+  ],
+  "title": "An expired Vercel login: refused at once with the refresh fix, no question, nothing written.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false,
+        "repo": "A"
+      }
+    },
+    "surface": "interactive",
+    "login": "expired",
+    "configured": false,
+    "configValid": true,
+    "destOk": true,
+    "sandbox": true,
+    "records": {
+      "A": "none"
+    },
+    "answers": [],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "refused"
+      ]
+    },
+    "prompts": 0,
+    "writes": 0,
+    "sandboxAfter": true,
+    "recordsAfter": {
+      "A": "none"
+    }
+  },
+  "tamper": {
+    "setup": "outcome-as-local"
+  },
+  "drive": {}
+}

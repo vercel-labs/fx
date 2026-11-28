@@ -6,10 +6,13 @@
 // run of the built fx needs --next. --self-check needs only TLC.
 //
 // An observation set describes one scenario. A setup set holds the inputs of
-// each shell call, the user's answers and other actions, and the outcome:
-// where each call ran or that it was refused, the prompts opened, and the
-// writes of config.remote. A run set is the ordered events of one remote run.
-// TLC accepts a set when the model has a behavior that gives all of it.
+// each shell call (and its repository), the destination (whether it resolves),
+// fx-sandbox and each repository's consent record at the start, the user's
+// answers to the copy question, and the outcome: where each call ran or that it
+// was refused, the copy questions opened, the yes answers (each writes
+// config.remote and the consent record), and fx-sandbox and the records at the
+// end. A run set is the ordered events of one remote run. TLC accepts a set
+// when the model has a behavior that gives all of it.
 //
 // Usage (from the repository root):
 //   bun tests/tla/drivers/runner/driver.ts --self-check
@@ -19,11 +22,12 @@
 // --self-check reads the hand-written sets in fixtures/*.json, requires TLC
 // to accept each one, then changes each set in the one way its fixture names
 // (a remote run reported as local, a second send, a write over a Mac edit, a
-// prompt after a decline, a write without an accept, and so on) and requires
+// prompt after a decline, a yes that was never given, and so on) and requires
 // TLC to reject it. --next runs each fixture's scenario through the built fx
 // against a fake Vercel API (tests/e2e/fixtures/fake-vercel-api.ts) and a fake
 // model gateway, turns what happened into the same sets, and checks and
-// tampers them the same way.
+// tampers them the same way. Each repository is its own folder and its own ACP
+// session, as in the product.
 //
 // Exit codes: 0 every check met, 1 a check missed, 2 a harness failure or
 // --next without the runner code.
@@ -44,15 +48,17 @@ const RULES = ["none", "local", "remote", "isolated"] as const;
 const FLOORS = ["none", "remote", "isolated"] as const;
 const LOGINS = ["none", "expired", "valid", "other_user"] as const;
 const SURFACES = ["interactive", "headless"] as const;
-// accept is the project accept at P2, the consent; team_accept is the team accept at P1.
-const ANSWERS = ["accept", "team_accept", "decline", "cancel", "no_answer", "rest_fail"] as const;
-const TEAM_COUNTS = ["one", "many"] as const;
-// The answers each prompt takes: P1 (team) and P2 (project).
-const TEAM_PROMPT_ANSWERS = ["team_accept", "decline", "cancel"] as const;
-const PROJECT_PROMPT_ANSWERS = ["accept", "decline", "cancel", "rest_fail"] as const;
+// accept is a yes to the copy question: the consent, the write, then the run.
+// decline is a no or a dismissal (E8). no_answer is the 15-minute limit (E15),
+// which --next does not wait for.
+const ANSWERS = ["accept", "decline", "no_answer"] as const;
+// A repository's consent record: none, a record for this destination, or one for another destination.
+const CONSENTS = ["none", "dest", "other"] as const;
 const OUTCOMES = ["local", "remote", "isolated", "refused"] as const;
-// The answers that set the decline mark (RunnerSetup.tla Answer).
-const MARKING_ANSWERS: readonly string[] = ["decline", "cancel", "no_answer"];
+// The answers that set the decline mark (RunnerSetup.tla FormDecline).
+const MARKING_ANSWERS: readonly string[] = ["decline", "no_answer"];
+// Each repository is one folder, and each folder is one ACP session.
+const REPOS = ["A", "B"] as const;
 const EVENTS = [
   "push_ok", "push_failed", "stop_before_send", "send_ran", "send_not_run", "send_failed", "send_gone", "resumed",
   "id_arrives", "no_id", "cmd_edits", "cmd_deletes", "cmd_exits", "stream_end", "idle_close",
@@ -73,10 +79,11 @@ type Login = (typeof LOGINS)[number];
 type Surface = (typeof SURFACES)[number];
 type Answer = (typeof ANSWERS)[number];
 type Outcome = (typeof OUTCOMES)[number];
-type TeamCount = (typeof TEAM_COUNTS)[number];
+type Consent = (typeof CONSENTS)[number];
+type Repo = (typeof REPOS)[number];
 type RunEvent = (typeof EVENTS)[number];
 
-type CallInput = { req: Request; rule: Rule; floor: Floor; sub: boolean };
+type CallInput = { req: Request; rule: Rule; floor: Floor; sub: boolean; repo: Repo };
 
 type SetupObs = {
   calls: Record<string, CallInput>;
@@ -84,7 +91,12 @@ type SetupObs = {
   login: Login;
   configured: boolean;
   configValid: boolean;
-  teams: TeamCount;
+  // false when the destination does not resolve: no team, a team not found, or a set project missing.
+  destOk: boolean;
+  // fx-sandbox exists at the start.
+  sandbox: boolean;
+  // each repository's consent record at the start.
+  records: Record<string, Consent>;
   answers: Answer[];
   cancels: Record<string, number>;
   retries: Record<string, number>;
@@ -92,14 +104,20 @@ type SetupObs = {
   loginChange: null | { to: Login; before: string };
   outcomes: Record<string, Outcome[]>;
   prompts: number;
+  // yes answers: each one writes config.remote and the consent record.
   writes: number;
+  // fx-sandbox exists at the end.
+  sandboxAfter: boolean;
+  // each repository's consent record at the end.
+  recordsAfter: Record<string, Consent>;
 };
 
 type RunObs = { events: RunEvent[] };
 
 type SetupTamper =
   | "outcome-as-local" | "local-as-remote" | "refused-as-remote" | "extra-prompt"
-  | "prompt-after-decline" | "write-without-accept" | "prompt-without-channel" | "p2-skipped";
+  | "prompt-after-decline" | "write-without-yes" | "prompt-without-channel"
+  | "create-without-yes" | "consent-without-yes";
 type RunTamper =
   | "resend-after-unknown" | "resend-after-close" | "overwrite-mac" | "exit-without-kill"
   | "stop-before-id" | "early-bring-back" | "exit-code-lie" | "resend-without-resume"
@@ -109,13 +127,17 @@ type RunTamper =
 /// setup set's inputs.
 type Drive = {
   command?: string; // the command each call runs after its marker and pwd
-  teams?: number; // teams in the fake API, 1 or more
   faults?: Record<string, unknown>; // fake API faults, set before the run
   stop?: boolean; // run in the background, then stop it
   stopWhenExecSent?: boolean; // stop once the exec request reached the fake
   file?: string; // the repository file the command may change
   deletes?: boolean; // the command deletes `file` in the sandbox, so its bring back finds it gone (V9)
   macEdit?: boolean; // edit `file` on the Mac once the command changed it remotely
+  dismiss?: boolean; // the decline is a dismissal of the form, not a No
+  defaultTeam?: boolean; // false: the user has no defaultTeamId
+  cliTeam?: string; // the Vercel CLI's currentTeam, by team id
+  teamSetting?: string; // sandbox_team in settings.json, by slug
+  projectSetting?: string; // sandbox_project in settings.json
 };
 
 type Fixture = {
@@ -158,10 +180,16 @@ function callCounts(value: unknown, calls: string[], where: string): Record<stri
   return Object.fromEntries(calls.map((call) => [call, call in record ? count(record[call], `${where}.${call}`) : 0]));
 }
 
+function consentsIn(value: unknown, repos: string[], where: string): Record<string, Consent> {
+  const record = keysExactly(value, repos, where);
+  return Object.fromEntries(repos.map((repo) => [repo, oneOf(CONSENTS, record[repo], `${where}.${repo}`)]));
+}
+
 function parseSetup(value: unknown, where: string): SetupObs {
   const s = keysExactly(value, [
-    "calls", "surface", "login", "configured", "configValid", "teams", "answers", "cancels", "retries",
-    "newTurns", "loginChange", "outcomes", "prompts", "writes",
+    "calls", "surface", "login", "configured", "configValid", "destOk", "sandbox", "records",
+    "answers", "cancels", "retries", "newTurns", "loginChange", "outcomes", "prompts", "writes",
+    "sandboxAfter", "recordsAfter",
   ], where);
   const callsIn = keysExactly(s.calls, [], `${where}.calls`, Object.keys(s.calls ?? {}));
   const names = Object.keys(callsIn).sort();
@@ -169,17 +197,24 @@ function parseSetup(value: unknown, where: string): SetupObs {
   const calls: Record<string, CallInput> = {};
   for (const name of names) {
     expect(/^c[1-9]$/.test(name), `${where}.calls`, `call names are c1, c2: ${name}`);
-    const c = keysExactly(callsIn[name], ["req", "rule", "floor", "sub"], `${where}.calls.${name}`);
+    const c = keysExactly(callsIn[name], ["req", "rule", "floor", "sub", "repo"], `${where}.calls.${name}`);
     expect(typeof c.sub === "boolean", `${where}.calls.${name}.sub`, "must be a boolean");
     calls[name] = {
       req: oneOf(REQUESTS, c.req, `${where}.calls.${name}.req`),
       rule: oneOf(RULES, c.rule, `${where}.calls.${name}.rule`),
       floor: oneOf(FLOORS, c.floor, `${where}.calls.${name}.floor`),
       sub: c.sub,
+      repo: oneOf(REPOS, c.repo, `${where}.calls.${name}.repo`),
     };
   }
-  expect(typeof s.configured === "boolean" && typeof s.configValid === "boolean", where, "configured and configValid are booleans");
+  const repos = [...new Set(names.map((name) => calls[name]!.repo))].sort();
+  for (const key of ["configured", "configValid", "destOk", "sandbox", "sandboxAfter"]) {
+    expect(typeof s[key] === "boolean", `${where}.${key}`, "must be a boolean");
+  }
+  const records = consentsIn(s.records, repos, `${where}.records`);
+  const recordsAfter = consentsIn(s.recordsAfter, repos, `${where}.recordsAfter`);
   expect(Array.isArray(s.answers), `${where}.answers`, "must be a list");
+  const answers = s.answers.map((a: unknown, i: number) => oneOf(ANSWERS, a, `${where}.answers[${i}]`));
   let loginChange: SetupObs["loginChange"] = null;
   if (s.loginChange !== null) {
     const change = keysExactly(s.loginChange, ["to", "before"], `${where}.loginChange`);
@@ -193,14 +228,27 @@ function parseSetup(value: unknown, where: string): SetupObs {
     expect(Array.isArray(outcomesIn[name]) && outcomesIn[name].length > 0, `${where}.outcomes.${name}`, "a non-empty list");
     outcomes[name] = outcomesIn[name].map((o: unknown, i: number) => oneOf(OUTCOMES, o, `${where}.outcomes.${name}[${i}]`));
   }
+  // A consent record for this destination needs the destination to exist (the
+  // model's readiness reads the project, and the fake has no other way to show it).
+  for (const repo of repos) {
+    expect(records[repo] !== "dest" || (s.sandbox && s.destOk), `${where}.records.${repo}`,
+      "a record for this destination needs fx-sandbox and a resolved destination");
+    expect(recordsAfter[repo] !== "dest" || s.sandboxAfter, `${where}.recordsAfter.${repo}`,
+      "a record for this destination needs fx-sandbox at the end");
+  }
+  expect(!s.sandbox || s.sandboxAfter, `${where}.sandboxAfter`, "fx-sandbox does not go away");
+  expect(s.sandbox || !s.sandboxAfter || answers.includes("accept"), `${where}.sandboxAfter`,
+    "fx-sandbox is made only after a yes");
   return {
     calls,
     surface: oneOf(SURFACES, s.surface, `${where}.surface`),
     login: oneOf(LOGINS, s.login, `${where}.login`),
     configured: s.configured,
     configValid: s.configValid,
-    teams: oneOf(TEAM_COUNTS, s.teams, `${where}.teams`),
-    answers: s.answers.map((a: unknown, i: number) => oneOf(ANSWERS, a, `${where}.answers[${i}]`)),
+    destOk: s.destOk,
+    sandbox: s.sandbox,
+    records,
+    answers,
     cancels: callCounts(s.cancels, names, `${where}.cancels`),
     retries: callCounts(s.retries, names, `${where}.retries`),
     newTurns: count(s.newTurns, `${where}.newTurns`),
@@ -208,6 +256,8 @@ function parseSetup(value: unknown, where: string): SetupObs {
     outcomes,
     prompts: count(s.prompts, `${where}.prompts`),
     writes: count(s.writes, `${where}.writes`),
+    sandboxAfter: s.sandboxAfter,
+    recordsAfter,
   };
 }
 
@@ -219,7 +269,8 @@ function parseRun(value: unknown, where: string): RunObs {
 
 const SETUP_TAMPERS: SetupTamper[] = [
   "outcome-as-local", "local-as-remote", "refused-as-remote", "extra-prompt",
-  "prompt-after-decline", "write-without-accept", "prompt-without-channel", "p2-skipped",
+  "prompt-after-decline", "write-without-yes", "prompt-without-channel",
+  "create-without-yes", "consent-without-yes",
 ];
 const RUN_TAMPERS: RunTamper[] = [
   "resend-after-unknown", "resend-after-close", "overwrite-mac", "exit-without-kill",
@@ -238,11 +289,10 @@ function parseFixture(path: string): Fixture {
   const tamperIn = keysExactly(f.tamper, [], `${name}.tamper`, ["setup", "run"]);
   expect((tamperIn.setup !== undefined) === (setup !== undefined), `${name}.tamper.setup`, "one tamper for the setup set");
   expect((tamperIn.run !== undefined) === (run !== undefined), `${name}.tamper.run`, "one tamper for the run set");
-  const drive = keysExactly(f.drive, [], `${name}.drive`, ["command", "teams", "faults", "stop", "stopWhenExecSent", "file", "macEdit", "deletes"]);
-  if (setup !== undefined) {
-    const driveTeams = (drive as Drive).teams ?? 1;
-    expect((setup.teams === "many") === (driveTeams >= 2), name, "setup.teams and drive.teams must agree");
-  }
+  const drive = keysExactly(f.drive, [], `${name}.drive`, [
+    "command", "faults", "stop", "stopWhenExecSent", "file", "deletes", "macEdit",
+    "dismiss", "defaultTeam", "cliTeam", "teamSetting", "projectSetting",
+  ]);
   return {
     name,
     covers: f.covers,
@@ -293,7 +343,7 @@ function tamperSetup(s: SetupObs, kind: SetupTamper): { set: SetupObs; why: stri
       t.prompts += 1;
       t.writes += 1;
       t.answers.push("accept");
-      return { set: t, why: "one more prompt, accepted and written" };
+      return { set: t, why: "one more copy question, answered yes and written" };
     case "prompt-after-decline": {
       const at = t.answers.findIndex((a) => MARKING_ANSWERS.includes(a));
       if (at < 0) throw new FixtureError("prompt-after-decline needs a decline");
@@ -301,28 +351,28 @@ function tamperSetup(s: SetupObs, kind: SetupTamper): { set: SetupObs; why: stri
       t.prompts += 1;
       t.writes += 1;
       const why = set(findOutcome(t, (o) => o === "refused", true), "remote");
-      return { set: t, why: `a prompt after the ${t.answers[at]}, accepted; ${why}` };
+      return { set: t, why: `a copy question after the ${t.answers[at]} in the same turn, answered yes; ${why}` };
     }
-    case "write-without-accept":
+    case "write-without-yes":
       t.writes += 1;
-      return { set: t, why: "a config write without an accept" };
-    case "p2-skipped": {
-      // A team accept, then no project prompt: the config is written anyway.
-      const at = t.answers.indexOf("team_accept");
-      if (at < 0 || at + 1 >= t.answers.length) {
-        throw new FixtureError("p2-skipped needs a team accept followed by a project answer");
-      }
-      t.answers.splice(at + 1, 1);
-      t.prompts -= 1;
-      t.writes += 1;
-      return { set: t, why: "the project prompt after the team accept is skipped, and the config is written" };
+      return { set: t, why: "a write of config.remote without a yes" };
+    case "create-without-yes": {
+      if (t.sandboxAfter) throw new FixtureError("create-without-yes needs fx-sandbox missing at the end");
+      t.sandboxAfter = true;
+      return { set: t, why: "fx-sandbox made without a yes" };
+    }
+    case "consent-without-yes": {
+      const repo = Object.keys(t.recordsAfter).sort().find((r) => t.recordsAfter[r] !== "dest");
+      if (repo === undefined) throw new FixtureError("consent-without-yes needs a repository without a record for this destination at the end");
+      t.recordsAfter[repo] = "dest";
+      return { set: t, why: `repository ${repo} gets a consent record without a yes` };
     }
     case "prompt-without-channel": {
       t.prompts += 1;
       t.writes += 1;
       t.answers.push("accept");
       const why = set(findOutcome(t, (o) => o === "refused"), "remote");
-      return { set: t, why: `a prompt without a prompt channel, accepted; ${why}` };
+      return { set: t, why: `a copy question without a prompt channel, answered yes; ${why}` };
     }
   }
 }
@@ -386,17 +436,23 @@ function perCall(calls: string[], value: (call: string) => string): string {
 
 function setupModule(s: SetupObs): string {
   const calls = Object.keys(s.calls).sort();
+  const repos = [...new Set(calls.map((c) => s.calls[c]!.repo))].sort();
   const lines = [
     "------------------------- MODULE RunnerSetupObserved -------------------------",
     "\\* Generated by tests/tla/drivers/runner/driver.ts.",
     `ObsReq == ${perCall(calls, (c) => str(s.calls[c]!.req))}`,
     `ObsRule == ${perCall(calls, (c) => str(s.calls[c]!.rule))}`,
     `ObsFloor == ${perCall(calls, (c) => str(s.calls[c]!.floor))}`,
+    `ObsRepo == ${perCall(calls, (c) => str(s.calls[c]!.repo))}`,
     `ObsSurface == ${str(s.surface)}`,
     `ObsLogin == ${str(s.login)}`,
     `ObsConfigured == ${bool(s.configured)}`,
     `ObsConfigValid == ${bool(s.configValid)}`,
-    `ObsTeams == ${str(s.teams)}`,
+    `ObsDestOk == ${bool(s.destOk)}`,
+    `ObsSandbox == ${bool(s.sandbox)}`,
+    `ObsSandboxEnd == ${bool(s.sandboxAfter)}`,
+    `ObsRecords == ${perCall(repos, (r) => str(s.records[r]!))}`,
+    `ObsRecordsEnd == ${perCall(repos, (r) => str(s.recordsAfter[r]!))}`,
     `ObsAnswers == ${tuple(s.answers.map(str))}`,
     `ObsCancels == ${perCall(calls, (c) => String(s.cancels[c] ?? 0))}`,
     `ObsRetries == ${perCall(calls, (c) => String(s.retries[c] ?? 0))}`,
@@ -412,16 +468,31 @@ function setupModule(s: SetupObs): string {
   return lines.join("\n");
 }
 
+/// The trace constants: each input domain is the one value the run observed,
+/// so TraceInit has exactly one initial state. Repos, calls and records are the
+/// ones in the fixture.
 function setupCfg(s: SetupObs): string {
   const calls = Object.keys(s.calls).sort();
   const subs = calls.filter((c) => s.calls[c]!.sub);
+  const repos = [...new Set(calls.map((c) => s.calls[c]!.repo))].sort();
+  const set = (values: string[]) => `{${[...new Set(values)].map(str).join(", ")}}`;
   return [
     "INIT TraceInit",
     "NEXT TraceStep",
     "CONSTANTS",
     `    Calls = {${calls.map(str).join(", ")}}`,
     `    SubCalls = {${subs.map(str).join(", ")}}`,
-    `    Requests = {"none", "local", "remote"}`,
+    `    Repos = {${repos.map(str).join(", ")}}`,
+    `    Requests = ${set(calls.map((c) => s.calls[c]!.req))}`,
+    `    RuleChoices = ${set(calls.map((c) => s.calls[c]!.rule))}`,
+    `    FloorChoices = ${set(calls.map((c) => s.calls[c]!.floor))}`,
+    `    SurfaceChoices = ${set([s.surface])}`,
+    `    LoginChoices = ${set([s.login])}`,
+    `    ConfiguredChoices = {${bool(s.configured)}}`,
+    `    ValidChoices = {${bool(s.configValid)}}`,
+    `    DestChoices = {${bool(s.destOk)}}`,
+    `    SandboxChoices = {${bool(s.sandbox)}}`,
+    `    RecordChoices = ${set(repos.map((r) => s.records[r]!))}`,
     `    MaxAttempts = ${Math.max(0, ...Object.values(s.retries))}`,
     `    MaxTurns = ${s.newTurns + 1}`,
     `    Bug = "none"`,
@@ -556,7 +627,7 @@ async function selfCheck(only: string | null, parallel: number): Promise<number>
 //
 // Written against the shell runner contracts (decide, admission, readiness
 // and setup, the runner contract, the remote runner, errors E1 to E15 and
-// notes N1 to N16, the config file, prompts P1 and P2). It needs
+// notes N1 to N16, the config file, and the copy question). It needs
 // src/core/runner/ and stops with a message without it.
 
 const NEXT_MODEL = "openai/gpt-5.5";
@@ -695,24 +766,38 @@ async function schemaBlocker(): Promise<string | null> {
   }
 }
 
-function sandboxConfig(f: Fixture, s: SetupObs, workspace: string): string {
-  if (!s.configValid) return "{\"rules\": 3}\n";
-  const calls = Object.keys(s.calls).sort();
-  const floors = new Set(calls.map((c) => s.calls[c]!.floor));
-  if (floors.size !== 1) throw new HarnessError(`${f.name}: --next runs one workspace, so every call needs the same floor`);
-  const floor = [...floors][0]!;
+// The fake account's destinations (tests/e2e/fixtures/fake-vercel-api.ts). A
+// scenario's destination is TEAM_ONE and fx-sandbox, unless it names others.
+const TEAM_ONE = { id: "team_fake_1", slug: "fake-one", name: "Fake 1" };
+const TEAM_TWO = { id: "team_fake_2", slug: "fake-two", name: "Fake 2" };
+const FAKE_WEB = { id: "prj_fake_1", name: "fake-web" };
+const SANDBOX_PROJECT = { id: "prj_sandbox", name: "fx-sandbox" };
+
+/// A scenario's sandbox config: its rules, each repository's floor, and the
+/// remote slot when the scenario starts configured (for the login's user, on
+/// the default destination).
+function sandboxConfig(f: Fixture, world: SetupObs, paths: Record<Repo, string>): string {
+  if (!world.configValid) return "{\"rules\": 3}\n";
+  const calls = Object.keys(world.calls).sort();
   const config: Record<string, unknown> = {};
-  const rules = calls.filter((c) => s.calls[c]!.rule !== "none")
-    .map((c) => ({ command: commandFor(f, c), runner: s.calls[c]!.rule }));
+  const rules = calls.filter((c) => world.calls[c]!.rule !== "none")
+    .map((c) => ({ command: commandFor(f, c), runner: world.calls[c]!.rule }));
   if (rules.length > 0) config.rules = rules;
-  if (floor !== "none") config.workspaces = { [workspace]: floor };
-  if (s.configured) {
+  const workspaces: Record<string, string> = {};
+  for (const repo of new Set(calls.map((c) => world.calls[c]!.repo))) {
+    const floors = new Set(calls.filter((c) => world.calls[c]!.repo === repo).map((c) => world.calls[c]!.floor));
+    if (floors.size !== 1) throw new HarnessError(`${f.name}: the calls in one repository need the same floor`);
+    const floor = [...floors][0]!;
+    if (floor !== "none") workspaces[paths[repo]] = floor;
+  }
+  if (Object.keys(workspaces).length > 0) config.workspaces = workspaces;
+  if (world.configured) {
     config.remote = {
       backend: "vercel",
-      team_id: "team_fake_1",
-      team_slug: "fake-one",
-      project_id: "prj_fake_1",
-      project_name: "fake-web",
+      team_id: TEAM_ONE.id,
+      team_slug: TEAM_ONE.slug,
+      project_id: SANDBOX_PROJECT.id,
+      project_name: SANDBOX_PROJECT.name,
       user_id: USER.id,
       confirmed_at: "2026-01-01T00:00:00Z",
     };
@@ -720,18 +805,20 @@ function sandboxConfig(f: Fixture, s: SetupObs, workspace: string): string {
   return `${JSON.stringify(config, null, 2)}\n`;
 }
 
-function writeLogin(home: string, login: Login) {
-  // The Vercel CLI's auth.json in both places fx reads it (macOS and XDG).
+function writeLogin(home: string, login: Login, cliTeam: string | null) {
+  // The Vercel CLI's auth.json and config.json in both places fx reads them (macOS and XDG).
   const places = [
     join(home, "Library", "Application Support", "com.vercel.cli"),
     join(home, ".local", "share", "com.vercel.cli"),
   ];
   for (const place of places) {
     rmSync(join(place, "auth.json"), { force: true });
+    rmSync(join(place, "config.json"), { force: true });
     if (login === "none") continue;
     mkdirSync(place, { recursive: true });
     const expiresAt = login === "expired" ? Math.floor(Date.now() / 1000) - 3600 : Math.floor(Date.now() / 1000) + 86_400;
     writeFileSync(join(place, "auth.json"), JSON.stringify({ token: login === "other_user" ? OTHER_TOKEN : VALID_TOKEN, expiresAt }));
+    if (cliTeam !== null) writeFileSync(join(place, "config.json"), JSON.stringify({ currentTeam: cliTeam }));
   }
 }
 
@@ -787,48 +874,91 @@ class Acp {
 
 type NextObservation = { setup?: SetupObs; run?: RunObs; problems: string[] };
 
+/// The world a fixture starts from. A run-only fixture starts ready: the default
+/// destination, fx-sandbox, and the consent of its repository.
+function worldOf(f: Fixture): SetupObs {
+  if (f.setup) return f.setup;
+  return {
+    calls: { c1: { req: "remote", rule: "none", floor: "none", sub: false, repo: "A" } },
+    surface: "interactive",
+    login: "valid",
+    configured: true,
+    configValid: true,
+    destOk: true,
+    sandbox: true,
+    records: { A: "dest" },
+    answers: [],
+    cancels: {},
+    retries: {},
+    newTurns: 0,
+    loginChange: null,
+    outcomes: { c1: ["remote"] },
+    prompts: 0,
+    writes: 0,
+    sandboxAfter: true,
+    recordsAfter: { A: "dest" },
+  };
+}
+
 async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> {
   const s = f.setup;
+  const world = worldOf(f);
   const { startDynamicFakeGateway, fakeGatewaySse, fakeGatewayFinalText } = await targetHelpers();
   const evalHelpers = await import(pathToFileURL(join(worktree, "tests", "evals", "eval-helpers.ts")).href);
   const { startFakeVercelApi } = await import(pathToFileURL(join(worktree, "tests", "e2e", "fixtures", "fake-vercel-api.ts")).href);
+  const remoteSetup = await import(pathToFileURL(join(worktree, "tests", "e2e", "remote-setup-fixture.ts")).href);
   // The real path, so the pwd a local run prints matches it.
   const home: string = realpathSync(evalHelpers.createIsolatedTestHome());
-  const workspace = join(home, "work", "repo");
+  const repos = [...new Set(Object.values(world.calls).map((c) => c.repo))].sort() as Repo[];
+  // No folder name is a prefix of another: the fake API rewrites Mac paths with a plain string replace.
+  const paths = Object.fromEntries(REPOS.map((repo) => [repo, join(home, "work", repo === "A" ? "repo" : "second-repo")])) as Record<Repo, string>;
+  for (const repo of repos) mkdirSync(paths[repo], { recursive: true });
   mkdirSync(join(home, ".fx", "sandbox"), { recursive: true, mode: 0o700 });
-  mkdirSync(workspace, { recursive: true });
   const problems: string[] = [];
-  const file = f.drive.file ? join(workspace, f.drive.file) : null;
+  const file = f.drive.file ? join(paths.A, f.drive.file) : null;
   const pushed = "mac version 0\n";
   if (file) writeFileSync(file, pushed);
-  const surface: Surface = s?.surface ?? "interactive";
-  const calls = s ? Object.keys(s.calls).sort() : ["c1"];
-  const inputs: Record<string, CallInput> = s?.calls ?? { c1: { req: "remote", rule: "none", floor: "none", sub: false } };
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
-    experimental: { sandbox_execution: true },
-    permission_mode: "full-access",
-  }));
+  const surface: Surface = world.surface;
+  const calls = Object.keys(world.calls).sort();
+  const repoOf = (call: string): Repo => world.calls[call]!.repo;
+  const settings: Record<string, unknown> = { experimental: { sandbox_execution: true }, permission_mode: "full-access" };
+  if (f.drive.teamSetting !== undefined) settings.sandbox_team = f.drive.teamSetting;
+  if (f.drive.projectSetting !== undefined) settings.sandbox_project = f.drive.projectSetting;
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify(settings));
   const configPath = join(home, ".fx", "sandbox", "config.json");
-  writeFileSync(configPath, s ? sandboxConfig(f, s, workspace) : sandboxConfig(f, {
-    calls: inputs, surface, login: "valid", configured: true, configValid: true, answers: [], cancels: {}, retries: {},
-    newTurns: 0, loginChange: null, outcomes: { c1: ["remote"] }, prompts: 0, writes: 0,
-  }, workspace), { mode: 0o600 });
-  writeLogin(home, s?.login ?? "valid");
+  writeFileSync(configPath, sandboxConfig(f, world, paths), { mode: 0o600 });
+  writeLogin(home, world.login, f.drive.cliTeam ?? null);
+  // The consent records start as the fixture says, for the login's user.
+  const loginUser = world.login === "other_user" ? OTHER_USER : USER;
+  for (const repo of repos) {
+    const record = world.records[repo] ?? "none";
+    if (record !== "none") {
+      remoteSetup.seedConsent(home, loginUser.id, paths[repo], TEAM_ONE.id, record === "dest" ? SANDBOX_PROJECT.id : FAKE_WEB.id);
+    }
+  }
 
   let loginChanged = false;
-  const teams = Array.from({ length: f.drive.teams ?? 1 }, (_, i) => ({ id: `team_fake_${i + 1}`, slug: `fake-${i + 1}`, name: `Fake ${i + 1}` }));
+  const defaultTeamId = f.drive.defaultTeam === false ? null : TEAM_ONE.id;
   const api = startFakeVercelApi({
-    users: { [VALID_TOKEN]: USER, [OTHER_TOKEN]: OTHER_USER, [TEST_TOKEN]: (s?.login ?? "valid") === "other_user" ? OTHER_USER : USER },
-    teams,
-    projects: { team_fake_1: [{ id: "prj_fake_1", name: "fake-web" }] },
+    users: {
+      [VALID_TOKEN]: { ...USER, defaultTeamId },
+      [OTHER_TOKEN]: { ...OTHER_USER, defaultTeamId },
+      [TEST_TOKEN]: { ...(world.login === "other_user" ? OTHER_USER : USER), defaultTeamId },
+    },
+    teams: [TEAM_ONE, TEAM_TWO],
+    projects: {
+      [TEAM_ONE.id]: world.sandbox ? [FAKE_WEB, SANDBOX_PROJECT] : [FAKE_WEB],
+      [TEAM_TWO.id]: [],
+    },
     privateRoot: join(home, "vercel-private"),
-    macRoots: [workspace],
-    // A login change "before" a call lands after fx checked the login and
-    // before the runner reads it again (V1).
+    macRoots: repos.map((repo) => paths[repo]),
+    // A login change lands after fx read the login and before it is read again (V1):
+    // the test override signs in the other account from then on, and the login file changes too.
     afterRequest: (entry: { route: string }) => {
-      if (s?.loginChange && !loginChanged && entry.route === "user") {
+      if (world.loginChange && !loginChanged && entry.route === "user") {
         loginChanged = true;
-        writeLogin(home, s.loginChange.to);
+        api.signInAs(TEST_TOKEN, OTHER_USER);
+        writeLogin(home, world.loginChange.to, f.drive.cliTeam ?? null);
       }
     },
   });
@@ -841,16 +971,11 @@ async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> 
   let prompts = 0;
   const cancelsLeft: Record<string, number> = { ...(s?.cancels ?? {}) };
   const cancels: Record<string, number> = Object.fromEntries(calls.map((c) => [c, 0]));
-  // ACP only: fx's own status for each tool call, the stop reason of each prompt,
-  // and each call the driver cancelled, with the turn it was cancelled in.
+  // ACP only: fx's own status for each tool call, the stop reason of each prompt
+  // by repository and turn, and each call the driver cancelled, with its turn.
   const toolStatus = new Map<string, string>();
-  const stopReasons = new Map<number, string>();
+  const stopReasons = new Map<string, string>();
   const cancelledAt: Array<{ call: string; turn: number }> = [];
-  const configSnapshots: string[] = [readFileSync(configPath, "utf8")];
-  const snapshotConfig = () => {
-    const now = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
-    if (now !== configSnapshots.at(-1)) configSnapshots.push(now);
-  };
   let stopAt: number | null = null;
   let cmdEditAt: number | null = null;
   let macEditAt: number | null = null;
@@ -864,7 +989,7 @@ async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> 
       request: {
         action: "run",
         command: commandFor(f, call),
-        ...(inputs[call]!.req === "none" ? {} : { runner: inputs[call]!.req }),
+        ...(world.calls[call]!.req === "none" ? {} : { runner: world.calls[call]!.req }),
         yield_time_ms: f.drive.stop ? 0 : 60_000,
       },
     },
@@ -872,18 +997,20 @@ async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> 
   const finishToolCalls = { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } };
 
   const gateway = startDynamicFakeGateway(async (body: string) => {
-    snapshotConfig();
     const seen = toolResults(body);
     for (const [id, text] of seen) {
       const parsed = parseCallId(id);
       if (parsed && !results.has(id)) results.set(id, { id, ...parsed, text, json: parseJson(text) });
     }
+    // The prompt names the repository of its session, so each session sees only its own calls.
+    const label = (/for repo ([AB]), turn/.exec(body)?.[1] ?? repos[0]) as Repo;
+    const session = calls.filter((c) => repoOf(c) === label);
     // A scenario with no sub-agent call has no child. The subagent tool is not
     // advertised on every surface, so its absence does not mark a child.
-    const isChild = calls.some((c) => inputs[c]!.sub) && !body.includes("\"name\":\"subagent\"");
-    const mine = calls.filter((c) => inputs[c]!.sub === isChild);
-    if (!isChild && calls.some((c) => inputs[c]!.sub)) {
-      const delegate = `sub_t${turn}`;
+    const isChild = session.some((c) => world.calls[c]!.sub) && !body.includes("\"name\":\"subagent\"");
+    const mine = session.filter((c) => world.calls[c]!.sub === isChild);
+    if (!isChild && session.some((c) => world.calls[c]!.sub)) {
+      const delegate = `sub_${label}_t${turn}`;
       if (!seen.has(delegate)) {
         return fakeGatewaySse([{
           type: "tool-call",
@@ -954,18 +1081,21 @@ async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> 
   let headlessMs = 0;
   try {
     if (surface === "headless") {
-      const started = Date.now();
-      const proc = Bun.spawn([binary, "ask", "--json", "--no-save", "Run the runner fixture."], {
-        cwd: workspace, env, stdout: "pipe", stderr: "pipe",
-      });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
-      ]);
-      headlessMs = Date.now() - started;
-      writeFileSync(join(dir, "fx-ask.log"), `exit ${exitCode}\n${stdout}\n[stderr]\n${stderr}\n`);
+      for (const repo of repos) {
+        const started = Date.now();
+        const proc = Bun.spawn([binary, "ask", "--json", "--no-save", `Run the runner fixture for repo ${repo}, turn 1.`], {
+          cwd: paths[repo], env, stdout: "pipe", stderr: "pipe",
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+        ]);
+        headlessMs += Date.now() - started;
+        writeFileSync(join(dir, `fx-ask-${repo}.log`), `exit ${exitCode}\n${stdout}\n[stderr]\n${stderr}\n`);
+      }
     } else {
-      const acp = new Acp(Bun.spawn([binary, "acp"], { cwd: workspace, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" }));
-      const onMessage = (m: any) => {
+      const acps = new Map<Repo, Acp>();
+      const sessionIds = new Map<Repo, string>();
+      const onMessageFor = (repo: Repo, acp: Acp) => (m: any) => {
         if (m.method === "session/request_permission" && m.id !== undefined) {
           acp.send({ id: m.id, result: { outcome: { outcome: "selected", optionId: "allow_once" } } });
         }
@@ -974,12 +1104,10 @@ async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> 
           if (typeof update.toolCallId === "string" && typeof update.status === "string") toolStatus.set(update.toolCallId, update.status);
         }
         if (m.method !== "elicitation/create" || m.id === undefined) return;
-        snapshotConfig();
         const message = String(m.params?.message ?? "");
         if (!message.startsWith("fx asks: ")) problems.push(`elicitation without the fx asks prefix: ${message}`);
-        const isTeam = message.includes("Which Vercel team");
         prompts += 1;
-        const pending = calls.find((c) => (cancelsLeft[c] ?? 0) > 0);
+        const pending = calls.find((c) => repoOf(c) === repo && (cancelsLeft[c] ?? 0) > 0);
         if (pending) {
           cancelsLeft[pending]! -= 1;
           cancels[pending]! += 1;
@@ -989,54 +1117,53 @@ async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> 
         }
         const answer = answersLeft.shift();
         if (answer === undefined) {
-          problems.push(`an elicitation with no scripted answer: ${message}`);
+          problems.push(`a copy question with no scripted answer: ${message}`);
           acp.send({ id: m.id, result: { action: "cancel" } });
           return;
         }
         if (answer === "no_answer") throw new HarnessError("no_answer waits 15 minutes; --next does not drive it");
-        const kindAnswers: readonly string[] = isTeam ? TEAM_PROMPT_ANSWERS : PROJECT_PROMPT_ANSWERS;
-        if (!kindAnswers.includes(answer)) {
-          problems.push(`the ${isTeam ? "team" : "project"} prompt was scripted ${answer}`);
+        if (!message.includes("Copy this repository to Vercel team")) {
+          problems.push(`an elicitation that is not the copy question: ${message}`);
           acp.send({ id: m.id, result: { action: "cancel" } });
           return;
         }
         answered.push(answer);
-        if (answer === "decline" || answer === "cancel") {
-          acp.send({ id: m.id, result: { action: answer } });
+        if (answer === "decline") {
+          if (f.drive.dismiss) acp.send({ id: m.id, result: { action: "decline" } });
+          else acp.send({ id: m.id, result: { action: "accept", content: { copy: "No" } } });
           return;
         }
-        const schema = m.params?.requestedSchema?.properties ?? {};
-        const field = isTeam ? "team" : "project";
-        const options: Array<{ const: string }> = schema[field]?.oneOf ?? [];
-        const content: Record<string, string> = { [field]: options[0]?.const ?? "__create__" };
-        // rest_fail: the client picks "Another project" and types a name the fake does not know (U6, E9).
-        // The product reads the typed name only when that choice is picked (`projectAnswer` in `src/core/runner/setup_host.zig`).
-        if (answer === "rest_fail" && !isTeam) {
-          content.project = "__other__";
-          content.other_project = "fx-missing-project";
-        }
-        acp.send({ id: m.id, result: { action: "accept", content } });
+        acp.send({ id: m.id, result: { action: "accept", content: { copy: "Yes" } } });
       };
       try {
-        await acp.request(1, "initialize", { protocolVersion: 1, clientCapabilities: { elicitation: { form: {} } } });
-        const created = await acp.request(2, "session/new", { cwd: workspace, mcpServers: [] });
-        if (created.error) throw new HarnessError(`session/new failed: ${JSON.stringify(created.error)}`);
+        for (const repo of repos) {
+          const acp = new Acp(Bun.spawn([binary, "acp"], { cwd: paths[repo], env, stdin: "pipe", stdout: "pipe", stderr: "pipe" }));
+          acps.set(repo, acp);
+          await acp.request(1, "initialize", { protocolVersion: 1, clientCapabilities: { elicitation: { form: {} } } });
+          const created = await acp.request(2, "session/new", { cwd: paths[repo], mcpServers: [] });
+          if (created.error) throw new HarnessError(`session/new failed: ${JSON.stringify(created.error)}`);
+          sessionIds.set(repo, created.result.sessionId);
+        }
         for (; turn <= (s?.newTurns ?? 0) + 1; turn += 1) {
-          const reply = await acp.request(10 + turn, "session/prompt", {
-            sessionId: created.result.sessionId,
-            prompt: [{ type: "text", text: `Run the runner fixture, turn ${turn}.` }],
-          }, onMessage);
-          stopReasons.set(turn, String(reply.result?.stopReason ?? ""));
+          for (const repo of repos) {
+            const acp = acps.get(repo)!;
+            const reply = await acp.request(10 + turn, "session/prompt", {
+              sessionId: sessionIds.get(repo),
+              prompt: [{ type: "text", text: `Run the runner fixture for repo ${repo}, turn ${turn}.` }],
+            }, onMessageFor(repo, acp));
+            stopReasons.set(`${repo}:${turn}`, String(reply.result?.stopReason ?? ""));
+          }
         }
         turn -= 1;
       } finally {
-        writeFileSync(join(dir, "fx-acp.stderr"), acp.stderr);
-        acp.close();
+        for (const [repo, acp] of acps) {
+          writeFileSync(join(dir, `fx-acp-${repo}.stderr`), acp.stderr);
+          acp.close();
+        }
       }
     }
   } finally {
     clearInterval(watcher);
-    snapshotConfig();
     gateway.stop();
   }
   writeFileSync(join(dir, "vercel-log.json"), `${JSON.stringify(api.log, null, 2)}\n`);
@@ -1044,7 +1171,7 @@ async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> 
 
   const commands: Array<any> = api.commands();
   // Where a call ran, from positive evidence only: its exec in the fake, or
-  // the local workspace path that its pwd printed.
+  // the local folder path that its pwd printed.
   const whereRan = (result: ToolResult): Outcome => {
     if (result.json?.error?.executed === false) {
       problems.push(`${result.id} was refused as an invalid request: ${result.text}`);
@@ -1053,10 +1180,11 @@ async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> 
     if (refused(result)) return "refused";
     const ran = commands.find((cmd) => cmd.kind === "exec" && cmd.args.join(" ").includes(marker(result.call)));
     if (ran) return ran.sandbox.startsWith("fx-iso-") ? "isolated" : "remote";
-    // A local run prints its own pwd. The floor notice names the workspace too,
+    // A local run prints its own pwd. The floor notice names the folder too,
     // so only the command's output counts as evidence.
+    const root = paths[repoOf(result.call)];
     const output = String(result.json?.output_delta ?? "");
-    if (output.includes(workspace) && !output.includes(api.remotePath(workspace))) return "local";
+    if (output.includes(root) && !output.includes(api.remotePath(root))) return "local";
     problems.push(`${result.id}: cannot tell where it ran: ${result.text.slice(0, 200)}`);
     return "refused";
   };
@@ -1068,9 +1196,23 @@ async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> 
     const prefix = `${cancel.call}_t${cancel.turn}_`;
     const statuses = [...toolStatus.entries()].filter(([id]) => id.startsWith(prefix)).map(([, status]) => status);
     if (statuses.some((status) => status === "failed" || status === "canceled")) return "refused";
-    if (stopReasons.get(cancel.turn) === "cancelled") return "refused";
+    if (stopReasons.get(`${repoOf(cancel.call)}:${cancel.turn}`) === "cancelled") return "refused";
     problems.push(`${cancel.call}: cancelled in turn ${cancel.turn}, with no tool status or cancelled stop reason`);
     return null;
+  };
+
+  // The consent record of each repository at the end: "dest" when it is the
+  // record of the destination now in the sandbox config, "other" for any other.
+  const consentsAfter = (): Record<string, Consent> => {
+    const config = existsSync(configPath) ? parseJson(readFileSync(configPath, "utf8")) : null;
+    const slot = config?.remote ?? null;
+    return Object.fromEntries(repos.map((repo): [string, Consent] => {
+      const file = join(home, ".fx", "sandbox", "state", remoteSetup.repoKeyFor(loginUser.id, paths[repo]), "consent.json");
+      if (!existsSync(file)) return [repo, "none"];
+      const record = parseJson(readFileSync(file, "utf8"));
+      const same = slot !== null && record?.team_id === slot.team_id && record?.project_id === slot.project_id;
+      return [repo, same ? "dest" : "other"];
+    })) as Record<string, Consent>;
   };
 
   let setup: SetupObs | undefined;
@@ -1099,8 +1241,14 @@ async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> 
       loginChange: s.loginChange && loginChanged ? s.loginChange : null,
       outcomes,
       prompts: surface === "headless" ? 0 : prompts,
-      writes: configSnapshots.length - 1,
+      // Each yes runs the locked write of config.remote and the consent record.
+      writes: answered.filter((a) => a === "accept").length,
+      sandboxAfter: world.sandbox || api.log.some((e) => e.route === "createProject" && e.status === 200),
+      recordsAfter: consentsAfter(),
     };
+    if (setup.writes > 0 && !Object.values(setup.recordsAfter).includes("dest")) {
+      problems.push(`${f.name}: a yes wrote no consent record for its destination`);
+    }
   }
 
   let run: RunObs | undefined;
