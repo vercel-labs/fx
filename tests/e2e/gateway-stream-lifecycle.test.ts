@@ -10363,7 +10363,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               "-j",
               "DROP",
             ];
-            execFileSync("sudo", ["iptables", "-I", ...args]);
+            execFileSync("sudo", ["-n", "iptables", "-I", ...args]);
             iptablesRuleArgs = args;
             socket.write(
               "HTTP/1.1 200 OK\r\n" +
@@ -10428,14 +10428,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(requestSockets.size).toBe(2);
         expect(trace).toContain("socket_err=ConnectionTimedOut");
       } finally {
-        if (iptablesRuleArgs) {
-          spawnSync("sudo", ["iptables", "-D", ...iptablesRuleArgs]);
-        }
+        const ruleRemoval = iptablesRuleArgs
+          ? spawnSync("sudo", ["-n", "iptables", "-D", ...iptablesRuleArgs], { encoding: "utf8" })
+          : undefined;
         for (const socket of sockets) socket.destroy();
         if (server.listening) {
           await new Promise<void>((resolve) => server.close(() => resolve()));
         }
         rmSync(root.root, { recursive: true, force: true });
+        if (ruleRemoval && ruleRemoval.status !== 0) {
+          throw new Error(`could not remove the loopback DROP rule: ${ruleRemoval.stderr || ruleRemoval.error}`);
+        }
       }
     },
     150_000,
