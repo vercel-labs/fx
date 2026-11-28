@@ -186,6 +186,21 @@ class DetectCiNeedTests(unittest.TestCase):
             "tests/tla/drivers/session/live.test.ts",
         ), libfx=False, mcp=False, subagent=True)
 
+    def test_history_load_model_and_driver_need_the_subagent_check(self) -> None:
+        self.commit_each((
+            "tests/tla/session/HistoryLoad.tla",
+            "tests/tla/session/HistoryLoadTrace.tla",
+            "tests/tla/session/history-design-b.cfg",
+            "tests/tla/drivers/session/history.test.ts",
+            "tests/e2e/fixtures/chat-completions.ts",
+        ), libfx=False, mcp=False, subagent=True)
+
+    def test_history_load_code_needs_the_libfx_and_subagent_checks(self) -> None:
+        self.commit_each((
+            "src/acp/history_pages.zig",
+            "src/acp/sessions.zig",
+        ), libfx=True, mcp=False, subagent=True)
+
     def test_managed_execution_paths_need_only_that_check(self) -> None:
         self.commit_each((
             "src/core/execution/quiet_notice.zig",

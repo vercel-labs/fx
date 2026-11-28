@@ -14374,16 +14374,17 @@ test "eb03: failed pending input restore scan shows error notice and keeps recor
     const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
     try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened, .session);
 
-    // Corrupt log.jsonl in place so the open handle fails to scan, keeping the original bytes for retry.
+    // Damage the open input's own line in place, keeping the original bytes for retry. The restore
+    // reads only the open inputs' lines, so it can't read this one; the whole-log scan it falls back
+    // to stops at it, as it stopped at damage anywhere before. Damage on another line no longer stops
+    // the restore (the next test).
     const log_rel = try std.Io.Dir.path.join(alloc, &.{ "home", ".fx", "sessions", "v2", sid, "log.jsonl" });
     defer alloc.free(log_rel);
     const saved_log = try tmp.dir.readFileAlloc(io_mod.getIo(), log_rel, alloc, .limited(1 << 20));
     defer alloc.free(saved_log);
-    {
-        var f = try tmp.dir.openFile(io_mod.getIo(), log_rel, .{ .mode = .read_write });
-        defer f.close(io_mod.getIo());
-        try f.writePositionalAll(io_mod.getIo(), "not valid json\n", 0);
-    }
+    const input_at = eb03LineStart(saved_log, "\"kind\":\"input_accepted\"") orelse return error.TestNoInputLine;
+    try std.testing.expect(input_at > 0);
+    try eb03DamageAt(&tmp, log_rel, input_at);
 
     try eb03DrainPendingInputRestore(&app, (&app).agent());
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
@@ -14404,6 +14405,145 @@ test "eb03: failed pending input restore scan shows error notice and keeps recor
     defer pending.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), pending.ids.len);
     try std.testing.expectEqualStrings("keep across failed scan", pending.texts[0]);
+}
+
+/// Where the line holding `needle` starts in `bytes`, or null when no line holds it.
+fn eb03LineStart(bytes: []const u8, needle: []const u8) ?usize {
+    const at = std.mem.find(u8, bytes, needle) orelse return null;
+    return if (std.mem.findScalarLast(u8, bytes[0..at], '\n')) |newline| newline + 1 else 0;
+}
+
+/// Writes over the log at `offset`, so the line there no longer parses.
+fn eb03DamageAt(tmp: *std.testing.TmpDir, log_rel: []const u8, offset: usize) !void {
+    var f = try tmp.dir.openFile(io_mod.getIo(), log_rel, .{ .mode = .read_write });
+    defer f.close(io_mod.getIo());
+    try f.writePositionalAll(io_mod.getIo(), "not valid json\n", offset);
+}
+
+test "eb03: damage on another line than the open input's no longer stops the restore, which restores the input once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("keep across damage elsewhere");
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened, .session);
+
+    // The log's first line is damaged; the open input's own line is intact.
+    const log_rel = try std.Io.Dir.path.join(alloc, &.{ "home", ".fx", "sessions", "v2", sid, "log.jsonl" });
+    defer alloc.free(log_rel);
+    try eb03DamageAt(&tmp, log_rel, 0);
+
+    try eb03DrainPendingInputRestore(&app, (&app).agent());
+    try std.testing.expectEqualStrings("keep across damage elsewhere", app.input_runtime.edit_state.input.items);
+    var restore_notices: usize = 0;
+    for (app.notices.items) |notice| {
+        if (std.mem.find(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the composer.") != null) restore_notices += 1;
+        try std.testing.expect(std.mem.find(u8, notice, "Couldn't restore prompts sent before fx stopped:") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), restore_notices);
+
+    // Withdrawn once restored, so nothing is left to restore again.
+    var remaining = try app.agent().session_persistence.v2.?.pendingAcceptedInputs(alloc);
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
+}
+
+test "eb03: with a snapshot from an fx before open_inputs, the restore reads the whole log, which damage stops as before" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("keep across failed full scan");
+    // Enough turns after the input that a snapshot follows its line.
+    const reply = "a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log a reply long enough to fill the log";
+    for (0..200) |_| {
+        try v2.commitTurn(.{ .assistant = .{
+            .user = .{ .text = @constCast("another turn") },
+            .assistant = @constCast(reply),
+        } }, types.ConversationLanguage.default());
+    }
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    // The newest snapshot as an fx before `open_inputs` wrote it.
+    const io = io_mod.getIo();
+    const log_rel = try std.Io.Dir.path.join(alloc, &.{ "home", ".fx", "sessions", "v2", sid, "log.jsonl" });
+    defer alloc.free(log_rel);
+    const written = try tmp.dir.readFileAlloc(io, log_rel, alloc, .limited(64 << 20));
+    defer alloc.free(written);
+    const older = try session_adapter.TestHooks.withoutNewestSnapshotOpenInputs(alloc, written);
+    defer alloc.free(older);
+    try std.testing.expectEqual(std.mem.count(u8, written, "\"open_inputs\"") - 1, std.mem.count(u8, older, "\"open_inputs\""));
+    try tmp.dir.writeFile(io, .{ .sub_path = log_rel, .data = older });
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened, .session);
+
+    // Damage on a line other than the input's: without a known list, the whole-log scan reads it.
+    try eb03DamageAt(&tmp, log_rel, 0);
+    try eb03DrainPendingInputRestore(&app, (&app).agent());
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    var saw_err = false;
+    for (app.notices.items) |notice| {
+        if (std.mem.find(u8, notice, "Couldn't restore prompts sent before fx stopped:") != null) saw_err = true;
+    }
+    try std.testing.expect(saw_err);
+
+    // The log as it was: no input_withdrawn was written, so the next resume still finds the input.
+    try tmp.dir.writeFile(io, .{ .sub_path = log_rel, .data = older });
+    Runtime(TestApp).closeWritableSession(&app, (&app).agent());
+    const retry = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    defer retry.close();
+    var pending = try retry.pendingAcceptedInputs(alloc);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), pending.ids.len);
+    try std.testing.expectEqualStrings("keep across failed full scan", pending.texts[0]);
 }
 
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;

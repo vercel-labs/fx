@@ -54,6 +54,10 @@ pub const Child = struct {
     }
 };
 
+/// An accepted input that is not yet delivered or withdrawn, and where its
+/// `input_accepted` line is in the log.
+pub const OpenInput = struct { id: u64, offset: u64, seq: u64 };
+
 /// Everything the log implies about a session except its identity, which
 /// is line 1. Owns every slice; free with `deinit`.
 pub const State = struct {
@@ -78,6 +82,11 @@ pub const State = struct {
     v1_source: ?[]u8 = null,
     /// Every child spawned in this session, in first-spawn order (D22).
     children: std.ArrayList(Child) = .empty,
+    /// Accepted inputs not yet delivered or withdrawn, oldest first.
+    open_inputs: std.ArrayList(OpenInput) = .empty,
+    /// False when the state's base snapshot was written before `open_inputs`
+    /// existed, so inputs accepted before that snapshot are not listed.
+    open_inputs_known: bool = true,
     last_compaction_seq: ?u64 = null,
     /// Byte offset of the newest `compacted` line. fx's `data` there may
     /// keep a tail of earlier lines, which the adapter reads back to.
@@ -97,6 +106,7 @@ pub const State = struct {
         }
         for (state.children.items) |child| child.deinit(gpa);
         state.children.deinit(gpa);
+        state.open_inputs.deinit(gpa);
         state.* = undefined;
     }
 
@@ -110,14 +120,31 @@ pub const State = struct {
     pub fn clone(state: *const State, gpa: std.mem.Allocator) error{OutOfMemory}!State {
         var copy: State = state.*;
         copy.children = .empty;
+        copy.open_inputs = .empty;
         inline for (setting_fields) |name| @field(copy, name) = null;
         errdefer copy.deinit(gpa);
         inline for (setting_fields) |name| {
             if (@field(state, name)) |value| @field(copy, name) = try gpa.dupe(u8, value);
         }
+        try copy.open_inputs.appendSlice(gpa, state.open_inputs.items);
         try copy.children.ensureTotalCapacity(gpa, state.children.items.len);
         for (state.children.items) |child| copy.children.appendAssumeCapacity(try child.clone(gpa));
         return copy;
+    }
+
+    fn addOpenInput(state: *State, gpa: std.mem.Allocator, input: OpenInput) error{OutOfMemory}!void {
+        try state.open_inputs.append(gpa, input);
+    }
+
+    /// Drops every open input with this id: a delivered or withdrawn input is settled.
+    fn removeOpenInput(state: *State, id: u64) void {
+        var kept: usize = 0;
+        for (state.open_inputs.items) |input| {
+            if (input.id == id) continue;
+            state.open_inputs.items[kept] = input;
+            kept += 1;
+        }
+        state.open_inputs.shrinkRetainingCapacity(kept);
     }
 
     pub fn setting(state: *const State, key: schema.SetKey) ?[]const u8 {
@@ -191,6 +218,8 @@ pub const State = struct {
         for (a.children.items, b.children.items) |x, y| {
             if (!x.eql(y)) return false;
         }
+        if (a.open_inputs_known != b.open_inputs_known) return false;
+        if (!openInputsEql(a.open_inputs.items, b.open_inputs.items)) return false;
         return a.last_compaction_seq == b.last_compaction_seq and
             a.compaction_offset == b.compaction_offset and
             a.clean_exit == b.clean_exit and
@@ -199,6 +228,14 @@ pub const State = struct {
 };
 
 const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "tool_identities", "moved_files", "compaction_records", "v1_source" };
+
+fn openInputsEql(a: []const OpenInput, b: []const OpenInput) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.id != y.id or x.offset != y.offset or x.seq != y.seq) return false;
+    }
+    return true;
+}
 
 fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
@@ -224,7 +261,9 @@ pub const Line = struct {
 /// before `fork_seq` belong to the source and are skipped.
 pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) error{OutOfMemory}!void {
     switch (line.body) {
-        .session_created, .item, .snapshot, .closed, .input_accepted, .input_delivered, .input_withdrawn => {},
+        .session_created, .item, .snapshot, .closed => {},
+        .input_accepted => |a| try state.addOpenInput(gpa, .{ .id = a.id, .offset = line.offset, .seq = line.seq }),
+        .input_delivered, .input_withdrawn => |r| state.removeOpenInput(r.id),
         .turn_started => |t| {
             state.open_turn = t.turn;
             state.last_turn = @max(state.last_turn, t.turn);
@@ -387,7 +426,19 @@ pub fn encodeState(gpa: std.mem.Allocator, out: *std.ArrayList(u8), state: *cons
     try printOptional(gpa, out, state.last_compaction_seq);
     try out.appendSlice(gpa, ",\"compaction_offset\":");
     try printOptional(gpa, out, state.compaction_offset);
+    if (state.open_inputs_known) try appendOpenInputs(gpa, out, state.open_inputs.items);
     try out.append(gpa, '}');
+}
+
+/// Written only when the list is known: an older reader ignores the field,
+/// and a snapshot without it decodes as unknown.
+fn appendOpenInputs(gpa: std.mem.Allocator, out: *std.ArrayList(u8), inputs: []const OpenInput) error{OutOfMemory}!void {
+    try out.appendSlice(gpa, ",\"open_inputs\":[");
+    for (inputs, 0..) |input, i| {
+        if (i > 0) try out.append(gpa, ',');
+        try out.print(gpa, "{{\"id\":{d},\"offset\":{d},\"seq\":{d}}}", .{ input.id, input.offset, input.seq });
+    }
+    try out.append(gpa, ']');
 }
 
 fn appendRawField(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime name: []const u8, value: []const u8) error{OutOfMemory}!void {
@@ -435,6 +486,18 @@ pub fn decodeState(gpa: std.mem.Allocator, arena: std.mem.Allocator, raw: []cons
             .finish_data = finish_data,
             .seq = try c.req(u64, "seq"),
         });
+    }
+    if (f.raw("open_inputs")) |raw_inputs| {
+        for (try schema.rawElements(arena, raw_inputs)) |raw_input| {
+            const input = try schema.Fields.parseObject(arena, raw_input);
+            try state.open_inputs.append(gpa, .{
+                .id = try input.req(u64, "id"),
+                .offset = try input.req(u64, "offset"),
+                .seq = try input.req(u64, "seq"),
+            });
+        }
+    } else {
+        state.open_inputs_known = false;
     }
     return state;
 }
@@ -813,4 +876,49 @@ test "input_accepted, input_delivered, and input_withdrawn plan and apply inside
     try testing.expectEqual(@as(u64, 0), state.interrupted);
     try testing.expectEqual(@as(?Interruption, null), state.last_interrupted);
     try testing.expectEqual(@as(u64, 7), state.last_seq);
+}
+
+test "open inputs: a delivered input leaves the other accepted input open, with its line's offset and seq" {
+    var state: State = .{};
+    defer state.deinit(testing.allocator);
+    try apply(testing.allocator, &state, 0, .{ .seq = 2, .offset = 200, .body = .{ .input_accepted = .{ .id = 1, .text = "first" } } });
+    try apply(testing.allocator, &state, 0, .{ .seq = 3, .offset = 300, .body = .{ .input_accepted = .{ .id = 2, .text = "second" } } });
+    try apply(testing.allocator, &state, 0, .{ .seq = 4, .offset = 400, .body = .{ .input_delivered = .{ .id = 1 } } });
+
+    try testing.expect(state.open_inputs_known);
+    try testing.expectEqual(@as(usize, 1), state.open_inputs.items.len);
+    try testing.expectEqual(@as(u64, 2), state.open_inputs.items[0].id);
+    try testing.expectEqual(@as(u64, 300), state.open_inputs.items[0].offset);
+    try testing.expectEqual(@as(u64, 3), state.open_inputs.items[0].seq);
+}
+
+test "open inputs: encode then decode keeps the open input, its offset and seq, and the known state" {
+    var state: State = .{};
+    defer state.deinit(testing.allocator);
+    try apply(testing.allocator, &state, 0, .{ .seq = 3, .offset = 300, .body = .{ .input_accepted = .{ .id = 2, .text = "second" } } });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    try encodeState(arena.allocator(), &out, &state);
+    try testing.expect(std.mem.find(u8, out.items, ",\"open_inputs\":[{\"id\":2,\"offset\":300,\"seq\":3}]") != null);
+
+    var decoded = try decodeState(testing.allocator, arena.allocator(), out.items);
+    defer decoded.deinit(testing.allocator);
+    try testing.expect(decoded.open_inputs_known);
+    try testing.expectEqual(@as(usize, 1), decoded.open_inputs.items.len);
+    try testing.expectEqual(@as(u64, 2), decoded.open_inputs.items[0].id);
+    try testing.expectEqual(@as(u64, 300), decoded.open_inputs.items[0].offset);
+    try testing.expectEqual(@as(u64, 3), decoded.open_inputs.items[0].seq);
+}
+
+test "open inputs: a snapshot state without open_inputs decodes as unknown" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const older_state = "{\"open_turn\":null,\"last_turn\":0,\"committed\":0,\"interrupted\":0,\"last_interrupted\":null,\"children\":[],\"last_compaction_seq\":null,\"compaction_offset\":null}";
+
+    var decoded = try decodeState(testing.allocator, arena.allocator(), older_state);
+    defer decoded.deinit(testing.allocator);
+    try testing.expect(!decoded.open_inputs_known);
+    try testing.expectEqual(@as(usize, 0), decoded.open_inputs.items.len);
 }

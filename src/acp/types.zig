@@ -269,6 +269,10 @@ pub const AgentCapabilities = struct {
     mcp_servers: bool = true,
     /// Accepts steering prompts through `session/prompt` during a turn.
     steering: bool = false,
+    /// Sends a load's newest turns first when the client asks, and older
+    /// ones through `_fx/session/history`. Advertised only when true, so a
+    /// host without it answers as before.
+    history_pages: bool = false,
     /// Accepts a client system prompt on `session/new` in append mode.
     system_prompt: bool = false,
     /// Serves `type: "acp"` MCP servers over this connection.
@@ -292,7 +296,9 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}");
     if (capabilities.system_prompt) try w.writeAll(",\"systemPrompt\":{}");
     try w.writeByte('}');
-    try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s}}}}}", .{if (capabilities.steering) "true" else "false"});
+    try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s}", .{if (capabilities.steering) "true" else "false"});
+    if (capabilities.history_pages) try w.writeAll(",\"historyPages\":true");
+    try w.writeAll("}}");
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
@@ -525,7 +531,7 @@ test "writeInitializeResponse contains required fields" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeInitializeResponse(&out.writer, .{ .image_prompts = true, .steering = true, .system_prompt = true, .mcp_over_acp = true });
+    try writeInitializeResponse(&out.writer, .{ .image_prompts = true, .steering = true, .system_prompt = true, .mcp_over_acp = true, .history_pages = true });
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
 
@@ -549,6 +555,20 @@ test "writeInitializeResponse contains required fields" {
     try std.testing.expectEqual(@as(usize, 0), session_capabilities.get("systemPrompt").?.object.count());
     const fx_meta = agent_capabilities.get("_meta").?.object.get("fx").?.object;
     try std.testing.expect(fx_meta.get("steering").?.bool);
+    try std.testing.expect(fx_meta.get("historyPages").?.bool);
+}
+
+test "writeInitializeResponse leaves historyPages out for a host without pages, as before" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeInitializeResponse(&out.writer, .{ .image_prompts = true, .steering = true });
+    // The bytes a host wrote before history pages: `fx`, `_meta` and the capabilities close.
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"_meta\":{\"fx\":{\"steering\":true}}},\"agentInfo\"") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const fx_meta = parsed.value.object.get("agentCapabilities").?.object.get("_meta").?.object.get("fx").?.object;
+    try std.testing.expect(fx_meta.get("historyPages") == null);
 }
 
 test "writeInitializeResponse withholds MCP transports a host rejects" {

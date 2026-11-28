@@ -50,6 +50,24 @@
 # their planted bugs; accepted-simulate-ideal and accepted-simulate-nonideal
 # run random behaviors. Pass `accepted` to run only the AcceptedInput checks.
 #
+# HistoryLoad models how an ACP client gets a saved session's history on
+# `session/load`: "current" is fx for a client that doesn't ask, "b" is fx
+# for a client that asks with `_meta.fx.historyPages` (the newest page, then
+# older pages on request through `_fx/session/history`), and "a", which
+# sends every older page in the same load, was rejected.
+# history-current-bottom shows a whole load sends the whole history before
+# the bottom screen, and history-current-damage that it leaves out every
+# turn after a damaged line; history-design-a breaks LoadBounded, as
+# its load sends the whole history, and passes everything else
+# (history-design-a-core); history-design-b* must pass; each
+# history-mutant-* removes one guard of design b; history-design-*-lock and
+# history-design-b-keeps add a second fx that holds the session's lock; each
+# history-witness-* must
+# be violated, so design b's runs reach paging; history-simulate-ideal and
+# history-simulate-nonideal run random behaviors. Pass `history` to run only
+# the HistoryLoad checks. drivers/session/history.test.ts runs fx acp along
+# design b and has TLC check each run (`HistoryLoadTrace.tla`).
+#
 # Run the real binary along the models and have TLC check every run:
 #   bun test ../drivers/session/
 #
@@ -63,7 +81,9 @@ cd "$(dirname "$0")"
 if [ "$#" -gt 0 ]; then
     expanded=""
     for arg in "$@"; do
-        if [ "$arg" = "accepted" ]; then
+        if [ "$arg" = "history" ]; then
+            expanded="$expanded history-current-bottom history-current-damage history-design-a history-design-a-core history-design-a-damage history-design-b history-design-b-damage history-design-b-old-client history-design-a-lock history-design-b-lock history-design-b-keeps history-mutant-no-split history-mutant-no-tag history-mutant-past-damage history-mutant-split-continuation history-mutant-prompt-before-restore history-mutant-no-generation history-mutant-ignore-capability history-mutant-read-before-lock history-mutant-send-before-lock history-witness-paged-to-top history-witness-live-during-page history-witness-locked-bottom history-witness-busy history-simulate-ideal history-simulate-nonideal"
+        elif [ "$arg" = "accepted" ]; then
             expanded="$expanded accepted-current-survives accepted-design-a accepted-design-a2 accepted-design-b accepted-mutant-a-two-lines accepted-mutant-a-show-before-write accepted-mutant-b-no-dedupe accepted-mutant-a-withdraw-after-drop accepted-mutant-a2-marker-later accepted-mutant-a2-withdraw-before-composer accepted-simulate-ideal accepted-simulate-nonideal"
         else
             expanded="$expanded $arg"
@@ -151,4 +171,30 @@ AcceptedInput accepted-mutant-a2-marker-later DeliveredNeverRestored
 AcceptedInput accepted-mutant-a2-withdraw-before-composer AcceptedSurvives
 AcceptedInput accepted-simulate-ideal simulate $sim_accepted
 AcceptedInput accepted-simulate-nonideal simulate $sim_accepted
+HistoryLoad history-current-bottom BottomBounded
+HistoryLoad history-current-damage BottomIsNewest
+HistoryLoad history-design-a LoadBounded
+HistoryLoad history-design-a-core -
+HistoryLoad history-design-a-damage -
+HistoryLoad history-design-b -
+HistoryLoad history-design-b-damage -
+HistoryLoad history-design-b-old-client -
+HistoryLoad history-design-a-lock -
+HistoryLoad history-design-b-lock -
+HistoryLoad history-design-b-keeps -
+HistoryLoad history-mutant-no-split BottomBounded
+HistoryLoad history-mutant-no-tag TranscriptExact
+HistoryLoad history-mutant-past-damage TrustedOnly
+HistoryLoad history-mutant-split-continuation WholeTurns
+HistoryLoad history-mutant-prompt-before-restore PromptSeesFullHistory
+HistoryLoad history-mutant-no-generation LiveBelowHistory
+HistoryLoad history-mutant-ignore-capability OldClientUnchanged
+HistoryLoad history-mutant-read-before-lock BottomIsNewest
+HistoryLoad history-mutant-send-before-lock BusyShowsNothing
+HistoryLoad history-witness-paged-to-top NeverPagedToTop
+HistoryLoad history-witness-live-during-page NeverLiveDuringPage
+HistoryLoad history-witness-locked-bottom NeverLockedBottom
+HistoryLoad history-witness-busy NeverBusy
+HistoryLoad history-simulate-ideal simulate $sim_accepted
+HistoryLoad history-simulate-nonideal simulate $sim_accepted
 EOF

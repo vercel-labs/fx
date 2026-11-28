@@ -14,6 +14,7 @@ const client_instructions = @import("client_instructions.zig");
 const tool_call_identities = @import("../core/mcp/tool_call_identities.zig");
 const workspace_binding = @import("workspace_binding.zig");
 const server = @import("server.zig");
+const history_pages = @import("history_pages.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
@@ -629,7 +630,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
             for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
             try sendActiveSessionInfoUpdate(state, alloc);
             setObserverHooks(state, observer_hooks);
-            return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks);
+            return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks, null);
         }
     }
 
@@ -695,7 +696,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     for (state.active_session.?.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
     try sendActiveSessionInfoUpdate(state, alloc);
     setObserverHooks(state, observer_hooks);
-    try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model, observer_hooks);
+    try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model, observer_hooks, null);
 }
 
 pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -857,6 +858,9 @@ fn handleRestoreSession(
     defer if (v2_owned) if (v2) |value| value.close();
     var v2_resumed: ?session_adapter.Resumed = null;
     defer if (v2_resumed) |*value| value.deinit(alloc);
+    // A client that asks for it gets the newest turns first, and older ones by
+    // `_fx/session/history` (`history_pages.zig`).
+    const tail_first = kind == .load and parsed.value == .object and (acp_types.fxMetaBool(parsed.value.object, "historyPages") orelse false);
     const v2_store = server.sessionsStore(state) orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.internal_error,
         .message = "Session store not available",
@@ -868,7 +872,7 @@ fn handleRestoreSession(
         defer v2_store.notice = null;
         v2 = session_adapter.Session.resumeSession(alloc, v2_store, .{ .id = session_id }, workspace_root, .acp) catch |err|
             return handleLoadFailure(state, alloc, msg, err);
-        v2_resumed = v2.?.durableState(alloc, workspace_root) catch |err|
+        v2_resumed = (if (tail_first) v2.?.durableSettings(alloc, workspace_root) else v2.?.durableState(alloc, workspace_root)) catch |err|
             return handleLoadFailure(state, alloc, msg, err);
     }
     const durable: *const session_codec.DurableSessionState = &v2_resumed.?.state;
@@ -953,8 +957,11 @@ fn handleRestoreSession(
     // One map, so a recovered read can name a call from an earlier turn.
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(alloc);
+    var page_arena: std.heap.ArenaAllocator = .init(alloc);
+    defer page_arena.deinit();
+    var history: ?LoadHistory = null;
     if (kind.replaysHistory()) {
-        try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
+        if (tail_first) history = try sendNewestHistoryPage(state, alloc, page_arena.allocator(), session_id) else try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
     }
     try notifyPendingAcceptedInputs(state, alloc, session_id);
     try sendActiveSessionInfoUpdate(state, alloc);
@@ -966,7 +973,10 @@ fn handleRestoreSession(
         msg,
         state.active_session.?.model,
         observer_hooks,
+        history,
     );
+    // The reply is out; the model's history is restored before fx reads another request.
+    if (tail_first) try restoreActiveHistory(state, alloc, workspace_root);
 }
 
 /// Adds the project's MCP servers after the request's own, and the user's profile servers too when the client sets
@@ -1175,7 +1185,7 @@ fn reloadActiveSession(
     }
     try notifyPendingAcceptedInputs(state, alloc, session_id);
     try sendActiveSessionInfoUpdate(state, alloc);
-    return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks);
+    return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks, null);
 }
 
 /// Sets the hook config of the active session under the lock its subagents
@@ -1192,6 +1202,7 @@ fn writeLoadSessionResponse(
     msg: *jsonrpc.Message,
     model: []const u8,
     observer_hooks: ?libfx_hooks.Config,
+    history: ?LoadHistory,
 ) !void {
     try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -1229,10 +1240,127 @@ fn writeLoadSessionResponse(
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
     try out.writer.writeByte('}');
-    if (observer_hooks != null) try out.writer.writeAll(",\"_meta\":{\"fx\":{\"hooksVersion\":1}}");
+    if (observer_hooks != null or history != null) {
+        try out.writer.writeAll(",\"_meta\":{\"fx\":{");
+        var fields: usize = 0;
+        if (observer_hooks != null) {
+            try out.writer.writeAll("\"hooksVersion\":1");
+            fields += 1;
+        }
+        if (history) |loaded| {
+            if (loaded.next) |cursor| {
+                if (fields > 0) try out.writer.writeByte(',');
+                try out.writer.writeAll("\"historyCursor\":");
+                try writeHistoryCursor(&out.writer, cursor);
+                fields += 1;
+            }
+            if (loaded.damaged) {
+                if (fields > 0) try out.writer.writeByte(',');
+                try out.writer.writeAll("\"historyDamaged\":true");
+            }
+        }
+        try out.writer.writeAll("}}");
+    }
     try out.writer.writeByte('}');
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+// -- History a page at a time (`history_pages.zig`) ------------------------------
+
+/// What a load that sent its newest page tells in its reply.
+const LoadHistory = struct {
+    /// Where the next older page ends, or null when the page reached the
+    /// log's start or a damaged line.
+    next: ?history_pages.Cursor,
+    damaged: bool,
+};
+
+fn writeHistoryCursor(w: *std.Io.Writer, cursor: history_pages.Cursor) !void {
+    try w.print("{{\"offset\":{d},\"seq\":{d},\"part\":{d}}}", .{ cursor.offset, cursor.seq, cursor.part });
+}
+
+/// An update that carries only `_meta.fx` (`meta`, a JSON object's members).
+fn sendHistoryMarker(state: *server.ServerState, alloc: Allocator, session_id: []const u8, meta: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(session_id, &out.writer);
+    try out.writer.print(",\"update\":{{\"sessionUpdate\":\"session_info_update\"}},\"_meta\":{{\"fx\":{{{s}}}}}}}", .{meta});
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+}
+
+/// The newest page's updates, oldest first, then the update that marks the
+/// bottom screen whole (`_meta.fx.historyNewestEnd`).
+fn sendNewestHistoryPage(state: *server.ServerState, alloc: Allocator, arena: Allocator, session_id: []const u8) !LoadHistory {
+    const page = try history_pages.build(state, arena, session_id, null, history_pages.newest_budget);
+    for (page.updates) |update| try state.writer.writeNotification(alloc, "session/update", update);
+    try sendHistoryMarker(state, alloc, session_id, "\"historyNewestEnd\":true");
+    return .{ .next = page.next, .damaged = page.damaged };
+}
+
+/// The model's history, after the bottom screen went out with the settings
+/// alone, so a prompt sees the same history as after a whole load
+/// (`tests/tla/session/HistoryLoad.tla` PromptSeesFullHistory).
+fn restoreActiveHistory(state: *server.ServerState, alloc: Allocator, workspace_root: []const u8) !void {
+    const active = &state.active_session.?;
+    const v2 = active.v2.?;
+    var full = try v2.durableState(alloc, workspace_root);
+    defer full.deinit(alloc);
+    try active.session_rt.restoreWithPermissionState(alloc, full.state.conversation_language, full.state.history, full.state.permission_state);
+    // The restore clears the downloads' blobs, which the load set up first (D44).
+    active.session_rt.configureWebFetchArtifactBlobs(alloc, try v2.childCapability(), v2.id());
+}
+
+/// `_fx/session/history` with `{"sessionId", "cursor": {"offset", "seq", "part"}}`: the page
+/// that ends at the cursor, answered with its updates, where the next older page ends (null at
+/// the log's start or a damaged line), whether a damaged line stopped it, and whether its last
+/// update continues the message below it.
+pub fn handleHistoryPage(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
+    defer parsed.deinit();
+    const request = historyRequest(parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
+    const active = if (state.active_session) |*a| a else return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Session not loaded" });
+    if (!sameSessionId(active.session_id, request.session_id) or active.v2 == null)
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Session not loaded" });
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const page = history_pages.build(state, arena_state.allocator(), request.session_id, request.cursor, history_pages.older_budget) catch |err| switch (err) {
+        error.InvalidCursor => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Unknown history cursor" }),
+        else => return err,
+    };
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"updates\":[");
+    for (page.updates, 0..) |update, index| {
+        if (index > 0) try out.writer.writeByte(',');
+        try out.writer.writeAll(update);
+    }
+    try out.writer.writeAll("],\"cursor\":");
+    if (page.next) |cursor| try writeHistoryCursor(&out.writer, cursor) else try out.writer.writeAll("null");
+    try out.writer.print(",\"damaged\":{s},\"continues\":{s}}}", .{ if (page.damaged) "true" else "false", if (page.continues) "true" else "false" });
+    try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+/// `_fx/session/history`'s params, or null when they aren't its shape.
+fn historyRequest(value: std.json.Value) ?struct { session_id: []const u8, cursor: history_pages.Cursor } {
+    if (value != .object) return null;
+    const session_id = value.object.get("sessionId") orelse return null;
+    const cursor = value.object.get("cursor") orelse return null;
+    if (session_id != .string or cursor != .object) return null;
+    const offset = cursor.object.get("offset") orelse return null;
+    const seq = cursor.object.get("seq") orelse return null;
+    const part: std.json.Value = cursor.object.get("part") orelse .{ .integer = 0 };
+    if (offset != .integer or seq != .integer or part != .integer) return null;
+    if (offset.integer < 0 or seq.integer < 1 or part.integer < 0) return null;
+    return .{ .session_id = session_id.string, .cursor = .{
+        .offset = @intCast(offset.integer),
+        .seq = @intCast(seq.integer),
+        .part = @intCast(part.integer),
+    } };
 }
 
 fn freshAcpState(
@@ -1698,7 +1826,7 @@ fn sendActiveHistoryUpdates(
     }
 }
 
-fn sendHistoryTurnAsUpdates(
+pub fn sendHistoryTurnAsUpdates(
     state: *server.ServerState,
     alloc: Allocator,
     session_id: []const u8,
@@ -1732,7 +1860,7 @@ fn sendHistoryTurnAsUpdates(
     }
 }
 
-fn sendUserHistoryTurn(
+pub fn sendUserHistoryTurn(
     state: *server.ServerState,
     alloc: Allocator,
     session_id: []const u8,
@@ -1784,7 +1912,7 @@ fn sendUserHistoryTurn(
             snapshot.bytes,
         );
         try out.writer.writeAll("}");
-        try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+        try writeHistoryUpdate(state, alloc, out.writer.buffered());
     }
 }
 
@@ -1806,10 +1934,10 @@ fn sendUserHistoryChunk(
         text,
     );
     try out.writer.writeAll("}");
-    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+    try writeHistoryUpdate(state, alloc, out.writer.buffered());
 }
 
-fn sendExecutionHistory(
+pub fn sendExecutionHistory(
     state: *server.ServerState,
     alloc: Allocator,
     session_id: []const u8,
@@ -2051,7 +2179,7 @@ fn sendHistoryToolCall(
     try out.writer.writeAll(",\"update\":");
     try acp_types.writeToolCall(&out.writer, call.id, call.name, call.title, call.kind, .pending, call.raw_input, call.meta);
     try out.writer.writeAll("}");
-    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+    try writeHistoryUpdate(state, alloc, out.writer.buffered());
     if (call.status == .pending) return;
     out.clearRetainingCapacity();
     try out.writer.writeAll("{\"sessionId\":");
@@ -2059,7 +2187,7 @@ fn sendHistoryToolCall(
     try out.writer.writeAll(",\"update\":");
     try acp_types.writeToolCallUpdate(&out.writer, call.id, call.status, call.content_text);
     try out.writer.writeAll("}");
-    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+    try writeHistoryUpdate(state, alloc, out.writer.buffered());
 }
 
 /// Replays absorbed steering. The original request ID is not persisted, so the
@@ -2079,10 +2207,17 @@ fn sendSteeringHistoryChunk(state: *server.ServerState, alloc: Allocator, sessio
         null,
     );
     try out.writer.writeAll("}");
-    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+    try writeHistoryUpdate(state, alloc, out.writer.buffered());
 }
 
-fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
+/// A history update: to the client, or to the page being built
+/// (`history_pages.zig`), whose updates go in its reply.
+fn writeHistoryUpdate(state: *server.ServerState, alloc: Allocator, params: []const u8) !void {
+    if (state.history_capture) |capture| return capture.add(params);
+    try state.writer.writeNotification(alloc, "session/update", params);
+}
+
+pub fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
     var message_id: acp_types.MessageIdBuffer = undefined;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -2095,7 +2230,7 @@ fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_i
         text,
     );
     try out.writer.writeAll("}");
-    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+    try writeHistoryUpdate(state, alloc, out.writer.buffered());
 }
 
 fn formatPendingInputsNotice(alloc: Allocator, texts: []const []const u8) ![]u8 {
@@ -2121,11 +2256,10 @@ fn notifyPendingAcceptedInputs(
     if (comptime !server.has_v2_session_store) return;
     const active = if (state.active_session) |*value| value else return;
     const v2 = active.v2 orelse return;
-    var reader = v2.pendingInputsReader();
-    defer reader.deinit();
-    // In-place ACP reloads reuse the open handle after prior withdrawals at higher seqs.
-    reader.up_to_seq = null;
-    var pending = reader.read(alloc, null) catch |err| switch (err) {
+    // From the session's folded state as it is now, which holds the withdrawals an
+    // earlier load through this handle wrote, so an in-place reload sees them too.
+    // A known list of open inputs reads only their lines, not the whole log.
+    var pending = v2.pendingAcceptedInputs(alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             debug_trace.logf("session", "event=pending_accepted_inputs_read_failed surface=acp err={s}", .{@errorName(err)});
@@ -4056,6 +4190,87 @@ test "eb03: ACP session/load and session/resume report pending accepted inputs o
     }
 }
 
+test "eb03: an ACP load through the open session reports no input this fx withdrew, and reads only the open inputs' lines" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-pending.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.cfg.auth_mode = .host_managed;
+    state.credential_source = .host_managed;
+    state.cfg.allow_acp_mcp = false;
+    state.cfg.home_override = home_path;
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const v2 = state.active_session.?.v2.?;
+    // Turns on both sides of the input, so the log spans several read pages.
+    for (0..300) |i| {
+        if (i == 150) _ = try v2.recordInputAccepted("withdrawn by the first load");
+        try v2.commitTurn(.{ .assistant = .{
+            .user = .{ .text = @constCast("a turn") },
+            .assistant = @constCast("a reply"),
+        } }, types.ConversationLanguage.default());
+    }
+    const sid = try arena.dupe(u8, state.active_session.?.session_id);
+    try server.releaseActiveSession(&state);
+
+    const restore_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = try arena.print("{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}", .{sid}),
+    };
+
+    // The first load reports the input, and this fx withdraws it through the handle it opened.
+    var first_capture = try tmp.dir.createFile(io_mod.getIo(), "acp-load-1.jsonl", .{ .read = true });
+    defer first_capture.close(io_mod.getIo());
+    state.writer = .{ .stdout = first_capture };
+    var first_msg = restore_msg;
+    try handleLoadSession(&state, arena, &first_msg);
+    try first_capture.sync(io_mod.getIo());
+    var read_first = try tmp.dir.openFile(io_mod.getIo(), "acp-load-1.jsonl", .{});
+    defer read_first.close(io_mod.getIo());
+    const first_out = try io_mod.readFileToEnd(alloc, &read_first, 4 << 20);
+    defer alloc.free(first_out);
+    try std.testing.expect(std.mem.find(u8, first_out, "withdrawn by the first load") != null);
+
+    // The same session loaded again keeps that handle open, so what it opened with is stale: the
+    // load reads the state as it is now, withdrawal included, and reports nothing.
+    var second_capture = try tmp.dir.createFile(io_mod.getIo(), "acp-load-2.jsonl", .{ .read = true });
+    defer second_capture.close(io_mod.getIo());
+    state.writer = .{ .stdout = second_capture };
+    var second_msg = restore_msg;
+    try handleLoadSession(&state, arena, &second_msg);
+    // The scan itself reads only the open inputs' lines, which are none now, not the whole log.
+    const reads_before = session_adapter.TestHooks.readToCount();
+    try notifyPendingAcceptedInputs(&state, arena, sid);
+    try std.testing.expectEqual(reads_before, session_adapter.TestHooks.readToCount());
+    try second_capture.sync(io_mod.getIo());
+    var read_second = try tmp.dir.openFile(io_mod.getIo(), "acp-load-2.jsonl", .{});
+    defer read_second.close(io_mod.getIo());
+    const second_out = try io_mod.readFileToEnd(alloc, &read_second, 4 << 20);
+    defer alloc.free(second_out);
+    try std.testing.expect(std.mem.find(u8, second_out, "withdrawn by the first load") == null);
+}
+
 test "eb03: failed ACP restore notice still withdraws accepted inputs" {
     if (comptime host_target.is_wasm) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -4333,10 +4548,16 @@ test "eb03: failed ACP pending input scan sends error chunk and leaves records p
     defer alloc.free(log_rel);
     const saved_log = try tmp.dir.readFileAlloc(io_mod.getIo(), log_rel, alloc, .limited(1 << 20));
     defer alloc.free(saved_log);
+    // Damage the open input's own line: the scan reads only the open inputs' lines, so it can't
+    // read this one, and the whole-log scan it falls back to stops at it, as it stopped at damage
+    // anywhere before. Damage on another line no longer stops the scan.
+    const input_kind = std.mem.find(u8, saved_log, "\"kind\":\"input_accepted\"") orelse return error.TestNoInputLine;
+    const input_at = if (std.mem.findScalarLast(u8, saved_log[0..input_kind], '\n')) |newline| newline + 1 else 0;
+    try std.testing.expect(input_at > 0);
     {
         var f = try tmp.dir.openFile(io_mod.getIo(), log_rel, .{ .mode = .read_write });
         defer f.close(io_mod.getIo());
-        try f.writePositionalAll(io_mod.getIo(), "not valid json\n", 0);
+        try f.writePositionalAll(io_mod.getIo(), "not valid json\n", input_at);
     }
 
     try notifyPendingAcceptedInputs(&state, alloc, sid);

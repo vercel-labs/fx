@@ -36,6 +36,7 @@ pub const Event = fold.Event;
 pub const Piece = fold.Piece;
 pub const State = fold.State;
 pub const Child = fold.Child;
+pub const OpenInput = fold.OpenInput;
 pub const Diagnostic = diag.Event;
 pub const DiagnosticKind = diag.Kind;
 pub const Diagnostics = diag.Sink;

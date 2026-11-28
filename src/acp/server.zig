@@ -15,6 +15,7 @@ pub const has_v2_session_store = runtime_profile.host.durable_sessions;
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
+const history_pages = @import("history_pages.zig");
 const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
@@ -101,6 +102,7 @@ const AcpMethod = enum {
     libfx_journal_open,
     libfx_journal_images,
     mcp_message,
+    fx_session_history,
     unknown,
 
     fn parse(method: []const u8) AcpMethod {
@@ -128,6 +130,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
         if (std.mem.eql(u8, method, "libfx/journal_images")) return .libfx_journal_images;
         if (std.mem.eql(u8, method, "mcp/message")) return .mcp_message;
+        if (std.mem.eql(u8, method, "_fx/session/history")) return .fx_session_history;
         return .unknown;
     }
 
@@ -147,6 +150,7 @@ const AcpMethod = enum {
             .libfx_handoff,
             .libfx_yield,
             .libfx_follow_up,
+            .fx_session_history,
             => false,
             .session_list,
             .session_remove,
@@ -341,6 +345,10 @@ const ActivePrompt = struct {
 };
 
 pub const ServerState = struct {
+    /// While a history page is built, its updates go here instead of to the
+    /// client, for its reply (`history_pages.zig`). Only the request thread
+    /// that builds the page sets it, so a running turn's updates never do.
+    history_capture: ?*history_pages.Capture = null,
     configured_providers: @import("../core/config/configured_provider.zig").Registry = .{},
     alloc: Allocator,
     cfg: Config,
@@ -1773,6 +1781,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
         .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
         .libfx_journal_images => handleKernelJournalImages(state, alloc, msg),
+        .fx_session_history => sessions.handleHistoryPage(state, alloc, msg),
         .initialize,
         .request_cancel,
         .session_cancel,
@@ -3523,6 +3532,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         .image_prompts = !host_target.is_wasm,
         .mcp_servers = state.cfg.allow_acp_mcp,
         .steering = !host_target.is_wasm and !state.cfg.minimal_kernel,
+        .history_pages = !host_target.is_wasm,
         .system_prompt = !host_target.is_wasm and !state.cfg.minimal_kernel,
         // fx takes only what ACP v1 defines and fx's MCP engine speaks: stdio and
         // HTTP.

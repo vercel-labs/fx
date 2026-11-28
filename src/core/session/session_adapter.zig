@@ -2077,6 +2077,9 @@ pub const Session = struct {
     /// Highest log seq present when this resumed session opened, so background
     /// restore ignores inputs accepted after resume.
     opened_last_seq: u64 = 0,
+    /// The open inputs as of `opened_last_seq`; null when that state does not
+    /// know them. Owned by this session.
+    opened_open_inputs: ?[]sm.OpenInput = null,
 
     pub fn create(alloc: Allocator, store: *Store, workspace: []const u8, host: Host, seed: Seed) !*Session {
         // Every v2 write needs a writable open, and both start here or in
@@ -2263,6 +2266,7 @@ pub const Session = struct {
         defer state.deinit(alloc);
         self.last_turn = state.last_turn;
         self.opened_last_seq = state.last_seq;
+        self.opened_open_inputs = try copyOpenInputs(alloc, &state);
         self.last_seq = state.last_seq;
         if (clean) cleanLeftovers(store, alloc, self.id(), &state);
         traceWiring("Open", self.id(), "", self.store.pid);
@@ -2412,6 +2416,7 @@ pub const Session = struct {
         if (self.language) |value| alloc.free(value);
         if (self.instructions) |value| alloc.free(value);
         if (self.first_title) |value| alloc.free(value);
+        if (self.opened_open_inputs) |inputs| alloc.free(inputs);
         alloc.free(self.files_path);
         alloc.destroy(self);
     }
@@ -3356,6 +3361,9 @@ pub const Session = struct {
                 .store = self.store,
                 .host = self.host,
                 .up_to_seq = null,
+                .alloc = self.alloc,
+                .open_inputs = null,
+                .open_at_seq = 0,
             };
         }
         BlobHost.retain(self.host);
@@ -3363,43 +3371,70 @@ pub const Session = struct {
             .store = self.store,
             .host = self.host,
             .up_to_seq = self.opened_last_seq,
+            .alloc = self.alloc,
+            .open_inputs = dupeOpenInputs(self.alloc, self.opened_open_inputs),
+            .open_at_seq = self.opened_last_seq,
         };
     }
 
-    /// Reads the entire log from the start (ignoring snapshots) and returns,
-    /// in log order, every `input_accepted` id and text with neither
-    /// `input_delivered` nor `input_withdrawn`. Caller owns the returned
-    /// `PendingAcceptedInputs` and must call `deinit(alloc)`.
+    /// Returns, in log order, every `input_accepted` id and text with neither
+    /// `input_delivered` nor `input_withdrawn`. Reads only the open inputs'
+    /// lines when the folded state knows them, else the whole log. Caller owns
+    /// the returned `PendingAcceptedInputs` and must call `deinit(alloc)`.
     pub fn pendingAcceptedInputs(self: *Session, alloc: Allocator) !PendingAcceptedInputs {
         if (comptime !durable_sessions_enabled) return .{};
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        return scanPendingAcceptedInputs(self.source(), alloc, null, null);
+        var state = try self.handle.state(alloc);
+        defer state.deinit(alloc);
+        return scanPendingAcceptedInputs(self.source(), alloc, null, null, knownOpenInputs(&state));
     }
 
+    /// An accepted input read from its own line: its text and images, or why
+    /// they cannot be read. Owns its slices; free with `deinit`.
+    const AcceptedItem = struct {
+        id: u64,
+        text: ?[]u8 = null,
+        images: []PendingAcceptedImage = &.{},
+        unreadable_err: ?anyerror = null,
+
+        fn deinit(accepted_item: AcceptedItem, alloc: Allocator) void {
+            if (accepted_item.text) |t| alloc.free(t);
+            for (accepted_item.images) |img| img.deinit(alloc);
+            alloc.free(accepted_item.images);
+        }
+    };
+
+    fn freeAccepted(alloc: Allocator, accepted: *std.ArrayList(AcceptedItem)) void {
+        for (accepted.items) |accepted_item| accepted_item.deinit(alloc);
+        accepted.deinit(alloc);
+    }
+
+    /// Reads the open inputs' lines when `open_inputs` is known and every
+    /// line is where the list says; otherwise reads the whole log.
     fn scanPendingAcceptedInputs(
         src: Source,
         alloc: Allocator,
         up_to_seq: ?u64,
         cancel_requested: ?*const std.atomic.Value(bool),
+        open_inputs: ?[]const sm.OpenInput,
     ) !PendingAcceptedInputs {
         if (comptime !durable_sessions_enabled) return .{};
-        const AcceptedItem = struct {
-            id: u64,
-            text: ?[]u8 = null,
-            images: []PendingAcceptedImage = &.{},
-            unreadable_err: ?anyerror = null,
-        };
+        if (open_inputs) |listed| {
+            if (try scanOpenInputs(src, alloc, listed, up_to_seq, cancel_requested)) |found| return found;
+        }
+        return scanWholeLog(src, alloc, up_to_seq, cancel_requested);
+    }
+
+    /// Reads the entire log from the start, ignoring snapshots.
+    fn scanWholeLog(
+        src: Source,
+        alloc: Allocator,
+        up_to_seq: ?u64,
+        cancel_requested: ?*const std.atomic.Value(bool),
+    ) !PendingAcceptedInputs {
         var accepted: std.ArrayList(AcceptedItem) = .empty;
-        var moved = false;
-        errdefer if (!moved) {
-            for (accepted.items) |item_entry| {
-                if (item_entry.text) |t| alloc.free(t);
-                for (item_entry.images) |img| img.deinit(alloc);
-                alloc.free(item_entry.images);
-            }
-            accepted.deinit(alloc);
-        };
+        defer freeAccepted(alloc, &accepted);
         var settled: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer settled.deinit(alloc);
 
@@ -3421,25 +3456,9 @@ pub const Session = struct {
                 const body = entry.body orelse continue;
                 switch (body) {
                     .input_accepted => |a| {
-                        if (acceptedInputText(src, alloc, a)) |copy| {
-                            if (dupePendingAcceptedImages(alloc, a.images)) |imgs| {
-                                accepted.append(alloc, .{ .id = a.id, .text = copy, .images = imgs }) catch |append_err| {
-                                    alloc.free(copy);
-                                    for (imgs) |img| img.deinit(alloc);
-                                    alloc.free(imgs);
-                                    return append_err;
-                                };
-                            } else |err| {
-                                alloc.free(copy);
-                                switch (err) {
-                                    error.InvalidSessionFormat => try accepted.append(alloc, .{ .id = a.id, .unreadable_err = err }),
-                                    else => return err,
-                                }
-                            }
-                        } else |err| switch (err) {
-                            error.InvalidSessionFormat => try accepted.append(alloc, .{ .id = a.id, .unreadable_err = err }),
-                            else => return err,
-                        }
+                        const accepted_item = try acceptedItemOf(src, alloc, a);
+                        errdefer accepted_item.deinit(alloc);
+                        try accepted.append(alloc, accepted_item);
                     },
                     .input_delivered, .input_withdrawn => |r| {
                         try settled.put(alloc, r.id, {});
@@ -3452,6 +3471,84 @@ pub const Session = struct {
             from = .{ .at = page.next orelse break };
         }
 
+        return finishPending(alloc, &accepted, &settled);
+    }
+
+    /// Reads only the lines `open_inputs` names, in list order. Returns null
+    /// when a line is not where the list says, so the caller reads the whole log.
+    fn scanOpenInputs(
+        src: Source,
+        alloc: Allocator,
+        open_inputs: []const sm.OpenInput,
+        up_to_seq: ?u64,
+        cancel_requested: ?*const std.atomic.Value(bool),
+    ) !?PendingAcceptedInputs {
+        var accepted: std.ArrayList(AcceptedItem) = .empty;
+        defer freeAccepted(alloc, &accepted);
+        var no_settled: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer no_settled.deinit(alloc);
+
+        for (open_inputs) |open| {
+            if (cancel_requested) |flag| {
+                if (flag.load(.acquire)) return error.PendingInputRestoreCancelled;
+            }
+            if (up_to_seq) |limit| {
+                if (open.seq > limit) continue;
+            }
+            const accepted_item = (try readOpenInput(src, alloc, open)) orelse {
+                debug_trace.logf("session", "event=pending_inputs_list_stale id={d}", .{open.id});
+                return null;
+            };
+            errdefer accepted_item.deinit(alloc);
+            try accepted.append(alloc, accepted_item);
+        }
+        return try finishPending(alloc, &accepted, &no_settled);
+    }
+
+    /// The accepted input `open` names, read from its own line. Null when that
+    /// line is not an `input_accepted` with the same id, seq, and offset.
+    fn readOpenInput(src: Source, alloc: Allocator, open: sm.OpenInput) !?AcceptedItem {
+        var page = try src.readTo(alloc, .{ .at = .{ .offset = open.offset, .seq = open.seq } }, .forward, 1);
+        defer page.deinit();
+        if (page.damaged or page.entries.len != 1) return null;
+        const entry = page.entries[0];
+        if (entry.offset != open.offset or entry.seq != open.seq) return null;
+        const body = entry.body orelse return null;
+        switch (body) {
+            .input_accepted => |a| {
+                if (a.id != open.id) return null;
+                return try acceptedItemOf(src, alloc, a);
+            },
+            else => return null,
+        }
+    }
+
+    /// The text and images of one accepted input. An input whose text or
+    /// images cannot be read comes back with `unreadable_err` set.
+    fn acceptedItemOf(src: Source, alloc: Allocator, accepted: sm.Body.InputAccepted) !AcceptedItem {
+        const text = acceptedInputText(src, alloc, accepted) catch |err| switch (err) {
+            error.InvalidSessionFormat => return .{ .id = accepted.id, .unreadable_err = err },
+            else => |e| return e,
+        };
+        errdefer alloc.free(text);
+        const images = dupePendingAcceptedImages(alloc, accepted.images) catch |err| switch (err) {
+            error.InvalidSessionFormat => {
+                alloc.free(text);
+                return .{ .id = accepted.id, .unreadable_err = err };
+            },
+            else => |e| return e,
+        };
+        return .{ .id = accepted.id, .text = text, .images = images };
+    }
+
+    /// Moves the accepted inputs that `settled` does not name into the result,
+    /// in log order. On success it empties `accepted`; on error the caller
+    /// still owns the items.
+    fn finishPending(
+        alloc: Allocator,
+        accepted: *std.ArrayList(AcceptedItem),
+        settled: *const std.AutoHashMapUnmanaged(u64, void),
+    ) !PendingAcceptedInputs {
         var pending_count: usize = 0;
         var unreadable_count: usize = 0;
         for (accepted.items) |item_entry| {
@@ -3469,15 +3566,12 @@ pub const Session = struct {
         const images_out = try alloc.alloc([]PendingAcceptedImage, pending_count);
         errdefer alloc.free(images_out);
         const unreadable_ids = try alloc.alloc(u64, unreadable_count);
-        moved = true;
 
         var out: usize = 0;
         var bad_out: usize = 0;
         for (accepted.items) |item_entry| {
             if (settled.contains(item_entry.id)) {
-                if (item_entry.text) |t| alloc.free(t);
-                for (item_entry.images) |img| img.deinit(alloc);
-                alloc.free(item_entry.images);
+                item_entry.deinit(alloc);
             } else if (item_entry.text) |t| {
                 ids[out] = item_entry.id;
                 texts[out] = t;
@@ -3490,12 +3584,33 @@ pub const Session = struct {
                 bad_out += 1;
             }
         }
-        accepted.deinit(alloc);
+        accepted.clearRetainingCapacity();
         return .{
             .ids = ids,
             .texts = texts,
             .images = images_out,
             .unreadable_ids = unreadable_ids,
+        };
+    }
+
+    /// The state's open inputs, borrowed from `state`; null when it does not know them.
+    fn knownOpenInputs(state: *const sm.State) ?[]const sm.OpenInput {
+        return if (state.open_inputs_known) state.open_inputs.items else null;
+    }
+
+    /// An owned copy of the state's open inputs; null when it does not know them.
+    fn copyOpenInputs(alloc: Allocator, state: *const sm.State) Allocator.Error!?[]sm.OpenInput {
+        const known = knownOpenInputs(state) orelse return null;
+        return try alloc.dupe(sm.OpenInput, known);
+    }
+
+    /// A reader's own copy of the open inputs. When the copy cannot be made,
+    /// the reader has no list and reads the whole log, which is always correct.
+    fn dupeOpenInputs(alloc: Allocator, known: ?[]const sm.OpenInput) ?[]sm.OpenInput {
+        const inputs = known orelse return null;
+        return alloc.dupe(sm.OpenInput, inputs) catch |err| {
+            debug_trace.logf("session", "event=pending_inputs_list_copy_failed err={s}", .{@errorName(err)});
+            return null;
         };
     }
 
@@ -4270,6 +4385,130 @@ pub const Session = struct {
         try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
     }
 
+    /// A page of history, as `historyPage` finds it.
+    pub const HistoryPage = struct {
+        /// The first line of each turn in the page, oldest first. A turn that
+        /// continues the one before it (`turn_continued`) is part of that one.
+        turns: []sm.Cursor,
+        /// Turns older than the page are left.
+        older: bool,
+        /// The backward read stopped at a damaged line: nothing older can be
+        /// trusted, so nothing older is read.
+        damaged: bool,
+
+        pub fn deinit(page: *HistoryPage, alloc: Allocator) void {
+            alloc.free(page.turns);
+        }
+    };
+
+    /// Lines a backward scan for a page reads at a time, so it reads about
+    /// the page's bytes, not `replay_page_lines` of them.
+    const page_scan_lines: usize = 16;
+
+    /// The turns that start before `before`, or before the log's end when it
+    /// is null: newest first back to `budget_bytes` of log, and at least one
+    /// turn. It reads backward through the manager's handle and takes no
+    /// lock, as `visitHistory` does. Caller frees with `deinit`.
+    pub fn historyPage(self: *Session, alloc: Allocator, before: ?sm.Cursor, budget_bytes: u64) !HistoryPage {
+        const src = self.source();
+        var newest_first: std.ArrayList(sm.Cursor) = .empty;
+        defer newest_first.deinit(alloc);
+        var from: sm.From = if (before) |c| .{ .at = c } else .end;
+        var newest: ?u64 = if (before) |c| c.offset else null;
+        var newer_continues = false;
+        const ended: struct { older: bool, damaged: bool } = scan: {
+            while (true) {
+                var page = try src.readTo(alloc, from, .backward, page_scan_lines);
+                defer page.deinit();
+                for (page.entries) |entry| {
+                    if (before) |c| if (entry.offset >= c.offset) continue;
+                    if (newest == null) newest = entry.offset;
+                    const body = entry.body orelse {
+                        newer_continues = false;
+                        continue;
+                    };
+                    switch (body) {
+                        .turn_started => {
+                            if (!newer_continues) {
+                                try newest_first.append(alloc, .{ .offset = entry.offset, .seq = entry.seq });
+                                if (newest.? - entry.offset >= budget_bytes) break :scan .{ .older = true, .damaged = false };
+                            }
+                            newer_continues = false;
+                        },
+                        .item => |piece| newer_continues = std.mem.eql(u8, piece.type, continued_type),
+                        else => newer_continues = false,
+                    }
+                }
+                if (page.damaged) break :scan .{ .older = false, .damaged = true };
+                from = .{ .at = page.next orelse break :scan .{ .older = false, .damaged = false } };
+            }
+        };
+        const turns = try alloc.dupe(sm.Cursor, newest_first.items);
+        std.mem.reverse(sm.Cursor, turns);
+        // The oldest turn found is where the page starts, so older turns are
+        // left only when the scan stopped before the log's first turn.
+        return .{ .turns = turns, .older = ended.older, .damaged = ended.damaged };
+    }
+
+    /// Where the turn that starts at `at` ends: the first line of the next
+    /// turn that doesn't continue it, or null when it runs to the log's end.
+    /// `at` must be the first line of a turn in this log, as `historyPage`
+    /// gives them, else `error.InvalidCursor`.
+    pub fn turnAfter(self: *Session, alloc: Allocator, at: sm.Cursor) !?sm.Cursor {
+        const src = self.source();
+        var from: sm.From = .{ .at = at };
+        var first = true;
+        // A turn's first line, until the line after it shows whether it
+        // continues the turn before it.
+        var candidate: ?sm.Cursor = null;
+        while (true) {
+            var page = src.readTo(alloc, from, .forward, page_scan_lines) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidCursor,
+            };
+            defer page.deinit();
+            for (page.entries) |entry| {
+                if (first) {
+                    first = false;
+                    const starts = entry.offset == at.offset and entry.seq == at.seq and
+                        entry.body != null and entry.body.? == .turn_started;
+                    if (!starts) return error.InvalidCursor;
+                    continue;
+                }
+                const body = entry.body orelse continue;
+                if (candidate) |next| {
+                    const continues = body == .item and std.mem.eql(u8, body.item.type, continued_type);
+                    if (!continues) return next;
+                    candidate = null;
+                }
+                if (body == .turn_started) candidate = .{ .offset = entry.offset, .seq = entry.seq };
+            }
+            if (first) return error.InvalidCursor;
+            from = .{ .at = page.next orelse return candidate };
+        }
+    }
+
+    /// `visitHistory` for the turns from `start` (the log's start when null)
+    /// up to the line at `stop` (the log's end when null).
+    pub fn visitHistoryRange(self: *Session, alloc: Allocator, start: ?sm.Cursor, stop: ?u64, visitor: anytype) !void {
+        var sink: VisitorSink(@TypeOf(visitor), .skip) = .{ .alloc = alloc, .visitor = visitor };
+        var src = self.source();
+        src.stop_offset = stop;
+        const from: sm.From = if (start) |c| .{ .at = c } else .start;
+        try replay(src, alloc, alloc, from, null, ReplaySink.init(&sink));
+    }
+
+    /// `durableState` with an empty history: the settings alone, for a load
+    /// that sends the bottom screen first and restores the history after.
+    pub fn durableSettings(self: *Session, alloc: Allocator, workspace: []const u8) !Resumed {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const state = try self.handle.state(scratch.allocator());
+        var restored = try settingsFrom(alloc, scratch.allocator(), state);
+        defer restored.deinit(alloc);
+        return resumedOf(alloc, &restored, self.id(), workspace);
+    }
+
     /// What a `visitHistory` reader does at a compaction summary. The
     /// transcript shows turns only, as v1's does, so a summary is never handed
     /// to the visitor.
@@ -4511,6 +4750,7 @@ pub const Session = struct {
         const state = try handle.state(arena.allocator());
         copy.last_turn = state.last_turn;
         copy.opened_last_seq = state.last_seq;
+        copy.opened_open_inputs = try copyOpenInputs(alloc, &state);
         copy.last_seq = state.last_seq;
         if (options.title) |title| try copy.rename(try forkTitle(arena.allocator(), title));
         traceWiring("Fork", copy.id(), "", copy.store.pid);
@@ -4873,9 +5113,20 @@ const Source = struct {
     host: ?*BlobHost = null,
     /// Where that session kept its side files before the move.
     files_path: ?[]const u8 = null,
+    /// A forward read ends before the line at this offset, for `visitHistoryRange`.
+    stop_offset: ?u64 = null,
 
     fn read(src: Source, sa: Allocator, from: sm.From, limit: usize) !sm.Page {
-        return src.readTo(sa, from, .forward, limit);
+        var page = try src.readTo(sa, from, .forward, limit);
+        if (src.stop_offset) |stop| {
+            var n: usize = 0;
+            while (n < page.entries.len and page.entries[n].offset < stop) n += 1;
+            if (n < page.entries.len or (page.entries.len > 0 and page.next != null and page.next.?.offset >= stop)) {
+                page.entries = page.entries[0..n];
+                page.next = null;
+            }
+        }
+        return page;
     }
 
     fn readTo(src: Source, sa: Allocator, from: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
@@ -5048,12 +5299,18 @@ pub const PendingInputsReader = struct {
     store: *Store,
     host: *BlobHost,
     up_to_seq: ?u64,
+    alloc: Allocator,
+    /// The open inputs as of `open_at_seq`, a copy this reader owns; null reads
+    /// the whole log. Only a scan that stops at `open_at_seq` may use them.
+    open_inputs: ?[]sm.OpenInput,
+    open_at_seq: u64,
 
     pub fn deinit(self: *PendingInputsReader) void {
         if (comptime !durable_sessions_enabled) {
             self.* = undefined;
             return;
         }
+        if (self.open_inputs) |inputs| self.alloc.free(inputs);
         BlobHost.release(self.host);
         self.* = undefined;
     }
@@ -5069,7 +5326,8 @@ pub const PendingInputsReader = struct {
         cancel_requested: ?*const std.atomic.Value(bool),
     ) !Session.PendingAcceptedInputs {
         if (comptime !durable_sessions_enabled) return .{};
-        return Session.scanPendingAcceptedInputs(self.source(), alloc, self.up_to_seq, cancel_requested);
+        const listed = if (self.up_to_seq == self.open_at_seq) self.open_inputs else null;
+        return Session.scanPendingAcceptedInputs(self.source(), alloc, self.up_to_seq, cancel_requested, listed);
     }
 };
 
@@ -11338,6 +11596,92 @@ test "a finished turn keeps no trace of its running calls" {
     try testing.expectEqual(@as(usize, 0), restored.history[0].assistant.execution.tool_steps.len);
 }
 
+test "historyPage finds turn starts back to a budget, oldest first, and turnAfter where a turn ends" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    const language = types.ConversationLanguage.default();
+    try s.commitTurn(assistantTurn("one", "1"), language);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    var summary = "turns one and two".*;
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    try s.commitTurn(assistantTurn("four", "4"), language);
+
+    // A budget of one byte still takes the newest turn, and says more are left.
+    var newest = try s.historyPage(testing.allocator, null, 1);
+    defer newest.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), newest.turns.len);
+    try testing.expect(newest.older and !newest.damaged);
+
+    var all = try s.historyPage(testing.allocator, null, 1 << 20);
+    defer all.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), all.turns.len);
+    try testing.expect(!all.older and !all.damaged);
+    for (all.turns[1..], all.turns[0 .. all.turns.len - 1]) |later, earlier| try testing.expect(later.offset > earlier.offset);
+    try testing.expectEqualDeep(newest.turns[0], all.turns[3]);
+
+    // The page before turn three holds turns one and two; the compaction
+    // line between is no turn of its own.
+    var before = try s.historyPage(testing.allocator, all.turns[2], 1 << 20);
+    defer before.deinit(testing.allocator);
+    try testing.expectEqualDeep(@as([]const sm.Cursor, all.turns[0..2]), @as([]const sm.Cursor, before.turns));
+
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            if (turn != .assistant) return;
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+    };
+    var visitor: Visitor = .{};
+    defer {
+        for (visitor.prompts.items) |prompt| testing.allocator.free(prompt);
+        visitor.prompts.deinit(testing.allocator);
+    }
+    try s.visitHistoryRange(testing.allocator, all.turns[1], all.turns[3].offset, &visitor);
+    try testing.expectEqual(@as(usize, 2), visitor.prompts.items.len);
+    try testing.expectEqualStrings("two", visitor.prompts.items[0]);
+    try testing.expectEqualStrings("three", visitor.prompts.items[1]);
+
+    try testing.expectEqualDeep(@as(?sm.Cursor, all.turns[1]), try s.turnAfter(testing.allocator, all.turns[0]));
+    try testing.expectEqual(@as(?sm.Cursor, null), try s.turnAfter(testing.allocator, all.turns[3]));
+    // A cursor that isn't a turn's first line is refused.
+    try testing.expectError(error.InvalidCursor, s.turnAfter(testing.allocator, .{ .offset = all.turns[1].offset + 1, .seq = all.turns[1].seq }));
+    try testing.expectError(error.InvalidCursor, s.turnAfter(testing.allocator, .{ .offset = all.turns[1].offset, .seq = all.turns[1].seq + 1 }));
+}
+
+test "historyPage stops at a damaged line and says so, with the turns after it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    const language = types.ConversationLanguage.default();
+    try s.commitTurn(assistantTurn("one", "1"), language);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    // One byte of turn one's prompt changes, so that line's checksum fails.
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", s.id(), "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    const at = std.mem.find(u8, bytes, "\"one\"").? + 1;
+    var log_file = try t.tmp.dir.openFile(io, log_path, .{ .mode = .read_write });
+    defer log_file.close(io);
+    try log_file.writePositionalAll(io, &.{bytes[at] ^ 0x01}, at);
+
+    var page = try s.historyPage(testing.allocator, null, 1 << 20);
+    defer page.deinit(testing.allocator);
+    try testing.expect(page.damaged and !page.older);
+    try testing.expectEqual(@as(usize, 2), page.turns.len);
+}
+
 test "the history splits into compaction cycles that Ctrl+O reads one at a time" {
     var t: TestHome = undefined;
     try t.init();
@@ -17176,6 +17520,115 @@ test "eb03: recordInputAccepted assigns ids across reopen without reading old re
     defer pending.deinit(testing.allocator);
     try testing.expectEqualSlices(u64, &.{ id1, id3 }, pending.ids);
 }
+
+/// Turns committed on each side of the accepted input, so the log spans
+/// several read pages and a snapshot is written after the input's line.
+const turns_before_open_input = 150;
+const turns_after_open_input = 150;
+
+const OpenInputFixture = struct { session_id: []u8, input_id: u64 };
+
+/// A closed session whose one accepted input is still open, among many turns.
+fn closedSessionWithOpenInput(t: *TestHome) !OpenInputFixture {
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    errdefer s.close();
+    const session_id = try testing.allocator.dupe(u8, s.id());
+    errdefer testing.allocator.free(session_id);
+    for (0..turns_before_open_input) |_| {
+        try s.commitTurn(assistantTurn("plain", "turn"), types.ConversationLanguage.default());
+    }
+    const input_id = try s.recordInputAccepted("still open");
+    for (0..turns_after_open_input) |_| {
+        try s.commitTurn(assistantTurn("plain", "turn"), types.ConversationLanguage.default());
+    }
+    s.close();
+    return .{ .session_id = session_id, .input_id = input_id };
+}
+
+test "pending accepted inputs read only the open input's line across many turns, through the session and its reader" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const fixture = try closedSessionWithOpenInput(&t);
+    defer testing.allocator.free(fixture.session_id);
+
+    const reopened = try Session.resumeSession(testing.allocator, &t.store, .{ .id = fixture.session_id }, "/w", .app);
+    defer reopened.close();
+
+    const reads_before = test_read_to_count.load(.acquire);
+    var pending = try reopened.pendingAcceptedInputs(testing.allocator);
+    defer pending.deinit(testing.allocator);
+    try testing.expectEqualSlices(u64, &.{fixture.input_id}, pending.ids);
+    try testing.expectEqualStrings("still open", pending.texts[0]);
+    try testing.expect(test_read_to_count.load(.acquire) - reads_before <= 2);
+
+    var reader = reopened.pendingInputsReader();
+    defer reader.deinit();
+    const reader_reads_before = test_read_to_count.load(.acquire);
+    var from_reader = try reader.read(testing.allocator, null);
+    defer from_reader.deinit(testing.allocator);
+    try testing.expectEqualSlices(u64, &.{fixture.input_id}, from_reader.ids);
+    try testing.expect(test_read_to_count.load(.acquire) - reader_reads_before <= 2);
+}
+
+test "pending accepted inputs still find the open input when the newest snapshot has no open_inputs" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const fixture = try closedSessionWithOpenInput(&t);
+    defer testing.allocator.free(fixture.session_id);
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", fixture.session_id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const before = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(64 << 20));
+    defer testing.allocator.free(before);
+    const after = try TestHooks.withoutNewestSnapshotOpenInputs(testing.allocator, before);
+    defer testing.allocator.free(after);
+    try testing.expectEqual(std.mem.count(u8, before, "\"open_inputs\"") - 1, std.mem.count(u8, after, "\"open_inputs\""));
+    try t.tmp.dir.writeFile(io, .{ .sub_path = log_path, .data = after });
+
+    const reopened = try Session.resumeSession(testing.allocator, &t.store, .{ .id = fixture.session_id }, "/w", .app);
+    defer reopened.close();
+    var pending = try reopened.pendingAcceptedInputs(testing.allocator);
+    defer pending.deinit(testing.allocator);
+    try testing.expectEqualSlices(u64, &.{fixture.input_id}, pending.ids);
+    try testing.expectEqualStrings("still open", pending.texts[0]);
+}
+
+/// Helpers for tests here and in the app's runtime, which build logs as an
+/// older fx left them.
+pub const TestHooks = if (builtin.is_test) struct {
+    /// How many pages `Source.readTo` has read so far, in every test of the binary.
+    pub fn readToCount() usize {
+        return test_read_to_count.load(.acquire);
+    }
+
+    /// `bytes` with `open_inputs` taken out of the newest snapshot line, and that
+    /// line's checksum recomputed: the snapshot an fx written before `open_inputs`
+    /// existed would have left. Caller owns the result.
+    pub fn withoutNewestSnapshotOpenInputs(alloc: Allocator, bytes: []const u8) ![]u8 {
+        const kind_at = std.mem.findLast(u8, bytes, "\"kind\":\"snapshot\"") orelse return error.TestNoSnapshot;
+        const line_start = if (std.mem.findScalarLast(u8, bytes[0..kind_at], '\n')) |newline| newline + 1 else 0;
+        const line_end = std.mem.findScalarPos(u8, bytes, kind_at, '\n') orelse return error.TestNoSnapshot;
+        const line = bytes[line_start..line_end];
+        const crc_at = std.mem.findLast(u8, line, ",\"crc\":\"") orelse return error.TestNoSnapshot;
+        const field_at = std.mem.find(u8, line[0..crc_at], ",\"open_inputs\":[") orelse return error.TestNoOpenInputs;
+        const field_end = (std.mem.findScalarPos(u8, line, field_at, ']') orelse return error.TestNoOpenInputs) + 1;
+        const payload = try std.mem.concat(alloc, u8, &.{ line[0..field_at], line[field_end..crc_at] });
+        defer alloc.free(payload);
+        const crc = std.hash.crc.@"CRC-32/ISCSI".hash(payload);
+        const framed = try alloc.print("{s},\"crc\":\"{x:0>8}\"}}\n", .{ payload, crc });
+        defer alloc.free(framed);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, bytes[0..line_start]);
+        try out.appendSlice(alloc, framed);
+        try out.appendSlice(alloc, bytes[line_end + 1 ..]);
+        return out.toOwnedSlice(alloc);
+    }
+} else struct {};
 
 test "eb03: fork copies lines 2..S byte-for-byte and appends input_withdrawn for pending inputs" {
     var t: TestHome = undefined;
