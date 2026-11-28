@@ -12,6 +12,7 @@
 //! folders it holds can vary between runs.
 
 const std = @import("std");
+
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const git_config = @import("git_config.zig");
@@ -388,7 +389,7 @@ fn repositoryRules(arena: Allocator, index_alloc: Allocator, root: []const u8, r
     if (wide.unavailable.len > 0) incomplete.* = true;
     for (loaded.paths) |read| try rules.sources.append(arena, .{ .path = read.path, .identity_only = false, .follow_symlinks = read.follow_symlinks });
     if (settings.excludes_file) |path| try rules.sources.append(arena, .{ .path = path, .identity_only = false, .follow_symlinks = settings.excludes_file_follows_symlinks });
-    for ([_][]const u8{"info/exclude"}) |name| try rules.sources.append(arena, .{ .path = try std.Io.Dir.path.join(arena, &.{ found.common_dir, name }), .identity_only = false });
+    try rules.sources.append(arena, .{ .path = try sources.infoExcludePath(arena, found.common_dir), .identity_only = false });
     for ([_][]const u8{ "index", "HEAD", "commondir" }) |name| try rules.sources.append(arena, .{ .path = try std.Io.Dir.path.join(arena, &.{ found.git_dir, name }), .identity_only = false });
 
     var lists: std.ArrayList(*const ignore.PatternList) = .empty;

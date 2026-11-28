@@ -4851,6 +4851,7 @@ const PendingToolDetailStart = struct {
     /// Set for a provisional start, whose arguments still stream in. Every
     /// other start clears it.
     streaming: bool = false,
+    command_placement: ?types.CommandPlacement = null,
 
     fn deinit(self: *PendingToolDetailStart, alloc: Allocator) void {
         const tool_name = self.tool_name;
@@ -4865,6 +4866,7 @@ const PendingToolDetailStart = struct {
 
 const PendingToolDetailTerminal = struct {
     result: ?[]u8 = null,
+    notice: ?[]u8 = null,
     result_handle: ?[]u8 = null,
     command_artifact_handle: ?[]u8 = null,
     command_output_replay: ?types.CommandOutputReplay = null,
@@ -4872,9 +4874,11 @@ const PendingToolDetailTerminal = struct {
     command_output_entry_id: ?u32 = null,
     command_process_entry: ?PendingCommandProcessEntry = null,
     subagent_started: bool = false,
+    command_placement: ?types.CommandPlacement = null,
 
     fn deinit(self: *PendingToolDetailTerminal, alloc: Allocator) void {
         if (self.result) |value| alloc.free(value);
+        if (self.notice) |value| alloc.free(value);
         if (self.result_handle) |value| alloc.free(value);
         if (self.command_artifact_handle) |value| alloc.free(value);
         if (self.command_output_replay) |replay| {
@@ -5142,6 +5146,7 @@ const transcript_screen_fields = [_][:0]const u8{
     "render_requests",
     "has_committed_frame",
     "committed_frame_layout",
+    "footer_close_reset_owed",
     "pending_session_scrollback_handoff",
     "terminal_dimensions_invalid",
     "full_transcript",
@@ -5281,6 +5286,8 @@ pub const TranscriptRuntime = struct {
     /// still use the startup error path.
     has_committed_frame: bool = false,
     committed_frame_layout: render_engine.frame_layout.CommittedLayoutSnapshot = .{},
+    /// A reprint skipped while a surface opens is owed to the next plain composer frame.
+    footer_close_reset_owed: bool = false,
     transcript_commit_state: TranscriptCommitState = .invalid,
     /// A partial scroll may have moved rows into terminal history already.
     /// No ordinary repaint may run until the remaining rows are committed.
@@ -5825,6 +5832,7 @@ pub const TranscriptRuntime = struct {
                 started.activity_kind,
                 started.arguments_json,
                 started.place_after_current_transcript,
+                started.command_placement,
             ),
             .progress => |progress| self.applyProgressLifecycle(
                 alloc,
@@ -6354,6 +6362,7 @@ pub const TranscriptRuntime = struct {
         activity_kind: types.ToolActivityKind,
         arguments_json: ?[]const u8,
         place_after_current_transcript: bool,
+        command_placement: ?types.CommandPlacement,
     ) !?types.ToolActivityKind {
         if (!admitLifecycleStart(&self.notebook.lifecycle_state, id)) return null;
 
@@ -6393,6 +6402,7 @@ pub const TranscriptRuntime = struct {
                     arguments_json,
                 );
                 defer detail_start.deinit(alloc);
+                detail_start.command_placement = command_placement;
                 try self.notebook.lifecycle_state.ensureRecordCapacity(alloc);
                 const owned_call_id = try alloc.dupe(u8, id.call_id);
                 errdefer alloc.free(owned_call_id);
@@ -6438,6 +6448,7 @@ pub const TranscriptRuntime = struct {
                 arguments_json,
             );
             defer detail_start.deinit(alloc);
+            detail_start.command_placement = command_placement;
             const owned_tool_name = try alloc.dupe(u8, tool_name);
             errdefer alloc.free(owned_tool_name);
             const line = try lifecycleStartLine(alloc, tool_name);
@@ -6476,6 +6487,7 @@ pub const TranscriptRuntime = struct {
             arguments_json,
         );
         defer detail_start.deinit(alloc);
+        detail_start.command_placement = command_placement;
         const entry_id = try self.createToolActivity(
             alloc,
             id,
@@ -7210,6 +7222,7 @@ pub const TranscriptRuntime = struct {
             pending.tool_name = null;
             if (pending.captured_command) |value| detail.captured_command = value;
             if (pending.activity_kind) |kind| detail.activity_kind = kind;
+            if (pending.command_placement) |placement| detail.command_placement = placement;
             detail.streaming = pending.streaming;
             if (pending.arguments_json) |arguments_json| {
                 if (detail.arguments_json) |old| alloc.free(old);
@@ -7233,6 +7246,7 @@ pub const TranscriptRuntime = struct {
             .arguments_json = pending.arguments_json,
             .lifecycle_id = pending.lifecycle_id,
             .streaming = pending.streaming,
+            .command_placement = pending.command_placement,
         };
         if (search.index == self.notebook.tool_details.items.len) {
             self.notebook.tool_details.appendAssumeCapacity(detail);
@@ -7344,6 +7358,9 @@ pub const TranscriptRuntime = struct {
         var pending: PendingToolDetailTerminal = .{};
         errdefer pending.deinit(alloc);
         if (result) |value| pending.result = try alloc.dupe(u8, value);
+        if (result_memory) |memory| {
+            if (memory.notice) |text| pending.notice = try alloc.dupe(u8, text);
+        }
         const result_handle = if (result_memory) |memory| memory.output_handle else null;
         if (result_handle) |handle| pending.result_handle = try alloc.dupe(u8, handle);
         if (command_artifact_handle) |handle| {
@@ -7359,6 +7376,7 @@ pub const TranscriptRuntime = struct {
         else
             null;
         pending.subagent_started = if (result_memory) |memory| memory.subagent_started else false;
+        pending.command_placement = if (result_memory) |memory| memory.command_placement else null;
         pending.command_output_entry_id = if (activity_kind == .command)
             command_output_entry_id_override orelse
                 self.commandOutputEntryIdForLifecycle(lifecycle_id)
@@ -7398,6 +7416,11 @@ pub const TranscriptRuntime = struct {
             detail.result = owned;
             pending.result = null;
         }
+        if (pending.notice) |owned| {
+            if (detail.notice) |old| alloc.free(old);
+            detail.notice = owned;
+            pending.notice = null;
+        }
         if (pending.result_handle) |owned| {
             if (detail.result_handle) |old| alloc.free(old);
             detail.result_handle = owned;
@@ -7417,6 +7440,7 @@ pub const TranscriptRuntime = struct {
         }
         detail.command_process_presentation = pending.command_process_presentation;
         detail.subagent_started = pending.subagent_started;
+        if (pending.command_placement) |placement| detail.command_placement = placement;
         if (activity_kind == .command) {
             detail.command_output_entry_id = pending.command_output_entry_id;
         }
@@ -8770,6 +8794,171 @@ pub const TranscriptRuntime = struct {
         self.footer_viewport.clearExternalInvalidation();
         self.terminal_reset_pending = true;
         try self.initViewportWithReservedRows(metrics, 1, min_body_rows);
+    }
+
+    fn footerCloseStrandsTranscript(
+        self: *const TranscriptRuntime,
+        footer_shrank: bool,
+        footer: render_engine.frame_layout.FooterMeasurement,
+        footer_area: render_engine.frame_layout.FrameRect,
+        selection: ?ViewportSelection,
+        source_visual_rows: u32,
+    ) bool {
+        const shown = selection orelse return false;
+        const rows_above_viewport = shown.start_line > 0 or shown.partial_skip_rows > 0;
+        const rows_above_footer = @as(u32, self.layout.rows) -| @as(u32, footer_area.height());
+        const plain_composer = footer.picker_rows == 0 and footer.banner_rows == 0;
+        return footer_shrank and
+            plain_composer and
+            self.has_committed_frame and
+            self.committed_frame_layout.terminal_cols == self.layout.cols and
+            self.resize_history_row_delta == null and
+            self.pending_resize_observation == null and
+            footer_area.bottom < self.layout.rows and
+            rows_above_viewport and
+            source_visual_rows >= rows_above_footer;
+    }
+
+    fn footerShrank(self: *const TranscriptRuntime, footer_area: render_engine.frame_layout.FrameRect) bool {
+        return footer_area.height() < self.committed_frame_layout.footer_area.height();
+    }
+
+    fn footerCloseResetDecision(
+        self: *TranscriptRuntime,
+        footer: render_engine.frame_layout.FooterMeasurement,
+        footer_area: render_engine.frame_layout.FrameRect,
+        footer_surface_opening: bool,
+        selection: ?ViewportSelection,
+        source_visual_rows: u32,
+    ) bool {
+        const footer_settled = footer.picker_rows > 0 or footer.banner_rows > 0 or footer_area.bottom >= self.layout.rows;
+        if (footer_settled) self.footer_close_reset_owed = false;
+        const shrink_due = self.footerShrank(footer_area) or self.footer_close_reset_owed;
+        if (!self.footerCloseStrandsTranscript(shrink_due, footer, footer_area, selection, source_visual_rows)) return false;
+        if (footer_surface_opening) {
+            self.footer_close_reset_owed = true;
+            return false;
+        }
+        self.footer_close_reset_owed = false;
+        return true;
+    }
+
+    pub fn solveFrameWithFooterCloseReset(
+        self: *TranscriptRuntime,
+        metrics: *Metrics,
+        comptime Context: type,
+        ctx: *Context,
+        input: render_engine.frame_layout.SolveInput,
+        prepare_candidate: *const fn (*Context, render_engine.frame_layout.FrameLayout) anyerror!render_engine.frame_fixed_point.CandidatePreparation,
+        resolve_candidate: *const fn (*Context, render_engine.frame_layout.FrameLayout, render_engine.frame_scroll_plan.FrameScrollPlan) anyerror!render_engine.frame_fixed_point.CandidateResolution,
+        footer_surface_opening: bool,
+        prepared: *const ?transcript_painter.PreparedTranscriptSurfacePaint,
+    ) !render_engine.frame_fixed_point.FramePlan {
+        const plan = try render_engine.frame_fixed_point.solve(Context, ctx, input, prepare_candidate, resolve_candidate);
+        const selection = if (prepared.*) |*paint| paint.selection else null;
+        const source_rows = if (prepared.*) |*paint| paint.sourceTotalVisualRows() else 0;
+        if (!self.footerCloseResetDecision(input.footer, plan.layout.footer_area, footer_surface_opening, selection, source_rows)) return plan;
+        debug_trace.logf("scroll", "footer_close_reset footer_bottom={d} terminal_rows={d} source_visual_rows={d} committed_footer_rows={d} footer_picker_rows={d} footer_banner_rows={d} footer_surface_opening={any}", .{ plan.layout.footer_area.bottom, self.layout.rows, source_rows, self.committed_frame_layout.footer_area.height(), input.footer.picker_rows, input.footer.banner_rows, footer_surface_opening });
+        // Pinned by resize_tests.zig "a footer surface closed after transcript growth leaves the composer on the bottom row".
+        try self.requestTerminalReset(metrics);
+        var reset_input = input;
+        reset_input.owned_top = self.owned_top_row;
+        return render_engine.frame_fixed_point.solve(Context, ctx, reset_input, prepare_candidate, resolve_candidate);
+    }
+
+    test "a footer close strands the transcript only when every condition holds" {
+        const above: ViewportSelection = .{
+            .top_row = 1,
+            .bottom_row = 8,
+            .start_line = 16,
+            .partial_skip_rows = 0,
+            .line_count = 8,
+        };
+        const footer: render_engine.frame_layout.FrameRect = .{ .top = 9, .bottom = 11 };
+        const bottom_footer: render_engine.frame_layout.FrameRect = .{ .top = 18, .bottom = 20 };
+        const fills_gap: u32 = 24;
+        const plain: render_engine.frame_layout.FooterMeasurement = .{ .natural_rows = 3, .min_rows = 1, .max_rows = 3 };
+        const picker: render_engine.frame_layout.FooterMeasurement = .{ .natural_rows = 12, .min_rows = 1, .max_rows = 12, .picker_rows = 8 };
+        const notice: render_engine.frame_layout.FooterMeasurement = .{ .natural_rows = 4, .min_rows = 1, .max_rows = 4, .banner_rows = 1 };
+        var shell = TranscriptRuntime{
+            .layout = .{
+                .rows = 20,
+                .cols = 100,
+                .content_bottom = 16,
+                .divider_top_row = 17,
+                .input_row = 18,
+                .divider_bottom_row = 19,
+                .hint_row = 20,
+            },
+            .has_committed_frame = true,
+            .committed_frame_layout = .{ .terminal_cols = 100 },
+        };
+        try std.testing.expect(shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(false, plain, footer, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, null, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, bottom_footer, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, picker, footer, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, notice, footer, above, fills_gap));
+        var at_top = above;
+        at_top.start_line = 0;
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, at_top, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, 10));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, 16));
+        try std.testing.expect(shell.footerCloseStrandsTranscript(true, plain, footer, above, 17));
+
+        shell.has_committed_frame = false;
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+        shell.has_committed_frame = true;
+
+        shell.committed_frame_layout.terminal_cols = 80;
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+        shell.committed_frame_layout.terminal_cols = 100;
+
+        shell.resize_history_row_delta = 3;
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+        shell.resize_history_row_delta = null;
+
+        shell.pending_resize_observation = .{
+            .layout = shell.layout,
+            .apply_after_ms = 0,
+            .expected_row = null,
+            .result = .unavailable,
+            .phase = .live,
+        };
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+        shell.pending_resize_observation = null;
+
+        const grown: render_engine.frame_layout.FrameRect = .{ .top = 7, .bottom = 11 };
+        shell.committed_frame_layout.footer_area = footer;
+        try std.testing.expect(!shell.footerShrank(grown));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(shell.footerShrank(grown), plain, grown, above, fills_gap));
+        shell.committed_frame_layout.footer_area = grown;
+        try std.testing.expect(shell.footerShrank(footer));
+
+        try std.testing.expect(shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+
+        shell.committed_frame_layout.footer_area = .{ .top = 9, .bottom = 20 };
+        try std.testing.expect(!shell.footerCloseResetDecision(plain, footer, true, above, fills_gap));
+        try std.testing.expect(shell.footer_close_reset_owed);
+        shell.committed_frame_layout.footer_area = footer;
+        try std.testing.expect(shell.footerCloseResetDecision(plain, footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footer_close_reset_owed);
+        shell.footer_close_reset_owed = true;
+        try std.testing.expect(!shell.footerCloseResetDecision(picker, footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footer_close_reset_owed);
+
+        shell.footer_close_reset_owed = true;
+        try std.testing.expect(shell.footerCloseResetDecision(plain, footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footer_close_reset_owed);
+
+        shell.footer_close_reset_owed = true;
+        try std.testing.expect(!shell.footerCloseResetDecision(notice, footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footer_close_reset_owed);
+
+        shell.footer_close_reset_owed = true;
+        try std.testing.expect(!shell.footerCloseResetDecision(plain, bottom_footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footer_close_reset_owed);
     }
 
     pub fn requestTerminalResetAfterResize(

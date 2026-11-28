@@ -1,0 +1,28 @@
+{
+  "covers": [
+    "AC-11"
+  ],
+  "title": "Vercel closes the quiet stream after the first byte; the runner reattaches by reading and gets the rest and the exit code.",
+  "run": {
+    "events": [
+      "push_ok",
+      "send_ran",
+      "id_arrives",
+      "idle_close",
+      "reattach_ok",
+      "cmd_exits",
+      "stream_end",
+      "bring_back_nothing",
+      "exit_cmd"
+    ]
+  },
+  "tamper": {
+    "run": "resend-after-close"
+  },
+  "drive": {
+    "command": "printf a; sleep 1; printf b",
+    "faults": {
+      "idleCloseAfterBytes": 1
+    }
+  }
+}

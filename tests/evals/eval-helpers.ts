@@ -513,6 +513,7 @@ export function envWithoutFxHome(
 export const CREDENTIAL_ENV_KEYS = [
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
+  "VERCEL_TOKEN",
 ] as const;
 
 /// Names that a developer's shell, or a long-lived tmux server, can hold and
@@ -523,6 +524,7 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   "FX_TEST_GATEWAY_MODELS_URL",
   "FX_TEST_GATEWAY_CREDITS_URL",
   "FX_TEST_UPGRADE_BASE_URL",
+  "FX_TEST_VERCEL_API_URL",
   "FX_PERMISSION_MODE",
   // A developer's provider choice would send a test to a login it did not set up.
   "FX_PROVIDER",
@@ -544,6 +546,7 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   // A forced approval-screen failure left there would deny the next approval
   // of every test's fx.
   "FX_TEST_APPROVAL_SCREEN_FAIL",
+  "FX_TEST_RECOVERY_RETRY_BUDGET_MS",
   "FX_TEST_REPORT_DELIVERY_HELD",
   "FX_TEST_REPORT_DELIVERY_RELEASE",
   "FX_TEST_SESSION_WRITE_HELD",
