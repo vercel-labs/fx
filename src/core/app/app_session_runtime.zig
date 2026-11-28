@@ -1872,15 +1872,19 @@ pub fn Runtime(comptime App: type) type {
             if (notice != .fork) {
                 noteInterruptedRequest(agent, v2);
                 if (comptime runtime_profile.allows(App, .durable_sessions)) {
-                    try schedulePendingAcceptedInputsRestore(agent, v2);
+                    try schedulePendingAcceptedInputsRestore(agent, v2, notice == .upgrade);
                 }
             }
         }
 
-        fn schedulePendingAcceptedInputsRestore(agent: *AppAgent, v2: *session_adapter.Session) !void {
+        /// After an upgrade's restart the restored prompts go out by
+        /// themselves (`send`); after any other reopen, such as a crash, they
+        /// wait in the composer.
+        fn schedulePendingAcceptedInputsRestore(agent: *AppAgent, v2: *session_adapter.Session, send: bool) !void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             const reader = v2.pendingInputsReader();
             try agent.session_persistence.pending_input_restore.queue(v2.id(), reader);
+            if (send) agent.session_persistence.pending_input_restore.sendAfterRestore();
         }
 
         fn resumeHandoffPending(app: *const App) bool {
@@ -2028,16 +2032,31 @@ pub fn Runtime(comptime App: type) type {
                     if (comptime @hasField(App, "shell")) {
                         app.shell.render_requests.request(.footer);
                     }
+                    // The composer sends them once the frame is up
+                    // (`input_submit_runtime.zig` `collectLaunchPromptFacts`).
+                    if (task.send_after_restore) {
+                        if (comptime agents.hasAgentField(App, "submission") and
+                            @hasField(@FieldType(AppAgent, "submission"), "send_restored_input"))
+                        {
+                            agent.submission.send_restored_input = true;
+                            debug_trace.logf("session", "event=pending_input_restore_send prompts={d}", .{pending.texts.len});
+                        }
+                    }
                 }
             }
+            const sends_restored = task.send_after_restore and failed_images == 0 and pending.unreadable_ids.len == 0;
+            // Prompts that go out by themselves need no "back in the
+            // composer" notice; a failed image or prompt still gets one.
             if (comptime @hasDecl(App, "writeDomainNotice")) {
-                var notice_buf: [288]u8 = undefined;
-                if (formatRestoreNotice(&notice_buf, pending.texts.len, failed_images, pending.unreadable_ids.len)) |body| {
-                    app.writeDomainNotice(.{ .topic = "session", .tone = .information, .body = body }, true) catch |err| {
+                if (!sends_restored) {
+                    var notice_buf: [288]u8 = undefined;
+                    if (formatRestoreNotice(&notice_buf, pending.texts.len, failed_images, pending.unreadable_ids.len)) |body| {
+                        app.writeDomainNotice(.{ .topic = "session", .tone = .information, .body = body }, true) catch |err| {
+                            debug_trace.logf("session", "event=restore_notice_failed err={s}", .{@errorName(err)});
+                        };
+                    } else |err| {
                         debug_trace.logf("session", "event=restore_notice_failed err={s}", .{@errorName(err)});
-                    };
-                } else |err| {
-                    debug_trace.logf("session", "event=restore_notice_failed err={s}", .{@errorName(err)});
+                    }
                 }
             }
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
@@ -6844,6 +6863,7 @@ const TestApp = struct {
         session_persistence: Persistence = .{},
         stream: types.StreamState = .{},
         worker: FakeWorker = .{},
+        submission: struct { send_restored_input: bool = false } = .{},
     } = .{},
     terminal_title_label: [128]u8 = undefined,
     terminal_title_label_len: usize = 0,
@@ -13559,6 +13579,8 @@ test "eb03: restore on resume into empty composer writes singular notice and wit
     try eb03DrainPendingInputRestore(&app, (&app).agent());
 
     try std.testing.expectEqualStrings("queued before crash", app.input_runtime.edit_state.input.items);
+    // After a crash the prompt waits in the composer for the person.
+    try std.testing.expect(!app.agent().submission.send_restored_input);
     var restore_notices: usize = 0;
     for (app.notices.items) |notice| {
         if (std.mem.find(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the composer.") != null) {
@@ -13571,6 +13593,58 @@ test "eb03: restore on resume into empty composer writes singular notice and wit
     defer remaining.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
     _ = id1;
+}
+
+test "upgrade resume sends the prompts the restart left queued instead of leaving them in the composer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("queued before the restart");
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened, .{ .upgrade = .{
+        .version = "0.0.18",
+        .channel = .dev,
+        .previous_revision = "",
+        .revision = "",
+    } });
+    try eb03DrainPendingInputRestore(&app, (&app).agent());
+
+    // The composer holds the prompt and sends it on the next frame; no
+    // "back in the composer" notice, and the record is withdrawn, so the
+    // send records it again.
+    try std.testing.expectEqualStrings("queued before the restart", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.agent().submission.send_restored_input);
+    for (app.notices.items) |notice| {
+        try std.testing.expect(std.mem.find(u8, notice, "back in the composer") == null);
+    }
+    var remaining = try app.agent().session_persistence.v2.?.pendingAcceptedInputs(alloc);
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
 }
 
 test "eb03: restore on resume appends to non-empty composer and emits plural notice" {

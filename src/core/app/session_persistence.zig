@@ -1062,6 +1062,7 @@ pub const PendingInputRestore = struct {
     pub const Queued = struct {
         session_id: []u8,
         reader: session_adapter.PendingInputsReader,
+        send_after_restore: bool = false,
 
         pub fn deinit(self: *Queued) void {
             alloc.free(self.session_id);
@@ -1080,6 +1081,9 @@ pub const PendingInputRestore = struct {
         image_verified: [][]bool = &.{},
         failure: ?anyerror = null,
         next: ?*Task = null,
+        /// The prompts go out once restored instead of waiting in the
+        /// composer: the session reopened after an upgrade's restart.
+        send_after_restore: bool = false,
 
         fn run(self: *Task) void {
             defer self.done.store(true, .release);
@@ -1156,6 +1160,17 @@ pub const PendingInputRestore = struct {
         self.state = .{ .queued = .{ .session_id = id_copy, .reader = owned_reader } };
     }
 
+    /// The queued restore sends its prompts instead of leaving them in the
+    /// composer, for a session an upgrade's restart reopened: they were
+    /// queued behind a turn the restart stopped (`app_upgrade_runtime.zig`
+    /// `restartBlocked`), and they go on as that turn does.
+    pub fn sendAfterRestore(self: *PendingInputRestore) void {
+        switch (self.state) {
+            .queued => |*queued| queued.send_after_restore = true,
+            .idle, .running => {},
+        }
+    }
+
     pub fn startQueued(self: *PendingInputRestore) !void {
         if (comptime !runtime_profile.host.durable_sessions) return;
         var queued = switch (self.state) {
@@ -1167,7 +1182,7 @@ pub const PendingInputRestore = struct {
             queued.deinit();
             return err;
         };
-        task.* = .{ .session_id = queued.session_id, .reader = queued.reader };
+        task.* = .{ .session_id = queued.session_id, .reader = queued.reader, .send_after_restore = queued.send_after_restore };
         if (comptime builtin.single_threaded or host_target.is_wasm) {
             task.run();
         } else {

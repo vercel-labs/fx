@@ -260,6 +260,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (app.trust.asking()) return;
             }
             const agent = agents.screenAgentOf(app);
+            if (agent.submission.send_restored_input) return sendRestoredInput(app, agent, max_prompt_history);
             const prompt = agent.submission.launch_prompt orelse return;
             if (app.shell.render_requests.hasReason(.first_frame)) return;
             // Typed input waits out a live session switch; so does this.
@@ -278,6 +279,19 @@ pub fn SubmitRuntime(comptime App: type) type {
             }
             debug_trace.logf("input", "event=launch_prompt_submit prompt_bytes={d}", .{prompt.len});
             try app.input_runtime.edit_state.setText(app.alloc, prompt);
+            try submit(app, max_prompt_history);
+        }
+
+        /// Sends the prompts an upgrade's restart left queued, which the
+        /// session restore put in the composer (`app_session_runtime.zig`
+        /// `applyPendingInputRestore`), through the same path as Enter.
+        fn sendRestoredInput(app: *App, agent: *AppAgent, max_prompt_history: usize) !void {
+            if (app.shell.render_requests.hasReason(.first_frame)) return;
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                if (agent.session_persistence.pending_live_session_policy != null) return;
+            }
+            agent.submission.send_restored_input = false;
+            debug_trace.logf("input", "event=restored_input_submit input_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
             try submit(app, max_prompt_history);
         }
 

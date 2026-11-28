@@ -125,15 +125,21 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Whether a restart that waits for idle can run now: nothing is
-        /// left that it would lose or cut off.
+        /// left that it would lose or cut off, and no prompt waits in a queue.
         fn idleForRestart(app: *App) bool {
-            return !restartBlocked(app, agents.screenAgentOf(app));
+            const agent = agents.screenAgentOf(app);
+            return !restartBlocked(app, agent) and queuedPromptsNotice(agent) == null;
         }
 
-        /// Whether a restart now would lose or cut off something: queued or
-        /// typed work, an answer an agent waits for, or a view that is open
-        /// (`upgradeUnavailableNotice`, `needsUserElsewhere`,
-        /// `queuedWorkElsewhere`).
+        /// Whether stopping the turns now would lose or cut off something:
+        /// typed work, an answer an agent waits for, a view that is open, or
+        /// prompts queued on another agent (`upgradeUnavailableNotice`,
+        /// `needsUserElsewhere`, `queuedWorkElsewhere`). Prompts queued on
+        /// `agent`, whose session the relaunch reopens, do not count: the
+        /// session keeps them, and the relaunched fx sends them after the
+        /// turn goes on (`app_session_runtime.zig`
+        /// `schedulePendingAcceptedInputsRestore`). Another agent's would wait
+        /// in its composer, so they still hold the restart.
         fn restartBlocked(app: *App, agent: *AppAgent) bool {
             if (upgradeUnavailableNotice(app, agent) != null) return true;
             var name_buf: [32]u8 = undefined;
@@ -146,10 +152,19 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
+        fn queuedPromptsNotice(agent: *AppAgent) ?[]const u8 {
+            if (comptime agents.hasAgentField(App, "worker")) {
+                if (comptime @hasDecl(@TypeOf(agent.worker), "queuedPromptCount")) {
+                    if (agent.worker.queuedPromptCount() > 0) return "upgrade is unavailable while prompts are queued";
+                }
+            }
+            return null;
+        }
+
         /// Writes why a host that cannot wait for its turns refuses Ctrl+G
         /// now, and returns whether it refused.
         fn writeRefusal(app: *App, agent: *AppAgent) !bool {
-            if (upgradeUnavailableNotice(app, agent)) |notice| {
+            if (upgradeUnavailableNotice(app, agent) orelse queuedPromptsNotice(agent)) |notice| {
                 try writeUpgradeNotice(app, .neutral, notice);
                 return true;
             }
@@ -347,10 +362,10 @@ pub fn Runtime(comptime App: type) type {
             // Relaunch), and fx exits once every turn holds or ends
             // (`collectUpgradeFacts`).
             if (comptime supportsYield(App)) {
-                // Queued prompts, a draft, a sent prompt, an open question or
-                // approval, or an open view would be lost or cut off by
-                // stopping now, so the turns go on and fx restarts once none
-                // is left (`finishWaitingRestart`).
+                // A draft, a sent prompt, an open question or approval, an
+                // open view, or prompts queued on another agent would be lost
+                // or cut off by stopping now, so the turns go on and fx
+                // restarts once none is left (`finishWaitingRestart`).
                 if (restartBlocked(app, agent)) {
                     app.upgrader.restart = .when_idle;
                     debug_trace.logf("upgrade", "event=restart_waits_for_idle reason=busy", .{});
@@ -405,13 +420,6 @@ pub fn Runtime(comptime App: type) type {
             // A host that stops turns between steps waits for them instead.
             if (comptime agents.hasAgentField(App, "stream") and !supportsYield(App)) {
                 if (agent.stream.active) return "upgrade is unavailable until the response finishes";
-            }
-            if (comptime agents.hasAgentField(App, "worker")) {
-                if (comptime @hasDecl(@TypeOf(agent.worker), "queuedPromptCount")) {
-                    if (agent.worker.queuedPromptCount() > 0) {
-                        return "upgrade is unavailable while prompts are queued";
-                    }
-                }
             }
             if (comptime agents.hasAgentField(App, "question_prompt")) {
                 if (agent.question_prompt.isActive()) return "upgrade is unavailable while a question is open";
@@ -744,6 +752,31 @@ test "app_upgrade_runtime lets queued prompts elsewhere run before the restart, 
     Runtime(TestApp).collectUpgradeFacts(&app);
     try std.testing.expect(app.should_exit);
     try std.testing.expectEqual(@as(usize, 0), app.release_count);
+}
+
+test "app_upgrade_runtime stops the turns for prompts queued on the agent on screen, since the relaunch sends them" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    app.agent().worker.queued_count = 2;
+    var deps_state = TestDepsState{};
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+
+    try std.testing.expectEqual(ApplyOutcome.waiting, outcome);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.waiting, app.upgrader.restart);
+    try std.testing.expectEqual(@as(usize, 1), app.yield_request_count);
+    try std.testing.expect(app.agent().upgrade_handoff);
+
+    // The turn holds; the queue does not hold the release or the exit, since
+    // the session keeps the prompts for the relaunched fx.
+    app.turn_held = true;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.releasing, app.upgrader.restart);
+    app.turn_running = false;
+    app.turn_held = false;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
 }
 
 test "app_upgrade_runtime validates then requests normal relaunch handoff" {

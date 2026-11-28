@@ -79,6 +79,9 @@ pub const State = struct {
     /// The prompt from `fx "<prompt>"`, sent once the first frame is on
     /// screen. Owned by the app allocator.
     launch_prompt: ?[]u8 = null,
+    /// The composer holds prompts restored after an upgrade's restart, and
+    /// sends them once the first frame is on screen, as the launch prompt.
+    send_restored_input: bool = false,
     retry_after_auth: bool = false,
     compaction_pending: bool = false,
     /// Identity only; auth retains its existing pending execution flag.
