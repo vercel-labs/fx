@@ -7,7 +7,8 @@
 # model-checks tests/tla/sdk/ and drives libfx along its state graphs, which
 # takes about 40 minutes. A pull request runs it only when it touches code
 # libfx owns: sdk/, the SDK models in tests/tla/sdk/, their drivers in
-# tests/tla/drivers/*.mjs, the shared TLC code in tests/tla/lib/, the
+# tests/tla/drivers/*.mjs and tests/tla/drivers/sdk/, the shared driver code
+# in tests/tla/drivers/lib/, the shared TLC code in tests/tla/lib/, the
 # Node-API and WebAssembly core entry points, src/acp/, src/core/hosts/, or
 # src/core/session_manager/.
 #
@@ -169,7 +170,10 @@ while IFS= read -r -d '' path; do
       require_mcp "$path: MCP driver changed" ;;
     tests/tla/drivers/acp/*)
       require_acp "$path: ACP driver changed" ;;
+    tests/tla/drivers/sdk/*)
+      require_libfx "$path: libfx driver changed" ;;
     tests/tla/drivers/lib/*)
+      require_libfx "$path: shared driver code changed"
       require_mcp "$path: shared driver code changed"
       require_transcript_window "$path: shared driver code changed"
       require_subagent "$path: shared driver code changed"
