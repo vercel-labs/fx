@@ -348,13 +348,15 @@ pub fn snapshotInvocation(
 /// runs with stdin from /dev/null so it cannot read the rest of the script.
 /// Its stderr is the one `snapshotInvocation` saved on fd 9, which it does
 /// not inherit. A redirection, unlike an `exec`, cannot be replaced by a
-/// replayed function or alias.
+/// replayed function or alias. With `merge_stderr`, the command's stderr is its
+/// stdout instead, so the output is one stream.
 pub fn snapshotScript(
     alloc: Allocator,
     kind: ShellKind,
     replay: []const u8,
     after_startup: []const u8,
     command: []const u8,
+    merge_stderr: bool,
 ) Allocator.Error![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(alloc);
@@ -369,7 +371,7 @@ pub fn snapshotScript(
     if (kind == .zsh) try output.appendSlice(alloc, zsh_command_prelude);
     try output.appendSlice(alloc, "\\builtin eval -- ");
     try appendShellWord(&output, alloc, command);
-    try output.appendSlice(alloc, " </dev/null 2>&9 9>&-\n");
+    try output.appendSlice(alloc, if (merge_stderr) " </dev/null 2>&1 9>&-\n" else " </dev/null 2>&9 9>&-\n");
     return output.toOwnedSlice(alloc);
 }
 
@@ -744,7 +746,7 @@ test "captured invocation provider projection shell-quotes every argv word" {
 }
 
 test "snapshot script turns off zsh equals expansion after the replay" {
-    const zsh = try snapshotScript(std.testing.allocator, .zsh, "builtin setopt equals", "", "echo ======");
+    const zsh = try snapshotScript(std.testing.allocator, .zsh, "builtin setopt equals", "", "echo ======", false);
     defer std.testing.allocator.free(zsh);
     try std.testing.expectEqualStrings(
         "builtin setopt equals\n__fx_snapshot_restored=1\n" ++
@@ -752,7 +754,7 @@ test "snapshot script turns off zsh equals expansion after the replay" {
         zsh,
     );
 
-    const bash = try snapshotScript(std.testing.allocator, .bash, "", "", "echo ======");
+    const bash = try snapshotScript(std.testing.allocator, .bash, "", "", "echo ======", false);
     defer std.testing.allocator.free(bash);
     try std.testing.expectEqualStrings(
         "__fx_snapshot_restored=1\n\\builtin eval -- 'echo ======' </dev/null 2>&9 9>&-\n",
@@ -760,9 +762,18 @@ test "snapshot script turns off zsh equals expansion after the replay" {
     );
 }
 
+test "snapshot script sends the command's stderr to its stdout when it merges streams" {
+    const bash = try snapshotScript(std.testing.allocator, .bash, "", "", "echo ======", true);
+    defer std.testing.allocator.free(bash);
+    try std.testing.expectEqualStrings(
+        "__fx_snapshot_restored=1\n\\builtin eval -- 'echo ======' </dev/null 2>&1 9>&-\n",
+        bash,
+    );
+}
+
 test "snapshot script runs the startup text in a group before the restored flag" {
     const text = "alias ll=\"echo NEW\"";
-    const zsh = try snapshotScript(std.testing.allocator, .zsh, "builtin setopt equals", text, "ll");
+    const zsh = try snapshotScript(std.testing.allocator, .zsh, "builtin setopt equals", text, "ll", false);
     defer std.testing.allocator.free(zsh);
     try std.testing.expectEqualStrings(
         "builtin setopt equals\n{ " ++ text ++ "\n} </dev/null 2>&9\n" ++
@@ -771,7 +782,7 @@ test "snapshot script runs the startup text in a group before the restored flag"
         zsh,
     );
 
-    const bash = try snapshotScript(std.testing.allocator, .bash, "", text, "ll");
+    const bash = try snapshotScript(std.testing.allocator, .bash, "", text, "ll", false);
     defer std.testing.allocator.free(bash);
     try std.testing.expectEqualStrings(
         "{ " ++ text ++ "\n} </dev/null 2>&9\n" ++
