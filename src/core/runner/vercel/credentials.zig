@@ -13,8 +13,14 @@ pub const max_token_bytes: usize = 4 * 1024;
 /// A token that expires within this many seconds counts as expired (R3).
 pub const expiry_margin_s: i64 = 60;
 
+/// The largest config.json read (R3.7). The disk reader applies one byte limit to every login file, so this matches `max_auth_file_bytes`.
+const max_cli_config_bytes: usize = max_auth_file_bytes;
+/// The longest team id accepted from config.json (R3.7).
+const max_team_id_bytes: usize = 256;
+
 const vercel_dir = "com.vercel.cli";
 const auth_file = "auth.json";
+const config_file = "config.json";
 
 /// The Vercel token. Its text is reached only through `bytes`. Formatting it
 /// prints a fixed label, so a stray print cannot show the value (R4.8).
@@ -158,37 +164,139 @@ pub fn load(
         }
     }
 
-    var paths: std.ArrayList([]const u8) = .empty;
+    const chosen = try chooseAuthFile(arena, env, os, files);
+    switch (chosen.read) {
+        .absent => {
+            traceOutcome(trace, "none", .missing);
+            return .missing;
+        },
+        .unreadable => {
+            traceOutcome(trace, "auth file", .missing);
+            return .missing;
+        },
+        .bytes => |bytes| {
+            const result = try parseAuthJson(arena, bytes, now_unix_s);
+            traceOutcome(trace, "auth file", result);
+            return result;
+        },
+    }
+}
+
+/// The auth.json fx uses: the first one in login order that exists. `folder`
+/// is its folder, and `read` is `absent` when no auth.json exists. `load` and
+/// `loadCliTeamId` both call this, so a login and its team come from one profile.
+const ChosenAuth = struct {
+    folder: []const u8,
+    read: FileRead,
+};
+
+fn chooseAuthFile(arena: std.mem.Allocator, env: Env, os: std.Target.Os.Tag, files: Files) std.mem.Allocator.Error!ChosenAuth {
+    for (try authFolders(arena, env, os)) |folder| {
+        const path = try std.Io.Dir.path.join(arena, &.{ folder, auth_file });
+        switch (try files.read(files.context, arena, path)) {
+            .absent => continue,
+            .unreadable => return .{ .folder = folder, .read = .unreadable },
+            .bytes => |bytes| return .{ .folder = folder, .read = .{ .bytes = bytes } },
+        }
+    }
+    return .{ .folder = "", .read = .absent };
+}
+
+/// The folders that may hold auth.json, in login order. The macOS folder comes
+/// first on macOS only. The arena owns the returned slice.
+fn authFolders(arena: std.mem.Allocator, env: Env, os: std.Target.Os.Tag) std.mem.Allocator.Error![]const []const u8 {
+    var folders: std.ArrayList([]const u8) = .empty;
     if (os == .macos) {
         if (env.home) |home| {
-            try paths.append(arena, try std.Io.Dir.path.join(arena, &.{ home, "Library", "Application Support", vercel_dir, auth_file }));
+            try folders.append(arena, try std.Io.Dir.path.join(arena, &.{ home, "Library", "Application Support", vercel_dir }));
         }
     }
     if (env.xdg_data_home) |xdg| {
         if (xdg.len != 0) {
-            try paths.append(arena, try std.Io.Dir.path.join(arena, &.{ xdg, vercel_dir, auth_file }));
+            try folders.append(arena, try std.Io.Dir.path.join(arena, &.{ xdg, vercel_dir }));
         }
     }
     if (env.home) |home| {
-        try paths.append(arena, try std.Io.Dir.path.join(arena, &.{ home, ".local", "share", vercel_dir, auth_file }));
+        try folders.append(arena, try std.Io.Dir.path.join(arena, &.{ home, ".local", "share", vercel_dir }));
     }
+    return folders.items;
+}
 
-    for (paths.items) |path| {
-        switch (try files.read(files.context, arena, path)) {
-            .absent => continue,
-            .unreadable => {
-                traceOutcome(trace, "auth file", .missing);
-                return .missing;
-            },
-            .bytes => |bytes| {
-                const result = try parseAuthJson(arena, bytes, now_unix_s);
-                traceOutcome(trace, "auth file", result);
-                return result;
-            },
-        }
+/// The Vercel CLI's active team id: the `currentTeam` of config.json in the
+/// folder of the auth.json that `load` uses. It is `null` when fx used
+/// VERCEL_TOKEN, when no auth.json exists, or when config.json is missing or
+/// unusable. The id is owned by `arena`, so it lives until the arena is freed.
+pub fn loadCliTeamId(arena: std.mem.Allocator, env: Env, os: std.Target.Os.Tag, files: Files, trace: Trace) std.mem.Allocator.Error!?[]const u8 {
+    if (env.vercel_token) |value| {
+        if (value.len != 0) return null;
     }
-    traceOutcome(trace, "none", .missing);
-    return .missing;
+    const chosen = try chooseAuthFile(arena, env, os, files);
+    if (chosen.read == .absent) return null;
+
+    const path = try std.Io.Dir.path.join(arena, &.{ chosen.folder, config_file });
+    const bytes = switch (try files.read(files.context, arena, path)) {
+        .absent => return null,
+        .unreadable => {
+            traceTeamRejection(trace, .unreadable);
+            return null;
+        },
+        .bytes => |content| content,
+    };
+    switch (try parseCliConfig(arena, bytes)) {
+        .team => |team| return team,
+        .rejected => |reason| {
+            traceTeamRejection(trace, reason);
+            return null;
+        },
+    }
+}
+
+const TeamRejection = enum {
+    unreadable,
+    not_json,
+    no_current_team,
+    not_string,
+    empty,
+    too_long,
+    control_character,
+};
+
+const TeamParse = union(enum) {
+    team: []const u8,
+    rejected: TeamRejection,
+};
+
+/// Reads the `currentTeam` string from config.json bytes. The team's bytes
+/// are owned by `arena`. Control bytes are refused, so the id stays one clean line.
+fn parseCliConfig(arena: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!TeamParse {
+    if (bytes.len > max_cli_config_bytes) return .{ .rejected = .too_long };
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .rejected = .not_json },
+    };
+    const object = switch (root) {
+        .object => |map| map,
+        else => return .{ .rejected = .no_current_team },
+    };
+    const value = object.get("currentTeam") orelse return .{ .rejected = .no_current_team };
+    const team = switch (value) {
+        .string => |text| text,
+        else => return .{ .rejected = .not_string },
+    };
+    if (team.len == 0) return .{ .rejected = .empty };
+    if (team.len > max_team_id_bytes) return .{ .rejected = .too_long };
+    for (team) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return .{ .rejected = .control_character };
+    }
+    return .{ .team = team };
+}
+
+/// One trace line for a config.json that exists but is not used. It names the
+/// reason, never the file's value or path (R4.8).
+fn traceTeamRejection(trace: Trace, reason: TeamRejection) void {
+    var buffer: [128]u8 = undefined;
+    const text = std.mem.print(&buffer, "vercel cli team: config.json rejected, reason {s}", .{@tagName(reason)}) catch return;
+    trace.write(text);
 }
 
 /// One trace line: the source and the outcome. Never the token or a path.
@@ -404,6 +512,151 @@ test "disk reads an absolute auth file and refuses a relative path" {
     try std.testing.expect((try disk.read(null, arena, "relative/auth.json")) == .unreadable);
 }
 
+const probe_team = "team_fake_probe_7Q2";
+
+fn configTeam(arena: std.mem.Allocator, config: FileRead, capture: *CaptureTrace) std.mem.Allocator.Error!?[]const u8 {
+    var fake: FakeFiles = .{ .entries = &.{
+        .{ .path = "/xdg/com.vercel.cli/auth.json", .read = .{ .bytes = "{\"token\":\"vca_fake\"}" } },
+        .{ .path = "/xdg/com.vercel.cli/config.json", .read = config },
+    } };
+    return loadCliTeamId(arena, .{ .home = test_home, .xdg_data_home = "/xdg" }, .linux, fake.files(), capture.trace());
+}
+
+fn expectRejectedConfig(config: FileRead, reason: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var capture: CaptureTrace = .{};
+    try std.testing.expect((try configTeam(arena_state.allocator(), config, &capture)) == null);
+    try std.testing.expect(std.mem.find(u8, capture.captured(), reason) != null);
+    try std.testing.expect(std.mem.find(u8, capture.captured(), probe_team) == null);
+}
+
+test "loadCliTeamId returns the currentTeam of config.json" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var capture: CaptureTrace = .{};
+    const team = (try configTeam(arena_state.allocator(), .{ .bytes = "{\"currentTeam\":\"team_fake_example_0001\",\"cachedTeamIds\":[]}" }, &capture)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("team_fake_example_0001", team);
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
+}
+
+test "loadCliTeamId gives no team and no trace when config.json is missing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var capture: CaptureTrace = .{};
+    try std.testing.expect((try configTeam(arena_state.allocator(), .absent, &capture)) == null);
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
+}
+
+test "loadCliTeamId refuses a config.json with no currentTeam key" {
+    try expectRejectedConfig(.{ .bytes = "{\"cachedTeamIds\":[\"team_fake_probe_7Q2\"]}" }, "reason no_current_team");
+    try expectRejectedConfig(.{ .bytes = "[\"team_fake_probe_7Q2\"]" }, "reason no_current_team");
+}
+
+test "loadCliTeamId refuses a currentTeam that is not a string" {
+    try expectRejectedConfig(.{ .bytes = "{\"currentTeam\":[\"team_fake_probe_7Q2\"]}" }, "reason not_string");
+    try expectRejectedConfig(.{ .bytes = "{\"currentTeam\":7}" }, "reason not_string");
+    try expectRejectedConfig(.{ .bytes = "{\"currentTeam\":null}" }, "reason not_string");
+}
+
+test "loadCliTeamId refuses an empty currentTeam" {
+    try expectRejectedConfig(.{ .bytes = "{\"currentTeam\":\"\"}" }, "reason empty");
+}
+
+test "loadCliTeamId refuses a currentTeam longer than the cap, and a file over the byte cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const long_team = try arena.alloc(u8, max_team_id_bytes + 1);
+    @memset(long_team, 'a');
+    const long_file = try arena.print("{{\"currentTeam\":\"{s}\"}}", .{long_team});
+    try expectRejectedConfig(.{ .bytes = long_file }, "reason too_long");
+
+    const huge = try arena.alloc(u8, max_cli_config_bytes + 1);
+    @memset(huge, ' ');
+    try expectRejectedConfig(.{ .bytes = huge }, "reason too_long");
+}
+
+test "loadCliTeamId refuses a currentTeam with control characters" {
+    try expectRejectedConfig(.{ .bytes = "{\"currentTeam\":\"team_fake_probe_7Q2\\u0007\"}" }, "reason control_character");
+    try expectRejectedConfig(.{ .bytes = "{\"currentTeam\":\"team\\u001bfake_probe_7Q2\"}" }, "reason control_character");
+}
+
+test "loadCliTeamId refuses an unreadable or broken config.json" {
+    try expectRejectedConfig(.unreadable, "reason unreadable");
+    try expectRejectedConfig(.{ .bytes = "{\"currentTeam\":\"team_fake_probe_7Q2\"" }, "reason not_json");
+}
+
+test "loadCliTeamId reads config.json from the folder of the chosen macOS auth.json" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fake: FakeFiles = .{ .entries = &.{
+        .{ .path = "/Users/example/Library/Application Support/com.vercel.cli/auth.json", .read = .{ .bytes = "{\"token\":\"vca_mac\"}" } },
+        .{ .path = "/Users/example/Library/Application Support/com.vercel.cli/config.json", .read = .{ .bytes = "{\"currentTeam\":\"team_fake_mac\"}" } },
+        .{ .path = "/Users/example/.local/share/com.vercel.cli/config.json", .read = .{ .bytes = "{\"currentTeam\":\"team_fake_share\"}" } },
+    } };
+    var capture: CaptureTrace = .{};
+    const team = (try loadCliTeamId(arena_state.allocator(), .{ .home = test_home }, .macos, fake.files(), capture.trace())) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("team_fake_mac", team);
+    try std.testing.expectEqual(@as(usize, 2), fake.requested_count);
+    try std.testing.expectEqualStrings("/Users/example/Library/Application Support/com.vercel.cli/config.json", fake.requested[1]);
+}
+
+test "loadCliTeamId reads config.json from the folder of the chosen XDG auth.json, never from ~/.local/share" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var capture: CaptureTrace = .{};
+
+    var with_xdg: FakeFiles = .{ .entries = &.{
+        .{ .path = "/xdg/com.vercel.cli/auth.json", .read = .{ .bytes = "{\"token\":\"vca_xdg\"}" } },
+        .{ .path = "/xdg/com.vercel.cli/config.json", .read = .{ .bytes = "{\"currentTeam\":\"team_fake_xdg\"}" } },
+        .{ .path = "/Users/example/.local/share/com.vercel.cli/config.json", .read = .{ .bytes = "{\"currentTeam\":\"team_fake_share\"}" } },
+    } };
+    const team = (try loadCliTeamId(arena_state.allocator(), .{ .home = test_home, .xdg_data_home = "/xdg" }, .linux, with_xdg.files(), capture.trace())) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("team_fake_xdg", team);
+
+    var xdg_without_config: FakeFiles = .{ .entries = &.{
+        .{ .path = "/xdg/com.vercel.cli/auth.json", .read = .{ .bytes = "{\"token\":\"vca_xdg\"}" } },
+        .{ .path = "/Users/example/.local/share/com.vercel.cli/config.json", .read = .{ .bytes = "{\"currentTeam\":\"team_fake_share\"}" } },
+    } };
+    try std.testing.expect((try loadCliTeamId(arena_state.allocator(), .{ .home = test_home, .xdg_data_home = "/xdg" }, .linux, xdg_without_config.files(), capture.trace())) == null);
+    try std.testing.expectEqual(@as(usize, 2), xdg_without_config.requested_count);
+    try std.testing.expectEqualStrings("/xdg/com.vercel.cli/config.json", xdg_without_config.requested[1]);
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
+}
+
+test "loadCliTeamId uses the folder of a broken auth.json that fx chose" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fake: FakeFiles = .{ .entries = &.{
+        .{ .path = "/xdg/com.vercel.cli/auth.json", .read = .{ .bytes = "{" } },
+        .{ .path = "/xdg/com.vercel.cli/config.json", .read = .{ .bytes = "{\"currentTeam\":\"team_fake_xdg\"}" } },
+    } };
+    const team = (try loadCliTeamId(arena_state.allocator(), .{ .home = test_home, .xdg_data_home = "/xdg" }, .linux, fake.files(), discard_trace)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("team_fake_xdg", team);
+}
+
+test "loadCliTeamId gives no team when VERCEL_TOKEN is the login, and reads no file" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fake: FakeFiles = .{ .entries = &.{
+        .{ .path = "/Users/example/.local/share/com.vercel.cli/config.json", .read = .{ .bytes = "{\"currentTeam\":\"team_fake_share\"}" } },
+    } };
+    try std.testing.expect((try loadCliTeamId(arena_state.allocator(), .{ .vercel_token = probe_token, .home = test_home }, .linux, fake.files(), discard_trace)) == null);
+    try std.testing.expectEqual(@as(usize, 0), fake.requested_count);
+}
+
+test "loadCliTeamId reads no config.json when no auth.json exists" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var fake: FakeFiles = .{ .entries = &.{
+        .{ .path = "/Users/example/.local/share/com.vercel.cli/config.json", .read = .{ .bytes = "{\"currentTeam\":\"team_fake_share\"}" } },
+    } };
+    try std.testing.expect((try loadCliTeamId(arena_state.allocator(), .{ .home = test_home }, .linux, fake.files(), discard_trace)) == null);
+    try std.testing.expectEqual(@as(usize, 1), fake.requested_count);
+    try std.testing.expectEqualStrings("/Users/example/.local/share/com.vercel.cli/auth.json", fake.requested[0]);
+}
+
 /// The fuzz oracle: the same rules, written again from the standard parser.
 const Oracle = struct {
     token: []const u8,
@@ -475,5 +728,54 @@ test "auth.json parses to one of three results, and a token equals its JSON stri
             "[]",
             "",
         }) ++ @import("fuzz_corpus").vercel_auth_json.*),
+    });
+}
+
+/// The fuzz oracle for config.json: the same rules, written again from the standard parser.
+fn oracleCliTeam(arena: std.mem.Allocator, bytes: []const u8) ?[]const u8 {
+    if (bytes.len > max_cli_config_bytes) return null;
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch return null;
+    if (root != .object) return null;
+    const value = root.object.get("currentTeam") orelse return null;
+    if (value != .string) return null;
+    const team = value.string;
+    if (team.len == 0 or team.len > max_team_id_bytes) return null;
+    for (team) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return null;
+    }
+    return team;
+}
+
+fn fuzzCliConfig(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const raw = try arena.alloc(u8, max_cli_config_bytes);
+    const len = smith.slice(raw);
+    const bytes = raw[0..len];
+
+    const result = try parseCliConfig(arena, bytes);
+    const oracle = oracleCliTeam(arena, bytes);
+    switch (result) {
+        .team => |team| {
+            const expected = oracle orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(expected, team);
+        },
+        .rejected => {
+            if (oracle != null) return error.TestUnexpectedResult;
+        },
+    }
+}
+
+test "config.json gives a team id or none, and a team id is non-empty, bounded, and free of control bytes, on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzCliConfig, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"currentTeam\":\"team_fake_example_0001\",\"cachedTeamIds\":[\"team_fake_example_0001\"]}",
+            "{\"currentTeam\":\"\"}",
+            "{\"currentTeam\":7}",
+            "{\"cachedTeamIds\":[]}",
+            "[]",
+            "",
+        }) ++ @import("fuzz_corpus").vercel_cli_config.*),
     });
 }
