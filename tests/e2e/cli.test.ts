@@ -8644,4 +8644,233 @@ describe("cli: ask stream events", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "fx ask --system --stream-events skips --stream-events as value",
+    async () => {
+      const home = createIsolatedTestHome();
+      try {
+        const res = await runFx(["ask", "--system", "--stream-events"], {
+          env: { FX_HOME: home },
+          timeoutMs: TIMEOUT,
+        });
+        expect(res.code).toBe(2);
+        expect(res.stdout).toBe("");
+        expect(res.stderr).toContain("missing prompt");
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --stream-events abbreviates workspace paths for read_file and write_file",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      const outsideDir = join(home, "outside");
+      mkdirSync(join(workspace, "sub"), { recursive: true });
+      mkdirSync(outsideDir, { recursive: true });
+      const insideRead = join(workspace, "sub", "a.txt");
+      const insideWrite = join(workspace, "b.txt");
+      const outsideRead = join(outsideDir, "ext.txt");
+      writeFileSync(insideRead, "inside\n");
+      writeFileSync(outsideRead, "outside\n");
+
+      let step = 0;
+      const gateway = startDynamicFakeGateway(async () => {
+        step += 1;
+        if (step === 1) {
+          return fakeGatewaySse([
+            { type: "tool-input-start", id: "call_r_in", toolName: "read_file" },
+            {
+              type: "tool-call",
+              toolCallId: "call_r_in",
+              toolName: "read_file",
+              input: { path: insideRead },
+            },
+            { type: "tool-input-start", id: "call_w_in", toolName: "write_file" },
+            {
+              type: "tool-call",
+              toolCallId: "call_w_in",
+              toolName: "write_file",
+              input: { path: insideWrite, content: "written\n" },
+            },
+            { type: "tool-input-start", id: "call_r_out", toolName: "read_file" },
+            {
+              type: "tool-call",
+              toolCallId: "call_r_out",
+              toolName: "read_file",
+              input: { path: outsideRead },
+            },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "STOP" } },
+          ]);
+        }
+        return fakeGatewayFinalText("PATHS_DONE");
+      });
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "test-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const res = await runFx(
+          ["ask", "--stream-events", "--no-save", "--full-access", "--model", FAKE_GATEWAY_MODEL, "paths"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(res.code).toBe(0);
+        const events = res.stdout.trimEnd().split("\n").map((line) => JSON.parse(line));
+        const starts = events.filter((e) => e.type === "tool_start");
+        expect(starts.map((e) => ({ call_id: e.call_id, target: e.target }))).toEqual([
+          { call_id: "call_r_in", target: "sub/a.txt" },
+          { call_id: "call_w_in", target: "b.txt" },
+          { call_id: "call_r_out", target: outsideRead },
+        ]);
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --stream-events emits tool_start before malformed or provisional tool_end",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(workspace, "notes.txt"), "note\n");
+
+      let step = 0;
+      const gateway = startDynamicFakeGateway(async () => {
+        step += 1;
+        if (step === 1) {
+          return fakeGatewaySse([
+            { type: "tool-input-start", id: "read_malformed", toolName: "read_file" },
+            {
+              type: "tool-call",
+              toolCallId: "read_malformed",
+              toolName: "read_file",
+              input: { path: "notes.txt" },
+            },
+            { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+          ]);
+        }
+        return fakeGatewayFinalText("RECOVERED_AFTER_MALFORMED");
+      });
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "test-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const res = await runFx(
+          ["ask", "--stream-events", "--no-save", "--auto", "--model", FAKE_GATEWAY_MODEL, "Read notes.txt."],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(res.code).toBe(0);
+        const events = res.stdout.trimEnd().split("\n").map((line) => JSON.parse(line));
+        const open = new Set<string>();
+        let sawMalformedEnd = false;
+        for (const ev of events) {
+          if (ev.type === "tool_start") {
+            expect(open.has(ev.call_id)).toBe(false);
+            open.add(ev.call_id);
+          } else if (ev.type === "tool_end") {
+            expect(open.has(ev.call_id)).toBe(true);
+            open.delete(ev.call_id);
+            if (ev.call_id === "read_malformed") sawMalformedEnd = true;
+          }
+        }
+        expect(sawMalformedEnd).toBe(true);
+        expect(open.size).toBe(0);
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --stream-events closes tool_end and fills result fields on NonInteractivePermissionRequired",
+    async () => {
+      for (const mode of ["stream", "json"] as const) {
+        const home = createIsolatedTestHome();
+        const workspace = join(home, "workspace");
+        mkdirSync(workspace, { recursive: true });
+        const gateway = startDynamicFakeGateway(async () =>
+          fakeGatewaySse([
+            { type: "tool-input-start", id: "call_deny", toolName: "shell" },
+            {
+              type: "tool-call",
+              toolCallId: "call_deny",
+              toolName: "shell",
+              input: { action: "run", command: "echo nope" },
+            },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "STOP" } },
+          ]),
+        );
+        try {
+          const env = {
+            AI_GATEWAY_API_KEY: "test-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            HOME: home,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          };
+          const flag = mode === "stream" ? "--stream-events" : "--json";
+          const res = await runFx(
+            ["ask", flag, "--ask", "--model", FAKE_GATEWAY_MODEL, "run echo nope"],
+            { cwd: workspace, env, timeoutMs: TIMEOUT },
+          );
+          expect(res.code).toBe(1);
+          if (mode === "stream") {
+            const events = res.stdout.trimEnd().split("\n").map((line) => JSON.parse(line));
+            expect(events.map((e) => e.type)).toEqual(["turn_start", "tool_start", "tool_end", "result"]);
+            expect(events[2]).toMatchObject({
+              type: "tool_end",
+              call_id: "call_deny",
+              name: "shell",
+              status: "denied",
+            });
+            expect(events[3]).toMatchObject({
+              type: "result",
+              exit_code: 1,
+              model: FAKE_GATEWAY_MODEL,
+              steps: 1,
+              error: "NonInteractivePermissionRequired",
+            });
+            expect(events[3].session_id.length).toBeGreaterThan(0);
+            expect(events[3].session_id).toBe(events[0].session_id);
+          } else {
+            const parsed = JSON.parse(res.stdout);
+            expect(parsed).toMatchObject({
+              exit_code: 1,
+              model: FAKE_GATEWAY_MODEL,
+              steps: 1,
+              error: "NonInteractivePermissionRequired",
+            });
+            expect(parsed.session_id.length).toBeGreaterThan(0);
+          }
+        } finally {
+          gateway.stop();
+          cleanupIsolatedTestHome(home);
+        }
+      }
+    },
+    TIMEOUT,
+  );
 });
