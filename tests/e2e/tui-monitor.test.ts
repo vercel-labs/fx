@@ -19,6 +19,7 @@ function scenario(name: string, body: (profile: Profile) => Promise<void>, bin: 
     const profile = new Profile(name.replace(/[^A-Za-z0-9]+/g, "-").slice(0, 32), bin);
     let passed = false;
     try {
+      profile.settings(ON);
       await body(profile);
       passed = true;
     } finally {
@@ -28,6 +29,20 @@ function scenario(name: string, body: (profile: Profile) => Promise<void>, bin: 
 }
 
 const TRACED = { FX_TRACE_SCOPES: "wiring,monitor" };
+// The monitor tool is an experiment, off unless the profile turns it on.
+const ON = { experimental: { monitor: true } };
+
+/// The tools the model was offered in the last request fx sent it.
+function offeredTools(profile: Profile): string[] {
+  const bodies = profile.gateway.requests.map((request) => request.body);
+  for (const text of bodies.reverse()) {
+    try {
+      const tools = JSON.parse(text).tools;
+      if (Array.isArray(tools) && tools.length > 0) return tools.map((tool: { name: string }) => tool.name);
+    } catch {}
+  }
+  return [];
+}
 
 /// The monitor trace lines fx wrote that say `what`, such as `event=event`.
 function monitorTrace(profile: Profile, what: string): string[] {
@@ -39,6 +54,32 @@ function monitorTrace(profile: Profile, what: string): string[] {
 /// request holds the earlier messages too, so this counts requests, not events.
 function monitorRequests(profile: Profile): string[] {
   return profile.gateway.requests.map((request) => request.body).filter((body) => body.includes('\\"source\\":\\"monitor\\"'));
+}
+
+for (const enabled of [false, true]) {
+  test.skipIf(!tmuxAvailable())(`the monitor tool is ${enabled ? "offered with" : "absent without"} experimental.monitor`, async () => {
+    const profile = new Profile(`flag-${enabled ? "on" : "off"}`, FX_BIN);
+    let passed = false;
+    try {
+      // A fresh profile has no setting at all: that is the default.
+      if (enabled) profile.settings(ON);
+      profile.answer("Say hello.", "HELLO_FLAG");
+      const shell = await profile.launch({ env: TRACED });
+      await shell.session.sendText("Say hello.");
+      await shell.session.waitForText("HELLO_FLAG", 30_000);
+      const tools = offeredTools(profile);
+      expect(tools).toContain("shell");
+      expect(tools.includes("monitor")).toBe(enabled);
+      // Off, nothing of a monitor ran or was kept.
+      if (!enabled) {
+        expect(monitorTrace(profile, "event=")).toHaveLength(0);
+        expect(existsSync(join(profile.home, ".fx", "monitors"))).toBe(false);
+      }
+      passed = true;
+    } finally {
+      await profile.close(!passed);
+    }
+  }, TIMEOUT);
 }
 
 scenario("a monitor's output wakes an idle agent, at most once every ten seconds, and stop ends it", async (profile) => {
@@ -340,7 +381,7 @@ test.skipIf(!tmuxAvailable())("Ctrl+G ends the monitors, and the restarted fx te
   const release = startUpgradeServer(profile.root, argvLog, { revision: "1111111111111111111111111111111111111111" });
   let passed = false;
   try {
-    profile.settings({ update_channel: "dev" });
+    profile.settings({ update_channel: "dev", ...ON });
     profile.script("Watch the quiet job.", [
       () => fakeGatewayToolCall("m1", "monitor", { action: "start", command: QUIET, label: "quiet" }),
       () => fakeGatewayFinalText("QUIET_STARTED"),

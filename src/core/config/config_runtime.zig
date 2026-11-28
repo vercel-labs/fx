@@ -94,6 +94,8 @@ pub const Settings = struct {
     experimental_workspace_capture: ?bool = null,
     /// `experimental.sandbox_execution`, profile-only.
     experimental_sandbox_execution: ?bool = null,
+    /// `experimental.monitor`, profile-only: offer the monitor tool.
+    experimental_monitor: ?bool = null,
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
     /// Owned absolute directories whose contents symlinked skills may resolve
@@ -2092,6 +2094,10 @@ fn parseProfileOnlyFields(
                 if (value != .bool) return error.InvalidExperimentalSandboxExecutionType;
                 settings.experimental_sandbox_execution = value.bool;
             }
+            if (experimental_value.object.get("monitor")) |value| {
+                if (value != .bool) return error.InvalidExperimentalMonitorType;
+                settings.experimental_monitor = value.bool;
+            }
         }
     }
 
@@ -2305,6 +2311,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.notification_max) |value| target.notification_max = value;
     if (incoming.experimental_workspace_capture) |value| target.experimental_workspace_capture = value;
     if (incoming.experimental_sandbox_execution) |value| target.experimental_sandbox_execution = value;
+    if (incoming.experimental_monitor) |value| target.experimental_monitor = value;
 
     if (incoming.has_permission_rules) {
         target.permission_rules.deinit(alloc);
@@ -5180,6 +5187,22 @@ test "the settings list names every value the settings enums accept" {
     }
     for (std.meta.tags(tool_placement.Placement)) |placement| try std.testing.expect(listed.has("tool_placement", @tagName(placement)));
     try std.testing.expectEqual(std.meta.tags(tool_placement.Placement).len, settings_keys.find("tool_placement").?.values.len);
+}
+
+test "experimental.monitor is read from the profile only and stays off by default" {
+    const alloc = std.testing.allocator;
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, null), absent.experimental_monitor);
+    var on = try parseSettingsJson(alloc, "{\"experimental\":{\"monitor\":true}}");
+    defer on.deinit(alloc);
+    try std.testing.expect(on.experimental_monitor.?);
+    // A repository's committed .fx.json can never turn it on.
+    var project = try parseSettingsJsonForLayer(alloc, "{\"experimental\":{\"monitor\":true}}", .project);
+    defer project.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, null), project.experimental_monitor);
+    // A value of another type is refused, as for every other switch.
+    try std.testing.expectError(error.InvalidExperimentalMonitorType, parseSettingsJson(alloc, "{\"experimental\":{\"monitor\":\"yes\"}}"));
 }
 
 test "experimental.sandbox_execution is read from the profile only and stays off by default" {

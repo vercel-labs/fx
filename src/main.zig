@@ -579,7 +579,9 @@ const App = struct {
 
     /// A quit the user chose: the next resume has no monitors to restart.
     pub fn clearMonitorRecord(self: *Self) void {
-        if (comptime !host_target.is_wasm) MonitorAppRuntime.clearRecord(self);
+        if (comptime !host_target.is_wasm) {
+            if (self.monitor_enabled) MonitorAppRuntime.clearRecord(self);
+        }
     }
 
     pub fn clearProgramResume(self: *Self) void {
@@ -678,6 +680,10 @@ const App = struct {
     /// `experimental.sandbox_execution` is on. Null when it is off, or when the
     /// load ran out of memory. Destroyed at teardown, after the agents.
     sandbox_policy: ?*sandbox_policy.Policy = null,
+    /// `experimental.monitor`, read once at startup. While it is off the
+    /// monitor tool is not offered, the loop looks at no monitor, and no
+    /// record or file of one is kept.
+    monitor_enabled: bool = false,
     pacer: assistant_pacer.AssistantPacer = .{},
 
     terminal_client: terminal_client_runtime.Runtime = .{},
@@ -869,7 +875,9 @@ const App = struct {
                 // with the startup instances, or once the picker has chosen.
                 if (picks) app.instances.restore_on_pick = true else app.instances.restore_pending = true;
                 SessionAppRuntime.syncTerminalTitle(&app, &app.main_agent);
-                if (comptime !host_target.is_wasm) MonitorAppRuntime.noteLeftRunning(&app);
+                if (comptime !host_target.is_wasm) {
+                    if (app.monitor_enabled) MonitorAppRuntime.noteLeftRunning(&app);
+                }
             } else if (launch.upgrade_relaunch) |relaunch| {
                 SessionAppRuntime.writeUpgradeNotice(&app, app_version, build_update_channel, relaunch.previous_revision orelse "", build_revision) catch |err|
                     debug_trace.logf("session", "event=upgrade_notice_unavailable err={s}", .{@errorName(err)});
@@ -2281,7 +2289,7 @@ const App = struct {
             .permission_rules = permission_rules,
             .subagent_available = subagent_available,
             // Monitors run for the main conversation only.
-            .monitor_available = !host_target.is_wasm and agent.child_run == null,
+            .monitor_available = !host_target.is_wasm and self.monitor_enabled and agent.child_run == null,
             .subagent_profiles = subagent_profiles,
             .behind_toolbox = self.toolbox_behind.slice(),
         }, .{ .runner = self.sandbox_policy != null });
@@ -3698,7 +3706,9 @@ const App = struct {
         // (`messageStartedBy`), so it stays right when that turn's end is
         // handled first.
         AgentsAppRuntime.takePosts(self);
-        if (comptime !host_target.is_wasm) MonitorAppRuntime.tick(self);
+        if (comptime !host_target.is_wasm) {
+            if (self.monitor_enabled) MonitorAppRuntime.tick(self);
+        }
         try tickAgentInContext({}, self, self.screenAgent());
         // Every other agent keeps working while it is hidden, each handled in
         // its own context.

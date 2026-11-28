@@ -130,6 +130,7 @@ const Writable = enum {
     collapse_tool_calls,
     context,
     effort,
+    @"experimental.monitor",
     @"experimental.sandbox_execution",
     fast_mode,
     max_agent_steps,
@@ -235,6 +236,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .cache_warming => patch.cache_warming = enabled,
         .collapse_tool_calls => patch.collapse_tool_calls = enabled,
         .context => patch.context = enabled,
+        .@"experimental.monitor" => patch.experimental_monitor = enabled,
         .@"experimental.sandbox_execution" => patch.experimental_sandbox_execution = enabled,
         .fast_mode => patch.fast_mode = enabled,
         .@"prompt_history.enabled" => patch.prompt_history_enabled = enabled,
@@ -557,16 +559,16 @@ pub const Effective = union(enum) {
 /// The keys `fx config` reads from the resolved state instead of the files.
 /// A test checks that each plain key is here or in `files_only_keys`.
 pub const resolved_keys = [_][]const u8{
-    "auto_compact_percent",           "auto_upgrade",                   "cache_warming",
-    "collapse_tool_calls",            "context",                        "effort",
-    "experimental.sandbox_execution", "experimental.workspace_capture", "fast_mode",
-    "first_call_tool_choice",         "max_agent_steps",                "max_tool_result_bytes",
-    "permission_mode",                "prompt_history.enabled",         "provider",
-    "provider_order",                 "provider_strict",                "review_model",
-    "session_titles",                 "slash_menu_categories",          "sound.attention_required",
-    "sound.max",                      "sound.turn_end",                 "status_line.context",
-    "status_line.session",            "status_line.workspace",          "theme",
-    "ultrafast_mode",                 "update_channel",
+    "auto_compact_percent",     "auto_upgrade",                   "cache_warming",
+    "collapse_tool_calls",      "context",                        "effort",
+    "experimental.monitor",     "experimental.sandbox_execution", "experimental.workspace_capture",
+    "fast_mode",                "first_call_tool_choice",         "max_agent_steps",
+    "max_tool_result_bytes",    "permission_mode",                "prompt_history.enabled",
+    "provider",                 "provider_order",                 "provider_strict",
+    "review_model",             "session_titles",                 "slash_menu_categories",
+    "sound.attention_required", "sound.max",                      "sound.turn_end",
+    "status_line.context",      "status_line.session",            "status_line.workspace",
+    "theme",                    "ultrafast_mode",                 "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -596,6 +598,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "collapse_tool_calls")) return boolean(state.collapse_tool_calls);
     if (eql(u8, key, "context")) return boolean(state.context_enabled);
     if (eql(u8, key, "effort")) return string(state.effort.label());
+    if (eql(u8, key, "experimental.monitor")) return boolean(state.monitor);
     if (eql(u8, key, "experimental.sandbox_execution")) return boolean(state.sandbox_execution);
     if (eql(u8, key, "experimental.workspace_capture")) return boolean(state.workspace_capture);
     if (eql(u8, key, "fast_mode")) return boolean(state.fast_mode);
@@ -926,6 +929,12 @@ test "config set turns each value into the patch the save path writes" {
     const fast = try changeForTest(&.{ "set", "fast_mode", "off" }, &problem);
     try std.testing.expectEqual(false, fast.patch.fast_mode.?);
     try std.testing.expect(!fast.value.?.bool);
+
+    const monitor_on = try changeForTest(&.{ "set", "experimental.monitor", "true" }, &problem);
+    try std.testing.expectEqual(true, monitor_on.patch.experimental_monitor.?);
+    try std.testing.expect(monitor_on.value.?.bool);
+    const monitor_off = try changeForTest(&.{ "set", "experimental.monitor", "false" }, &problem);
+    try std.testing.expectEqual(false, monitor_off.patch.experimental_monitor.?);
 
     const sandbox_on = try changeForTest(&.{ "set", "experimental.sandbox_execution", "true" }, &problem);
     try std.testing.expectEqual(true, sandbox_on.patch.experimental_sandbox_execution.?);

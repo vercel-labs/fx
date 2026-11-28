@@ -293,6 +293,8 @@ pub const StartupState = struct {
     /// `experimental.sandbox_execution`: run the shell commands that the
     /// sandbox config places in a sandbox.
     sandbox_execution: bool = false,
+    /// `experimental.monitor`: offer the monitor tool.
+    monitor: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
@@ -979,6 +981,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
     state.workspace_capture = settings.experimental_workspace_capture orelse false;
     state.sandbox_execution = settings.experimental_sandbox_execution orelse false;
+    state.monitor = settings.experimental_monitor orelse false;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
 }

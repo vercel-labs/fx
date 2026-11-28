@@ -101,8 +101,9 @@ const status_line_child_descriptions = [_][]const u8{
     "Show the session title in the footer",
     "Show the workspace path and Git branch in the footer",
 };
-const experimental_children = [_][]const u8{ "sandbox_execution", "workspace_capture" };
+const experimental_children = [_][]const u8{ "monitor", "sandbox_execution", "workspace_capture" };
 const experimental_child_descriptions = [_][]const u8{
+    "Offer the monitor tool: the agent starts a command and its output arrives as messages",
     "Run shell commands in a Vercel Sandbox as rules in ~/.fx/sandbox/config.json say",
     "Record the repository's state at each turn's start and end in the session, for evals",
 };
