@@ -18,6 +18,7 @@ const file_mutation = @import("../../../tooling/file_mutation.zig");
 const command_result_mapping = @import("../../../tooling/command_result_mapping.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
+const tooling_tool_admission = @import("../../../tooling/tool_admission.zig");
 const tool_specs = @import("../../../tooling/tool_specs.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
@@ -36,6 +37,8 @@ const runtime_telemetry = @import("../telemetry.zig");
 const recovery = @import("../../../recovery/recovery.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
+const permission_prompter = @import("../../../permissions/permission_prompter.zig");
+const permission_request = @import("../../../permissions/permission_request.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const auto_classifier_context = @import("../../../permissions/auto_classifier_context.zig");
 
@@ -8663,4 +8666,340 @@ test "processQueuedPrompt settles the start capture of a turn that fails before 
     const expected = [_][]const u8{ "capture:begin", "capture:capture", "capture:settle" };
     try std.testing.expectEqual(expected.len, hooks.capture_log.items.len);
     for (expected, hooks.capture_log.items) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "child live authority keeps exact write_file approval across two generation changes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+
+    const calls = [_]ToolCall{toolCall(
+        "write_1",
+        "write_file",
+        "{\"path\":\"note.txt\",\"content\":\"hello\\n\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "wrote note.txt" } }};
+
+    const Prompter = struct {
+        prompts: usize = 0,
+
+        fn request(
+            raw: *anyopaque,
+            resp_alloc: std.mem.Allocator,
+            _: permission_request.PermissionRequest,
+            _: ToolCall,
+            _: ?*const diff.FileReview,
+            _: ?[]const PermissionGrant,
+        ) anyerror!permission_request.OwnedPermissionResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.prompts += 1;
+            // First prompt approves once; any second prompt denies so a lost
+            // exact approval blocks execution instead of silently running.
+            const decision: types.ToolPermissionDecision = if (self.prompts == 1) .once else .deny;
+            return permission_request.OwnedPermissionResponse.init(resp_alloc, decision, null);
+        }
+
+        fn prompter(self: *@This()) permission_prompter.Prompter {
+            return .{ .context = @ptrCast(self), .request_fn = request };
+        }
+    };
+    var prompter = Prompter{};
+
+    var worker: worker_runtime.WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    const write_tools = [_]tool_dispatch.Tool{builtin_tools.write_file};
+
+    const AdmissionContext = struct {
+        workspace_root: []const u8,
+        worker: *worker_runtime.WorkerRuntime,
+        prompter: *Prompter,
+        tools: []const tool_dispatch.Tool,
+
+        fn request(
+            raw: *anyopaque,
+            arena: std.mem.Allocator,
+            call: ToolCall,
+            review_turn: permission_auto_classifier.ReviewTurnContext,
+            permission_mode: types.PermissionMode,
+            local_grants: []const PermissionGrant,
+            live_authority: ?runtime_tool_contracts.LiveToolAuthority,
+            revalidation: ?runtime_tool_contracts.LivePermissionRevalidation,
+            advertised_dynamic_tool_names: []const []const u8,
+        ) !command_admission.PermissionOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const input: tooling_tool_admission.Input = .{
+                .workspace_root = self.workspace_root,
+                .permission_grants = if (live_authority) |live| live.grants else &.{},
+                .permission_rules = if (live_authority) |live| live.rules else .{},
+                .tool_registry = .{ .tools = self.tools },
+                .worker = self.worker,
+                .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
+                .mcp_runtime = .{},
+                .auto_classifier = permission_auto_classifier.Classifier.disabled(),
+                .permission_prompter = self.prompter.prompter(),
+                .permission_review_turn = review_turn,
+            };
+            if (revalidation) |rev| return switch (rev) {
+                .action => |action| tooling_tool_admission.revalidateLiveActionPermissionOutcome(
+                    input,
+                    arena,
+                    call,
+                    permission_mode,
+                    local_grants,
+                    action.authority,
+                    action.human_approval,
+                ),
+            };
+            return tooling_tool_admission.requestPermissionOutcome(
+                input,
+                arena,
+                call,
+                permission_mode,
+                local_grants,
+            );
+        }
+    };
+    var admission = AdmissionContext{
+        .workspace_root = workspace,
+        .worker = &worker,
+        .prompter = &prompter,
+        .tools = &write_tools,
+    };
+    hooks.permission_request_override = .{
+        .context = &admission,
+        .request_fn = AdmissionContext.request,
+    };
+
+    const AuthorityProvider = struct {
+        calls: usize = 0,
+        const tools = [_][]const u8{"write_file"};
+
+        fn resolve(
+            raw: *anyopaque,
+            _: std.mem.Allocator,
+            _: ToolCall,
+            _: []const u8,
+            _: []const u8,
+            _: tool_dispatch.PermissionTargetKind,
+        ) !runtime_deps.ResolvedLiveToolAuthority {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const generation: u64 = switch (self.calls) {
+                1 => 1,
+                2 => 2,
+                else => 3,
+            };
+            return .{
+                .authority = .{
+                    .generation = generation,
+                    .root_id = "root",
+                    .tools = &tools,
+                    .integrations = &.{},
+                    .rules = .{},
+                    .grants = &.{},
+                    .permission_mode = .ask,
+                },
+                .decision = .ask,
+            };
+        }
+    };
+    var authority = AuthorityProvider{};
+    hooks.live_tool_authority = .{
+        .context = &authority,
+        .resolve_fn = AuthorityProvider.resolve,
+    };
+
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), prompter.prompts);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("write_file", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 4), authority.calls);
+}
+
+test "child live authority reprompts and refuses write_file when symlink target changes between checks" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io_mod.getIo(), "dir-a", .default_dir);
+    try tmp.dir.createDir(io_mod.getIo(), "dir-b", .default_dir);
+    try tmp.dir.symLink(io_mod.getIo(), "dir-a", "link", .{ .is_directory = true });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "permission.trace" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "permission");
+
+    const calls = [_]ToolCall{toolCall(
+        "write_link",
+        "write_file",
+        "{\"path\":\"link/note.txt\",\"content\":\"hello\\n\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    const Prompter = struct {
+        prompts: usize = 0,
+
+        fn request(
+            raw: *anyopaque,
+            resp_alloc: std.mem.Allocator,
+            _: permission_request.PermissionRequest,
+            _: ToolCall,
+            _: ?*const diff.FileReview,
+            _: ?[]const PermissionGrant,
+        ) anyerror!permission_request.OwnedPermissionResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.prompts += 1;
+            const decision: types.ToolPermissionDecision = if (self.prompts == 1) .once else .deny;
+            return permission_request.OwnedPermissionResponse.init(resp_alloc, decision, null);
+        }
+
+        fn prompter(self: *@This()) permission_prompter.Prompter {
+            return .{ .context = @ptrCast(self), .request_fn = request };
+        }
+    };
+    var prompter = Prompter{};
+
+    var worker: worker_runtime.WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    const write_tools = [_]tool_dispatch.Tool{builtin_tools.write_file};
+
+    const AdmissionContext = struct {
+        workspace_root: []const u8,
+        worker: *worker_runtime.WorkerRuntime,
+        prompter: *Prompter,
+        tools: []const tool_dispatch.Tool,
+
+        fn request(
+            raw: *anyopaque,
+            arena: std.mem.Allocator,
+            call: ToolCall,
+            review_turn: permission_auto_classifier.ReviewTurnContext,
+            permission_mode: types.PermissionMode,
+            local_grants: []const PermissionGrant,
+            live_authority: ?runtime_tool_contracts.LiveToolAuthority,
+            revalidation: ?runtime_tool_contracts.LivePermissionRevalidation,
+            advertised_dynamic_tool_names: []const []const u8,
+        ) !command_admission.PermissionOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const input: tooling_tool_admission.Input = .{
+                .workspace_root = self.workspace_root,
+                .permission_grants = if (live_authority) |live| live.grants else &.{},
+                .permission_rules = if (live_authority) |live| live.rules else .{},
+                .tool_registry = .{ .tools = self.tools },
+                .worker = self.worker,
+                .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
+                .mcp_runtime = .{},
+                .auto_classifier = permission_auto_classifier.Classifier.disabled(),
+                .permission_prompter = self.prompter.prompter(),
+                .permission_review_turn = review_turn,
+            };
+            if (revalidation) |rev| return switch (rev) {
+                .action => |action| tooling_tool_admission.revalidateLiveActionPermissionOutcome(
+                    input,
+                    arena,
+                    call,
+                    permission_mode,
+                    local_grants,
+                    action.authority,
+                    action.human_approval,
+                ),
+            };
+            return tooling_tool_admission.requestPermissionOutcome(
+                input,
+                arena,
+                call,
+                permission_mode,
+                local_grants,
+            );
+        }
+    };
+    var admission = AdmissionContext{
+        .workspace_root = workspace,
+        .worker = &worker,
+        .prompter = &prompter,
+        .tools = &write_tools,
+    };
+    hooks.permission_request_override = .{
+        .context = &admission,
+        .request_fn = AdmissionContext.request,
+    };
+
+    const AuthorityProvider = struct {
+        calls: usize = 0,
+        dir: std.Io.Dir,
+        const tools = [_][]const u8{"write_file"};
+
+        fn resolve(
+            raw: *anyopaque,
+            _: std.mem.Allocator,
+            _: ToolCall,
+            _: []const u8,
+            _: []const u8,
+            _: tool_dispatch.PermissionTargetKind,
+        ) !runtime_deps.ResolvedLiveToolAuthority {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 2) {
+                // Retarget the symlink to an unapproved directory when generation bumps.
+                try self.dir.deleteFile(io_mod.getIo(), "link");
+                try self.dir.symLink(io_mod.getIo(), "dir-b", "link", .{ .is_directory = true });
+            }
+            return .{
+                .authority = .{
+                    .generation = if (self.calls == 1) 1 else 2,
+                    .root_id = "root",
+                    .tools = &tools,
+                    .integrations = &.{},
+                    .rules = .{},
+                    .grants = &.{},
+                    .permission_mode = .ask,
+                },
+                .decision = .ask,
+            };
+        }
+    };
+    var authority = AuthorityProvider{ .dir = tmp.dir };
+    hooks.live_tool_authority = .{
+        .context = &authority,
+        .resolve_fn = AuthorityProvider.resolve,
+    };
+
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    debug_trace.shutdown();
+
+    try std.testing.expectEqual(@as(usize, 2), prompter.prompts);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    const trace = try test_support.readTraceFile(alloc, trace_path, 8192);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "revalidation_reprompt") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "reason=target_or_policy_changed") != null);
 }

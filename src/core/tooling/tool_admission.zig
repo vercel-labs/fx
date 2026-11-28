@@ -1710,10 +1710,29 @@ fn exactApprovalLocalGrants(
     call: ToolCall,
     local_grants: []const PermissionGrant,
     authority: command_admission.ToolExecutionAuthority,
+    human_approval: command_admission.HumanApprovalProvenance,
 ) ![]const PermissionGrant {
     switch (authority) {
         .file_mutation => |authorization| {
             const offer = authorization.grant_offer orelse return local_grants;
+            if (human_approval == .once) {
+                const permission_name = permissions.permissionNameForTool(call.name);
+                const grants = try arena.alloc(
+                    PermissionGrant,
+                    local_grants.len + authorization.policy_targets.items.len,
+                );
+                @memcpy(grants[0..local_grants.len], local_grants);
+                for (authorization.policy_targets.items, grants[local_grants.len..]) |item, *grant| {
+                    grant.* = .{
+                        .tool_name = try arena.dupe(u8, permission_name),
+                        .target_path = try arena.dupe(
+                            u8,
+                            authorization.policy_targets.permissionPath(item),
+                        ),
+                    };
+                }
+                return grants;
+            }
             const grants = try arena.alloc(
                 PermissionGrant,
                 local_grants.len + offer.grants.len,
@@ -1794,6 +1813,7 @@ pub fn revalidateLiveActionPermissionOutcome(
             call,
             local_grants,
             authority,
+            human_approval,
         )
     else
         local_grants;
@@ -1855,6 +1875,23 @@ pub fn revalidateLiveActionPermissionOutcome(
         },
     };
     if (human_approval != .none and
+        (outcome.human_approval != .none or
+            outcome.denial_reason == .user_denied or
+            outcome.decision == .permission_required))
+    {
+        const reason = if (authority == .file_mutation and authority.file_mutation.grant_offer == null)
+            "missing_grant_offer"
+        else if (authority == .file_mutation)
+            "target_or_policy_changed"
+        else
+            "policy_or_target_changed";
+        debug_trace.logf(
+            "permission",
+            "revalidation_reprompt call_id={s} tool_name={s} authority={s} reason={s} decision={s}",
+            .{ call.id, call.name, @tagName(authority), reason, @tagName(outcome.decision) },
+        );
+    }
+    if (human_approval != .none and
         outcome.tool_failure == null and
         !outcome.decision.isDenied())
     {
@@ -1864,6 +1901,19 @@ pub fn revalidateLiveActionPermissionOutcome(
             .none => unreachable,
         };
         outcome.human_approval = human_approval;
+        if (authority == .file_mutation and outcome.execution_authority != null) {
+            switch (outcome.execution_authority.?) {
+                .file_mutation => |*new_auth| {
+                    // Keep the approved exact target grants for any later
+                    // generation bump; a target change misses those grants and
+                    // still reprompts.
+                    if (new_auth.grant_offer == null) {
+                        new_auth.grant_offer = authority.file_mutation.grant_offer;
+                    }
+                },
+                else => {},
+            }
+        }
     }
     return outcome;
 }
@@ -2257,7 +2307,7 @@ fn promptPermissionOutcome(
     };
     const prompter = input.permission_prompter orelse return unavailable;
     const grant_offer = if (try isRunCommandCall(input, arena, call))
-        try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary)
+        try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary, .none)
     else
         null;
     var response = prompter.request(
@@ -4210,6 +4260,7 @@ test "exact command approval remains valid across live authority revalidation" {
         call,
         &.{},
         .ordinary,
+        .none,
     );
     var targets = try permissionTargetsForCall(input, arena, call);
     defer targets.deinit(arena);
@@ -4370,6 +4421,73 @@ test "interactive file admission passes its canonical grant offer to the prompte
             expected_grant.target_path,
             observed_grant.target_path,
         );
+    }
+}
+
+test "always file admission keeps its grant offer across repeated revalidations" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{ .decision = .always };
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}/note.txt\",\"content\":\"hello\\n\"}}",
+        .{workspace},
+    );
+    const call: ToolCall = .{
+        .id = "write-always",
+        .name = "write_file",
+        .arguments_json = arguments_json,
+    };
+
+    const initial = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.always, initial.decision);
+    const initial_grants = initial.execution_authority.?.file_mutation.grant_offer.?.grants;
+
+    const first_recheck = try revalidateLiveActionPermissionOutcome(
+        input,
+        arena,
+        call,
+        .ask,
+        &.{},
+        initial.execution_authority.?,
+        .always,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.always, first_recheck.decision);
+    try std.testing.expect(first_recheck.execution_authority.?.file_mutation.grant_offer != null);
+
+    const second_recheck = try revalidateLiveActionPermissionOutcome(
+        input,
+        arena,
+        call,
+        .ask,
+        &.{},
+        first_recheck.execution_authority.?,
+        .always,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.always, second_recheck.decision);
+    const kept_grants = second_recheck.execution_authority.?.file_mutation.grant_offer.?.grants;
+    try std.testing.expectEqual(initial_grants.len, kept_grants.len);
+    for (initial_grants, kept_grants) |expected_grant, kept_grant| {
+        try std.testing.expectEqualStrings(expected_grant.tool_name, kept_grant.tool_name);
+        try std.testing.expectEqualStrings(expected_grant.target_path, kept_grant.target_path);
     }
 }
 
