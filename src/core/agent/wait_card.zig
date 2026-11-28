@@ -11,6 +11,9 @@ const types = @import("../shared/types.zig");
 pub const Kind = enum {
     sign_in,
     quota,
+    /// A provider's daily limit. Waiting for its reset is the only retry, so
+    /// the card offers none.
+    daily_limit,
     rejected,
     too_long,
     content_filter,
@@ -21,6 +24,7 @@ pub const Kind = enum {
         return switch (need orelse return .rejected) {
             .sign_in => .sign_in,
             .quota => .quota,
+            .daily_limit => .daily_limit,
             .rejected => .rejected,
             .too_long => .too_long,
             .content_filter => .content_filter,
@@ -37,6 +41,7 @@ pub const Choice = enum { retry, sign_in, change_model, open_screen, stop, cance
 const retry_and_sign_in = [_]Choice{ .retry, .sign_in, .change_model, .open_screen, .stop };
 const retry_and_model = [_]Choice{ .retry, .change_model, .open_screen, .stop };
 const retry_only = [_]Choice{ .retry, .open_screen, .stop };
+const model_only = [_]Choice{ .change_model, .open_screen, .stop };
 
 const name_max_bytes = 64;
 const reason_max_bytes = recovery.Text.capacity;
@@ -90,6 +95,7 @@ pub const WaitCardPrompt = struct {
             .sign_in, .rejected => &retry_and_sign_in,
             .quota, .too_long => &retry_and_model,
             .content_filter, .crash_loop, .stale => &retry_only,
+            .daily_limit => &model_only,
         };
     }
 

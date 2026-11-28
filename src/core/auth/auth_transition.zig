@@ -45,16 +45,26 @@ pub fn decideLogoutProvider(facts: LogoutFacts) model_provider.ProviderId {
     if (facts.requested) |provider| return provider;
     if (facts.selected == .grok or facts.active_source == .grok_subscription) return .grok;
     if (facts.selected == .codex or facts.active_source == .chatgpt_subscription) return .codex;
+    if (facts.selected == .google or facts.active_source == .gemini_api_key or facts.active_source == .google_subscription) return .google;
     if (facts.active_source == .fx_login) return .gateway;
 
+    const has_google = facts.available_sources.contains(.google_subscription) or
+        facts.available_sources.contains(.gemini_api_key);
     const only_grok_login = facts.available_sources.contains(.grok_subscription) and
         !facts.available_sources.contains(.fx_login) and
-        !facts.available_sources.contains(.chatgpt_subscription);
+        !facts.available_sources.contains(.chatgpt_subscription) and
+        !has_google;
     if (only_grok_login) return .grok;
     const only_codex_login = facts.available_sources.contains(.chatgpt_subscription) and
         !facts.available_sources.contains(.fx_login) and
-        !facts.available_sources.contains(.grok_subscription);
+        !facts.available_sources.contains(.grok_subscription) and
+        !has_google;
     if (only_codex_login) return .codex;
+    const only_google_login = has_google and
+        !facts.available_sources.contains(.fx_login) and
+        !facts.available_sources.contains(.chatgpt_subscription) and
+        !facts.available_sources.contains(.grok_subscription);
+    if (only_google_login) return .google;
     return .gateway;
 }
 
@@ -64,7 +74,8 @@ pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId
     if (!removed.eql(facts.selected) or removed == .gateway) return candidates;
 
     var count: usize = 0;
-    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok, .google }) |provider| {
+        if (count >= candidates.len) break;
         if (provider.eql(removed)) continue;
         const available = switch (provider) {
             .gateway => facts.available_sources.contains(.vercel_oidc_token) or
@@ -73,6 +84,8 @@ pub fn logoutFallbackProviders(facts: LogoutFacts) [2]?model_provider.ProviderId
                 facts.available_sources.contains(.stored_key),
             .codex => facts.available_sources.contains(.chatgpt_subscription),
             .grok => facts.available_sources.contains(.grok_subscription),
+            .google => facts.available_sources.contains(.gemini_api_key) or
+                facts.available_sources.contains(.google_subscription),
             .configured => false,
         };
         if (!available) continue;
@@ -99,6 +112,24 @@ test "logout fallback prefers Gateway then the remaining subscription" {
             candidates[1].?,
         );
     }
+}
+
+test "google logout targets google and falls back to gateway when available" {
+    const candidates = logoutFallbackProviders(.{
+        .requested = .google,
+        .selected = .google,
+        .active_source = .gemini_api_key,
+        .available_sources = .initOne(.ai_gateway_api_key),
+    });
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, candidates[0].?);
+    try std.testing.expectEqual(@as(?model_provider.ProviderId, null), candidates[1]);
+
+    try std.testing.expectEqual(model_provider.ProviderId.google, decideLogoutProvider(.{
+        .requested = null,
+        .selected = .google,
+        .active_source = .gemini_api_key,
+        .available_sources = .initOne(.gemini_api_key),
+    }));
 }
 
 test "default logout honors an active fx login before other subscriptions" {
@@ -157,6 +188,10 @@ pub fn signInCompletion(
             .{ .switch_provider = .grok }
         else
             .{ .activate_source = .grok_subscription },
+        .google => if (provider_routing_supported)
+            .{ .switch_provider = .google }
+        else
+            .{ .activate_source = .google_subscription },
     };
 }
 

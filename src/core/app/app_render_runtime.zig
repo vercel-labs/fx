@@ -641,6 +641,7 @@ pub fn Runtime(comptime App: type) type {
             var provider_stage: picker_state.ProviderPickerStage = .provider;
             var provider_picker_items: []const []const u8 = &.{};
             var provider_picker_annotations: []const []const u8 = &.{};
+            var provider_picker_detail_lines: []const []const u8 = &.{};
             var provider_picker_index: usize = 0;
             var provider_picker_window_start: usize = 0;
             var provider_picker_anchor: usize = 0;
@@ -669,6 +670,12 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .api_key => {},
                 }
+                provider_picker_detail_lines = provider_picker_runtime.Runtime(App).selectedDetailLines(
+                    app,
+                    picker_query,
+                    &provider_picker_column,
+                    provider_picker_index,
+                );
             }
 
             const completion_rt = input_completion_runtime.CompletionRuntime(App);
@@ -805,6 +812,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider_picker_stage = provider_stage,
                 .provider_picker_completions = provider_picker_items,
                 .provider_picker_annotations = provider_picker_annotations,
+                .provider_picker_detail_lines = provider_picker_detail_lines,
                 .provider_picker_completion_index = provider_picker_index,
                 .provider_picker_completion_window_start = provider_picker_window_start,
                 .provider_picker_completion_anchor = provider_picker_anchor,

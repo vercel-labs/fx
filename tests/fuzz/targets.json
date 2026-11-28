@@ -1,6 +1,11 @@
 {
   "targets": [
     {"name": "kept_sign_outs", "module": "fx", "test": "a kept sign-out record parses or is refused on fuzzed bytes, and what parses writes back the same", "iterations": 400000},
+    {"name": "gemini_interactions_stream", "module": "fx", "test": "gemini interactions consume_stream parses or refuses fuzzed SSE bytes cleanly", "iterations": 400000},
+    {"name": "gemini_errors_classify", "module": "fx", "test": "gemini errors classify returns for fuzzed status, body, and header bytes", "iterations": 400000},
+    {"name": "google_session_parse", "module": "fx", "test": "a Google session record parses or is refused on fuzzed bytes, and what parses writes back the same", "iterations": 400000},
+    {"name": "google_http_date", "module": "fx", "test": "HTTP-date parser handles fuzzed bytes and round-trips formatted dates", "iterations": 1000000},
+    {"name": "google_oauth_callback", "module": "fx", "test": "Google OAuth callback parsers handle fuzzed URLs and targets cleanly", "iterations": 1000000},
     {"name": "acp_mcp_servers", "module": "fx", "test": "ACP MCP parser handles fuzzed request bytes", "iterations": 1500000},
     {"name": "vision_json", "module": "fx", "test": "Vision JSON parsers tolerate arbitrary bounded bytes", "iterations": 1200000},
     {"name": "doctor_child_status", "module": "fx", "test": "doctor child status parser tolerates arbitrary bytes", "iterations": 1500000},

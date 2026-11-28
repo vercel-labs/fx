@@ -11,6 +11,8 @@ test {
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/agent/presentation/inline_render.zig");
     _ = @import("core/auth/credentials.zig");
+    _ = @import("core/auth/google_oauth.zig");
+    _ = @import("core/auth/google_session.zig");
     _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
@@ -79,6 +81,8 @@ test {
     _ = @import("core/workspace/tool_files.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/client.zig");
+    _ = @import("gateway/gemini_errors.zig");
+    _ = @import("gateway/gemini_interactions_protocol.zig");
     _ = @import("gateway/openai_codex.zig");
     _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/sse.zig");

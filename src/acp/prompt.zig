@@ -1355,7 +1355,17 @@ pub fn handlePromptWithInputId(
     };
     var unused_v2_input_id = v2_input_id;
     errdefer withdrawUnusedV2Input(session, unused_v2_input_id);
-    if (!try server.selectCredentialForProvider(state, session.provider)) {
+    const selected = server.selectCredentialForProvider(state, session.provider) catch |err| {
+        const message = switch (err) {
+            error.GoogleSignInRequired => credentials.google_sign_in_required_message,
+            error.GoogleSessionDamaged => credentials.google_session_damaged_message,
+            else => return err,
+        };
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
+        return .{ .rpc_error = .{ .code = ErrorCode.invalid_request, .message = message } };
+    };
+    if (!selected) {
         withdrawUnusedV2Input(session, unused_v2_input_id);
         unused_v2_input_id = null;
         return .{ .rpc_error = .{

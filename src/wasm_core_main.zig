@@ -5,6 +5,8 @@ const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const host_openai_codex = @import("gateway/host_openai_codex.zig");
 const openai_codex = @import("gateway/openai_codex.zig");
 const host_xai_grok = @import("gateway/host_xai_grok.zig");
+const host_google_gemini = @import("gateway/host_google_gemini.zig");
+const google_gemini = @import("gateway/google_gemini.zig");
 const host_chat_completions = @import("gateway/host_chat_completions.zig");
 const model_provider = @import("core/config/model_provider.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
@@ -92,10 +94,11 @@ const js_host_gateway_provider = gateway_provider.Provider{
 const codex_context = host_openai_codex.Context{ .transport = js_host_stream_provider.transport };
 // Mutable: it remembers the Grok client version between requests.
 var grok_context = host_xai_grok.Context{ .transport = js_host_stream_provider.transport };
+const google_context = host_google_gemini.Context{ .transport = js_host_stream_provider.transport };
 
 const js_host_provider_set = set: {
     var providers = provider_set.gateway_only(.{
-        .capabilities = .{ .gateway_prompt_caching = true },
+        .capabilities = .{ .gateway_prompt_caching = true, .declares_effort_levels = true },
         .presentation = provider_catalog.find(.gateway),
         .auth_strategy = .vercel,
         .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
@@ -117,10 +120,16 @@ const js_host_provider_set = set: {
         .agent_stream = host_xai_grok.provider(&grok_context),
         .model_catalog = host_xai_grok.modelCatalogProvider(&grok_context),
     };
+    providers.google = .{
+        .capabilities = google_gemini.bundle_capabilities,
+        .presentation = provider_catalog.find(.google),
+        .agent_stream = host_google_gemini.provider(@constCast(&google_context)),
+        .model_catalog = host_google_gemini.model_catalog_provider,
+    };
     break :set providers;
 };
 
-/// libfx engines run Gateway, Codex, Grok, or the configured provider, bound to
+/// libfx engines run Gateway, Codex, Grok, Google, or the configured provider, bound to
 /// its definition so saved sessions record it. Null keeps the startup provider.
 fn providerOverrideFromEnv(value: ?[]const u8, configured: ?*const host_chat_completions.Context) error{InvalidProvider}!?model_provider.ProviderId {
     const raw = value orelse return null;
@@ -132,6 +141,7 @@ fn providerOverrideFromEnv(value: ?[]const u8, configured: ?*const host_chat_com
     if (std.mem.eql(u8, raw, "gateway")) return .gateway;
     if (std.mem.eql(u8, raw, "codex")) return .codex;
     if (std.mem.eql(u8, raw, "grok")) return .grok;
+    if (std.mem.eql(u8, raw, "google")) return .google;
     return error.InvalidProvider;
 }
 

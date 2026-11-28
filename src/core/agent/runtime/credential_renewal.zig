@@ -34,6 +34,8 @@ pub const Renewal = struct {
     /// Whether the newest credential differs from the rejected token, so one
     /// more send can work.
     resend: bool = false,
+    /// True when refresh failed because the Google sign-in must be renewed.
+    google_sign_in_required: bool = false,
 
     /// The forced credential when there is one, else the stored one.
     pub fn newest(self: Renewal) ?RefreshedGatewayCredential {
@@ -60,11 +62,25 @@ pub fn load(
     rejected_token: ?[]const u8,
     trace_ctx: TraceContext,
 ) Allocator.Error!?RefreshedGatewayCredential {
+    var unused = false;
+    return loadCheckingSignIn(deps, alloc, sign_in, mode, rejected_token, trace_ctx, &unused);
+}
+
+fn loadCheckingSignIn(
+    deps: *const AgentRuntimeDeps,
+    alloc: Allocator,
+    sign_in: SignIn,
+    mode: CredentialRefreshMode,
+    rejected_token: ?[]const u8,
+    trace_ctx: TraceContext,
+    google_sign_in_required: *bool,
+) Allocator.Error!?RefreshedGatewayCredential {
     const source = sign_in.source orelse return null;
     if (!credentials.sourceRefreshable(source)) return null;
     const refresh = deps.refresh_gateway_credential orelse return null;
     return refresh(deps.ctx, alloc, source, mode, sign_in.account_id, rejected_token) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.GoogleSignInRequired) google_sign_in_required.* = true;
         debug_trace.eventf(
             "gateway",
             "credential_refresh_failed",
@@ -92,12 +108,14 @@ pub fn renewRejected(
     rejected: []const u8,
     trace_ctx: TraceContext,
 ) Allocator.Error!Renewal {
-    const stored = (try load(deps, alloc, sign_in, .reload, null, trace_ctx)) orelse {
+    var google_sign_in_required = false;
+    const stored = (try loadCheckingSignIn(deps, alloc, sign_in, .reload, null, trace_ctx, &google_sign_in_required)) orelse {
         debug_trace.eventf("gateway", "credential_renewal_skipped", trace_ctx, "reason=no_usable_stored_credential", .{});
-        return .{};
+        return .{ .google_sign_in_required = google_sign_in_required };
     };
     errdefer free(alloc, stored);
     if (!std.mem.eql(u8, stored.token, rejected)) return .{ .stored = stored, .resend = true };
-    const forced = (try load(deps, alloc, sign_in, .force, rejected, trace_ctx)) orelse return .{ .stored = stored };
+    const forced = (try loadCheckingSignIn(deps, alloc, sign_in, .force, rejected, trace_ctx, &google_sign_in_required)) orelse
+        return .{ .stored = stored, .google_sign_in_required = google_sign_in_required };
     return .{ .stored = stored, .forced = forced, .resend = true };
 }

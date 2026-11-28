@@ -133,6 +133,7 @@ const FooterSurfaceProjection = struct {
     picker_kind: PickerKind,
     picker_items: []const []const u8,
     picker_annotations: []const []const u8,
+    picker_detail_lines: []const []const u8,
     file_picker_items: []const file_index.SearchResult,
     picker_selection_index: usize,
     picker_window_start: usize,
@@ -189,6 +190,7 @@ const FooterSurfaceProjection = struct {
             .picker_kind = self.picker_kind,
             .picker_items = self.picker_items,
             .picker_annotations = self.picker_annotations,
+            .picker_detail_lines = self.picker_detail_lines,
             .file_picker_items = self.file_picker_items,
             .picker_selection_index = self.picker_selection_index,
             .picker_window_start = self.picker_window_start,
@@ -469,6 +471,7 @@ fn buildFooterSurfaceProjection(
     else
         &.{};
     const picker_annotations: []const []const u8 = if (show_provider_query) ctx.provider_picker_annotations else &.{};
+    const picker_detail_lines: []const []const u8 = if (show_provider_query) ctx.provider_picker_detail_lines else &.{};
     const file_picker_items: []const file_index.SearchResult = if (show_file_query) ctx.file_completions else &.{};
     const picker_selection_index: usize = if (show_skills_query)
         ctx.skills_menu.selected_index
@@ -734,6 +737,7 @@ fn buildFooterSurfaceProjection(
         .picker_kind = picker_kind,
         .picker_items = picker_items,
         .picker_annotations = picker_annotations,
+        .picker_detail_lines = picker_detail_lines,
         .file_picker_items = file_picker_items,
         .picker_selection_index = picker_selection_index,
         .picker_window_start = picker_window_start,
@@ -933,6 +937,7 @@ pub const SurfaceFooterMeasurement = struct {
     picker_kind: PickerKind = .model_stage,
     picker_items: []const []const u8 = &.{},
     picker_annotations: []const []const u8 = &.{},
+    picker_detail_lines: []const []const u8 = &.{},
     file_picker_items: []const file_index.SearchResult = &.{},
     picker_selection_index: usize = 0,
     picker_window_start: usize = 0,
@@ -1077,6 +1082,7 @@ pub const SurfaceFooterMeasurement = struct {
             .picker_kind = self.picker_kind,
             .picker_items = self.picker_items,
             .picker_annotations = self.picker_annotations,
+            .picker_detail_lines = self.picker_detail_lines,
             .file_picker_items = self.file_picker_items,
             .picker_selection_index = self.picker_selection_index,
             .picker_window_start = self.picker_window_start,
@@ -1215,6 +1221,7 @@ pub noinline fn measureSurfaceFooter(
     measurement.show_picker = projection.show_picker;
     measurement.picker_items = projection.picker_items;
     measurement.picker_annotations = projection.picker_annotations;
+    measurement.picker_detail_lines = projection.picker_detail_lines;
     measurement.file_picker_items = projection.file_picker_items;
     measurement.picker_selection_index = projection.picker_selection_index;
     measurement.picker_window_start = projection.picker_window_start;

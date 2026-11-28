@@ -23,11 +23,13 @@ const FindGenericPasswordFn = *const fn (
 ) callconv(.c) i32;
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
+pub const gemini_api_key_service_name = "FX_GEMINI_API_KEY";
 /// The sign-in credentials the MCP engine hands fx to keep, a different format.
 /// Not `FX_MCP_OAUTH_CREDENTIALS_V2`: fx builds that still run read and
 /// rewrite that item (`mcp_host/credentials.zig` says why).
 pub const mcp_host_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V3";
 pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
+pub const google_session_service_name = "FX_GOOGLE_SESSION_V1";
 /// The fx login's sign-outs that its issuer did not confirm, kept to revoke
 /// later (`auth/pending_revocation.zig`).
 pub const oauth_pending_revocations_service_name = "FX_OAUTH_PENDING_REVOCATIONS_V1";
@@ -40,6 +42,7 @@ pub const AccountBuffer = [256]u8;
 const passwd_scratch_bytes = 2048;
 const max_mcp_credentials_bytes: usize = 1024 * 1024;
 const max_oauth_session_bytes: usize = 64 * 1024;
+const max_google_session_bytes: usize = 256 * 1024;
 /// `pending_revocation.max_record_bytes`.
 const max_oauth_pending_revocations_bytes: usize = 256 * 1024;
 /// How long one Keychain call may take, in milliseconds; leased locks held
@@ -165,14 +168,27 @@ pub fn load(alloc: std.mem.Allocator) !?[]u8 {
     return loadFromService(alloc, service_name);
 }
 
+/// Caller owns the returned slice and must zero and free it via `secret.zeroAndFree`.
+pub fn loadGeminiApiKey(alloc: std.mem.Allocator) !?[]u8 {
+    return loadFromService(alloc, gemini_api_key_service_name);
+}
+
 /// Checks Keychain metadata only. It never asks Security.framework for the
 /// secret value and never spawns the `security` command-line tool.
 pub fn contains() Error!host.SecretStorePresence {
     return containsService(service_name);
 }
 
+pub fn geminiApiKeyPresence() Error!host.SecretStorePresence {
+    return containsService(gemini_api_key_service_name);
+}
+
 pub fn oauthSessionPresence() Error!host.SecretStorePresence {
     return containsService(oauth_session_service_name);
+}
+
+pub fn googleSessionPresence() Error!host.SecretStorePresence {
+    return containsService(google_session_service_name);
 }
 
 fn containsService(service: []const u8) Error!host.SecretStorePresence {
@@ -213,6 +229,10 @@ fn containsService(service: []const u8) Error!host.SecretStorePresence {
 
 pub fn loadOAuthSession(alloc: std.mem.Allocator) !?[]u8 {
     return loadMcpValueMacControlled(alloc, oauth_session_service_name, null);
+}
+
+pub fn loadGoogleSession(alloc: std.mem.Allocator) Error!?[]u8 {
+    return loadMcpValueMacControlled(alloc, google_session_service_name, null);
 }
 
 fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
@@ -356,7 +376,22 @@ pub fn storeInteractive() Error!void {
 
     // Let macOS prompt for the secret; do not put it in argv.
     var account_buf: AccountBuffer = undefined;
-    const argv = try storeInteractiveArgv(&account_buf);
+    return runInteractiveStore(try storeInteractiveArgv(&account_buf));
+}
+
+/// The Gemini API key item, prompted the same way as `storeInteractive`.
+pub fn storeGeminiApiKeyInteractive() Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+
+    var account_buf: AccountBuffer = undefined;
+    return runInteractiveStore(geminiStoreArgv(try accountName(&account_buf)));
+}
+
+fn geminiStoreArgv(account: []const u8) [8][]const u8 {
+    return .{ "/usr/bin/security", "add-generic-password", "-a", account, "-s", gemini_api_key_service_name, "-U", "-w" };
+}
+
+fn runInteractiveStore(argv: [8][]const u8) Error!void {
     var child = std.process.spawn(io_mod.getIo(), .{
         .argv = &argv,
         .stdin = .inherit,
@@ -375,6 +410,18 @@ pub fn storeValue(value: []const u8) Error!void {
     return error.UnsupportedPlatform;
 }
 
+pub fn storeGeminiApiKey(value: []const u8) Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    if (value.len == 0) return error.KeychainWriteFailed;
+
+    if (comptime builtin.target.os.tag == .macos) return storeValueMac(gemini_api_key_service_name, value);
+    return error.UnsupportedPlatform;
+}
+
+pub fn deleteGeminiApiKey(alloc: std.mem.Allocator) Error!bool {
+    return deleteServiceItem(alloc, gemini_api_key_service_name);
+}
+
 pub fn storeOAuthSession(value: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
     if (value.len == 0 or value.len > max_oauth_session_bytes) {
@@ -385,6 +432,18 @@ pub fn storeOAuthSession(value: []const u8) Error!void {
 
 pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {
     return deleteMcpValueMac(alloc, oauth_session_service_name);
+}
+
+pub fn storeGoogleSession(value: []const u8) Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    if (value.len == 0 or value.len > max_google_session_bytes) {
+        return error.KeychainWriteFailed;
+    }
+    return storeMcpValueMac(google_session_service_name, value);
+}
+
+pub fn deleteGoogleSession(alloc: std.mem.Allocator) Error!bool {
+    return deleteMcpValueMac(alloc, google_session_service_name);
 }
 
 /// Returns error.KeychainItemNotFound when no sign-out is kept.

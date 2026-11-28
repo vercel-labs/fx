@@ -6,6 +6,9 @@ const openai_codex_permission_reviewer = @import("../gateway/openai_codex_permis
 const xai_grok = @import("../gateway/xai_grok.zig");
 const xai_grok_models = @import("../gateway/xai_grok_models.zig");
 const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_reviewer.zig");
+const google_gemini = @import("../gateway/google_gemini.zig");
+const google_gemini_models = @import("../gateway/google_gemini_models.zig");
+const google_gemini_permission_reviewer = @import("../gateway/google_gemini_permission_reviewer.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 const chat_completions = @import("../gateway/chat_completions.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
@@ -35,5 +38,14 @@ pub const native = provider_set.Set{
         .cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
         .model_catalog = xai_grok_models.model_catalog_provider,
         .permission_reviewer = xai_grok_permission_reviewer.provider,
+    },
+    .google = .{
+        .capabilities = google_gemini.bundle_capabilities,
+        .presentation = provider_catalog.find(.google),
+        .title_model = google_gemini_models.title_model,
+        .agent_stream = google_gemini.agent_stream_provider,
+        .cli_model_catalog = google_gemini_models.cli_model_catalog_provider,
+        .model_catalog = google_gemini_models.model_catalog_provider,
+        .permission_reviewer = google_gemini_permission_reviewer.provider,
     },
 };

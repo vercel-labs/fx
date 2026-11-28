@@ -16,7 +16,9 @@ const types = @import("../shared/types.zig");
 pub const Method = enum {
     /// Browser sign-in that yields an fx login session.
     oauth,
-    /// A pasted AI Gateway key held in the keychain or profile.
+    /// Browser sign-in for Google AI Pro or Ultra plan.
+    plan,
+    /// A pasted AI Gateway or Gemini API key held in the keychain or profile.
     api_key,
 };
 
@@ -99,18 +101,20 @@ pub fn keySourceCredential(source: KeySource) ?types.CredentialSource {
 pub fn methodSlug(method: Method) []const u8 {
     return switch (method) {
         .oauth => "oauth",
+        .plan => "plan",
         .api_key => "api-key",
     };
 }
 
 pub fn parseMethod(value: []const u8) ?Method {
     if (std.ascii.eqlIgnoreCase(value, methodSlug(.oauth))) return .oauth;
+    if (std.ascii.eqlIgnoreCase(value, methodSlug(.plan))) return .plan;
     if (std.ascii.eqlIgnoreCase(value, methodSlug(.api_key))) return .api_key;
     return null;
 }
 
 fn providerVisible(id: model_provider.ProviderId) bool {
-    if (comptime host_target.is_wasm) return id != .grok;
+    if (comptime host_target.is_wasm) return id != .grok and id != .google;
     return true;
 }
 
@@ -128,16 +132,18 @@ pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
 pub fn providerMethods(id: model_provider.ProviderId) []const Method {
     return switch (id) {
         .gateway => &.{ .oauth, .api_key },
+        .google => &.{ .plan, .api_key },
         .codex, .grok, .configured => &.{},
     };
 }
 
 /// True when `source` is one of the ways `method` can be satisfied. The API key
-/// method covers every gateway key origin, not just the environment variable.
+/// method covers every key origin, not just the environment variable.
 pub fn methodMatchesSource(method: Method, source: types.CredentialSource) bool {
     return switch (method) {
         .oauth => source == .fx_login or source == .vercel_oidc_token,
-        .api_key => source == .ai_gateway_api_key or source == .stored_key,
+        .plan => source == .google_subscription,
+        .api_key => source == .ai_gateway_api_key or source == .stored_key or source == .gemini_api_key,
     };
 }
 
@@ -153,14 +159,25 @@ test "provider options expose the catalog slugs the composer accepts" {
     }
 }
 
-test "only the gateway offers a method column" {
+test "gateway and google expose method columns while direct subscription providers do not" {
     try std.testing.expectEqual(@as(usize, 2), providerMethods(.gateway).len);
+    try std.testing.expectEqualSlices(Method, &.{ .plan, .api_key }, providerMethods(.google));
     try std.testing.expectEqual(@as(usize, 0), providerMethods(.codex).len);
     try std.testing.expectEqual(@as(usize, 0), providerMethods(.grok).len);
 }
 
+test "provider options include google on native builds" {
+    var buf: [max_provider_options][]const u8 = undefined;
+    const count = providerOptions(&buf);
+    var saw_google = false;
+    for (buf[0..count]) |slug| {
+        if (std.mem.eql(u8, slug, "google")) saw_google = true;
+    }
+    try std.testing.expectEqual(!host_target.is_wasm, saw_google);
+}
+
 test "method slugs round trip and stay single tokens" {
-    for ([_]Method{ .oauth, .api_key }) |method| {
+    for ([_]Method{ .oauth, .plan, .api_key }) |method| {
         const slug = methodSlug(method);
         try std.testing.expectEqual(method, parseMethod(slug).?);
         try std.testing.expect(std.mem.findScalar(u8, slug, ' ') == null);
@@ -170,9 +187,16 @@ test "method slugs round trip and stay single tokens" {
 
 test "method ownership of credential sources is disjoint" {
     try std.testing.expect(methodMatchesSource(.oauth, .fx_login));
+    try std.testing.expect(methodMatchesSource(.plan, .google_subscription));
     try std.testing.expect(methodMatchesSource(.api_key, .stored_key));
+    try std.testing.expect(methodMatchesSource(.api_key, .gemini_api_key));
     try std.testing.expect(!methodMatchesSource(.oauth, .stored_key));
+    try std.testing.expect(!methodMatchesSource(.oauth, .gemini_api_key));
+    try std.testing.expect(!methodMatchesSource(.oauth, .google_subscription));
+    try std.testing.expect(!methodMatchesSource(.plan, .gemini_api_key));
+    try std.testing.expect(!methodMatchesSource(.plan, .fx_login));
     try std.testing.expect(!methodMatchesSource(.api_key, .fx_login));
+    try std.testing.expect(!methodMatchesSource(.api_key, .google_subscription));
 }
 
 test "key field shows a placeholder when empty and one bullet per byte" {

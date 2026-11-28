@@ -2954,6 +2954,18 @@ fn bodyReadError(response: *const std.http.Client.Response) anyerror {
     return error.ReadFailed;
 }
 
+pub const OAuthFetchResult = struct {
+    status: std.http.Status,
+    dpop_nonce: ?[]u8 = null,
+    date_header: ?[]u8 = null,
+
+    pub fn deinit(self: *OAuthFetchResult, alloc: std.mem.Allocator) void {
+        if (self.dpop_nonce) |nonce| secret.zeroAndFree(alloc, nonce);
+        if (self.date_header) |date| alloc.free(date);
+        self.* = .{ .status = .internal_server_error };
+    }
+};
+
 /// `std.http.Client.fetch` with the connection opened by `openRequestOnJob`,
 /// for an operation that `runBoundedHttpOperation` runs. Redirects are not
 /// followed: `options.redirect_behavior` must be `.unhandled`, and the
@@ -2971,6 +2983,48 @@ pub fn fetchWholeBodyOnOpenJob(options: std.http.Client.FetchOptions) !std.http.
     var opened = try openRequestOnJob(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
     defer opened.deinit();
     return fetchOnRequest(&opened.request, options, true);
+}
+
+/// Focused variant of `fetchOnOpenJob` for OAuth requests that also copies
+/// `DPoP-Nonce` and `Date` response headers when present. Caller owns the
+/// returned slices and releases them with `OAuthFetchResult.deinit`.
+pub fn fetchOnOpenJobWithResponseHeaders(
+    alloc: std.mem.Allocator,
+    options: std.http.Client.FetchOptions,
+) !OAuthFetchResult {
+    std.debug.assert(options.redirect_behavior == .unhandled);
+    var opened = try openRequestOnJob(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
+    defer opened.deinit();
+
+    const req = &opened.request;
+    try sendFetchRequest(req, options);
+    var response = try req.receiveHead(&.{});
+
+    // Read headers before reading the body, which reuses the head's buffer.
+    var dpop_nonce: ?[]u8 = null;
+    errdefer if (dpop_nonce) |nonce| secret.zeroAndFree(alloc, nonce);
+    var date_header: ?[]u8 = null;
+    errdefer if (date_header) |date| alloc.free(date);
+
+    var header_it = response.head.iterateHeaders();
+    while (header_it.next()) |header| {
+        const trimmed = std.mem.trim(u8, header.value, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "dpop-nonce")) {
+            if (dpop_nonce) |prev| secret.zeroAndFree(alloc, prev);
+            dpop_nonce = try alloc.dupe(u8, trimmed);
+        } else if (std.ascii.eqlIgnoreCase(header.name, "date")) {
+            if (date_header) |prev| alloc.free(prev);
+            date_header = try alloc.dupe(u8, trimmed);
+        }
+    }
+
+    try readFetchResponseBody(&response, req.client.allocator, options, false);
+    return .{
+        .status = response.head.status,
+        .dpop_nonce = dpop_nonce,
+        .date_header = date_header,
+    };
 }
 
 /// `std.http.Client.fetch` on a client the caller owns, without its panic on
@@ -3003,9 +3057,7 @@ fn fetchRequestOptions(options: std.http.Client.FetchOptions) std.http.Client.Re
     };
 }
 
-/// Sends an opened request and reads its answer as `std.http.Client.fetch`
-/// does, except that a failed body read returns `bodyReadError`.
-fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchOptions, require_whole_body: bool) !std.http.Client.FetchResult {
+fn sendFetchRequest(req: *std.http.Client.Request, options: std.http.Client.FetchOptions) !void {
     if (options.payload) |payload| {
         req.transfer_encoding = .{ .content_length = payload.len };
         var body = try req.sendBodyUnflushed(&.{});
@@ -3015,16 +3067,30 @@ fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchO
     } else {
         try req.sendBodiless();
     }
+}
 
+/// Sends an opened request and reads its answer as `std.http.Client.fetch`
+/// does, except that a failed body read returns `bodyReadError`.
+fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchOptions, require_whole_body: bool) !std.http.Client.FetchResult {
+    try sendFetchRequest(req, options);
     var response = try req.receiveHead(&.{});
+    try readFetchResponseBody(&response, req.client.allocator, options, require_whole_body);
+    return .{ .status = response.head.status };
+}
+
+fn readFetchResponseBody(
+    response: *std.http.Client.Response,
+    client_alloc: std.mem.Allocator,
+    options: std.http.Client.FetchOptions,
+    require_whole_body: bool,
+) !void {
     const response_writer = options.response_writer orelse {
         _ = response.reader(&.{}).discardRemaining() catch |err| switch (err) {
-            error.ReadFailed => return bodyReadError(&response),
+            error.ReadFailed => return bodyReadError(response),
         };
-        return .{ .status = response.head.status };
+        return;
     };
 
-    const client_alloc = req.client.allocator;
     const decompress_buffer: []u8 = switch (response.head.content_encoding) {
         .identity => &.{},
         .zstd => options.decompress_buffer orelse try client_alloc.alloc(u8, std.compress.zstd.default_window_len),
@@ -3039,12 +3105,11 @@ fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchO
     const body_len = reader.streamRemaining(response_writer) catch |err| switch (err) {
         error.ReadFailed => {
             if (decompressError(response.head.content_encoding, &decompress)) |decoded| return decoded;
-            return bodyReadError(&response);
+            return bodyReadError(response);
         },
         else => |e| return e,
     };
-    if (require_whole_body and plainBodyCutOff(&response, body_len)) return error.HttpBodyCutOff;
-    return .{ .status = response.head.status };
+    if (require_whole_body and plainBodyCutOff(response, body_len)) return error.HttpBodyCutOff;
 }
 
 /// True when a plain 200 body is shorter than its Content-Length. The std

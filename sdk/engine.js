@@ -4,12 +4,15 @@
 import { maxCoreMessageBytes } from "./core-output.js";
 import { codexSubscription } from "./chatgpt.js";
 import { customProviderDefinition, customProviderSpec } from "./custom-provider.js";
+import { googleApiKeySpec } from "./google.js";
 import { grokSubscription } from "./grok.js";
 import { createSubscriptionAuthorizer, credentialMemory } from "./subscription.js";
 import { toolObservation } from "./tool-observation.js";
 
 // Providers that run on a user's plan, authorized by the host's credentials.
 const subscriptionProviders = new Set(["codex", "grok"]);
+// Built-in providers authorized by a host-supplied API key.
+const apiKeyProviders = new Set(["google"]);
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -174,21 +177,22 @@ export function normalizeAgentOptions(value) {
   const custom = options.provider !== null && typeof options.provider === "object"
     ? customProviderDefinition(options.provider)
     : undefined;
-  if (!custom && options.provider !== undefined && options.provider !== "gateway" && !subscriptionProviders.has(options.provider)) {
-    throw new TypeError("provider must be \"gateway\", \"codex\", \"grok\" or a custom provider { name, baseUrl }");
+  if (!custom && options.provider !== undefined && options.provider !== "gateway" && !subscriptionProviders.has(options.provider) && !apiKeyProviders.has(options.provider)) {
+    throw new TypeError("provider must be \"gateway\", \"codex\", \"grok\", \"google\" or a custom provider { name, baseUrl }");
   }
   options.customProvider = custom;
   options.providerName = custom ? custom.name : options.provider;
   const subscription = subscriptionProviders.has(options.provider);
+  const hostKeyProvider = apiKeyProviders.has(options.provider);
   // Gateway needs its key; every other provider runs on the host's credentials.
-  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, !subscription && !custom);
-  if (subscription && typeof options.credentials !== "function") {
+  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, !subscription && !hostKeyProvider && !custom);
+  if ((subscription || hostKeyProvider) && typeof options.credentials !== "function") {
     throw new TypeError(`provider "${options.provider}" needs a credentials() function`);
   }
-  if (!subscription && !custom && options.credentials !== undefined) {
-    throw new TypeError("credentials needs provider \"codex\", \"grok\" or a custom provider");
+  if (!subscription && !hostKeyProvider && !custom && options.credentials !== undefined) {
+    throw new TypeError("credentials needs provider \"codex\", \"grok\", \"google\" or a custom provider");
   }
-  // A custom provider's key is never refreshed, so it has no onCredentials or refreshLock.
+  // An API key is never refreshed, so it has no onCredentials or refreshLock.
   for (const name of ["onCredentials", "refreshLock"]) {
     if (!subscription && options[name] !== undefined) throw new TypeError(`${name} needs provider "codex" or "grok"`);
   }
@@ -196,10 +200,10 @@ export function normalizeAgentOptions(value) {
     if (options[name] !== undefined && typeof options[name] !== "function") throw new TypeError(`${name} must be a function`);
   }
   Object.assign(options, normalizeModelChoice(options));
-  // fx's default model is a Gateway id. Codex, Grok, and a custom provider
+  // fx's default model is a Gateway id. Codex, Grok, Google, and a custom provider
   // name their own models, so each needs one, as the fx CLI asks for.
   if (custom && options.model === undefined) throw new TypeError("a custom provider needs a model");
-  if (subscription && options.model === undefined) {
+  if ((subscription || hostKeyProvider) && options.model === undefined) {
     throw new TypeError(`provider "${options.provider}" needs a model; fx's default model is an AI Gateway id`);
   }
   validateGatewayChatUrl(options.gatewayChatUrl);
@@ -1459,9 +1463,11 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
   // Adds the host's credentials to the provider's own requests.
   const providerAuth = subscriptionProviders.has(options.provider)
     ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, refreshLock: options.refreshLock, fetch: hostFetch, memory: options[credentialMemory] })
-    : options.customProvider && options.credentials
-      ? createSubscriptionAuthorizer([customProviderSpec(options.customProvider, () => sessionId)], { credentials: options.credentials, fetch: hostFetch })
-      : null;
+    : options.provider === "google"
+      ? createSubscriptionAuthorizer([googleApiKeySpec(() => sessionId)], { credentials: options.credentials, fetch: hostFetch })
+      : options.customProvider && options.credentials
+        ? createSubscriptionAuthorizer([customProviderSpec(options.customProvider, () => sessionId)], { credentials: options.credentials, fetch: hostFetch })
+        : null;
   const transportFetch = async (input, init = {}) => {
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
     let endpoint = String(input?.url ?? input);

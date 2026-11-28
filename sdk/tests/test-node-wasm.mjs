@@ -37,6 +37,7 @@ const commands = [
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-transport-retry.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-codex.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-grok.mjs", import.meta.url)), "wasm"]],
+  [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-google.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-custom.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-core.mjs", import.meta.url))]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-core-cancel.mjs", import.meta.url))]],

@@ -750,7 +750,11 @@ fn countText(alloc: Allocator, count: usize) ![]const u8 {
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription and source != .configured);
+    return auth.gateway_connected or (source != .chatgpt_subscription and
+        source != .grok_subscription and
+        source != .gemini_api_key and
+        source != .google_subscription and
+        source != .configured);
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
@@ -759,6 +763,10 @@ fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
 
 fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.grok_connected or auth.active_source == .grok_subscription;
+}
+
+fn googleProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+    return auth.google_connected or auth.active_source == .google_subscription or auth.active_source == .gemini_api_key;
 }
 
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
@@ -775,6 +783,11 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (grokProviderConnected(auth)) {
         if (wrote_provider) try writer.writeAll(", Grok");
         if (!wrote_provider) try writer.writeAll("Grok");
+        wrote_provider = true;
+    }
+    if (googleProviderConnected(auth)) {
+        if (wrote_provider) try writer.writeAll(", Google");
+        if (!wrote_provider) try writer.writeAll("Google");
         wrote_provider = true;
     }
     if (!wrote_provider) try writer.writeAll("none");
@@ -1051,7 +1064,10 @@ pub const StatusSnapshot = struct {
     fn writeConnections(self: StatusSnapshot, writer: *std.Io.Writer) !void {
         if (self.provider == .configured and self.auth.active_source == .configured) {
             try writer.writeAll(self.provider.label());
-            if (!gatewayProviderConnected(self.auth) and !chatGptProviderConnected(self.auth) and !grokProviderConnected(self.auth)) return;
+            if (!gatewayProviderConnected(self.auth) and
+                !chatGptProviderConnected(self.auth) and
+                !grokProviderConnected(self.auth) and
+                !googleProviderConnected(self.auth)) return;
             try writer.writeAll(", ");
         }
         try writeConnectedProvidersText(writer, self.auth);
@@ -1122,6 +1138,11 @@ pub const StatusSnapshot = struct {
             if (grokProviderConnected(self.auth)) {
                 if (wrote_provider) try writer.writeByte(',');
                 try std.json.Stringify.value("grok", .{}, writer);
+                wrote_provider = true;
+            }
+            if (googleProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
+                try std.json.Stringify.value("google", .{}, writer);
             }
             try writer.writeByte(']');
         }
@@ -1424,6 +1445,7 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
+            .google => provider_catalog.label(.google),
             .configured => "configured provider",
         };
     }
@@ -4894,4 +4916,49 @@ test "oneOffHeaderMessageStyled uses adaptive bold brand without help hint" {
     defer alloc.free(expected_plain);
     try std.testing.expectEqualStrings(expected_plain, plain);
     try std.testing.expect(std.mem.findScalar(u8, plain, '\x1b') == null);
+}
+
+test "status omits Vercel AI Gateway when only Google plan or key is connected" {
+    const alloc = std.testing.allocator;
+    const plan_only = StatusSnapshot{
+        .model = "gemini-4-hydrogen",
+        .provider = .google,
+        .auth = .{
+            .active_source = .google_subscription,
+            .gateway_connected = false,
+            .google_connected = true,
+        },
+        .permission_mode = .auto,
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+    };
+    const text = try plan_only.renderText(alloc);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "connected_providers=Google\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Vercel AI Gateway") == null);
+
+    const json = try plan_only.renderJson(alloc);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"connected_providers\":[\"google\"]") != null);
+    try std.testing.expect(std.mem.find(u8, json, "vercel-ai-gateway") == null);
+
+    const configured_and_google = StatusSnapshot{
+        .model = "custom-model",
+        .provider = model_provider.parse("custom").?,
+        .auth = .{
+            .active_source = .configured,
+            .gateway_connected = false,
+            .google_connected = true,
+        },
+        .permission_mode = .auto,
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+    };
+    const configured_text = try configured_and_google.renderText(alloc);
+    defer alloc.free(configured_text);
+    try std.testing.expect(std.mem.find(u8, configured_text, "connected_providers=custom, Google\n") != null);
 }

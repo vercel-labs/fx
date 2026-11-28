@@ -7,6 +7,7 @@ pub const ProviderId = union(enum) {
     gateway,
     codex,
     grok,
+    google,
     configured: struct {
         bytes: [configured_provider.max_id_bytes]u8 = @splat(0),
         len: u8,
@@ -19,6 +20,7 @@ pub const ProviderId = union(enum) {
             .gateway => "gateway",
             .codex => "codex",
             .grok => "grok",
+            .google => "google",
             .configured => |*value| value.bytes[0..value.len],
         };
     }
@@ -106,14 +108,19 @@ pub const ProviderSelection = struct {
     model: []const u8,
 };
 
+fn configured_with_name(value: []const u8) ProviderId {
+    var result: ProviderId = .{ .configured = .{ .len = @intCast(value.len) } };
+    @memcpy(result.configured.bytes[0..value.len], value);
+    return result;
+}
+
 pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
+    if (std.ascii.eqlIgnoreCase(value, "google")) return .google;
     configured_provider.validate_id(value) catch return null;
-    var result: ProviderId = .{ .configured = .{ .len = @intCast(value.len) } };
-    @memcpy(result.configured.bytes[0..value.len], value);
-    return result;
+    return configured_with_name(value);
 }
 
 pub fn parse_saved(value: std.json.Value) error{InvalidProviderBinding}!ProviderId {
@@ -126,8 +133,14 @@ pub fn parse_saved(value: std.json.Value) error{InvalidProviderBinding}!Provider
     const name = value.object.get("name") orelse return error.InvalidProviderBinding;
     const encoded = value.object.get("binding") orelse return error.InvalidProviderBinding;
     if (name != .string or encoded != .string or encoded.string.len != 64) return error.InvalidProviderBinding;
-    var provider = parse(name.string) orelse return error.InvalidProviderBinding;
-    if (provider != .configured) return error.InvalidProviderBinding;
+    var provider = if (configured_provider.is_late_reserved_id(name.string)) blk: {
+        configured_provider.validate_id(name.string) catch return error.InvalidProviderBinding;
+        break :blk configured_with_name(name.string);
+    } else blk: {
+        const parsed = parse(name.string) orelse return error.InvalidProviderBinding;
+        if (parsed != .configured) return error.InvalidProviderBinding;
+        break :blk parsed;
+    };
     var binding: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&binding, encoded.string) catch return error.InvalidProviderBinding;
     provider.configured.binding = binding;
@@ -138,10 +151,11 @@ pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSourc
     const selected = source orelse return false;
     if (selected == .host_managed) return true;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .configured,
+        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .gemini_api_key and selected != .google_subscription and selected != .configured,
         .configured => selected == .configured,
         .codex => selected == .chatgpt_subscription,
         .grok => selected == .grok_subscription,
+        .google => selected == .gemini_api_key or selected == .google_subscription,
     };
 }
 
@@ -155,6 +169,15 @@ test "explicit providers authorize only their own credential origins" {
     try std.testing.expect(authorizesCredential(.grok, .grok_subscription));
     try std.testing.expect(!authorizesCredential(.grok, .chatgpt_subscription));
     try std.testing.expect(!authorizesCredential(.gateway, .grok_subscription));
+    try std.testing.expect(authorizesCredential(.google, .gemini_api_key));
+    try std.testing.expect(authorizesCredential(.google, .google_subscription));
+    try std.testing.expect(!authorizesCredential(.google, .ai_gateway_api_key));
+    try std.testing.expect(!authorizesCredential(.google, .fx_login));
+    try std.testing.expect(!authorizesCredential(.google, .chatgpt_subscription));
+    try std.testing.expect(!authorizesCredential(.google, .grok_subscription));
+    try std.testing.expect(!authorizesCredential(.google, null));
+    try std.testing.expect(!authorizesCredential(.gateway, .gemini_api_key));
+    try std.testing.expect(!authorizesCredential(.gateway, .google_subscription));
 }
 
 test "configured provider identity serializes its binding and rejects rebinding" {
@@ -181,6 +204,22 @@ test "configured provider identity serializes its binding and rejects rebinding"
     try std.testing.expectError(error.InvalidProviderBinding, parse_saved(.{ .string = "local" }));
     try std.testing.expect(!authorizesCredential(.gateway, .configured));
     try std.testing.expect(!authorizesCredential(bound, .ai_gateway_api_key));
+
+    const hex_binding = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const saved_google_json = "{\"name\":\"google\",\"binding\":\"" ++ hex_binding ++ "\"}";
+    var saved_google = try std.json.parseFromSlice(ProviderId, alloc, saved_google_json, .{});
+    defer saved_google.deinit();
+    try std.testing.expect(saved_google.value == .configured);
+    try std.testing.expectEqualStrings("google", saved_google.value.label());
+    try std.testing.expectError(error.ConfiguredProviderRemoved, saved_google.value.bind(empty));
+
+    const saved_google_str = try parse_saved(.{ .string = "google" });
+    try std.testing.expectEqual(ProviderId.google, saved_google_str);
+
+    const saved_grok_json = "{\"name\":\"grok\",\"binding\":\"" ++ hex_binding ++ "\"}";
+    var grok_value = try std.json.parseFromSlice(std.json.Value, alloc, saved_grok_json, .{});
+    defer grok_value.deinit();
+    try std.testing.expectError(error.InvalidProviderBinding, parse_saved(grok_value.value));
 }
 
 test "provider equality compares tags before names and name keys stay name-only" {
@@ -207,6 +246,9 @@ test "provider parsing recognizes builtins and validated configured names" {
     try std.testing.expectEqual(ProviderId.gateway, parse("gateway").?);
     try std.testing.expectEqual(ProviderId.codex, parse("CODEX").?);
     try std.testing.expectEqual(ProviderId.grok, parse("GROK").?);
+    try std.testing.expectEqual(ProviderId.google, parse("google").?);
+    try std.testing.expectEqual(ProviderId.google, parse("GOOGLE").?);
+    try std.testing.expectEqualStrings("google", ProviderId.label(&.google));
     try std.testing.expect(parse("openai-codex").? == .configured);
     try std.testing.expect(parse("bad/name") == null);
     try std.testing.expect(parse("") == null);

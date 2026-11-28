@@ -26,6 +26,9 @@ pub const Bundle = struct {
         /// Whether a request carries fx's output limit. ChatGPT's Codex
         /// endpoint chooses its own and rejects the parameter.
         sends_output_limit: bool = true,
+        /// Whether the provider's catalog declares each model's effort levels
+        /// so unsupported `--effort` should emit a session notice when known.
+        declares_effort_levels: bool = false,
     };
 
     capabilities: Capabilities = .{},
@@ -59,6 +62,7 @@ pub const Set = struct {
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
+    google: Bundle,
     definitions: []const @import("../config/configured_provider.zig").Definition = &.{},
     /// Builds a configured provider's bundle; `configured_context` is passed through.
     configured_fn: ?*const fn (?*anyopaque, *const @import("../config/configured_provider.zig").Definition) Bundle = null,
@@ -69,6 +73,7 @@ pub const Set = struct {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .google => self.google,
             .configured => blk: {
                 const factory = self.configured_fn orelse break :blk .{};
                 const registry = @import("../config/configured_provider.zig").Registry{ .definitions = self.definitions };
@@ -84,6 +89,7 @@ pub fn gateway_only(gateway: Bundle) Set {
         .gateway = gateway,
         .codex = .{},
         .grok = .{},
+        .google = .{},
     };
 }
 
@@ -91,6 +97,7 @@ test "provider set selects each provider's complete route" {
     var gateway_tag: u8 = 0;
     var codex_tag: u8 = 0;
     var grok_tag: u8 = 0;
+    var google_tag: u8 = 0;
 
     const Fake = struct {
         fn cli_catalog(
@@ -153,7 +160,17 @@ test "provider set selects each provider's complete route" {
         .model_catalog = .{ .context = &grok_tag, .fetch_fn = Fake.model_catalog_fetch },
         .permission_reviewer = .{ .context = &grok_tag, .review_fn = Fake.review },
     };
-    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok };
+    const google = Bundle{
+        .presentation = provider_catalog.find(.google),
+        .agent_stream = stream_provider.Provider{
+            .context = &google_tag,
+            .stream_fn = stream_provider.unavailable_provider.stream_fn,
+        },
+        .cli_model_catalog = .{ .context = &google_tag, .fetch_fn = Fake.cli_catalog },
+        .model_catalog = .{ .context = &google_tag, .fetch_fn = Fake.model_catalog_fetch },
+        .permission_reviewer = .{ .context = &google_tag, .review_fn = Fake.review },
+    };
+    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok, .google = google };
 
     try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.gateway).capabilities.fx_search);
@@ -164,9 +181,17 @@ test "provider set selects each provider's complete route" {
     try std.testing.expect(providers.select(.gateway).cli_model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.codex).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
     try std.testing.expect(providers.select(.grok).permission_reviewer.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
+    try std.testing.expectEqualStrings("google", providers.select(.google).presentation.?.slug);
+    try std.testing.expect(providers.select(.google).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&google_tag)));
+    try std.testing.expect(providers.select(.google).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&google_tag)));
     try std.testing.expect(providers.select(.codex).agent_stream_or_unavailable().context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
 
     providers.codex.model_catalog = null;
     try std.testing.expect(providers.select(.codex).model_catalog == null);
     try std.testing.expect(providers.select(.gateway).model_catalog != null);
+
+    const only = gateway_only(gateway);
+    try std.testing.expect(only.select(.google).agent_stream == null);
+    try std.testing.expect(only.select(.google).model_catalog == null);
+    try std.testing.expect(only.select(.google).agent_stream_or_unavailable().stream_fn == stream_provider.unavailable_provider.stream_fn);
 }

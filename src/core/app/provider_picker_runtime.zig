@@ -88,20 +88,22 @@ pub fn Runtime(comptime App: type) type {
                     for (slugs[0..count], 0..) |slug, i| {
                         column.labels[i] = slug;
                         const id = provider_catalog.parse(slug) orelse .gateway;
-                        column.annotations[i] = if (id.eql(active_provider) and
-                            model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "";
+                        const is_current = id.eql(active_provider) and
+                            model_provider.authorizesCredential(id, app.auth.credentialSource());
+                        column.annotations[i] = providerAnnotation(id, is_current, app.auth.credentialSource());
                     }
                 },
                 .method => {
                     const pending = app.input_runtime.picker.provider_picker_pending_provider.items;
                     const provider = provider_catalog.parse(pending) orelse return 0;
                     const active_source = app.auth.credentialSource();
+                    const view = app.auth.pickerView();
                     const methods = provider_picker_catalog.providerMethods(provider);
                     for (methods, 0..) |method, i| {
                         column.labels[i] = provider_picker_catalog.methodSlug(method);
                         const in_use = provider.eql(active_provider) and
                             if (active_source) |source| provider_picker_catalog.methodMatchesSource(method, source) else false;
-                        column.annotations[i] = if (in_use) "current" else "";
+                        column.annotations[i] = methodAnnotation(provider, method, in_use, view);
                     }
                     count = methods.len;
                 },
@@ -164,6 +166,20 @@ pub fn Runtime(comptime App: type) type {
                 count,
             );
             return column.count;
+        }
+
+        pub fn selectedDetailLines(
+            app: *App,
+            query: picker_state.ProviderPickerQuery,
+            column: *const ColumnBuffer,
+            selected_index: usize,
+        ) []const []const u8 {
+            if (comptime !supported(App)) return &.{};
+            if (query.stage != .method or column.count == 0) return &.{};
+            const pending = app.input_runtime.picker.provider_picker_pending_provider.items;
+            const provider = provider_catalog.parse(pending) orelse return &.{};
+            const selected_label = column.labels[selected_index % column.count];
+            return app.auth.pickerView().methodDetailLines(provider, selected_label);
         }
 
         pub fn hasQuery(app: *App) bool {
@@ -297,7 +313,22 @@ pub fn Runtime(comptime App: type) type {
                     const provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
+                    if (method == .plan) {
+                        const view = app.auth.pickerView();
+                        if (view.available_sources.contains(.google_subscription)) {
+                            if (try commitGooglePlanSource(app, agents.screenAgentOf(app))) return true;
+                        }
+                        app.input_runtime.picker.clearProviderPickerFlow();
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                        try app_auth_runtime.Runtime(App).beginGoogleSignInForProviderPicker(app, agents.screenAgentOf(app));
+                        app.shell.render_requests.request(.footer);
+                        return true;
+                    }
                     if (method == .api_key) {
+                        if (provider == .google) {
+                            try openKeyStageForProvider(app, query.prefix, .api_key, .google);
+                            return true;
+                        }
                         // With detected keys the next column asks which to use
                         // (or `new` to paste one); with none there is nothing
                         // to ask, so the paste field opens directly.
@@ -348,10 +379,30 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Opens `/provider google api-key` directly on the masked key field.
+        pub fn openGoogleApiKeyPrompt(app: *App) !void {
+            if (comptime !supported(App)) return;
+            const provider_slug = provider_catalog.find(.google).slug;
+            const method_slug = provider_picker_catalog.methodSlug(.api_key);
+            try setComposerText(app, "{s}{s} {s} ", .{ picker_state.provider_prefix, provider_slug, method_slug });
+            try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, provider_slug, method_slug, .api_key);
+            app.auth.openGoogleApiKeyPickerInline(app.alloc);
+            app.shell.render_requests.request(.footer);
+        }
+
         /// Opens one of the api-key stages under the `api-key` argument: the
         /// which-key list, or the masked entry field (whose bytes the auth
         /// runtime owns; the composer only carries the breadcrumb).
         fn openKeyStage(app: *App, prefix: []const u8, stage: ProviderPickerStage) !void {
+            try openKeyStageForProvider(app, prefix, stage, .gateway);
+        }
+
+        fn openKeyStageForProvider(
+            app: *App,
+            prefix: []const u8,
+            stage: ProviderPickerStage,
+            target: auth_runtime.ApiKeyTarget,
+        ) !void {
             const provider_slug = try app.alloc.dupe(u8, app.input_runtime.picker.provider_picker_pending_provider.items);
             defer app.alloc.free(provider_slug);
             const method_slug = provider_picker_catalog.methodSlug(.api_key);
@@ -360,7 +411,12 @@ pub fn Runtime(comptime App: type) type {
 
             try setComposerText(app, "{s}{s} {s} ", .{ stable_prefix, provider_slug, method_slug });
             try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, provider_slug, method_slug, stage);
-            if (stage == .api_key) app.auth.openApiKeyPickerInline(app.alloc);
+            if (stage == .api_key) {
+                switch (target) {
+                    .gateway => app.auth.openApiKeyPickerInline(app.alloc),
+                    .google => app.auth.openGoogleApiKeyPickerInline(app.alloc),
+                }
+            }
             app.shell.render_requests.request(.footer);
         }
 
@@ -512,6 +568,22 @@ pub fn Runtime(comptime App: type) type {
             return .vercel_oidc_token;
         }
 
+        fn commitGooglePlanSource(app: *App, agent: *AppAgent) !bool {
+            app.input_runtime.picker.clearProviderPickerFlow();
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            const auth_rt = app_auth_runtime.Runtime(App);
+            const switched = auth_rt.applySourceChoice(app, agent, .google_subscription) catch |err| switch (err) {
+                error.GoogleSignInRequired => return false,
+                else => return err,
+            };
+            if (!switched) return false;
+            if (!provider_runtime.providerOf(app, agent).eql(.google)) {
+                try auth_rt.applyPickerChoice(app, agent, .{ .provider = .google });
+            }
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         /// Switching to a detected credential is a complete leaf: apply the
         /// source, then the provider it authenticates.
         fn commitSource(app: *App, agent: *AppAgent, source: credentials.Source, provider: model_provider.ProviderId) !void {
@@ -626,6 +698,37 @@ pub fn Runtime(comptime App: type) type {
     };
 }
 
+fn providerAnnotation(
+    id: model_provider.ProviderId,
+    is_current: bool,
+    active_source: ?credentials.Source,
+) []const u8 {
+    if (id == .google) {
+        if (!is_current) return "Google (AI Pro or Ultra plan, or Gemini API key)";
+        return if (active_source == .google_subscription)
+            "Google AI Pro or Ultra plan · current"
+        else
+            "Gemini API key · current";
+    }
+    return if (is_current) "current" else "";
+}
+
+fn methodAnnotation(
+    provider: model_provider.ProviderId,
+    method: provider_picker_catalog.Method,
+    in_use: bool,
+    view: auth_runtime.PickerView,
+) []const u8 {
+    if (provider == .google) {
+        return switch (method) {
+            .plan => if (in_use) view.googlePlanCurrentLabel() else view.googlePlanLabel(),
+            .api_key => if (in_use) "Gemini API key · current" else "Gemini API key",
+            .oauth => "",
+        };
+    }
+    return if (in_use) "current" else "";
+}
+
 fn exactLabel(raw_query: []const u8, column: *const ColumnBuffer) ?[]const u8 {
     const query = std.mem.trim(u8, raw_query, " \t");
     if (query.len == 0) return null;
@@ -673,6 +776,8 @@ const ColumnTestApp = struct {
         save_in_flight: bool = false,
         inventory_refresh_active: bool = false,
         available: auth_runtime.SourceSet = .empty,
+        google_plan_label: []const u8 = "",
+        google_plan_current_label: []const u8 = "",
 
         fn sourceInventoryRefreshActive(self: *const TestAuth) bool {
             return self.inventory_refresh_active;
@@ -689,6 +794,8 @@ const ColumnTestApp = struct {
                 .selected_choice = null,
                 .active_source = self.source,
                 .include_skip = false,
+                .google_plan_label = self.google_plan_label,
+                .google_plan_current_label = self.google_plan_current_label,
             };
         }
 
@@ -747,11 +854,15 @@ test "provider column lists every provider and marks the active one" {
     app.auth.source = .ai_gateway_api_key;
 
     const column = columnFor(&app, .provider, "");
-    try std.testing.expect(column.count >= 2);
+    try std.testing.expect(column.count >= 4);
     try std.testing.expectEqualStrings("vercel", column.labels[0]);
     try std.testing.expectEqualStrings("current", column.annotations[0]);
-    for (column.annotations[1..column.count]) |annotation| {
-        try std.testing.expectEqualStrings("", annotation);
+    for (column.labels[1..column.count], column.annotations[1..column.count]) |label, annotation| {
+        if (std.mem.eql(u8, label, "google")) {
+            try std.testing.expectEqualStrings("Google (AI Pro or Ultra plan, or Gemini API key)", annotation);
+        } else {
+            try std.testing.expectEqualStrings("", annotation);
+        }
     }
 }
 
@@ -762,11 +873,63 @@ test "provider column requires matching authentication for a current annotation"
         app.auth.source = source;
         const column = columnFor(&app, .provider, "");
         for (column.annotations[0..column.count]) |annotation| {
-            try std.testing.expectEqualStrings("", annotation);
+            try std.testing.expect(std.mem.find(u8, annotation, "current") == null);
         }
     }
     app.auth.source = .host_managed;
     try std.testing.expectEqualStrings("current", columnFor(&app, .provider, "").annotations[0]);
+}
+
+test "google provider and method columns show approved labels and active state" {
+    const alloc = std.testing.allocator;
+    var app = ColumnTestApp.init(alloc);
+    defer app.deinit();
+
+    const inactive = columnFor(&app, .provider, "goo");
+    try std.testing.expectEqual(@as(usize, 1), inactive.count);
+    try std.testing.expectEqualStrings("google", inactive.labels[0]);
+    try std.testing.expectEqualStrings("Google (AI Pro or Ultra plan, or Gemini API key)", inactive.annotations[0]);
+
+    try app.input_runtime.picker.beginProviderPickerFlow(alloc, "google", "", .method);
+    const methods_inactive = columnFor(&app, .method, "");
+    try std.testing.expectEqual(@as(usize, 2), methods_inactive.count);
+    try std.testing.expectEqualStrings("plan", methods_inactive.labels[0]);
+    try std.testing.expectEqualStrings("Sign in with Google (AI Pro or Ultra)", methods_inactive.annotations[0]);
+    try std.testing.expectEqualStrings("api-key", methods_inactive.labels[1]);
+    try std.testing.expectEqualStrings("Gemini API key", methods_inactive.annotations[1]);
+
+    app.auth.available = auth_runtime.SourceSet.initOne(.google_subscription);
+    app.auth.google_plan_label = "Google AI Pro or Ultra plan · dev@example.com";
+    app.auth.google_plan_current_label = "Google AI Pro or Ultra plan · dev@example.com · current";
+    try app.provider_selection.replaceSelection(.google, "gemini-4-hydrogen");
+    app.auth.source = .google_subscription;
+    const plan_active = columnFor(&app, .provider, "goo");
+    try std.testing.expectEqualStrings("Google AI Pro or Ultra plan · current", plan_active.annotations[0]);
+
+    const methods_plan_active = columnFor(&app, .method, "");
+    try std.testing.expectEqualStrings("Google AI Pro or Ultra plan · dev@example.com · current", methods_plan_active.annotations[0]);
+    try std.testing.expectEqualStrings("Gemini API key", methods_plan_active.annotations[1]);
+
+    app.auth.source = .gemini_api_key;
+    const active = columnFor(&app, .provider, "goo");
+    try std.testing.expectEqualStrings("Gemini API key · current", active.annotations[0]);
+
+    const methods_active = columnFor(&app, .method, "");
+    try std.testing.expectEqualStrings("Google AI Pro or Ultra plan · dev@example.com", methods_active.annotations[0]);
+    try std.testing.expectEqualStrings("Gemini API key · current", methods_active.annotations[1]);
+
+    const method_query = picker_state.ProviderPickerQuery{
+        .stage = .method,
+        .prefix = "/provider google ",
+        .query = "",
+        .token_start = 0,
+    };
+    const plan_details = Runtime(ColumnTestApp).selectedDetailLines(&app, method_query, &methods_active, 0);
+    try std.testing.expectEqual(@as(usize, 3), plan_details.len);
+    try std.testing.expectEqualStrings("Sign out on this device: /logout google", plan_details[0]);
+    try std.testing.expectEqualStrings("Disconnect Google Account: /logout google --disconnect", plan_details[1]);
+    try std.testing.expectEqualStrings("Manage access: https://myaccount.google.com/connections", plan_details[2]);
+    try std.testing.expectEqual(@as(usize, 0), Runtime(ColumnTestApp).selectedDetailLines(&app, method_query, &methods_active, 1).len);
 }
 
 test "provider column narrows to what was typed" {
