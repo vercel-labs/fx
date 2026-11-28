@@ -122,8 +122,8 @@
   },
   {
     "description": "A logout leaves the login that waits for its check request going: the answer saves and reports it",
-    "old": "            /\\ phase' = Ended(live[cur])\n            /\\ live' = [live EXCEPT ![cur] = 0]\n            /\\ indicator' = FALSE\n       ELSE UNCHANGED <<gone, phase, live, indicator>>",
-    "new": "            /\\ phase' = phase\n            /\\ live' = live\n            /\\ indicator' = indicator\n       ELSE UNCHANGED <<gone, phase, live, indicator>>",
+    "old": "            /\\ phase' = Ended(live[cur])\n            /\\ live' = [live EXCEPT ![cur] = 0]\n            /\\ indicator' = FALSE\n            /\\ logged' = logged \\cup {live[cur]}\n       ELSE UNCHANGED <<gone, phase, live, indicator, logged>>",
+    "new": "            /\\ phase' = phase\n            /\\ live' = live\n            /\\ indicator' = indicator\n            /\\ logged' = logged\n       ELSE UNCHANGED <<gone, phase, live, indicator, logged>>",
     "invariant": "LoggedOutNeverSaved"
   },
   {
@@ -149,5 +149,53 @@
     "old": "          /\\ saved' = IF ~refused THEN saved \\cup {k} ELSE saved\n",
     "new": "          /\\ saved' = saved \\cup {k}\n",
     "invariant": "RefusedNeverSaved"
+  },
+  {
+    "description": "A callback whose state isn't the live flow's ends the sign-in with no event",
+    "old": "               /\\ logged' = logged \\cup {k}\n               /\\ UNCHANGED badRedeem",
+    "new": "               /\\ UNCHANGED <<badRedeem, logged>>",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A token endpoint that refuses the code ends the sign-in with no event",
+    "old": "                  /\\ logged' = IF ok THEN logged ELSE logged \\cup {k}\n",
+    "new": "                  /\\ logged' = logged\n",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A refused check request ends the sign-in with no event",
+    "old": "          /\\ logged' = IF a \\in Refusals THEN logged \\cup {k} ELSE logged\n",
+    "new": "          /\\ logged' = logged\n",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "The 45 second deadline refuses a login with no event",
+    "old": "          /\\ logged' = IF refused THEN logged \\cup {k} ELSE logged\n",
+    "new": "          /\\ logged' = logged\n",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A logout that cuts off a login waiting for its check leaves no event",
+    "old": "            /\\ logged' = logged \\cup {live[cur]}\n       ELSE UNCHANGED <<gone, phase, live, indicator, logged>>",
+    "new": "            /\\ logged' = logged\n       ELSE UNCHANGED <<gone, phase, live, indicator, logged>>",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A browser that never comes back ends the sign-in at its deadline with no event",
+    "old": "          /\\ logged' = logged \\cup {k}\n    /\\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone>>\n\n\\* A host's end",
+    "new": "    /\\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, saved, ck, next, badRedeem, foreignTaken, unread, swapped, gone, logged>>\n\n\\* A host's end",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A host's end closes its sign-ins and leaves no event",
+    "old": "LoggedGone(h) == logged \\cup {k \\in Logins : hostOf[k] = h /\\ Pending(k)}",
+    "new": "LoggedGone(h) == logged",
+    "invariant": "FailureLeavesEvent"
+  },
+  {
+    "description": "A reload that drops the server ends its sign-in with no event",
+    "old": "            /\\ logged' = logged \\cup {live[cur]}\n       ELSE UNCHANGED <<phase, live, indicator, unread, swapped, gone, logged>>",
+    "new": "            /\\ logged' = logged\n       ELSE UNCHANGED <<phase, live, indicator, unread, swapped, gone, logged>>",
+    "invariant": "FailureLeavesEvent"
   }
 ]

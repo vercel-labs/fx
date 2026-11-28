@@ -22,6 +22,7 @@ const config = @import("config.zig");
 const credentials = @import("credentials.zig");
 const kept_sign_outs = @import("kept_sign_outs.zig");
 const login_words = @import("login_words.zig");
+const sign_in_events = @import("sign_in_events.zig");
 const loopback = @import("login.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
@@ -1298,7 +1299,7 @@ pub const Runtime = struct {
                 if (r.confirmingLogin(i)) {
                     debug_trace.logf("mcp", "MCP login dropped server={s} reason=signed out while it waited for the server", .{s.name});
                     r.endLogin(i);
-                    r.notify(.{ .sign_in_failed = .{ .server = s.name, .reason = "signed out before the server answered" } });
+                    r.signInEnded(.{ .sign_in_failed = .{ .server = s.name, .reason = "signed out before the server answered" } }, .{ .host = .signed_out });
                 }
                 r.flags[i] = .{};
                 // A program that exits next would lose a revocation still on
@@ -1417,7 +1418,7 @@ pub const Runtime = struct {
                 try r.saveCredential(i);
                 r.flags[i] = .{ .signed_in = true };
                 r.endLogin(i);
-                r.notify(if (how == .accepted) .{ .signed_in = name } else .{ .signed_in_unchecked = name });
+                r.signInEnded(if (how == .accepted) .{ .signed_in = name } else .{ .signed_in_unchecked = name }, .none);
             },
             .refused => |reason| {
                 debug_trace.logf("mcp", "MCP new login dropped server={s} reason=server refused the new login status=401 error={s}", .{ name, logCode(reason.code) });
@@ -1431,7 +1432,7 @@ pub const Runtime = struct {
                 // Nothing was saved, so there is nothing to say beyond the sign-in's failure.
                 r.flags[i] = .{ .needs_login = true, .refused_new_ms = r.nowMs() };
                 r.endLogin(i);
-                r.notify(.{ .sign_in_failed = .{ .server = name, .reason = text } });
+                r.signInEnded(.{ .sign_in_failed = .{ .server = name, .reason = text } }, .{ .login = reason.kind });
                 r.endToolWaiters(i, .needs_login);
             },
         }
@@ -1526,7 +1527,7 @@ pub const Runtime = struct {
                 continue;
             }
             r.engine.cancelSignIn(name) catch {};
-            r.notify(.{ .sign_in_failed = .{ .server = name, .reason = "the browser didn't come back within 5 minutes" } });
+            r.signInEnded(.{ .sign_in_failed = .{ .server = name, .reason = "the browser didn't come back within 5 minutes" } }, .{ .host = .browser_timeout });
             r.endLogin(l.server);
         }
     }
@@ -1725,6 +1726,7 @@ pub const Runtime = struct {
                         // Why the server refused is kept for when the store reads: the status
                         // says the store can't be read until then.
                         r.flags[i].login.set(reasonOf(required));
+                        sign_in_events.record(name, .needs_login, .{ .host = .store_unreadable });
                         debug_trace.logf("mcp", "MCP login not asked for server={s} reason=saved logins not read err={s}", .{ name, @errorName(err) });
                         return r.endToolWaiters(i, .failed);
                     }
@@ -1742,7 +1744,7 @@ pub const Runtime = struct {
                 } else {
                     debug_trace.logf("mcp", "MCP login needed server={s} reason={s}", .{ name, if (required.step_up) "more scopes" else "sign-in required" });
                 }
-                r.notify(.{ .needs_login = name });
+                r.signInEnded(.{ .needs_login = name }, .{ .login = reason.kind });
                 // Nothing comes until someone logs in.
                 r.endToolWaiters(i, .needs_login);
             },
@@ -1765,7 +1767,7 @@ pub const Runtime = struct {
                 const l = r.loginFor(i) orelse {
                     try r.saveCredential(i);
                     r.flags[i] = .{ .signed_in = true };
-                    return r.notify(.{ .signed_in = name });
+                    return r.signInEnded(.{ .signed_in = name }, .none);
                 };
                 l.confirming = true;
                 l.deadline_ms = r.nowMs() + confirm_wait_ms;
@@ -1781,7 +1783,7 @@ pub const Runtime = struct {
                 var buffer: [512]u8 = undefined;
                 const reason = signInFailure(&buffer, f.why, f.message);
                 r.endLogin(i);
-                r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
+                r.signInEnded(.{ .sign_in_failed = .{ .server = name, .reason = reason } }, .{ .failure = f.why });
             },
             .tools_stale => _ = r.tools_epochs[i].fetchAdd(1, .release),
             // A new login's tokens are saved once the server has taken them
@@ -2068,7 +2070,7 @@ pub const Runtime = struct {
                 if (r.flags[i].not_saved) return;
                 r.flags[i].not_saved = true;
                 var buf: [320]u8 = undefined;
-                r.notify(.{ .not_saved = .{ .server = s.name, .reason = r.ensureCredentialStore().writeFailure(&buf, err) } });
+                r.signInEnded(.{ .not_saved = .{ .server = s.name, .reason = r.ensureCredentialStore().writeFailure(&buf, err) } }, .{ .host = .store_write_failed });
             }
         } else {
             // The tokens are gone, so this process is signed out whatever
@@ -2266,7 +2268,7 @@ pub const Runtime = struct {
                 std.mem.print(&buf, "the MCP config changed before the browser came back; run /mcp login {s} again", .{name}) catch "the MCP config changed before the browser came back"
             else
                 "the MCP config changed before the browser came back";
-            r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
+            r.signInEnded(.{ .sign_in_failed = .{ .server = name, .reason = reason } }, .{ .host = .config_changed });
             r.endLogin(i);
         }
         var k: usize = 0;
@@ -2372,7 +2374,7 @@ pub const Runtime = struct {
             var buf: [320]u8 = undefined;
             const reason = std.mem.print(&buf, "the MCP config changed before the browser came back; run /mcp login {s} again", .{name}) catch
                 "the MCP config changed before the browser came back; sign in again";
-            r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
+            r.signInEnded(.{ .sign_in_failed = .{ .server = name, .reason = reason } }, .{ .host = .config_changed });
             r.endLogin(server);
         }
         // A shared call still waiting ends as cancelled: the owner is told,
@@ -2562,6 +2564,13 @@ pub const Runtime = struct {
 
     fn notify(r: *Runtime, notice: Notice) void {
         if (r.options.notify) |n| n.notice(n.context, notice);
+    }
+
+    /// A sign-in's end: kept for `/trace` first (`sign_in_events`), so what the shell then
+    /// says is already in the report.
+    fn signInEnded(r: *Runtime, notice: Notice, reason: sign_in_events.Reason) void {
+        if (signInEvent(notice)) |event| sign_in_events.record(event.server, event.kind, reason);
+        r.notify(notice);
     }
 
     fn serverIndex(r: *const Runtime, name: []const u8) ?usize {
@@ -2835,7 +2844,7 @@ pub const Runtime = struct {
             return true;
         }
         debug_trace.logf("mcp", "MCP login saved by another fx taken server={s}", .{s.name});
-        r.notify(.{ .signed_in = s.name });
+        r.signInEnded(.{ .signed_in = s.name }, .none);
         return true;
     }
 
@@ -3061,6 +3070,18 @@ fn declaredCapabilities(questions: elicitation.Capabilities) []const u8 {
     return "{}";
 }
 
+/// The event a notice leaves for `/trace`. The address a login opens at is no end.
+fn signInEvent(notice: Notice) ?struct { server: []const u8, kind: sign_in_events.Kind } {
+    return switch (notice) {
+        .authorize => null,
+        .signed_in => |server| .{ .server = server, .kind = .signed_in },
+        .signed_in_unchecked => |server| .{ .server = server, .kind = .signed_in_unchecked },
+        .sign_in_failed => |failed| .{ .server = failed.server, .kind = .sign_in_failed },
+        .needs_login => |server| .{ .server = server, .kind = .needs_login },
+        .not_saved => |saved| .{ .server = saved.server, .kind = .not_saved },
+    };
+}
+
 /// Why a sign-in failed, in words, with the authorization server's own when
 /// it gave some.
 fn signInFailure(buffer: []u8, why: mcp.auth.client.Failure, message: ?[]const u8) []const u8 {
@@ -3094,6 +3115,38 @@ test "a saved login taken back counts as the one from before a refusal only for 
     try std.testing.expect(!refusalRecent(5_000, 5_000 + refusal_pickup_ms + 1));
     // Hours later, a login another fx saved is a new login.
     try std.testing.expect(!refusalRecent(5_000, 5_000 + 3 * 60 * 60 * 1000));
+}
+
+test "every notice but the address to sign in at leaves an event of its own kind for the server it names" {
+    const pairs = [_]struct { Notice, sign_in_events.Kind }{
+        .{ .{ .signed_in = "a" }, .signed_in },
+        .{ .{ .signed_in_unchecked = "a" }, .signed_in_unchecked },
+        .{ .{ .sign_in_failed = .{ .server = "a", .reason = "it said no" } }, .sign_in_failed },
+        .{ .{ .needs_login = "a" }, .needs_login },
+        .{ .{ .not_saved = .{ .server = "a", .reason = "disk full" } }, .not_saved },
+    };
+    for (pairs) |pair| {
+        const event = signInEvent(pair[0]).?;
+        try std.testing.expectEqualStrings("a", event.server);
+        try std.testing.expectEqual(pair[1], event.kind);
+    }
+    try std.testing.expect(signInEvent(.{ .authorize = .{ .server = "a", .url = "https://as.example/authorize" } }) == null);
+}
+
+test "a notice's words never reach the event it leaves" {
+    sign_in_events.reset();
+    defer sign_in_events.reset();
+    var runtime: Runtime = undefined;
+    runtime.options = .{ .client_version = "test", .credentials = .{ .detect = "" } };
+    const hostile = "token=sk-live-0123456789abcdef \x1b[31m";
+    runtime.signInEnded(.{ .sign_in_failed = .{ .server = "fixture", .reason = hostile } }, .{ .failure = .redemption });
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const snap = try sign_in_events.snapshot(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), snap.events.len);
+    try std.testing.expectEqualStrings("fixture", snap.events[0].server());
+    try std.testing.expectEqualStrings("redemption", snap.events[0].reason.name());
+    try std.testing.expect(std.mem.find(u8, std.mem.asBytes(&snap.events[0]), "sk-live") == null);
 }
 
 test "a failed sign-in says why in words, with the server's own" {

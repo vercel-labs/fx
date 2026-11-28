@@ -215,6 +215,12 @@ function startAuthFixture(
     refreshAnswer?: { status: number; body: unknown };
     challengeScope?: string;
     rejectCodeExchange?: boolean;
+    /** The token endpoint answers a code with this, in place of tokens. */
+    codeExchangeAnswer?: { status: number; body: unknown };
+    /** The authorization server publishes no metadata, so a sign-in can't find where to go. */
+    omitAuthorizationMetadata?: boolean;
+    /** With `registration`, the registration endpoint refuses every client. */
+    refuseRegistration?: boolean;
     resourceAtOrigin?: boolean;
     /** Answer revocations this late. */
     revokeDelayMs?: number;
@@ -370,6 +376,7 @@ function startAuthFixture(
         });
       }
       if (url.pathname === "/.well-known/oauth-authorization-server") {
+        if (options.omitAuthorizationMetadata) return new Response("not found", { status: 404 });
         if (options.discoveryDelayMs) await Bun.sleep(options.discoveryDelayMs);
         const metadata = {
           issuer: origin,
@@ -484,6 +491,7 @@ function startAuthFixture(
           expect(form.get("client_secret")).toBeNull();
         }
         if (options.rejectCodeExchange) return Response.json({ error: "invalid_grant" }, { status: 400 });
+        if (options.codeExchangeAnswer) return Response.json(options.codeExchangeAnswer.body, { status: options.codeExchangeAnswer.status });
         expect(form.get("grant_type")).toBe("authorization_code");
         expect(form.get("code")).toBe("fixture-code");
         const verifier = form.get("code_verifier") ?? "";
@@ -510,6 +518,7 @@ function startAuthFixture(
       }
       if (url.pathname === "/register" && options.registration && request.method === "POST") {
         registrations += 1;
+        if (options.refuseRegistration) return Response.json({ error: "invalid_client_metadata" }, { status: 400 });
         const asked = JSON.parse(body) as { redirect_uris?: string[] };
         return Response.json({ client_id: "fx-mcp-auth-test", token_endpoint_auth_method: "none", redirect_uris: asked.redirect_uris ?? [] }, { status: 201 });
       }
@@ -1742,6 +1751,190 @@ describe("MCP login", () => {
     expect(report.text).not.toContain(ACCESS_INITIAL);
     expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
   }, 90_000);
+
+  // ---- /trace says how every sign-in ended, with FX_TRACE off ----
+  //
+  // The engine writes its sign-in trace only when tracing is on, and `/trace` used to say only
+  // "needs login" for most failures. The host keeps the end of each sign-in in a small ring
+  // (`src/core/mcp_host/sign_in_events.zig`), whether or not tracing is on, and the report lists
+  // it and names the newest reason in the server's problem. A reason is a fixed word: no text a
+  // server sent goes in.
+  const HOSTILE = "token=sk-live-0123456789abcdef";
+
+  /** A TUI with the debug trace off, driven by `drive`, then the `/trace` report it writes: the report is all there is to read. */
+  const traceOfSignIn = async (root: ReturnType<typeof createRoot>, drive: (session: TmuxSession) => Promise<void>): Promise<TraceReport> => {
+    const traceDir = join(root.home, "tmp");
+    mkdirSync(traceDir, { recursive: true });
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: {
+        ...v2Env(root), TMPDIR: traceDir, FX_TRACE_LOG: undefined, FX_TRACE_SCOPES: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      },
+    });
+    await tui.waitForComposer(15_000);
+    await drive(tui);
+    const before = new Set(traceReportNames(traceDir));
+    await tui.sendText("/trace");
+    const report = await waitForNewTraceReport(traceDir, before);
+    expect(report.one("current_state").fx_trace).toBe(false);
+    expect(report.all("trace_log")).toEqual([]);
+    return report;
+  };
+  const signInEvents = (report: TraceReport) => report.all("mcp_sign_in_event").map(({ server, kind, reason }) => ({ server, kind, reason }));
+  const problemOf = (report: TraceReport) => report.problems("mcp_server").find((p) => p.name === "fixture");
+  /** The login the shell starts by itself ends needing one; `/mcp login` then fails, and the report says why. */
+  const failedLogin = async (session: TmuxSession, notice: string) => {
+    await session.waitForText("fixture needs login · /mcp", 15_000);
+    await session.sendText("/mcp login fixture");
+    await session.waitForText(notice, 20_000);
+    await session.waitForComposer(10_000);
+  };
+  /** What the report says of a sign-in that ended in `reason`: its newest event, and the problem's reason. */
+  const expectEndedIn = (report: TraceReport, last: { kind: string; reason: string }, problemReason: string | undefined) => {
+    const events = signInEvents(report);
+    expect(events.at(-1)).toEqual({ server: "fixture", ...last });
+    expect(report.one("mcp_sign_ins")).toMatchObject({ retained: events.length, dropped: 0, capacity: 32 });
+    const problem = problemOf(report);
+    expect(problem?.issue).toBe("needs_login");
+    expect(problem?.reason).toBe(problemReason);
+  };
+
+  for (const [what, notice, reason, setup] of [
+    ["the server publishes no sign-in metadata", "Couldn't sign in to fixture: fx couldn't find how to sign in to it", "discovery",
+      () => ({ auth: { omitAuthorizationMetadata: true }, oauth: true })],
+    ["the server refuses to register fx", "Couldn't sign in to fixture: it didn't register fx as a client", "registration",
+      () => ({ auth: { registration: true, refuseRegistration: true }, oauth: false })],
+    ["the token endpoint refuses the code", "Couldn't sign in to fixture: it didn't accept the sign-in (invalid_grant)", "redemption",
+      () => ({ auth: { rejectCodeExchange: true }, oauth: true })],
+  ] as const) {
+    test.skipIf(!tmuxAvailable())(`/trace says why a sign-in failed with FX_TRACE off: ${what}`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      const chosen = setup();
+      auth = startAuthFixture(upstream.url, chosen.auth);
+      const root = createRoot(auth, chosen.oauth);
+      const report = await traceOfSignIn(root, (session) => failedLogin(session, notice));
+      expectEndedIn(report, { kind: "sign_in_failed", reason }, reason);
+      // What the person is told stays the words the shell says; the report adds no text of the server's.
+      expect(problemOf(report)?.error).toBeUndefined();
+    }, 90_000);
+  }
+
+  test.skipIf(!tmuxAvailable())("/trace says why a sign-in failed with FX_TRACE off: the browser comes back with an error", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const report = await traceOfSignIn(root, async (session) => {
+      await session.waitForText("fixture needs login · /mcp", 15_000);
+      await session.sendText("/mcp login fixture");
+      expect(await waitForFile(root.openLog, 20_000)).toBe(true);
+      // The user denies it at the authorization server, which sends the browser back with an error.
+      const approved = await fetch(readFileSync(root.openLog, "utf8").trim(), { redirect: "manual" });
+      const back = new URL(approved.headers.get("location")!);
+      back.searchParams.delete("code");
+      back.searchParams.set("error", "access_denied");
+      await fetch(back);
+      await session.waitForText("Couldn't sign in to fixture: the sign-in page returned an error", 20_000);
+      await session.waitForComposer(10_000);
+    });
+    expectEndedIn(report, { kind: "sign_in_failed", reason: "response" }, "response");
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/trace says why a sign-in failed with FX_TRACE off: the server refuses the new login", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refusal: REFUSAL, noRefreshToken: true });
+    auth.validTokens.clear();
+    const root = createRoot(auth);
+    const report = await traceOfSignIn(root, (session) => failedLogin(session, `Couldn't sign in to fixture: ${REFUSED_NEW}.`));
+    expectEndedIn(report, { kind: "sign_in_failed", reason: "login_refused" }, "login_refused");
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/trace says why a server needs a login with FX_TRACE off: the authorization server refuses the refresh", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { rejectRefresh: true });
+    const root = createRoot(auth);
+    seedV2Credential(root, auth, { expires_at_ms: 0 });
+    const report = await traceOfSignIn(root, (session) => session.waitForText("fixture needs login · /mcp", 20_000));
+    expectEndedIn(report, { kind: "needs_login", reason: "refresh_refused" }, "refresh_refused");
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/trace says why a server needs a login with FX_TRACE off: the server refuses the saved login", async () => {
+    const root = await refusedSavedLogin();
+    const report = await traceOfSignIn(root, (session) => session.waitForText("fixture refused the saved login · /mcp", 20_000));
+    expectEndedIn(report, { kind: "needs_login", reason: "login_refused" }, "login_refused");
+    // The words the server named are still in the problem's error, as before; the event holds only the fixed word.
+    expect(problemOf(report)?.error).toContain(REFUSED_SAVED);
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/trace says a sign-in ended because the person signed out while the server checked the new login", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const barrier = mkdtempSync(join(tmpdir(), "fx-mcp-check-barrier-"));
+    const started = join(barrier, "started");
+    const release = join(barrier, "release");
+    auth = startAuthFixture(upstream.url, {
+      rotateAuthorizationToken: true, noRefreshToken: true, checkBarrierStartedPath: started, checkBarrierReleasePath: release,
+    });
+    const root = createRoot(auth);
+    const report = await traceOfSignIn(root, async (session) => {
+      await session.sendText("/mcp login fixture");
+      expect(await waitForFile(started, 20_000)).toBe(true);
+      await session.sendText("/mcp logout fixture");
+      await session.waitForText("Couldn't sign in to fixture: signed out before the server answered.", 15_000);
+      writeFileSync(release, "go");
+      await session.waitForComposer(10_000);
+    });
+    const failed = signInEvents(report).filter((event) => event.kind === "sign_in_failed");
+    expect(failed).toEqual([{ server: "fixture", kind: "sign_in_failed", reason: "signed_out" }]);
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("/trace says a sign-in ended because a change to the MCP config removed its server", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const report = await traceOfSignIn(root, async (session) => {
+      await session.waitForText("fixture needs login · /mcp", 15_000);
+      await session.sendText("/mcp login fixture");
+      expect(await waitForFile(root.openLog, 20_000)).toBe(true);
+      await session.sendText("/mcp remove fixture");
+      await session.waitForText("Couldn't sign in to fixture: the MCP config changed before the browser came back", 20_000);
+      await session.waitForComposer(10_000);
+    });
+    const failed = signInEvents(report).filter((event) => event.kind === "sign_in_failed");
+    expect(failed).toEqual([{ server: "fixture", kind: "sign_in_failed", reason: "config_changed" }]);
+    // The server is gone, so it has no problem; the event is what is left to say how its sign-in ended.
+    expect(problemOf(report)).toBeUndefined();
+  }, 90_000);
+
+  // A server's own words never reach the events or the reason. The token endpoint's error and the
+  // 401's description are both fx's to show the person, terminal-safe and quoted; the report's
+  // events and the problem's reason are fixed words, so nothing a server sends can forge one.
+  test.skipIf(!tmuxAvailable())("/trace's sign-in events and reasons hold none of a server's words, whatever it sends", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, {
+      codeExchangeAnswer: { status: 400, body: { error: "invalid_grant", error_description: `${HOSTILE} \u001b[31mred\u0007 \u009b "quoted" \\ end` } },
+    });
+    const root = createRoot(auth);
+    const report = await traceOfSignIn(root, (session) => failedLogin(session, "Couldn't sign in to fixture:"));
+    expectEndedIn(report, { kind: "sign_in_failed", reason: "redemption" }, "redemption");
+    const lines = report.text.split("\n").filter((line) => /"type":"(mcp_sign_ins|mcp_sign_in_event)"/.test(line) || /"kind":"mcp_server"/.test(line));
+    expect(lines.length).toBeGreaterThan(2);
+    for (const line of lines) {
+      expect(line).not.toContain("sk-live");
+      expect(line).not.toContain("quoted");
+      expect(line).not.toContain("\\u001b");
+      expect(line).not.toContain("\\u0007");
+    }
+
+    // The same for the words a 401 carries, which the problem's error shows only masked.
+    const refused = await refusedSavedLogin({ error: "invalid_token", description: HOSTILE });
+    await tui!.kill();
+    tui = null;
+    const again = await traceOfSignIn(refused, (session) => session.waitForText("fixture refused the saved login · /mcp", 20_000));
+    for (const event of again.all("mcp_sign_in_event")) expect(JSON.stringify(event)).not.toContain("sk-live");
+    expect(problemOf(again)?.reason).toBe("login_refused");
+    expect(JSON.stringify(again.all("mcp_sign_ins"))).not.toContain("sk-live");
+  }, 150_000);
 
   // The shell reads the store of saved logins again for a server that needs a login
   // (before a status, a tool list, a call), and takes the login saved there. A new

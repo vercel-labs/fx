@@ -24,6 +24,8 @@ pub const Status = runtime_mod.Status;
 pub const signalServersForExit = runtime_mod.signalServersForExit;
 pub const waitRetired = runtime_mod.waitRetired;
 pub const menu = @import("menu.zig");
+/// How sign-ins ended in this process, for `/trace`.
+pub const sign_in_events = @import("sign_in_events.zig");
 
 pub const Extras = struct {
     /// The questions fx's UI on this surface can ask.

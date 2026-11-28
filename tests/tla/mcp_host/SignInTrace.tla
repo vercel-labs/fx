@@ -46,7 +46,8 @@ Viol ==
     (IF NeverTakeRefused THEN {} ELSE {"NeverTakeRefused"}) \cup
     (IF AnsweredKeptAndReported THEN {} ELSE {"AnsweredKeptAndReported"}) \cup
     (IF HeldNeverReplaced THEN {} ELSE {"HeldNeverReplaced"}) \cup
-    (IF LoggedOutNeverSaved THEN {} ELSE {"LoggedOutNeverSaved"})
+    (IF LoggedOutNeverSaved THEN {} ELSE {"LoggedOutNeverSaved"}) \cup
+    (IF FailureLeavesEvent THEN {} ELSE {"FailureLeavesEvent"})
 
 Probed(k, result) ==
     /\ IF result = "open" THEN phase[k] = "open" /\ alive[hostOf[k]] ELSE ~Open(k)

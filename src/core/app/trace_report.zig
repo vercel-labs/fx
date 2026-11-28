@@ -67,7 +67,9 @@
 //!   failures that later successful calls do not remove; `compaction` {`event`,
 //!   `turn_id`, `detail`}, for the newest 3 failures; `mcp_server` {`issue`
 //!   (`failed`, `retrying`, `missing_env`, `invalid_env`, or `needs_login`),
-//!   `name`, `variable`, `error` (masked)}; `model_catalog` {`event`,
+//!   `name`, `variable`, `error` (masked), `reason`, for `needs_login` only:
+//!   the newest reason in the `mcp_sign_in_event` records, left out when none
+//!   is kept}; `model_catalog` {`event`,
 //!   `detail`}, for the newest 3 failures.
 //! - `last_shutdown`: `status` (`recorded`, `none`, or `unreadable`),
 //!   `total_ms`, `recorded_at`, and `stages`, a list of {`name`, `step_ms`}.
@@ -266,6 +268,19 @@
 //!   unset), `tmux`, `cmux`, `mcp_servers`; then an `mcp_server` per server:
 //!   `name`, `state`, `transport`, `tools`, `signed_in`, `needs_login`,
 //!   `error` (masked).
+//! - `mcp_sign_ins`: `retained`, `dropped`, and `capacity`: how MCP sign-ins
+//!   ended in this process, kept in a bounded ring that drops the oldest event
+//!   and counts it. Then an `mcp_sign_in_event` per retained event, oldest
+//!   first: `at`, `sequence`, `server`, `kind` (`signed_in`,
+//!   `signed_in_unchecked`, `sign_in_failed`, `needs_login`, or `not_saved`),
+//!   and `reason`, a fixed word: `none`, why a login is needed (`no_login`,
+//!   `login_refused`, `refresh_refused`, `more_scopes`), why a sign-in ended
+//!   without a token (`discovery`, `registration`, `response`, `mismatch`,
+//!   `redemption`, `cancelled`, `refused`, `insecure_endpoint`,
+//!   `internal_endpoint`, or `metadata_not_json`), or what fx itself did
+//!   (`browser_timeout`, `signed_out`, `config_changed`, `store_unreadable`,
+//!   or `store_write_failed`). These are recorded even when `FX_TRACE` is
+//!   off, and hold no text a server sent.
 //! - `shell`: how fx starts the agent's shell commands in the user's own
 //!   environment, and what the user's startup files change in them.
 //!   `login_shell`, the configured login shell, left out when unknown;
@@ -603,6 +618,7 @@ fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     try writeSettings(r, app.workspace_root);
     try writeSkills(r, app);
     try writeRuntimeContext(r, app);
+    try writeMcpSignIns(r, app);
     try writeShell(r, shell_view, shell_resolver.configuredLoginShellInto(try arena.alloc(u8, std.Io.Dir.max_path_bytes)));
     // Prepared first: masking the transcript collects the secrets the visible rows need.
     const notebook = &app.shell.notebook;
@@ -1040,20 +1056,34 @@ fn writeMcpHostProblems(p: *Records, app: anytype) !void {
     if (comptime !@hasDecl(@TypeOf(app.*), "mcpHostStatuses")) return;
     const statuses = (try app.mcpHostStatuses(p.arena)) orelse return;
     for (statuses) |s| {
-        const issue = switch (s.state) {
-            .failed => "failed",
-            .retrying => "retrying",
-            .missing_env => "missing_env",
-            .invalid_env => "invalid_env",
-            else => if (s.needs_login) "needs_login" else continue,
+        const issue: McpIssue = switch (s.state) {
+            .failed => .failed,
+            .retrying => .retrying,
+            .missing_env => .missing_env,
+            .invalid_env => .invalid_env,
+            else => if (s.needs_login) .needs_login else continue,
         };
         try beginProblem(p, "mcp_server");
-        try p.text("issue", issue);
+        try p.text("issue", @tagName(issue));
         try p.text("name", s.name);
         if (s.missing) |variable| try p.text("variable", variable);
         if (s.last_error) |err| try p.masked("error", err);
+        if (issue == .needs_login) {
+            if (try signInReason(p.arena, app, s.name)) |reason| try p.text("reason", reason);
+        }
         try p.end();
     }
+}
+
+const McpIssue = enum { failed, retrying, missing_env, invalid_env, needs_login };
+
+/// Why `server` needs a login, as the newest sign-in event says it, or null
+/// when none is kept.
+fn signInReason(arena: std.mem.Allocator, app: anytype, server: []const u8) !?[]const u8 {
+    if (comptime !@hasDecl(@TypeOf(app.*), "mcpHostSignInEvents")) return null;
+    const snap = try app.mcpHostSignInEvents(arena);
+    const event = snap.latestWhy(server) orelse return null;
+    return event.reason.name();
 }
 
 /// Failed model-catalog loads, capability lookup misses, and image gate
@@ -2448,6 +2478,27 @@ fn writeRuntimeContext(r: *Records, app: anytype) !void {
         try r.boolean("signed_in", s.signed_in);
         try r.boolean("needs_login", s.needs_login);
         if (s.last_error) |err| try r.masked("error", err);
+        try r.end();
+    }
+}
+
+/// The `mcp_sign_ins` record and its events: how this process's MCP sign-ins
+/// ended, from a ring that is kept whether or not `FX_TRACE` is on.
+fn writeMcpSignIns(r: *Records, app: anytype) !void {
+    if (comptime !@hasDecl(@TypeOf(app.*), "mcpHostSignInEvents")) return;
+    const snap = try app.mcpHostSignInEvents(r.arena);
+    try r.begin("mcp_sign_ins");
+    try r.number("retained", snap.events.len);
+    try r.number("dropped", snap.dropped);
+    try r.number("capacity", snap.capacity);
+    try r.end();
+    for (snap.events) |*event| {
+        try r.begin("mcp_sign_in_event");
+        try r.time("at", event.at_ms);
+        try r.number("sequence", event.sequence);
+        try r.text("server", event.server());
+        try r.text("kind", @tagName(event.kind));
+        try r.text("reason", event.reason.name());
         try r.end();
     }
 }
@@ -6349,6 +6400,76 @@ test "trace permissions and MCP servers become records with errors masked" {
     var bare_trace = try bare.trace();
     defer bare_trace.deinit();
     try std.testing.expectEqual(@as(i64, 0), try testInt(try bare_trace.one("runtime_context"), "mcp_servers"));
+}
+
+test "trace lists how MCP sign-ins ended and names the newest reason for a server that needs a login" {
+    const sign_in_events = @import("../mcp_host/sign_in_events.zig");
+    const Status = struct {
+        name: []const u8,
+        state: enum { ready, failed, retrying, missing_env, invalid_env, idle },
+        needs_login: bool,
+        last_error: ?[]const u8 = null,
+        missing: ?[]const u8 = null,
+    };
+    const StubApp = struct {
+        statuses: []const Status,
+        events: sign_in_events.Snapshot,
+        pub fn mcpHostStatuses(self: *@This(), _: std.mem.Allocator) !?[]const Status {
+            return self.statuses;
+        }
+        pub fn mcpHostSignInEvents(self: *@This(), _: std.mem.Allocator) !sign_in_events.Snapshot {
+            return self.events;
+        }
+    };
+    var log: sign_in_events.Log = .{};
+    log.push("login", .needs_login, .{ .login = .login_refused }, 1_700_000_000_000);
+    log.push("bad\x1b[31m\nname", .sign_in_failed, .{ .failure = .registration }, 1_700_000_001_000);
+    log.push("login", .sign_in_failed, .{ .failure = .discovery }, 1_700_000_002_000);
+    log.push("ok", .signed_in, .none, 1_700_000_003_000);
+    var kept: [sign_in_events.capacity]sign_in_events.Event = undefined;
+    const count = log.snapshot(&kept);
+    var stub: StubApp = .{
+        .statuses = &.{
+            .{ .name = "ok", .state = .ready, .needs_login = false },
+            .{ .name = "login", .state = .idle, .needs_login = true },
+            .{ .name = "silent", .state = .idle, .needs_login = true },
+            .{ .name = "down", .state = .failed, .needs_login = false, .last_error = "it fell over" },
+        },
+        .events = .{ .events = kept[0..count], .dropped = 3 },
+    };
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeMcpSignIns(&w.records, &stub);
+    try writeMcpHostProblems(&w.records, &stub);
+    try std.testing.expect(std.mem.find(u8, w.out.written(), "\x1b") == null);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    const summary = try trace.one("mcp_sign_ins");
+    try std.testing.expectEqual(@as(i64, 4), try testInt(summary, "retained"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "dropped"));
+    try std.testing.expectEqual(@as(i64, sign_in_events.capacity), try testInt(summary, "capacity"));
+    try std.testing.expectEqual(@as(usize, 4), trace.count("mcp_sign_in_event"));
+    const first = try trace.nth("mcp_sign_in_event", 0);
+    try std.testing.expectEqualStrings("login", try testString(first, "server"));
+    try std.testing.expectEqualStrings("needs_login", try testString(first, "kind"));
+    try std.testing.expectEqualStrings("login_refused", try testString(first, "reason"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(first, "sequence"));
+    try std.testing.expectEqualStrings("2023-11-14T22:13:20.000Z", try testString(first, "at"));
+    try std.testing.expectEqualStrings("bad\x1b[31m\nname", try testString(try trace.nth("mcp_sign_in_event", 1), "server"));
+    try std.testing.expectEqualStrings("registration", try testString(try trace.nth("mcp_sign_in_event", 1), "reason"));
+    try std.testing.expectEqualStrings("none", try testString(try trace.nth("mcp_sign_in_event", 3), "reason"));
+
+    try std.testing.expectEqual(@as(usize, 3), trace.count("problem"));
+    const login = try trace.nth("problem", 0);
+    try std.testing.expectEqualStrings("login", try testString(login, "name"));
+    try std.testing.expectEqualStrings("discovery", try testString(login, "reason"));
+    const silent = try trace.nth("problem", 1);
+    try std.testing.expectEqualStrings("silent", try testString(silent, "name"));
+    try expectAbsent(silent, "reason");
+    const down = try trace.nth("problem", 2);
+    try std.testing.expectEqualStrings("failed", try testString(down, "issue"));
+    try expectAbsent(down, "reason");
 }
 
 fn testAutoReview(outcome: diagnostics.AutoReviewOutcome, call_id: []const u8, action: []const u8, rationale: []const u8) diagnostics.AutoReview {

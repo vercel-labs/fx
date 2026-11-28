@@ -2113,6 +2113,11 @@ const App = struct {
         return self.mcp.hostStatusesNow(alloc);
     }
 
+    /// How this process's MCP sign-ins ended, for `/trace`.
+    pub fn mcpHostSignInEvents(_: *App, alloc: Allocator) Allocator.Error!mcp_host.sign_in_events.Snapshot {
+        return mcp_host.sign_in_events.snapshot(alloc);
+    }
+
     pub fn refreshMcpHostStatus(self: *App) void {
         if (self.mcp.refreshHostStatus(io_mod.milliTimestamp())) RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
     }
