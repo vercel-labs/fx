@@ -350,7 +350,7 @@ test.skipIf(!tmuxAvailable())("/effort on GPT-6 keeps the session's first effort
   await session.sendText("/effort low");
   await session.waitForText(`Reasoning effort set to low for ${gpt6}`, 5_000);
   await session.sendText("first question");
-  await session.waitForPane((pane) => pane.includes("ANSWER") && turnSettled(pane), 10_000);
+  await session.waitForReplyAndTurnEnd("ANSWER", 10_000);
   await session.waitForComposer(10_000);
 
   await session.sendText("/effort high");
