@@ -483,6 +483,7 @@ jobs:
               cat /tmp/npm-view.err >&2
               # npm prints --json errors on several lines; an annotation keeps only its first line.
               one_line=$({ jq -c . <<<"$output" 2>/dev/null || printf '%s' "$output"; } | tr '\n' ' ')
+              one_line=${one_line% }
               echo "::error::npm view ${name}@${LIBFX_VERSION} failed with exit ${status} and code '${code}': ${one_line}"
               exit 1
             done

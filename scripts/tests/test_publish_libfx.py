@@ -188,6 +188,7 @@ class WaitForPublishedPackagesTests(unittest.TestCase):
         self.assertEqual(len(annotation), 1, result.stdout)
         self.assertIn('"code":"E401"', annotation[0])
         self.assertIn('"summary":"E401 for @libfx/libfx-darwin-arm64@1.2.3"', annotation[0])
+        self.assertFalse(annotation[0].endswith(" "), repr(annotation[0]))
 
     def test_fails_before_asking_npm_when_the_version_is_empty(self) -> None:
         self.env["LIBFX_VERSION"] = ""
