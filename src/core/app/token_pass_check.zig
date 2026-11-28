@@ -101,10 +101,6 @@ pub fn answerOf(snapshot: output_contracts.CreditsSnapshot) ?token_pass.Answer {
     return null;
 }
 
-/// How often a prompt's wait looks at its cancel flag. The lookup wakes the
-/// wait itself when it finishes.
-const cancel_check_ms: i64 = 10;
-
 /// For `fx ask` and ACP: the answer saved for the team, refreshed by a
 /// credits check that runs while the session works. Without a saved answer,
 /// what depends on it waits for the check with `awaitAnswer`, as the first
@@ -154,10 +150,14 @@ pub const Check = struct {
     }
 
     /// Waits while fx knows nothing of the team (`requestWaitMs`), or until
-    /// `cancel` is set. The lookup wakes the wait when it finishes.
+    /// `cancel` is set. The lookup wakes the wait when it finishes, and
+    /// `wakeWaiter` once `cancel` is set.
     pub fn awaitAnswer(self: *Check, alloc: Allocator, cancel: ?*const std.atomic.Value(bool)) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
+        // Read before each look at the answer and the cancel flag, so a
+        // wake after the look ends the wait that follows it.
+        var seen = self.lookup.wakeCount();
         var wait_ms = self.takeAnswerLocked(alloc);
         if (wait_ms == 0) return;
         debug_trace.logf("token_pass", "check wait started", .{});
@@ -166,29 +166,39 @@ pub const Check = struct {
                 debug_trace.logf("token_pass", "check wait stopped reason=cancelled", .{});
                 return;
             };
-            const slice_ms = if (cancel != null) @min(wait_ms, cancel_check_ms) else wait_ms;
-            self.awaitFinishUnlocked(slice_ms) catch |err| switch (err) {
+            self.awaitFinishUnlocked(seen, wait_ms) catch |err| switch (err) {
                 error.Canceled => {
                     debug_trace.logf("token_pass", "check wait stopped reason=cancelled", .{});
                     return;
                 },
             };
+            seen = self.lookup.wakeCount();
             wait_ms = self.takeAnswerLocked(alloc);
         }
         if (self.lookup.task != null) debug_trace.logf("token_pass", "check wait ended without an answer wait_ms={d}", .{first_prompt_wait_ms});
     }
 
+    /// Ends a wait in `awaitAnswer` at once, so it looks at its cancel flag
+    /// again. Call it after setting that flag.
+    pub fn wakeWaiter(self: *Check) void {
+        // The lock keeps the lookup's task, which the wait sleeps on, from
+        // being taken and freed meanwhile.
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.lookup.wake();
+    }
+
     /// Waits up to `wait_ms` for the lookup without the lock, so another
-    /// thread takes the answer meanwhile. The lookup's task, whose event
-    /// this waits on, stays until the wait ends (`waiters`).
-    fn awaitFinishUnlocked(self: *Check, wait_ms: i64) std.Io.Cancelable!void {
+    /// thread takes the answer meanwhile. The lookup's task, whose wake
+    /// count this waits on, stays until the wait ends (`waiters`).
+    fn awaitFinishUnlocked(self: *Check, seen: u32, wait_ms: i64) std.Io.Cancelable!void {
         self.waiters += 1;
         self.mutex.unlock(io_mod.getIo());
         defer {
             self.mutex.lockUncancelable(io_mod.getIo());
             self.waiters -= 1;
         }
-        try self.lookup.awaitFinish(wait_ms);
+        try self.lookup.awaitFinish(seen, wait_ms);
     }
 
     fn takeAnswerLocked(self: *Check, alloc: Allocator) i64 {

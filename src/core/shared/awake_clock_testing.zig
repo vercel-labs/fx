@@ -1,8 +1,8 @@
 //! An awake clock for tests: from `install` until `deinit`, `io.getIo()`
 //! reads an awake clock that starts at zero, and a sleep or a timed futex
 //! wait on it moves it on at once, so a test reads how long the code would
-//! have waited without waiting. `deliverAt` releases a held reply at a set
-//! time inside such a wait. One at a time. `stuck_lookup_testing.zig` swaps
+//! have waited without waiting. `deliverAt` releases a held reply, and
+//! `releaseAt` a test thread, at a set time inside such a wait. One at a time. `stuck_lookup_testing.zig` swaps
 //! the Io the same way to hang DNS lookups on the real clock.
 const std = @import("std");
 const io_mod = @import("io.zig");
@@ -14,11 +14,12 @@ pub const FakeAwakeClock = struct {
     var base: std.Io = undefined;
     var awake_ns: std.atomic.Value(i64) = .init(0);
     var delivery: ?Delivery = null;
-    /// The event of the last delivery, and the wakes the code sent it.
+    /// The word the wait a delivery fell in sleeps on, and the wakes the
+    /// code sent it.
     var watched: std.atomic.Value(usize) = .init(0);
     var wakes: std.atomic.Value(u32) = .init(0);
 
-    const Delivery = struct { at_ms: i64, release: *std.atomic.Value(bool), done: *std.Io.Event };
+    const Delivery = struct { at_ms: i64, release: *std.atomic.Value(bool), done: ?*std.Io.Event };
 
     /// How long a wait that a delivery reached waits, for real, for the
     /// work to finish or to wake it. Past it, the wake counts as lost.
@@ -51,15 +52,20 @@ pub const FakeAwakeClock = struct {
     /// `done` once it ends.
     pub fn deliverAt(at_ms: i64, release: *std.atomic.Value(bool), done: *std.Io.Event) void {
         delivery = .{ .at_ms = at_ms, .release = release, .done = done };
-        watched.store(@intFromPtr(done), .seq_cst);
     }
 
-    /// The delivery due by `end_ns`, released, or null.
-    fn releaseDue(end_ns: i64) ?Delivery {
+    /// Sets `release` when the clock reaches `at_ms`, for a test thread that
+    /// then acts, such as one that cancels. A timed wait the time falls in
+    /// ends then only if the code wakes it.
+    pub fn releaseAt(at_ms: i64, release: *std.atomic.Value(bool)) void {
+        delivery = .{ .at_ms = at_ms, .release = release, .done = null };
+    }
+
+    /// The delivery due by `end_ns`, taken but not released yet, or null.
+    fn takeDue(end_ns: i64) ?Delivery {
         const due = delivery orelse return null;
         if (due.at_ms * std.time.ns_per_ms > end_ns) return null;
         delivery = null;
-        due.release.store(true, .seq_cst);
         return due;
     }
 
@@ -82,10 +88,13 @@ pub const FakeAwakeClock = struct {
             .none, .deadline => return error.Canceled,
         };
         const end_ns = awake_ns.load(.seq_cst) + ns;
-        if (releaseDue(end_ns)) |due| {
-            const give_up_ms = realMs() + real_wake_limit_ms;
-            // A failed yield only spins once more.
-            while (!due.done.isSet() and realMs() < give_up_ms) std.Thread.yield() catch {};
+        if (takeDue(end_ns)) |due| {
+            due.release.store(true, .seq_cst);
+            if (due.done) |done| {
+                const give_up_ms = realMs() + real_wake_limit_ms;
+                // A failed yield only spins once more.
+                while (!done.isSet() and realMs() < give_up_ms) std.Thread.yield() catch {};
+            }
         }
         awake_ns.store(end_ns, .seq_cst);
     }
@@ -103,8 +112,12 @@ pub const FakeAwakeClock = struct {
         };
         if (@atomicLoad(u32, ptr, .acquire) != expected) return;
         const end_ns = awake_ns.load(.seq_cst) + ns;
-        const wakes_before = wakes.load(.seq_cst);
-        if (releaseDue(end_ns)) |due| {
+        if (takeDue(end_ns)) |due| {
+            // The word this wait sleeps on, watched before the release, so
+            // the wake the release leads to counts.
+            watched.store(@intFromPtr(ptr), .seq_cst);
+            const wakes_before = wakes.load(.seq_cst);
+            due.release.store(true, .seq_cst);
             awake_ns.store(due.at_ms * std.time.ns_per_ms, .seq_cst);
             const give_up_ms = realMs() + real_wake_limit_ms;
             // A failed yield only spins once more.

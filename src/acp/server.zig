@@ -1238,11 +1238,16 @@ pub fn runWithTransport(
         };
         if (state.terminate_connection) break;
     }
+    endOfInput(&state);
+}
+
+/// The reader's last step, once the client's input ends.
+fn endOfInput(state: *ServerState) void {
     // Close outbound admission before cancelling existing waiters so a prompt
     // entering `beginOutboundRequest` after the sweep cannot block forever
     // (`tests/tla/acp_eof/AcpEof.tla` NoWaitAfterEof).
-    closeOutboundOnEof(&state);
-    handleCancel(&state, false);
+    closeOutboundOnEof(state);
+    handleCancel(state, false);
 }
 
 fn shouldRespondToMessage(msg: *const jsonrpc.Message) bool {
@@ -3350,6 +3355,50 @@ const TokenPassFixture = struct {
     fn lookupDone(self: *TokenPassFixture) *std.Io.Event {
         return &self.check().lookup.task.?.done;
     }
+
+    /// How many threads sleep on the lookup.
+    fn lookupSleepers(self: *TokenPassFixture) *std.atomic.Value(u32) {
+        return &self.check().lookup.task.?.sleepers;
+    }
+
+    /// Gives the server an active session, as a prompt has, with its cancel
+    /// flags clear.
+    fn openSession(self: *TokenPassFixture) *ActiveSessionState {
+        self.state.cfg.minimal_kernel = false;
+        var active: ActiveSessionState = undefined;
+        active.cancel_flag = .init(false);
+        active.turn_cancel = .init(false);
+        self.state.active_session = active;
+        return &self.state.active_session.?;
+    }
+};
+
+/// The reader's side of a prompt's Token Pass wait: once the fake clock
+/// reaches the time `FakeAwakeClock.releaseAt` set inside the wait, it reads
+/// `session/cancel` or the end of the client's input on its own thread, as
+/// the reader does.
+const ReaderDuringWait = struct {
+    state: *ServerState,
+    input: enum { session_cancel, end_of_input },
+    due: std.atomic.Value(bool) = .init(false),
+
+    /// How long, in real time, the reader waits for the release before it
+    /// gives up, for a wait that never reaches the release time.
+    const give_up_ms: i64 = 10_000;
+
+    fn run(self: *ReaderDuringWait) void {
+        // The real clock, which the fake awake clock leaves alone.
+        const deadline_ms = io_mod.milliTimestamp() + give_up_ms;
+        while (!self.due.load(.seq_cst)) {
+            if (io_mod.milliTimestamp() > deadline_ms) return;
+            // A failed yield only spins once more.
+            std.Thread.yield() catch {};
+        }
+        switch (self.input) {
+            .session_cancel => handleCancel(self.state, true),
+            .end_of_input => endOfInput(self.state),
+        }
+    }
 };
 
 test "ACP initialize starts the Token Pass check without waiting for its answer" {
@@ -3469,6 +3518,46 @@ test "ACP prompt's Token Pass wait ends at once when the prompt is cancelled" {
     try std.testing.expectEqual(token_pass_check.first_prompt_wait_ms, FakeAwakeClock.elapsedMs());
 }
 
+test "ACP prompt's Token Pass wait ends as soon as session/cancel arrives, not when it next looks at its cancel flag" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: TokenPassFixture = undefined;
+    try fixture.init(std.testing.allocator, .fake);
+    defer fixture.deinit();
+    const state = &fixture.state;
+    startTokenPassCheck(state, state.alloc, .compiled_default);
+    const session = fixture.openSession();
+
+    // The client cancels 3 ms into the prompt's wait.
+    var reader: ReaderDuringWait = .{ .state = state, .input = .session_cancel };
+    FakeAwakeClock.releaseAt(3, &reader.due);
+    const thread = try std.Thread.spawn(.{}, ReaderDuringWait.run, .{&reader});
+    awaitTokenPassForPrompt(state, &session.cancel_flag);
+    thread.join();
+
+    try std.testing.expectEqual(@as(i64, 3), FakeAwakeClock.elapsedMs());
+    try std.testing.expect(fixture.check().lookup.task != null);
+}
+
+test "ACP prompt's Token Pass wait ends as soon as the client's input ends, not when it next looks at its cancel flag" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: TokenPassFixture = undefined;
+    try fixture.init(std.testing.allocator, .fake);
+    defer fixture.deinit();
+    const state = &fixture.state;
+    startTokenPassCheck(state, state.alloc, .compiled_default);
+    const session = fixture.openSession();
+
+    // The client closes its input 3 ms into the prompt's wait.
+    var reader: ReaderDuringWait = .{ .state = state, .input = .end_of_input };
+    FakeAwakeClock.releaseAt(3, &reader.due);
+    const thread = try std.Thread.spawn(.{}, ReaderDuringWait.run, .{&reader});
+    awaitTokenPassForPrompt(state, &session.cancel_flag);
+    thread.join();
+
+    try std.testing.expectEqual(@as(i64, 3), FakeAwakeClock.elapsedMs());
+    try std.testing.expect(fixture.check().lookup.task != null);
+}
+
 test "ACP's reader moves new sessions to the Token Pass default when a prompt's thread took the answer" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: TokenPassFixture = undefined;
@@ -3558,7 +3647,7 @@ test "ACP session/new wakes on the Token Pass answer with the real clock" {
     const state = &fixture.state;
     startTokenPassCheck(state, state.alloc, .compiled_default);
 
-    const releaser = try std.Thread.spawn(.{}, HeldCredits.releaseOnceWaiting, .{ &fixture.credits, fixture.lookupDone(), 2 * token_pass_check.first_prompt_wait_ms });
+    const releaser = try std.Thread.spawn(.{}, HeldCredits.releaseOnceWaiting, .{ &fixture.credits, fixture.lookupSleepers(), 2 * token_pass_check.first_prompt_wait_ms });
     const started_ms = io_mod.awakeMilliTimestamp();
     awaitTokenPassForNewSession(state);
     const waited_ms = io_mod.awakeMilliTimestamp() - started_ms;
@@ -4260,6 +4349,8 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
         session.cancel_flag.store(true, .seq_cst);
         // A prompt waiting for its subagents' reports stops waiting.
         state.worker.nudgeWaiter();
+        // So does a prompt waiting for the Token Pass answer.
+        if (state.token_pass_run) |*check| check.wakeWaiter();
         // A libfx turn keeps its queued steering until it ends, which hands
         // back what never reached the model.
         if (state.cfg.minimal_kernel) session.steering.cancelForUser(&session.cancel_flag);

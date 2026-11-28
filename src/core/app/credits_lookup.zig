@@ -75,18 +75,34 @@ pub const Lookup = struct {
         return result;
     }
 
-    /// Waits at most `wait_ms` for the running lookup to finish, and returns
-    /// at once when none runs. A wait can end early, so the caller checks
-    /// the lookup and the time again.
-    pub fn awaitFinish(self: *Lookup, wait_ms: i64) std.Io.Cancelable!void {
+    /// The running lookup's wake count, or 0 when none runs. A waiter reads
+    /// it before it looks at what it waits for and passes it to
+    /// `awaitFinish`, so a finish or a `wake` after that look still ends
+    /// the wait.
+    pub fn wakeCount(self: *const Lookup) u32 {
+        const task = self.task orelse return 0;
+        return task.wake_count.load(.acquire);
+    }
+
+    /// Waits at most `wait_ms` for the running lookup to finish or for a
+    /// `wake`, and returns at once when either came since `seen` was read
+    /// or when none runs. A wait can end early, so the caller checks the
+    /// lookup and the time again.
+    pub fn awaitFinish(self: *Lookup, seen: u32, wait_ms: i64) std.Io.Cancelable!void {
         const task = self.task orelse return;
-        task.done.waitTimeout(io_mod.getIo(), .{ .duration = .{
+        _ = task.sleepers.fetchAdd(1, .monotonic);
+        defer _ = task.sleepers.fetchSub(1, .monotonic);
+        try io_mod.getIo().futexWaitTimeout(u32, &task.wake_count.raw, seen, .{ .duration = .{
             .raw = .fromMilliseconds(wait_ms),
             .clock = .awake,
-        } }) catch |err| switch (err) {
-            error.Timeout => {},
-            error.Canceled => return error.Canceled,
-        };
+        } });
+    }
+
+    /// Ends every `awaitFinish` on the running lookup at once, so its caller
+    /// looks again, such as at a cancel flag it set before this call.
+    pub fn wake(self: *Lookup) void {
+        const task = self.task orelse return;
+        task.wakeWaiters();
     }
 
     /// `deinit` for process exit, which never waits. A lookup still running,
@@ -122,8 +138,14 @@ const Task = struct {
     renewal: ?Renewal,
     renewal_account_id: ?[]u8,
     cancel: std.atomic.Value(bool) = .init(false),
-    /// Set once `result` is final; a waiter wakes on it (`Lookup.awaitFinish`).
+    /// Set once `result` is final.
     done: std.Io.Event = .unset,
+    /// Changes when the task finishes and on each `Lookup.wake`; a waiter
+    /// sleeps on it (`Lookup.awaitFinish`).
+    wake_count: std.atomic.Value(u32) = .init(0),
+    /// How many threads sleep in `Lookup.awaitFinish`; a test acts once one
+    /// does.
+    sleepers: std.atomic.Value(u32) = .init(0),
     result: Result = .{ .snapshot = .{} },
     future: std.Io.Future(void) = undefined,
 
@@ -173,7 +195,7 @@ const Task = struct {
                 else
                     renewal_failed_message;
                 self.result.snapshot = .{ .err_message = alloc.dupe(u8, message) catch null };
-                self.done.set(io_mod.getIo());
+                self.finished();
                 return;
             };
             if (renewed) |value| {
@@ -188,7 +210,17 @@ const Task = struct {
             .tenant = tenant,
             .cancel_flag = &self.cancel,
         });
+        self.finished();
+    }
+
+    fn finished(self: *Task) void {
         self.done.set(io_mod.getIo());
+        self.wakeWaiters();
+    }
+
+    fn wakeWaiters(self: *Task) void {
+        _ = self.wake_count.fetchAdd(1, .release);
+        io_mod.getIo().futexWake(u32, &self.wake_count.raw, std.math.maxInt(u32));
     }
 
     /// Awaits the task, frees it, and returns its result.
@@ -261,13 +293,14 @@ test "credits lookup wakes a waiter when it finishes, and a wait with none runni
     defer lookup.deinit();
 
     var started_ms = io_mod.awakeMilliTimestamp();
-    try lookup.awaitFinish(wait_ms);
+    try lookup.awaitFinish(lookup.wakeCount(), wait_ms);
     try std.testing.expect(io_mod.awakeMilliTimestamp() - started_ms < @divTrunc(wait_ms, 2));
 
     _ = try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0);
-    const releaser = try std.Thread.spawn(.{}, HeldCredits.releaseOnceWaiting, .{ &fake, &lookup.task.?.done, 2 * wait_ms });
+    const seen = lookup.wakeCount();
+    const releaser = try std.Thread.spawn(.{}, HeldCredits.releaseOnceWaiting, .{ &fake, &lookup.task.?.sleepers, 2 * wait_ms });
     started_ms = io_mod.awakeMilliTimestamp();
-    try lookup.awaitFinish(wait_ms);
+    try lookup.awaitFinish(seen, wait_ms);
     const waited_ms = io_mod.awakeMilliTimestamp() - started_ms;
     releaser.join();
 

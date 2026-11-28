@@ -22,12 +22,13 @@ pub const HeldCredits = struct {
         self.released.store(true, .seq_cst);
     }
 
-    /// Releases the reply once a waiter parks on `done`, the lookup's
-    /// event, or after `give_up_ms` when none does. For a thread of its own.
-    pub fn releaseOnceWaiting(self: *HeldCredits, done: *const std.Io.Event, give_up_ms: i64) void {
+    /// Releases the reply once a waiter sleeps on the lookup (`sleepers`,
+    /// its task's count), or after `give_up_ms` when none does. For a thread
+    /// of its own.
+    pub fn releaseOnceWaiting(self: *HeldCredits, sleepers: *const std.atomic.Value(u32), give_up_ms: i64) void {
         const deadline_ms = io_mod.awakeMilliTimestamp() + give_up_ms;
         // A failed yield only spins once more.
-        while (@atomicLoad(std.Io.Event, done, .acquire) != .waiting and io_mod.awakeMilliTimestamp() < deadline_ms) std.Thread.yield() catch {};
+        while (sleepers.load(.acquire) == 0 and io_mod.awakeMilliTimestamp() < deadline_ms) std.Thread.yield() catch {};
         self.release();
     }
 
