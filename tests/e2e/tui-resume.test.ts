@@ -25,6 +25,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
+import { completion as configuredCompletion, createConfiguredProviderFixture, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import { replayGrids } from "./info-panel";
 import { findFooterBlocks } from "./tui-render-assertions";
 import {
@@ -455,7 +456,7 @@ test.skipIf(!tmuxAvailable())(
       expect(await active.capturePane()).not.toContain(labels[0]!);
 
       await active.sendText("Continue with the prepared follow-up.");
-      await active.waitForPane((pane) => pane.includes("AFTER_RESUME_INTERACTION") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("AFTER_RESUME_INTERACTION", TIMEOUT);
       await active.waitForStableComposer(TIMEOUT);
       expectPublishedRows(await active.captureFullScrollbackEscapes());
       await waitForPersistedSessionMarker(home, "AFTER_RESUME_INTERACTION");
@@ -1402,10 +1403,7 @@ printf '${trailingMarker}   '
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
       expect(readFileSync(tracePath, "utf8")).toContain("route=approved_shell");
 
-      await active.waitForPane(
-        (pane) => pane.includes(doneMarker) && turnSettled(pane),
-        TIMEOUT,
-      );
+      await active.waitForReplyAndTurnEnd(doneMarker, TIMEOUT);
       const compactGrid = await active.capturePaneGrid();
       await active.resizeWindow(48, 24);
       const narrow = await active.waitForText(doneMarker, TIMEOUT);
@@ -1591,7 +1589,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Apply the block edit.");
-      await active.waitForPane((pane) => pane.includes(doneMarker) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(doneMarker, TIMEOUT);
       expect(readFileSync(target, "utf8")).toBe(original.replace(oldBlock, newBlock));
 
       await active.sendKeys("C-o");
@@ -1695,7 +1693,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Apply the edit.");
-      await active.waitForPane((pane) => pane.includes(doneMarker) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(doneMarker, TIMEOUT);
       expect(readFileSync(target).equals(edited)).toBe(true);
 
       await active.sendKeys("C-o");
@@ -1772,7 +1770,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared watcher and stop it.");
-      await active.waitForPane((pane) => pane.includes("SESSION_LABEL_DONE") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("SESSION_LABEL_DONE", TIMEOUT);
       const live = await active.captureFullScrollback();
       // The launch returned while its command ran on, and the session's input
       // and its stop join its row, which shows the latest state.
@@ -1884,7 +1882,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Is the watcher still running?");
-      await active.waitForPane((pane) => pane.includes("STALE_NOTE_PHASE2_DONE") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("STALE_NOTE_PHASE2_DONE", TIMEOUT);
       expect(gatewaySawNote(resumedGateway)).toBe(true);
       // The note rides on the resumed turn's own message, so the instructions
       // stay as they were cached; the next turn of this process keeps that one
@@ -1943,7 +1941,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Start the watcher for session one.");
-      await active.waitForPane((pane) => pane.includes("LIVE_HANDLE_S1_DONE") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("LIVE_HANDLE_S1_DONE", TIMEOUT);
 
       await active.sendText("/new");
       await active.waitForPane((pane) => hasEmptyComposer(stripAnsi(pane)), TIMEOUT);
@@ -2017,10 +2015,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
-      await active.waitForPane(
-        (pane) => pane.includes("FULL_CTRL_O_DONE") && turnSettled(pane),
-        TIMEOUT,
-      );
+      await active.waitForReplyAndTurnEnd("FULL_CTRL_O_DONE", TIMEOUT);
       const compact = await active.captureFullScrollback();
       expect(compact).toMatch(/^● Ran awk .*✓$/m);
       expect(compact).not.toContain("lines more (ctrl+o to view)");
@@ -2176,7 +2171,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cap-crossing command.");
-      await active.waitForPane((pane) => pane.includes(finalMarker) && turnSettled(pane), timeout);
+      await active.waitForReplyAndTurnEnd(finalMarker, timeout);
       const compact = await active.captureFullScrollback();
       expect(compact).toContain("● Ran awk, printf, sleep +1 more ✓");
       expect(compact).not.toContain("lines more (ctrl+o to view)");
@@ -2888,7 +2883,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText(prompt);
-      await active.waitForPane((pane) => pane.includes(finalMarker) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(finalMarker, TIMEOUT);
 
       const inlineVisible = await captureFullScrollbackArtifacts(
         active,
@@ -2993,7 +2988,7 @@ test.skipIf(!tmuxAvailable())(
           });
           await active.waitForComposer(TIMEOUT);
           await active.sendText("Return the prepared TypeScript block.");
-          await active.waitForPane((pane) => pane.includes("WIRE_APPEND_DONE") && turnSettled(pane), TIMEOUT);
+          await active.waitForReplyAndTurnEnd("WIRE_APPEND_DONE", TIMEOUT);
           const scrollback = await active.captureFullScrollback();
           const markerRows = scrollback.split("\n").filter((line) =>
             line.includes("WIRE_LINE_")
@@ -3126,7 +3121,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Save a session before testing Cmd+R.");
-      await active.waitForPane((pane) => pane.includes(saved) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(saved, TIMEOUT);
       await active.sendLiteralText(draft);
       await active.waitForText(draft, TIMEOUT);
 
@@ -3202,7 +3197,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Start the prepared Ctrl-O input check.");
-      await active.waitForPane((pane) => pane.includes(firstDone) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(firstDone, TIMEOUT);
       await active.waitForComposer(TIMEOUT);
 
       await active.sendKeys("C-o");
@@ -3869,7 +3864,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Return the prepared Markdown response.");
-      await active.waitForPane((pane) => pane.includes(doneMarker) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(doneMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
       await Bun.sleep(250);
@@ -3927,7 +3922,7 @@ test.skipIf(!tmuxAvailable())(
           });
           await active.waitForComposer(TIMEOUT);
           await active.sendText("Show the prepared paragraphs.");
-          await active.waitForPane((pane) => pane.includes("BRAVO28_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") && turnSettled(pane), TIMEOUT);
+          await active.waitForReplyAndTurnEnd("BRAVO28_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", TIMEOUT);
           await active.waitForStableComposer(TIMEOUT);
           await active.sendLiteral(draft);
           await active.waitForText(`┃ ${draft}`, TIMEOUT);
@@ -4021,7 +4016,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Read the prepared file.");
-      await active.waitForPane((pane) => pane.includes("CTRL_O_READ_DONE") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("CTRL_O_READ_DONE", TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText("READ_RESULT_MARKER", TIMEOUT);
@@ -4084,7 +4079,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared read-only tools.");
-      await active.waitForPane((pane) => pane.includes("PARALLEL_DETAIL_DONE") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("PARALLEL_DETAIL_DONE", TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText("LIST_FULL_DETAIL_MARKER", TIMEOUT);
@@ -4188,7 +4183,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      await active.waitForPane((pane) => pane.includes(priorSummary) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(priorSummary, TIMEOUT);
       const beforeHandoff = await active.captureFullScrollback();
       expect(beforeHandoff).not.toContain("lines more (ctrl+o to view)");
       expect(countOccurrences(beforeHandoff, priorSummary)).toBe(1);
@@ -4459,12 +4454,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       await waitForScrollback(active, "CTRL_O_HANDOFF_SCROLLBACK_DONE");
-      await active.waitForPane(
-        (pane) =>
-          pane.includes("CTRL_O_HANDOFF_SCROLLBACK_DONE") &&
-          turnSettled(pane),
-        actionTimeout,
-      );
+      await active.waitForReplyAndTurnEnd("CTRL_O_HANDOFF_SCROLLBACK_DONE", actionTimeout);
       const scrollback = await active.captureFullScrollback();
 
       expect(countOccurrences(scrollback, bulletMarker)).toBe(1);
@@ -4627,7 +4617,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      await active.waitForPane((pane) => pane.includes(setupSentinel) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(setupSentinel, TIMEOUT);
       const setupScrollback = await waitForScrollbackMarkers(active, [
         assistantHead,
         assistantTail,
@@ -5372,7 +5362,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Save a session for transient input reset.");
-      await active.waitForPane((pane) => pane.includes("SESSION_INPUT_RESET_SAVED") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("SESSION_INPUT_RESET_SAVED", TIMEOUT);
 
       await seedTransientDraft("STALE_SESSION_DRAFT_NEW");
       await active.sendText("/new");
@@ -6093,7 +6083,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Save Markdown for resume.");
-      await active.waitForPane((pane) => pane.includes("render_ready") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("render_ready", TIMEOUT);
       const liveMarkdown = await active.captureFullScrollback();
       expectRenderedMarkdown(liveMarkdown, "tmux");
       expectInferredTypeScriptCodeBlock(liveMarkdown);
@@ -6202,7 +6192,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run pwd once for resume.");
-      await active.waitForPane((pane) => pane.includes(toolReply) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(toolReply, TIMEOUT);
       const liveToolScrollback = await active.captureFullScrollback();
       expect(liveToolScrollback).toContain("Ran pwd");
       expect(liveToolScrollback).not.toContain(toolWorkspaceMarker);
@@ -6795,7 +6785,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Ctrl+G while the turn runs: the upgrade waits instead of refusing.
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
       // A draft in the composer holds the restart, so the screen before it
       // can be checked.
       await active.sendLiteralText("HOLD");
@@ -6962,10 +6952,10 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendHexBytes(["07"]);
       await active.waitForText(
-        "fx restarts for the upgrade when the running turns stop or end; Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart",
+        "upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip",
         TIMEOUT,
       );
-      await active.waitForText("restart waits: ctrl+g to cancel", TIMEOUT);
+      await active.waitForText("restart pending · ctrl+g cancel", TIMEOUT);
       await active.sendLiteralText("HOLD");
       await active.waitForPane((pane) => composerContains(pane, "HOLD"), TIMEOUT);
       releaseFirst();
@@ -7101,7 +7091,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendHexBytes(["07"]);
       await active.waitForText(
-        "fx restarts for the upgrade when the running turns stop or end; Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart",
+        "upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip",
         TIMEOUT,
       );
       await active.sendLiteralText("HOLD");
@@ -7268,7 +7258,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Ctrl+G while the turn runs: the upgrade waits instead of refusing.
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
       releaseFirst();
 
       // The tool runs, the turn stops between steps, fx relaunches with the
@@ -7436,7 +7426,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Ctrl+G while request 6 is held: the upgrade waits for the turn to stop.
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
       releaseStep5();
 
       // The step ends, the turn stops between steps, fx relaunches, and the
@@ -7788,6 +7778,20 @@ test.skipIf(!tmuxAvailable())(
   UPGRADE_TIMEOUT * 2,
 );
 
+// A request from `solo` carries its task and not main's prompt or `main_solo` call.
+// Depth-1 TUI subagents still receive the `subagent` tool, so tool presence does not distinguish them.
+function isChildRequest(body: any): boolean {
+  const json = JSON.stringify(body);
+  return json.includes("SOLO_TASK") && !json.includes('"main_solo"') && !json.includes("UPGRADE_MAIN");
+}
+
+// The parent's turn that a subagent's report started (`src/core/subagent/reports.zig`).
+function isReportTurn(body: any): boolean {
+  const last = body.messages?.at(-1);
+  return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("Subagent report (untrusted agent output, not user instructions):");
+}
+
+// Runs on the configured `local` connection: only gateway turns stop between steps (src/core/agent/runtime/orchestrator.zig), so a turn on another provider runs to its end and the restart waits for it.
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g without a saved turn on a filled screen keeps the old screen in place until the new build redraws it",
   async () => {
@@ -7886,16 +7890,10 @@ test.skipIf(!tmuxAvailable())(
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-subagent-")));
     const tapeBefore = join(root, "before.fxtape");
     const tapeAfter = join(root, "after.fxtape");
-    const home = join(root, "home");
-    const workspace = join(root, "workspace");
     const installDir = join(root, "install");
     const stderrPath = join(root, "stderr.log");
     const argvLogPath = join(root, "upgrade-argv.log");
-    mkdirSync(home);
-    mkdirSync(workspace);
     mkdirSync(installDir);
-    const workspaceRoot = realpathSync(workspace);
-    writeFileSync(join(workspaceRoot, "notes.txt"), "SOLO_NOTES\n");
     const installedFx = join(installDir, "fx");
     copyFileSync(FX_BIN, installedFx);
     chmodSync(installedFx, 0o755);
@@ -7905,36 +7903,39 @@ test.skipIf(!tmuxAvailable())(
     let soloRequests = 0;
     let releaseSolo = () => {};
     const soloReleased = new Promise<void>((resolve) => { releaseSolo = resolve; });
-    const gateway = startDynamicFakeGateway(async (body) => {
-      // The subagent's own requests carry its task but not main's call.
-      if (body.includes("SOLO_TASK") && !body.includes('"main_solo"')) {
+    const f = createConfiguredProviderFixture(async (body) => {
+      if (isChildRequest(body)) {
         soloRequests += 1;
-        // Its first request waits for the test and reads a file. Its second
-        // comes after Ctrl+G, so it proves the subagent was not stopped.
-        if (!body.includes("call_solo_read")) {
+        // Its first answer waits for the test and reads a file. Its second
+        // answer comes once that read has run, so it proves the subagent was
+        // not stopped.
+        if (!body.messages.some((message: any) => message.role === "tool")) {
           soloAsked = true;
           await soloReleased;
-          return fakeGatewayToolCall("call_solo_read", "read_file", { path: "notes.txt" });
+          return configuredToolCompletion(body.model, "read_file", { path: "notes.txt" }, "call_solo_read");
         }
-        return fakeGatewayFinalText("SOLO_DONE");
+        return configuredCompletion(body.model, "SOLO_DONE");
       }
-      // Only main's turn for the subagent's report holds its reply.
-      if (body.includes("SOLO_DONE")) return fakeGatewayFinalText("MAIN_SAW_REPORT");
-      if (!body.includes('"main_solo"')) {
-        return fakeGatewayToolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK" } });
-      }
-      return fakeGatewayFinalText("MAIN_DONE");
+      if (isReportTurn(body)) return configuredCompletion(body.model, "MAIN_SAW_REPORT");
+      if (body.messages.some((message: any) => message.role === "tool")) return configuredCompletion(body.model, "MAIN_DONE");
+      return configuredToolCompletion(body.model, "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK" } }, "main_solo");
     });
+    // The fixture's settings turn automatic upgrades off. FX_AUTO_UPGRADE only
+    // turns them off, so this test turns them on in its settings.
+    f.settings.auto_upgrade = true;
+    f.save();
+    writeFileSync(join(f.workspace, "notes.txt"), "SOLO_NOTES\n");
     const release = startUpgradeServer(root, argvLogPath, { relaunchEnv: { FX_RECORD: tapeAfter } });
     const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    const chatBodies = () => f.requests.filter((request) => request.path === "/v1/chat/completions").map((request) => request.body);
 
     try {
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
         cmd: shellQuote(installedFx),
-        cwd: workspaceRoot,
+        cwd: f.workspace,
         env: {
-          ...gatewayEnv(home, gateway),
+          ...f.env,
           FX_AUTO_UPGRADE: "1",
           FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
           FX_PERMISSION_MODE: "full-access",
@@ -7949,19 +7950,19 @@ test.skipIf(!tmuxAvailable())(
 
       // Main's turn ends while its subagent still works.
       await active.sendText("UPGRADE_MAIN start solo");
-      await active.waitForPane((pane) => pane.includes("MAIN_DONE") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("MAIN_DONE", TIMEOUT);
       for (const deadline = Date.now() + TIMEOUT; !soloAsked; await Bun.sleep(50)) {
         if (Date.now() > deadline) throw new Error("the subagent never asked the model");
       }
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
-      // The restart waits for the subagent to finish its work.
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
-      await active.waitForText("and the subagents finish", TIMEOUT);
+      // This turn's provider cannot stop between steps, so the restart waits for the subagent's turn to end.
+      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip", TIMEOUT);
       expect(relaunched()).toBe(false);
 
-      // The subagent goes on past its next step and finishes; then fx
-      // restarts on its own, and main reads its report in the new build.
+      // The subagent's turn ends with its second answer. Then fx restarts on
+      // its own, and main reads its report in the new build.
       const version = (await runFx(["--version"])).stdout.trim();
       releaseSolo();
       await active.waitForText(`✓ fx has been updated to v${version} (notes)`, TIMEOUT);
@@ -7969,7 +7970,7 @@ test.skipIf(!tmuxAvailable())(
       expect(soloRequests).toBe(2);
       await active.waitForPane((pane) => pane.includes("MAIN_SAW_REPORT") && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       // Its report said it finished: main's report turn read its answer.
-      expect(gateway.requests.some((request) => request.body.includes("SOLO_DONE") && request.body.includes('"main_solo"'))).toBe(true);
+      expect(chatBodies().some((body) => isReportTurn(body) && JSON.stringify(body).includes("SOLO_DONE"))).toBe(true);
       expect(soloRequests).toBe(2);
       expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
 
@@ -7982,7 +7983,7 @@ test.skipIf(!tmuxAvailable())(
       expect(tapesShowed([tapeBefore, tapeAfter], ["solo was cancelled", "What can fx do differently?"], frames)).toEqual([]);
       // The tapes hold the restart's wait in the first process and main's
       // report in the second.
-      expect(tapesShowed([tapeBefore], ["and the subagents finish"], join(frames, "before"))).toEqual(["and the subagents finish"]);
+      expect(tapesShowed([tapeBefore], ["upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip"], join(frames, "before"))).toEqual(["upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip"]);
       expect(tapesShowed([tapeAfter], ["MAIN_SAW_REPORT"], join(frames, "after"))).toEqual(["MAIN_SAW_REPORT"]);
       await active.kill();
       active = null;
@@ -7995,7 +7996,7 @@ test.skipIf(!tmuxAvailable())(
         await active.kill();
       }
       release.stop();
-      gateway.stop();
+      f.close();
       rmSync(root, { recursive: true, force: true });
     }
   },
@@ -8101,13 +8102,13 @@ test.skipIf(!tmuxAvailable())(
       await soloAsked.fired;
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
-      // The restart waits for the subagent to finish its work.
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
-      await active.waitForText("and the subagents finish", TIMEOUT);
+      // The subagent has one request left, so the restart waits for that request to answer.
+      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip", TIMEOUT);
       expect(relaunched()).toBe(false);
 
-      // The subagent finishes; then fx restarts on its own, and main reads
-      // its report in the new build.
+      // Its answer ends the subagent turn; then fx restarts on its own, and main
+      // reads its report in the new build.
       const version = (await runFx(["--version"])).stdout.trim();
       releaseSolo();
       await active.waitForText(`✓ fx has been updated to v${version} (notes)`, TIMEOUT);
@@ -8211,11 +8212,11 @@ test.skipIf(!tmuxAvailable())(
 
       // Main's turn ends while its subagent still works.
       await active.sendText("UPGRADE_MAIN start solo");
-      await active.waitForPane((pane) => pane.includes("MAIN_DONE") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("MAIN_DONE", TIMEOUT);
       await soloAsked.fired;
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
 
       // A prompt waits for the restart, but /quit still quits, with no relaunch.
       await active.sendText("/quit");
@@ -8321,8 +8322,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Enter");
       await active.waitForPane((pane) => pane.includes("fx 1/2") && !pane.includes(LIST_HINT), TIMEOUT);
       await active.sendHexBytes(["07"]);
-      const refused = await active.waitForText("upgrade is unavailable while fx 2 has queued prompts", TIMEOUT);
-      expect(refused).not.toContain("fx restarts for the upgrade");
+      const refused = await active.waitForText("upgrade unavailable · fx 2 has queued prompts", TIMEOUT);
+      expect(refused).not.toContain("upgrade ready · restarts when the turn stops");
       expect(relaunched()).toBe(false);
 
       // The command ends, the turn answers, and fx 1 quits.
@@ -8426,7 +8427,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("UPGRADE_MAIN start solo");
       await mainAsked.fired;
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
 
       // Main starts the subagent, then stops before its next request. The
       // subagent keeps working, so fx waits for it.
@@ -8468,6 +8469,489 @@ test.skipIf(!tmuxAvailable())(
         } catch {}
         await active.kill();
       }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+// A subagent's request carries its task and not main's call.
+function isSoloSubagentRequest(body: string): boolean {
+  return body.includes("SOLO_TASK") && !body.includes('"main_solo"');
+}
+
+// The messages a request sends, in order.
+function promptOf(body: string): unknown[] {
+  return JSON.parse(body).prompt as unknown[];
+}
+
+// How many relaunch lines the upgrade wrapper wrote to its argv log.
+function relaunchCount(argvLogPath: string): number {
+  if (!existsSync(argvLogPath)) return 0;
+  return readFileSync(argvLogPath, "utf8").split("\n").filter((line) => line.includes("\t--upgrade-relaunch")).length;
+}
+
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g stops a working subagent between steps and continues it after the relaunch",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-solo-stop-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    writeFileSync(join(workspaceRoot, "notes.txt"), "NOTES_BODY\n");
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    let active: TmuxSession | null = null;
+    const soloAsked = signal();
+    let releaseSolo = () => {};
+    const soloReleased = new Promise<void>((resolve) => { releaseSolo = resolve; });
+    let relaunchedAtSecond = false;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (isSoloSubagentRequest(body)) {
+        // Its first request waits for the test, then reads notes.txt. Its
+        // second comes after Ctrl+G, so it must come after the relaunch.
+        if (!body.includes("call_solo_read")) {
+          soloAsked.fire();
+          await soloReleased;
+          return fakeGatewayToolCall("call_solo_read", "read_file", { path: "notes.txt" });
+        }
+        relaunchedAtSecond = relaunched();
+        return fakeGatewayFinalText("SOLO_DONE");
+      }
+      if (body.includes("SOLO_DONE")) return fakeGatewayFinalText("MAIN_SAW_REPORT");
+      if (!body.includes('"main_solo"')) {
+        return fakeGatewayToolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK" } });
+      }
+      return fakeGatewayFinalText("MAIN_STARTED");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_PERMISSION_MODE: "full-access",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+
+      await active.sendText("UPGRADE_MAIN start solo");
+      await soloAsked.fired;
+      await active.waitForPane((pane) => pane.includes("MAIN_STARTED") && turnSettled(pane), TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await active.sendHexBytes(["07"]);
+      // Main's turn has ended, so only the subagent holds the restart. It
+      // stops at its next step boundary; the restart does not wait for it.
+      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      const version = (await runFx(["--version"])).stdout.trim();
+      releaseSolo();
+
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      await active.waitForText("MAIN_SAW_REPORT", UPGRADE_TIMEOUT);
+
+      const solo = gateway.requests.map((request) => request.body).filter(isSoloSubagentRequest);
+      const main = gateway.requests.map((request) => request.body).filter((body) => !isSoloSubagentRequest(body));
+      expect(relaunchedAtSecond).toBe(true);
+      expect(solo).toHaveLength(2);
+      expect(solo[1]).toContain("call_solo_read");
+      expect(solo[1]).toContain("NOTES_BODY");
+      expect(promptOf(solo[1]).slice(0, promptOf(solo[0]).length)).toEqual(promptOf(solo[0]));
+      expect(main.filter((body) => body.includes("SOLO_DONE"))).toHaveLength(1);
+      expect(relaunched()).toBe(true);
+      expect(relaunchCount(argvLogPath)).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      releaseSolo();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g twice releases a held subagent in the same process",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-solo-twice-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    writeFileSync(join(workspaceRoot, "notes.txt"), "NOTES_BODY\n");
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    let active: TmuxSession | null = null;
+    const soloAsked = signal();
+    let releaseSolo = () => {};
+    const soloReleased = new Promise<void>((resolve) => { releaseSolo = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (isSoloSubagentRequest(body)) {
+        if (!body.includes("call_solo_read")) {
+          soloAsked.fire();
+          await soloReleased;
+          return fakeGatewayToolCall("call_solo_read", "read_file", { path: "notes.txt" });
+        }
+        return fakeGatewayFinalText("SOLO_DONE");
+      }
+      if (body.includes("SOLO_DONE")) return fakeGatewayFinalText("MAIN_SAW_REPORT");
+      if (!body.includes('"main_solo"')) {
+        return fakeGatewayToolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK" } });
+      }
+      return fakeGatewayFinalText("MAIN_STARTED");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_PERMISSION_MODE: "full-access",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "worker",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+
+      await active.sendText("UPGRADE_MAIN start solo");
+      await soloAsked.fired;
+      await active.waitForPane((pane) => pane.includes("MAIN_STARTED") && turnSettled(pane), TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await active.sendHexBytes(["07"]);
+      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      // A draft holds the release. With an empty composer, the restart would
+      // relaunch as soon as the subagent yields, before Ctrl+G can cancel it.
+      await active.sendLiteralText("HOLD");
+      await active.waitForPane((pane) => composerContains(pane, "HOLD"), TIMEOUT);
+      releaseSolo();
+
+      // Main's turn has ended, so only the subagent can hold the restart.
+      await waitForCondition(
+        () => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=turn_held_for_restart"),
+        "event=turn_held_for_restart in the trace",
+        UPGRADE_TIMEOUT,
+      );
+      await active.sendHexBytes(["07"]);
+      await active.waitForText("restart cancelled; Ctrl+G restarts for the upgrade later", TIMEOUT);
+      await active.waitForText("MAIN_SAW_REPORT", UPGRADE_TIMEOUT);
+
+      const solo = gateway.requests.map((request) => request.body).filter(isSoloSubagentRequest);
+      const main = gateway.requests.map((request) => request.body).filter((body) => !isSoloSubagentRequest(body));
+      expect(relaunched()).toBe(false);
+      expect(solo).toHaveLength(2);
+      expect(solo[1]).toContain("call_solo_read");
+      expect(solo[1]).toContain("NOTES_BODY");
+      expect(promptOf(solo[1]).slice(0, promptOf(solo[0]).length)).toEqual(promptOf(solo[0]));
+      expect(main.filter((body) => body.includes("SOLO_DONE"))).toHaveLength(1);
+
+      await active.sendKeys("BSpace BSpace BSpace BSpace");
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      releaseSolo();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g gives a parent blocked in wait its subagent's report once after the relaunch",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-solo-wait-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    writeFileSync(join(workspaceRoot, "notes.txt"), "NOTES_BODY\n");
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    let active: TmuxSession | null = null;
+    const soloAsked = signal();
+    const mainWaitSent = signal();
+    let releaseSolo = () => {};
+    const soloReleased = new Promise<void>((resolve) => { releaseSolo = resolve; });
+    let relaunchedAtSecond = false;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (isSoloSubagentRequest(body)) {
+        if (!body.includes("call_solo_read")) {
+          soloAsked.fire();
+          await soloReleased;
+          return fakeGatewayToolCall("call_solo_read", "read_file", { path: "notes.txt" });
+        }
+        relaunchedAtSecond = relaunched();
+        return fakeGatewayFinalText("SOLO_DONE");
+      }
+      if (body.includes("SOLO_DONE")) return fakeGatewayFinalText("MAIN_SAW_REPORT");
+      // The restart ends main's wait with this text; main waits again once.
+      if (body.includes("This wait ends now") && !body.includes('"main_wait_b"')) {
+        return fakeGatewayToolCall("main_wait_b", "subagent", { request: { action: "wait" } });
+      }
+      if (!body.includes('"main_solo"')) {
+        return fakeGatewayToolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK" } });
+      }
+      if (!body.includes('"main_wait_a"')) {
+        mainWaitSent.fire();
+        return fakeGatewayToolCall("main_wait_a", "subagent", { request: { action: "wait" } });
+      }
+      return fakeGatewayFinalText("MAIN_WAITING");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_PERMISSION_MODE: "full-access",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+
+      await active.sendText("UPGRADE_MAIN start solo");
+      await soloAsked.fired;
+      await mainWaitSent.fired;
+      await active.sendHexBytes(["07"]);
+      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      const version = (await runFx(["--version"])).stdout.trim();
+      releaseSolo();
+
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      await active.waitForText("MAIN_SAW_REPORT", UPGRADE_TIMEOUT);
+
+      const solo = gateway.requests.map((request) => request.body).filter(isSoloSubagentRequest);
+      const main = gateway.requests.map((request) => request.body).filter((body) => !isSoloSubagentRequest(body));
+      expect(relaunchedAtSecond).toBe(true);
+      expect(solo).toHaveLength(2);
+      expect(solo[1]).toContain("call_solo_read");
+      expect(solo[1]).toContain("NOTES_BODY");
+      expect(promptOf(solo[1]).slice(0, promptOf(solo[0]).length)).toEqual(promptOf(solo[0]));
+      expect(main.filter((body) => body.includes("SOLO_DONE"))).toHaveLength(1);
+      expect(main.every((body) => countOccurrences(body, "SOLO_DONE") <= 1)).toBe(true);
+      expect(relaunched()).toBe(true);
+      expect(relaunchCount(argvLogPath)).toBe(1);
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      releaseSolo();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+// A crash is not a restart: the held subagent continues from its saved turn, and its report is not the interrupted one.
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g: a kill -9 while a subagent holds continues it on the next launch",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-kill-solo-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const relaunchStderrPath = join(root, "relaunch-stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    writeFileSync(join(workspaceRoot, "notes.txt"), "NOTES_BODY\n");
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    let active: TmuxSession | null = null;
+    const soloAsked = signal();
+    let releaseSolo = () => {};
+    const soloReleased = new Promise<void>((resolve) => { releaseSolo = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (isSoloSubagentRequest(body)) {
+        if (!body.includes("call_solo_read")) {
+          soloAsked.fire();
+          await soloReleased;
+          return fakeGatewayToolCall("call_solo_read", "read_file", { path: "notes.txt" });
+        }
+        return fakeGatewayFinalText("SOLO_DONE");
+      }
+      if (body.includes("SOLO_DONE")) return fakeGatewayFinalText("MAIN_SAW_REPORT");
+      if (!body.includes('"main_solo"')) {
+        return fakeGatewayToolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK" } });
+      }
+      return fakeGatewayFinalText("MAIN_STARTED");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    const soloBodies = () => gateway.requests.map((request) => request.body).filter(isSoloSubagentRequest);
+    const turnHeld = () => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=turn_held_for_restart");
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_PERMISSION_MODE: "full-access",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "worker",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+
+      await active.sendText("UPGRADE_MAIN start solo");
+      await soloAsked.fired;
+      await active.waitForPane((pane) => pane.includes("MAIN_STARTED") && turnSettled(pane), TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await active.sendHexBytes(["07"]);
+      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      // A draft holds the release. With an empty composer, the restart would
+      // relaunch as soon as the turn holds, so the draft comes first.
+      await active.sendLiteralText("draft held");
+      await active.waitForPane((pane) => composerContains(pane, "draft held"), TIMEOUT);
+      releaseSolo();
+      await waitForCondition(turnHeld, "event=turn_held_for_restart in the trace", UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(false);
+      // Held before its second request: that request has not gone out yet.
+      expect(soloBodies()).toHaveLength(1);
+
+      const pid = active.processPid();
+      const requestsAtKill = gateway.requests.length;
+      const killed = Bun.spawnSync(["kill", "-9", String(pid)]);
+      expect(killed.exitCode).toBe(0);
+      await waitForCondition(() => !processAlive(pid), "fx to exit after kill -9");
+      await active.kill();
+      active = null;
+
+      // The next launch continues the same session in this home and workspace.
+      active = await TmuxSession.create({
+        cmd: `${shellQuote(installedFx)} -c`,
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_PERMISSION_MODE: "full-access",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "worker",
+        },
+        stderrPath: relaunchStderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForPane((pane) => pane.includes("MAIN_SAW_REPORT") && hasEmptyComposer(pane) && turnSettled(pane), UPGRADE_TIMEOUT);
+
+      const solo = soloBodies();
+      const soloAfterKill = gateway.requests.slice(requestsAtKill).map((request) => request.body).filter(isSoloSubagentRequest);
+      expect(solo).toHaveLength(2);
+      expect(soloAfterKill).toHaveLength(1);
+      expect(solo[1]).toContain("call_solo_read");
+      expect(solo[1]).toContain("NOTES_BODY");
+      expect(promptOf(solo[1]).slice(0, promptOf(solo[0]).length)).toEqual(promptOf(solo[0]));
+      const main = gateway.requests.map((request) => request.body).filter((body) => !isSoloSubagentRequest(body));
+      expect(main.filter((body) => body.includes("SOLO_DONE"))).toHaveLength(1);
+      expect(main.some((body) => body.includes("fx stopped before it finished"))).toBe(false);
+      expect(relaunched()).toBe(false);
+      expect(relaunchCount(argvLogPath)).toBe(0);
+      expect(readFileSync(relaunchStderrPath, "utf8")).not.toMatch(/panic:|unreachable/);
+      await active.kill();
+      active = null;
+    } finally {
+      releaseSolo();
+      if (active) await active.kill();
       release.stop();
       gateway.stop();
       rmSync(root, { recursive: true, force: true });
@@ -8545,10 +9029,10 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("First turn before the control sequences, team \u{1f469}\u200d\u{1f4bb}.");
-      await active.waitForPane((pane) => pane.includes("CONTROL_FIRST_TURN_DONE") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("CONTROL_FIRST_TURN_DONE", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Reply with control sequences.");
-      await active.waitForPane((pane) => pane.includes("CONTROL_REPLY_END") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("CONTROL_REPLY_END", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await expectReplyShownAsText(active, "live turn");
       await active.sendText("/quit");
@@ -8664,7 +9148,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(questionMarker, TIMEOUT);
       await active.sendLiteralText("1");
       await active.sendKeys("Enter");
-      await active.waitForPane((pane) => pane.includes(completion) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(completion, TIMEOUT);
       const live = await active.captureFullScrollback();
       expectCompactQuestion(live);
       await active.sendText("/quit");
@@ -8792,10 +9276,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendLiteralText(
         Array.from({ length: batchSize }, (_, index) => (index % 2 === 0 ? "1" : "2")).join(""),
       );
-      await active.waitForPane(
-        (pane) => pane.includes(completion) && turnSettled(pane),
-        TIMEOUT,
-      );
+      await active.waitForReplyAndTurnEnd(completion, TIMEOUT);
       expectEveryAnswer(await waitForScrollback(active, completion));
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -8907,7 +9388,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Apply this change?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      await active.waitForPane((pane) => pane.includes(firstCompletion) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(firstCompletion, TIMEOUT);
       const firstLive = await active.captureFullScrollback();
       expect(firstLive).toContain("Wrote first-large.md +120");
       expect(firstLive).not.toContain("RESUMED_FIRST_FILE_LINE_001");
@@ -8919,7 +9400,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Apply this change?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      await active.waitForPane((pane) => pane.includes(secondCompletion) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(secondCompletion, TIMEOUT);
       const live = await active.captureFullScrollback();
       expect(live).toContain("Wrote first-large.md +120");
       expect(live).toContain("Wrote second-large.md +60");
@@ -9048,7 +9529,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Apply this change?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      await active.waitForPane((pane) => pane.includes(completion) && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd(completion, TIMEOUT);
       const live = await active.captureFullScrollback();
       expect(live).toContain("Wrote spilled-diff.md +400");
       expect(readFileSync(join(workspace, "spilled-diff.md"), "utf8")).toBe(
@@ -10762,7 +11243,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendHexBytes(["0f"]);
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Continue after the compacted resume.");
-      await active.waitForPane((pane) => pane.includes("AFTER_COMPACTED_RESUME_OK") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("AFTER_COMPACTED_RESUME_OK", TIMEOUT);
       const resumed = gateway.requests.at(-1)!.body;
       expect(resumed).toContain("<compacted_conversation>");
       expect(resumed).toContain(JSON.stringify(`User 1:\n${earlierRequest}\n`).slice(1, -1));
@@ -10982,7 +11463,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     await other.waitForText("REMEMBERED_B_HISTORY", TIMEOUT);
     await other.waitForStableComposer(TIMEOUT);
     await active.sendText("Continue the older active conversation without tools.");
-    await active.waitForPane((pane) => pane.includes("LATER_A_ACTIVITY") && turnSettled(pane), TIMEOUT);
+    await active.waitForReplyAndTurnEnd("LATER_A_ACTIVITY", TIMEOUT);
     await active.waitForStableComposer(TIMEOUT);
     await close(active); active = null;
     await close(other); other = null;
@@ -13227,7 +13708,7 @@ async function resumeLongHistory(options: DrainCase) {
       );
       if (options.typeDuringFinish) expect(composerContains(pane, DRAIN_TYPED)).toBe(true);
       hold.release(DRAIN_DONE);
-      await terminal.waitForPane((text) => text.includes(DRAIN_DONE) && turnSettled(text), TIMEOUT);
+      await terminal.waitForReplyAndTurnEnd(DRAIN_DONE, TIMEOUT);
     }
     const scrollback = await terminal.captureFullScrollback();
     const frames = drainFrames(trace());
@@ -13418,7 +13899,7 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
       for (const rows of frames.before) expect(rows).toBeLessThanOrEqual(DRAIN_ROWS_PER_FRAME);
 
       resumedHold.release("RESUMED_ANSWER_4b17");
-      const settled = await terminal.waitForPane((pane) => pane.includes("RESUMED_ANSWER_4b17") && turnSettled(pane), TIMEOUT);
+      const settled = await terminal.waitForReplyAndTurnEnd("RESUMED_ANSWER_4b17", TIMEOUT);
       expect(composerText(settled)).toBe(queuedPrompt);
       const scrollback = await terminal.captureFullScrollback();
       expect(countOccurrences(scrollback, RESTORE_SINGULAR_NOTICE)).toBe(1);

@@ -22,7 +22,6 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 import { RAW_ANSWER, RAW_KEYS, RAW_STATE, arrayOf, escapedString, expectRawRetry, longNumber, longString, nested, objectOf, rawForm, rawLinesAt, rawRequests } from "./mcp-raw-rounds";
@@ -1304,7 +1303,7 @@ describe("modern MCP stdio compatibility", () => {
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Load the fixture echo tool and call it.");
-      await tui.waitForPane((pane) => pane.includes("FIRST_TURN_DONE") && turnSettled(pane), 20_000);
+      await tui.waitForReplyAndTurnEnd("FIRST_TURN_DONE", 20_000);
       await tui.waitForComposer(10_000);
       expect(toolResultText(activeGateway.requests[2]!.body, "first_call")).toContain(`${MODERN_RESULT}:first`);
       await tui.sendText("Call the echo tool again.");
@@ -2825,7 +2824,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP fixture.");
     await options.answer?.(tui);
-    await tui.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), 20_000);
+    await tui.waitForReplyAndTurnEnd(finalText, 20_000);
     const live = compactRows(await tui.captureFullScrollback());
     expect(live).toContain(`└ ${row}`);
     expect(live.filter((line) => line.includes(alias))).toEqual([`├ Opened ${alias}`]);
@@ -2925,7 +2924,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath, env });
         await tui.waitForComposer(15_000);
         await tui.sendText("Call the MCP fixture.");
-        await tui.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), 20_000);
+        await tui.waitForReplyAndTurnEnd(finalText, 20_000);
         await tui.waitForStableComposer(10_000);
         const live = compactRows(await tui.captureFullScrollback());
         expect(live).toContain(`└ Used ${serverName} to echo`);
@@ -3059,7 +3058,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath, env });
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP tool.");
-    await tui.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), 25_000);
+    await tui.waitForReplyAndTurnEnd(finalText, 25_000);
     await tui.waitForStableComposer(10_000);
     const live = compactRows(await tui.captureFullScrollback());
     expect(live).toContain(row);
@@ -3172,7 +3171,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       const cause = "arguments rejected: limit is a string, the schema wants a number";
       // The row names the failed call, and the cause follows it on its line.
       await tui.waitForText(cause, 20_000);
-      await tui.waitForPane((pane) => pane.includes("Rejected arguments complete.") && turnSettled(pane), 20_000);
+      await tui.waitForReplyAndTurnEnd("Rejected arguments complete.", 20_000);
       expect(await tui.captureFullScrollback()).toContain(`Couldn't use ${TOOL_ROW} · ${cause}`);
       // The model still gets the server's own words, which say how to fix the call.
       expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
@@ -6232,7 +6231,7 @@ describe("fx mcp call", () => {
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Page through the list.");
-      await tui.waitForPane((pane) => pane.includes("BRIDGE_ROWS_DONE") && turnSettled(pane), 30_000);
+      await tui.waitForReplyAndTurnEnd("BRIDGE_ROWS_DONE", 30_000);
       const scrollback = await tui.captureFullScrollback();
       // The calls of one tool share a row that counts them, in the
       // command's group.
@@ -6266,7 +6265,7 @@ describe("fx mcp call", () => {
       tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 140, height: 40, stderrPath, env });
       await tui.waitForComposer(15_000);
       await tui.sendText("Page through the list.");
-      await tui.waitForPane((pane) => pane.includes("BRIDGE_ROWS_SAVED") && turnSettled(pane), 30_000);
+      await tui.waitForReplyAndTurnEnd("BRIDGE_ROWS_SAVED", 30_000);
       await tui.waitForComposer(10_000);
       expect(await tui.captureFullScrollback()).toContain(`└ Used ${TOOL_ROW} ×3`);
       await tui.sendText("/quit");
@@ -6366,7 +6365,7 @@ describe("fx mcp call", () => {
 
       // The session goes on.
       await tui.sendText("Go on.");
-      await tui.waitForPane((pane) => pane.includes("BRIDGE_AFTER_CANCEL") && turnSettled(pane), 10_000);
+      await tui.waitForReplyAndTurnEnd("BRIDGE_AFTER_CANCEL", 10_000);
       await tui.waitForComposer(10_000);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
