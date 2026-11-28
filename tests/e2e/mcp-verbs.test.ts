@@ -1345,10 +1345,12 @@ describe("/mcp in the shell", () => {
     expect(await tui.captureFullScrollback()).not.toContain("Removed web");
   }, 90_000);
 
-  test.skipIf(!tmuxAvailable())("/mcp blinks fx's working marker on the row of a server that loads, and drops it once the server is ready", async () => {
-    // An HTTP server that answers initialize only when the test lets it.
+  test.skipIf(!tmuxAvailable())("/mcp blinks fx's working marker on the row of a server that connects or lists its first tools, and drops it once its tools are in", async () => {
+    // An HTTP server that answers initialize, then tools/list, only when the test lets it.
     let answerInitialize = () => {};
     const initializeHeld = new Promise<void>((resolve) => (answerInitialize = resolve));
+    let answerToolsList = () => {};
+    const toolsListHeld = new Promise<void>((resolve) => (answerToolsList = resolve));
     const slow = Bun.serve({
       port: 0,
       async fetch(request) {
@@ -1362,6 +1364,7 @@ describe("/mcp in the shell", () => {
           return Response.json({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "slow", version: "1" } } });
         }
         if (message.method === "tools/list") {
+          await toolsListHeld;
           return Response.json({ jsonrpc: "2.0", id: message.id, result: { tools: [{ name: "echo_slow", description: "Echo.", inputSchema: { type: "object", properties: {} } }] } });
         }
         return Response.json({ jsonrpc: "2.0", id: message.id ?? null, error: { code: -32601, message: "Method not found" } });
@@ -1391,13 +1394,18 @@ describe("/mcp in the shell", () => {
       await tui.waitForText(/› slow +• connecting/, 10_000);
       await blinks("connecting");
 
+      // Connected, it still waits for its first tools, and says so on its row.
+      answerInitialize();
+      await tui.waitForText(/› slow +• ready, 0 tools/, 10_000);
+      await blinks("ready, 0 tools");
+
       // Its screen blinks it on the status and on the tools it waits for.
       await tui.sendKeys("Enter");
       await tui.waitForText("Loading tools…", 10_000);
       await blinks("Loading tools…");
-      await tui.waitForText(/status +• connecting/, 5_000);
+      await tui.waitForText(/status +• ready/, 5_000);
 
-      answerInitialize();
+      answerToolsList();
       await tui.waitForText("Tools 1", 15_000);
       await tui.waitForText(/status +ready/, 5_000);
       const menuLines = (pane: string) => pane.split("\n").filter((line) => /slow|status|Tools|Loading/.test(line));
@@ -1407,6 +1415,7 @@ describe("/mcp in the shell", () => {
       expect(menuLines(await tui.capturePane()).join("\n")).not.toContain("•");
     } finally {
       answerInitialize();
+      answerToolsList();
       slow.stop(true);
     }
   }, 90_000);

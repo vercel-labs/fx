@@ -279,10 +279,10 @@ fn statusWidth(arena: Allocator, rows: []const menu.Row, width: u16) !usize {
     return @min(want, @max(room, 22));
 }
 
-/// A server on its way to ready or to a login: its status shows fx's working
-/// marker.
+/// A server on its way to ready, to its first tools, or to a login: its status
+/// shows fx's working marker.
 fn loads(r: menu.Row) bool {
-    return r.status.signing_in or r.status.state == .connecting or r.status.state == .retrying;
+    return r.status.signing_in or r.status.tools_pending or r.status.state == .connecting or r.status.state == .retrying;
 }
 
 fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool, width: u16, status_width: usize, marker_phase: i16) !Row {
@@ -1265,6 +1265,25 @@ test "a server that connects, retries, or signs in blinks fx's working marker be
     defer testing.allocator.free(marker);
     try testing.expect(std.mem.find(u8, lit.items, marker) != null);
     try testing.expect(std.mem.find(u8, row.items, "•") == null);
+}
+
+test "a ready server whose first tools are on their way blinks the marker until they come" {
+    var listing = testStatus("listing", .ready);
+    listing.tools_pending = true;
+    var rows = [_]menu.Row{.{ .status = listing }};
+    var p: Projection = .{ .rows = &rows };
+    menu.open(&p.state);
+    const pending = try render(p, 88);
+    defer testing.allocator.free(pending);
+    try testing.expect(std.mem.find(u8, pending, "› listing                 • ready, 0 tools        profile\n") != null);
+    try testing.expect(p.showsLoading());
+
+    rows[0].status.tools_pending = false;
+    rows[0].status.tools = 1;
+    const listed = try render(p, 88);
+    defer testing.allocator.free(listed);
+    try testing.expect(std.mem.find(u8, listed, "› listing                 ready, 1 tool           profile\n") != null);
+    try testing.expect(!p.showsLoading());
 }
 
 test "the working marker keeps a loading row inside 20 and 25 columns" {

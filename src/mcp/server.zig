@@ -482,6 +482,11 @@ pub const Server = struct {
     /// number fx read, for an HTTP refusal); null when it did not. A list that is accepted, and a new process,
     /// clear it. An older accepted list is still `toolList`. The words stay valid until the next page is refused:
     /// copy them.
+    /// Whether the first tool list of the server's process is on its way: it is listing, and has no list to serve yet.
+    pub fn listingFirstTools(r: *const Server) bool {
+        return r.catalog.listing and r.catalog.cache == .none;
+    }
+
     pub fn listRefusal(r: *const Server) ?[]const u8 {
         return if (r.catalog.refused and r.list_refusal_len > 0) r.list_refusal_buf[0..r.list_refusal_len] else null;
     }
@@ -3001,6 +3006,21 @@ test "what a listing leaves out is counted over every page, and a listing that i
     r.publishStore();
     try std.testing.expectEqual(@as(usize, 1), r.toolList().len());
     try std.testing.expectEqual(@as(u32, 0), r.droppedTools().total());
+}
+
+test "the first tool list is on its way only while the server lists with no list to serve" {
+    var r: Server = undefined;
+    try pageTestServer(&r);
+    defer r.deinit();
+    try std.testing.expect(!r.listingFirstTools());
+    r.catalog.listing = true;
+    try std.testing.expect(r.listingFirstTools());
+    // A later listing serves the list it has meanwhile.
+    r.catalog.cache = .stale;
+    try std.testing.expect(!r.listingFirstTools());
+    r.catalog.cache = .fresh;
+    r.catalog.listing = false;
+    try std.testing.expect(!r.listingFirstTools());
 }
 
 test "a listing that fails drops what its pages left out, and the published count stays" {
