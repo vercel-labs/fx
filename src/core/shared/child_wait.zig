@@ -45,15 +45,32 @@ pub fn killAndReap(child: *std.process.Child, label: []const u8) void {
     child.id = null;
 }
 
+const WaitStep = enum { retry, still_running, exited, failed };
+
+/// Decides what one non-blocking waitpid call means. `waited` is its return
+/// value and `err` its errno, which is SUCCESS unless `waited` is -1.
+fn classifyWaitpid(pid: std.posix.pid_t, waited: std.posix.pid_t, err: std.posix.E) WaitStep {
+    if (waited == pid) return .exited;
+    if (waited == 0) return .still_running;
+    if (waited == -1 and err == .INTR) return .retry;
+    return .failed;
+}
+
 fn reapExited(child: *std.process.Child) !?std.process.Child.Term {
     const pid = child.id orelse return error.WaitFailed;
-    var status: c_int = undefined;
-    const waited = std.c.waitpid(pid, &status, std.c.W.NOHANG);
-    if (waited == 0) return null;
-    if (waited != pid) return error.WaitFailed;
-
-    child.id = null;
-    return termFromStatus(status);
+    while (true) {
+        var status: c_int = undefined;
+        const waited = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+        switch (classifyWaitpid(pid, waited, std.posix.errno(waited))) {
+            .retry => continue,
+            .still_running => return null,
+            .failed => return error.WaitFailed,
+            .exited => {
+                child.id = null;
+                return termFromStatus(status);
+            },
+        }
+    }
 }
 
 fn termFromStatus(status: c_int) std.process.Child.Term {
@@ -129,4 +146,21 @@ test "waitWithDeadline returns the exit status of a finished child" {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "waitWithDeadline classifies an interrupted waitpid as a retry" {
+    try std.testing.expectEqual(WaitStep.retry, classifyWaitpid(7, -1, .INTR));
+}
+
+test "waitWithDeadline classifies a waitpid with no exited child as still running" {
+    try std.testing.expectEqual(WaitStep.still_running, classifyWaitpid(7, 0, .SUCCESS));
+}
+
+test "waitWithDeadline classifies the waited pid as exited" {
+    try std.testing.expectEqual(WaitStep.exited, classifyWaitpid(7, 7, .SUCCESS));
+}
+
+test "waitWithDeadline classifies other waitpid errors and other pids as failed" {
+    try std.testing.expectEqual(WaitStep.failed, classifyWaitpid(7, -1, .CHILD));
+    try std.testing.expectEqual(WaitStep.failed, classifyWaitpid(7, 3, .SUCCESS));
 }
