@@ -211,4 +211,48 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "/usage shows today's numbers while the 7-day range is still pending",
+    async () => {
+      let mark7dStarted!: () => void;
+      const weekStarted = new Promise<void>((resolve) => {
+        mark7dStarted = resolve;
+      });
+      let release7d!: () => void;
+      const weekGate = new Promise<void>((resolve) => {
+        release7d = resolve;
+      });
+      const { env } = start("fx-tui-usage-progressive-", {
+        report: async (from) => {
+          if (from === "2026-10-06") {
+            mark7dStarted();
+            await weekGate;
+          }
+          return rows(from);
+        },
+      });
+      try {
+        session = await TmuxSession.create({
+          env: { ...env, AI_GATEWAY_API_KEY: "e2e-usage-key" },
+        });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("/usage");
+        await weekStarted;
+        const partial = await session.waitForText("provider/today", 5_000);
+        expect(partial).toContain("updating…");
+        expect(partial).toMatch(/today\s+\$0\.5000\s+2\s/);
+        expect(partial).not.toContain("fetching usage from AI Gateway");
+        expect(partial).not.toContain("provider/month");
+
+        release7d();
+        const ready = await session.waitForText("provider/month", TIMEOUT);
+        expect(ready).toContain("updated just now");
+        expect(ready).toMatch(/month\s+\$2\.50\s+6\s/);
+      } finally {
+        release7d();
+      }
+    },
+    TIMEOUT * 2,
+  );
 });

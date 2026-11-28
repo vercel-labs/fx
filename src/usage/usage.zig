@@ -568,7 +568,7 @@ pub const Dashboard = struct {
         if (!policy.due(trigger, self.is_open, self.fetch_state, now)) return false;
         // Another process may already hold today's finished days.
         self.reloadEntryLocked();
-        const finished_day: ?i64 = if (self.entry) |e| (if (e.entry.finished) |f| f.day else null) else null;
+        const finished_day: ?i64 = if (self.entry) |e| (if (e.entry.finished) |f| (if (f.complete) f.day else null) else null) else null;
         const job = Job.init(self.gpa, s, policy.plan(s.scope, finished_day, now), now) catch return false;
         if (builtin.single_threaded or self.inline_fetches) {
             // `open` and `refresh` only queue it, because a key read during
@@ -602,20 +602,7 @@ pub const Dashboard = struct {
         switch (outcome) {
             .stored => |owned| {
                 self.fetch_state.failed_at_ms = null;
-                const current = if (self.session) |s| std.mem.eql(u8, &s.identity, &job.identity) else false;
-                if (current) {
-                    // This sign-in has had its fetch.
-                    self.fetch_owed = false;
-                    self.failure = null;
-                    if (self.entry) |*e| e.deinit();
-                    self.entry = owned;
-                    self.adoptRenewedBearerLocked(job);
-                } else {
-                    // The sign-in changed mid-fetch: the answer is cached
-                    // for its own identity but not shown.
-                    var o = owned;
-                    o.deinit();
-                }
+                self.installOwnedLocked(job, owned);
             },
             .failed => |failure| {
                 // Only this sign-in's own failures hold its floor.
@@ -628,6 +615,30 @@ pub const Dashboard = struct {
             },
             .cancelled => {},
         }
+        self.bump();
+    }
+
+    fn installOwnedLocked(self: *Dashboard, job: *const Job, owned: cache.Owned) void {
+        const current = if (self.session) |s| std.mem.eql(u8, &s.identity, &job.identity) else false;
+        if (current) {
+            // This sign-in has had its fetch.
+            self.fetch_owed = false;
+            self.failure = null;
+            if (self.entry) |*e| e.deinit();
+            self.entry = owned;
+            self.adoptRenewedBearerLocked(job);
+        } else {
+            // The sign-in changed mid-fetch: the answer is cached
+            // for its own identity but not shown.
+            var o = owned;
+            o.deinit();
+        }
+    }
+
+    fn publishPartial(self: *Dashboard, job: *const Job, owned: cache.Owned) void {
+        self.mutex.lockUncancelable(self.io());
+        defer self.mutex.unlock(self.io());
+        self.installOwnedLocked(job, owned);
         self.bump();
     }
 
@@ -750,7 +761,10 @@ fn fetchAll(dashboard: *Dashboard, job: *const Job) Outcome {
     var run: Run = .{ .dashboard = dashboard, .job = job };
     defer run.deinit();
     const fetched = collect(&run) catch return run.stop;
+    return storeEntry(dashboard, job, fetched);
+}
 
+fn storeEntry(dashboard: *Dashboard, job: *const Job, fetched: cache.Entry) Outcome {
     const now = dashboard.host.now_fn(dashboard.host.ctx);
     // What the dashboard holds now counts too: the plan may have skipped
     // parts it already had, and the file may hold less after it was unreadable.
@@ -765,6 +779,13 @@ fn fetchAll(dashboard: *Dashboard, job: *const Job) Outcome {
         else => return unsaved(dashboard, job, fetched, now, held),
     };
     return .{ .stored = stored };
+}
+
+fn publishProgress(run: *Run, fetched: cache.Entry) void {
+    switch (storeEntry(run.dashboard, run.job, fetched)) {
+        .stored => |owned| run.dashboard.publishPartial(run.job, owned),
+        .failed, .cancelled => {},
+    }
 }
 
 /// What a fetch shows when the cache cannot be written (a read-only or
@@ -786,13 +807,28 @@ fn collect(run: *Run) error{Stop}!cache.Entry {
     var fetched: cache.Entry = .{
         .today = .{ .day = job.plan.day, .at_ms = job.started_ms, .models = try fetchRows(run, job.plan.todayRange()) },
     };
+    if (job.plan.finished or job.plan.budget) publishProgress(run, fetched);
     if (job.plan.finished) {
+        const week_rows = try fetchRows(run, job.plan.weekRange());
+        const month_range = job.plan.monthRange();
         fetched.finished = .{
             .day = job.plan.day,
             .at_ms = job.started_ms,
-            .days_7 = try fetchRows(run, job.plan.weekRange()),
-            .month = if (job.plan.monthRange()) |range| try fetchRows(run, range) else &.{},
+            .days_7 = week_rows,
+            .month = &.{},
+            .complete = month_range == null,
         };
+        if (month_range != null or job.plan.budget) publishProgress(run, fetched);
+        if (month_range) |range| {
+            fetched.finished = .{
+                .day = job.plan.day,
+                .at_ms = job.started_ms,
+                .days_7 = week_rows,
+                .month = try fetchRows(run, range),
+                .complete = true,
+            };
+            if (job.plan.budget) publishProgress(run, fetched);
+        }
     }
     if (job.plan.budget) {
         // The budget line is extra: a failure here keeps the usage numbers.
@@ -839,9 +875,13 @@ fn fetchCodex(run: *Run) error{Stop}!codex.Usage {
     const owned = codex.parse(dashboard.gpa, body, dashboard.host.now_fn(dashboard.host.ctx)) catch return run.fail(.{ .failed = .bad_response });
     run.codex_part = owned;
     var value = owned.usage;
+    publishProgress(run, .{ .codex = .{ .at_ms = job.started_ms, .value = value } });
     // The activity and breakdown are extra: a failure keeps the limits, and
     // the cache keeps what it already has.
-    if (fetchProfile(run)) |profile| value.profile = profile else |_| {}
+    if (fetchProfile(run)) |profile| {
+        value.profile = profile;
+        publishProgress(run, .{ .codex = .{ .at_ms = job.started_ms, .value = value } });
+    } else |_| {}
     if (fetchBreakdown(run)) |breakdown| value.breakdown = breakdown else |_| {}
     return value;
 }
@@ -899,6 +939,7 @@ fn fetchGrok(run: *Run) error{Stop}!grok.Usage {
     const owned = grok.parseBilling(gpa, body) catch return run.fail(.{ .failed = .bad_response });
     run.grok_part = owned;
     var value = owned.usage;
+    publishProgress(run, .{ .grok = .{ .at_ms = job.started_ms, .value = value } });
     // The plan's name is extra: a failure keeps the billing, and the cache
     // keeps the name it already has.
     if (fetchGrokSettings(run)) |settings| value.settings = settings else |_| {}
@@ -980,6 +1021,14 @@ const FakeGateway = struct {
     count: usize = 0,
     /// While set, every request waits, so a test can keep a fetch in flight.
     held: std.atomic.Value(bool) = .init(false),
+    /// While set, requests whose path contains `slow_match` signal `slow_entered`
+    /// and wait until `slow_release` is set.
+    slow_match: ?[]const u8 = null,
+    slow_entered: std.atomic.Value(bool) = .init(false),
+    slow_release: std.atomic.Value(bool) = .init(true),
+    /// Status returned for requests whose path contains `fail_match`.
+    fail_match: ?[]const u8 = null,
+    fail_status: u16 = 500,
     /// When set, every request first redraws and ticks this dashboard, as the
     /// WebAssembly terminal's pulse does while a request waits.
     reenter: ?*Dashboard = null,
@@ -1041,6 +1090,10 @@ const FakeGateway = struct {
             self.reentries += 1;
         }
         while (self.held.load(.acquire)) std.atomic.spinLoopHint();
+        if (self.slow_match) |needle| if (std.mem.find(u8, request.path, needle) != null) {
+            self.slow_entered.store(true, .release);
+            while (!self.slow_release.load(.acquire)) std.atomic.spinLoopHint();
+        };
         self.mutex.lockUncancelable(testing.io);
         defer self.mutex.unlock(testing.io);
         const i = self.count;
@@ -1049,6 +1102,9 @@ const FakeGateway = struct {
         self.path_lens[i] = request.path.len;
         self.teams[i] = request.team != null;
         self.accounts[i] = request.account_id != null;
+        if (self.fail_match) |needle| if (std.mem.find(u8, request.path, needle) != null) {
+            return .{ .status = self.fail_status, .body = try alloc.dupe(u8, "{}") };
+        };
         if (self.refused_bearer) |refused| if (std.mem.eql(u8, request.bearer, refused)) {
             self.refusals += 1;
             return .{ .status = 401, .body = try alloc.dupe(u8, "{}") };
@@ -1756,4 +1812,45 @@ test "an empty or relative home is no home, and a fetch still shows" {
         defer shown.deinit();
         try testing.expectEqual(@as(?i64, gateway.now_ms), shown.of(.today).fetched_at_ms);
     }
+}
+
+test "today's numbers show while 7d is slow, and a later month failure keeps today and 7d" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{
+        .slow_match = "start_date=2026-10-05",
+        .slow_release = .init(false),
+        .fail_match = "start_date=2026-10-01",
+        .fail_status = 500,
+    };
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer {
+        gateway.slow_release.store(true, .release);
+        dashboard.deinit();
+    }
+
+    dashboard.open(api_key);
+    while (!gateway.slow_entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    {
+        var while_slow = try dashboard.snapshot(testing.allocator);
+        defer while_slow.deinit();
+        try testing.expect(while_slow.status == .fetching);
+        try testing.expect(while_slow.of(.today).today_current);
+        try testing.expectApproxEqAbs(@as(f64, 2.5), while_slow.of(.today).totals.total_cost, 1e-9);
+        try testing.expectEqual(@as(usize, 1), while_slow.of(.today).models.len);
+    }
+
+    gateway.slow_release.store(true, .release);
+    dashboard.waitForFetch();
+
+    var after_fail = try dashboard.snapshot(testing.allocator);
+    defer after_fail.deinit();
+    try testing.expectEqual(Status{ .failed = .server }, after_fail.status);
+    try testing.expect(after_fail.of(.today).today_current);
+    try testing.expectApproxEqAbs(@as(f64, 2.5), after_fail.of(.today).totals.total_cost, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 43), after_fail.of(.days_7).totals.total_cost, 1e-9);
+    try testing.expectEqual(@as(usize, 2), after_fail.of(.days_7).models.len);
 }
