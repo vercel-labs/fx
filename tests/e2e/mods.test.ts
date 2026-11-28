@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, createConfiguredProviderFixture as fixture, toolCompletion } from "./fixtures/chat-completions";
-import { collectFiles, runGit } from "./fixtures/shared-helpers";
+import { collectFiles, runGit, waitForCondition } from "./fixtures/shared-helpers";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT_MS = 30_000;
@@ -755,4 +755,414 @@ describe("mod profiles and themes", () => {
       f.close();
     }
   }, 60000);
+});
+
+/** A mod's profile `agents/<name>/`: its description and a prompt marker. */
+function profileFiles(name: string, marker: string): Record<string, string> {
+  return {
+    [`agents/${name}/profile.json`]: JSON.stringify({ description: `${name} profile` }),
+    [`agents/${name}/prompt.md`]: marker,
+  };
+}
+
+function skillMd(name: string, description: string): string {
+  return `---\nname: ${name}\ndescription: ${description}\n---\nBody\n`;
+}
+
+function themeFile(color: string): string {
+  return JSON.stringify({ type: "dark", colors: { inline_code: color, dim: color, hint: color } });
+}
+
+/** The store folders of a mod's installed versions, by name. */
+function storeVersions(f: Fixture, name: string): string[] {
+  return readdirSync(join(modsDir(f), ".store")).filter(entry => entry.startsWith(`${name}-`));
+}
+
+/** The one installed version folder of a mod, as the store holds it. */
+function storeVersion(f: Fixture, name: string): string {
+  const [version] = storeVersions(f, name);
+  if (!version) throw new Error(`no installed version of ${name}`);
+  return join(modsDir(f), ".store", version);
+}
+
+/** The bodies fx sent to the gateway from request `from` on, as JSON text. */
+function sentSince(f: Fixture, from: number): string {
+  return JSON.stringify(f.requests.slice(from).map(request => request.body));
+}
+
+/**
+ * A parent that spawns `profile` as a subagent and waits for it. A request
+ * carrying a `_MARKER` string is the child's; it answers "child reply".
+ */
+function spawnFixture(profile: string) {
+  return fixture(body => {
+    if (JSON.stringify(body.messages).includes("_MARKER")) return completion(body.model, "child reply");
+    const toolResults = body.messages.filter((message: any) => message.role === "tool").length;
+    if (toolResults === 0) {
+      return toolCompletion(body.model, "subagent", { action: "message", agent: "kid", profile, message: "do the task" }, "call-spawn");
+    }
+    if (toolResults === 1) return toolCompletion(body.model, "subagent", { action: "wait" }, "call-wait");
+    return completion(body.model, "parent done");
+  });
+}
+
+function spawnAsk(f: Fixture) {
+  return runFx(["ask", "--json", "--provider", "local", "--model", "local-model", "run helper"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+}
+
+function doctorJson(f: Fixture) {
+  return runFx(["doctor", "--json"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+}
+
+/** The theme escapes of a one-line `fx ask` run in a terminal that accepts colors. */
+async function themedEscapes(f: Fixture, theme: string): Promise<string> {
+  let session: TmuxSession | null = null;
+  try {
+    session = await TmuxSession.create({
+      isolated: true,
+      cmd: terminalCommand(["ask", "--provider", "local", "--model", "local-model", "--no-save", "hi"]),
+      cwd: f.workspace,
+      env: {
+        ...f.env,
+        NO_COLOR: undefined,
+        FX_THEME: theme,
+        COLORFGBG: "15;0",
+        COLORTERM: undefined,
+        TERM_PROGRAM: "Apple_Terminal",
+      },
+      width: 100,
+      height: 30,
+      remainOnExit: true,
+    });
+    await session.waitForText("__FX_EXIT_0__", TIMEOUT_MS);
+    return await session.capturePaneEscapes();
+  } finally {
+    if (session) await session.kill();
+  }
+}
+
+/** Closes the `/skills` menu, and waits until the footer no longer offers "esc close". */
+async function closeMenu(session: TmuxSession): Promise<void> {
+  await session.sendKeys("Escape");
+  expect(await waitForPane(session, p => !p.includes("esc close"))).not.toContain("esc close");
+  await session.waitForComposer(TIMEOUT_MS);
+}
+
+async function openTui(f: Fixture): Promise<TmuxSession> {
+  return TmuxSession.create({ cwd: f.workspace, env: f.env, width: 120, height: 40 });
+}
+
+/** Polls the pane until `check` holds or the deadline passes; returns the last pane. */
+async function waitForPane(session: TmuxSession, check: (pane: string) => boolean, timeoutMs = TIMEOUT_MS): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const pane = await session.capturePane();
+    if (check(pane) || Date.now() >= deadline) return pane;
+    await Bun.sleep(100);
+  }
+}
+
+describe("mod clashes and order", () => {
+  test("two mods with one profile name load neither: the spawn names both, doctor warns, and disabling one loads the other", async () => {
+    const f = spawnFixture("helper");
+    try {
+      const alpha = makeModFolder(f, "alpha", { name: "alpha", version: "1.0.0", description: "Alpha" }, profileFiles("helper", "ALPHA_HELPER_MARKER"));
+      const beta = makeModFolder(f, "beta", { name: "beta", version: "1.0.0", description: "Beta" }, profileFiles("helper", "BETA_HELPER_MARKER"));
+      expect((await fxMod(f, ["add", "--yes", alpha])).code).toBe(0);
+      expect((await fxMod(f, ["add", "--yes", beta])).code).toBe(0);
+
+      const clashed = await spawnAsk(f);
+      expect(clashed.code, clashed.stderr).toBe(0);
+      expect(sentSince(f, 0)).toContain("is defined by multiple mods (alpha, beta)");
+      expect(sentSince(f, 0)).not.toContain("ALPHA_HELPER_MARKER");
+      expect(sentSince(f, 0)).not.toContain("BETA_HELPER_MARKER");
+      const doctor = await doctorJson(f);
+      expect(doctor.stdout).toContain("profile 'helper' is defined by multiple mods (alpha, beta), so neither loads");
+
+      expect((await fxMod(f, ["off", "beta"])).code).toBe(0);
+      const before = f.requests.length;
+      const loaded = await spawnAsk(f);
+      expect(loaded.code, loaded.stderr).toBe(0);
+      expect(sentSince(f, before)).toContain("ALPHA_HELPER_MARKER");
+      expect(sentSince(f, before)).not.toContain("BETA_HELPER_MARKER");
+      expect((await doctorJson(f)).stdout).not.toContain("is defined by multiple mods");
+    } finally {
+      f.close();
+    }
+  }, 90000);
+
+  test("the user's profile beats a mod's, and a mod's beats the project's, with no clash warning", async () => {
+    const f = spawnFixture("helper");
+    try {
+      writeFile(join(f.home, ".fx", "agents"), "helper/profile.json", JSON.stringify({ description: "home helper" }));
+      writeFile(join(f.home, ".fx", "agents"), "helper/prompt.md", "HOME_HELPER_MARKER");
+      writeFile(join(f.workspace, ".fx", "agents"), "helper/profile.json", JSON.stringify({ description: "project helper" }));
+      writeFile(join(f.workspace, ".fx", "agents"), "helper/prompt.md", "PROJECT_HELPER_MARKER");
+      const alpha = makeModFolder(f, "alpha", { name: "alpha", version: "1.0.0", description: "Alpha" }, profileFiles("helper", "ALPHA_HELPER_MARKER"));
+      expect((await fxMod(f, ["add", "--yes", alpha])).code).toBe(0);
+
+      const home = await spawnAsk(f);
+      expect(home.code, home.stderr).toBe(0);
+      expect(sentSince(f, 0)).toContain("HOME_HELPER_MARKER");
+      expect(sentSince(f, 0)).not.toContain("ALPHA_HELPER_MARKER");
+      expect(sentSince(f, 0)).not.toContain("PROJECT_HELPER_MARKER");
+      expect((await doctorJson(f)).stdout).not.toContain("is defined by multiple mods");
+
+      rmSync(join(f.home, ".fx", "agents", "helper"), { recursive: true });
+      const before = f.requests.length;
+      const fromMod = await spawnAsk(f);
+      expect(fromMod.code, fromMod.stderr).toBe(0);
+      expect(sentSince(f, before)).toContain("ALPHA_HELPER_MARKER");
+      expect(sentSince(f, before)).not.toContain("PROJECT_HELPER_MARKER");
+    } finally {
+      f.close();
+    }
+  }, 90000);
+
+  test.skipIf(!tmuxAvailable())("two mods with one theme name load neither: FX_THEME falls back, and doctor warns", async () => {
+    const f = fixture(body => completion(body.model, "themed `reply`"));
+    try {
+      const alpha = makeModFolder(f, "alpha", { name: "alpha", version: "1.0.0", description: "Alpha" }, { "themes/clash.json": themeFile("#FF0000") });
+      const beta = makeModFolder(f, "beta", { name: "beta", version: "1.0.0", description: "Beta" }, { "themes/clash.json": themeFile("#00FF00") });
+      expect((await fxMod(f, ["add", "--yes", alpha])).code).toBe(0);
+      expect((await fxMod(f, ["add", "--yes", beta])).code).toBe(0);
+
+      const escapes = await themedEscapes(f, "clash");
+      expect(escapes).toContain("themed");
+      expect(escapes).not.toContain("38;2;255;0;0");
+      expect(escapes).not.toContain("38;2;0;255;0");
+      const doctor = await doctorJson(f);
+      expect(doctor.stdout).toContain("theme 'clash' is defined by multiple mods (alpha, beta), so neither loads");
+    } finally {
+      f.close();
+    }
+  }, 90000);
+
+  test.skipIf(!tmuxAvailable())("a theme in ~/.fx/themes shadows a clashing mod theme, with no warning", async () => {
+    const f = fixture(body => completion(body.model, "themed `reply`"));
+    try {
+      writeFile(join(f.home, ".fx", "themes"), "clash.json", themeFile("#0000FF"));
+      const alpha = makeModFolder(f, "alpha", { name: "alpha", version: "1.0.0", description: "Alpha" }, { "themes/clash.json": themeFile("#FF0000") });
+      const beta = makeModFolder(f, "beta", { name: "beta", version: "1.0.0", description: "Beta" }, { "themes/clash.json": themeFile("#00FF00") });
+      expect((await fxMod(f, ["add", "--yes", alpha])).code).toBe(0);
+      expect((await fxMod(f, ["add", "--yes", beta])).code).toBe(0);
+
+      const escapes = await themedEscapes(f, "clash");
+      expect(escapes).toContain("38;2;0;0;255");
+      expect(escapes).not.toContain("38;2;255;0;0");
+      expect(escapes).not.toContain("38;2;0;255;0");
+      expect((await doctorJson(f)).stdout).not.toContain("theme 'clash' is defined by multiple mods");
+    } finally {
+      f.close();
+    }
+  }, 90000);
+
+  test.skipIf(!tmuxAvailable())("two mods with one skill name keep both copies, each labelled with its mod in /skills", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    let session: TmuxSession | null = null;
+    try {
+      const alpha = makeModFolder(f, "alpha", { name: "alpha", version: "1.0.0", description: "Alpha" }, { "skills/shared-review/SKILL.md": skillMd("shared-review", "Alpha review") });
+      const beta = makeModFolder(f, "beta", { name: "beta", version: "1.0.0", description: "Beta" }, { "skills/shared-review/SKILL.md": skillMd("shared-review", "Beta review") });
+      expect((await fxMod(f, ["add", "--yes", alpha])).code).toBe(0);
+      expect((await fxMod(f, ["add", "--yes", beta])).code).toBe(0);
+
+      session = await openTui(f);
+      await session.waitForComposer(TIMEOUT_MS);
+      await session.sendText("/skills list");
+      const pane = await waitForPane(session, p => p.includes("mod alpha") && p.includes("mod beta"));
+      expect(pane).toContain("mod alpha");
+      expect(pane).toContain("mod beta");
+      expect(pane.split("shared-review").length - 1).toBeGreaterThanOrEqual(2);
+    } finally {
+      if (session) await session.kill();
+      f.close();
+    }
+  }, 90000);
+});
+
+describe("mods change a running fx", () => {
+  test.skipIf(!tmuxAvailable())("a skill from a mod added while the TUI runs shows in /skills after the next turn, and leaves after fx mod off", async () => {
+    let replies = 0;
+    const f = fixture(body => completion(body.model, `live reply ${++replies}`));
+    let session: TmuxSession | null = null;
+    try {
+      session = await openTui(f);
+      await session.waitForComposer(TIMEOUT_MS);
+      const folder = makeModFolder(f, "live", { name: "live", version: "1.0.0", description: "Live" }, { "skills/live-check/SKILL.md": skillMd("live-check", "Live check") });
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+
+      // The turn's submit asks for a skill refresh; the list follows the new catalog.
+      await session.sendText("first");
+      await session.waitForText("live reply 1", TIMEOUT_MS);
+      await session.waitForComposer(TIMEOUT_MS);
+      await session.sendText("/skills list");
+      expect(await waitForPane(session, p => p.includes("live-check"))).toContain("mod live");
+      await closeMenu(session);
+
+      expect((await fxMod(f, ["off", "live"])).code).toBe(0);
+      await session.sendText("second");
+      await session.waitForText("live reply 2", TIMEOUT_MS);
+      await session.waitForComposer(TIMEOUT_MS);
+      await session.sendText("/skills list");
+      // "Workspace" is a filter label of the menu, so the menu has drawn before the list is checked.
+      const pane = await waitForPane(session, p => p.includes("Workspace"));
+      expect(pane).not.toContain("live-check");
+    } finally {
+      if (session) await session.kill();
+      f.close();
+    }
+  }, 90000);
+
+  test.skipIf(!tmuxAvailable())("a mod update keeps the version a running TUI reads, and frees the old one once the TUI shows the new", async () => {
+    // Who frees v1: the catalog generation that holds v1's pin is freed when the TUI
+    // adopts v2 and its last lease ends (reaped on a loop pass). The generation's
+    // release starts the background cleanup, which deletes v1's folder once no
+    // pin names it. v2's pin is held by the new catalog, so v2 stays.
+    let replies = 0;
+    const f = fixture(body => completion(body.model, `pin reply ${++replies}`));
+    let session: TmuxSession | null = null;
+    try {
+      const folder = makeModFolder(f, "pin-check", { name: "pin-check", version: "1.0.0", description: "Pinned" }, { "skills/pin-v1/SKILL.md": skillMd("pin-v1", "Pinned v1") });
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+
+      session = await openTui(f);
+      await session.waitForComposer(TIMEOUT_MS);
+      await session.sendText("first");
+      await session.waitForText("pin reply 1", TIMEOUT_MS);
+      await session.waitForComposer(TIMEOUT_MS);
+      await session.sendText("/skills list");
+      expect(await waitForPane(session, p => p.includes("pin-v1"))).toContain("pin-v1");
+      await closeMenu(session);
+
+      writeFileSync(join(folder, "mod.json"), JSON.stringify({ name: "pin-check", version: "2.0.0", description: "Pinned" }));
+      rmSync(join(folder, "skills", "pin-v1"), { recursive: true });
+      writeFile(join(folder, "skills"), "pin-v2/SKILL.md", skillMd("pin-v2", "Pinned v2"));
+      expect((await fxMod(f, ["update", "pin-check"])).code).toBe(0);
+      // The running TUI still pins v1, so the store keeps both version folders.
+      expect(storeVersions(f, "pin-check")).toHaveLength(2);
+
+      await session.sendText("second");
+      await session.waitForText("pin reply 2", TIMEOUT_MS);
+      await session.waitForComposer(TIMEOUT_MS);
+      await session.sendText("/skills list");
+      const shown = await waitForPane(session, p => p.includes("pin-v2"));
+      expect(shown).toContain("pin-v2");
+      expect(shown).not.toContain("pin-v1");
+      await closeMenu(session);
+
+      expect(await waitForCondition(() => storeVersions(f, "pin-check").length === 1, TIMEOUT_MS)).toBe(true);
+      const [kept] = storeVersions(f, "pin-check");
+      expect(existsSync(join(modsDir(f), ".store", kept!, "skills", "pin-v2", "SKILL.md"))).toBe(true);
+    } finally {
+      if (session) await session.kill();
+      f.close();
+    }
+  }, 90000);
+});
+
+describe("mod threats in the installed store", () => {
+  // The first defense is the store copy: `store.add` refuses a symbolic link in a
+  // mod (`Invalid.symlink`; "a symbolic link inside a mod is refused" above). These
+  // tests plant the link in the installed version folder afterwards, as a tampered
+  // store would, and check the loader's own defense.
+
+  test.skipIf(!tmuxAvailable())("a skill folder that links outside the mod does not load", async () => {
+    // Defense: the mod root is strict like the managed root, so `collectSkillEntries`
+    // skips a linked entry (`allow_linked` is false) in `skill_runtime.zig`.
+    const f = fixture(() => completion("glm-model", "reply"));
+    let session: TmuxSession | null = null;
+    try {
+      const folder = makeModFolder(f, "linked", { name: "linked", version: "1.0.0", description: "Linked" }, { "skills/plain-skill/SKILL.md": skillMd("plain-skill", "Plain") });
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+      writeFile(join(f.home, "outside"), "evil-skill/SKILL.md", skillMd("evil-skill", "Evil"));
+      symlinkSync(join(f.home, "outside", "evil-skill"), join(storeVersion(f, "linked"), "skills", "evil-skill"));
+
+      session = await openTui(f);
+      await session.waitForComposer(TIMEOUT_MS);
+      await session.sendText("/skills list");
+      const pane = await waitForPane(session, p => p.includes("mod linked"));
+      expect(pane).toContain("plain-skill");
+      expect(pane).not.toContain("evil-skill");
+    } finally {
+      if (session) await session.kill();
+      f.close();
+    }
+  }, 90000);
+
+  test("a mod profile whose prompt.md links outside the mod never sends the outside text", async () => {
+    // Defense: `readProfile` reads with `within` set to the mod folder, so a link out
+    // fails with `OutsideRepository` ("it links outside the mod...") in profiles.zig.
+    const f = spawnFixture("linked-helper");
+    try {
+      const folder = makeModFolder(f, "linked-profile", { name: "linked-profile", version: "1.0.0", description: "Linked" }, profileFiles("linked-helper", "LINKED_HELPER_MARKER"));
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+      writeFile(join(f.home, "outside"), "prompt.md", "OUTSIDE_PROMPT_MARKER");
+      const prompt = join(storeVersion(f, "linked-profile"), "agents", "linked-helper", "prompt.md");
+      rmSync(prompt);
+      symlinkSync(join(f.home, "outside", "prompt.md"), prompt);
+
+      const result = await spawnAsk(f);
+      expect(result.code, result.stderr).toBe(0);
+      expect(sentSince(f, 0)).not.toContain("OUTSIDE_PROMPT_MARKER");
+      expect(sentSince(f, 0)).not.toContain("LINKED_HELPER_MARKER");
+      expect(sentSince(f, 0)).toContain("links outside the mod");
+      expect(sentSince(f, 0)).not.toContain("links outside the repository");
+    } finally {
+      f.close();
+    }
+  }, 90000);
+
+  test.skipIf(!tmuxAvailable())("a mod theme file that links outside the mod does not load", async () => {
+    // Defense: the theme loader lists a mod's `themes/` and skips any entry that is
+    // not a regular file (`item.kind != .file` in `theme.zig`), so a link is never read.
+    const f = fixture(body => completion(body.model, "themed `reply`"));
+    try {
+      const folder = makeModFolder(f, "theme-link", { name: "theme-link", version: "1.0.0", description: "Themes" }, {
+        "themes/good.json": themeFile("#00FF00"),
+        "themes/evil.json": themeFile("#FF0000"),
+      });
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+      writeFile(join(f.home, "outside"), "evil-theme.json", themeFile("#FF0000"));
+      const evil = join(storeVersion(f, "theme-link"), "themes", "evil.json");
+      rmSync(evil);
+      symlinkSync(join(f.home, "outside", "evil-theme.json"), evil);
+
+      // The control: a regular file in the same mod still loads.
+      expect(await themedEscapes(f, "good")).toContain("38;2;0;255;0");
+      const escapes = await themedEscapes(f, "evil");
+      expect(escapes).not.toContain("38;2;255;0;0");
+    } finally {
+      f.close();
+    }
+  }, 90000);
+
+  test("a mod's agents/main does not change the main agent's prompt, or a subagent asked for main", async () => {
+    // Defense: `main` resolves to the built-in profile before any mod root
+    // (`profiles.zig`, `main_name` in the load paths).
+    const f = fixture(body => {
+      if (JSON.stringify(body.messages).includes("_MARKER")) return completion(body.model, "child reply");
+      if (!JSON.stringify(body.messages).includes("run helper")) return completion(body.model, "main reply");
+      const toolResults = body.messages.filter((message: any) => message.role === "tool").length;
+      if (toolResults === 0) {
+        return toolCompletion(body.model, "subagent", { action: "message", agent: "kid", profile: "main", message: "do the task" }, "call-spawn");
+      }
+      if (toolResults === 1) return toolCompletion(body.model, "subagent", { action: "wait" }, "call-wait");
+      return completion(body.model, "parent done");
+    });
+    try {
+      const folder = makeModFolder(f, "main-mod", { name: "main-mod", version: "1.0.0", description: "Main" }, profileFiles("main", "MOD_MAIN_MARKER"));
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+
+      const mainAsk = await runFx(["ask", "--json", "--provider", "local", "--model", "local-model", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      expect(mainAsk.code, mainAsk.stderr).toBe(0);
+      expect(JSON.parse(mainAsk.stdout).output).toContain("main reply");
+      expect(sentSince(f, 0)).not.toContain("MOD_MAIN_MARKER");
+
+      const spawned = await spawnAsk(f);
+      expect(spawned.code, spawned.stderr).toBe(0);
+      expect(sentSince(f, 0)).not.toContain("MOD_MAIN_MARKER");
+    } finally {
+      f.close();
+    }
+  }, 90000);
 });
