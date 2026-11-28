@@ -49,10 +49,11 @@ pub const ProcessInstanceToken = struct {
             {
                 return error.InvalidProcessInstanceToken;
             }
-            macos_start = .{
-                .seconds = try std.fmt.parseInt(u64, start_sec, 10),
-                .microseconds = try std.fmt.parseInt(u64, start_usec, 10),
-            };
+            const seconds = std.fmt.parseInt(u64, start_sec, 10) catch
+                return error.InvalidProcessInstanceToken;
+            const microseconds = std.fmt.parseInt(u64, start_usec, 10) catch
+                return error.InvalidProcessInstanceToken;
+            macos_start = .{ .seconds = seconds, .microseconds = microseconds };
         } else {
             return error.InvalidProcessInstanceToken;
         }
@@ -148,6 +149,14 @@ test "process instance tokens are canonical and require exact match" {
             "linux:00112233445566778899AABBCCDDEEFF:12345",
         ),
     );
+}
+
+test "parse returns only InvalidProcessInstanceToken" {
+    const parse_return = @typeInfo(@TypeOf(ProcessInstanceToken.parse)).@"fn".return_type.?;
+    const parse_errors = @typeInfo(@typeInfo(parse_return).error_union.error_set).error_set;
+    const names = parse_errors.error_names orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("InvalidProcessInstanceToken", names[0]);
 }
 
 test "a macOS token carries its start time and a Linux token carries none" {

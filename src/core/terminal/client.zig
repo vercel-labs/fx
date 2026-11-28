@@ -2014,16 +2014,29 @@ fn readableOrAtEnd(fd: std.posix.fd_t, timeout_ms: i32) !bool {
             timeout: *std.c.timeval,
         ) c_int;
     };
-    var read_set: system.FdSet = .{ .bits = @splat(0) };
+    const fd_set_bits = @bitSizeOf(@FieldType(system.FdSet, "bits"));
+    if (fd < 0 or fd >= fd_set_bits) return error.TestFdOutsideSelectRange;
     const index: usize = @intCast(@divFloor(fd, 32));
-    read_set.bits[index] |= @as(u32, 1) << @intCast(@mod(fd, 32));
+    const bit = @as(u32, 1) << @intCast(@mod(fd, 32));
     var timeout: std.c.timeval = .{
         .sec = @divFloor(timeout_ms, 1000),
         .usec = @mod(timeout_ms, 1000) * 1000,
     };
-    const ready = system.select(fd + 1, &read_set, null, null, &timeout);
+    var ready: c_int = undefined;
+    while (true) {
+        // select leaves the set unspecified after it fails, so each try builds it again.
+        var read_set: system.FdSet = .{ .bits = @splat(0) };
+        read_set.bits[index] = bit;
+        ready = system.select(fd + 1, &read_set, null, null, &timeout);
+        if (ready >= 0 or std.c.errno(ready) != .INTR) break;
+    }
     if (ready < 0) return error.TestSelectFailed;
     return ready > 0;
+}
+
+test "readableOrAtEnd rejects an fd past the select set on macOS" {
+    if (comptime builtin.target.os.tag != .macos) return error.SkipZigTest;
+    try std.testing.expectError(error.TestFdOutsideSelectRange, readableOrAtEnd(1024, 0));
 }
 
 /// A process a test started, with the identity it had, so the test ends it by
