@@ -1991,6 +1991,69 @@ describe("MCP login", () => {
     }
   }, 60_000);
 
+  // The macOS test above, on Linux, where revoke(2) does not exist: stdin-eio-linux.c
+  // answers stdin as a revoked terminal does once FX_STDIN_EIO_ARM exists, so
+  // the paste wait's read fails with EIO and the terminal no longer answers as one.
+  test.skipIf(process.platform !== "linux")("a terminal that reads EIO and stops answering as one ends fx mcp login --no-browser quietly on Linux", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const dir = join(root.root, "pty");
+    mkdirSync(dir);
+    const library = join(dir, "stdin-eio-linux.so");
+    const built = Bun.spawnSync(["cc", "-shared", "-fPIC", "-O2", "-Wall", "-Wextra", join(import.meta.dirname, "fixtures", "stdin-eio-linux.c"), "-o", library, "-ldl"]);
+    expect(built.stderr.toString()).toBe("");
+    expect(built.exitCode).toBe(0);
+    const arm = join(dir, "stdin-eio.arm");
+    const eioRecord = join(dir, "stdin-eio.record");
+    const pty = await PtySession.launch({
+      bin: FX_BIN,
+      args: ["mcp", "login", "--no-browser", "fixture"],
+      cwd: root.workspace,
+      dir,
+      env: {
+        HOME: root.home,
+        PATH: [root.bin, "/usr/bin", "/bin"].join(delimiter),
+        TERM: "xterm-256color",
+        FX_HOME: join(root.home, ".fx"),
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SOUND: "0",
+        FX_AUTO_UPGRADE: "0",
+        AI_GATEWAY_API_KEY: "fake-mcp-login-linux-eio-key",
+        LD_PRELOAD: library,
+        FX_STDIN_EIO_ARM: arm,
+        FX_STDIN_EIO_RECORD: eioRecord,
+      },
+    });
+    try {
+      expect(await pty.waitForOutput((text) => text.includes("paste the address"), 15_000)).toBe(true);
+      // fx waits for a pasted address; then the terminal starts failing.
+      expect(await pty.waitForQuietOutput(300, 15_000)).toBe(true);
+      writeFileSync(arm, "");
+      const exit = await pty.waitForExit(5_000);
+      // A spin shows in CPU, and in how many passes fx made on the failing terminal.
+      const passes = () => (existsSync(eioRecord) ? readFileSync(eioRecord, "utf8").split("\n").length : 0);
+      let spinning = false;
+      if (!exit) {
+        const cpuBefore = pty.cpuSeconds() ?? 0;
+        const passesBefore = passes();
+        await Bun.sleep(1_000);
+        spinning = (pty.cpuSeconds() ?? 0) - cpuBefore >= 0.5 || passes() - passesBefore >= 100;
+      }
+      expect({ exit, spinning }).toEqual({ exit: { code: 129, signal: null }, spinning: false });
+      expect(pty.stderr()).toBe("");
+      expect(readFileSync(eioRecord, "utf8")).toContain("read-eio");
+      expect(readFileSync(eioRecord, "utf8")).toContain("isatty-0");
+      // The sign-in never got past its address: nothing was approved or exchanged, and nothing was saved.
+      expect(auth.authorizationRequests).toBe(0);
+      expect(auth.tokenExchanges).toBe(0);
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(await statusOf(root)).not.toBe("signed_in");
+    } finally {
+      await pty.dispose();
+    }
+  }, 60_000);
+
   test("fx mcp login takes only its own return: a stray return and a silent connection don't end or hold up the sign-in", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
