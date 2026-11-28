@@ -97,6 +97,9 @@ pub const Status = struct {
     /// The HTTP status behind `list_refusal` when it says the server is temporarily unavailable (429, 503), else 0.
     /// A number, so it copies like one. Only an HTTP server has one, and the shared owner runs stdio servers only.
     list_unavailable: u16 = 0,
+    /// The first tool list of the server's process is on its way (`Server.listingFirstTools`): `tools` says 0 only
+    /// because none came yet.
+    tools_pending: bool = false,
     /// How many tools of the list the server serves fx left out, by reason (`Server.droppedTools`). Plain counts: it
     /// holds no words and copies like a number.
     dropped: tools.Dropped = .{},
@@ -233,6 +236,7 @@ pub const Engine = struct {
             .last_error = slot.last_error,
             .list_refusal = if (slot.server) |s| s.listRefusal() else null,
             .list_unavailable = if (slot.server) |s| s.listUnavailable() else 0,
+            .tools_pending = if (slot.server) |s| s.listingFirstTools() else false,
             .dropped = if (slot.server) |s| s.droppedTools() else .{},
             .exit = if (slot.server) |s| s.exitStatus() else null,
             .stray_line = if (slot.server) |s| s.strayLine() else null,

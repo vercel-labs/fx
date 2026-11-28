@@ -2316,7 +2316,7 @@ pub fn Runtime(comptime App: type) type {
         fn noticeScreen(app: *App, agent: *AppAgent) auth_runtime.NoticeScreen {
             if (comptime !@hasField(App, "main_agent")) return auth_runtime.main_notice_screen;
             if (agent == &app.main_agent) return auth_runtime.main_notice_screen;
-            if (comptime !@hasField(AppAgent, "screen_id")) return @intFromPtr(agent);
+            if (comptime !agents.hasAgentField(App, "screen_id")) return @intFromPtr(agent);
             return agent.screen_id;
         }
 

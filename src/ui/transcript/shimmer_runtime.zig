@@ -221,7 +221,7 @@ fn paintPlannedActivityRow(
         .thinking, .live => writeThinkingBlinkText(
             &buf,
             preview.bytes,
-            input.thinking_blink orelse markerBlinkVisible(input.shimmer_pos),
+            input.thinking_blink orelse render_request.markerBlinkVisible(input.shimmer_pos),
         ),
         .tool_marker => writeToolMarkerBlinkText(&buf, preview.bytes, input.shimmer_pos),
         .neutral => writeStaticStyledText(&buf, preview.bytes, ui_render.dim_style),
@@ -252,13 +252,6 @@ fn paintPlannedActivityRow(
         .row = row,
         .overlay = overlay,
     };
-}
-
-// A steady on/off blink with no fade. Folding in the padding keeps the phase
-// non-negative so the blink wraps seamlessly across the fixed cycle.
-fn markerBlinkVisible(shimmer_pos: i16) bool {
-    const half = render_request.blink_half_period_frames;
-    return @mod(shimmer_pos + render_request.animation_padding, 2 * half) < half;
 }
 
 fn writeThinkingBlinkText(out: []u8, label: []const u8, marker_visible: bool) []const u8 {
@@ -307,17 +300,6 @@ test "thinking blink keeps the counter bright and dims only the token suffix" {
     try std.testing.expect(std.mem.find(u8, plain, ui_render.dim_style) == null);
 }
 
-test "marker blink is on and off for equal halves of the 40-frame cycle" {
-    var on: usize = 0;
-    var pos: i16 = -8;
-    while (pos <= 31) : (pos += 1) {
-        if (markerBlinkVisible(pos)) on += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 20), on);
-    try std.testing.expect(!markerBlinkVisible(31));
-    try std.testing.expect(markerBlinkVisible(-8));
-}
-
 fn writeStaticStyledText(out: []u8, label: []const u8, style: []const u8) []const u8 {
     const required = style.len + label.len + ui_render.reset_style.len;
     if (required > out.len) return label;
@@ -358,7 +340,7 @@ fn writeToolMarkerBlinkText(out: []u8, label: []const u8, shimmer_pos: i16) []co
 
     var marker_buf: [64]u8 = undefined;
     var marker_writer: std.Io.Writer = .fixed(&marker_buf);
-    if (markerBlinkVisible(shimmer_pos)) {
+    if (render_request.markerBlinkVisible(shimmer_pos)) {
         marker_writer.print("{s}{s}{s}", .{
             ui_render.permission_auto_style,
             label[marker_start..marker_end],

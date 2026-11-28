@@ -677,13 +677,13 @@ pub fn Runtime(comptime App: type) type {
             return error.ContextCompactionPersistenceUnavailable;
         }
 
-        pub fn propagateGrant(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
+        pub fn propagateGrant(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
             if (comptime @hasDecl(App, "propagateGrant")) {
-                try app.propagateGrant(tool_name, target_path);
+                try app.propagateGrant(tool_name, target_path, shell_epoch);
                 return;
             }
-            try app_permission_runtime.Runtime(App).allowAtOnce(app, agent, tool_name, target_path);
-            try agent.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path);
+            try app_permission_runtime.Runtime(App).allowAtOnce(app, agent, tool_name, target_path, shell_epoch);
+            try agent.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path, shell_epoch);
         }
 
         pub fn pushEvent(app: *App, agent: *AppAgent, event: WorkerEvent) !void {
@@ -1096,12 +1096,22 @@ pub fn Runtime(comptime App: type) type {
             syncState(app, agent, event_handlers.tool_lifecycle);
 
             const now_ms = io_mod.milliTimestamp();
-            _ = advanceVisibleAnimation(
+            const advanced = advanceVisibleAnimation(
                 app,
                 agent,
                 event_handlers.tool_lifecycle,
                 now_ms,
             );
+            if (!advanced) _ = advanceLoadingMarkerBlink(app, now_ms);
+        }
+
+        /// Keeps frames coming while the footer shows a loading marker, such
+        /// as a server that connects in `/mcp`, so the marker blinks with or
+        /// without a turn.
+        fn advanceLoadingMarkerBlink(app: *App, now_ms: i64) bool {
+            if (comptime !@hasField(@TypeOf(app.shell), "loading_marker_active")) return false;
+            if (!app.shell.loading_marker_active) return false;
+            return app.shell.render_requests.requestAnimationDue(now_ms);
         }
 
         fn advanceVisibleAnimation(
@@ -1663,7 +1673,9 @@ pub fn Runtime(comptime App: type) type {
                         // composer; it closes first and gives back the draft
                         // it set aside, so the rule below sees the real draft.
                         if (comptime @hasDecl(@TypeOf(app.input_runtime), "cancelEffortMenu")) {
-                            _ = app.input_runtime.cancelEffortMenu(app.alloc, "failed_prompt_restored");
+                            if (app.input_runtime.cancelEffortMenu(app.alloc, "failed_prompt_restored")) {
+                                app.shell.render_requests.request(.footer);
+                            }
                         }
                         // Never clobber a draft the user typed while the doomed
                         // turn was still retrying; only an empty composer gets
@@ -2124,7 +2136,7 @@ const FakeWorker = struct {
         self.propagated_history_turns += 1;
     }
 
-    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
+    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8, _: u64) !void {
         _ = alloc;
         _ = tool_name;
         _ = target_path;
@@ -2252,6 +2264,7 @@ const FakeCommandOutputDisplay = struct {
 const FakeShell = struct {
     command_output_display: FakeCommandOutputDisplay = .{},
     shimmer_active: bool = false,
+    loading_marker_active: bool = false,
     native_history_active: bool = false,
     render_requests: render_request.RenderRequestState = .{},
     lifecycle: transcript_runtime.TranscriptRuntime = .{
@@ -3267,6 +3280,24 @@ test "core.app_worker_runtime ticks animation for completed assistant presentati
     app.agent().question_prompt.active = false;
     app.agent().approval_prompt.force_active = true;
     app.shell.render_requests.animation_next_deadline_ms = 1;
+    try tickNoop(&app);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
+}
+
+test "core.app_worker_runtime keeps frames coming for a footer loading marker while idle, and stops when it goes" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    // A server loads in `/mcp`: no turn, no activity row, only the marker.
+    app.shell.loading_marker_active = true;
+    app.shell.render_requests.animation_visible = true;
+    app.shell.render_requests.animation_next_deadline_ms = 1;
+    try tickNoop(&app);
+    try std.testing.expect(app.shell.render_requests.hasReason(.animation));
+
+    // Everything loaded: the next frame showed no marker, so no more frames.
+    app.shell.loading_marker_active = false;
+    app.shell.render_requests = .{ .animation_visible = true, .animation_next_deadline_ms = 1 };
     try tickNoop(&app);
     try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
 }

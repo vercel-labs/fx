@@ -566,7 +566,7 @@ function sameTurn(base: (body: string) => Response, gates: { later?: Gate; child
   };
 }
 
-// Whether the trace log at `path` holds `text` yet.
+// Waits until `done` holds, and fails after `ms` naming `what`.
 async function until(what: string, done: () => boolean, ms = 30_000) {
   const deadline = Date.now() + ms;
   while (!done()) {
@@ -575,6 +575,7 @@ async function until(what: string, done: () => boolean, ms = 30_000) {
   }
 }
 
+// Whether the trace log at `path` holds `text` yet.
 function traceHas(path: string, text: string): boolean {
   return existsSync(path) && readFileSync(path, "utf8").includes(text);
 }
