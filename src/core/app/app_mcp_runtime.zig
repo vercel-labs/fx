@@ -1321,7 +1321,7 @@ pub fn trustFolderWithAttempt(app: anytype, attempt_value: config_runtime.Commit
     try app.writeDomainNotice(.{
         .topic = "mcp",
         .tone = .neutral,
-        .body = "Trusted this folder. fx starts the servers in its .mcp.json, now and when more are added.",
+        .body = "Trusted this folder. fx starts the servers in its .mcp.json now, and servers added later when fx next starts.",
     }, true);
 }
 

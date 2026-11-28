@@ -3042,7 +3042,7 @@ test "trustFolder reloads host and writes neutral notice on success, and warning
     try std.testing.expectEqualStrings("mcp", app.notice_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
     try std.testing.expectEqualStrings(
-        "Trusted this folder. fx starts the servers in its .mcp.json, now and when more are added.",
+        "Trusted this folder. fx starts the servers in its .mcp.json now, and servers added later when fx next starts.",
         app.notice_body.items,
     );
 
