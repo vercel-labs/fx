@@ -273,6 +273,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_MONITOR_GAP_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SHELL_QUIET_NOTICE_MS": {
       "job": "test",
       "stability": "internal"

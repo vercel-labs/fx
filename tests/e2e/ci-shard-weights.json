@@ -66,6 +66,7 @@
   { "file": "tui-resume-brutal.test.ts", "weight": 18 },
   { "file": "tui-host-switch.test.ts", "weight": 10 },
   { "file": "tui-mcp-http-many-servers.test.ts", "weight": 5 },
+  { "file": "tui-monitor.test.ts", "weight": 150 },
   { "file": "tui-resume.test.ts", "weight": 289 },
   { "file": "tui-program-resume.test.ts", "weight": 61 },
   { "file": "tui-slash-commands.test.ts", "weight": 5 },

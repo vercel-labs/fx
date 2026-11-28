@@ -207,7 +207,9 @@ fn permissionNameForCall(input: Input, arena: Allocator, call: ToolCall) ![]cons
     if (call.toolbox_lookup) |lookup| return lookup.permission;
     const command_call = try isRunCommandCall(input, arena, call);
     if (command_call) return "run_command";
-    return if (std.mem.eql(u8, call.name, "shell")) "terminal" else call.name;
+    // The monitor tool's list and stop are the shell tool's kind of action on
+    // the agent's own commands, so the terminal rules cover them too.
+    return if (std.mem.eql(u8, call.name, "shell") or std.mem.eql(u8, call.name, "monitor")) "terminal" else call.name;
 }
 
 fn permissionTargetKindForCall(
@@ -3317,6 +3319,36 @@ test "permission target failures name the unresolved path without hiding runtime
     }
 }
 
+test "a monitor start is judged as a command run, and its list and stop as terminal actions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    const input: Input = .{
+        .workspace_root = "/tmp/workspace",
+        .permission_grants = &.{},
+        .permission_rules = .{},
+        .tool_registry = test_admission_registry,
+        .worker = &worker,
+        .advertised_dynamic_tool_names = &.{},
+        .mcp_runtime = .{},
+    };
+    const start: ToolCall = .{ .id = "s", .name = "monitor", .arguments_json = "{\"action\":\"start\",\"command\":\"gh pr checks 1 --watch\"}" };
+    const list: ToolCall = .{ .id = "l", .name = "monitor", .arguments_json = "{\"action\":\"list\"}" };
+    const stop: ToolCall = .{ .id = "x", .name = "monitor", .arguments_json = "{\"action\":\"stop\",\"id\":\"shell-1\"}" };
+    const shell_stop: ToolCall = .{ .id = "y", .name = "shell", .arguments_json = "{\"action\":\"stop\",\"session_id\":\"shell-1\"}" };
+    // The same rules and grants as a shell run of that command.
+    try std.testing.expectEqualStrings("run_command", try permissionNameForCall(input, arena, start));
+    const command = try runCommandContext(input, arena, start);
+    try std.testing.expectEqualStrings("gh pr checks 1 --watch", command.command);
+    // The same kind as the shell tool's own list-like and stop actions.
+    try std.testing.expectEqualStrings("terminal", try permissionNameForCall(input, arena, list));
+    try std.testing.expectEqualStrings("terminal", try permissionNameForCall(input, arena, stop));
+    try std.testing.expectEqualStrings("terminal", try permissionNameForCall(input, arena, shell_stop));
+    try std.testing.expectError(error.NotRunCommand, runCommandContext(input, arena, list));
+}
+
 test "permission target resolution and outcome report unsupported tty shell to the model" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -4558,6 +4590,7 @@ const test_admission_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.glob_files,
     test_builtin_tools.shell,
     test_builtin_tools.shell,
+    test_builtin_tools.monitor,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
 } };

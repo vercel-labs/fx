@@ -21,6 +21,7 @@ const session_child_store = @import("../session/session_child_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
+const monitor = @import("../monitor/monitor.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
@@ -289,6 +290,9 @@ pub const DispatchContext = struct {
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     command_artifact_dir: ?[]const u8 = null,
     managed_executions: ?*managed_execution.Runtime = null,
+    /// The agent's monitors. Set only where monitors run, the terminal UI's
+    /// main agent; a `monitor` call without it says so.
+    monitors: ?*monitor.Registry = null,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,

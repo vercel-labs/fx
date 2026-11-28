@@ -1599,6 +1599,42 @@ export const PROBES: Probe[] = [
   },
 ];
 
+// A monitor start: the action and a command, with no field the tool lacks.
+function validMonitorStart(input: Record<string, unknown> | null): boolean {
+  return (
+    input?.action === "start" &&
+    typeof input.command === "string" &&
+    input.command.trim().length > 0 &&
+    Object.keys(input).every((key) => ["action", "command", "label"].includes(key))
+  );
+}
+
+const startsMonitor = (calls: ProbeCall[]) => ok(calls.some((c) => c.name === "monitor" && validMonitorStart(c.input)), "started a monitor with a valid call");
+const noMonitor = (calls: ProbeCall[]) => ok(!calls.some((c) => c.name === "monitor"), "did not start a monitor");
+
+// The monitor tool in a terminal request: `adopt-*` asks for what a monitor is
+// for, and `route-*` asks for ordinary work that must stay with the shell
+// tool. Run each against a body without the tool (arm A) and with it (arm B).
+export const MONITOR_PROBES: Probe[] = [
+  { id: "adopt-ci", tool: "monitor", prompt: "Watch the CI checks on pull request 2431 in this repository, and tell me when they all finish.", check: startsMonitor },
+  { id: "adopt-log", tool: "monitor", prompt: "Follow build.log and let me know as soon as it prints an error.", check: startsMonitor },
+  { id: "adopt-poll", tool: "monitor", prompt: "Check https://status.example.com/health once a minute and tell me when it stops answering 200.", check: startsMonitor },
+  { id: "route-build", tool: "monitor", prompt: "Run zig build and tell me whether it passes.", check: noMonitor },
+  { id: "route-status", tool: "monitor", prompt: "Run git status and summarize it.", check: noMonitor },
+  { id: "route-list", tool: "monitor", prompt: "List the files in the src directory.", check: noMonitor },
+  { id: "route-wait", tool: "monitor", prompt: "Run sleep 5, then tell me what the date is.", check: noMonitor },
+  // Held out: worded after the text under test was written, and not used to tune it.
+  { id: "adopt-deploy", tool: "monitor", prompt: "Let me know when the deploy at https://staging.example.com starts serving build id abc123.", check: startsMonitor },
+  { id: "adopt-queue", tool: "monitor", prompt: "Keep an eye on queue.txt and tell me if the number in it ever goes above 100.", check: startsMonitor },
+  { id: "adopt-wait", tool: "monitor", prompt: "The migration prints its progress to migrate.out. Wait for it to finish and tell me how it went.", check: startsMonitor },
+  { id: "route-tests", tool: "monitor", prompt: "Run the unit tests once and show me any failures.", check: noMonitor },
+  { id: "route-fetch", tool: "monitor", prompt: "Download https://example.com/data.json with curl and tell me how big it is.", check: noMonitor },
+  { id: "route-sleep", tool: "monitor", prompt: "Run sleep 8 && echo done and tell me what it printed.", check: noMonitor },
+  { id: "route-slow", tool: "monitor", prompt: "Run the full test suite, wait for it to finish, and tell me how many tests failed.", check: noMonitor },
+];
+
+PROBES.push(...MONITOR_PROBES);
+
 async function probeOnce(body: Record<string, unknown>, model: string, prompt: string, testKey: string): Promise<{ calls: ProbeCall[]; usage: Usage | null; text: string; error?: string }> {
   const request: Record<string, unknown> = structuredClone(body);
   const messages = request.prompt as Array<Record<string, unknown>>;

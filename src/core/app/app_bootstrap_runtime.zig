@@ -609,6 +609,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !host_target.is_wasm and @hasField(App, "sandbox_policy")) {
                 if (startup.sandbox_execution) app.sandbox_policy = sandbox_policy.loadForProcess(app.alloc);
             }
+            if (comptime @hasField(App, "monitor_enabled")) app.monitor_enabled = startup.monitor;
             app.fast_mode = startup.fast_mode;
             app.input_runtime.slash_menu_categories = startup.slash_menu_categories;
             app.shell.collapse_tool_calls = startup.collapse_tool_calls;

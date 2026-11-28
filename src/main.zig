@@ -62,6 +62,7 @@ const app_session_runtime = @import("core/app/app_session_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
 const app_agents_runtime = @import("core/app/app_agents_runtime.zig");
+const app_monitor_runtime = @import("core/app/app_monitor_runtime.zig");
 const render_input = @import("ui/footer/render_input.zig");
 const app_profile_runtime = @import("core/app/app_profile_runtime.zig");
 const app_instances_runtime = @import("core/app/app_instances_runtime.zig");
@@ -434,6 +435,7 @@ const App = struct {
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const AgentsAppRuntime = app_agents_runtime.Runtime(Self);
+    const MonitorAppRuntime = app_monitor_runtime.Runtime(Self);
     const InstancesAppRuntime = app_instances_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
@@ -577,6 +579,13 @@ const App = struct {
         self.shell.writeProgramResume(&self.metrics, report);
     }
 
+    /// A quit the user chose: the next resume has no monitors to restart.
+    pub fn clearMonitorRecord(self: *Self) void {
+        if (comptime !host_target.is_wasm) {
+            if (self.monitor_enabled) MonitorAppRuntime.clearRecord(self);
+        }
+    }
+
     pub fn clearProgramResume(self: *Self) void {
         SessionAppRuntime.clearProgramResume(self);
     }
@@ -677,6 +686,10 @@ const App = struct {
     /// `experimental.sandbox_execution` is on. Null when it is off, or when the
     /// load ran out of memory. Destroyed at teardown, after the agents.
     sandbox_policy: ?*sandbox_policy.Policy = null,
+    /// `experimental.monitor`, read once at startup. While it is off the
+    /// monitor tool is not offered, the loop looks at no monitor, and no
+    /// record or file of one is kept.
+    monitor_enabled: bool = false,
     pacer: assistant_pacer.AssistantPacer = .{},
 
     terminal_client: terminal_client_runtime.Runtime = .{},
@@ -868,6 +881,9 @@ const App = struct {
                 // with the startup instances, or once the picker has chosen.
                 if (picks) app.instances.restore_on_pick = true else app.instances.restore_pending = true;
                 SessionAppRuntime.syncTerminalTitle(&app, &app.main_agent);
+                if (comptime !host_target.is_wasm) {
+                    if (app.monitor_enabled) MonitorAppRuntime.noteLeftRunning(&app);
+                }
             } else if (launch.upgrade_relaunch) |relaunch| {
                 SessionAppRuntime.writeUpgradeNotice(&app, app_version, build_update_channel, relaunch.previous_revision orelse "", build_revision) catch |err|
                     debug_trace.logf("session", "event=upgrade_notice_unavailable err={s}", .{@errorName(err)});
@@ -1208,6 +1224,7 @@ const App = struct {
         };
         self.terminal_client.deinit();
         main_agent.managed_executions.deinit();
+        main_agent.monitors.deinit();
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         self.credits_lookup.deinit();
@@ -2277,6 +2294,8 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = subagent_available,
+            // Monitors run for the main conversation only.
+            .monitor_available = !host_target.is_wasm and self.monitor_enabled and agent.child_run == null,
             .subagent_profiles = subagent_profiles,
             .behind_toolbox = self.toolbox_behind.slice(),
         }, .{ .runner = self.sandbox_policy != null });
@@ -3693,6 +3712,9 @@ const App = struct {
         // (`messageStartedBy`), so it stays right when that turn's end is
         // handled first.
         AgentsAppRuntime.takePosts(self);
+        if (comptime !host_target.is_wasm) {
+            if (self.monitor_enabled) MonitorAppRuntime.tick(self);
+        }
         try tickAgentInContext({}, self, self.screenAgent());
         // Every other agent keeps working while it is hidden, each handled in
         // its own context.

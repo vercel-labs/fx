@@ -466,6 +466,11 @@ pub fn Runtime(comptime App: type) type {
                     agent.managed_executions.replayStore()
                 else
                     null,
+                // Only the main conversation runs monitors; a subagent has none.
+                .monitors = if (comptime agents.hasAgentField(App, "monitors") and @hasField(App, "monitor_enabled"))
+                    (if (agent.child_run == null and app.monitor_enabled) &agent.monitors else null)
+                else
+                    null,
                 .session = &agent.session,
                 .session_allocator = app.alloc,
                 .skills_dir = app.skills.dir,

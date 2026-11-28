@@ -1619,6 +1619,7 @@ fn callInteract(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const session_id = input.session_id orelse return unavailable(ctx);
+    if (try refuseMonitor(ctx, session_id)) |refusal| return refusal;
     switch (ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
         return runtimeFailure(ctx, err)) {
         .indexed => {},
@@ -1651,12 +1652,24 @@ fn callInteract(
     return finishPrepared(withoutSteeringYield(ctx, yield_time_ms), runtime, &prepared, .command);
 }
 
+/// A monitor's command is the monitor tool's: a read or a stop here would take
+/// its output or its end from the events that carry them.
+fn refuseMonitor(ctx: tool_dispatch.DispatchContext, session_id: []const u8) Allocator.Error!?tool_dispatch.ToolResult {
+    const registry = ctx.monitors orelse return null;
+    if (!registry.contains(session_id)) return null;
+    return .{ .failure = try ctx.allocator.print(
+        "{f} is a monitor. Its output arrives as messages, and everything it printed is in the file each message names. Use the monitor tool with action=stop and id={f} to end it.",
+        .{ text_utils.terminalSafe(session_id), text_utils.terminalSafe(session_id) },
+    ) };
+}
+
 fn callStop(
     ctx: tool_dispatch.DispatchContext,
     input: Input,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const session_id = input.session_id orelse return unavailable(ctx);
+    if (try refuseMonitor(ctx, session_id)) |refusal| return refusal;
     switch (ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
         return runtimeFailure(ctx, err)) {
         .indexed => {},

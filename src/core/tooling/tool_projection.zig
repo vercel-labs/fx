@@ -14,6 +14,8 @@ pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
+    /// Whether this surface runs monitors: only the terminal UI does.
+    monitor_available: bool = false,
     /// Profiles main can start a subagent in, listed beside the `subagent` tool.
     subagent_profiles: []const profiles.Entry = &.{},
     /// Built-in tools fx lists in the toolbox menu instead of sending.
@@ -520,6 +522,12 @@ fn appendBuiltinTool(
     if (!tool.model_visible) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
+    if (std.mem.eql(u8, tool.name, "monitor")) {
+        if (!options.monitor_available) return;
+        // A monitor runs a command as the shell tool does, so a rule that
+        // takes the shell tool away takes it too.
+        if (options.permission_mode != .yolo and permissions.rulesDenyAllTargetsForTool(options.permission_rules, "shell")) return;
+    }
     // toolbox opens and runs these, so they stay out of the tools list
     // (`tests/tla/toolbox/Toolbox.tla` ToolsFixed), and with toolbox denied
     // they're denied too.

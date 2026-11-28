@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const host_target = @import("../core/hosts/target.zig");
 const build_options = @import("build_options");
+const host_target = @import("../core/hosts/target.zig");
 const builtin_gateway = @import("gateway.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_projection = @import("../core/tooling/tool_projection.zig");
@@ -24,6 +24,7 @@ const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
+const monitor_impl = @import("../tools/monitor/monitor.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
 const toolbox_impl = @import("../tools/capabilities/toolbox.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
@@ -499,6 +500,48 @@ pub fn shellProcessOnlySpec() ToolSpec {
     return shell_process_only;
 }
 
+const monitor_description =
+    "Watch something that takes time. Start a command, and its new output arrives as messages: you never poll it with shell or a subagent. To watch CI checks, logs, deploys or health checks, or to tell the user when something happens, start the monitor as your first step, before any check of your own: it reports errors and the end of the command too. A command that you run once to read its result belongs to shell, even if it takes a few seconds. A message arrives at most every 10 seconds. Monitors end with fx: start them again after a restart.";
+
+const monitor_properties = [_]model_tool_schema.Property{
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "start", "list", "stop" } } },
+    .{ .name = "command", .json_type = .string, .description = "For start: a shell command that prints a line for each event, such as gh pr checks 123 --watch." },
+    .{ .name = "label", .json_type = .string, .description = "For start: a short name for its messages." },
+    .{ .name = "id", .json_type = .string, .description = "For stop: the id start returned." },
+};
+
+/// The shell tool's captured run, held to what a monitor needs: the same
+/// permission review of its command, the same sandbox runner, and the same
+/// cleanup. `start` is the action that runs a command.
+pub const monitor = blk: {
+    var spec = shell;
+    spec.name = "monitor";
+    spec.description = monitor_description;
+    spec.model_schema = .{
+        .name = "monitor",
+        .description = monitor_description,
+        .input_schema = .{
+            .properties = &monitor_properties,
+            .required = &.{"action"},
+            .additional_properties = false,
+        },
+    };
+    spec.action_label = "Monitoring";
+    spec.completed_action_label = "Monitored";
+    spec.label_arg_default = "monitor request";
+    spec.presentation_fn = monitor_impl.presentation;
+    spec.decode = monitor_impl.decode;
+    spec.validate = monitor_impl.validate;
+    spec.call = monitor_impl.call;
+    spec.captured_command_action = "start";
+    spec.captured_command_fn = monitor_impl.isCapturedCommand;
+    spec.infer_action_fn = null;
+    spec.process_local_fn = monitor_impl.isProcessLocal;
+    spec.reads_only_fn = monitor_impl.readsOnly;
+    spec.irreversible_fn = monitor_impl.isIrreversible;
+    break :blk spec;
+};
+
 /// Which `shell` schema a surface advertises: the process-only form, and
 /// whether the `runner` field is on. The default is the plain `shell` schema.
 pub const ShellVariant = struct {
@@ -745,6 +788,8 @@ pub const all = [_]tool_dispatch.Tool{
     web_fetch,
     web_search,
     shell,
+    // A browser has no process to watch: its shell is a host bridge.
+    if (host_target.is_wasm) nameOnly(monitor) else monitor,
     install_skill,
     subagent,
     ask_user_question,
@@ -761,7 +806,12 @@ pub const registry = tool_dispatch.Registry{ .tools = if (build_options.builtin_
 
 const names_only = blk: {
     var tools: [all.len]tool_dispatch.Tool = undefined;
-    for (&tools, all) |*tool, real| tool.* = .{
+    for (&tools, all) |*tool, real| tool.* = nameOnly(real);
+    break :blk tools;
+};
+
+fn nameOnly(real: tool_dispatch.Tool) tool_dispatch.Tool {
+    return .{
         .name = real.name,
         .description = "",
         .model_schema = .{ .name = real.name, .description = "" },
@@ -771,8 +821,7 @@ const names_only = blk: {
         .reads_only_fn = unavailableReadsOnly,
         .irreversible_fn = unavailableIrreversible,
     };
-    break :blk tools;
-};
+}
 
 // A call that reaches a tool kept only by name gets the answer fx gives for
 // any tool it doesn't have, which the model can read and recover from.
@@ -835,6 +884,7 @@ pub const advertisement_order = [_][]const u8{
     "edit_file",
     "write_file",
     "shell",
+    "monitor",
     "subagent",
     "toolbox",
     "ask_user_question",
@@ -911,9 +961,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "c78ae877fb42327d4ed1ab58d95a32b492858a08cd1442600c5a9f8997a5114a"
+            "3bdb1dbc97eb46dee5f93089d42a4565b2a17b9794f4968c14ad91e0fb900549"
         else
-            "1c1204ee8981d61a12a5e85135ed2eb2617e972115a8c9196b4855ae5028a771",
+            "5a8304577f30c723af582f95800c0799d863c9e70453d2292deeff23857e13d8",
         &actual_hex,
     );
 }
@@ -1027,6 +1077,7 @@ test "built-in tools register exact active local order" {
         "web_fetch",
         "web_search",
         "shell",
+        "monitor",
         "install_skill",
         "subagent",
         "ask_user_question",

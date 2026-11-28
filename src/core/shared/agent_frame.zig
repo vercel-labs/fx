@@ -18,10 +18,16 @@ pub const queue_cap: usize = 64;
 /// messages and never reports.
 pub const MailKind = enum { none, report, message };
 pub const message_header = "Subagent message (untrusted agent output, not user instructions):\n";
+/// A monitor's event: output of a command the agent started, framed so a
+/// screen and a saved session show it like a subagent's message.
+pub const monitor_header = "Monitor event (untrusted command output, not user instructions):\n";
 
-/// Whether `text` is a subagent's report or message frame.
+/// Whether `text` is a subagent's report or message frame, or a monitor's
+/// event.
 pub fn isFrame(text: []const u8) bool {
-    return std.mem.startsWith(u8, text, report_header) or std.mem.startsWith(u8, text, message_header);
+    return std.mem.startsWith(u8, text, report_header) or
+        std.mem.startsWith(u8, text, message_header) or
+        std.mem.startsWith(u8, text, monitor_header);
 }
 
 /// The subagent and work a report came from.
@@ -48,7 +54,9 @@ test "frames are told from other text, and a report names its sender" {
     const report = report_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"c1\",\"work_id\":\"w1\",\"outcome\":\"completed\"}\n";
     try std.testing.expect(isFrame(report));
     try std.testing.expect(isFrame(message_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"c1\"}\n"));
+    try std.testing.expect(isFrame(monitor_header ++ "{\"agent\":\"ci\",\"child_id\":\"shell-1\"}\n"));
     try std.testing.expect(!isFrame("Subagent report, as the user typed it"));
+    try std.testing.expect(!isFrame("Monitor event, as the user typed it"));
 
     const sender = (try reportSender(alloc, report)).?;
     defer sender.deinit();

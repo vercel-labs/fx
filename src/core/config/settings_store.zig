@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const host_target = @import("../hosts/target.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
@@ -133,6 +134,8 @@ pub const UserSettingsPatch = struct {
     cache_warming: ?bool = null,
     /// `experimental.sandbox_execution`, the profile-only switch for sandboxed shell runs.
     experimental_sandbox_execution: ?bool = null,
+    /// `experimental.monitor`, the profile-only switch for the monitor tool.
+    experimental_monitor: ?bool = null,
     /// One `tool_placement.<tool>` entry.
     tool_placement: ?ToolPlacementPatch = null,
     /// One `shortcuts.<key>` entry: added, or removed when `action_json` is null.
@@ -170,6 +173,7 @@ pub const UserSettingsPatch = struct {
             self.context == null and
             self.cache_warming == null and
             self.experimental_sandbox_execution == null and
+            self.experimental_monitor == null and
             self.tool_placement == null and
             self.shortcut == null and
             self.remove == null;
@@ -1421,6 +1425,20 @@ fn applyUserPatchToRoot(
             break :blk root.object.getPtr("experimental").?;
         };
         application.changed = try putBool(arena, &experimental.object, "sandbox_execution", enabled) or application.changed;
+    }
+
+    // The browser build has no monitor tool, so it writes no such setting.
+    if (comptime !host_target.is_wasm) {
+        if (patch.experimental_monitor) |enabled| {
+            var experimental = if (root.object.getPtr("experimental")) |value| blk: {
+                if (value.* != .object) return error.InvalidSettingsFormat;
+                break :blk value;
+            } else blk: {
+                try root.object.put(arena, "experimental", .{ .object = .empty });
+                break :blk root.object.getPtr("experimental").?;
+            };
+            application.changed = try putBool(arena, &experimental.object, "monitor", enabled) or application.changed;
+        }
     }
 
     if (patch.statusline_item) |item_patch| {
