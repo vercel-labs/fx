@@ -1915,7 +1915,7 @@ test "deinitForProcessExit waits for an in-flight toggle to save mcp.json" {
     const registry: tool_dispatch.Registry = .{ .tools = &.{} };
     var state: State = .{};
     defer {
-        state.toggle_group.await(io_mod.getIo()) catch {};
+        state.toggle_group.await(io_mod.getIo()) catch |err| std.debug.panic("toggle await failed in test cleanup: {s}", .{@errorName(err)});
         state.process_exiting.store(false, .release);
         state.deinit();
     }
@@ -1925,6 +1925,7 @@ test "deinitForProcessExit waits for an in-flight toggle to save mcp.json" {
 
     const Releaser = struct {
         fn run(l: *io_mod.TimedAdvisoryLock, held: *bool) void {
+            // Keep mcp.lock held briefly so the toggle must wait; deinitForProcessExit awaits it regardless of timing.
             io_mod.sleep(150 * std.time.ns_per_ms);
             l.release();
             held.* = false;
