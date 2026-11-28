@@ -8804,7 +8804,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           sandbox: "none",
           permission_mode: "yolo",
           permission: {},
-          startup_scrollback: false,
           status_line: { context: true },
           yolo_acknowledged: true,
         }),

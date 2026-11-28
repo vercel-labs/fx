@@ -36,7 +36,6 @@ pub const SettingId = enum {
     ultrafast_mode,
     permission_mode,
     sound_level,
-    startup_scrollback,
     prompt_history,
 };
 
@@ -62,7 +61,6 @@ pub const Snapshot = struct {
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
     session_titles: bool = true,
-    startup_scrollback: bool = true,
     prompt_history: bool = true,
     sound_level: []const u8 = "on",
 
@@ -79,7 +77,6 @@ pub const Snapshot = struct {
             .slash_menu_categories => onOff(self.slash_menu_categories),
             .collapse_tool_calls => onOff(self.collapse_tool_calls),
             .session_titles => onOff(self.session_titles),
-            .startup_scrollback => onOff(self.startup_scrollback),
             .prompt_history => onOff(self.prompt_history),
             .sound_level => self.sound_level,
         };
@@ -192,14 +189,9 @@ pub const Menu = struct {
     category: Category = .all,
     selected_index: usize = 0,
     window_start: usize = 0,
-    startup_scrollback: bool = true,
 
     pub fn open(self: *Menu) void {
         self.* = .{ .active = true };
-    }
-
-    pub fn openWithStartupScrollback(self: *Menu, enabled: bool) void {
-        self.* = .{ .active = true, .startup_scrollback = enabled };
     }
 
     pub fn close(self: *Menu) void {
@@ -272,7 +264,6 @@ const specs = [_]Spec{
     .{ .id = .permission_mode, .category = .agent, .label = "Permission mode", .description = "Choose when fx asks before taking actions" },
     .{ .id = .session_titles, .category = .agent, .label = "Session titles", .description = "Generate a short session title from the first prompt" },
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max sounds and terminal bells" },
-    .{ .id = .startup_scrollback, .category = .advanced, .label = "Startup scrollback", .description = "Restore terminal output when fx starts" },
     .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts and slash commands for composer history" },
 };
 
@@ -358,7 +349,6 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         .slash_menu_categories,
         .collapse_tool_calls,
         .session_titles,
-        .startup_scrollback,
         .prompt_history,
         => &on_off_options,
         .sound_level => &sound_level_options,
@@ -416,24 +406,23 @@ test "settings catalog projects grouped searchable preferences" {
         .permission_mode = "ask",
         .statusline_context = true,
         .statusline_workspace = false,
-        .startup_scrollback = true,
         .prompt_history = true,
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 14), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 13), filteredCount(snapshot, .all, ""));
     try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
     try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
-    try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
+    try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .advanced, ""));
 
     const current_model = itemAt(snapshot, .all, "glm 5.2", 0).?;
     try std.testing.expectEqual(SettingId.model, current_model.id);
     try std.testing.expectEqualStrings("zai/glm-5.2", current_model.value);
 
-    const startup = itemAt(snapshot, .all, "restore startup", 0).?;
-    try std.testing.expectEqual(SettingId.startup_scrollback, startup.id);
-    try std.testing.expectEqualStrings("on", startup.value);
+    const history = itemAt(snapshot, .advanced, "", 0).?;
+    try std.testing.expectEqual(SettingId.prompt_history, history.id);
+    try std.testing.expectEqualStrings("on", history.value);
     try std.testing.expect(itemAt(snapshot, .all, "missing preference", 0) == null);
 }
 
@@ -458,7 +447,6 @@ test "settings catalog returns typed edit choices without effects" {
         .supports_fast_mode = true,
         .permission_mode = "ask",
         .statusline_context = true,
-        .startup_scrollback = true,
         .prompt_history = true,
         .sound_level = "on",
     };
@@ -508,7 +496,6 @@ test "settings menu navigates rows and changes selected values inline" {
         .fast_mode = true,
         .permission_mode = "ask",
         .statusline_context = true,
-        .startup_scrollback = true,
         .prompt_history = true,
         .sound_level = "on",
     };
@@ -533,9 +520,6 @@ test "settings menu navigates rows and changes selected values inline" {
     menu.category = .agent;
     menu.selected_index = 0;
     try std.testing.expect(menu.changeSelectedOption(&snapshot, "", 1) == null);
-
-    menu.openWithStartupScrollback(false);
-    try std.testing.expect(!menu.startup_scrollback);
 }
 
 test "notification level keeps the existing off on and max policy" {
