@@ -5973,6 +5973,8 @@ fn dupeToolResultMemory(
         .{ .command = try alloc.dupe(u8, crossing.command), .quiet_ms = crossing.quiet_ms }
     else
         null;
+    errdefer if (quiet_crossing) |crossing| alloc.free(crossing.command);
+    const opened_record = try types.dupeOpenedRecord(alloc, memory.opened_record);
     return .{
         .output_handle = output_handle,
         .preview = preview,
@@ -5986,6 +5988,7 @@ fn dupeToolResultMemory(
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
         .subagent_started = memory.subagent_started,
+        .opened_record = opened_record,
         .command_placement = memory.command_placement,
     };
 }
@@ -6002,6 +6005,7 @@ fn freeToolResultMemory(
         types.freeCommandOutputReplay(alloc, replay);
     }
     if (value.quiet_crossing) |crossing| alloc.free(@constCast(crossing.command));
+    types.freeOpenedRecord(alloc, value.opened_record);
 }
 
 fn makePrompt(alloc: std.mem.Allocator, text: []const u8, model: []const u8) !QueuedPrompt {

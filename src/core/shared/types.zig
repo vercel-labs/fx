@@ -1328,7 +1328,41 @@ pub const PersistedToolResult = struct {
     /// A `subagent` message that made a new subagent, which a v2 session
     /// saves as an item of its own beside the result (D101).
     subagent_started: bool = false,
+    /// What the saved call a `read_tool_result` call reopened did, which a v2
+    /// session saves as an item of its own beside the result (D104). Owned.
+    opened_record: ?OpenedRecord = null,
 };
+
+/// What the saved tool call a `read_tool_result` call reopened by its record
+/// ID did, read from the record's head when the call ran, so its row can say
+/// it the same way live and after a resume (D104). The model never sees it.
+pub const OpenedRecord = struct {
+    kind: Kind,
+    /// The one argument that names the saved call, such as the path it read
+    /// or the command it ran, as the call sent it.
+    target: []const u8,
+
+    pub const Kind = enum { read, search, run, fetch, edit, write, mcp };
+
+    /// The most bytes of a target fx saves; a call named by more gets no
+    /// record name.
+    pub const max_target_bytes = 1024;
+
+    /// Whether fx saves `target`, and reads it back on resume.
+    pub fn validTarget(target: []const u8) bool {
+        return target.len > 0 and target.len <= max_target_bytes and std.unicode.utf8ValidateSlice(target);
+    }
+};
+
+/// The caller owns the copy; free it with `freeOpenedRecord`.
+pub fn dupeOpenedRecord(alloc: std.mem.Allocator, record: ?OpenedRecord) !?OpenedRecord {
+    const value = record orelse return null;
+    return .{ .kind = value.kind, .target = try alloc.dupe(u8, value.target) };
+}
+
+pub fn freeOpenedRecord(alloc: std.mem.Allocator, record: ?OpenedRecord) void {
+    if (record) |value| alloc.free(value.target);
+}
 
 pub const CommandOutputReplayDescriptor = struct {
     handle: []const u8,
@@ -1519,6 +1553,8 @@ pub const ToolResultMemory = struct {
     /// A `subagent` message that made a new subagent, so its row reads
     /// "Started" rather than "Messaged". The model never sees it.
     subagent_started: bool = false,
+    /// What the saved call a `read_tool_result` call reopened did (D104).
+    opened_record: ?OpenedRecord = null,
     /// Where an admitted shell command ran, when admission placed it.
     /// Live memory only; saved sessions never write it (R3.5).
     command_placement: ?CommandPlacement = null,
@@ -1887,6 +1923,8 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .{ .command = try alloc.dupe(u8, crossing.command), .quiet_ms = crossing.quiet_ms }
     else
         null;
+    errdefer if (quiet_crossing) |crossing| alloc.free(crossing.command);
+    const opened_record = try dupeOpenedRecord(alloc, memory.opened_record);
     return .{
         .review_feedback = memory.review_feedback,
         .tool_images = tool_images,
@@ -1903,6 +1941,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
         .subagent_started = memory.subagent_started,
+        .opened_record = opened_record,
         .command_placement = memory.command_placement,
     };
 }
@@ -1917,6 +1956,7 @@ pub fn freeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
     if (memory.committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
     if (memory.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
     if (memory.quiet_crossing) |crossing| alloc.free(crossing.command);
+    freeOpenedRecord(alloc, memory.opened_record);
 }
 
 test "dupeToolResultMemory copies survive teardown of every source allocation" {
@@ -4025,6 +4065,8 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
     errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
     const tool_image_handle = if (result.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
     errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const opened_record = try dupeOpenedRecord(alloc, result.opened_record);
+    errdefer freeOpenedRecord(alloc, opened_record);
     const tool_images = try dupeToolImages(alloc, result.tool_images);
     return .{
         .tool_images = tool_images,
@@ -4047,6 +4089,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .command_process_presentation = result.command_process_presentation,
         .terminal_action_presentation = result.terminal_action_presentation,
         .subagent_started = result.subagent_started,
+        .opened_record = opened_record,
     };
 }
 
@@ -4063,6 +4106,7 @@ pub fn freePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolRe
         freeCommittedFilePresentation(alloc, presentation);
     }
     if (result.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    freeOpenedRecord(alloc, result.opened_record);
 }
 
 pub fn dupeCommandOutputReplay(

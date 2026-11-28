@@ -6,6 +6,7 @@ const json_depth = @import("../shared/json_depth.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -280,19 +281,35 @@ pub fn savedOutputNoun(handle: []const u8) []const u8 {
     return outputNoun(handle, "command", "saved");
 }
 
-fn recordNoun(kind: u8) []const u8 {
-    return switch (std.ascii.toUpper(kind)) {
-        'M' => "turn",
-        'T' => "tool call",
-        else => "compaction",
+/// A saved record a call opens: what it is, and its ID in upper case, such as
+/// "T5". `requestView` admits only a record ID: one letter, then digits.
+pub const OpenedRecordId = struct {
+    kind: Kind,
+    id: []u8,
+
+    pub const Kind = enum { turn, tool_call, compaction };
+};
+
+fn recordKind(letter: u8) OpenedRecordId.Kind {
+    return switch (std.ascii.toUpper(letter)) {
+        'M' => .turn,
+        'T' => .tool_call,
+        else => .compaction,
     };
 }
 
-/// A saved record by its kind and ID, such as "tool call T5". `requestView`
-/// admits only a record ID: one letter, then digits. The caller owns the
-/// result.
+fn recordNoun(kind: OpenedRecordId.Kind) []const u8 {
+    return switch (kind) {
+        .turn => "turn",
+        .tool_call => "tool call",
+        .compaction => "compaction",
+    };
+}
+
+/// A saved record by its kind and ID, such as "tool call T5". The caller
+/// owns the result.
 fn recordName(alloc: Allocator, handle: []const u8) Allocator.Error![]u8 {
-    return alloc.print("{s} {c}{s}", .{ recordNoun(handle[0]), std.ascii.toUpper(handle[0]), handle[1..] });
+    return alloc.print("{s} {c}{s}", .{ recordNoun(recordKind(handle[0])), std.ascii.toUpper(handle[0]), handle[1..] });
 }
 
 /// `query` as a row repeats it: terminal-safe, cut short past
@@ -390,15 +407,15 @@ pub fn outputSearch(alloc: Allocator, arguments_json: []const u8) Allocator.Erro
     return .{ .handle = handle, .quoted_query = try quotedQuery(alloc, view.query) };
 }
 
-/// The saved record a call opens, such as "tool call T5", without the
-/// "earlier" that `displayTarget` puts first. Null for any other request and
-/// for arguments `decode` rejects. The caller owns the result.
-pub fn openedRecordName(alloc: Allocator, arguments_json: []const u8) Allocator.Error!?[]u8 {
+/// The saved record a call opens, by ID, by a search of it, or by a later
+/// page. Null for any other request and for arguments `decode` rejects. The
+/// caller owns `id`.
+pub fn openedRecordId(alloc: Allocator, arguments_json: []const u8) Allocator.Error!?OpenedRecordId {
     var parsed = (try parseArguments(alloc, arguments_json)) orelse return null;
     defer parsed.deinit();
     const view = (try requestView(parsed.arena.allocator(), parsed.value.object)) orelse return null;
     if (view.kind != .record) return null;
-    return try recordName(alloc, view.handle);
+    return .{ .kind = recordKind(view.handle[0]), .id = try std.ascii.allocUpperString(alloc, view.handle) };
 }
 
 /// The row text for what a call reads: the output of the earlier call that
@@ -429,6 +446,104 @@ pub fn displayTarget(
             return try alloc.print("earlier {s}", .{name});
         },
         .images, .history_search => return null,
+    }
+}
+
+/// The argument that names a saved call of each tool a reopened record's row
+/// can name, and what the call did (D104).
+const NamingArgument = struct { tool: []const u8, kind: types.OpenedRecord.Kind, field: []const u8 };
+
+const naming_arguments = [_]NamingArgument{
+    .{ .tool = "read_file", .kind = .read, .field = "path" },
+    .{ .tool = "grep_files", .kind = .search, .field = "pattern" },
+    .{ .tool = "glob_files", .kind = .search, .field = "pattern" },
+    .{ .tool = "web_search", .kind = .search, .field = "query" },
+    .{ .tool = "shell", .kind = .run, .field = "command" },
+    .{ .tool = "web_fetch", .kind = .fetch, .field = "url" },
+    .{ .tool = "edit_file", .kind = .edit, .field = "path" },
+    .{ .tool = "write_file", .kind = .write, .field = "path" },
+};
+
+/// What the saved call at the start of a record did, by the one argument
+/// that names it: the path a read, edit, or write named, the pattern or query
+/// a search looked for, the command a run ran, the URL a fetch read, or the
+/// MCP tool a call used, also through `toolbox`. Null for a turn or an
+/// earlier compaction, a call that names none of these or names one longer
+/// than `OpenedRecord.max_target_bytes`, and a head that ends before the
+/// call's arguments do. The target lives in `arena`.
+pub fn openedRecord(arena: Allocator, head: []const u8) Allocator.Error!?types.OpenedRecord {
+    const call = compactor.recordedToolCall(head) orelse return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (parsed != .object) return null;
+    const args = (try tool_args.unwrapRequest(arena, parsed.object)) orelse return null;
+    return namedCall(call.tool, args);
+}
+
+fn namedCall(tool: []const u8, args: std.json.ObjectMap) ?types.OpenedRecord {
+    if (types.isMcpToolName(tool)) return withTarget(.mcp, tool);
+    if (std.mem.eql(u8, tool, "toolbox")) {
+        const run = tool_args.optionalStringArg(args, "run") orelse return null;
+        if (types.isMcpToolName(run)) return withTarget(.mcp, run);
+        // A built-in tool the toolbox ran is named as a direct call of it.
+        const inner = args.get("arguments") orelse return null;
+        if (inner != .object or std.mem.eql(u8, run, "toolbox")) return null;
+        return namedCall(run, inner.object);
+    }
+    for (naming_arguments) |naming| if (std.mem.eql(u8, tool, naming.tool)) {
+        return withTarget(naming.kind, tool_args.optionalStringArg(args, naming.field) orelse return null);
+    };
+    return null;
+}
+
+fn withTarget(kind: types.OpenedRecord.Kind, raw: []const u8) ?types.OpenedRecord {
+    const target = std.mem.trim(u8, raw, " \t\r\n");
+    if (!types.OpenedRecord.validTarget(target)) return null;
+    return .{ .kind = kind, .target = target };
+}
+
+test "a reopened record names its saved call by the argument that names it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Case = struct { head: []const u8, kind: ?types.OpenedRecord.Kind, target: []const u8 = "" };
+    const call_head = "Call ID: call-1\n\nArguments:\n";
+    const cases = [_]Case{
+        .{ .head = "T51 read_file: src/client.rs\n" ++ call_head ++ "{\"path\":\"src/client.rs\",\"start_line\":4}\n\nResult:\nfn main", .kind = .read, .target = "src/client.rs" },
+        // The index line joins every argument, so the pattern comes from the
+        // arguments, not from it.
+        .{ .head = "T7 grep_files: ws.ping src\n" ++ call_head ++ "{\"pattern\":\"ws.ping\",\"path\":\"src\"}\n\nResult:\n", .kind = .search, .target = "ws.ping" },
+        .{ .head = "T8 glob_files: **/*.rs\n" ++ call_head ++ "{\"pattern\":\"**/*.rs\"}\n\nResult:\n", .kind = .search, .target = "**/*.rs" },
+        .{ .head = "T8 web_search: zig 0.17\n" ++ call_head ++ "{\"query\":\"zig 0.17\"}\n\nResult:\n", .kind = .search, .target = "zig 0.17" },
+        .{ .head = "T9 shell: run git log /repo\n" ++ call_head ++ "{\"action\":\"run\",\"command\":\"git log\",\"cwd\":\"/repo\"}\n\nResult:\n", .kind = .run, .target = "git log" },
+        .{ .head = "T9 shell: run git log\n" ++ call_head ++ "{\"request\":{\"action\":\"run\",\"command\":\" git log \"}}\n\nResult:\n", .kind = .run, .target = "git log" },
+        .{ .head = "T10 web_fetch: https://example.com/a\n" ++ call_head ++ "{\"url\":\"https://example.com/a\"}\n\nResult:\n", .kind = .fetch, .target = "https://example.com/a" },
+        .{ .head = "T11 edit_file: src/a.rs x y\n" ++ call_head ++ "{\"path\":\"src/a.rs\",\"old_string\":\"x\",\"new_string\":\"y\"}\n\nResult:\n", .kind = .edit, .target = "src/a.rs" },
+        .{ .head = "T12 write_file: src/b.rs\n" ++ call_head ++ "{\"path\":\"src/b.rs\",\"content\":\"z\"}\n\nResult:\n", .kind = .write, .target = "src/b.rs" },
+        .{ .head = "T13 mcp_slack_read_thread: C1\n" ++ call_head ++ "{\"channel\":\"C1\"}\n\nResult:\n", .kind = .mcp, .target = "mcp_slack_read_thread" },
+        .{ .head = "T14 toolbox: mcp_slack_read_thread C1\n" ++ call_head ++ "{\"run\":\"mcp_slack_read_thread\",\"arguments\":{\"channel\":\"C1\"}}\n\nResult:\n", .kind = .mcp, .target = "mcp_slack_read_thread" },
+        .{ .head = "T15 toolbox: web_fetch https://example.com\n" ++ call_head ++ "{\"run\":\"web_fetch\",\"arguments\":{\"url\":\"https://example.com\"}}\n\nResult:\n", .kind = .fetch, .target = "https://example.com" },
+        // Calls with nothing that names them, and heads with no call.
+        .{ .head = "T16 toolbox: notes\n" ++ call_head ++ "{\"open\":\"notes\"}\n\nResult:\n", .kind = null },
+        .{ .head = "T17 subagent: message scout\n" ++ call_head ++ "{\"action\":\"message\",\"agent\":\"scout\"}\n\nResult:\n", .kind = null },
+        .{ .head = "T18 shell: stop s1\n" ++ call_head ++ "{\"action\":\"stop\",\"session_id\":\"s1\"}\n\nResult:\n", .kind = null },
+        .{ .head = "T19 read_file: \n" ++ call_head ++ "{\"path\":\"  \"}\n\nResult:\n", .kind = null },
+        .{ .head = "T20 read_file: x\n" ++ call_head ++ "{\"path\":\"" ++ text_utils.repeat("a", types.OpenedRecord.max_target_bytes + 1) ++ "\"}\n\nResult:\n", .kind = null },
+        .{ .head = "T21 read_file: x\n" ++ call_head ++ "not json\n\nResult:\n", .kind = null },
+        .{ .head = "T22 read_file: x\n" ++ call_head ++ "{\"path\":\"src/cl", .kind = null },
+        .{ .head = "M3 turn: hello\nUser 3:\nhello\n", .kind = null },
+        .{ .head = "L2 earlier compaction, through turn M9 and tool call T31\n", .kind = null },
+    };
+    for (cases) |case| {
+        const record = try openedRecord(arena, case.head);
+        if (case.kind) |kind| {
+            try std.testing.expectEqual(kind, record.?.kind);
+            try std.testing.expectEqualStrings(case.target, record.?.target);
+        } else {
+            try std.testing.expect(record == null);
+        }
     }
 }
 
@@ -504,11 +619,20 @@ test "read_tool_result searches and record opens give the parts a short row name
     try std.testing.expectEqualStrings("command", savedOutputNoun("fx-command-replay-0123.bin"));
     try std.testing.expectEqualStrings("saved", savedOutputNoun("result-x.txt"));
 
-    const record = (try openedRecordName(alloc, "{\"request\":{\"handle\":\"t5\"}}")).?;
-    defer alloc.free(record);
-    try std.testing.expectEqualStrings("tool call T5", record);
-    try std.testing.expect(try openedRecordName(alloc, "{\"handle\":\"result-x\"}") == null);
-    try std.testing.expect(try openedRecordName(alloc, "not json") == null);
+    const Case = struct { arguments_json: []const u8, kind: OpenedRecordId.Kind, id: []const u8 };
+    for ([_]Case{
+        .{ .arguments_json = "{\"request\":{\"handle\":\"t5\"}}", .kind = .tool_call, .id = "T5" },
+        .{ .arguments_json = "{\"handle\":\" m12 \",\"query\":\"retry\"}", .kind = .turn, .id = "M12" },
+        .{ .arguments_json = "{\"handle\":\"L2\",\"start_byte\":4097}", .kind = .compaction, .id = "L2" },
+    }) |case| {
+        const record = (try openedRecordId(alloc, case.arguments_json)).?;
+        defer alloc.free(record.id);
+        try std.testing.expectEqual(case.kind, record.kind);
+        try std.testing.expectEqualStrings(case.id, record.id);
+    }
+    try std.testing.expect(try openedRecordId(alloc, "{\"handle\":\"result-x\"}") == null);
+    try std.testing.expect(try openedRecordId(alloc, "{\"search\":\"T5\"}") == null);
+    try std.testing.expect(try openedRecordId(alloc, "not json") == null);
 }
 
 test "read_tool_result rows read a request sent as JSON text as they read an object" {

@@ -99,6 +99,9 @@ pub const ToolDetailRecord = struct {
     /// A `subagent` message that made a new subagent, as its host said
     /// live and its session saved (D101).
     subagent_started: bool = false,
+    /// What the saved call a `read_tool_result` call reopened did, as core
+    /// read it from the record live and its session saved (D104). Owned.
+    opened_record: ?types.OpenedRecord = null,
     /// Where an admitted shell command ran, from admission's placement
     /// (`ToolLifecycleEvent.authoritative_started.command_placement` and
     /// `ToolResultMemory.command_placement`). Null for any other call or a
@@ -133,6 +136,7 @@ pub const ToolDetailRecord = struct {
         if (self.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
         if (self.mcp_server) |value| alloc.free(value);
         if (self.mcp_tool) |value| alloc.free(value);
+        types.freeOpenedRecord(alloc, self.opened_record);
         self.* = undefined;
     }
 };

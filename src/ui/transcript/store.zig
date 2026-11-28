@@ -2008,6 +2008,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
     errdefer if (mcp_server) |value| alloc.free(value);
     const mcp_tool = if (source.mcp_tool) |value| try alloc.dupe(u8, value) else null;
     errdefer if (mcp_tool) |value| alloc.free(value);
+    const opened_record = try types.dupeOpenedRecord(alloc, source.opened_record);
 
     return .{
         .entry_id = source.entry_id,
@@ -2035,6 +2036,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .check_found_command_ended = source.check_found_command_ended,
         .resolved_path = resolved_path,
         .subagent_started = source.subagent_started,
+        .opened_record = opened_record,
         .command_placement = source.command_placement,
         .mcp_server = mcp_server,
         .mcp_tool = mcp_tool,
@@ -2121,6 +2123,20 @@ test "a snapshot copy of a tool detail keeps its subagent start mark" {
         defer copy.deinit(alloc);
         try std.testing.expectEqual(started, copy.subagent_started);
     }
+}
+
+test "a snapshot copy of a tool detail keeps what a reopened record's saved call did (D104)" {
+    const alloc = std.testing.allocator;
+    var copy = try cloneToolDetailForSnapshot(alloc, .{
+        .entry_id = 4,
+        .tool_name = @constCast("read_tool_result"),
+        .activity_kind = .read,
+        .arguments_json = @constCast("{\"handle\":\"T51\"}"),
+        .opened_record = .{ .kind = .search, .target = "ws.ping" },
+    });
+    defer copy.deinit(alloc);
+    try std.testing.expectEqual(types.OpenedRecord.Kind.search, copy.opened_record.?.kind);
+    try std.testing.expectEqualStrings("ws.ping", copy.opened_record.?.target);
 }
 
 fn cloneCommandLines(

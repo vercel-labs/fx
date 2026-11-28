@@ -3746,6 +3746,9 @@ pub const Session = struct {
             if (try encodeSubagentStarted(a, event)) |data| {
                 try batch.append(a, .{ .item = try self.itemAs(a, subagent_started_type, data) });
             }
+            if (try encodeOpenedRecord(a, event)) |data| {
+                try batch.append(a, .{ .item = try self.itemAs(a, opened_record_type, data) });
+            }
             if (event == .user and author != .user) {
                 try batch.append(a, .{ .item = try self.itemAs(a, author_type, try encodeAuthor(a, author)) });
             }
@@ -6818,6 +6821,10 @@ noinline fn replay(
                         try noteSubagentStarted(src, pa, &builder, piece);
                         continue;
                     }
+                    if (std.mem.eql(u8, piece.type, opened_record_type)) {
+                        try noteOpenedRecord(src, pa, &builder, piece);
+                        continue;
+                    }
                     if (std.mem.eql(u8, piece.type, author_type)) {
                         try builder.setUserAuthor(decodeAuthor(pa, try src.pieceData(pa, piece)));
                         continue;
@@ -7670,6 +7677,64 @@ fn decodeSubagentStarted(a: Allocator, data: []const u8) error{OutOfMemory}!?[]c
     return value.call_id;
 }
 
+/// The item right after the `tool_result` of a `read_tool_result` call that
+/// reopened a saved tool call, `{"call_id":…,"kind":"read","target":…}`, so a
+/// resume names the saved call as the live row did (D104). The result piece
+/// keeps its bytes: older fx versions reject an unknown field in a piece but
+/// skip an unknown item.
+const opened_record_type = "opened_record";
+
+const OpenedRecordData = struct { call_id: []const u8, kind: []const u8, target: []const u8 };
+
+/// The `opened_record` item data for `event`, or null when it needs none.
+/// The data is owned by `a`.
+fn encodeOpenedRecord(a: Allocator, event: Event) !?[]u8 {
+    const result = switch (event) {
+        .tool_result => |value| value,
+        else => return null,
+    };
+    const record = result.opened_record orelse return null;
+    if (result.call_id.len == 0 or result.call_id.len > session_event.max_conversation_identity_bytes) return error.InvalidConversationFrame;
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try std.json.Stringify.value(OpenedRecordData{ .call_id = result.call_id, .kind = @tagName(record.kind), .target = record.target }, .{}, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+/// Gives the turn's result an `opened_record` item names what its saved call
+/// did. One that can't be read, or names no `read_tool_result` result of the
+/// turn, is logged and left out, and the row names no saved call.
+fn noteOpenedRecord(src: Source, a: Allocator, builder: *session_log.ConversationTurnBuilder, piece: sm.Body.Piece) !void {
+    const data = src.pieceData(a, piece) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_opened_record_unreadable session={s} err={s} dropped=opened_record", .{ src.id, @errorName(err) });
+            return;
+        },
+    };
+    const value = try decodeOpenedRecord(a, data) orelse {
+        debug_trace.logf("session", "event=sessions_v2_opened_record_invalid session={s} dropped=opened_record", .{src.id});
+        return;
+    };
+    if (!try builder.attachOpenedRecord(value.call_id, value.record)) {
+        debug_trace.logf("session", "event=sessions_v2_opened_record_unmatched session={s} dropped=opened_record", .{src.id});
+    }
+}
+
+/// The call and saved call an `opened_record` item's data names, or null
+/// when the data isn't one, such as a kind a newer fx added. Fields a newer
+/// fx adds are ignored. The strings are in `a`.
+fn decodeOpenedRecord(a: Allocator, data: []const u8) error{OutOfMemory}!?struct { call_id: []const u8, record: types.OpenedRecord } {
+    const value = json_decode.parseFromSliceLeaky(OpenedRecordData, a, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (value.call_id.len == 0 or value.call_id.len > session_event.max_conversation_identity_bytes) return null;
+    const kind = std.meta.stringToEnum(types.OpenedRecord.Kind, value.kind) orelse return null;
+    if (!types.OpenedRecord.validTarget(value.target)) return null;
+    return .{ .call_id = value.call_id, .record = .{ .kind = kind, .target = value.target } };
+}
+
 /// An edit's full-diff rows, saved right after its `tool_result` item rather
 /// than inside it. Older fx versions reject unknown fields in a piece but
 /// skip unknown item types, so they still read the result and show the
@@ -7926,6 +7991,9 @@ test "v2 conversation pieces stay bounded under fuzzed bytes" {
             // A cancelled wait (D102), with names and with names to refuse.
             "{\"call_id\":\"call-wait\",\"subagents\":\"lander, scout\"}",
             "{\"call_id\":\"call-wait\",\"subagents\":\"lander\\u001b[2J\"}",
+            // A reopened record (D104), and one with a kind this fx doesn't know.
+            "{\"call_id\":\"call-open\",\"kind\":\"read\",\"target\":\"src/client.rs\"}",
+            "{\"call_id\":\"call-open\",\"kind\":\"teleport\",\"target\":\"\\u001b[2J\"}",
         }) ++ @import("fuzz_corpus").session_conversation_piece.*),
     });
 }
@@ -7951,6 +8019,11 @@ fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
     if (try decodeCancelledWait(arena_state.allocator(), buffer[0..len])) |wait| {
         try std.testing.expect(wait.call_id.len > 0 and wait.call_id.len <= session_event.max_conversation_identity_bytes);
         if (wait.subagents) |names| try std.testing.expect(validCancelledWaitNames(names));
+    }
+    // A reopened record (D104) names one call and a bounded, valid target.
+    if (try decodeOpenedRecord(arena_state.allocator(), buffer[0..len])) |opened| {
+        try std.testing.expect(opened.call_id.len > 0 and opened.call_id.len <= session_event.max_conversation_identity_bytes);
+        try std.testing.expect(types.OpenedRecord.validTarget(opened.record.target));
     }
     if (decodeModelCall(arena_state.allocator(), buffer[0..len])) |record| {
         try std.testing.expect(types.validModelCallText(record.provider) and types.validModelCallText(record.model));
@@ -13156,6 +13229,79 @@ test "replay reads a subagent start a newer fx wrote and leaves out one it can't
     @memset(long_id, 'c');
     try testing.expect(try decodeSubagentStarted(a, try a.print("{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
     try testing.expect(try decodeSubagentStarted(a, "not json") == null);
+}
+
+test "a reopened record keeps what its saved call did on resume, in an item older fx skips (D104)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("look back") };
+    var calls = [_]types.ToolCall{
+        .{ .id = "call-open", .name = "read_tool_result", .arguments_json = "{\"handle\":\"T51\"}" },
+        .{ .id = "call-turn", .name = "read_tool_result", .arguments_json = "{\"handle\":\"M3\"}" },
+    };
+    const page = "<tool_result handle=\"compacted-T51.txt\">T51 read_file: src/client.rs</tool_result>";
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("call-open"), .tool_name = @constCast("read_tool_result"), .status = .success, .output = @constCast(page), .output_bytes = page.len, .stored_output_bytes = page.len, .opened_record = .{ .kind = .read, .target = "src/client.rs" } },
+        .{ .tool_call_id = @constCast("call-turn"), .tool_name = @constCast("read_tool_result"), .status = .success, .output = @constCast(page), .output_bytes = page.len, .stored_output_bytes = page.len },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    try s.appendProgress(user, execution, .{});
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
+    try s.prepareTurn(&turn);
+    defer for (&results) |result| {
+        if (result.output_handle) |handle| testing.allocator.free(handle);
+        if (result.preview) |preview| testing.allocator.free(preview);
+    };
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    // One item, on the line right after its result, whose piece holds only
+    // the fields older fx versions read.
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, opened_record_type));
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    const item_at = std.mem.find(u8, bytes, "\"type\":\"" ++ opened_record_type ++ "\",\"data\":{\"call_id\":\"call-open\",\"kind\":\"read\",\"target\":\"src/client.rs\"}") orelse return error.TestExpectedItem;
+    const result_at = std.mem.find(u8, bytes, "\"call_id\":\"call-open\",\"tool_name\":\"read_tool_result\",\"status\"") orelse return error.TestExpectedResult;
+    try testing.expect(result_at < item_at);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes[result_at..item_at], "\n"));
+    try testing.expect(std.mem.find(u8, bytes, "\"opened_record\":") == null);
+
+    // Resume gives that call alone what its saved call did.
+    const history = try detailHistory(.{ .store = &t.store, .id = id }, testing.allocator);
+    defer types.freeHistoryTurnSlice(testing.allocator, history);
+    const restored = history[0].assistant.execution.tool_steps[0].tool_results;
+    try testing.expectEqual(types.OpenedRecord.Kind.read, restored[0].opened_record.?.kind);
+    try testing.expectEqualStrings("src/client.rs", restored[0].opened_record.?.target);
+    try testing.expect(restored[1].opened_record == null);
+}
+
+test "replay reads a reopened record a newer fx wrote and leaves out one it can't read (D104)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const newer = (try decodeOpenedRecord(a, "{\"call_id\":\"c\",\"kind\":\"run\",\"target\":\"git log\",\"tool\":\"shell\"}")).?;
+    try testing.expectEqualStrings("c", newer.call_id);
+    try testing.expectEqual(types.OpenedRecord.Kind.run, newer.record.kind);
+    try testing.expectEqualStrings("git log", newer.record.target);
+    // A kind this fx doesn't know, an empty or too long target, an empty
+    // call id, a missing field, and bytes that aren't JSON.
+    try testing.expect(try decodeOpenedRecord(a, "{\"call_id\":\"c\",\"kind\":\"teleport\",\"target\":\"x\"}") == null);
+    try testing.expect(try decodeOpenedRecord(a, "{\"call_id\":\"c\",\"kind\":\"read\",\"target\":\"\"}") == null);
+    const long_target = try a.alloc(u8, types.OpenedRecord.max_target_bytes + 1);
+    @memset(long_target, 'p');
+    try testing.expect(try decodeOpenedRecord(a, try a.print("{{\"call_id\":\"c\",\"kind\":\"read\",\"target\":\"{s}\"}}", .{long_target})) == null);
+    try testing.expect(try decodeOpenedRecord(a, "{\"call_id\":\"\",\"kind\":\"read\",\"target\":\"a.rs\"}") == null);
+    try testing.expect(try decodeOpenedRecord(a, "{\"call_id\":\"c\",\"target\":\"a.rs\"}") == null);
+    try testing.expect(try decodeOpenedRecord(a, "not json") == null);
 }
 
 test "replay keeps a bridge call record a newer fx wrote and leaves out one it can't show" {

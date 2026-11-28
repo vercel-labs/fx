@@ -36,6 +36,7 @@ pub fn makePersistedToolResult(
     errdefer if (tool_image_handle) |handle| alloc.free(handle);
     const tool_images = if (memory) |info| if (tool_image_handle == null) try types.dupeToolImages(alloc, info.tool_images) else try alloc.alloc(types.ToolImage, 0) else try alloc.alloc(types.ToolImage, 0);
     errdefer types.freeToolImages(alloc, tool_images);
+    const opened_record = try types.dupeOpenedRecord(alloc, if (memory) |info| info.opened_record else null);
     var result: types.PersistedToolResult = .{
         .tool_images = tool_images,
         .tool_image_handle = tool_image_handle,
@@ -55,6 +56,7 @@ pub fn makePersistedToolResult(
         .command_process_presentation = if (memory) |info| info.command_process_presentation else null,
         .terminal_action_presentation = if (memory) |info| info.terminal_action_presentation else null,
         .subagent_started = if (memory) |info| info.subagent_started else false,
+        .opened_record = opened_record,
     };
     if (memory) |info| {
         if (info.committed_file_presentation) |presentation| {
@@ -601,6 +603,7 @@ pub fn freeTransientPersistedToolResult(
     if (result.command_output_replay) |replay| {
         types.freeCommandOutputReplay(alloc, replay);
     }
+    types.freeOpenedRecord(alloc, result.opened_record);
 }
 
 fn appendPersistedPermissionFeedback(
