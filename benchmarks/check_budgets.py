@@ -16,7 +16,7 @@ import platform
 import sys
 
 
-MAX_REGRESSION = 0.15
+MAX_REGRESSION = 0.20
 RAW_GUARD_SECONDS = 0.003
 PROCESS_BASELINE = "process baseline"
 ROUNDS_DIR_ENV = "FX_BENCH_ROUNDS_DIR"

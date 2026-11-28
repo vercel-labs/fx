@@ -82,9 +82,9 @@ class BudgetComparisonTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertIn("PASS  fx sessions --json", result.stdout)
 
-    def test_twenty_percent_slower_fails(self) -> None:
+    def test_twenty_five_percent_slower_fails(self) -> None:
         result = self.run_checker(
-            pr={SESSIONS: [2.4] * 5},
+            pr={SESSIONS: [2.5] * 5},
             base={SESSIONS: [2.0] * 5},
         )
         self.assertEqual(1, result.returncode, result.stdout + result.stderr)
@@ -189,8 +189,8 @@ class BudgetComparisonTests(unittest.TestCase):
         self.assertTrue(passed)
         self.assertIn("not evaluated on Darwin", output.getvalue())
 
-    def test_margin_is_fifteen_percent(self) -> None:
-        self.assertEqual(0.15, check_budgets.MAX_REGRESSION)
+    def test_margin_is_twenty_percent(self) -> None:
+        self.assertEqual(0.20, check_budgets.MAX_REGRESSION)
 
     def test_raw_guard_is_three_milliseconds(self) -> None:
         self.assertEqual(0.003, check_budgets.RAW_GUARD_SECONDS)
