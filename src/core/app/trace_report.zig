@@ -193,16 +193,20 @@
 //!   wait for the fx login's `auth.lock` that every fx process sharing the
 //!   login takes (`outcome` `taken`, `given_up`, or the name of another lock
 //!   error, `waited_ms`, and for a failure `limit_ms`);
-//!   `refresh`, one refresh of the saved fx login (`mode`, `outcome`
-//!   `rotated`, `saved_login_used`, `no_saved_login`, or `failed` with the
-//!   `step` and `err` where it stopped, `ms`); `issuer`, its request to the
-//!   issuer (`outcome`, `step`, `err`, `ms`, `login_deleted`, whether fx
-//!   deleted the saved login after the issuer refused it); or `prompt`, a
-//!   prompt that stopped for its credential or went on after a sign-in
-//!   (`outcome`, `screen` `main` or `subagent`, `turn_id`, and for a failure
-//!   `source`, `reason`, `retryable`, `err`, and `notice` `shown` or
-//!   `not_shown`). A `detail` holds only these names, counts, and
-//!   durations, never a token or an account. Sign-in events are recorded
+//!   `refresh`, one refresh of the saved fx login (`mode`, then `outcome`
+//!   `rotated` or `saved_login_used` with `saved_expired` and `ms`,
+//!   `failed` with the `step` and `err` where it stopped and `ms`, or
+//!   `no_saved_login` with only the `step`, `lock` or `load`, that found no
+//!   login); `issuer`, its request to the issuer (`outcome`, `step`, `err`,
+//!   `ms`, `login_deleted`, whether fx deleted the saved login after the
+//!   request failed); or `prompt`, a prompt that stopped for its credential
+//!   or went on after a sign-in (`outcome`, `screen` `main` or `subagent`,
+//!   `turn_id`; for a failure `source`, `reason`, `retryable`, `err`, and
+//!   `notice` `shown` or `not_shown`; for `resumed`, `trigger`:
+//!   `auth_completion` after a sign-in, `submit` when Enter found the
+//!   credential current, or `retry` when Enter started a new refresh). A
+//!   `detail` holds only these names, counts, and durations, never a token
+//!   or an account. Sign-in events are recorded
 //!   even when `FX_TRACE` is off.
 //! - `tool_calls`: `retained`, `outcomes` {`succeeded`, `rejected`,
 //!   `command_failed`, `tool_failed`, `runtime_failed`}, `total_ms`, `session`
