@@ -1,0 +1,42 @@
+{
+  "covers": [
+    "U7-dismiss"
+  ],
+  "title": "The user dismisses the setup form; it sets the decline mark, so the repeat in the same turn gets no prompt.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false
+      }
+    },
+    "teams": "one",
+    "surface": "interactive",
+    "login": "valid",
+    "configured": false,
+    "configValid": true,
+    "answers": [
+      "cancel"
+    ],
+    "cancels": {},
+    "retries": {
+      "c1": 1
+    },
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "refused",
+        "refused"
+      ]
+    },
+    "prompts": 1,
+    "writes": 0
+  },
+  "tamper": {
+    "setup": "prompt-after-decline"
+  },
+  "drive": {}
+}
