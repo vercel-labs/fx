@@ -1,4 +1,5 @@
 const std = @import("std");
+const core_types = @import("../shared/types.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const result_store = @import("../session/result_store.zig");
@@ -21,7 +22,9 @@ pub fn resolve(
     if (!tool_mcp_runtime.isAdvertisedDynamicToolName(
         advertised_dynamic_tool_names,
         name,
-    )) return .not_selected;
+    )) {
+        return if (core_types.isMcpToolName(name)) .not_selected else .unsupported;
+    }
     if (runtime.call_tool == null) return .unsupported;
     return .{ .registered = dynamicTool(name) };
 }
@@ -229,6 +232,19 @@ test "dynamic MCP resolution preserves selected and unselected states" {
     try std.testing.expect(resolve(&advertised, .{}, "mcp_other") == .unsupported);
     try std.testing.expect(resolve(&advertised, .{ .context = @ptrCast(&fixture) }, "mcp_fs_read") == .unsupported);
     try std.testing.expect(resolve(&advertised, runtime, "mcp_fs_read") == .registered);
+}
+
+test "non-MCP unknown names resolve to unsupported even with an active MCP context" {
+    var fixture: u8 = 0;
+    const advertised = [_][]const u8{"mcp_fs_read"};
+    const runtime = tool_mcp_runtime.RuntimeCapabilities{
+        .context = @ptrCast(&fixture),
+        .call_tool = callFixture,
+    };
+
+    try std.testing.expect(resolve(&advertised, runtime, "bash") == .unsupported);
+    try std.testing.expect(resolve(&advertised, runtime, "foo") == .unsupported);
+    try std.testing.expect(resolve(&advertised, runtime, "mcp_other") == .not_selected);
 }
 
 test "dynamic MCP descriptor executes through registered dispatch" {

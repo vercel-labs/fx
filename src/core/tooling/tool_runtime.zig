@@ -4128,6 +4128,91 @@ test "a workspace call of unsupported bash hints the visible shell tool unless b
     try std.testing.expectEqualStrings("Unsupported tool: bash", registered_bash.model_output);
 }
 
+test "context-off dispatch hints shell for unknown bash and reports unknown foo while keeping unselected MCP in toolbox" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var mcp_fixture: u8 = 0;
+    const mcp_ops = struct {
+        fn callTool(
+            _: *anyopaque,
+            alloc: Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: usize,
+            _: tool_mcp_runtime.CallOptions,
+        ) anyerror!?tool_mcp_runtime.CallResult {
+            return .{ .model_output = try alloc.dupe(u8, "mcp ok") };
+        }
+    };
+    var install_tool = test_builtin_tools.install_skill;
+    install_tool.call = registryOwnedInstallSkillCall;
+    const tools = [_]tool_dispatch.Tool{ test_builtin_tools.shell, install_tool };
+    var rt = TestRuntime{
+        .tool_registry = .{ .tools = &tools },
+        .mcp_ctx = @ptrCast(&mcp_fixture),
+        .mcp_call_tool = mcp_ops.callTool,
+    };
+    defer rt.deinit(std.testing.allocator);
+
+    const bash_result = try executeToolCallAuthorized(rt.context(), .{
+        .call_allocator = arena,
+        .result_allocator = arena,
+        .call = .{ .id = "bash-call", .name = "bash", .arguments_json = "{\"command\":\"echo hi\"}" },
+        .authority = .ordinary,
+        .session_grants = &.{},
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = 64 * 1024,
+        .classification_complete = false,
+        .toolbox_behind = &.{"install_skill"},
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, bash_result.status);
+    try std.testing.expectEqualStrings("Unsupported tool: bash. Use shell instead.", bash_result.model_output);
+
+    const foo_result = try executeToolCallAuthorized(rt.context(), .{
+        .call_allocator = arena,
+        .result_allocator = arena,
+        .call = .{ .id = "foo-call", .name = "foo", .arguments_json = "{}" },
+        .authority = .ordinary,
+        .session_grants = &.{},
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = 64 * 1024,
+        .classification_complete = false,
+        .toolbox_behind = &.{"install_skill"},
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, foo_result.status);
+    try std.testing.expectEqualStrings("Unsupported tool: foo", foo_result.model_output);
+
+    const mcp_result = try executeToolCallAuthorized(rt.context(), .{
+        .call_allocator = arena,
+        .result_allocator = arena,
+        .call = .{ .id = "mcp-call", .name = "mcp_other", .arguments_json = "{}" },
+        .authority = .ordinary,
+        .session_grants = &.{},
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = 64 * 1024,
+        .classification_complete = false,
+        .toolbox_behind = &.{"install_skill"},
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, mcp_result.status);
+    try expectContains(mcp_result.model_output, "mcp_other is not one of the tools in this request. Open it with toolbox");
+
+    const behind_result = try executeToolCallAuthorized(rt.context(), .{
+        .call_allocator = arena,
+        .result_allocator = arena,
+        .call = .{ .id = "behind-call", .name = "install_skill", .arguments_json = "{\"source\":\"/tmp/skills\",\"skill\":\"workflow\"}" },
+        .authority = .ordinary,
+        .session_grants = &.{},
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = 64 * 1024,
+        .classification_complete = false,
+        .toolbox_behind = &.{"install_skill"},
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, behind_result.status);
+    try std.testing.expectEqualStrings("registry-owned install_skill", behind_result.model_output);
+}
+
 fn registryOwnedWebFetchCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
