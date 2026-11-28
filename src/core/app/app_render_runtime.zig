@@ -13,6 +13,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const env_settings = @import("../config/env_settings.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -427,13 +428,14 @@ const approval_screen_failure_notice = "The approval screen could not open, so f
 
 /// `FX_TEST_APPROVAL_SCREEN_FAIL` makes the next approval screen fail, so a
 /// test can prove the deny reaches the request's owner
-/// (`tests/e2e/tui-host-switch.test.ts`).
+/// (`tests/e2e/tui-host-switch.test.ts`). Like every test switch, only an on
+/// value such as `1` turns it on, so `0` opens the screen as usual.
 const approval_screen_fail_env = "FX_TEST_APPROVAL_SCREEN_FAIL";
 var approval_screen_fail_used = false;
 
-fn approvalScreenFailureForced() bool {
+fn approvalScreenFailureForced(raw: ?[]const u8) bool {
     if (approval_screen_fail_used) return false;
-    if (io_mod.getenv(approval_screen_fail_env) == null) return false;
+    if (!env_settings.testSwitchOn(raw)) return false;
     approval_screen_fail_used = true;
     return true;
 }
@@ -1514,7 +1516,8 @@ pub fn Runtime(comptime App: type) type {
                     .attempt_invalidations = attempt_invalidations,
                     .pending_tail_rows = if (pending_card) |card| card.row_count else 0,
                 };
-                const fixed_point = try render_engine.frame_fixed_point.solve(
+                const fixed_point = try presentation_shell.solveFrameWithFooterCloseReset(
+                    &app.metrics,
                     FixedPointTranscriptContext(App),
                     &fixed_point_ctx,
                     .{
@@ -1529,6 +1532,8 @@ pub fn Runtime(comptime App: type) type {
                     },
                     FixedPointTranscriptContext(App).prepareCandidate,
                     FixedPointTranscriptContext(App).resolveCandidate,
+                    skillsMenuRefreshPending(app),
+                    &prepared_transcript,
                 );
                 const solved = fixed_point.layout;
                 solved_layout = solved;
@@ -1948,7 +1953,7 @@ pub fn Runtime(comptime App: type) type {
         fn renderApprovalScreen(app: *App, agent: *AppAgent) !FrameAttemptResult {
             const approval = agent.approval_prompt.projection() orelse return error.MissingApprovalRequest;
             const request = approval.request;
-            if (approvalScreenFailureForced()) {
+            if (approvalScreenFailureForced(io_mod.getenv(approval_screen_fail_env))) {
                 return failApprovalScreen(app, agent, request.id, error.ForcedApprovalScreenFailure);
             }
             const clear_display = approvalScreenNeedsClear(
@@ -2137,6 +2142,17 @@ pub fn Runtime(comptime App: type) type {
         fn skillsMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "skills")) return app.skills.menuVisible();
             return false;
+        }
+
+        /// `/skills` and `/skills <name>` open the skills menu when the catalog
+        /// refresh they queued lands, so the frame before that shows the plain composer.
+        fn skillsMenuRefreshPending(app: *const App) bool {
+            if (comptime !@hasField(App, "skills")) return false;
+            const pending = app.skills.pending_refresh_action orelse return false;
+            return switch (pending.action) {
+                .list, .show => true,
+                .notice, .startup_notice => false,
+            };
         }
 
         fn modelMenuActive(app: *const App) bool {
@@ -4238,6 +4254,18 @@ const ApprovalScreenFailureTestApp = struct {
         return self.notice_buf[0..self.notice_len];
     }
 };
+
+test "only an on value fails the next approval screen" {
+    approval_screen_fail_used = false;
+    defer approval_screen_fail_used = false;
+    try std.testing.expect(!approvalScreenFailureForced(null));
+    try std.testing.expect(!approvalScreenFailureForced("0"));
+    try std.testing.expect(!approvalScreenFailureForced(""));
+    try std.testing.expect(!approvalScreenFailureForced("false"));
+    try std.testing.expect(approvalScreenFailureForced("1"));
+    // One shot: an on value fails one screen, not every later one.
+    try std.testing.expect(!approvalScreenFailureForced("1"));
+}
 
 test "a failed approval screen denies the request on the worker that owns it" {
     const alloc = std.testing.allocator;

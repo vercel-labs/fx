@@ -21,7 +21,7 @@ pub const Prompter = struct {
         ?*const diff_mod.FileReview,
         ?[]const types.PermissionGrant,
     ) anyerror!permission_request.OwnedPermissionResponse,
-    retain_grant_fn: ?*const fn (*anyopaque, []const u8, []const u8) anyerror!void = null,
+    retain_grant_fn: ?*const fn (*anyopaque, []const u8, []const u8, u64) anyerror!void = null,
 
     pub fn request(
         self: Prompter,
@@ -47,9 +47,9 @@ pub const Prompter = struct {
         return response;
     }
 
-    pub fn retainGrant(self: Prompter, tool_name: []const u8, target_path: []const u8) anyerror!bool {
+    pub fn retainGrant(self: Prompter, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) anyerror!bool {
         const retain = self.retain_grant_fn orelse return false;
-        try retain(self.context, tool_name, target_path);
+        try retain(self.context, tool_name, target_path, shell_epoch);
         return true;
     }
 };

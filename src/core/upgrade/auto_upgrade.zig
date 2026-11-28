@@ -58,8 +58,8 @@ fn parseCheckIntervalMs(text: ?[]const u8) u64 {
 
 /// The build that an earlier check installed while this fx runs. Later checks
 /// compare a release with it, not with the running build, so the installed
-/// release is never installed again: a dev release replaces it when its commit
-/// differs, and a stable release when its version is higher
+/// release is never installed again: a dev release replaces it when it is
+/// newer, and a stable release when its version is higher
 /// (`update_target.Target.shouldInstall`). This tracks what fx installed, not
 /// the file itself, so a binary another process writes there is not noticed.
 const StagedBuild = struct {
@@ -69,6 +69,7 @@ const StagedBuild = struct {
     version_len: usize = 0,
     revision_buf: [update_target.max_revision_bytes]u8 = undefined,
     revision_len: usize = 0,
+    build: u32 = 0,
 
     /// Copies what `target` names. Its version and revision passed the
     /// target's own length checks, so they fit.
@@ -79,6 +80,7 @@ const StagedBuild = struct {
         @memcpy(self.revision_buf[0..revision.len], revision);
         self.version_len = version.len;
         self.revision_len = revision.len;
+        self.build = target.build();
         self.channel = target.channel();
         self.installed = true;
     }
@@ -91,6 +93,7 @@ const StagedBuild = struct {
             .channel = self.channel,
             .version = self.version_buf[0..self.version_len],
             .revision = self.revision_buf[0..self.revision_len],
+            .build = self.build,
         };
     }
 };
@@ -257,10 +260,10 @@ pub const AutoUpgrade = struct {
             .downloading => {
                 var ver_buf: [32]u8 = undefined;
                 const ver = self.getLatestVersion(&ver_buf);
-                return std.mem.print(buf, "upgrading to {s}...", .{ver}) catch "";
+                return std.mem.print(buf, "updating to {s}...", .{ver}) catch "";
             },
             .ready => return "update ready: ctrl+g to reload",
-            .failed => return "upgrade failed",
+            .failed => return "update failed",
             else => return "",
         }
     }
@@ -562,6 +565,28 @@ test "a staged dev build is the baseline, so only a different revision replaces 
     try std.testing.expectEqual(update_target.Channel.dev, staged.baseline(current).channel);
 }
 
+test "a staged dev build keeps its build number, so a stale manifest cannot replace it" {
+    const alloc = std.testing.allocator;
+    const current: update_target.CurrentBuild = .{
+        .channel = .dev,
+        .version = "0.0.18",
+        .revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .build = 100,
+    };
+    var newer = try update_target.Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"2222222222222222222222222222222222222222\",\"build\":105}");
+    defer newer.deinit(alloc);
+    var stale = try update_target.Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"1111111111111111111111111111111111111111\",\"build\":103}");
+    defer stale.deinit(alloc);
+
+    var staged: StagedBuild = .{};
+    try std.testing.expect(newer.shouldInstall(staged.baseline(current)));
+    staged.record(newer);
+    try std.testing.expectEqual(@as(u32, 105), staged.baseline(current).build);
+    // Newer than the running build, but older than the one installed.
+    try std.testing.expect(stale.shouldInstall(current));
+    try std.testing.expect(!stale.shouldInstall(staged.baseline(current)));
+}
+
 test "a staged stable build is the baseline, so only a higher version replaces it" {
     const alloc = std.testing.allocator;
     const current: update_target.CurrentBuild = .{ .channel = .stable, .version = "0.0.18", .revision = "" };
@@ -647,7 +672,7 @@ test "statusLabel downloading shows ellipsis" {
     au.setState(.downloading);
     var buf: [64]u8 = undefined;
     const label = au.statusLabel(&buf);
-    try std.testing.expectEqualStrings("upgrading to 0.3.0...", label);
+    try std.testing.expectEqualStrings("updating to 0.3.0...", label);
 }
 
 test "statusLabel ready explains ctrl+g reload" {
@@ -731,12 +756,23 @@ test "statusLabel checking returns empty" {
     try std.testing.expectEqual(@as(usize, 0), label.len);
 }
 
-test "statusLabel failed shows upgrade failed" {
+test "statusLabel failed shows update failed" {
     var au = AutoUpgrade{};
     au.setState(.failed);
     var buf: [64]u8 = undefined;
     const label = au.statusLabel(&buf);
-    try std.testing.expectEqualStrings("upgrade failed", label);
+    try std.testing.expectEqualStrings("update failed", label);
+}
+
+test "footer statuses for downloading, ready and failed all say update" {
+    var au = AutoUpgrade{};
+    au.setLatestVersion("v0.3.0");
+    var buf: [64]u8 = undefined;
+    for ([_]State{ .downloading, .ready, .failed }) |state| {
+        au.setState(state);
+        const label = au.statusLabel(&buf);
+        try std.testing.expect(std.mem.find(u8, label, "updat") != null);
+    }
 }
 
 test "getState returns the current atomic state" {

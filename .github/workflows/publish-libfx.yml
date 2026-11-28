@@ -349,7 +349,8 @@ jobs:
   publish:
     needs: [metadata, package]
     runs-on: ubuntu-24.04
-    environment: npm
+    # Only a dev publish that a passing CI run on main starts runs in npm-dev, which has no reviewer; manual runs and stable wait for approval in npm.
+    environment: ${{ github.event_name == 'workflow_run' && needs.metadata.outputs.channel == 'dev' && 'npm-dev' || 'npm' }}
     permissions:
       contents: read
       id-token: write
@@ -378,8 +379,8 @@ jobs:
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
         run: |
           set -euo pipefail
-          # The npm environment can hold this job for approval, so this build
-          # may be behind main and still newer than the dev tag. Dev versions
+          # CI runs on main can finish out of order, so this build may be
+          # behind main and still newer than the dev tag. Dev versions
           # end in .g<first 12 characters of the commit>.
           CURRENT_VERSION=$(npm view libfx dist-tags.dev --registry=https://registry.npmjs.org/) || CURRENT_VERSION=""
           CURRENT_SHA=""
@@ -400,8 +401,13 @@ jobs:
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
           NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
+          CHANNEL: ${{ needs.metadata.outputs.channel }}
         run: |
           set -euo pipefail
+          if [ "$CHANNEL" != stable ] && [ "$NPM_TAG" != dev ]; then
+            echo "::error::a run on the ${CHANNEL:-unknown} channel may publish only the dev tag, not '$NPM_TAG'"
+            exit 1
+          fi
           if npm view "libfx@${LIBFX_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
             echo "libfx@${LIBFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
             exit 0
@@ -450,6 +456,10 @@ jobs:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
+          if [ -z "${LIBFX_VERSION:-}" ]; then
+            echo "::error::LIBFX_VERSION is empty, so there is no version to wait for"
+            exit 1
+          fi
           deadline_seconds=600
           poll_interval_seconds=15
           deadline=$((SECONDS + deadline_seconds))
@@ -471,7 +481,10 @@ jobs:
                 continue
               fi
               cat /tmp/npm-view.err >&2
-              echo "::error::npm view ${name}@${LIBFX_VERSION} failed with exit ${status} and code '${code}': ${output}"
+              # npm prints --json errors on several lines; an annotation keeps only its first line.
+              one_line=$({ jq -c . <<<"$output" 2>/dev/null || printf '%s' "$output"; } | tr '\n' ' ')
+              one_line=${one_line% }
+              echo "::error::npm view ${name}@${LIBFX_VERSION} failed with exit ${status} and code '${code}': ${one_line}"
               exit 1
             done
             if [ "${#missing[@]}" -eq 0 ]; then

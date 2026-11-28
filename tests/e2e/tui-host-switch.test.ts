@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { processAlive } from "./process-alive";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
@@ -785,63 +786,78 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     "the agent list shows a subagent's conversation, which takes messages typed there",
     async () => {
       let mainCalls = 0;
-      const bodies = await withFx((body) => {
-        if (!isMainRequest(body)) {
-          if (latestUserText(body).includes("SWITCH_TYPED")) return text("child_reply", "SWITCH_CHILD_REPLY");
-          return text("child_answer", "SWITCH_CHILD_ANSWER");
-        }
-        mainCalls += 1;
-        if (mainCalls === 1) {
-          return toolCall("main_sub", "subagent", {
-            request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" },
-          });
-        }
-        return text("main_final", "SWITCH_MAIN_FINAL");
-      }, async (session) => {
-        await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_FINAL", 30_000);
-        await session.waitForComposer(15_000);
+      const mainTurn1Done = held();
+      try {
+        const bodies = await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            if (latestUserText(body).includes("SWITCH_TYPED")) return text("child_reply", "SWITCH_CHILD_REPLY");
+            // Hold the subagent's reply until main's first turn has finished so
+            // its report always starts a third main request instead of joining
+            // the second.
+            await mainTurn1Done.promise;
+            return text("child_answer", "SWITCH_CHILD_ANSWER");
+          }
+          mainCalls += 1;
+          if (mainCalls === 1) {
+            return toolCall("main_sub", "subagent", {
+              request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" },
+            });
+          }
+          if (mainCalls === 2) return text("main_final", "SWITCH_MAIN_FINAL");
+          return text("main_report", "SWITCH_MAIN_REPORT_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("SWITCH_MAIN_FINAL", 30_000);
+          await session.waitForComposer(15_000);
+          mainTurn1Done.release();
 
-        // The subagent's conversation replaces main's, and the footer names it.
-        await showAgent(session, "reviewer");
-        const subagent = await session.waitForPane((pane) =>
-          pane.includes("SWITCH_CHILD_ANSWER") && pane.includes("reviewer \u00b7 "), 15_000);
-        expect(subagent).toContain("SWITCH_TASK look for nothing");
-        // A new subagent opens with fx's welcome, as a fresh fx does.
-        expect(subagent).toContain("Run /help for commands");
-        expect(subagent).not.toContain("SWITCH_MAIN_FINAL");
-        expect(await session.captureFullScrollback()).not.toContain("SWITCH_USER");
+          // The subagent's conversation replaces main's, and the footer names it.
+          await showAgent(session, "reviewer");
+          const subagent = await session.waitForPane((pane) =>
+            pane.includes("SWITCH_CHILD_ANSWER") && pane.includes("reviewer \u00b7 "), 15_000);
+          expect(subagent).toContain("SWITCH_TASK look for nothing");
+          // A new subagent opens with fx's welcome, as a fresh fx does.
+          expect(subagent).toContain("Run /help for commands");
+          expect(subagent).not.toContain("SWITCH_MAIN_FINAL");
+          expect(await session.captureFullScrollback()).not.toContain("SWITCH_USER");
 
-        // Typed here, it is a message to the subagent.
-        await session.sendText("SWITCH_TYPED to the subagent");
-        await session.waitForText("SWITCH_CHILD_REPLY", 30_000);
+          // Typed here, it is a message to the subagent.
+          await session.sendText("SWITCH_TYPED to the subagent");
+          await session.waitForText("SWITCH_CHILD_REPLY", 30_000);
 
-        // Main's session commands stay on main's screen, /clear and /reset
-        // included: on a subagent they would replace its saved conversation.
-        for (const command of ["/new", "/clear", "/reset", "/fork", "/resume"]) {
-          await session.sendText(command);
-          await session.waitForText(`${command} works on main's screen`, 15_000);
-        }
-        expect(await session.capturePane()).toContain("SWITCH_CHILD_REPLY");
+          // Main's session commands stay on main's screen, /clear and /reset
+          // included: on a subagent they would replace its saved conversation.
+          for (const command of ["/new", "/clear", "/reset", "/fork", "/resume"]) {
+            await session.sendText(command);
+            await session.waitForText(`${command} works on main's screen`, 15_000);
+          }
+          expect(await session.capturePane()).toContain("SWITCH_CHILD_REPLY");
 
-        // Main is as it was.
-        await showAgent(session, "main");
-        const main = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL"), 15_000);
-        expect(main).toContain("SWITCH_USER");
-        expect(main).not.toContain("SWITCH_CHILD_REPLY");
-        // The footer names main, not the subagent.
-        expect(main).not.toMatch(/^reviewer \u00b7 /m);
-        // The subagent's report of main's message shows as a subagent row.
-        expect(main).toContain("reviewer finished");
-      });
+          // Main is as it was, and its report turn has finished.
+          await showAgent(session, "main");
+          const main = await session.waitForPane((pane) =>
+            pane.includes("SWITCH_MAIN_FINAL") &&
+            pane.includes("SWITCH_MAIN_REPORT_DONE") &&
+            pane.includes("reviewer finished") &&
+            turnSettled(pane), 15_000);
+          expect(main).toContain("SWITCH_USER");
+          expect(main).not.toContain("SWITCH_CHILD_REPLY");
+          // The footer names main, not the subagent.
+          expect(main).not.toMatch(/^reviewer \u00b7 /m);
+          // The subagent's report of main's message shows as a subagent row.
+          expect(main).toContain("reviewer finished");
+        });
 
-      // Main's model never sees the answer to a message it did not send: its
-      // call, the turn after the receipt, and the turn the report started.
-      const mainBodies = bodies.filter(isMainRequest);
-      expect(mainBodies.length).toBe(3);
-      for (const body of mainBodies) expect(body).not.toContain("SWITCH_CHILD_REPLY");
-      expect(mainBodies.filter((body) => body.includes("SWITCH_CHILD_ANSWER"))).toHaveLength(1);
-      expect(bodies.some((body) => !isMainRequest(body) && latestUserText(body).includes("SWITCH_TYPED"))).toBe(true);
+        // Main's model never sees the answer to a message it did not send: its
+        // call, the turn after the receipt, and the turn the report started.
+        const mainBodies = bodies.filter(isMainRequest);
+        expect(mainBodies.length).toBe(3);
+        for (const body of mainBodies) expect(body).not.toContain("SWITCH_CHILD_REPLY");
+        expect(mainBodies.filter((body) => body.includes("SWITCH_CHILD_ANSWER"))).toHaveLength(1);
+        expect(bodies.some((body) => !isMainRequest(body) && latestUserText(body).includes("SWITCH_TYPED"))).toBe(true);
+      } finally {
+        mainTurn1Done.release();
+      }
     },
     TIMEOUT,
   );
@@ -2650,10 +2666,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "/trace on a subagent's screen shows why its prompt waits for a sign-in: the failed refresh, the issuer step, and the notice it never showed",
+    "/trace on a subagent's screen shows why its prompt waits for a sign-in: the failed refresh, the issuer step, and the notice each screen showed",
     async () => {
       // The issuer cannot refresh the saved login. Main's screen shows the
-      // failure; the subagent's prompt then waits with no notice of its own.
+      // failure, and the subagent's screen shows it again for its own prompt.
       const issuer = startFakeIssuer({ refresh: () => new Response("unavailable", { status: 500 }) });
       const traceDir = mkdtempSync(join(tmpdir(), "fx-sign-in-trace-"));
       let mainCalls = 0;
@@ -2698,7 +2714,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           expect(has("issuer", true, "outcome=failed", "step=token", "login_deleted=false")).toBe(true);
           expect(has("refresh", true, "mode=if_needed", "outcome=failed", "step=issuer")).toBe(true);
           expect(has("prompt", true, "outcome=credential_failed", "screen=main", "notice=shown")).toBe(true);
-          expect(has("prompt", true, "outcome=credential_failed", "screen=subagent", "notice=not_shown")).toBe(true);
+          expect(has("prompt", true, "outcome=credential_failed", "screen=subagent", "notice=shown")).toBe(true);
           expect(has("prompt", true, "outcome=waits_for_sign_in", "screen=subagent")).toBe(true);
 
           const summary = report.one("sign_in");
@@ -2716,6 +2732,74 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       } finally {
         issuer.stop();
         rmSync(traceDir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a prompt on a subagent's screen says its sign-in refresh failed after main's screen showed the same failure, and main's screen does not say it again",
+    async () => {
+      // A failed refresh of the saved login parks the prompt until the person
+      // retries or signs in. Main's screen already told the person once; the
+      // subagent's screen must say so too, or it shows only "Thinking".
+      const issuer = startFakeIssuer({ refresh: () => new Response("unavailable", { status: 500 }) });
+      const subagentAsked: string[] = [];
+      let mainCalls = 0;
+      try {
+        await withFx((body) => {
+          if (!isMainRequest(body)) {
+            subagentAsked.push(latestUserText(body));
+            return text(`road_${subagentAsked.length}`, "SWITCH_ROAD_DONE");
+          }
+          mainCalls += 1;
+          if (mainCalls === 1) return toolCall("main_road", "subagent", { request: { action: "message", agent: "roadmap", message: "SWITCH_ROAD_TASK" } });
+          return text(`main_${mainCalls}`, `SWITCH_MAIN_${mainCalls}`);
+        }, async (session, { home }) => {
+          await session.sendText("SWITCH_USER start the roadmap");
+          await session.waitForText("roadmap finished", 30_000);
+          await session.waitForComposer(15_000);
+
+          // The saved login is now past its refresh deadline, and the issuer
+          // cannot refresh it.
+          writeFxLogin(home, issuer.issuerUrl, "seeded-token", { expiresAtMs: Date.now() - 120_000 });
+          await session.sendText("SWITCH_MAIN_AFTER_EXPIRY");
+          await session.waitForText("credential refresh failed", 30_000);
+          // Ctrl+C drops that prompt; the failure it reported stays recorded.
+          await session.sendKeys("C-c");
+          await until("main's prompt dropped", () => traceText().includes("reason=ctrl_c_pending_submission"), 15_000);
+
+          await showAgent(session, "roadmap");
+          await session.waitForPane((pane) => pane.includes("roadmap \u00b7 "), 15_000);
+          await session.sendText("SWITCH_ROAD_PROMPT after the failure");
+          const pane = await session.waitForPane(
+            (shown) => shown.includes("SWITCH_ROAD_PROMPT") && shown.includes("credential refresh failed"),
+            30_000,
+          );
+          expect(pane).toContain("press enter to retry. Your prompt is saved.");
+          expect(subagentAsked.some((asked) => asked.includes("SWITCH_ROAD_PROMPT"))).toBe(false);
+
+          // Back on main, a new prompt meets the same failure: main's screen
+          // already showed it, so it gets no second copy.
+          const dropped = () => traceText().split("reason=ctrl_c_pending_submission").length - 1;
+          const waiting = () => traceText().split("pending_prompt_awaiting_auth").length - 1;
+          const droppedBefore = dropped();
+          await session.sendKeys("C-c");
+          await until("the roadmap prompt dropped", () => dropped() > droppedBefore, 15_000);
+          await showAgent(session, "main");
+          const waitingBefore = waiting();
+          await session.sendText("SWITCH_MAIN_AGAIN");
+          await until("main's new prompt waits", () => waiting() > waitingBefore, 30_000);
+          await session.waitForPane((shown) => shown.includes("SWITCH_MAIN_AGAIN"), 15_000);
+          const mainScreen = await session.captureFullScrollback();
+          expect(mainScreen.split("credential refresh failed").length - 1).toBe(1);
+        }, (home) => writeFxLogin(home, issuer.issuerUrl, "seeded-token"), false, {
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          AI_GATEWAY_API_KEY: undefined as unknown as string,
+        });
+      } finally {
+        issuer.stop();
       }
     },
     TIMEOUT,
@@ -4874,10 +4958,16 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   // test decides: `again` holds main's, `typed` fails the user's. `run` starts
   // once `broken` and `fine` have ended and `cut` still works.
   async function withEndedSubagents(
-    run: (session: TmuxSession, context: Run, gates: { cut: ReturnType<typeof held>; again: ReturnType<typeof held> }, reports: () => ReportSeen[], trace: () => string) => Promise<void>,
-    options: { trace?: boolean } = {},
+    run: (session: TmuxSession, context: Run, gates: { cut: ReturnType<typeof held>; again: ReturnType<typeof held>; againSteps: () => number }, reports: () => ReportSeen[], trace: () => string) => Promise<void>,
+    options: { trace?: boolean; earlyReport?: boolean } = {},
   ) {
-    const gates = { cut: held(), again: held() };
+    let againSteps = 0;
+    let unexpectedMainReplies = 0;
+    const gates = { cut: held(), again: held(), againSteps: () => againSteps };
+    const fifoDir = options.earlyReport ? mkdtempSync(join(tmpdir(), "fx-fifo-early-")) : "";
+    const fifoPath = fifoDir ? join(fifoDir, "hold.fifo") : "";
+    if (fifoPath) Bun.spawnSync(["mkfifo", fifoPath]);
+    const fineGatewayDone = held();
     // With `trace`, fx writes its trace log, which `run` reads as its last argument.
     let tracePath = "";
     const env: Record<string, string> = {};
@@ -4911,29 +5001,55 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             await gates.cut.promise;
             return text("cut_done", "ENDED_CUT_DONE");
           }
+          fineGatewayDone.release();
           return text("fine_done", "ENDED_FINE_DONE");
         }
         for (const report of reportsIn(body)) reported.set(report.workId, report);
-        if (latestUserText(body).includes('"child_id"')) return text(`main_saw_${reported.size}`, "ENDED_MAIN_SAW");
-        if (latestUserText(body).includes("ENDED_AGAIN")) {
-          if (!body.includes('"ended_again_broken"')) {
-            return messageSteps([
-              { id: "ended_again_broken", agent: "broken", message: "ENDED_AGAIN try once more" },
-              { id: "ended_again_cut", agent: "cut", message: "ENDED_AGAIN start over" },
-            ]);
-          }
+        if (body.includes('"ended_again_broken"') && !body.includes("ENDED_MAIN_AGAIN")) {
           return text("main_again", "ENDED_MAIN_AGAIN");
         }
         if (!body.includes('"ended_broken"')) {
+          if (options.earlyReport) {
+            return fakeGatewaySse([
+              { type: "tool-call", toolCallId: "ended_broken", toolName: "subagent", input: { request: { action: "message", agent: "broken", message: "ENDED_BROKEN run the bench" } } },
+              { type: "tool-call", toolCallId: "ended_cut", toolName: "subagent", input: { request: { action: "message", agent: "cut", message: "ENDED_CUT work slowly" } } },
+              { type: "tool-call", toolCallId: "ended_fine", toolName: "subagent", input: { request: { action: "message", agent: "fine", message: "ENDED_FINE say hello" } } },
+              { type: "tool-call", toolCallId: "ended_hold", toolName: "shell", input: { request: { action: "run", command: `cat ${fifoPath}` } } },
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+            ]);
+          }
           return messageSteps([
             { id: "ended_broken", agent: "broken", message: "ENDED_BROKEN run the bench" },
             { id: "ended_cut", agent: "cut", message: "ENDED_CUT work slowly" },
             { id: "ended_fine", agent: "fine", message: "ENDED_FINE say hello" },
           ]);
         }
-        return text("main_wait", "ENDED_MAIN_WAITING");
+        // Main's second request (the tool-result turn after starting the three)
+        // must still answer ENDED_MAIN_WAITING even if a child report already
+        // joined at the boundary before it was sent; and report turns checked
+        // before ENDED_AGAIN ensure a child's ENDED_AGAIN_DONE report never
+        // re-triggers the again steps.
+        if (!body.includes("ENDED_MAIN_WAITING")) return text("main_wait", "ENDED_MAIN_WAITING");
+        if (latestUserText(body).includes('"child_id"')) return text(`main_saw_${reported.size}`, "ENDED_MAIN_SAW");
+        if (latestUserText(body).includes("ENDED_AGAIN")) {
+          againSteps += 1;
+          return messageSteps([
+            { id: "ended_again_broken", agent: "broken", message: "ENDED_AGAIN try once more" },
+            { id: "ended_again_cut", agent: "cut", message: "ENDED_AGAIN start over" },
+          ]);
+        }
+        unexpectedMainReplies += 1;
+        return text("main_unexpected", "ENDED_MAIN_UNEXPECTED");
       }, async (session, context) => {
         await session.sendText("SWITCH_USER start the team");
+        if (options.earlyReport) {
+          await fineGatewayDone.promise;
+          // Wait until the host main loop has actually posted the report into
+          // main's worker mailbox (not just queued it from the child thread)
+          // before unblocking the FIFO-held shell call.
+          await until("fine report posted to main", () => trace().includes("child_delivery_posted"));
+          await writeFile(fifoPath, "go\n");
+        }
         // Main's turn is over once the three are started; the reports of
         // `broken` and `fine` come after it.
         await session.waitForText("ENDED_MAIN_WAITING", 60_000);
@@ -4945,13 +5061,17 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForComposer(30_000);
         await run(session, context, gates, () => [...reported.values()], trace);
       }, (home) => {
-        if (!options.trace) return;
+        if (!options.trace && !options.earlyReport) return;
         tracePath = join(home, "fx-trace.log");
         env.FX_TRACE_LOG = tracePath;
+        if (options.earlyReport) env.FX_TRACE_SCOPES = "host,input";
       }, false, env);
+      expect(unexpectedMainReplies).toBe(0);
     } finally {
       gates.cut.release();
       gates.again.release();
+      fineGatewayDone.release();
+      if (fifoDir) rmSync(fifoDir, { recursive: true, force: true });
     }
   }
 
@@ -5097,9 +5217,30 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "the footer on a subagent's own screen still says failed, stopped, or done when a subagent report joins before ENDED_MAIN_WAITING",
+    async () => {
+      await withEndedSubagents(async (session, context, gates) => {
+        expect(context.requests.some((request) =>
+          isMainRequest(request.body) &&
+          !request.body.includes("ENDED_MAIN_WAITING") &&
+          latestUserText(request.body).includes('"child_id"'))).toBe(true);
+        expect(await session.capturePane()).toContain("ENDED_MAIN_WAITING");
+        await stopCut(session);
+        await session.waitForPane((pane) => pane.includes("cut \u00b7 stopped"), 10_000);
+        await showAgent(session, "broken");
+        await session.waitForPane((pane) => pane.includes("broken \u00b7 failed"), 10_000);
+        await showAgent(session, "fine");
+        await session.waitForPane((pane) => pane.includes("fine \u00b7 done"), 10_000);
+        expect(gates.againSteps()).toBe(0);
+      }, { earlyReport: true });
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a subagent's next turn says working, and a later turn that completes clears its failed or stopped state",
     async () => {
-      await withEndedSubagents(async (session, _context, gates) => {
+      await withEndedSubagents(async (session, _context, gates, reports) => {
         await stopCut(session);
         // They start out as the last turn left them.
         await session.sendKeys("C-x");
@@ -5130,6 +5271,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           expect(cleared).not.toMatch(subagentRow(name, "failed"));
           expect(cleared).not.toMatch(subagentRow(name, "stopped"));
         }
+        await until("both again reports reach main", () =>
+          reports().filter((report) => report.outcome === "completed").length >= 3, 15_000);
+        expect(gates.againSteps()).toBe(1);
       });
     },
     TIMEOUT,
@@ -5981,6 +6125,60 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
         writeSpikeWriter,
         false,
         { FX_TEST_APPROVAL_SCREEN_FAIL: "1" },
+        {},
+        "",
+        true,
+      );
+    },
+    TIMEOUT,
+  );
+
+  // The hook is a test switch like any other: only an on value fails a screen.
+  // `0` leaves it off, so the request opens its screen and a key answers it.
+  test(
+    "a zero approval screen fail value leaves the approval screen open for the key",
+    async () => {
+      const arrived = held();
+      let childCalls = 0;
+      await withFx(
+        (body) => {
+          if (!SPIKE_MAIN(body)) {
+            childCalls += 1;
+            // The write waits for the person to be on the subagent's own
+            // screen, so the request opens its screen there.
+            if (childCalls === 1) {
+              return arrived.promise.then(() =>
+                toolCall("child_e8_write", "write_file", { path: "spike-e8.txt", content: "SPIKE_WROTE\n" })
+              );
+            }
+            return text("child_e8_done", "SPIKE_E8_WROTE");
+          }
+          if (!body.includes('"main_e8_start"')) {
+            return toolCall("main_e8_start", "subagent", {
+              request: { action: "message", agent: "writer", message: "SPIKE_E8_TASK", profile: "writer" },
+            });
+          }
+          return text("main_e8_tail", "SPIKE_E8_MAIN_DONE");
+        },
+        async (session, { workspace, stderrPath }) => {
+          await session.sendText("SPIKE_USER_e8");
+          await session.waitForText("SPIKE_E8_MAIN_DONE", 30_000);
+          await showAgent(session, "writer");
+          arrived.release();
+          // The screen opens as usual, and its key answers the request.
+          await session.waitForText("Apply this change?", 30_000);
+          expect(await session.capturePane()).toContain("spike-e8.txt");
+          await session.sendKeys("1");
+          await until("the write", () => existsSync(join(workspace, "spike-e8.txt")));
+          expect(readFileSync(join(workspace, "spike-e8.txt"), "utf8")).toBe("SPIKE_WROTE\n");
+          await session.waitForText("SPIKE_E8_WROTE", 30_000);
+          expect(await session.capturePane()).not.toContain("could not open");
+          expect(stderrPath).toBeDefined();
+          expect(readFileSync(stderrPath!, "utf8")).toBe("");
+        },
+        writeSpikeWriter,
+        false,
+        { FX_TEST_APPROVAL_SCREEN_FAIL: "0" },
         {},
         "",
         true,

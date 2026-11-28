@@ -47,6 +47,7 @@ const input_full_transcript_runtime = @import("core/app/input_full_transcript_ru
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
+const sandbox_policy = @import("core/runner/runner.zig");
 const app_trust_runtime = @import("core/app/app_trust_runtime.zig");
 const workspace_trust = @import("core/workspace_trust/workspace_trust.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
@@ -119,6 +120,7 @@ const subagent_tool_host = @import("core/subagent/tool_host.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
+const shell_snapshot = @import("core/terminal/shell_snapshot.zig");
 const command_runner = @import("core/execution/command_runner.zig");
 const command_admission = @import("core/permissions/command_admission.zig");
 const permission_auto_classifier = @import("core/permissions/auto_classifier.zig");
@@ -140,6 +142,7 @@ const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
 const session_log = @import("core/session/session_log.zig");
 const builtin_tools = @import("builtins/tools.zig");
+const shell_projection = @import("builtins/shell_projection.zig");
 const browser_workspace_tools = @import("builtins/browser_workspace_tools.zig");
 const browser_capabilities = @import("core/hosts/browser_capabilities.zig");
 const tool_admission = @import("core/tooling/tool_admission.zig");
@@ -401,6 +404,7 @@ fn currentBuild() update_target.CurrentBuild {
         .channel = compiled_update_channel,
         .version = version,
         .revision = build_options.git_commit,
+        .build = build_options.build_number,
     };
 }
 
@@ -635,6 +639,10 @@ const App = struct {
     /// started, each marked by its role. Owned by
     /// `app_agents_runtime`.
     child_agents: std.ArrayList(*app_agents_runtime.ChildAgent) = .empty,
+    /// The `screen_id` the next agent in `child_agents` gets; 0 is the
+    /// first instance's. Owned by `app_agents_runtime`; main loop only, like
+    /// the writes to `child_agents`.
+    next_screen_id: u64 = 1,
     /// What every instance starts from, and how many startup opens. Owned
     /// by `app_instances_runtime`.
     instances: app_instances_runtime.State = .{},
@@ -665,6 +673,10 @@ const App = struct {
     /// `app_agents_runtime`.
     child_handoffs: app_agents_runtime.Handoffs = .{},
     shell: TranscriptRuntime = .{},
+    /// The sandbox policy for shell commands, loaded at startup when
+    /// `experimental.sandbox_execution` is on. Null when it is off, or when the
+    /// load ran out of memory. Destroyed at teardown, after the agents.
+    sandbox_policy: ?*sandbox_policy.Policy = null,
     pacer: assistant_pacer.AssistantPacer = .{},
 
     terminal_client: terminal_client_runtime.Runtime = .{},
@@ -1216,6 +1228,9 @@ const App = struct {
         self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         AgentsAppRuntime.deinitChildren(self);
+        // Every agent and worker that could place a command has ended, so the policy can go.
+        if (self.sandbox_policy) |loaded| loaded.destroy();
+        self.sandbox_policy = null;
         self.instances.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         main_agent.session_title.deinit(self.alloc);
@@ -2258,13 +2273,13 @@ const App = struct {
             const roots = try profiles.Roots.init(profile_arena.allocator(), io_mod.homeDir(), workspace_root);
             break :listed try profiles.list(profile_arena.allocator(), roots);
         } else &.{};
-        return tool_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(agent), .{
+        return shell_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(agent), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = subagent_available,
             .subagent_profiles = subagent_profiles,
             .behind_toolbox = self.toolbox_behind.slice(),
-        });
+        }, .{ .runner = self.sandbox_policy != null });
     }
 
     pub fn subagentToolContextForAdmission(
@@ -2423,8 +2438,8 @@ const App = struct {
     }
 
     /// Records an "always" approval from `agent`'s turn on its instance.
-    pub fn allowToolForSession(self: *App, agent: *agents.Agent, tool_name: []const u8, target_path: []const u8) !void {
-        try app_permission_runtime.Runtime(App).allowForSession(self, agent, tool_name, target_path);
+    pub fn allowToolForSession(self: *App, agent: *agents.Agent, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
+        try app_permission_runtime.Runtime(App).allowForSession(self, agent, tool_name, target_path, shell_epoch);
     }
 
     pub fn permissionReviewerProvider(self: *const App) ?permission_auto_classifier.Provider {
@@ -2477,6 +2492,10 @@ const App = struct {
 
     pub fn resolveToolActionDisplayTarget(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall) !?[]const u8 {
         return AgentAppRuntime.resolveToolActionDisplayTarget(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    }
+
+    pub fn resolveCommandPlacement(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall) !?types.CommandPlacement {
+        return AgentAppRuntime.resolveCommandPlacement(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn describeToolActionWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -4174,6 +4193,8 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     if (c_argc > 0) ui_program_resume.rememberProgramName(c_argv[0]);
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
+    // The built-in remote runner comes first (spec L4): no settings, update check, sessions, MCP or terminal setup.
+    if (isBuiltinRunnerInvocation(raw_args)) runBuiltinRunner(raw_args, raw_env);
     // Before any mode runs, since terminal helpers write under fx's folder too.
     try useFxHomeFromEnv(raw_env);
 
@@ -4322,6 +4343,24 @@ fn writeTopLevelHelpFast(raw_env: RawEnviron) !void {
         style,
     );
     try writeStdoutFast(text);
+}
+
+fn isBuiltinRunnerInvocation(raw_args: []const [*:0]const u8) bool {
+    return raw_args.len >= 2 and std.mem.eql(u8, std.mem.span(raw_args[1]), sandbox_policy.subcommand);
+}
+
+fn runBuiltinRunner(raw_args: []const [*:0]const u8, raw_env: RawEnviron) noreturn {
+    io_mod.setRawEnviron(raw_env);
+    const alloc = processAllocator();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    const words = arena.allocator().alloc([]const u8, raw_args.len) catch exitFast(sandbox_policy.exit_did_not_run);
+    for (raw_args, words) |raw, *word| word.* = std.mem.span(raw);
+    var threaded = std.Io.Threaded.init(alloc, processIoOptions(argsFromRaw(raw_args), environBlockFromRaw(raw_env)));
+    io_mod.setIo(threaded.io());
+    const code = sandbox_policy.runBuiltin(arena.allocator(), words);
+    threaded.deinit();
+    arena.deinit();
+    exitFast(code);
 }
 
 fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_args: []const [:0]const u8) !void {
@@ -4896,6 +4935,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -4933,6 +4973,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -4970,6 +5011,7 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -5784,6 +5826,7 @@ test {
     _ = @import("acp/server.zig");
     _ = @import("acp/libfx_hooks.zig");
     _ = @import("acp/types.zig");
+    _ = @import("protocol/spec/schemas.zig");
     _ = @import("core/mcp_host/model.zig");
     _ = @import("core/output/activity_status.zig");
     _ = @import("core/agent/agent_runtime.zig");
@@ -5863,6 +5906,7 @@ test {
     _ = @import("builtins/gateway.zig");
     _ = @import("builtins/gateway/typesafe_permission_reviewer.zig");
     _ = @import("builtins/hooks.zig");
+    _ = @import("core/shared/child_wait.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/output/full_transcript_metadata.zig");
@@ -5933,6 +5977,7 @@ test {
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/shell_command/safe_git.zig");
     _ = @import("core/execution/router.zig");
+    _ = @import("core/runner/runner.zig");
     _ = @import("core/execution/command_runner.zig");
     _ = @import("core/permissions/direct_command.zig");
     _ = @import("core/permissions/auto_classifier.zig");
@@ -5993,6 +6038,7 @@ test {
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/shared/text_utils.zig");
+    _ = @import("core/shared/wildcard.zig");
     _ = @import("core/shared/testing_listener.zig");
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");
@@ -6003,6 +6049,7 @@ test {
     _ = @import("core/hosts/browser_capabilities.zig");
     _ = @import("core/tooling/tool_args.zig");
     _ = @import("core/tooling/tool_result_errors.zig");
+    _ = @import("core/tooling/shell_result_notice.zig");
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("core/tooling/tool_specs.zig");
     _ = @import("core/tooling/toolbox.zig");
@@ -9085,13 +9132,13 @@ test "each instance keeps its own permission mode and session approvals" {
     try std.testing.expectEqual(types.PermissionMode.yolo, Permission.livePermissionSnapshot(&app, &second.agent).mode);
 
     // An approval belongs to the instance whose turn asked for it.
-    try Permission.allowForSession(&app, &second.agent, "run_command", "/tmp/workspace::zig build");
+    try Permission.allowForSession(&app, &second.agent, "run_command", "/tmp/workspace::zig build", shell_snapshot.processOwner().approvalEpoch());
     const second_count = grantCount(&app, &second.agent);
     try std.testing.expect(second_count > 0);
     try std.testing.expectEqual(@as(usize, 0), grantCount(&app, &app.main_agent));
 
     // A subagent's still go to the first instance, as before instances.
-    try Permission.allowForSession(&app, &child.agent, "run_command", "/tmp/workspace::zig fmt");
+    try Permission.allowForSession(&app, &child.agent, "run_command", "/tmp/workspace::zig fmt", shell_snapshot.processOwner().approvalEpoch());
     try std.testing.expect(grantCount(&app, &app.main_agent) > 0);
     try std.testing.expect(Permission.grantsLocked(&app, &child.agent).ptr == Permission.grantsLocked(&app, &app.main_agent).ptr);
     try std.testing.expectEqual(second_count, grantCount(&app, &second.agent));
@@ -9140,12 +9187,12 @@ test "a subagent's always approval reaches its instance's list at once, for main
     const arena = arena_state.allocator();
 
     // The grants a file change's approval offers: the workspace tree.
-    const file_grants = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent);
+    const file_grants = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent, shell_snapshot.processOwner().approvalEpoch());
     try std.testing.expect(file_grants.len > 0);
 
     // They are in the list when the call returns, before the event that
     // carries them reaches the main loop.
-    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
+    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path, grant.shell_epoch);
     for ([_]*agents.Agent{ &app.main_agent, &child.agent, &sibling.agent }) |agent| {
         try std.testing.expect(grantAllowed(app, agent, "write_file", "/tmp/workspace/other/file.txt"));
     }
@@ -9153,14 +9200,14 @@ test "a subagent's always approval reaches its instance's list at once, for main
     const stored = grantCount(app, &app.main_agent);
 
     // The same approval again leaves the list as it was.
-    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
+    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path, grant.shell_epoch);
     try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
 
     // A second instance is another session: it keeps its own list, and its
     // subagent's approval stays there.
     try std.testing.expectEqual(@as(usize, 0), grantCount(app, &second.agent));
     try std.testing.expect(!grantAllowed(app, &other.agent, "write_file", "/tmp/workspace/other/file.txt"));
-    try Worker.propagateGrant(app, &other.agent, "skill", "demo");
+    try Worker.propagateGrant(app, &other.agent, "skill", "demo", 0);
     try std.testing.expect(grantAllowed(app, &second.agent, "skill", "demo"));
     try std.testing.expect(!grantAllowed(app, &app.main_agent, "skill", "demo"));
     try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
@@ -9168,10 +9215,10 @@ test "a subagent's always approval reaches its instance's list at once, for main
     // Main's own answer is written at once too, so a subagent that is running
     // reads it at its next call. The main loop's event for the same answer
     // then adds no second row.
-    try Worker.propagateGrant(app, &app.main_agent, "skill", "main-only");
+    try Worker.propagateGrant(app, &app.main_agent, "skill", "main-only", 0);
     try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
     try std.testing.expect(grantAllowed(app, &child.agent, "skill", "main-only"));
-    try Permission.allowForSession(app, &app.main_agent, "skill", "main-only");
+    try Permission.allowForSession(app, &app.main_agent, "skill", "main-only", 0);
     try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
 }
 
@@ -9191,9 +9238,9 @@ test "main's check reads the approvals its instance holds when it checks, and no
 
     // The turn began, or the prompt was queued, before the approval, so its own
     // list has none of it.
-    const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own") }};
+    const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own"), .shell_epoch = 0 }};
     try std.testing.expect(!permissions.sessionGrantAllowed(Merge.mergeLiveGrants(app, &app.main_agent, arena, &own), "skill", "granted"));
-    try Worker.propagateGrant(app, &child.agent, "skill", "granted");
+    try Worker.propagateGrant(app, &child.agent, "skill", "granted", 0);
 
     // Main's check now reads it, and still reads the turn's own approval.
     const main_grants = Merge.mergeLiveGrants(app, &app.main_agent, arena, &own);
@@ -9207,6 +9254,31 @@ test "main's check reads the approvals its instance holds when it checks, and no
     const second_grants = Merge.mergeLiveGrants(app, &second.agent, arena, &own);
     try std.testing.expectEqual(own.len, second_grants.len);
     try std.testing.expect(!permissions.sessionGrantAllowed(second_grants, "skill", "granted"));
+}
+
+test "a subagent's shell grant made after a shell refresh stays live in main's check" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    const Worker = app_worker_runtime.Runtime(App);
+    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const child = try addTestChildAgent(app, "child-1");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Merge = App.AgentAppRuntime;
+
+    const owner = shell_snapshot.processOwner();
+    owner.markDirty(.user_reload);
+    const epoch = owner.approvalEpoch();
+    try std.testing.expectEqual(@as(u64, 1), epoch);
+    try Worker.propagateGrant(app, &child.agent, "bash", "echo x", epoch);
+
+    const own: []const types.PermissionGrant = &.{};
+    const main_grants = Merge.mergeLiveGrants(app, &app.main_agent, arena, own);
+    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "run_command", "echo x"));
 }
 
 test "subagents' workers and main's worker add approvals while main's worker and main's thread read them" {
@@ -9242,7 +9314,7 @@ test "subagents' workers and main's worker add approvals while main's worker and
                     _ = self.torn.fetchAdd(1, .monotonic);
                     return;
                 };
-                Worker.propagateGrant(self.app, child, "skill", target) catch {
+                Worker.propagateGrant(self.app, child, "skill", target, 0) catch {
                     _ = self.torn.fetchAdd(1, .monotonic);
                     return;
                 };
@@ -9270,7 +9342,7 @@ test "subagents' workers and main's worker add approvals while main's worker and
                 _ = arena.reset(.retain_capacity);
                 const ctx = App.AgentAppRuntime.toolContext(self.app, &self.app.main_agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
                 _ = ctx;
-                const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("m-own") }};
+                const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("m-own"), .shell_epoch = 0 }};
                 self.check(App.AgentAppRuntime.mergeLiveGrants(self.app, &self.app.main_agent, arena.allocator(), &own));
             }
         }
@@ -9309,7 +9381,7 @@ test "subagents' workers and main's worker add approvals while main's worker and
     for (0..Race.approvals) |i| {
         var buf: [16]u8 = undefined;
         const target = try std.mem.print(&buf, "m-{d}", .{i});
-        try Permission.allowForSession(app, &app.main_agent, "skill", target);
+        try Permission.allowForSession(app, &app.main_agent, "skill", target, 0);
     }
     first_writer.join();
     second_writer.join();
@@ -10965,4 +11037,31 @@ test "wait card: the screen's own model choice still writes the user settings" {
     defer if (settings) |text| alloc.free(text);
     const text = settings orelse return error.UserSettingsMissing;
     try std.testing.expect(std.mem.find(u8, text, "openai/gpt-5-mini") != null);
+}
+
+test "an approval in one instance does not revive another instance's older bash grant" {
+    const alloc = std.testing.allocator;
+    const Permission = app_permission_runtime.Runtime(App);
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer Permission.deinitSessionGrants(&app, &app.main_agent);
+    const second = try addTestChildAgent(&app, "instance-2");
+    second.agent.role = .instance;
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+
+    try Permission.allowForSession(&app, &second.agent, "run_command", "echo x", shell_snapshot.processOwner().approvalEpoch());
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    try Permission.allowForSession(&app, &app.main_agent, "run_command", "echo x", shell_snapshot.processOwner().approvalEpoch());
+
+    const second_grants = try Permission.copyGrants(&app, &second.agent, alloc);
+    defer types.freePermissionGrantSlice(alloc, second_grants);
+    try std.testing.expect(!permissions.sessionGrantAllowed(second_grants, "run_command", "echo x"));
+
+    const main_grants = try Permission.copyGrants(&app, &app.main_agent, alloc);
+    defer types.freePermissionGrantSlice(alloc, main_grants);
+    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "run_command", "echo x"));
 }

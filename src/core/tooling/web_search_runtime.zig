@@ -1184,37 +1184,84 @@ test "a configure with a null team leaves the runtime holding no team" {
 
 test "a configure and a snapshot share the runtime's own copy" {
     const alloc = std.testing.allocator;
-    var runtime = Runtime.init(.{ .worker_model = "m", .gateway_chat_url = "https://gateway.test/chat" });
-    defer runtime.deinit();
+    // Both threads race, and the snapshotter can finish every round before the
+    // configurer's first `configure` takes the lock, so the runtime starts with
+    // every value already set. Each snapshot must then hold all of them.
+    const Threads = struct {
+        const rounds: usize = 200;
+        const api_key = "sign-in-key";
+        const gateway_team = "team";
+        const worker_model = "m";
+        const gateway_chat_url = "https://gateway.test/chat";
 
-    const Configurer = struct {
-        fn run(rt: *Runtime, a: Allocator) void {
-            for (0..200) |_| {
-                const key = a.dupe(u8, "sign-in-key") catch return;
+        fn configure(rt: *Runtime, a: Allocator, finished: *std.atomic.Value(usize)) void {
+            for (0..rounds) |_| {
+                // The runtime copies this key, so it is freed at once, while
+                // the snapshotter may still be reading the previous one.
+                const key = a.dupe(u8, api_key) catch return;
                 rt.configure(.{
                     .api_key = key,
-                    .gateway_team = "team",
-                    .worker_model = "m",
+                    .gateway_team = gateway_team,
+                    .worker_model = worker_model,
                     .gateway_retry_count = 3,
-                    .gateway_chat_url = "https://gateway.test/chat",
+                    .gateway_chat_url = gateway_chat_url,
                 });
                 a.free(key);
+                _ = finished.fetchAdd(1, .monotonic);
             }
         }
-    };
-    const Snapshotter = struct {
-        fn run(rt: *Runtime, a: Allocator, seen: *std.atomic.Value(usize)) void {
-            for (0..200) |_| {
-                var snapshot = rt.inputsSnapshot(a) catch return;
-                _ = seen.fetchAdd(snapshot.api_key.len, .monotonic);
-                snapshot.deinit(a);
+
+        fn snapshot(
+            rt: *Runtime,
+            a: Allocator,
+            intact: *std.atomic.Value(usize),
+            failed: *std.atomic.Value(usize),
+        ) void {
+            for (0..rounds) |_| {
+                // A thread cannot `try`, so a failure is counted here and the
+                // test asserts the count after `join`.
+                var live = rt.inputsSnapshot(a) catch {
+                    _ = failed.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                const complete = holdsEveryValue(&live);
+                live.deinit(a);
+                if (complete) {
+                    _ = intact.fetchAdd(1, .monotonic);
+                } else {
+                    _ = failed.fetchAdd(1, .monotonic);
+                }
             }
         }
+
+        /// A snapshot taken between two configures still holds all four values
+        /// the runtime was set up with: never torn and never empty.
+        fn holdsEveryValue(live: *const OwnedInputs) bool {
+            const team = live.gateway_team orelse return false;
+            return std.mem.eql(u8, live.api_key, api_key) and
+                std.mem.eql(u8, team, gateway_team) and
+                std.mem.eql(u8, live.worker_model, worker_model) and
+                std.mem.eql(u8, live.gateway_chat_url, gateway_chat_url);
+        }
     };
-    var seen = std.atomic.Value(usize).init(0);
-    const configurer = try std.Thread.spawn(.{}, Configurer.run, .{ &runtime, alloc });
-    const snapshotter = try std.Thread.spawn(.{}, Snapshotter.run, .{ &runtime, alloc, &seen });
+
+    var runtime = Runtime.init(.{
+        .api_key = Threads.api_key,
+        .gateway_team = Threads.gateway_team,
+        .worker_model = Threads.worker_model,
+        .gateway_chat_url = Threads.gateway_chat_url,
+    });
+    defer runtime.deinit();
+
+    var configures = std.atomic.Value(usize).init(0);
+    var intact = std.atomic.Value(usize).init(0);
+    var failures = std.atomic.Value(usize).init(0);
+    const configurer = try std.Thread.spawn(.{}, Threads.configure, .{ &runtime, alloc, &configures });
+    const snapshotter = try std.Thread.spawn(.{}, Threads.snapshot, .{ &runtime, alloc, &intact, &failures });
     configurer.join();
     snapshotter.join();
-    try std.testing.expect(seen.load(.monotonic) > 0);
+
+    try std.testing.expectEqual(Threads.rounds, configures.load(.monotonic));
+    try std.testing.expectEqual(Threads.rounds, intact.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), failures.load(.monotonic));
 }

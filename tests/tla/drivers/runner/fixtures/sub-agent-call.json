@@ -1,0 +1,37 @@
+{
+  "covers": [
+    "sub-agent"
+  ],
+  "title": "A sub-agent's remote call with no destination is refused (E10) without a prompt.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": true
+      }
+    },
+    "teams": "one",
+    "surface": "interactive",
+    "login": "valid",
+    "configured": false,
+    "configValid": true,
+    "answers": [],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "refused"
+      ]
+    },
+    "prompts": 0,
+    "writes": 0
+  },
+  "tamper": {
+    "setup": "prompt-without-channel"
+  },
+  "drive": {}
+}
