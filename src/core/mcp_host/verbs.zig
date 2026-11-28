@@ -23,6 +23,8 @@ const login_words = @import("login_words.zig");
 const runtime_mod = @import("runtime.zig");
 const mcp = @import("../../mcp/mcp.zig");
 const mcp_call_client = @import("mcp_call_client.zig");
+const ui_terminal = @import("../../ui/terminal/terminal.zig");
+const output_contracts = @import("../output/output_contracts.zig");
 const Host = @import("host.zig").Host;
 
 const Allocator = std.mem.Allocator;
@@ -418,12 +420,19 @@ pub fn run(c: Context, args: []const []const u8) u8 {
     const arena = arena_state.allocator();
     const code = runParsed(c, arena, args) catch |err| code: {
         debug_trace.logf("mcp", "MCP verb failed args0={s} err={s}", .{ if (args.len > 0) args[0] else "", @errorName(err) });
-        c.err.print("{s}: {s}\n", .{ c.surface.prog(), describe(err) }) catch {};
-        break :code 1;
+        break :code reportFailure(c.err, c.surface, err);
     };
     c.out.flush() catch {};
     c.err.flush() catch {};
     return code;
+}
+
+/// The exit code for a verb that failed, after saying why on `err_writer`. A
+/// hang-up ends quietly, as the other CLI commands do.
+fn reportFailure(err_writer: *Writer, surface: Surface, err: anyerror) u8 {
+    if (err == error.TerminalHungUp) return output_contracts.terminal_hung_up_exit_code;
+    err_writer.print("{s}: {s}\n", .{ surface.prog(), describe(err) }) catch {};
+    return 1;
 }
 
 /// `fx mcp list --json` and `show --json` report a usage error as the JSON
@@ -1365,11 +1374,20 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
 fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
     var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
     if (try std.posix.poll(&fds, 100) == 0) return null;
+    return readPastedFrom(arena, line, std.posix.STDIN_FILENO, std.posix.read, ui_terminal.terminalGone, sleepPasteSlice);
+}
+
+/// Reads what waits on `fd` and takes a complete line from it. Test seam for the read, the hang-up check, and the wait.
+fn readPastedFrom(arena: Allocator, line: *std.ArrayList(u8), fd: std.posix.fd_t, comptime readFn: anytype, comptime goneFn: anytype, comptime sleepFn: anytype) !?[]const u8 {
     var buffer: [1024]u8 = undefined;
-    const n = std.posix.read(std.posix.STDIN_FILENO, &buffer) catch return null;
+    const n = readFn(fd, &buffer) catch |err| {
+        if (goneFn(fd, err)) return error.TerminalHungUp;
+        sleepFn();
+        return null;
+    };
+    // stdin closed: wait for the browser instead.
     if (n == 0) {
-        // stdin closed: wait for the browser instead.
-        io_mod.sleep(100 * std.time.ns_per_ms);
+        sleepFn();
         return null;
     }
     try line.appendSlice(arena, buffer[0..n]);
@@ -1380,7 +1398,80 @@ fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
     return if (copy.len == 0) null else copy;
 }
 
+/// Waits out one paste slice, so a stdin that keeps failing cannot spin the wait loop.
+fn sleepPasteSlice() void {
+    io_mod.sleep(100 * std.time.ns_per_ms);
+}
+
 const testing = std.testing;
+
+fn readEio(_: std.posix.fd_t, _: []u8) std.posix.ReadError!usize {
+    return error.InputOutput;
+}
+
+fn readNothing(_: std.posix.fd_t, _: []u8) std.posix.ReadError!usize {
+    return 0;
+}
+
+fn readPastedLine(_: std.posix.fd_t, buffer: []u8) std.posix.ReadError!usize {
+    const text = "abc\n";
+    @memcpy(buffer[0..text.len], text);
+    return text.len;
+}
+
+fn goneYes(_: std.posix.fd_t, _: anyerror) bool {
+    return true;
+}
+
+fn goneNo(_: std.posix.fd_t, _: anyerror) bool {
+    return false;
+}
+
+/// Counts the paste slices a read waited out. Each test resets it first.
+const CountingSleep = struct {
+    var calls: usize = 0;
+
+    fn sleep() void {
+        calls += 1;
+    }
+};
+
+test "a failed paste read on a terminal that is gone ends the login as a hang-up, without sleeping" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var line: std.ArrayList(u8) = .empty;
+    CountingSleep.calls = 0;
+    try testing.expectError(error.TerminalHungUp, readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readEio, goneYes, CountingSleep.sleep));
+    try testing.expectEqual(@as(usize, 0), CountingSleep.calls);
+}
+
+test "a failed paste read on a terminal that is still there waits one slice before it returns" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var line: std.ArrayList(u8) = .empty;
+    CountingSleep.calls = 0;
+    try testing.expectEqual(@as(?[]const u8, null), try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readEio, goneNo, CountingSleep.sleep));
+    try testing.expectEqual(@as(usize, 1), CountingSleep.calls);
+}
+
+test "a paste read of zero bytes waits one slice and keeps waiting for the browser" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var line: std.ArrayList(u8) = .empty;
+    CountingSleep.calls = 0;
+    try testing.expectEqual(@as(?[]const u8, null), try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readNothing, goneNo, CountingSleep.sleep));
+    try testing.expectEqual(@as(usize, 1), CountingSleep.calls);
+}
+
+test "a complete pasted line is returned without its line break, without sleeping" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var line: std.ArrayList(u8) = .empty;
+    CountingSleep.calls = 0;
+    const pasted = (try readPastedFrom(arena_state.allocator(), &line, std.posix.STDIN_FILENO, readPastedLine, goneNo, CountingSleep.sleep)).?;
+    try testing.expectEqualStrings("abc", pasted);
+    try testing.expectEqual(@as(usize, 0), CountingSleep.calls);
+}
 
 fn parseCli(arena: Allocator, args: []const []const u8) !Parsed {
     return parse(arena, .cli, args);
@@ -1395,6 +1486,20 @@ pub fn isValidServerName(name: []const u8) bool {
         return false;
     }
     return true;
+}
+
+test "a verb that ends on a hang-up exits 129 and says nothing" {
+    var err: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+    try testing.expectEqual(@as(u8, 129), reportFailure(&err.writer, .cli, error.TerminalHungUp));
+    try testing.expectEqualStrings("", err.written());
+}
+
+test "a verb that fails for another reason says it in fx's words and exits 1" {
+    var err: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+    try testing.expectEqual(@as(u8, 1), reportFailure(&err.writer, .cli, error.OutOfMemory));
+    try testing.expectEqualStrings("fx mcp: out of memory\n", err.written());
 }
 
 test "a server name is letters, digits, underscores, and hyphens" {

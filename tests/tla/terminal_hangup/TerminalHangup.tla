@@ -22,11 +22,11 @@ EXTENDS Naturals
 
 CONSTANTS
   Design,   \* "current" | "design_a" | "design_b"
-  Mutant,   \* "none" | "no_init_hangup" | "no_pollnval" | "no_orphan_check" | "blind_eio" | "no_exit_check"
+  Mutant,   \* "none" | "no_init_hangup" | "no_pollnval" | "no_orphan_check" | "blind_eio" | "no_exit_check" | "no_still_terminal"
   Class     \* "all" | "ideal" | "nonideal"
 
 ASSUME Design \in {"current", "design_a", "design_b"}
-ASSUME Mutant \in {"none", "no_init_hangup", "no_pollnval", "no_orphan_check", "blind_eio", "no_exit_check"}
+ASSUME Mutant \in {"none", "no_init_hangup", "no_pollnval", "no_orphan_check", "blind_eio", "no_exit_check", "no_still_terminal"}
 ASSUME Class \in {"all", "ideal", "nonideal"}
 
 VARIABLES
@@ -73,7 +73,7 @@ TerminalCloseClean ==
   /\ Running
   /\ termState = "open"
   /\ Class = "ideal" => phase = "idle"
-  /\ termState' \in (IF Class = "ideal" THEN {"hung_up"} ELSE {"hung_up", "revoked"})
+  /\ termState' \in (IF Class = "ideal" THEN {"hung_up"} ELSE {"hung_up", "revoked", "readable_revoked"})
   /\ UNCHANGED <<phase, sighupPending, turnActive, errKind, errOnOpenTerm,
                  failedInInit, outcome, msgPrinted, crashSaved,
                  turnSavedForResume, spinCount, altScreen>>
@@ -121,6 +121,7 @@ DesignASeesGone(ts) ==
   \/ Mutant = "blind_eio"
   \/ ts \in {"hung_up", "revoked", "closing_eio_only"} \* closing_eio_only resolved via bounded wait
   \/ (ts = "orphaned" /\ Mutant # "no_orphan_check")
+  \/ (ts = "readable_revoked" /\ Mutant # "no_still_terminal") \* EIO on a descriptor that is no longer a terminal
 
 LifecycleWrite(fromStartup) ==
   /\ Running
@@ -251,6 +252,16 @@ PollAndReadInput ==
               /\ errOnOpenTerm' = FALSE
               /\ failedInInit' = FALSE
               /\ UNCHANGED <<termState, spinCount>>
+       [] termState = "readable_revoked" ->
+            \* macOS 15 polls the revoked terminal as readable, so the read itself fails with EIO.
+            /\ phase' = "exiting"
+            /\ errOnOpenTerm' = FALSE
+            /\ failedInInit' = FALSE
+            /\ spinCount' = 0
+            /\ IF Design = "design_a" /\ DesignASeesGone(termState)
+               THEN errKind' = "eof"
+               ELSE errKind' = "eio_read"
+            /\ UNCHANGED termState
        [] termState \in {"closing_eio_only", "orphaned"} ->
             /\ phase' = "exiting"
             /\ errOnOpenTerm' = FALSE
@@ -290,7 +301,7 @@ ExitClassify ==
          /\ Design = "design_b"
          /\ Mutant # "no_exit_check"
          /\ errKind \in {"eio_lifecycle", "eio_read", "sync_recovery_failed"}
-         /\ (Mutant = "blind_eio" \/ termState \in {"closing_eio_only", "hung_up", "revoked", "orphaned"})
+         /\ (Mutant = "blind_eio" \/ termState \in {"closing_eio_only", "hung_up", "revoked", "readable_revoked", "orphaned"})
        isHup == directHup \/ designBExitGone
      IN
        /\ phase' = "done"
@@ -360,7 +371,7 @@ FairSpec ==
 (* ------------------------------ Invariants ------------------------------- *)
 
 TypeOK ==
-  /\ termState \in {"open", "closing_eio_only", "hung_up", "revoked", "orphaned"}
+  /\ termState \in {"open", "closing_eio_only", "hung_up", "revoked", "readable_revoked", "orphaned"}
   /\ phase \in {"startup", "idle", "turn_running", "frame_write", "alt_screen", "exiting", "done"}
   /\ outcome \in {"running", "quiet_hangup", "saved_turn_hangup", "error_reported"}
   /\ msgPrinted \in {"none", "disk", "terminal_hung_up", "sync_failed"}

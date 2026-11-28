@@ -10,6 +10,7 @@ const model_provider = @import("../config/model_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
 const mode_contract = @import("../modes/mode_contract.zig");
+const host_target = @import("../hosts/target.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -49,6 +50,13 @@ pub const OutputFormat = enum {
 /// command, an unknown or invalid flag, or a missing or bad argument. Work
 /// that fails after the command line is accepted exits 1.
 pub const usage_exit_code: u8 = 2;
+
+/// Process exit status for a command whose terminal hung up: 128 + SIGHUP, the
+/// status a shell reports for a process SIGHUP ended. WASI has no signals, so 1.
+pub const terminal_hung_up_exit_code: u8 = if (host_target.is_wasm)
+    1
+else
+    128 + @as(u8, @intCast(@backingInt(std.posix.SIG.HUP)));
 
 pub const CommandFailureSnapshot = struct {
     kind: []const u8,
