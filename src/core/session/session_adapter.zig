@@ -3100,9 +3100,9 @@ pub const Session = struct {
     }
 
     /// Saves a call a command made through `fx mcp call` in the open turn,
-    /// as it ends (`bridge_call_type`). The shell call that ran the command
-    /// is still running, so the turn is open; with none open, nothing is
-    /// written and the caller logs the row as dropped.
+    /// as it ends (`bridge_call_type`). The shell call that follows the
+    /// command is still running, so the turn is open; with none open,
+    /// nothing is written and the caller logs the row as dropped.
     pub fn saveBridgeCall(self: *Session, record: types.BridgeCallRecord) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -7380,7 +7380,7 @@ fn checkWorkspaceCapture(alloc: Allocator, payload: []const u8) error{ OutOfMemo
 }
 
 /// A call a command made through `fx mcp call`, saved in the open turn as it
-/// ends, while its shell call still runs. Its data is a
+/// ends, while the shell call that follows its command still runs. Its data is a
 /// `types.BridgeCallRecord`: the shell call's id, the request id, the tool's
 /// name, and how the call ended, never its arguments or its result. Replay
 /// gives it to the turn, and a resume shows its row in its shell call's

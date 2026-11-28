@@ -16,6 +16,8 @@ import { Harness, actFor, checkTlc, seededRandom, specFiles, toTla, type Checked
 const start = (token = "t1"): Event => ({ event: "started", token });
 const stop: Event = { event: "stopped" };
 const add = (token = "t2", owner = "child"): Event => ({ event: "owner_added", owner, token });
+const follow = (owner = "child"): Event => ({ event: "owner_followed", owner });
+const unfollow = (owner = "child", cancel = false): Event => ({ event: "owner_unfollowed", owner, cancel });
 const remove = (owner = "child"): Event => ({ event: "owner_removed", owner });
 const request = (token = "t1", version = 1): Event => ({ event: "request", token, version });
 const allow = (id: number): Event => ({ event: "authorized", id, allow: true });
@@ -39,8 +41,14 @@ export const scripted: Record<string, Event[]> = {
   "stopping mid-call lets work go and the next session drains it": [
     start(), request(), request(), allow(0), stop, request(), allow(1), start("t2"), request("t2"), finish(0, "ok"), request("t2"), finish(2), allow(2),
   ],
-  "a subagent ends mid-call": [start(), add(), request("t2"), request("t2"), allow(0), remove(), request("t2"), finish(0, "ok"), allow(1), add("t2"), request("t2")],
-  "a subagent cannot take a token in use or register twice": [start(), add("t1"), add("t2", "main"), add("t2"), add("t1"), remove("main"), request("t2"), remove(), remove()],
+  "a subagent ends mid-call": [start(), add(), follow(), request("t2"), request("t2"), allow(0), remove(), request("t2"), finish(0, "ok"), allow(1), add("t2"), follow(), request("t2")],
+  "a subagent cannot take a token in use or register twice": [start(), add("t1"), add("t2", "main"), add("t2"), follow(), add("t1"), remove("main"), request("t2"), remove(), remove()],
+  "a call waits while no shell call follows its command, then is admitted once one does": [
+    start(), add(), request("t2"), follow(), request("t2"), allow(0), unfollow(), finish(0), replied(0), gone(0), request("t2"), follow(), request("t2"), allow(1), finish(1), replied(1),
+  ],
+  "a follower's cancel lets its call go and keeps the token": [
+    start(), add(), follow(), request("t2"), request("t2"), allow(0), unfollow("child", true), request("t2"), finish(0, "failed"), allow(1), follow(), request("t2"), allow(2), finish(2), replied(2),
+  ],
   "a crash mid-call starts the next process from nothing": [start(), request(), allow(0), crash, finish(0), start(), request(), allow(0), finish(0, "failed")],
   "a lost reply is logged": [start(), request(), allow(0), finish(0), replied(0, false), replied(0)],
   "answers for ids never issued are stale": [start(), allow(5), finish(7), replied(9), gone(3), request(), finish(1), allow(0)],
@@ -71,10 +79,12 @@ function randomEvent(random: () => number, shown: Shown, previous: Event | undef
   if (roll < 0.6) return finish(anyId(), pick(random, ["ok", "ok", "tool_error", "failed"]));
   if (roll < 0.7) return replied(anyId(), random() < 0.85);
   if (roll < 0.78) return gone(anyId());
-  if (roll < 0.84) return add(pick(random, ["t1", "t2"]), random() < 0.9 ? "child" : "main");
-  if (roll < 0.89) return remove(random() < 0.9 ? "child" : "main");
-  if (roll < 0.93) return stop;
-  if (roll < 0.96) return start(pick(random, ["t1", "t2"]));
+  if (roll < 0.82) return add(pick(random, ["t1", "t2"]), random() < 0.9 ? "child" : "main");
+  if (roll < 0.87) return follow(random() < 0.9 ? "child" : "main");
+  if (roll < 0.92) return unfollow(random() < 0.9 ? "child" : "main", random() < 0.5);
+  if (roll < 0.95) return remove(random() < 0.9 ? "child" : "main");
+  if (roll < 0.97) return stop;
+  if (roll < 0.99) return start(pick(random, ["t1", "t2"]));
   return crash;
 }
 

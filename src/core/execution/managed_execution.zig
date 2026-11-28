@@ -36,6 +36,16 @@ fn capturedWaitPollMs() i64 {
     return captured_wait_poll_ms;
 }
 
+/// Test builds only: runs when a held wait has steering due, which the hold
+/// keeps from yielding.
+var test_held_steer_hook: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
+
+fn noteHeldSteerYield() void {
+    if (builtin.is_test) {
+        if (test_held_steer_hook) |hook| hook();
+    }
+}
+
 fn traceDroppedCrossing(
     quiet_wait: quiet_notice.Wait,
     now_ms: i64,
@@ -118,6 +128,21 @@ pub const StartCapturedInput = struct {
     /// `yield_time_ms`: the command is waiting on an `fx mcp call` whose
     /// owner is this call, which must not end before the answer does.
     yield_hold: ?*const std.atomic.Value(u32) = null,
+    /// Sent once: when the command this input starts has ended, or before
+    /// `startCaptured` returns when the input starts none.
+    end_notice: ?EndNotice = null,
+};
+
+/// Tells the caller that a command has ended, so what the caller holds for
+/// the command can end with it. `notify` runs once, without a lock of this
+/// runtime held, and must not call into it.
+pub const EndNotice = struct {
+    id: u64,
+    notify: *const fn (id: u64) void,
+
+    fn send(self: EndNotice) void {
+        self.notify(self.id);
+    }
 };
 
 pub const TtyCursor = struct {
@@ -315,6 +340,8 @@ const Entry = struct {
     tombstone_sequence: std.atomic.Value(u32) = .init(0),
     active_operations: usize = 0,
     pending_delete: bool = false,
+    /// Sent by the worker when the command has ended. Set once, at `init`.
+    end_notice: ?EndNotice = null,
 
     fn init(runtime: *Runtime, input: StartCapturedInput) !*Entry {
         const entry = try runtime.alloc.create(Entry);
@@ -390,6 +417,7 @@ const Entry = struct {
             .output_chunk_ctx = input.output_chunk_ctx,
             .on_output_chunk = input.on_output_chunk,
             .extra_environment = extra_environment,
+            .end_notice = input.end_notice,
         };
         entry.started_ms = io_mod.milliTimestamp();
         entry.last_output_ms = entry.started_ms;
@@ -654,6 +682,7 @@ const Entry = struct {
             self.barrier.output_drained = true;
             self.mutex.unlock(zio);
             self.worker_done.set(zio);
+            if (self.end_notice) |notice| notice.send();
             return;
         };
 
@@ -672,6 +701,7 @@ const Entry = struct {
         self.barrier = next.barrier;
         self.mutex.unlock(zio);
         self.worker_done.set(zio);
+        if (self.end_notice) |notice| notice.send();
     }
 
     /// Blocks until the worker settles the entry or `poll_ms` passes, so every
@@ -771,9 +801,13 @@ pub const Runtime = struct {
         input: StartCapturedInput,
     ) !PreparedSnapshot {
         if (input.yield_time_ms > contract.max_wait_ceiling_ms) {
+            if (input.end_notice) |notice| notice.send();
             return error.InvalidYieldTime;
         }
-        const admission = try self.admitCaptured(input);
+        const admission = self.admitCaptured(input) catch |err| {
+            if (input.end_notice) |notice| notice.send();
+            return err;
+        };
         const entry = admission.entry;
         var published = false;
         errdefer if (admission.created and !published) {
@@ -781,6 +815,8 @@ pub const Runtime = struct {
         };
 
         if (!admission.created) {
+            // The entry already runs with the notice it was started with.
+            if (input.end_notice) |notice| notice.send();
             published = true;
             return self.prepareSnapshot(alloc, entry.execution_id);
         }
@@ -863,6 +899,19 @@ pub const Runtime = struct {
         entry.mutex.unlock(zio);
         published = true;
         return prepared;
+    }
+
+    /// The id of the end notice a captured command will send, while it has
+    /// not ended (`StartCapturedInput.end_notice`).
+    pub fn endNoticeId(self: *Runtime, execution_id: []const u8) ?u64 {
+        const entry = self.acquireEntry(execution_id) orelse return null;
+        defer self.releaseEntry(entry);
+        const notice = entry.end_notice orelse return null;
+        const zio = io_mod.getIo();
+        entry.mutex.lockUncancelable(zio);
+        defer entry.mutex.unlock(zio);
+        if (entry.isTerminal()) return null;
+        return notice.id;
     }
 
     pub fn registerTty(
@@ -1121,11 +1170,13 @@ pub const Runtime = struct {
     ) !PreparedSnapshot {
         // `waitOrYield` without steering, for callers no steering reaches,
         // such as tests.
-        return self.waitOrYield(alloc, execution_id, wait_ceiling_ms, cancel_flag, null);
+        return self.waitOrYield(alloc, execution_id, wait_ceiling_ms, cancel_flag, null, null);
     }
 
     /// `wait`, which also returns the command running once `tool_yield_flag`
     /// is set and `steerYieldDue` passes, so steering need not wait for it.
+    /// While `yield_hold` is above zero, neither that yield nor the ceiling
+    /// ends the wait (`StartCapturedInput.yield_hold`).
     pub fn waitOrYield(
         self: *Runtime,
         alloc: Allocator,
@@ -1133,6 +1184,7 @@ pub const Runtime = struct {
         wait_ceiling_ms: u32,
         cancel_flag: ?*std.atomic.Value(bool),
         tool_yield_flag: ?*const std.atomic.Value(bool),
+        yield_hold: ?*const std.atomic.Value(u32),
     ) !PreparedSnapshot {
         if (wait_ceiling_ms > contract.max_wait_ceiling_ms) {
             return error.InvalidWaitCeiling;
@@ -1194,14 +1246,18 @@ pub const Runtime = struct {
                 }
             }
             const now_ms = io_mod.milliTimestamp();
+            const held = if (yield_hold) |hold| hold.load(.acquire) > 0 else false;
             if (steerYieldDue(tool_yield_flag, wait_started_ms, now_ms, yield_grace_ms)) {
-                quiet_crossed = quiet_notice.crossedAt(quiet_wait, now_ms, last_output_ms, limit_ms);
-                debug_trace.logf("managed-execution", "wait yielded for steering execution={s} elapsed_ms={d}", .{ execution_id, now_ms - wait_started_ms });
-                break;
+                if (!held) {
+                    quiet_crossed = quiet_notice.crossedAt(quiet_wait, now_ms, last_output_ms, limit_ms);
+                    debug_trace.logf("managed-execution", "wait yielded for steering execution={s} elapsed_ms={d}", .{ execution_id, now_ms - wait_started_ms });
+                    break;
+                }
+                noteHeldSteerYield();
             }
             const step = quiet_notice.poll(quiet_wait, now_ms, last_output_ms, limit_ms);
             quiet_wait = step.wait;
-            if (step.end == .ceiling) {
+            if (!held and step.end == .ceiling) {
                 quiet_crossed = step.crossed;
                 break;
             }
@@ -2356,7 +2412,7 @@ test "steering yield returns a captured command running and keeps it running" {
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
 
     // A follow-up wait yields too, and the command still runs.
-    var followed = try runtime.waitOrYield(alloc, input.execution_id, 30_000, null, &yield_flag);
+    var followed = try runtime.waitOrYield(alloc, input.execution_id, 30_000, null, &yield_flag, null);
     defer followed.deinit(alloc);
     try std.testing.expectEqual(SnapshotState.running, followed.snapshot.state);
     try runtime.commitDelivery(followed.snapshot.execution_id, followed.reservation_id);
@@ -2400,6 +2456,197 @@ test "a command that ends inside the steering grace returns its result" {
     }
     try std.testing.expect(std.mem.find(u8, started.snapshot.output_delta, "quick") != null);
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+}
+
+test "a captured command's end notice is sent once when the command ends" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    const Notices = struct {
+        var count: std.atomic.Value(u32) = .init(0);
+        var last_id: std.atomic.Value(u64) = .init(0);
+        var sent: std.Io.Event = .unset;
+
+        fn notify(id: u64) void {
+            last_id.store(id, .release);
+            _ = count.fetchAdd(1, .acq_rel);
+            sent.set(io_mod.getIo());
+        }
+    };
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var input = StartCapturedInput{
+        .execution_id = "managed-end-notice",
+        .command = "printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = contract.max_yield_time_ms,
+        .end_notice = .{ .id = 7, .notify = Notices.notify },
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    switch (started.snapshot.state) {
+        .completed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    // The worker sends the notice after it settles the command, so the test
+    // waits for the send itself.
+    try Notices.sent.waitTimeout(io_mod.getIo(), .{ .duration = .{
+        .raw = .fromMilliseconds(10_000),
+        .clock = .awake,
+    } });
+    try std.testing.expectEqual(@as(u64, 7), Notices.last_id.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), Notices.count.load(.acquire));
+    try std.testing.expectEqual(@as(?u64, null), runtime.endNoticeId(input.execution_id));
+}
+
+test "a start that is refused or reuses an entry sends its end notice" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    const Notices = struct {
+        var count: std.atomic.Value(u32) = .init(0);
+        var last_id: std.atomic.Value(u64) = .init(0);
+
+        fn notify(id: u64) void {
+            last_id.store(id, .release);
+            _ = count.fetchAdd(1, .acq_rel);
+        }
+    };
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var owner_input = StartCapturedInput{
+        .execution_id = "managed-end-notice-owner",
+        .command = "sleep 5; printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+        .end_notice = .{ .id = 1, .notify = Notices.notify },
+    };
+    owner_input.authority = testAuthority(owner_input);
+    var owner = try runtime.startCaptured(alloc, owner_input);
+    defer owner.deinit(alloc);
+    try runtime.commitDelivery(owner.snapshot.execution_id, owner.reservation_id);
+    try std.testing.expectEqual(@as(?u64, 1), runtime.endNoticeId(owner_input.execution_id));
+    try std.testing.expectEqual(@as(u32, 0), Notices.count.load(.acquire));
+
+    var refused = owner_input;
+    refused.execution_id = "managed-end-notice-refused";
+    refused.yield_time_ms = contract.max_wait_ceiling_ms + 1;
+    refused.end_notice = .{ .id = 2, .notify = Notices.notify };
+    try std.testing.expectError(error.InvalidYieldTime, runtime.startCaptured(alloc, refused));
+    try std.testing.expectEqual(@as(u64, 2), Notices.last_id.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), Notices.count.load(.acquire));
+
+    var conflicting = owner_input;
+    conflicting.command = "printf other";
+    conflicting.end_notice = .{ .id = 3, .notify = Notices.notify };
+    try std.testing.expectError(error.ExecutionIdentityConflict, runtime.startCaptured(alloc, conflicting));
+    try std.testing.expectEqual(@as(u64, 3), Notices.last_id.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 2), Notices.count.load(.acquire));
+
+    // A start that reuses the running entry keeps the owner's notice.
+    var reused_input = owner_input;
+    reused_input.end_notice = .{ .id = 4, .notify = Notices.notify };
+    var reused = try runtime.startCaptured(alloc, reused_input);
+    defer reused.deinit(alloc);
+    try runtime.commitDelivery(reused.snapshot.execution_id, reused.reservation_id);
+    try std.testing.expectEqual(@as(u64, 4), Notices.last_id.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 3), Notices.count.load(.acquire));
+    try std.testing.expectEqual(@as(?u64, 1), runtime.endNoticeId(owner_input.execution_id));
+}
+
+test "waitOrYield does not end at its ceiling or for steering while held, and ends once released" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    const Hold = struct {
+        var value: std.atomic.Value(u32) = .init(1);
+        var held_steer_yields: u32 = 0;
+
+        fn releaseAtHeldSteer() void {
+            held_steer_yields += 1;
+            value.store(0, .release);
+        }
+    };
+    Hold.value.store(1, .release);
+    Hold.held_steer_yields = 0;
+    test_held_steer_hook = Hold.releaseAtHeldSteer;
+    defer test_held_steer_hook = null;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var input = StartCapturedInput{
+        .execution_id = "managed-held-wait",
+        .command = "sleep 5; printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    // A zero ceiling has passed at the first look. The steering grace passes
+    // while the hold is up; the hook releases it there, so the wait returns
+    // only after that.
+    var held = try runtime.waitOrYield(alloc, input.execution_id, 0, null, &yield_flag, &Hold.value);
+    defer held.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), Hold.held_steer_yields);
+    try std.testing.expectEqual(SnapshotState.running, held.snapshot.state);
+    try runtime.commitDelivery(held.snapshot.execution_id, held.reservation_id);
+}
+
+test "waitOrYield still ends at cancel and at the command's end while held" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var hold = std.atomic.Value(u32).init(1);
+    var input = StartCapturedInput{
+        .execution_id = "managed-held-wait-ends",
+        .command = "sleep 0.2; printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    var cancel = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Cancelled,
+        runtime.waitOrYield(alloc, input.execution_id, 10_000, &cancel, null, &hold),
+    );
+
+    // Once the command ends, the held wait returns its result.
+    var completed = try runtime.waitOrYield(alloc, input.execution_id, 10_000, null, null, &hold);
+    defer completed.deinit(alloc);
+    switch (completed.snapshot.state) {
+        .completed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.find(u8, completed.snapshot.output_delta, "done") != null);
+    try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
 }
 
 var timed_yield_holds: u32 = 0;
@@ -2621,7 +2868,7 @@ test "cancelling or preempting a run or wait past the quiet limit traces the dro
         defer wait_helper_stop.store(true, .seq_cst);
         try std.testing.expectError(
             error.Cancelled,
-            runtime.waitOrYield(alloc, wait_execution_id, 5_000, &wait_cancel, null),
+            runtime.waitOrYield(alloc, wait_execution_id, 5_000, &wait_cancel, null, null),
         );
     }
     try std.testing.expect(!wait_timed_out.load(.seq_cst));
@@ -2655,7 +2902,7 @@ test "cancelling or preempting a run or wait past the quiet limit traces the dro
         defer preempt_helper_stop.store(true, .seq_cst);
         try std.testing.expectError(
             error.WaitPreempted,
-            runtime.waitOrYield(alloc, preempt_execution_id, 5_000, null, null),
+            runtime.waitOrYield(alloc, preempt_execution_id, 5_000, null, null, null),
         );
     }
     try std.testing.expect(!preempt_timed_out.load(.seq_cst));

@@ -14,6 +14,7 @@
 #   steer-never-cross  a steering yield reports no crossing    CrossingReported
 #   no-rearm           output during a wait does not arm it    CrossingReported
 #   ceiling-late       a wait runs one tick past its ceiling   WaitBounded
+#   hold-ignored       a held wait ends at ceiling or steer    HeldWaitStaysOpen
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -37,4 +38,5 @@ QuietWait quiet-wait-mutation-never-cross CrossingReported
 QuietWait quiet-wait-mutation-steer-never-cross CrossingReported
 QuietWait quiet-wait-mutation-no-rearm CrossingReported
 QuietWait quiet-wait-mutation-ceiling-late WaitBounded
+QuietWait quiet-wait-mutation-hold-ignored HeldWaitStaysOpen
 VERDICTS

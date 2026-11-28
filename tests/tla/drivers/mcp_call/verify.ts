@@ -14,8 +14,8 @@
 //   9. traceability: DESIGN.md accounts for every question, rule, and law,
 //      and rejects designs that drop one.
 //
-// The shell around the core has not landed, so nothing here runs the fx
-// binary yet; design/FINISH.md tracks the binary stage.
+// The binary stage in design/FINISH.md (D1) is still open, so nothing here runs
+// the fx binary yet.
 //
 // Settings: FX_MCP_CALL_SEED (default 20261029), FX_MCP_CALL_TRACES (random
 // traces, default 300), FX_TLA_OUT (where the report goes).

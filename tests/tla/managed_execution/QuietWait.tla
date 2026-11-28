@@ -13,6 +13,17 @@
 (* model to check it, and a wait that ends past the limit after seeing the *)
 (* command under it reports one crossing per quiet spell.                  *)
 (*                                                                         *)
+(* While yield_hold is above zero (held; waitOrYield in                    *)
+(* src/core/execution/managed_execution.zig), neither the ceiling nor a    *)
+(* steering yield ends the wait: a steering yield that arrives while held  *)
+(* waits until the hold drops, and the wait can run past its ceiling,      *)
+(* ending on the first unheld look after the hold drops (checking command  *)
+(* finish first, then steering, then quiet_notice.poll and the ceiling).   *)
+(* Cancel (error.Cancelled, outside the result path) and the command's end *)
+(* still end a held wait. Each hold ends, and a run of them leaves the     *)
+(* waiter an unheld look now and then (fairness on Release and ~held /\    *)
+(* Poll).                                                                  *)
+(*                                                                         *)
 (* Time is a discrete clock. quiet counts ticks since the last output, or  *)
 (* since the start, and saturates past Limit. The worker thread's output   *)
 (* and the command's exit come at any moment; the waiter polls every       *)
@@ -28,6 +39,7 @@
 (*   steer_never_cross  a steering yield never reports a crossing          *)
 (*   no_rearm           output during a wait does not arm it               *)
 (*   ceiling_late       a wait runs one tick past its ceiling              *)
+(*   hold_ignored       a held wait ends at its ceiling or for steering    *)
 (***************************************************************************)
 EXTENDS Naturals
 
@@ -38,7 +50,7 @@ CONSTANTS
 
 Bugs == {"none", "notice_any_quiet", "notice_when_done", "end_at_crossing",
          "cross_unarmed", "never_cross", "steer_never_cross", "no_rearm",
-         "ceiling_late"}
+         "ceiling_late", "hold_ignored"}
 
 ASSUME /\ Limit \in 1..6 /\ MaxCeil \in 0..12 /\ Bug \in Bugs
 
@@ -57,13 +69,18 @@ VARIABLES
                   \* or by output during it (a ghost the code does not keep)
     outDuring,    \* output came during the wait (a ghost)
     spellCrosses, \* crossings reported in the current quiet spell (a ghost, 0..2)
-    result        \* the last result a wait returned
+    result,       \* the last result a wait returned
+    held,         \* yield_hold is above zero
+    heldLate,     \* a look found the wait held at or past its ceiling (a ghost)
+    steerDue      \* steering is due (steerYieldDue) during the open wait
 
-vars == <<cmd, quiet, waiting, ceil, waitAge, armed, polled, under, outDuring, spellCrosses, result>>
+vars == <<cmd, quiet, waiting, ceil, waitAge, armed, polled, under, outDuring,
+          spellCrosses, result, held, heldLate, steerDue>>
 
 NoResult == [end |-> "none", running |-> FALSE, quietDue |-> FALSE,
              notice |-> FALSE, crossed |-> FALSE, armed |-> FALSE,
-             under |-> FALSE, output |-> FALSE, waitAge |-> 0, ceil |-> 0]
+             under |-> FALSE, output |-> FALSE, waitAge |-> 0, ceil |-> 0,
+             held |-> FALSE, heldLate |-> FALSE]
 
 Due == quiet >= Limit
 
@@ -85,6 +102,7 @@ TypeOK ==
     /\ spellCrosses \in 0..2
     /\ result.end \in Ends
     /\ result.crossed \in BOOLEAN
+    /\ held \in BOOLEAN /\ heldLate \in BOOLEAN /\ steerDue \in BOOLEAN
 
 Init ==
     /\ cmd = "running"
@@ -98,6 +116,9 @@ Init ==
     /\ outDuring = FALSE
     /\ spellCrosses = 0
     /\ result = NoResult
+    /\ held = FALSE
+    /\ heldLate = FALSE
+    /\ steerDue = FALSE
 
 \* The command prints: Entry.appendOutput on the worker thread.
 Output ==
@@ -107,22 +128,36 @@ Output ==
     /\ under' = (under \/ waiting)
     /\ outDuring' = (outDuring \/ waiting)
     /\ spellCrosses' = 0
-    /\ UNCHANGED <<cmd, waiting, ceil, waitAge, armed, result>>
+    /\ UNCHANGED <<cmd, waiting, ceil, waitAge, armed, result, held, heldLate, steerDue>>
 
 \* The command exits: Entry.workerMain reaches a terminal state.
 Finish ==
     /\ cmd = "running"
     /\ cmd' = "done"
     /\ polled' = FALSE
-    /\ UNCHANGED <<quiet, waiting, ceil, waitAge, armed, under, outDuring, spellCrosses, result>>
+    /\ UNCHANGED <<quiet, waiting, ceil, waitAge, armed, under, outDuring, spellCrosses, result, held, heldLate, steerDue>>
 
-\* One tick of the clock. An open wait has looked since the last change.
+\* One tick of the clock. An open wait has looked since the last change. Its
+\* age stops one tick past the ceiling: the code tells no later age apart.
 Tick ==
     /\ waiting => polled
     /\ quiet' = IF quiet + 1 > QSat THEN QSat ELSE quiet + 1
-    /\ waitAge' = IF waiting THEN waitAge + 1 ELSE waitAge
+    /\ waitAge' = IF waiting /\ waitAge <= ceil THEN waitAge + 1 ELSE waitAge
     /\ polled' = FALSE
-    /\ UNCHANGED <<cmd, waiting, ceil, armed, under, outDuring, spellCrosses, result>>
+    /\ UNCHANGED <<cmd, waiting, ceil, armed, under, outDuring, spellCrosses, result, held, heldLate, steerDue>>
+
+\* An fx mcp call request holds the wait (yield_hold rises above zero).
+Hold ==
+    /\ cmd = "running" /\ ~held
+    /\ held' = TRUE
+    /\ UNCHANGED <<cmd, quiet, waiting, ceil, waitAge, armed, polled, under, outDuring, spellCrosses, result, heldLate, steerDue>>
+
+\* The hold drops (yield_hold reaches zero). The waiter looks again.
+Release ==
+    /\ held
+    /\ held' = FALSE
+    /\ polled' = FALSE
+    /\ UNCHANGED <<cmd, quiet, waiting, ceil, waitAge, armed, under, outDuring, spellCrosses, result, heldLate, steerDue>>
 
 \* A wait begins: shell interact on a captured session, quiet_notice.beginWait.
 Begin(c) ==
@@ -134,63 +169,72 @@ Begin(c) ==
     /\ under' = ~Due
     /\ outDuring' = FALSE
     /\ polled' = FALSE
-    /\ UNCHANGED <<cmd, quiet, spellCrosses, result>>
+    /\ heldLate' = FALSE
+    /\ steerDue' = FALSE
+    /\ UNCHANGED <<cmd, quiet, spellCrosses, result, held>>
 
-\* The waiter looks: one pass of Runtime.wait's loop, quiet_notice.poll. A
-\* finished command ends the wait first, before the module is asked.
+\* Steering becomes due during an open wait on a running command
+\* (steerYieldDue). The waiter looks on its next pass.
+Steer ==
+    /\ waiting /\ cmd = "running" /\ ~steerDue
+    /\ steerDue' = TRUE
+    /\ polled' = FALSE
+    /\ UNCHANGED <<cmd, quiet, waiting, ceil, waitAge, armed, under, outDuring, spellCrosses, result, held, heldLate>>
+
+\* The waiter looks: one pass of Runtime.waitOrYield's loop. A finished
+\* command ends the wait first. Next, steering is checked before
+\* quiet_notice.poll: when unheld it ends the wait using crossedAt without
+\* polling quiet_notice; when held it does not end and quiet_notice.poll still
+\* runs (updating armed), and the ceiling end is also blocked while held.
 Poll ==
     /\ waiting /\ ~polled
-    /\ LET a == IF cmd = "done" \/ Bug = "no_rearm" THEN armed ELSE armed \/ ~Due
+    /\ LET free == ~held \/ Bug = "hold_ignored"
+           steerEnds == cmd = "running" /\ steerDue /\ free
+           runPoll == cmd = "running" /\ ~steerEnds
+           a == IF runPoll /\ Bug # "no_rearm" THEN armed \/ ~Due ELSE armed
            pastCeil == IF Bug = "ceiling_late" THEN waitAge > ceil ELSE waitAge >= ceil
+           late == heldLate \/ (held /\ pastCeil)
            e == IF cmd = "done" THEN "done"
-                ELSE IF Bug = "end_at_crossing" /\ a /\ Due THEN "ceiling"
-                ELSE IF pastCeil THEN "ceiling"
+                ELSE IF steerEnds THEN "steer"
+                ELSE IF Bug = "end_at_crossing" /\ a /\ Due /\ free THEN "ceiling"
+                ELSE IF pastCeil /\ free THEN "ceiling"
                 ELSE "none"
-           c == IF e # "ceiling" THEN FALSE
-                ELSE CASE Bug = "cross_unarmed" -> Due
-                       [] Bug = "never_cross" -> FALSE
-                       [] OTHER -> a /\ Due
+           c == CASE e = "steer" -> IF Bug = "steer_never_cross" THEN FALSE
+                                    ELSE IF Bug = "cross_unarmed" THEN Due
+                                    ELSE armed /\ Due
+                  [] e = "ceiling" -> IF Bug = "cross_unarmed" THEN Due
+                                      ELSE IF Bug = "never_cross" THEN FALSE
+                                      ELSE a /\ Due
+                  [] OTHER -> FALSE
        IN /\ armed' = a
           /\ polled' = TRUE
+          /\ heldLate' = late
           /\ IF e = "none"
-             THEN UNCHANGED <<waiting, spellCrosses, result>>
+             THEN UNCHANGED <<waiting, spellCrosses, result, steerDue>>
              ELSE /\ waiting' = FALSE
+                  /\ steerDue' = FALSE
                   /\ spellCrosses' =
                         IF c THEN (IF spellCrosses < 2 THEN spellCrosses + 1 ELSE 2)
                         ELSE spellCrosses
                   /\ result' = [end |-> e, running |-> cmd = "running",
                                 quietDue |-> Due, notice |-> Notice(cmd = "running"),
                                 crossed |-> c, armed |-> a, under |-> under,
-                                output |-> outDuring, waitAge |-> waitAge, ceil |-> ceil]
-    /\ UNCHANGED <<cmd, quiet, ceil, waitAge, under, outDuring>>
-
-\* A steering yield ends an open wait on a running command at any time,
-\* using quiet_notice.crossedAt for the crossing flag.
-Steer ==
-    /\ waiting /\ cmd = "running"
-    /\ LET c == IF Bug = "steer_never_cross" THEN FALSE
-                ELSE IF Bug = "cross_unarmed" THEN Due
-                ELSE armed /\ Due
-       IN /\ waiting' = FALSE
-          /\ polled' = TRUE
-          /\ spellCrosses' =
-                IF c THEN (IF spellCrosses < 2 THEN spellCrosses + 1 ELSE 2)
-                ELSE spellCrosses
-          /\ result' = [end |-> "steer", running |-> TRUE,
-                        quietDue |-> Due, notice |-> Notice(TRUE),
-                        crossed |-> c, armed |-> armed, under |-> under,
-                        output |-> outDuring, waitAge |-> waitAge, ceil |-> ceil]
-    /\ UNCHANGED <<cmd, quiet, ceil, waitAge, armed, under, outDuring>>
+                                output |-> outDuring, waitAge |-> waitAge, ceil |-> ceil,
+                                held |-> held, heldLate |-> late]
+    /\ UNCHANGED <<cmd, quiet, ceil, waitAge, under, outDuring, held>>
 
 Next ==
     \/ Output
     \/ Finish
     \/ Tick
+    \/ Hold
+    \/ Release
     \/ \E c \in 0..MaxCeil : Begin(c)
-    \/ Poll
     \/ Steer
+    \/ Poll
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Poll) /\ SF_vars(Tick)
+        /\ WF_vars(Release) /\ SF_vars(~held /\ Poll)
 
 ----------------------------------------------------------------------------
 (* Rules *)
@@ -201,10 +245,10 @@ NoticeRule ==
     result.end # "none" => (result.notice <=> (result.running /\ result.quietDue))
 
 \* (a) A running command's wait never ends early for quiet: it ends at its
-\* ceiling or at a steering yield.
+\* steering yield, or at its ceiling (which ran past only if held there).
 NoEarlyEnd ==
     (result.end # "none" /\ result.running) =>
-        (result.end = "steer" \/ (result.end = "ceiling" /\ result.waitAge = result.ceil))
+        (result.end = "steer" \/ (result.end = "ceiling" /\ (result.waitAge = result.ceil \/ result.heldLate)))
 
 \* (b) A crossing is reported only when the wait saw the command under the
 \* limit and the command is running past the limit at the end.
@@ -220,13 +264,25 @@ CrossingReported ==
 OncePerSpell ==
     spellCrosses <= 1
 
-\* A wait that ends at its ceiling ran exactly that long.
+\* A wait that ends at its ceiling ran exactly that long, unless a look found
+\* it held there.
 CeilingEndOnTime ==
-    result.end = "ceiling" => result.waitAge = result.ceil
+    result.end = "ceiling" => (result.waitAge = result.ceil \/ result.heldLate)
 
-\* An open wait never runs past its ceiling.
+\* An open wait runs past its ceiling only after a look found it held there.
 WaitBounded ==
-    waiting => waitAge <= ceil
+    (waiting /\ waitAge > ceil) => heldLate
+
+\* A held wait stays open past its ceiling and past steering: it ends neither
+\* at its ceiling nor for steering while held.
+HeldWaitStaysOpen ==
+    result.end \in {"ceiling", "steer"} => ~result.held
+
+\* Once the waiter has looked without a hold, a running wait is not left open
+\* at its ceiling or with steering due: it ended there, or at the first look
+\* after the hold dropped.
+CeilingEnds ==
+    (waiting /\ polled /\ ~held /\ cmd = "running") => (waitAge < ceil /\ ~steerDue)
 
 \* Once the waiter has looked, a finished command has ended the wait.
 DoneEnds ==

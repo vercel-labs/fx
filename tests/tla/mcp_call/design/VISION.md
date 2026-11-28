@@ -7,7 +7,7 @@ The agent treats every MCP tool as a command. It looks a tool up with `fx mcp ca
 ## What the bridge is
 
 - **A second way in to the same MCP engine.** A bridge call and a direct call share one catalog, one connection per server, one login, one permission check, and one access policy. There is no second MCP client.
-- **Owned by the session.** The bridge opens when a session starts and closes when it ends. Tokens are made per session and per subagent, and revoked when their owner ends.
+- **Owned by the command.** Each command that fx's shell tool runs gets its own token, which lasts until the command ends, and a subagent's command is its own owner. The bridge listens while any command is registered and closes after the last one ends. The shell call that follows a command, its `run` and then each `interact`, lends the permission check.
 - **A pure core with a thin shell.** `step(state, event)` decides admission, ordering, and cleanup. It holds no bytes of arguments or results, reads no clock, and performs no I/O. The shell runs effects and reports their results as events.
 
 ## What it refuses to be

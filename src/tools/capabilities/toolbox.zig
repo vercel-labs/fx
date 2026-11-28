@@ -806,7 +806,7 @@ test "a failed toolbox open says why and what to do next, by the name it was giv
     var context: u8 = 0;
     const with_mcp: tool_dispatch.DispatchContext = .{
         .allocator = std.testing.allocator,
-        .mcp_call_capability = .{ .context = &context, .authorize_fn = Failing.authorize, .call_fn = Failing.call, .lookup_fn = Failing.lookup },
+        .mcp_call_capability = .{ .context = &context, .agent = 0, .authorize_fn = Failing.authorize, .call_fn = Failing.call, .lookup_fn = Failing.lookup },
     };
     const Case = struct { ctx: tool_dispatch.DispatchContext, args: []const u8, says: []const []const u8 };
     const cases = [_]Case{

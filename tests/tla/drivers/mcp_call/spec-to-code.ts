@@ -18,10 +18,11 @@
 // steps, so routes avoid Crash unless it saves more, and each core state
 // takes its own Crash last. Every transition is
 // taken, so coverage is complete or the run fails.
-import { loadGraph } from "../graph.mjs";
+import { createReadStream, existsSync } from "node:fs";
+import { createInterface } from "node:readline";
+import { parseValue } from "../graph.mjs";
 import { Harness, canonical, coreOf, eventFor, shownOf, type Act } from "./lib.ts";
 
-type Graph = { states: Map<string, Record<string, unknown>>; next: Map<string, Set<string>>; init: string };
 type Transition = { index: number; key: string; from: string; to: string; act: Act; expected: string };
 type Plan = {
   states: number;
@@ -64,38 +65,61 @@ function planFor(graphPath: string): Promise<Plan> {
   let plan = plans.get(graphPath);
   if (!plan) {
     plan = (async () => {
-      const graph = (await loadGraph(graphPath)) as Graph;
-      // Each state's keys, computed once rather than once per edge.
+      if (!existsSync(graphPath)) throw new Error(`${graphPath} is missing; run model check first`);
+      const unescape = (text: string) => text.replace(/\\(.)/g, (_, char: string) => (char === "n" ? "\n" : char));
       const coreKey = new Map<string, string>();
       const actKey = new Map<string, string>();
       const shownKey = new Map<string, string>();
-      for (const [id, state] of graph.states) {
-        coreKey.set(id, canonical(coreOf(state)));
-        actKey.set(id, canonical(state.act));
-        shownKey.set(id, canonical(shownOf(state)));
+      const acts = new Map<string, Act>();
+      let init: string | null = null;
+      let states = 0;
+
+      // Pass 1: read node records without retaining the full edge set in memory.
+      for await (const line of createInterface({ input: createReadStream(graphPath, { encoding: "utf8" }), crlfDelay: Infinity })) {
+        const node = /^(-?\d+) \[label="((?:[^"\\]|\\.)*)"/.exec(line);
+        if (!node) continue;
+        const [, id, label] = node;
+        const state: Record<string, unknown> = {};
+        for (const entry of unescape(label!).split(/\n(?=\/\\ )/)) {
+          const match = /^\/\\ (\w+) = ([\s\S]*)$/.exec(entry.trim());
+          if (match) state[match[1]!] = parseValue(match[2]!.trim());
+        }
+        states += 1;
+        coreKey.set(id!, canonical(coreOf(state)));
+        actKey.set(id!, canonical(state.act));
+        shownKey.set(id!, canonical(shownOf(state)));
+        acts.set(id!, state.act as Act);
+        const act = state.act as { name?: string } | unknown[];
+        if ((!Array.isArray(act) && act?.name === "Init") || (Array.isArray(act) && act[0] === "Init")) init = id!;
       }
+      if (!init) throw new Error("the graph has an initial state");
+
+      // Pass 2: stream edges and deduplicate directly by (fromCore, act).
       const byKey = new Map<string, Transition>();
       const outgoing = new Map<string, Transition[]>();
       let edges = 0;
       let conflict: Plan["conflict"] = null;
-      for (const [fromId, targets] of graph.next) {
-        for (const toId of targets) {
-          edges += 1;
-          const act = graph.states.get(toId)!.act as Act;
-          const from = coreKey.get(fromId)!;
-          const key = `${from}|${actKey.get(toId)!}`;
-          const expected = shownKey.get(toId)!;
-          const known = byKey.get(key);
-          if (known) {
-            if (known.expected !== expected && !conflict) conflict = { act, first: known.expected, second: expected };
-            continue;
-          }
-          const transition = { index: byKey.size, key, from, to: coreKey.get(toId)!, act, expected };
-          byKey.set(key, transition);
-          if (!outgoing.has(from)) outgoing.set(from, []);
-          outgoing.get(from)!.push(transition);
+      for await (const line of createInterface({ input: createReadStream(graphPath, { encoding: "utf8" }), crlfDelay: Infinity })) {
+        const edge = /^(-?\d+) -> (-?\d+) \[label="(\w+)"/.exec(line);
+        if (!edge) continue;
+        const [, fromId, toId] = edge;
+        edges += 1;
+        const act = acts.get(toId!)!;
+        const from = coreKey.get(fromId!)!;
+        const key = `${from}|${actKey.get(toId!)!}`;
+        const expected = shownKey.get(toId!)!;
+        const known = byKey.get(key);
+        if (known) {
+          if (known.expected !== expected && !conflict) conflict = { act, first: known.expected, second: expected };
+          continue;
         }
+        const transition = { index: byKey.size, key, from, to: coreKey.get(toId!)!, act, expected };
+        byKey.set(key, transition);
+        if (!outgoing.has(from)) outgoing.set(from, []);
+        outgoing.get(from)!.push(transition);
       }
+      const zero = coreKey.get(init)!;
+      const initShown = shownKey.get(init)!;
       // A fixed order, with each core state's Crash last, so the harness
       // restarts once per core state.
       for (const list of outgoing.values()) {
@@ -126,10 +150,10 @@ function planFor(graphPath: string): Promise<Plan> {
         }
       }
       return {
-        states: graph.states.size,
+        states,
         edges,
-        zero: coreKey.get(graph.init)!,
-        initShown: canonical(shownOf(graph.states.get(graph.init)!)),
+        zero,
+        initShown,
         transitions,
         outgoing,
         conflict,
