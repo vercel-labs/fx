@@ -10,6 +10,8 @@ const writer = @import("writer.zig");
 
 pub const Result = reader.Result;
 pub const read = reader.read;
+/// The gap reason of an evicted segment whose counts are unknown. Gap readers must not count it as zero loss.
+pub const gap_reason_unreadable = writer.gap_reason_unreadable;
 
 pub const Options = struct {
     folder: std.Io.Dir,
@@ -24,6 +26,7 @@ pub const Options = struct {
     on_gap_written_for_test: ?writer.GapHook = null,
     on_switch_gap_for_test: ?writer.SwitchGapHook = null,
     on_seal_scan_for_test: ?writer.SealScanHook = null,
+    on_sync_for_test: ?writer.SyncHook = null,
     test_ctx: ?*anyopaque = null,
 };
 
@@ -57,6 +60,7 @@ pub const Recorder = struct {
             .on_gap_written_for_test = options.on_gap_written_for_test,
             .on_switch_gap_for_test = options.on_switch_gap_for_test,
             .on_seal_scan_for_test = options.on_seal_scan_for_test,
+            .on_sync_for_test = options.on_sync_for_test,
             .test_ctx = options.test_ctx,
         });
         return self;
@@ -533,11 +537,12 @@ fn tickAndWait(rec: *Recorder) !void {
 const SegmentTotals = struct {
     frames: u64,
     dropped: u64,
+    missing: u64,
     open_files: u64,
 };
 
 fn totalSegments(dir: std.Io.Dir) !SegmentTotals {
-    var totals: SegmentTotals = .{ .frames = 0, .dropped = 0, .open_files = 0 };
+    var totals: SegmentTotals = .{ .frames = 0, .dropped = 0, .missing = 0, .open_files = 0 };
     var it = dir.iterate();
     while (try it.next(testing.io)) |entry| {
         if (std.mem.endsWith(u8, entry.name, ".open")) totals.open_files += 1;
@@ -549,6 +554,7 @@ fn totalSegments(dir: std.Io.Dir) !SegmentTotals {
         defer res.deinit(testing.allocator);
         totals.frames += res.frames.items.len;
         totals.dropped += res.dropped;
+        totals.missing += res.missing;
     }
     return totals;
 }
@@ -691,6 +697,168 @@ test "failed seals do not grow the folder past max_session_bytes" {
     const totals = try totalSegments(tmp.dir);
     try testing.expect(totals.open_files <= cap_test_max_segments + 2);
     try testing.expectEqual(@as(u64, cap_test_events), totals.frames + totals.dropped);
+}
+
+const GapTotals = struct {
+    records: u64 = 0,
+    frames: u64 = 0,
+    dropped: u64 = 0,
+    missing: u64 = 0,
+};
+
+fn sumGapRecords(dir: std.Io.Dir) !GapTotals {
+    const GapCounts = struct {
+        frames: u64 = 0,
+        dropped: u64 = 0,
+        missing: u64 = 0,
+    };
+    var totals: GapTotals = .{};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var it = dir.iterate();
+    while (try it.next(testing.io)) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "gap-") or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const bytes = try readFileBytes(arena.allocator(), dir, testing.io, entry.name);
+        const gap = try std.json.parseFromSliceLeaky(GapCounts, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
+        totals.records += 1;
+        totals.frames += gap.frames;
+        totals.dropped += gap.dropped;
+        totals.missing += gap.missing;
+    }
+    return totals;
+}
+
+test "eviction after drops names the dropped count in the gap record" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const payload = "0123456789abcdef0123456789abcdef";
+
+    // Instance A: segment 0 holds 45 frames and drops the other 15, because no next segment is ever prepared.
+    const first = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5201,
+        .segment_bytes = switch_pause_segment_bytes,
+        .fail_prealloc_for_test = true,
+    });
+    while (first.inner.current.load(.acquire) == null) try std.Thread.yield();
+    for (0..60) |_| first.emit(1, 1, payload);
+    first.stop();
+
+    // Instance B: the cap of three segments makes eviction remove A's segment 0, which holds the drops.
+    const second = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5202,
+        .segment_bytes = switch_pause_segment_bytes,
+        .max_session_bytes = 3 * switch_pause_segment_bytes,
+        .sync_interval_ms = 5000,
+    });
+    while (second.inner.next.load(.acquire) == null) try std.Thread.yield();
+    try waitForTicks(second, 1);
+    for (0..50) |_| second.emit(1, 2, payload);
+    try tickAndWait(second);
+    second.stop();
+
+    const segments = try totalSegments(tmp.dir);
+    const gaps = try sumGapRecords(tmp.dir);
+    try testing.expect(gaps.records >= 1);
+    const accounted = segments.frames + segments.dropped + segments.missing +
+        gaps.frames + gaps.dropped + gaps.missing;
+    try testing.expectEqual(@as(u64, 110), accounted);
+}
+
+const SyncCounter = struct {
+    count: std.atomic.Value(u64) = .init(0),
+
+    fn onSync(ctx: ?*anyopaque) void {
+        const self: *SyncCounter = @ptrCast(@alignCast(ctx.?));
+        _ = self.count.fetchAdd(1, .monotonic);
+    }
+};
+
+const sync_burst_wakes: usize = 10;
+
+test "a burst of wakes syncs the current segment at most once per sync interval" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var syncs: SyncCounter = .{};
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5203,
+        .segment_bytes = 64 * 1024,
+        .sync_interval_ms = 60_000,
+        .on_sync_for_test = SyncCounter.onSync,
+        .test_ctx = &syncs,
+    });
+    try waitForTicks(rec, 1);
+    for (0..sync_burst_wakes) |_| try tickAndWait(rec);
+    const sync_count = syncs.count.load(.monotonic);
+    rec.stop();
+
+    try testing.expectEqual(@as(u64, 1), sync_count);
+}
+
+test "a sealed segment the reader cannot parse is evicted with an unreadable gap record" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const payload = "0123456789abcdef0123456789abcdef";
+
+    // A sealed segment whose bytes are not a segment. It is created first, so eviction reaches it first.
+    const corrupt_instance: u64 = 0x5301;
+    var corrupt_name_buf: [segment.name_buf_bytes]u8 = undefined;
+    const corrupt_name = segment.sealedFileName(&corrupt_name_buf, corrupt_instance, 0);
+    var garbage: [switch_pause_segment_bytes]u8 = @splat(0xAB);
+    {
+        var file = try tmp.dir.createFile(testing.io, corrupt_name, .{
+            .read = false,
+            .truncate = true,
+            .exclusive = false,
+            .permissions = .fromMode(0o600),
+        });
+        defer file.close(testing.io);
+        try file.writeStreamingAll(testing.io, &garbage);
+    }
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5302,
+        .segment_bytes = switch_pause_segment_bytes,
+        .max_session_bytes = 3 * switch_pause_segment_bytes,
+        .sync_interval_ms = 5000,
+    });
+    while (rec.inner.next.load(.acquire) == null) try std.Thread.yield();
+    try waitForTicks(rec, 1);
+    for (0..50) |_| rec.emit(1, 2, payload);
+    try tickAndWait(rec);
+    rec.stop();
+
+    try testing.expect(!fileExists(tmp.dir, corrupt_name));
+
+    var gap_name_buf: [segment.name_buf_bytes]u8 = undefined;
+    const gap_name = segment.gapFileName(&gap_name_buf, corrupt_instance, 0);
+    const GapView = struct {
+        reason: []const u8 = "",
+        events: u64 = 0,
+        frames: u64 = 0,
+        dropped: u64 = 0,
+        missing: u64 = 0,
+        bytes: u64 = 0,
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const bytes = try readFileBytes(arena.allocator(), tmp.dir, testing.io, gap_name);
+    const gap = try std.json.parseFromSliceLeaky(GapView, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
+
+    try testing.expectEqualStrings("cap_unreadable", gap.reason);
+    try testing.expectEqual(@as(u64, 0), gap.events);
+    try testing.expectEqual(@as(u64, 0), gap.frames);
+    try testing.expectEqual(@as(u64, 0), gap.dropped);
+    try testing.expectEqual(@as(u64, 0), gap.missing);
+    try testing.expectEqual(@as(u64, switch_pause_segment_bytes), gap.bytes);
 }
 
 test "a session cap below three segments is refused at start" {

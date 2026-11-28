@@ -52,6 +52,7 @@ const GapObservation = struct {
     events: u64,
     frames: u64,
     bytes: u64,
+    unreadable: bool,
 };
 
 const ScriptObservation = struct {
@@ -75,6 +76,7 @@ const ScriptObservation = struct {
 };
 
 const GapDetailJson = struct {
+    reason: []const u8 = "",
     instance: u64 = 0,
     index: u64 = 0,
     events: u64 = 0,
@@ -397,6 +399,7 @@ fn scanScriptFolder(
                 .events = gap.events,
                 .frames = gap.frames,
                 .bytes = gap.bytes,
+                .unreadable = std.mem.eql(u8, gap.reason, fr.gap_reason_unreadable),
             });
         }
     }

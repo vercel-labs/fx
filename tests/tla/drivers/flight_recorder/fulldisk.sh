@@ -112,7 +112,8 @@ run_case_b() {
   fi
 
   read_json=$("$LAB_BIN" read "$dir_b")
-  emit_json=$(cat "$emit_out")
+  # The lab prints a ready line first, then the result on the last line.
+  emit_json=$(tail -n 1 "$emit_out")
   bun -e '
     const [fsName, rawEmit, rawRead] = process.argv.slice(1);
     const e = JSON.parse(rawEmit);

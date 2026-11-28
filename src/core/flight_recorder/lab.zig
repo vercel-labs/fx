@@ -43,6 +43,7 @@ const ReadSummary = struct {
     overflowed: u64,
     dropped: u64,
     gap_events: u64,
+    unreadable_gaps: u64,
     newer: u64,
 };
 
@@ -54,7 +55,10 @@ const EmitSummary = struct {
 };
 
 const GapJson = struct {
+    reason: []const u8 = "",
     events: u64 = 0,
+    dropped: u64 = 0,
+    missing: u64 = 0,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -357,6 +361,7 @@ fn runRead(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
     var total_overflowed: u64 = 0;
     var total_dropped: u64 = 0;
     var total_gap_events: u64 = 0;
+    var total_unreadable_gaps: u64 = 0;
     var total_newer: u64 = 0;
 
     var it = dir.iterate();
@@ -402,6 +407,10 @@ fn runRead(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
             defer scratch.deinit();
             const gap = try std.json.parseFromSliceLeaky(GapJson, scratch.allocator(), bytes, .{ .ignore_unknown_fields = true });
             total_gap_events += gap.events;
+            total_dropped += gap.dropped;
+            total_missing += gap.missing;
+            // Such a record claims no count, so it is reported apart from the totals, not as zero loss.
+            if (std.mem.eql(u8, gap.reason, fr.gap_reason_unreadable)) total_unreadable_gaps += 1;
         }
     }
 
@@ -431,6 +440,7 @@ fn runRead(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
         .overflowed = total_overflowed,
         .dropped = total_dropped,
         .gap_events = total_gap_events,
+        .unreadable_gaps = total_unreadable_gaps,
         .newer = total_newer,
     };
 

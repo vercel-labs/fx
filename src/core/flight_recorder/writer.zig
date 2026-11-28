@@ -27,6 +27,9 @@ pub const SwitchGapHook = *const fn (ctx: ?*anyopaque) void;
 /// Called by the recorder thread in `sealReadySegments` between its two loads of `current` and `next`.
 pub const SealScanHook = *const fn (ctx: ?*anyopaque) void;
 
+/// Called by the recorder thread after each successful sync of the current segment.
+pub const SyncHook = *const fn (ctx: ?*anyopaque) void;
+
 /// Recorder-thread steps that a test can make fail once.
 pub const FaultSite = enum { sync, evict, seal };
 
@@ -43,6 +46,7 @@ pub const Options = struct {
     on_gap_written_for_test: ?GapHook = null,
     on_switch_gap_for_test: ?SwitchGapHook = null,
     on_seal_scan_for_test: ?SealScanHook = null,
+    on_sync_for_test: ?SyncHook = null,
     test_ctx: ?*anyopaque = null,
 };
 
@@ -62,13 +66,28 @@ const SealedEntry = struct {
     instance_mtime_ns: i96 = 0,
 };
 
+/// The counts of a segment the cap evicted, read by the module's reader before the unlink.
 const GapRecord = struct {
     segment: []const u8,
     instance: u64,
     index: u64,
+    reason: []const u8,
     events: u64,
     frames: u64,
+    dropped: u64,
+    missing: u64,
     bytes: u64,
+};
+
+pub const gap_reason_cap = "cap";
+/// The evicted segment's counts are unknown, so the record claims no count at all.
+pub const gap_reason_unreadable = "cap_unreadable";
+
+const SegmentCounts = struct {
+    events: u64 = 0,
+    frames: u64 = 0,
+    dropped: u64 = 0,
+    missing: u64 = 0,
 };
 
 pub const Writer = struct {
@@ -85,6 +104,7 @@ pub const Writer = struct {
     on_gap_written_for_test: ?GapHook,
     on_switch_gap_for_test: ?SwitchGapHook,
     on_seal_scan_for_test: ?SealScanHook,
+    on_sync_for_test: ?SyncHook,
     test_ctx: ?*anyopaque,
 
     current: std.atomic.Value(?*segment.Segment),
@@ -102,6 +122,7 @@ pub const Writer = struct {
     wake_state: std.atomic.Value(u32),
     tick_count: std.atomic.Value(u64),
     recorder: ?std.Io.Future(void),
+    last_sync_at: ?std.Io.Clock.Timestamp,
     open_segments: std.ArrayList(*segment.Segment),
 
     startup_mutex: std.Io.Mutex,
@@ -139,6 +160,7 @@ pub const Writer = struct {
             .on_gap_written_for_test = options.on_gap_written_for_test,
             .on_switch_gap_for_test = options.on_switch_gap_for_test,
             .on_seal_scan_for_test = options.on_seal_scan_for_test,
+            .on_sync_for_test = options.on_sync_for_test,
             .test_ctx = options.test_ctx,
             .current = .init(null),
             .next = .init(null),
@@ -151,6 +173,7 @@ pub const Writer = struct {
             .wake_state = .init(@backingInt(WakeState.idle)),
             .tick_count = .init(0),
             .recorder = null,
+            .last_sync_at = null,
             .open_segments = .empty,
             .startup_mutex = .init,
             .startup_buf = startup_buf,
@@ -415,11 +438,23 @@ pub const Writer = struct {
         _ = self.tick_count.fetchAdd(1, .release);
     }
 
+    /// Syncs at most once per `sync_interval_ms`: a switch wakes the recorder, and a burst of wakes must not
+    /// queue behind fsync while producers fill the next segment. Stop still syncs, because sealing syncs.
     fn syncCurrent(self: *Writer, cur: *segment.Segment) !void {
+        if (!self.syncDue()) return;
         const cursor = format.unpackCursor(cur.cursorPtr().load(.acquire));
         const written = @min(@as(usize, @intCast(cursor.offset)), cur.capacity);
         if (self.takeTestFault(.sync)) return error.InjectedFault;
         try cur.sync(written);
+        self.last_sync_at = std.Io.Clock.Timestamp.now(self.io, .awake);
+        if (self.on_sync_for_test) |hook| hook(self.test_ctx);
+    }
+
+    /// True before the first sync and once `sync_interval_ms` has passed since the last one.
+    fn syncDue(self: *const Writer) bool {
+        const last = self.last_sync_at orelse return true;
+        const elapsed_ns = last.untilNow(self.io).raw.toNanoseconds();
+        return elapsed_ns >= @as(i96, self.sync_interval_ms) * std.time.ns_per_ms;
     }
 
     fn sealOne(self: *Writer, seg: *segment.Segment) !void {
@@ -651,7 +686,10 @@ pub const Writer = struct {
     }
 
     fn writeGapRecord(self: *Writer, entry: SealedEntry) !u64 {
-        const counts = self.countSegmentEventsAndFrames(entry.name);
+        // Unknown counts stay unknown: the record names them as unreadable and claims no loss.
+        const counts = self.readSegmentCounts(entry.name);
+        const known = counts orelse SegmentCounts{};
+        const reason = if (counts == null) gap_reason_unreadable else gap_reason_cap;
 
         var gap_buf: [segment.name_buf_bytes]u8 = undefined;
         const gap_name = segment.gapFileName(&gap_buf, entry.instance, entry.index);
@@ -662,8 +700,11 @@ pub const Writer = struct {
             .segment = entry.name,
             .instance = entry.instance,
             .index = entry.index,
-            .events = counts.events,
-            .frames = counts.frames,
+            .reason = reason,
+            .events = known.events,
+            .frames = known.frames,
+            .dropped = known.dropped,
+            .missing = known.missing,
             .bytes = entry.bytes,
         }, .{}, &out.writer);
 
@@ -684,26 +725,35 @@ pub const Writer = struct {
         return payload.len;
     }
 
-    fn countSegmentEventsAndFrames(self: *Writer, name: []const u8) struct { events: u64, frames: u64 } {
-        var file = self.folder.openFile(self.io, name, .{}) catch return .{ .events = 0, .frames = 0 };
+    /// Counts a sealed segment the way a reader would. Returns null when the counts are unknown: the file
+    /// cannot be opened, read, or parsed, or it is in a newer format this reader does not count.
+    fn readSegmentCounts(self: *Writer, name: []const u8) ?SegmentCounts {
+        var file = self.folder.openFile(self.io, name, .{}) catch return null;
         defer file.close(self.io);
-        const stat = file.stat(self.io) catch return .{ .events = 0, .frames = 0 };
-        const size = std.math.cast(usize, stat.size) orelse return .{ .events = 0, .frames = 0 };
-        const buf = self.gpa.alloc(u8, size) catch return .{ .events = 0, .frames = 0 };
+        const stat = file.stat(self.io) catch return null;
+        const size = std.math.cast(usize, stat.size) orelse return null;
+        const buf = self.gpa.alloc(u8, size) catch return null;
         defer self.gpa.free(buf);
         var total: usize = 0;
         while (total < buf.len) {
-            const n = file.readPositionalAll(self.io, buf[total..], total) catch return .{ .events = 0, .frames = 0 };
+            const n = file.readPositionalAll(self.io, buf[total..], total) catch return null;
             if (n == 0) break;
             total += n;
         }
-        var res = reader.read(self.gpa, buf[0..total]) catch return .{ .events = 0, .frames = 0 };
+        if (total != buf.len) return null;
+        var res = reader.read(self.gpa, buf) catch return null;
         defer res.deinit(self.gpa);
+        if (res.version_status == .newer) return null;
         var events: u64 = 0;
         for (res.frames.items) |frame| {
             if ((frame.flags & format.flag_continues) == 0) events += 1;
         }
-        return .{ .events = events, .frames = res.frames.items.len };
+        return .{
+            .events = events,
+            .frames = res.frames.items.len,
+            .dropped = res.dropped,
+            .missing = res.missing,
+        };
     }
 };
 

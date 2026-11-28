@@ -1,5 +1,5 @@
 %% Always-on mmap flight recorder lifecycle (FlightRecorder.tla, design-mmap).
-%% design-mmap passes all invariants (R1-R8, EvictOnlySealed, OneSwitchPerSegment) across 16,608,533 distinct states.
+%% design-mmap passes all invariants (R1-R8, EvictOnlySealed, OneSwitchPerSegment) across 16,666,683 distinct states.
 stateDiagram-v2
     state "Session open, producers idle" as Open
     state "Switching full segment (current CAS pending)" as Switching
@@ -21,8 +21,8 @@ stateDiagram-v2
     OffsetReserved --> HeaderWritten : producer writes magic, length, and header CRC
     HeaderWritten --> Copied : producer copies event bytes
     Copied --> Open : producer writes commit word
-    Open --> Open : drop without next ready, prealloc (next null or current), msync, or chat turn
-    Open --> Evicting : segments above cap (write durable gap record first)
+    Open --> Open : drop into current segment header without next ready, prealloc (next null or current), msync, or chat turn
+    Open --> Evicting : segments above cap (write durable gap record with frames, cuts, and segment drops first)
     Evicting --> Open : delete oldest sealed segment (no reserved frame inside)
     Open --> Exited : fx exits cleanly (seals non-empty next, discards empty next)
     ClearingNext --> Exited : fx exits cleanly (seals if another thread wrote frames)
@@ -54,6 +54,7 @@ stateDiagram-v2
 %% - mutant-no-exit-mark breaks InstanceEndKnown (R5): Open -> kill -9 -> reopen (3 states).
 %% - mutant-evict-without-gap breaks NoSilentLoss (R1): fill segments past cap -> Evict deletes segment 1 without gap -> kill -9 -> reopen.
 %% - mutant-delete-before-gap breaks NoSilentLoss (R1): fill segments past cap -> Evict deletes segment 1 before writing gap -> kill -9 -> reopen.
+%% - mutant-gap-without-drops breaks NoSilentLoss (R1): commit frame + drop in seg 1 -> Prealloc -> SwitchCurrent -> Evict writes gap omitting seg 1 drops -> EvictDeleteSeg -> CleanExit -> reopen (14 states).
 %% - mutant-evict-open breaks EvictOnlySealed (R3.7): open 3rd segment (after crash/reopen) -> Evict picks unsealed or reserved-in-flight segment -> deletes it.
 %%
 %% Events this chart leaves out:
