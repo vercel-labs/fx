@@ -21,6 +21,7 @@ const host = @import("../hosts/host.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const composer_insertion = @import("../input/composer_insertion.zig");
 const composer_stash = @import("../input/composer_stash.zig");
+const clipboard_read = @import("../images/clipboard_read.zig");
 const gesture_state = @import("../input/gesture_state.zig");
 const horizontal_navigation = @import("../input/horizontal_navigation.zig");
 const input_action = @import("../input/input_action.zig");
@@ -919,6 +920,27 @@ pub fn Runtime(comptime App: type) type {
                     settleModelPickerDraft(app);
                 }
             }
+        }
+
+        /// Takes a finished clipboard read and attaches its image to the
+        /// agent that asked, on screen or hidden. While the model picker
+        /// holds the composer the read waits, and lands once it closes
+        /// (`tests/tla/clipboard_read/ClipboardRead.tla`
+        /// PickerComposerUntouched).
+        pub fn collectClipboardImageFacts(app: *App) !void {
+            if (comptime !@hasField(App, "clipboard_read")) return;
+            if (paste_rt.modelPickerBorrowsComposer(app)) return;
+            var finished = app.clipboard_read.take() orelse return;
+            defer finished.outcome.deinit(app.alloc);
+            const images = image_commands.Commands(App);
+            const requester = finished.requester orelse return images.dropClipboard(app, &finished.outcome);
+            if (!try app_agents_runtime.Runtime(App).withAgentDraft(app, requester, &finished.outcome, finishClipboardIn)) {
+                try images.dropClipboard(app, &finished.outcome);
+            }
+        }
+
+        fn finishClipboardIn(outcome: *clipboard_read.Outcome, app: *App, draft: ?*composer_stash.State) anyerror!void {
+            try image_commands.Commands(App).finishClipboard(app, outcome, draft);
         }
 
         pub const prepareFilePicker = completion_rt.prepareFilePicker;
@@ -4125,6 +4147,8 @@ const RoutingFakeApp = struct {
     gateway_metadata: model_capabilities.GatewayMetadata = .{},
     model_cache_loading: bool = false,
     model_cache: model_cache_runtime.Runtime,
+    // Unsupported by default, so no routing test reaches a clipboard.
+    clipboard_read: clipboard_read.Runtime = .{ .loader = .{ .load = noClipboardImage, .supported = false } },
     file_completion_values: []const file_index.Candidate = &.{},
     file_completion_current: bool = true,
     expected_file_completion_kind: ?file_index.CandidateKind = null,
@@ -4163,11 +4187,6 @@ const RoutingFakeApp = struct {
         return .{ .open_fn = routingOpenUrl };
     }
 
-    pub fn loadClipboardImageAttachment(self: *RoutingFakeApp) !image_attachments.ClipboardImageAttachment {
-        self.clipboard_image_reads += 1;
-        return error.NoClipboardImage;
-    }
-
     fn init(alloc: std.mem.Allocator) !RoutingFakeApp {
         var app = RoutingFakeApp{
             .alloc = alloc,
@@ -4191,6 +4210,7 @@ const RoutingFakeApp = struct {
     }
 
     fn deinit(self: *RoutingFakeApp) void {
+        self.clipboard_read.deinit(self.alloc);
         self.auth.deinit(self.alloc);
         self.agent().approval_prompt.deinit(self.alloc);
         self.agent().question_prompt.deinit(self.alloc);
@@ -9777,6 +9797,81 @@ test "app_input_runtime image attach is skipped while the model catalog borrows 
     try std.testing.expect(app.model_cache.menu.active);
 }
 
+fn noClipboardImage(_: ?*anyopaque, _: std.mem.Allocator, _: image_attachments.CaptureBudget) anyerror!image_attachments.ClipboardImageAttachment {
+    return error.NoClipboardImage;
+}
+
+/// Counts each export on the worker thread. Read the count only after
+/// `waitClipboardReadDone`, which takes the read's mutex.
+fn countClipboardRead(ctx: ?*anyopaque, _: std.mem.Allocator, _: image_attachments.CaptureBudget) anyerror!image_attachments.ClipboardImageAttachment {
+    const reads: *usize = @ptrCast(@alignCast(ctx.?));
+    reads.* += 1;
+    return error.NoClipboardImage;
+}
+
+/// Makes `app`'s clipboard reads supported and counted by `clipboard_image_reads`.
+fn countClipboardReads(app: *RoutingFakeApp) void {
+    app.clipboard_read.loader = .{ .ctx = &app.clipboard_image_reads, .load = countClipboardRead };
+}
+
+fn waitClipboardReadDone(read: *clipboard_read.Runtime) !void {
+    var waited_ms: usize = 0;
+    while (true) : (waited_ms += 1) {
+        read.mutex.lockUncancelable(std.testing.io);
+        const done = read.phase == .done;
+        read.mutex.unlock(std.testing.io);
+        if (done) return;
+        if (waited_ms > 10_000) return error.TestTimedOut;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+test "a clipboard read that finishes while the model catalog borrows the composer waits until it closes" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.clipboard_read.loader = .{ .load = noClipboardImage };
+    try app.input_runtime.textReplacementState().replace(alloc, "draft");
+
+    try std.testing.expectEqual(clipboard_read.Start.started, try app.clipboard_read.start(alloc, (&app).agent()));
+    try feedRoutingBytes(&app, "\x10");
+    try std.testing.expect(app.model_cache.menu.active);
+    try waitClipboardReadDone(&app.clipboard_read);
+    const notices_before = app.notice_write_count;
+
+    try Runtime(RoutingFakeApp).collectClipboardImageFacts(&app);
+    try std.testing.expectEqual(notices_before, app.notice_write_count);
+    try std.testing.expect(app.clipboard_read.phase == .done);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 0x1b, 4096, 100);
+    try Runtime(RoutingFakeApp).flushPendingEscape(&app, (&app).agent(), 0);
+    try std.testing.expect(!app.model_cache.menu.active);
+    try Runtime(RoutingFakeApp).collectClipboardImageFacts(&app);
+    try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+    try std.testing.expectEqualStrings("no image found on clipboard", app.notice_body.items);
+    try std.testing.expect(app.clipboard_read.phase == .idle);
+    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+}
+
+test "a clipboard read whose agent closed is dropped without touching the composer" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.clipboard_read.loader = .{ .load = noClipboardImage };
+    try app.input_runtime.textReplacementState().replace(alloc, "draft");
+
+    try std.testing.expectEqual(clipboard_read.Start.started, try app.clipboard_read.start(alloc, (&app).agent()));
+    app.clipboard_read.forget((&app).agent());
+    try waitClipboardReadDone(&app.clipboard_read);
+    const notices_before = app.notice_write_count;
+
+    try Runtime(RoutingFakeApp).collectClipboardImageFacts(&app);
+    // Only an image tells the user; a read with nothing to attach is logged.
+    try std.testing.expectEqual(notices_before, app.notice_write_count);
+    try std.testing.expect(app.clipboard_read.phase == .idle);
+    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+}
+
 test "app_input_runtime image attach is skipped while ctrl+p inline stages borrow the composer" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
@@ -10413,6 +10508,7 @@ test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "keep");
+    countClipboardReads(&app);
 
     try feedRoutingBytes(
         &app,
@@ -10422,6 +10518,7 @@ test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
     try std.testing.expectEqualStrings("keep", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     // One notice for the clipboard check the empty paste starts, one for the ignored suffix.
+    try waitClipboardReadDone(&app.clipboard_read);
     try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
     try std.testing.expectEqual(@as(usize, 2), app.notice_write_count);
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -10645,14 +10742,19 @@ test "app_input_runtime empty composer paste checks the clipboard for an image" 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
 
+    countClipboardReads(&app);
     const notices_before = app.notice_write_count;
     // xterm.js terminals (VS Code, VSCodium, Cursor) send this for Cmd+V
     // when the clipboard holds only an image.
     try feedRoutingBytes(&app, "\x1b[200~\x1b[201~");
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
+    try std.testing.expectEqualStrings("reading clipboard", app.notice_body.items);
     try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+    try waitClipboardReadDone(&app.clipboard_read);
+    try Runtime(RoutingFakeApp).collectClipboardImageFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
+    try std.testing.expectEqual(notices_before + 2, app.notice_write_count);
     try std.testing.expectEqualStrings("no image found on clipboard", app.notice_body.items);
     debug_trace.shutdown();
 
@@ -10676,6 +10778,7 @@ test "app_input_runtime empty composer paste skips the clipboard while the model
 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
+    countClipboardReads(&app);
     try enterRoutingShortcutEffortStage(&app, "draft", "draft".len);
 
     try feedRoutingBytes(&app, "\x1b[200~\x1b[201~");
@@ -10692,6 +10795,7 @@ test "app_input_runtime text composer paste does not read the clipboard" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
 
+    countClipboardReads(&app);
     try feedRoutingBytes(&app, "\x1b[200~hello\x1b[201~");
     try std.testing.expectEqualStrings("hello", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
@@ -10702,7 +10806,9 @@ test "app_input_runtime ctrl+v reads the clipboard through the app's reader" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
 
+    countClipboardReads(&app);
     try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+    try waitClipboardReadDone(&app.clipboard_read);
     try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
 }
 
