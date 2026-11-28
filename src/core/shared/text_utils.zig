@@ -674,13 +674,184 @@ fn maskSecretsWith(arena: std.mem.Allocator, text: []const u8, values: ?*SecretV
         modified = true;
         if (values) |collected| try collected.put(arena, text[span.prefix_end..][0..span.value_len]);
         try out.writer.writeAll(text[written..span.prefix_end]);
-        try out.writer.writeAll("[redacted]");
+        try out.writer.writeAll(redaction_marker);
         debug_trace.logf("core", "secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
         written = span.prefix_end + span.value_len;
     }
     if (!modified) return text;
     try out.writer.writeAll(text[written..]);
     return try out.toOwnedSlice();
+}
+
+/// The text that replaces each secret span in masked output.
+const redaction_marker = "[redacted]";
+
+/// `maskSecrets` for the crash handler. It writes the masked `text` into `out`
+/// and returns the part that was written. It allocates nothing, takes no lock,
+/// and logs nothing, so the crash handler may call it.
+///
+/// The result is always a prefix of what `maskSecrets` returns. A marker is
+/// written whole or not at all, so none is cut, and no secret byte is written.
+/// Only the start of a new secret is limited: one that starts past the room left
+/// in `out` could never be written, so it is not searched for. `findSecretSpan`
+/// still reads all of `text`, so a secret that starts inside `out` and runs past
+/// its end is matched whole.
+pub fn maskSecretsInto(out: []u8, text: []const u8) []const u8 {
+    return maskSecretsIntoScan(out, text).masked;
+}
+
+/// What `maskSecretsIntoScan` wrote, and how far its span search read in `text`.
+const IntoScan = struct { masked: []const u8, searched_to: usize };
+
+/// `maskSecretsInto`, which also reports how far the span search read. A test
+/// uses `searched_to` to pin the bound: the search never reads past the room
+/// left in `out` for a new secret.
+fn maskSecretsIntoScan(out: []u8, text: []const u8) IntoScan {
+    var spans: SecretSpans = .{ .text = text };
+    var used: usize = 0;
+    var written: usize = 0;
+    while (out.len > used) {
+        const limit = written + (out.len - used);
+        const span = spans.nextBefore(limit) orelse {
+            _ = copyPrefixInto(out, &used, text[written..]);
+            break;
+        };
+        if (!copyPrefixInto(out, &used, text[written..span.prefix_end])) break;
+        if (out.len - used < redaction_marker.len) break;
+        @memcpy(out[used..][0..redaction_marker.len], redaction_marker);
+        used += redaction_marker.len;
+        written = span.prefix_end + span.value_len;
+    }
+    return .{ .masked = out[0..used], .searched_to = spans.at };
+}
+
+/// Copies as much of `bytes` as fits in `out` after `used`, and returns whether
+/// all of it fit.
+fn copyPrefixInto(out: []u8, used: *usize, bytes: []const u8) bool {
+    const n = @min(bytes.len, out.len - used.*);
+    @memcpy(out[used.*..][0..n], bytes[0..n]);
+    used.* += n;
+    return n == bytes.len;
+}
+
+/// Fails when `written` holds the first six bytes of `body`, a fragment that a
+/// secret with that body would leave behind.
+fn expectNoSecretBody(written: []const u8, body: []const u8) !void {
+    var start: usize = 0;
+    while (start + 6 <= body.len) : (start += 1) {
+        if (std.mem.find(u8, written, body[start..][0..6]) != null) return error.SecretLeaked;
+    }
+}
+
+/// Fake secret shapes for the `maskSecretsInto` tests. Each body is the part of
+/// the token that a leak would show.
+const FakeSecret = struct { token: []const u8, body: []const u8 };
+const fake_secrets = [_]FakeSecret{
+    .{ .token = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", .body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" },
+    .{ .token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", .body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" },
+    .{ .token = "AKIA0123456789ABCDEF", .body = "0123456789ABCDEF" },
+    .{ .token = "Bearer ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", .body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" },
+};
+
+test "maskSecretsInto matches maskSecrets for every secret kind when the buffer is large enough" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const inputs = [_][]const u8{
+        "run AI_GATEWAY_API_KEY=abcdefghijklmnop now",
+        "key sk-abcdefghijklmnopqrstuvwxyz123456 end",
+        "token ghp_" ++ repeat("A", 36) ++ " end",
+        "token gho_" ++ repeat("a", 36) ++ " end",
+        "pat github_pat_abcdefghijklmnopqrstuvwxyz1234 end",
+        "bot xoxb-1234567890abcdefghij end",
+        "aws AKIA0123456789ABCDEF done",
+        "curl -H \"Authorization: Bearer " ++ repeat("t", 40) ++ "\" end",
+        "clone https://fxuser:fakepass123@example.com/repo.git now",
+        "API_KEY=abcdefghijklmnop and TOKEN=zyxwvutsrqponmlk",
+        "plain words with no secret at all",
+    };
+    var buf: [1024]u8 = undefined;
+    var masked_count: usize = 0;
+    for (inputs) |input| {
+        const want = try maskSecrets(arena_state.allocator(), input);
+        const got = maskSecretsInto(&buf, input);
+        try std.testing.expectEqualStrings(want, got);
+        if (!std.mem.eql(u8, want, input)) masked_count += 1;
+    }
+    try std.testing.expectEqual(inputs.len - 1, masked_count);
+}
+
+test "maskSecretsInto writes no secret byte for a secret at any offset near the buffer end" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var input: [640]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    for (fake_secrets) |secret| {
+        for (470..531) |offset| {
+            @memset(&input, 'a');
+            input[offset - 1] = ' ';
+            @memcpy(input[offset..][0..secret.token.len], secret.token);
+            input[offset + secret.token.len] = ' ';
+            const got = maskSecretsInto(&buf, &input);
+            const want = try maskSecrets(arena_state.allocator(), &input);
+            try std.testing.expect(std.mem.find(u8, want, redaction_marker) != null);
+            try std.testing.expect(std.mem.startsWith(u8, want, got));
+            try expectNoSecretBody(got, secret.body);
+        }
+    }
+}
+
+test "maskSecretsInto stops its secret search at the buffer end, even on a huge text" {
+    var text: [64 * 1024 + 4096]u8 = undefined;
+    for (&text, 0..) |*byte, index| byte.* = if (index % 6 == 5) ' ' else 'w';
+    const secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    @memcpy(text[60_000..][0..secret.len], secret);
+    var buf: [512]u8 = undefined;
+    const scan = maskSecretsIntoScan(&buf, &text);
+    try std.testing.expectEqualSlices(u8, text[0..512], scan.masked);
+    // The search stopped at the buffer end and never reached the secret at 60000.
+    try std.testing.expectEqual(buf.len, scan.searched_to);
+}
+
+test "maskSecretsInto writes the marker whole or not at all at the buffer end" {
+    const token = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const input = "xxxxx " ++ token;
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("xxxxx [redacted]", maskSecretsInto(buf[0..16], input));
+    try std.testing.expectEqualStrings("xxxxx ", maskSecretsInto(buf[0..15], input));
+    try std.testing.expectEqualStrings("xxxxx ", maskSecretsInto(buf[0..6], input));
+    try std.testing.expectEqualStrings("xxxxx", maskSecretsInto(buf[0..5], input));
+    try std.testing.expectEqualStrings("xxxx", maskSecretsInto(buf[0..4], input));
+    try std.testing.expectEqualStrings("", maskSecretsInto(buf[0..0], input));
+    try std.testing.expectEqualStrings("[redacted]", maskSecretsInto(buf[0..10], token));
+    try std.testing.expectEqualStrings("", maskSecretsInto(buf[0..9], token));
+}
+
+test "maskSecretsInto output is a prefix of maskSecrets with no secret body at every buffer size" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var input: [128]u8 = undefined;
+    var buf: [128]u8 = undefined;
+    for (fake_secrets) |secret| {
+        for (0..42) |lead| {
+            @memset(&input, 'a');
+            input[lead] = ' ';
+            const token_end = lead + 1 + secret.token.len;
+            @memcpy(input[lead + 1 ..][0..secret.token.len], secret.token);
+            const tail = " tail words";
+            @memcpy(input[token_end..][0..tail.len], tail);
+            const text = input[0 .. token_end + tail.len];
+            const want = try maskSecrets(arena_state.allocator(), text);
+            for (0..text.len + 1) |size| {
+                const got = maskSecretsInto(buf[0..size], text);
+                try std.testing.expect(got.len <= size);
+                try std.testing.expect(std.mem.startsWith(u8, want, got));
+                try expectNoSecretBody(got, secret.body);
+                if (std.mem.find(u8, got, "[") != null) {
+                    try std.testing.expect(std.mem.find(u8, got, redaction_marker) != null);
+                }
+            }
+        }
+    }
 }
 
 /// Whether `c` can be part of a run of secret bytes. Keys and tokens are
@@ -704,7 +875,15 @@ const SecretSpans = struct {
     at: usize = 0,
 
     fn next(self: *SecretSpans) ?SecretSpan {
-        while (self.at < self.text.len) {
+        return self.nextBefore(self.text.len);
+    }
+
+    /// The next span whose secret starts before `limit`. Only the starts are
+    /// limited: `findSecretSpan` reads the whole text, so a span that starts
+    /// before `limit` and runs past it is returned whole.
+    fn nextBefore(self: *SecretSpans, limit: usize) ?SecretSpan {
+        const end = @min(limit, self.text.len);
+        while (self.at < end) {
             if (findSecretSpan(self.text, self.at)) |span| {
                 self.at = span.prefix_end + span.value_len;
                 return span;

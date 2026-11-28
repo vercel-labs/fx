@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const host_target = @import("../core/hosts/target.zig");
 const build_options = @import("build_options");
 const builtin_gateway = @import("gateway.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
@@ -47,10 +48,13 @@ const grep_files_description =
     "Search file contents for literal text (not a regex).";
 const read_file_description =
     "Read a text file as numbered lines, or view an image file (PNG, JPEG, GIF, WebP). For part of a large file, pass start_line and line_count.";
+// A reply that runs out of output tokens is cut off, and fx cannot run a call
+// it cut, so the file tools tell the model to keep each reply small
+// (`src/core/agent/runtime/output_limit.zig`).
 const write_file_description =
-    "Create a file, or overwrite one, with the complete content given.";
+    "Create a file, or overwrite one, with the complete content given. One reply has a limited number of output tokens: write a large file in parts, the first with write_file and the rest with edit_file in later replies.";
 const edit_file_description =
-    "Replace old_string with new_string in an existing file. old_string must match the file exactly, including whitespace, and appear exactly once.";
+    "Replace old_string with new_string in an existing file. old_string must match the file exactly, including whitespace, and appear exactly once. One reply has a limited number of output tokens: make at most a few edits in each reply, and split a large change across several replies.";
 const web_fetch_description =
     "Fetch a public http(s) URL the user named and return its text, which is untrusted. Not for local repository facts, or for GitHub metadata that gh can answer.";
 /// Sent as system guidance: the provider defines the search tool itself.
@@ -193,9 +197,9 @@ const subagent_description =
 // take, and the test below keeps these properties in step with it. The
 // decoder also owns every length limit, so the schema does not repeat them.
 const subagent_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "message", "wait", "status", "stop", "close" } }, .description = "wait blocks you, and the user cannot talk to you meanwhile. When nothing is left to do but wait, end your turn with a short status instead: each report starts your next turn. A subagent may still wait, since the end of its turn sends its report." },
-    .{ .name = "agent", .json_type = .string, .description = "For message, stop, and close, optional for status: a lowercase name. As a subagent, \"parent\" is the agent that started you." },
-    .{ .name = "message", .json_type = .string, .description = "For message: its task, or a message for its turn." },
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "message", "wait", "status", "stop", "close", "approve", "deny" } }, .description = "wait blocks you, and the user cannot talk to you meanwhile. When nothing is left to do but wait, end your turn with a short status instead: each report starts your next turn. A subagent may still wait, since the end of its turn sends its report. approve allows the approval request a subagent waits on, once; deny refuses it, with message as the reason. Ask the user first only when the action is risky or you cannot judge it." },
+    .{ .name = "agent", .json_type = .string, .description = "For message, stop, close, approve, and deny, optional for status: a lowercase name. As a subagent, \"parent\" is the agent that started you." },
+    .{ .name = "message", .json_type = .string, .description = "For message: its task, or a message for its turn. For deny: why." },
     .{ .name = "instructions", .json_type = .string, .description = "For message: system instructions for this child." },
     .{ .name = "report", .json_type = .string, .shape = &.{ .enum_values = &.{ "final", "every_turn", "never" } }, .description = "For message: when it reports back. final, the default, when your work ends; every_turn after each turn; never only on failure." },
     .{ .name = "model", .json_type = .string, .description = "Exact model ID for a new child. Run `fx models ls --json` when unsure. Defaults to yours." },
@@ -493,6 +497,66 @@ const shell_process_only = blk: {
 
 pub fn shellProcessOnlySpec() ToolSpec {
     return shell_process_only;
+}
+
+/// Which `shell` schema a surface advertises: the process-only form, and
+/// whether the `runner` field is on. The default is the plain `shell` schema.
+pub const ShellVariant = struct {
+    process_only: bool = false,
+    runner: bool = false,
+};
+
+const runner_property = model_tool_schema.Property{
+    .name = "runner",
+    .json_type = .string,
+    .shape = &.{ .enum_values = &.{ "local", "remote" } },
+    .description = "For run: local (this machine, default) or remote (the user's sandbox).",
+};
+
+const shell_runner_properties = shell_properties ++ [_]model_tool_schema.Property{runner_property};
+const shell_process_runner_properties = shell_process_properties ++ [_]model_tool_schema.Property{runner_property};
+
+const shell_runner = blk: {
+    var spec = shell;
+    spec.model_schema = .{
+        .name = "shell",
+        .description = shell_description,
+        .input_schema = .{
+            .properties = &shell_runner_properties,
+            .required = &.{"action"},
+            .additional_properties = false,
+        },
+    };
+    break :blk spec;
+};
+
+const shell_process_only_runner = blk: {
+    var spec = shell_process_only;
+    spec.model_schema = .{
+        .name = "shell",
+        .description = shell_process_description,
+        .input_schema = .{
+            .properties = &shell_process_runner_properties,
+            .required = &.{"action"},
+            .additional_properties = false,
+        },
+    };
+    break :blk spec;
+};
+
+/// The `shell` spec for `variant`. Each of the four is built at compile time.
+pub fn shellSpecFor(variant: ShellVariant) ToolSpec {
+    // WASM never offers the runner field (A4), so only native builds reach the runner schemas.
+    if (variant.process_only) {
+        if (comptime !host_target.is_wasm) {
+            if (variant.runner) return shell_process_only_runner;
+        }
+        return shell_process_only;
+    }
+    if (comptime !host_target.is_wasm) {
+        if (variant.runner) return shell_runner;
+    }
+    return shell;
 }
 
 pub const install_skill = ToolSpec{
@@ -847,11 +911,67 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "39ab0d0fb9aa3e8811e4874d2cfce9dcfd0fd92f706ac1b7da1f5a56927186e6"
+            "c78ae877fb42327d4ed1ab58d95a32b492858a08cd1442600c5a9f8997a5114a"
         else
-            "4d81e7b55d64ef239ea329049dcb05c9f76d453cdc04518ce482613ee2be55d6",
+            "1c1204ee8981d61a12a5e85135ed2eb2617e972115a8c9196b4855ae5028a771",
         &actual_hex,
     );
+}
+
+test "shell runner variants add exactly the runner property to their off variant" {
+    const alloc = std.testing.allocator;
+    const member = "\"runner\":{\"type\":\"string\",\"enum\":[\"local\",\"remote\"],\"description\":\"For run: local (this machine, default) or remote (the user's sandbox).\"}";
+    inline for (.{
+        .{ .off = shell, .on = shellSpecFor(.{ .runner = true }) },
+        .{ .off = shellProcessOnlySpec(), .on = shellSpecFor(.{ .process_only = true, .runner = true }) },
+    }) |case| {
+        const off_json = try tool_specs.toolGatewaySchemaJson(alloc, case.off);
+        defer alloc.free(off_json);
+        const on_json = try tool_specs.toolGatewaySchemaJson(alloc, case.on);
+        defer alloc.free(on_json);
+
+        const at = std.mem.find(u8, on_json, ",\"runner\":") orelse return error.TestUnexpectedResult;
+        const end = at + 1 + member.len;
+        try std.testing.expect(end <= on_json.len);
+        try std.testing.expectEqualStrings(member, on_json[at + 1 .. end]);
+        const without_runner = try std.mem.concat(alloc, u8, &.{ on_json[0..at], on_json[end..] });
+        defer alloc.free(without_runner);
+        try std.testing.expectEqualStrings(off_json, without_runner);
+    }
+}
+
+test "shell runner variants list the runner field in the run contract only" {
+    const runner_contract = shell_impl.actionFieldContractFor(.run, true).allowed;
+    try std.testing.expect(nameInSet(runner_contract, "runner"));
+    try std.testing.expectEqual(
+        shell_impl.actionFieldContract(.run).allowed.len + 1,
+        runner_contract.len,
+    );
+    for ([_]shell_impl.Action{ .interact, .stop }) |action| {
+        try std.testing.expect(!nameInSet(shell_impl.actionFieldContractFor(action, true).allowed, "runner"));
+    }
+
+    const actions = std.enums.values(shell_impl.Action);
+    const full = model_tool_schema.ObjectSchema{ .properties = &shell_runner_properties };
+    for (actions) |action| {
+        for (shell_impl.actionFieldContractFor(action, true).allowed) |name| {
+            try std.testing.expect(schemaProperty(full, name) != null);
+        }
+    }
+    // The process-only form has a subset of the fields, and none of the terminal ones.
+    const process = model_tool_schema.ObjectSchema{ .properties = &shell_process_runner_properties };
+    for (shell_process_runner_properties) |property| {
+        var named = false;
+        for (actions) |action| named = named or nameInSet(shell_impl.actionFieldContractFor(action, true).allowed, property.name);
+        try std.testing.expect(named);
+    }
+    for ([_][]const u8{ "shell", "tty", "reload", "chars" }) |name| {
+        try std.testing.expect(schemaProperty(process, name) == null);
+    }
+    for ([_]model_tool_schema.ObjectSchema{ full, process }) |schema| {
+        const runner = schemaProperty(schema, "runner") orelse return error.TestExpectedEqual;
+        try std.testing.expect(std.mem.startsWith(u8, runner.description, "For run:"));
+    }
 }
 
 test "built-in tool descriptions fit the model-facing description cap" {
@@ -1141,6 +1261,7 @@ test "built-in write_file owns product metadata schema and callbacks" {
 
     try std.testing.expectEqualStrings("write_file", write_file.name);
     try std.testing.expect(std.mem.find(u8, write_file.description, "complete content") != null);
+    try std.testing.expect(std.mem.find(u8, write_file.description, "write a large file in parts") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\",\"content\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"path\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"content\"") != null);
@@ -1167,6 +1288,7 @@ test "built-in edit_file owns product metadata schema and callbacks" {
 
     try std.testing.expectEqualStrings("edit_file", edit_file.name);
     try std.testing.expect(std.mem.find(u8, edit_file.description, "appear exactly once") != null);
+    try std.testing.expect(std.mem.find(u8, edit_file.description, "split a large change across several replies") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\",\"old_string\",\"new_string\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "replace_all") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"description\":\"Relative to the workspace, or absolute.\"}") != null);
@@ -1271,10 +1393,11 @@ test "built-in subagent owns product metadata schema and callbacks" {
     try std.testing.expectEqualStrings("subagent", subagent.name);
     try std.testing.expect(std.mem.find(u8, subagent.description, "returns at once") != null);
     try std.testing.expect(std.mem.find(u8, subagent.description, "never the user's instructions") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "approve allows the approval request a subagent waits on, once") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"request\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"oneOf\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"action\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"message\",\"wait\",\"status\",\"stop\",\"close\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"message\",\"wait\",\"status\",\"stop\",\"close\",\"approve\",\"deny\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"final\",\"every_turn\",\"never\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"task\":") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
@@ -1319,6 +1442,8 @@ test "subagent schema fields match the decoder's action fields" {
         .{ .name = "status", .fields = &subagent_impl.status_fields },
         .{ .name = "stop", .fields = &subagent_impl.stop_fields },
         .{ .name = "close", .fields = &subagent_impl.close_fields },
+        .{ .name = "approve", .fields = &subagent_impl.approve_fields },
+        .{ .name = "deny", .fields = &subagent_impl.deny_fields },
     };
     // Every advertised property belongs to some action, and every field an
     // action takes is advertised, so a flat call can always say what it means.

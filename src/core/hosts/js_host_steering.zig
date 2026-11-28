@@ -8,9 +8,16 @@ const max_id_bytes: usize = 128;
 extern "fx" fn fx_steering_take(output_ptr: [*]u8, output_cap: usize) i32;
 extern "fx" fn fx_steering_close() void;
 extern "fx" fn fx_steering_state() i32;
+extern "fx" fn fx_steering_yield() i32;
 
 pub fn close() void {
     fx_steering_close();
+}
+
+/// Whether the host asked the running turn to stop at its next safe point
+/// (`turn.yield()`): the web core reads no ACP message while a prompt runs.
+pub fn yieldRequested() bool {
+    return fx_steering_yield() > 0;
 }
 
 /// The host's steering for the running turn: closed once the turn takes no

@@ -46,17 +46,17 @@ pub const SemanticNotice = struct {
     /// An optional dim line under the body, indented like a wrapped body row
     /// and without its own glyph.
     detail: []const u8 = "",
+    /// Where the detail row shows; `.full_only` keeps it to the full transcript.
+    detail_visibility: NoticeVisibility = .compact_and_full,
 };
 
-/// Status glyph leading every semantic notice, keyed by tone. Tool activity
-/// owns "●"; notices deliberately use distinct git-style status glyphs so the
-/// two channels never read as the same raw marker. The neutral marker "*"
-/// avoids the middot, which the footer already uses as a separator.
+/// Status glyph leading every semantic notice, keyed by tone. Tool activity owns "●",
+/// so notices use other marks; "⚠" matches the status line's warning sign, and "*" avoids the footer's middot.
 pub fn noticeGlyph(tone: NoticeTone) []const u8 {
     return switch (tone) {
         .information => "i",
         .success => "✓",
-        .warning => "!",
+        .warning => "⚠",
         .@"error" => "✗",
         .cancelled => "⊘",
         .neutral => "*",
@@ -76,6 +76,7 @@ pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.
         .body = body,
         .visibility = notice.visibility,
         .detail = try alloc.dupe(u8, notice.detail),
+        .detail_visibility = notice.detail_visibility,
     };
 }
 
@@ -215,7 +216,35 @@ pub const TurnPresentationOutcome = enum {
 pub const TurnFinished = struct {
     turn_id: u64,
     outcome: TurnPresentationOutcome,
+    /// How the turn's last model reply ended, when one did. A subagent's
+    /// parent reads it to say why a failed turn failed.
+    disposition: ?ProviderCompletionDisposition = null,
 };
+
+/// Why a turn failed when its reply was cut off at the output limit, in the
+/// failure a subagent's parent sees in place of `agent_turn_failed`.
+const output_limit_failure = "output_limit: the reply was cut off at its output-token limit";
+
+/// The failure a turn that ended this way reports, when its own reason says
+/// more than that it failed.
+pub fn turnFailureFor(finished: TurnFinished) ?ModelFailureDiagnostic {
+    if (finished.outcome != .failed) return null;
+    const disposition = finished.disposition orelse return null;
+    return switch (disposition) {
+        .length_limited => ModelFailureDiagnostic.init(output_limit_failure),
+        else => null,
+    };
+}
+
+test "a turn that a cut reply failed reports the output limit" {
+    try std.testing.expectEqualStrings(
+        "output_limit: the reply was cut off at its output-token limit",
+        turnFailureFor(.{ .turn_id = 1, .outcome = .failed, .disposition = .length_limited }).?.view(),
+    );
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .completed, .disposition = .length_limited }) == null);
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .failed }) == null);
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .failed, .disposition = .completed }) == null);
+}
 
 pub const ToolLifecycleId = struct {
     turn_id: u64,
@@ -245,6 +274,26 @@ pub const ToolOutcome = struct {
 pub const McpToolName = struct {
     server: []const u8,
     tool: []const u8,
+};
+
+/// Where an admitted shell command runs: on this machine (`local`), in the
+/// kept remote sandbox (`remote`), or in a fresh isolated sandbox (`isolated`).
+/// Live lifecycle events and in-memory transcript records carry it; saved
+/// sessions never write it (R3.5).
+pub const CommandPlacement = enum {
+    local,
+    remote,
+    isolated,
+
+    /// The runner phrase placed after the row verb (`"on remote"`, `"on isolated"`),
+    /// or null for a local run whose text does not change.
+    pub fn runnerPhrase(self: CommandPlacement) ?[]const u8 {
+        return switch (self) {
+            .local => null,
+            .remote => "on remote",
+            .isolated => "on isolated",
+        };
+    }
 };
 
 pub const ToolLifecycleEvent = union(enum) {
@@ -277,6 +326,9 @@ pub const ToolLifecycleEvent = union(enum) {
         resolved_display_target: ?[]const u8 = null,
         /// As `provisional.mcp_tool`.
         mcp_tool: ?McpToolName = null,
+        /// Where an admitted shell command runs, when admission placed it.
+        /// Live memory only; saved sessions never write it (R3.5).
+        command_placement: ?CommandPlacement = null,
     },
     progress: struct {
         id: ToolLifecycleId,
@@ -1077,6 +1129,9 @@ pub const ToolCall = struct {
     /// decide it as the tool it replaced. Borrowed only for this action.
     /// Copies and durable/provider encodings omit it.
     toolbox_lookup: ?ToolboxLookup = null,
+    /// Where an admitted shell command runs, when admission placed it.
+    /// Action-scoped only; copies and durable/provider encodings omit it (R3.5).
+    command_placement: ?CommandPlacement = null,
 
     /// The name the model called, which this call's result goes back under.
     pub fn calledName(self: ToolCall) []const u8 {
@@ -1445,6 +1500,9 @@ pub const ToolResultMemory = struct {
     tool_image_handle: ?[]const u8 = null,
     output_handle: ?[]const u8 = null,
     preview: ?[]const u8 = null,
+    /// The notice lines of a shell run's result, joined by newlines, without the shell snapshot
+    /// warning (`shell_result_notice.visibleNotice`). The person sees them; the model sees the result.
+    notice: ?[]const u8 = null,
     output_bytes: usize = 0,
     stored_output_bytes: usize = 0,
     truncated: bool = false,
@@ -1461,6 +1519,9 @@ pub const ToolResultMemory = struct {
     /// A `subagent` message that made a new subagent, so its row reads
     /// "Started" rather than "Messaged". The model never sees it.
     subagent_started: bool = false,
+    /// Where an admitted shell command ran, when admission placed it.
+    /// Live memory only; saved sessions never write it (R3.5).
+    command_placement: ?CommandPlacement = null,
 };
 
 /// A shell command that crossed the quiet limit during a wait: its command
@@ -1692,6 +1753,23 @@ pub const FileEvidence = struct {
     stale: bool = false,
 };
 
+/// The toolbox menu a conversation sends on every request (D103).
+pub const SavedToolboxMenu = struct {
+    /// The lead and the menu, as the requests send them.
+    text: []u8,
+    /// `toolbox.entriesHash` of what the menu lists.
+    entries_hash: u64,
+};
+
+/// What a toolbox change note told the conversation the toolbox holds (D103).
+pub const ToolboxNoted = struct {
+    /// `toolbox.entriesHash` of what the toolbox held.
+    entries_hash: u64,
+    /// How many compactions the conversation had when the note was added. A
+    /// later compaction's summary replaces the note.
+    compaction_count: usize,
+};
+
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
@@ -1705,6 +1783,11 @@ pub const ExecutionMemory = struct {
     /// that captured it saves it; later turns send the newest saved copy
     /// unchanged (D94).
     runtime_context: ?[][]u8 = null,
+    /// The toolbox menu this turn sent first for the conversation. Later
+    /// turns, resumed ones included, send these bytes unchanged (D103).
+    toolbox_menu: ?SavedToolboxMenu = null,
+    /// What this turn's toolbox change note told the conversation (D103).
+    toolbox_noted: ?ToolboxNoted = null,
     turn_summary: ?TurnSummary = null,
     /// The turn's settled model calls, in order, for Ctrl+O. Display data:
     /// never part of what the model is sent.
@@ -1820,6 +1903,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
         .subagent_started = memory.subagent_started,
+        .command_placement = memory.command_placement,
     };
 }
 
@@ -1855,6 +1939,7 @@ test "dupeToolResultMemory copies survive teardown of every source allocation" {
         .model_view_covers_full_file = false,
         .command_output_replay = .{ .available = .{ .handle = try alloc.dupe(u8, "cmd-replay-1"), .framed_bytes = 42 } },
         .command_process_presentation = .{ .exit_code = 3 },
+        .command_placement = .remote,
     };
     const copy = try dupeToolResultMemory(alloc, source);
     // Tear down every source allocation; the testing allocator scribbles
@@ -1885,6 +1970,8 @@ test "dupeToolResultMemory copies survive teardown of every source allocation" {
         .unavailable => return error.TestUnexpectedResult,
     }
     try std.testing.expect(copy.command_process_presentation.? == .exit_code);
+    try std.testing.expectEqual(?CommandPlacement, @TypeOf(copy.command_placement));
+    try std.testing.expectEqual(@as(?CommandPlacement, .remote), copy.command_placement);
 
     freeToolResultMemory(alloc, copy);
 }
@@ -2061,23 +2148,34 @@ pub const ChatMessage = struct {
     /// counts too and fx's note for a cancelled question never does. Never
     /// saved or sent to a provider.
     user_answer: bool = false,
+    /// A question's result that fx stored outside the session behind a
+    /// preview (`ToolResultMemory.output_handle`), so its answers are not in
+    /// `content`. The security review reads them by handle before it takes
+    /// them as the user's words (`isStoredUserAnswer`). Never saved or sent
+    /// to a provider.
+    stored_user_answer: bool = false,
 };
 
 /// The tool that asks the user questions.
 pub const user_question_tool_name = "ask_user_question";
 
-/// The user's answers in a question tool's result, which lists each answered
-/// question. Null for any other text, such as fx's note that the user
-/// cancelled the question or that no one could answer it. The answers borrow
-/// `arena`.
-pub fn questionAnswers(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const []const u8 {
-    const Answered = struct { answer: []const u8 };
-    const answered = json_decode.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+/// The answered questions in a question tool's result, in its order. Null for
+/// any other text, such as fx's note that the user cancelled the question or
+/// that no one could answer it. Only the answers must be there; a missing
+/// question reads as empty. The strings borrow `output` or `arena`.
+pub fn answeredQuestions(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const QuestionAnswer {
+    return json_decode.parseFromSliceLeaky([]const QuestionAnswer, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    const answers = try arena.alloc([]const u8, answered.len);
-    for (answers, answered) |*answer, item| answer.* = item.answer;
+}
+
+/// The user's answers in a question tool's result (`answeredQuestions`). The
+/// answers borrow `output` or `arena`.
+pub fn questionAnswers(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const []const u8 {
+    const pairs = try answeredQuestions(arena, output) orelse return null;
+    const answers = try arena.alloc([]const u8, pairs.len);
+    for (answers, pairs) |*answer, pair| answer.* = pair.answer;
     return answers;
 }
 
@@ -2089,7 +2187,18 @@ pub fn isUserAnswer(alloc: std.mem.Allocator, ran_tool: []const u8, status: ?Per
     if (!std.mem.eql(u8, ran_tool, user_question_tool_name) or status == .failure) return false;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
-    return try questionAnswers(scratch.allocator(), output) != null;
+    return try answeredQuestions(scratch.allocator(), output) != null;
+}
+
+/// Whether a result is a question's answers that fx stored behind a preview:
+/// the question tool ran (`ran_tool`, as for `isUserAnswer`), it did not
+/// fail, the model saw only a preview (`truncated`), and the whole output has
+/// a stored handle. fx saves a short result under a handle too, but the model
+/// sees all of it, so that result is not one.
+pub fn isStoredUserAnswer(ran_tool: []const u8, status: ?PersistedToolStatus, memory: ?ToolResultMemory) bool {
+    if (!std.mem.eql(u8, ran_tool, user_question_tool_name) or status == .failure) return false;
+    const stored = memory orelse return false;
+    return stored.truncated and stored.output_handle != null;
 }
 
 test "only a question's listed answers are the user's answer" {
@@ -2107,6 +2216,34 @@ test "only a question's listed answers are the user's answer" {
         "(ask_user_question: invalid arguments; provide {questions})",
         "[{\"question\":\"Choose next step?\"}]",
     }) |note| try std.testing.expect(!try isUserAnswer(alloc, "ask_user_question", .success, note));
+}
+
+test "a question's result gives each question with its answer, in order" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pairs = (try answeredQuestions(arena, "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"},{\"question\":\"When may I push?\",\"answer\":\"only after CI is green\"}]")).?;
+    try std.testing.expectEqual(@as(usize, 2), pairs.len);
+    try std.testing.expectEqualStrings("Choose next step?", pairs[0].question);
+    try std.testing.expectEqualStrings("Run tests", pairs[0].answer);
+    try std.testing.expectEqualStrings("When may I push?", pairs[1].question);
+    try std.testing.expectEqualStrings("only after CI is green", pairs[1].answer);
+    const unasked = (try answeredQuestions(arena, "[{\"answer\":\"Run tests\"}]")).?;
+    try std.testing.expectEqualStrings("", unasked[0].question);
+    try std.testing.expect(try answeredQuestions(arena, "(user cancelled the question)") == null);
+    // A question that is not a string makes the text no answer list.
+    try std.testing.expect(try answeredQuestions(arena, "[{\"question\":5,\"answer\":\"Run tests\"}]") == null);
+    // An empty list is a list of no answers.
+    try std.testing.expectEqual(@as(usize, 0), (try answeredQuestions(arena, "[]")).?.len);
+    // A full batch of 20 reads whole, in order.
+    var full: std.Io.Writer.Allocating = .init(arena);
+    try full.writer.writeByte('[');
+    for (0..20) |n| try full.writer.print("{s}{{\"question\":\"Q{d}?\",\"answer\":\"A{d}\"}}", .{ if (n == 0) "" else ",", n, n });
+    try full.writer.writeByte(']');
+    const batch = (try answeredQuestions(arena, full.written())).?;
+    try std.testing.expectEqual(@as(usize, 20), batch.len);
+    try std.testing.expectEqualStrings("Q19?", batch[19].question);
+    try std.testing.expectEqualStrings("A19", batch[19].answer);
 }
 
 /// Returns a caller-owned shallow projection only when incompatible replay exists.
@@ -3261,7 +3398,9 @@ pub const QuestionBatchEntry = struct {
 /// One persisted answer from an interactive question batch. The strings are
 /// borrowed from the short-lived arena that decodes the completed tool result.
 pub const QuestionAnswer = struct {
-    question: []const u8,
+    /// Empty when a saved answer list leaves the question out
+    /// (`answeredQuestions`).
+    question: []const u8 = "",
     answer: []const u8,
 };
 
@@ -3529,6 +3668,11 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     errdefer freePersistedContextNotes(alloc, context_notes);
     const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
     errdefer if (runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    const toolbox_menu: ?SavedToolboxMenu = if (memory.toolbox_menu) |menu|
+        .{ .text = try alloc.dupe(u8, menu.text), .entries_hash = menu.entries_hash }
+    else
+        null;
+    errdefer if (toolbox_menu) |menu| alloc.free(menu.text);
     const model_calls = try dupeModelCallRecords(alloc, memory.model_calls);
     errdefer freeModelCallRecords(alloc, model_calls);
     const bridge_calls = try dupeBridgeCallRecords(alloc, memory.bridge_calls);
@@ -3538,6 +3682,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        .toolbox_menu = toolbox_menu,
+        .toolbox_noted = memory.toolbox_noted,
         .turn_summary = memory.turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,
@@ -3552,6 +3698,7 @@ pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) vo
     freePersistedSteering(alloc, memory.steering);
     freePersistedContextNotes(alloc, memory.context_notes);
     if (memory.runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    if (memory.toolbox_menu) |menu| alloc.free(menu.text);
 }
 
 /// Caller owns the result; free it with `freeRuntimeContext`.
@@ -4086,11 +4233,13 @@ test "dupeToolCall drops action scoped bindings" {
         .arguments_json = "{\"open\":\"/skills/workflow\"}",
         .toolbox_lookup = .{ .permission = "skill", .target = "workflow" },
         .resolved_display_target = "more output from zig build test",
+        .command_placement = .remote,
     };
     const copy = try dupeToolCall(std.testing.allocator, source);
     defer freeToolCall(std.testing.allocator, copy);
     try std.testing.expect(copy.toolbox_lookup == null);
     try std.testing.expect(copy.resolved_display_target == null);
+    try std.testing.expect(copy.command_placement == null);
     try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }
 

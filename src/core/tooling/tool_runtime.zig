@@ -33,6 +33,7 @@ const glob_pattern = @import("../workspace/glob_pattern.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const command_admission = @import("../permissions/command_admission.zig");
+const sandbox_policy = @import("../runner/runner.zig");
 const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -193,6 +194,10 @@ pub const Context = struct {
     host_tool_provider: ?tool_dispatch.HostToolProvider = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
+    /// The user turn this context serves: the turn id a surface creates at its
+    /// user-turn boundary. Zero when a surface has none, and the decline mark then
+    /// uses the worker's active turn (spec U4).
+    user_turn_id: u64 = 0,
     permission_mode: PermissionMode,
     permission_grants: []const PermissionGrant,
     session_grants: []const PermissionGrant = &.{},
@@ -267,12 +272,17 @@ pub const Context = struct {
     on_web_fetch_progress: ?tool_dispatch.WebFetchProgressFn = null,
     workspace_executor: ?js_host_workspace.Executor = null,
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
+    /// The sandbox policy for shell commands. Null when sandbox execution is off.
+    sandbox_policy: ?*const sandbox_policy.Policy = null,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?subagent_tool_host.ModelOverrideResolver = null,
     /// False when running outside an interactive TUI (e.g. ACP). Tools
     /// that require a live user (like `ask_user_question`) short-circuit
     /// in that case.
     interactive: bool = true,
+    /// False for a sub-agent's tool context, so its calls never start remote
+    /// setup (spec U2). Main conversations keep the default.
+    remote_setup_allowed: bool = true,
     /// Lets a turn that is not interactive still ask the user questions: a
     /// subagent's, whose questions show on its own screen and on main's.
     ask_user_questions: bool = false,
@@ -305,7 +315,12 @@ pub const Context = struct {
             .context_limits = self.context_limits,
             .auto_classifier = self.admissionAutoClassifier(),
             .terminal_review_context = self.terminalReviewContext(),
+            .review_result_store = .{
+                .capability = self.session_child_capability,
+                .result_dir = self.tool_result_dir,
+            },
             .host_sandbox_default = self.host_sandbox_default,
+            .sandbox_policy = self.sandbox_policy,
         };
         if (self.permission_state_override != null) {
             input.session_permission_state_provider = null;
@@ -459,10 +474,6 @@ pub fn executeToolCallAuthorized(
         execution_ctx.session_grants = authority.grants;
         execution_ctx.permission_rules = authority.rules;
         execution_ctx.advertised_dynamic_tool_names = authority.integrations;
-        execution_ctx.mcp_access = rebindMcpAuthorityGeneration(
-            execution_ctx.mcp_access,
-            authority.generation,
-        );
     } else {
         execution_ctx.session_grants = request.session_grants;
         execution_ctx.advertised_dynamic_tool_names =
@@ -727,21 +738,6 @@ pub fn executeHostToolCallAuthorized(
     return toolExecutionResultFromDispatch(dispatched, .{});
 }
 
-fn rebindMcpAuthorityGeneration(
-    access: tool_mcp_runtime.Access,
-    authority_generation: u64,
-) tool_mcp_runtime.Access {
-    return switch (access) {
-        .scoped => |scope| .{ .scoped = .{
-            .captured = scope.captured,
-            .admission_authority_generation = scope.admission_authority_generation,
-            .live = scope.live,
-            .action_authority_generation = authority_generation,
-        } },
-        else => access,
-    };
-}
-
 fn containsName(values: []const []const u8, needle: []const u8) bool {
     for (values) |value| {
         if (std.mem.eql(u8, value, needle)) return true;
@@ -822,13 +818,13 @@ fn executeWorkspaceToolCallInner(
         }
     }
     const spec = registeredToolSpec(ctx, call.name) orelse
-        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
+        return semanticFailure(try tool_dispatch.unsupportedToolOutput(arena, ctx.tool_registry, call.name));
     if (ctx.tool_registry.tools.len != 1 or
         !std.mem.eql(u8, spec.name, "shell") or
         spec.executor_kind != .run_command or
         spec.runtime_provider != .run_command)
     {
-        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
+        return semanticFailure(try tool_dispatch.unsupportedToolOutput(arena, ctx.tool_registry, call.name));
     }
 
     var command_backend = RunCommandBackendState{ .runtime = ctx };
@@ -879,7 +875,10 @@ fn resolveToolDispatchPrelude(
             try tool_mcp_runtime.notSelectedOutput(arena, call.name),
         ) },
         .unsupported => .{ .completed = semanticFailure(
-            try tool_mcp_registry.unsupportedOutput(arena, call.name, call.carried_by),
+            if (call.carried_by == null)
+                try tool_dispatch.unsupportedToolOutput(arena, ctx.tool_registry, call.name)
+            else
+                try tool_mcp_registry.unsupportedOutput(arena, call.name, call.carried_by),
         ) },
     };
 }
@@ -941,7 +940,6 @@ fn executeRegisteredTool(
         .authorized_image_catalog = authorized_image_catalog,
     };
     var mcp_progress_bridge = McpProgressBridge{ .ctx = ctx };
-    var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
     var dispatch_metadata: DispatchMetadata = .{};
     var subagent_provider = SubagentProviderState{
@@ -969,7 +967,6 @@ fn executeRegisteredTool(
         .input_responder = ctx.mcp_input_responder,
         .access = ctx.mcp_access,
     };
-    dispatch_ctx.mcp_call_status_sink = &mcp_call_status;
     if (ctx.mcp_ctx != null and ctx.mcp_call_tool != null) {
         dispatch_ctx.mcp_call_capability = mcp_call_bridge.capability();
     }
@@ -1024,10 +1021,6 @@ fn executeRegisteredTool(
     else
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (mcp_call_status == .input_required) {
-        execution.finish_turn = true;
-        execution.status_detail = "McpInputRequired";
-    }
     execution.context_notices = context_notice_sink.notices.items;
     execution.result_commit = result_commit_token;
     if (dispatch_ctx.cancel_flag) |cancel_flag| {
@@ -1373,7 +1366,6 @@ fn callBridgeTool(
         .success => .{ .status = .ok, .bytes = try bridgeResultData(arena, result.model_output) },
         .tool_failure => .{ .status = .tool_error, .bytes = try bridgeResultData(arena, result.model_output) },
         .protocol_failure => .{ .status = .failed, .bytes = result.model_output },
-        .input_required => .{ .status = .failed, .bytes = "This tool asked for input that fx mcp call cannot give. Call the tool directly instead." },
     };
 }
 
@@ -1993,6 +1985,22 @@ fn recordContextNoticeForDispatch(raw_ctx: ?*anyopaque, notice: []const u8) erro
     try state.notices.append(state.allocator, duplicate);
 }
 
+/// The decline key of a main call with no saved session, such as `fx ask
+/// --no-save`: one key for the process, so a decline holds for its turn (U4).
+const process_setup_key = "fx-process-setup";
+
+/// The remote setup values of one tool call. The turn id is the surface's user
+/// turn, and the worker's active turn when the surface has none. The session key
+/// is the main session's id, or the process key when there is none. It is null
+/// when setup is not allowed (spec U2), so such a call reads no decline mark (U4).
+fn remoteSetupContext(ctx: Context) tool_dispatch.RemoteSetupContext {
+    return .{
+        .allowed = ctx.remote_setup_allowed,
+        .session_key = if (ctx.remote_setup_allowed) (ctx.lifecycle_scope.session_id orelse process_setup_key) else null,
+        .turn_id = if (ctx.user_turn_id != 0) ctx.user_turn_id else ctx.worker.activeTurnId(),
+    };
+}
+
 fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchContext {
     var capabilities = tool_dispatch.ToolCapabilities.for_host(
         host_capabilities.current(),
@@ -2002,6 +2010,8 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
     return .{
         .allocator = arena,
         .observer = ctx.observer,
+        .sandbox_policy = ctx.sandbox_policy,
+        .remote_setup = remoteSetupContext(ctx),
         .permission_mode = ctx.permission_mode,
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.access_scope,
@@ -2412,12 +2422,22 @@ fn toolRunCommand(
 ) !ToolExecutionResult {
     const command = request.command;
     const cwd = request.resolved_cwd;
-    const command_ctx = command_admission.CommandContext{
-        .command = command,
-        .resolved_cwd = cwd,
-        .target_os = builtin.target.os.tag,
-        .environment = request.environment,
-    };
+    // The run keeps the placement its authority approved. A changed placement
+    // refuses the run, and a placed run gets its launch from the policy.
+    const command_ctx = (try tool_admission.placementAsApproved(
+        ctx.sandbox_policy,
+        arena,
+        ctx.workspace_root,
+        managed_execution.admittedFingerprint(authority),
+        .{
+            .command = command,
+            .resolved_cwd = cwd,
+            .target_os = builtin.target.os.tag,
+            .environment = request.environment,
+        },
+        std.meta.activeTag(request.environment) != .workspace_clean,
+        null,
+    )) orelse return error.CommandAdmissionChanged;
     const timeout = try effectiveCommandTimeout(
         request.timeout_ms,
         ctx.command_timeout_ms,
@@ -3018,6 +3038,48 @@ fn subagentProviderRefusal(
     return .{ .status = .failure, .body = try why.body(alloc) };
 }
 
+/// Checks a subagent's waiting call as main's own, for `answerApproval`
+/// (`Runtime.ApprovalCheck`). It borrows the caller's tool context, which
+/// this provider call keeps alive while `executeManaged` runs.
+const SubagentApprovalCheck = struct {
+    runtime: Context,
+    /// The subagent whose request this check answers, for the card ACP shows
+    /// in main's session. Empty when the answer is not for a named subagent.
+    agent: []const u8 = "",
+
+    fn check(raw: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 {
+        const self: *SubagentApprovalCheck = @ptrCast(@alignCast(raw));
+        const ctx = self.runtime;
+        // A name this context cannot resolve is refused, not allowed:
+        // `requestPermissionOutcome` allows a name it has no contract for as
+        // its not-registered default, and the child's own admission runs the
+        // action, so allowing it would grant what main never saw (RULES.md
+        // R4.3). An MCP tool main does not advertise is such a name, since
+        // the child's profile may select servers main never did.
+        if (ctx.tool_registry.lookup(call.name) == null and
+            !containsName(ctx.advertised_dynamic_tool_names, call.name))
+        {
+            return try arena.dupe(u8, "your parent's permissions cannot check this action");
+        }
+        // The check answers another agent's call, not one of main's, so its
+        // card gets an id of its own: main's session must not reuse a card of
+        // its own with the child's id, and ACP names the agent on the card
+        // from this prefix (`subagentCardAgent`).
+        const check_call = types.ToolCall{
+            .id = try arena.print("subagent:{s}:{s}", .{ self.agent, call.id }),
+            .name = call.name,
+            .arguments_json = call.arguments_json,
+        };
+        // No selected MCP view is passed: a dynamic tool is checked as an
+        // advertised name of main's, and one it does not advertise is refused
+        // above, so nothing is checked through a view this path cannot supply.
+        return switch (try checkNestedCall(ctx, arena, check_call, null)) {
+            .allow => null,
+            .deny => |message| message,
+        };
+    }
+};
+
 fn executeSubagentProvider(
     raw_context: ?*anyopaque,
     arena: Allocator,
@@ -3032,6 +3094,15 @@ fn executeSubagentProvider(
         return subagentProviderRefusal(arena, .{ .caller_unavailable = .unidentified });
     const identity_epoch = host.issueOperationIdentity(invocation_id);
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
+    // The parent's answer checks the subagent's waiting call as main's own,
+    // with the permission context this call runs under.
+    var approval_check = SubagentApprovalCheck{
+        .runtime = ctx,
+        .agent = switch (request.*) {
+            .approve => |value| value.agent,
+            else => "",
+        },
+    };
     const output = host.executeManaged(arena, request, .{
         .observer = ctx.observer,
         .caller_id = caller_id,
@@ -3054,6 +3125,7 @@ fn executeSubagentProvider(
         .cancel_flag = runtimeCancelFlag(ctx),
         .caller_worker = ctx.worker,
         .turn_messages = ctx.current_turn_messages,
+        .approval_check = .{ .context = &approval_check, .check_fn = SubagentApprovalCheck.check },
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
         .model_capability_resolver = ctx.model_capability_resolver,
         .model_override_resolver = ctx.model_override_resolver,
@@ -3311,6 +3383,8 @@ const TestRuntime = struct {
     session: SessionRuntime = .{ .max_history_turns = 8 },
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
+    user_turn_id: u64 = 0,
     model: []const u8 = "",
     reviewer_model: []const u8 = "",
     session_allocator: Allocator = std.testing.allocator,
@@ -3396,6 +3470,8 @@ const TestRuntime = struct {
             .tool_registry = self.tool_registry,
             .subagent_host = self.subagent_host,
             .subagent_caller_id = self.subagent_caller_id,
+            .lifecycle_scope = .{ .kind = .interactive, .workspace_root = "", .session_id = self.session_id },
+            .user_turn_id = self.user_turn_id,
             .worker = &self.worker,
             .permission_prompter = if (self.interactive)
                 tool_admission.workerPrompter(&self.worker)
@@ -4010,6 +4086,46 @@ test "a workspace call of a tool that is not the one shell tool answers as an un
     }, .ordinary, true);
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try std.testing.expectEqualStrings("Unsupported tool: read_file", result.model_output);
+}
+
+test "a workspace call of unsupported bash hints the visible shell tool unless bash is registered or no shell exists" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var workspace_rt = TestRuntime{ .tool_registry = test_browser_workspace_tools.registry };
+    defer workspace_rt.deinit(std.testing.allocator);
+    const hinted = try executeWorkspaceToolCallInner(workspace_rt.context(), arena, .{
+        .id = "bash-ws",
+        .name = "bash",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, hinted.status);
+    try std.testing.expectEqualStrings("Unsupported tool: bash. Use shell instead.", hinted.model_output);
+
+    var no_shell_rt = TestRuntime{ .tool_registry = .{ .tools = &.{test_builtin_tools.read_file} } };
+    defer no_shell_rt.deinit(std.testing.allocator);
+    const no_shell = try executeWorkspaceToolCallInner(no_shell_rt.context(), arena, .{
+        .id = "bash-no-shell",
+        .name = "bash",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, no_shell.status);
+    try std.testing.expectEqualStrings("Unsupported tool: bash", no_shell.model_output);
+
+    var bash_tool = test_builtin_tools.read_file;
+    bash_tool.name = "bash";
+    bash_tool.model_schema.name = "bash";
+    const with_bash_tools = [_]tool_dispatch.Tool{ test_builtin_tools.shell, bash_tool };
+    var with_bash_rt = TestRuntime{ .tool_registry = .{ .tools = &with_bash_tools } };
+    defer with_bash_rt.deinit(std.testing.allocator);
+    const registered_bash = try executeWorkspaceToolCallInner(with_bash_rt.context(), arena, .{
+        .id = "bash-registered",
+        .name = "bash",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, registered_bash.status);
+    try std.testing.expectEqualStrings("Unsupported tool: bash", registered_bash.model_output);
 }
 
 fn registryOwnedWebFetchCall(
@@ -6257,6 +6373,50 @@ test "registered read_tool_result restores an omitted stored-result suffix" {
     try expectContains(result.model_output, handle);
 }
 
+test "the decline mark uses the surface's user turn, and the worker's active turn only when there is none" {
+    var rt = TestRuntime{ .session_id = "session-main", .user_turn_id = 9 };
+    rt.worker.active_turn_id = 7;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqual(@as(u64, 9), typedDispatchContext(rt.context(), arena).remote_setup.turn_id);
+    rt.user_turn_id = 0;
+    try std.testing.expectEqual(@as(u64, 7), typedDispatchContext(rt.context(), arena).remote_setup.turn_id);
+}
+
+test "a main call with no saved session still has a session key, so its declines hold in the process" {
+    var rt = TestRuntime{};
+    rt.worker.active_turn_id = 3;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const main_call = typedDispatchContext(rt.context(), arena).remote_setup;
+    try std.testing.expect(main_call.allowed);
+    try std.testing.expect(main_call.session_key != null);
+}
+
+test "typedDispatchContext copies the remote setup values: the flag, the session key and the active turn" {
+    var rt = TestRuntime{ .session_id = "session-main" };
+    rt.worker.active_turn_id = 7;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const main_call = typedDispatchContext(rt.context(), arena).remote_setup;
+    try std.testing.expect(main_call.allowed);
+    try std.testing.expectEqualStrings("session-main", main_call.session_key.?);
+    try std.testing.expectEqual(@as(u64, 7), main_call.turn_id);
+
+    var sub_context = rt.context();
+    sub_context.remote_setup_allowed = false;
+    const sub_call = typedDispatchContext(sub_context, arena).remote_setup;
+    try std.testing.expect(!sub_call.allowed);
+    try std.testing.expect(sub_call.session_key == null);
+    try std.testing.expectEqual(@as(u64, 7), sub_call.turn_id);
+}
+
 test "no-save terminal exec publishes one readable ephemeral replay" {
     if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
@@ -7343,10 +7503,9 @@ const McpFixture = struct {
         snapshot_rule_count: usize = 0,
     };
 
-    const AuthorityContext = struct {
+    const ScopedCallContext = struct {
         calls: usize = 0,
-        admission_generation: u64 = 0,
-        action_generation: u64 = 0,
+        captured: ?*const mcp_access_policy.View = null,
         expected_runtime_generation: ?u64 = null,
     };
 
@@ -7376,15 +7535,14 @@ const McpFixture = struct {
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
 
-    fn callRecordingAuthority(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-        const ctx: *AuthorityContext = @ptrCast(@alignCast(raw_ctx));
+    fn callRecordingScope(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
+        const ctx: *ScopedCallContext = @ptrCast(@alignCast(raw_ctx));
         const scope = switch (options.access) {
             .scoped => |value| value,
             else => return error.McpScopedAccessExpected,
         };
         ctx.calls += 1;
-        ctx.admission_generation = scope.admission_authority_generation;
-        ctx.action_generation = scope.action_authority_generation;
+        ctx.captured = scope.captured;
         ctx.expected_runtime_generation = options.expected_runtime_generation;
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
@@ -7664,7 +7822,7 @@ test "an MCP call that finishes after a cancel is not a cancelled command" {
     try std.testing.expectEqual(false, result.cancelled);
 }
 
-test "MCP execution binds the last live action generation before transport" {
+test "MCP execution gives the transport the child's view and the expected generation, once" {
     const alloc = std.testing.allocator;
     var captured = mcp_access_policy.View{
         .runtime_generation = 1,
@@ -7674,27 +7832,14 @@ test "MCP execution binds the last live action generation before transport" {
         .tools = try alloc.alloc(mcp_access_policy.ToolIdentity, 0),
     };
     defer captured.deinit(alloc);
-    const UnusedLiveProvider = struct {
-        fn resolve(_: *anyopaque, _: Allocator) !tool_mcp_runtime.ResolvedLiveView {
-            return error.TestUnexpectedResult;
-        }
-    };
-    var marker: u8 = 0;
-    var authority = McpFixture.AuthorityContext{};
+    var recorded = McpFixture.ScopedCallContext{};
     var rt = TestRuntime{
-        .mcp_ctx = @ptrCast(&authority),
-        .mcp_call_tool = McpFixture.callRecordingAuthority,
+        .mcp_ctx = @ptrCast(&recorded),
+        .mcp_call_tool = McpFixture.callRecordingScope,
     };
     defer rt.deinit(alloc);
     var tool_ctx = rt.context();
-    tool_ctx.mcp_access = .{ .scoped = .{
-        .captured = &captured,
-        .admission_authority_generation = 17,
-        .live = .{
-            .context = @ptrCast(&marker),
-            .resolve_fn = UnusedLiveProvider.resolve,
-        },
-    } };
+    tool_ctx.mcp_access = .{ .scoped = .{ .captured = &captured } };
     const integrations = [_][]const u8{"mcp_fs_read"};
     const result = try executeToolCallAuthorized(tool_ctx, .{
         .call_allocator = alloc,
@@ -7723,16 +7868,9 @@ test "MCP execution binds the last live action generation before transport" {
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
     try std.testing.expectEqualStrings("mcp ok", result.model_output);
-    try std.testing.expectEqual(@as(usize, 1), authority.calls);
-    try std.testing.expectEqual(@as(u64, 17), authority.admission_generation);
-    try std.testing.expectEqual(@as(u64, 41), authority.action_generation);
-    try std.testing.expectEqual(@as(?u64, 73), authority.expected_runtime_generation);
-    const original_scope = switch (tool_ctx.mcp_access) {
-        .scoped => |scope| scope,
-        else => return error.McpScopedAccessExpected,
-    };
-    try std.testing.expectEqual(@as(u64, 17), original_scope.admission_authority_generation);
-    try std.testing.expectEqual(@as(u64, 0), original_scope.action_authority_generation);
+    try std.testing.expectEqual(@as(usize, 1), recorded.calls);
+    try std.testing.expectEqual(@as(?*const mcp_access_policy.View, &captured), recorded.captured);
+    try std.testing.expectEqual(@as(?u64, 73), recorded.expected_runtime_generation);
 }
 
 test "MCP dynamic tool preserves provider errors without leaking dispatch output" {
@@ -9281,4 +9419,19 @@ test "in auto mode a command's fx mcp call skips the safety check for the approv
     try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
     try std.testing.expect(try nestedBridgeStatus(&rt, &.{}, "mcp_fixture_echo") != .denied);
     try std.testing.expectEqual(@as(usize, 2), reviewer.calls);
+}
+
+test "the approve check refuses a name main cannot resolve" {
+    var rt = TestRuntime{ .interactive = false };
+    defer rt.deinit(std.testing.allocator);
+    var check = SubagentApprovalCheck{ .runtime = rt.context() };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const refused = try SubagentApprovalCheck.check(
+        &check,
+        arena.allocator(),
+        .{ .id = "call-1", .name = "not_a_main_tool", .arguments_json = "{}" },
+    );
+    try std.testing.expect(refused != null);
+    try expectContains(refused.?, "your parent's permissions cannot check this action");
 }

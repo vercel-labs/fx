@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { bundledAssetUrl } from "./bundled-asset.js";
 import { CoreOutput } from "./core-output.js";
 import { fetchCleanupAction, cleanupTimeoutMs, cleanupByteLimit, retryAfterSeconds } from "./fetch-cleanup.js";
-import { createDurableAgentFactory, memory, wakeHandler } from "./durable.js";
+import { checkHandOffBound, createDurableAgentFactory, memory, wakeHandler } from "./durable.js";
 import { fxHarness } from "./fx-harness.js";
 import {
   createFxEngine as createEngine,
@@ -701,7 +701,7 @@ async function chooseEnvironmentDurability(dir) {
  * An agent whose sessions survive crashes, timeouts and redeployments. It
  * does no I/O until a session is used.
  */
-export const createFxAgent = createDurableAgentFactory({
+const createDurableFxAgent = createDurableAgentFactory({
   name: "createFxAgent",
   label: "fx agent",
   defaultDurability: environmentDurability,
@@ -716,6 +716,65 @@ export const createFxAgent = createDurableAgentFactory({
       process.env.VERCEL_OIDC_TOKEN || undefined,
   }),
 });
+
+// How long a turn may run on after SIGTERM before it is cut off: half the
+// 500 ms a Vercel function gets, so the cut-off's writes fit in the rest.
+const sigtermHandOffMs = 250;
+// The agents that hand off on SIGTERM, each with its bound; one process
+// listener serves them all.
+const sigtermAgents = new Map();
+let sigtermHandingOff = false;
+
+/**
+ * An agent whose sessions survive crashes, timeouts and redeployments. It
+ * does no I/O until a session is used. On SIGTERM it hands its turns off
+ * (`agent.handOff()`) before the process exits, unless `handOffOnSigterm` is
+ * false.
+ */
+export function createFxAgent(options = {}) {
+  // Options that are not an object get the factory's own error.
+  if (!options || typeof options !== "object" || Array.isArray(options)) return createDurableFxAgent(options);
+  const { handOffOnSigterm = true, ...agentOptions } = options;
+  const within = sigtermBound(handOffOnSigterm);
+  const agent = createDurableFxAgent(agentOptions);
+  if (within !== null) watchSigterm(agent, within);
+  return agent;
+}
+
+// The bound `handOffOnSigterm` sets, in milliseconds, or null when it is off.
+function sigtermBound(option) {
+  if (option === false) return null;
+  if (option === true) return sigtermHandOffMs;
+  if (option === null || typeof option !== "object" || Array.isArray(option)) {
+    throw new TypeError("createFxAgent() handOffOnSigterm must be true, false, or { within }");
+  }
+  const { within = sigtermHandOffMs } = option;
+  return checkHandOffBound(within, "createFxAgent() handOffOnSigterm within");
+}
+
+// The agent hands off on SIGTERM until it closes.
+function watchSigterm(agent, within) {
+  if (sigtermAgents.size === 0) process.on("SIGTERM", handOffAll);
+  sigtermAgents.set(agent, within);
+  const close = agent.close.bind(agent);
+  agent.close = () => {
+    sigtermAgents.delete(agent);
+    if (sigtermAgents.size === 0 && !sigtermHandingOff) process.removeListener("SIGTERM", handOffAll);
+    return close();
+  };
+}
+
+// Hands every agent off, then raises SIGTERM again, so the process ends as it
+// would have without libfx: a listener that let libfx go first, such as
+// signal-exit's, sees the signal once libfx no longer listens, and Node.js
+// exits when no listener is left. An app's own listener sees it again.
+async function handOffAll() {
+  if (sigtermHandingOff) return;
+  sigtermHandingOff = true;
+  await Promise.allSettled([...sigtermAgents].map(([agent, within]) => agent.handOff({ within })));
+  process.removeListener("SIGTERM", handOffAll);
+  process.kill(process.pid, "SIGTERM");
+}
 
 export function createFxTerminal(options = {}) {
   return createWithFallback("terminal", "createFxTerminal", options);

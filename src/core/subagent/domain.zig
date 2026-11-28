@@ -23,6 +23,7 @@ pub const QueuedMessage = struct {
     root_user_intent_context: []u8 = &.{},
     root_user_messages: [][]u8 = &.{},
     root_user_evidence_complete: bool = false,
+    continues_yielded: bool = false,
     created_at_ms: i64,
 
     pub fn deinit(self: *QueuedMessage, alloc: Allocator) void {
@@ -54,7 +55,6 @@ pub const AdmissionSnapshot = struct {
     grants: []types.PermissionGrant,
     permission_state: session_permission_state.State = .{},
     integration_names: [][]u8,
-    authority_generation: u64 = 0,
     mcp_view: ?mcp_access.View = null,
 
     /// An owned copy, made the way `captureAdmission` makes the original.
@@ -72,7 +72,6 @@ pub const AdmissionSnapshot = struct {
             .grants = self.grants,
             .permission_state = self.permission_state,
             .integration_names = self.integration_names,
-            .authority_generation = self.authority_generation,
             .mcp_view = self.mcp_view,
         });
     }
@@ -104,7 +103,6 @@ pub const AdmissionInput = struct {
     grants: []const types.PermissionGrant = &.{},
     permission_state: session_permission_state.State = .{},
     integration_names: []const []const u8 = &.{},
-    authority_generation: u64 = 0,
     mcp_view: ?mcp_access.View = null,
 };
 
@@ -182,7 +180,6 @@ pub fn captureAdmission(
         .grants = grants,
         .permission_state = permission_state,
         .integration_names = integration_names,
-        .authority_generation = input.authority_generation,
         .mcp_view = mcp_view,
     };
 }
@@ -314,7 +311,6 @@ test "a cloned admission owns copies of every field" {
         .effort = .auto,
         .permission_mode = .ask,
         .tool_names = &tools,
-        .authority_generation = 7,
     });
     var copy = try original.clone(alloc);
     defer copy.deinit(alloc);
@@ -325,5 +321,4 @@ test "a cloned admission owns copies of every field" {
     try std.testing.expectEqual(types.PermissionMode.ask, copy.permission_mode);
     try std.testing.expectEqual(@as(usize, 2), copy.tool_names.len);
     try std.testing.expectEqualStrings("grep_files", copy.tool_names[1]);
-    try std.testing.expectEqual(@as(u64, 7), copy.authority_generation);
 }

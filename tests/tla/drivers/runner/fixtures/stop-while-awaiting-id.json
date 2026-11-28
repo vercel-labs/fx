@@ -1,0 +1,28 @@
+{
+  "covers": [
+    "V10-awaiting"
+  ],
+  "title": "A stop while the runner awaits the command's id waits for the id, kills, then exits 143.",
+  "run": {
+    "events": [
+      "push_ok",
+      "send_ran",
+      "stop_requested",
+      "id_arrives",
+      "kill_sent",
+      "stop_exit",
+      "exit_143"
+    ]
+  },
+  "tamper": {
+    "run": "stop-before-id"
+  },
+  "drive": {
+    "command": "sleep 300",
+    "stop": true,
+    "stopWhenExecSent": true,
+    "faults": {
+      "delayCommandLineMs": 800
+    }
+  }
+}

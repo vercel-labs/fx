@@ -3,7 +3,7 @@
 // WebAssembly, along paths of the TLC state graph of DurableSession.tla, and
 // checks after every step that the code is in a state the model allows.
 //
-//   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
+//   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue|handoff] [--walks N] [--seed S] [--backend native|wasm]
 //     [--durability local|world|vercel] [--hooks]
 //
 // The lookup and cutoff graphs run a lookup, which starts before its intent
@@ -35,16 +35,25 @@
 // `tests/tla/sdk/check.sh` model-checks the spec and writes its
 // graphs/<graph>.dot; the cutoff
 // graph runs lookup with more claims and no freezes, so a step can be cut off
-// at the deadline until the bound stops running it. Each walk
-// starts two agents, A and B, on one World directory, each in a server of its
-// own: a worker thread, session-process.mjs, with its own registry of agents,
-// as another server has, so the two are copies of one agent. Every model
-// request and tool call waits until the driver releases it, and so does each
-// worker's claim on the session, so the driver decides the interleaving: it
-// performs the step the walk chose, waits for the code to settle, reads back
-// each worker's position, the tool runs, and the epoch of every UI line, and
-// moves to the successor state that matches. A step the model has no
-// matching successor for is a conformance failure.
+// at the deadline until the bound stops running it.
+//
+// The handoff graph, from DurableHandOff.tla, is the cutoff graph with a host
+// that hands one worker's process off (agent.handOff()): the asked worker
+// takes no new work, its turn yields at the save before its next model
+// request, or the bound cuts it off as the deadline does, and the other
+// worker continues the turn. A walk reaches Yield only when the host asks the
+// worker that runs the tool before the tool ends, so in this graph every other
+// step goes toward the nearest Yield (stepsToYield below).
+//
+// Each walk starts two agents, A and B, on one World directory, each in a
+// server of its own: a worker thread, session-process.mjs, with its own
+// registry of agents, as another server has, so the two are copies of one
+// agent. Every model request and tool call waits until the driver releases
+// it, and so does each worker's claim on the session, so the driver decides
+// the interleaving: it performs the step the walk chose, waits for the code
+// to settle, reads back each worker's position, the tool runs, and the epoch
+// of every UI line, and moves to the successor state that matches. A step
+// the model has no matching successor for is a conformance failure.
 import { strict as assert } from "node:assert";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -59,8 +68,8 @@ const option = (name, fallback) => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leased", "queue"].includes(arg)) ?? "send";
-const tool = graphName === "cutoff" ? "lookup" : graphName === "leased" || graphName === "queue" ? "send" : graphName;
+const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leased", "queue", "handoff"].includes(arg)) ?? "send";
+const tool = graphName === "cutoff" || graphName === "handoff" ? "lookup" : graphName === "leased" || graphName === "queue" ? "send" : graphName;
 // The tool as the host declares it, and whether its calls run ahead.
 const toolFlags = { lookup: { idempotent: true }, write: { idempotent: true, writes: true }, send: { idempotent: false } }[tool];
 const runsAhead = tool === "lookup";
@@ -210,6 +219,8 @@ async function harness() {
   const holders = { A: [], B: [] };
   const claimed = { A: null, B: null };
   const frozen = { A: false, B: false };
+  // Whether the host asked each worker's process to hand off.
+  const asked = { A: false, B: false };
   // Each worker's held writes: its claims on the session, a call's first
   // intent, and a frozen leased worker's renewals.
   const held = { A: [], B: [] };
@@ -410,6 +421,27 @@ async function harness() {
         const head = await leaseHolder(w);
         if (claimed[w] && !holders[w].includes(head)) await until(() => stopped());
       }
+    } else if (name === "AskHandOff") {
+      // The host asks w's process to stop; once w's turn has the request, it
+      // stops at its next safe point.
+      asked[w] = true;
+      await call(w, "handOff", { sessionId });
+    } else if (name === "Yield") {
+      // w's tool returns, and the turn stops at the save before its next model
+      // request: turn_yield, then a release that names no cut-off.
+      const entry = calls.find((item) => item.w === w);
+      assert.ok(entry, `${w} has a tool call to end`);
+      end(entry);
+      await until(async () => !(await call(w, "leaseStands", { sessionId })) &&
+        (await streamLines()).some((line) => line.type === "turn_yield" && line.epoch === claimed[w].epoch));
+      claimed[w] = null;
+    } else if (name === "Deadline" && asked[w]) {
+      // The hand-off's bound cuts w's turn off. An asked worker never takes
+      // the session back: it lets the session go, or, replaced, stops.
+      const fencedBefore = fenced[w];
+      await call(w, "stopAtDeadline", { sessionId });
+      await until(async () => fenced[w] > fencedBefore || !(await call(w, "leaseStands", { sessionId })));
+      if (fenced[w] === fencedBefore) claimed[w] = null;
     } else if (name === "Deadline") {
       // w's timer fires: it stops, and the same message comes back to it.
       const before = new Set(liveHolders);
@@ -475,6 +507,34 @@ let steps = 0;
 const successors = (id) => [...(graph.next.get(id) ?? [])].filter((to) => to !== id);
 const actOf = (id) => graph.states.get(id).act;
 
+// How many steps each state of the handoff graph is from a Yield, counted
+// back from every state a Yield reaches.
+const stepsToYield = new Map();
+if (graphName === "handoff") {
+  const before = new Map();
+  for (const [from, targets] of graph.next) {
+    for (const to of targets) {
+      if (to === from) continue;
+      if (!before.has(to)) before.set(to, []);
+      before.get(to).push(from);
+    }
+  }
+  let ring = [...graph.states.keys()].filter((id) => graph.states.get(id).act?.name === "Yield");
+  for (const id of ring) stepsToYield.set(id, 0);
+  while (ring.length > 0) {
+    const next = [];
+    for (const id of ring) {
+      for (const from of before.get(id) ?? []) {
+        if (stepsToYield.has(from)) continue;
+        stepsToYield.set(from, stepsToYield.get(id) + 1);
+        next.push(from);
+      }
+    }
+    ring = next;
+  }
+}
+let yields = 0;
+
 for (let walk = 1; walk <= walks; walk += 1) {
   const code = await harness();
   const path = [];
@@ -491,16 +551,22 @@ for (let walk = 1; walk <= walks; walk += 1) {
           if (act.name === "Announce") continue;
           // local() hands a message that comes back at the deadline to the
           // same worker, so a Deadline that only releases the session is a
-          // path the code cannot take.
-          if (act.name === "Deadline" && graph.states.get(to).pc[act.w] === "none") continue;
+          // path the code cannot take. An asked worker is the exception: it
+          // sends the message back and lets the session go.
+          if (act.name === "Deadline" && graph.states.get(to).pc[act.w] === "none" && !graph.states.get(to).asked?.[act.w]) continue;
           let option = options.find((item) => sameAct(item.act, act));
-          if (!option) options.push(option = { act, fresh: false });
+          if (!option) options.push(option = { act, fresh: false, toYield: Infinity });
           if (!covered.has(`${from}>${to}`)) option.fresh = true;
+          option.toYield = Math.min(option.toYield, stepsToYield.get(to) ?? Infinity);
         }
       }
       if (options.length === 0) break;
       const fresh = options.filter((option) => option.fresh);
-      const pool = fresh.length > 0 ? fresh : options;
+      let pool = fresh.length > 0 ? fresh : options;
+      if (stepsToYield.size > 0 && random() < 0.5) {
+        const nearest = Math.min(...options.map((option) => option.toYield));
+        if (nearest < Infinity) pool = options.filter((option) => option.toYield === nearest);
+      }
       const { act } = pool[Math.floor(random() * pool.length)];
       const expectedEpoch = act.name === "Claim" || act.name === "Deadline"
         ? Math.max(...[...current].flatMap((from) => successors(from).filter((to) => sameAct(actOf(to), act)).map((to) => graph.states.get(to).epoch[act.w])))
@@ -509,6 +575,7 @@ for (let walk = 1; walk <= walks; walk += 1) {
       await code.perform(act, expectedEpoch);
       path.push(`${act.name}(${act.w})`);
       steps += 1;
+      if (act.name === "Yield") yields += 1;
       // The states the step can reach, and the edges to each.
       const allowed = new Set();
       const reached = new Map();
@@ -569,6 +636,6 @@ if (hooks && !process.exitCode) {
     process.exitCode = 1;
   }
 }
-if (!process.exitCode) console.log(`ok ${graphName}: ${walks} walks, ${steps} steps matched the model; ${covered.size} of ${totalEdges} edges covered (${backend})`);
+if (!process.exitCode) console.log(`ok ${graphName}: ${walks} walks, ${steps} steps matched the model; ${covered.size} of ${totalEdges} edges covered (${backend})${stepsToYield.size > 0 ? `; ${yields} yields` : ""}`);
 // An agent a failed walk left mid-turn keeps timers alive; nothing more runs.
 process.exit(process.exitCode ?? 0);

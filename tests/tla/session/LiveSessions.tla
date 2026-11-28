@@ -15,34 +15,41 @@
 (* and each child's newest work by name. A child closed for good is not    *)
 (* listed.                                                                 *)
 (*                                                                         *)
-(* An open that finds the lock held tries again each step until its budget *)
-(* runs out (lock_wait_ms, D38), then fails as busy. The scan's own hold   *)
-(* lasts far less than one retry step; the model states that as: while the *)
-(* scan is about to let a lock go, an opener that already found the scan   *)
-(* holding it does not try again. So a scan holds a lock for at most one   *)
-(* of an opener's tries (ScanHoldsOneTry), and makes an open fail only     *)
-(* when that open's last try lands inside the scan's hold: an open with no *)
-(* wait, as a picker's, or one whose budget a real holder used up. The     *)
-(* witness-open-fails-on-scan config shows that state is reached.          *)
+(* An open that finds the lock held sleeps a step and tries again until    *)
+(* its budget has passed on the monotonic clock (lock_wait_ms, D38), then  *)
+(* fails as busy. A sleep can last up to MaxSleep steps, as on a loaded    *)
+(* machine or in a background process, so the open reads the clock rather  *)
+(* than counting its sleeps (src/core/session_manager/lock_wait.zig), and  *)
+(* stops within one sleep of its budget (WaitEndsAtBudget). The scan's own *)
+(* hold lasts far less than one retry step; the model states that as:      *)
+(* while the scan is about to let a lock go, an opener that already found  *)
+(* the scan holding it does not try again. So a scan holds a lock for at   *)
+(* most one of an opener's tries (ScanHoldsOneTry), and makes an open fail *)
+(* only when that open's last try lands inside the scan's hold: an open    *)
+(* with no wait, as a picker's, or one whose budget a real holder used up. *)
+(* The witness-open-fails-on-scan config shows that state is reached.      *)
 (*                                                                         *)
 (* A process that ends cleanly closes its turn and its children's work in  *)
 (* the log. One that crashes leaves them open, and the next open repairs   *)
 (* the log first, as crash repair does.                                    *)
 (*                                                                         *)
-(* The five planted bugs are switches, each FALSE in fx:                   *)
+(* The six planted bugs are switches, each FALSE in fx:                    *)
 (*   InvertedProbe     a free lock reads as live                           *)
 (*   ProbeKeepsLock    the scan never lets a free lock go                  *)
 (*   ListClosed        a child closed for good is still listed             *)
 (*   ChildTakesParent  a child shows its parent's state, not its own       *)
 (*   RecentIsLive      a session counts as live when its log was written   *)
 (*                     since its last open, without trying the lock        *)
+(*   CountsSleeps      an open counts each sleep as one step, however long *)
+(*                     it lasted, as fx did before                         *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS Sessions, Procs, Names, Wait,
-          InvertedProbe, ProbeKeepsLock, ListClosed, ChildTakesParent, RecentIsLive
+CONSTANTS Sessions, Procs, Names, Wait, MaxSleep,
+          InvertedProbe, ProbeKeepsLock, ListClosed, ChildTakesParent, RecentIsLive,
+          CountsSleeps
 
-ASSUME Wait \in Nat
+ASSUME Wait \in Nat /\ MaxSleep \in Nat \ {0}
 
 Free == "free"
 Scanner == "scanner"
@@ -63,7 +70,9 @@ VARIABLES
 
 vars == <<lock, proc, turn, child, written, scan, probes, failed>>
 
-Off == [st |-> "off", s |-> None, tries |-> 0, saw |-> FALSE]
+\* waited: steps since the open's first try, on the monotonic clock;
+\* counted: the wait the open reads, which is the clock unless CountsSleeps.
+Off == [st |-> "off", s |-> None, waited |-> 0, counted |-> 0, saw |-> FALSE]
 NoFail == [by |-> None, saw |-> FALSE]
 
 TypeOK ==
@@ -93,7 +102,7 @@ Dropped(s) == IF scan.phase = "probing" THEN scan.dropped \cup {s} ELSE scan.dro
 
 Open(p, s) ==
   /\ proc[p].st = "off"
-  /\ proc' = [proc EXCEPT ![p] = [st |-> "trying", s |-> s, tries |-> Wait, saw |-> FALSE]]
+  /\ proc' = [proc EXCEPT ![p] = [st |-> "trying", s |-> s, waited |-> 0, counted |-> 0, saw |-> FALSE]]
   /\ UNCHANGED <<lock, turn, child, written, scan, probes, failed>>
 
 \* Taking a free lock repairs what a crash left open.
@@ -108,14 +117,18 @@ Acquire(p) ==
   /\ written' = [written EXCEPT ![s] = FALSE]
   /\ UNCHANGED <<scan, probes, failed>>
 
-\* The lock is held: wait a step, or give up when the budget is spent.
+\* The lock is held: sleep a step, which lasts 1 to MaxSleep steps, or give
+\* up once the wait the open reads has reached its budget.
 Retry(p) ==
   LET s == proc[p].s IN
   /\ proc[p].st = "trying"
   /\ lock[s] # Free
   /\ ~(lock[s] = Scanner /\ proc[p].saw /\ scan.unlock = s)
-  /\ IF proc[p].tries > 0
-       THEN /\ proc' = [proc EXCEPT ![p].tries = @ - 1, ![p].saw = (lock[s] = Scanner)]
+  /\ IF proc[p].counted < Wait
+       THEN /\ \E slept \in 1..MaxSleep :
+                 proc' = [proc EXCEPT ![p].waited = @ + slept,
+                                      ![p].counted = IF CountsSleeps THEN @ + 1 ELSE @ + slept,
+                                      ![p].saw = (lock[s] = Scanner)]
             /\ UNCHANGED failed
        ELSE /\ proc' = [proc EXCEPT ![p] = Off]
             /\ failed' = [by |-> lock[s], saw |-> proc[p].saw]
@@ -268,6 +281,10 @@ AgentsAsLogged == \A e \in scan.listed : e.agents = e.truth
 \* A scan holds a lock for at most one of an opener's tries: an open that
 \* fails on the scan did not find the scan holding it at its try before.
 ScanHoldsOneTry == failed.by = Scanner => ~failed.saw
+
+\* An open stops trying once its budget has passed on the monotonic clock:
+\* it is never still trying a whole sleep past it, however long sleeps last.
+WaitEndsAtBudget == \A p \in Procs : proc[p].st = "trying" => proc[p].waited < Wait + MaxSleep
 
 (* Witnesses: each must be violated, to show the state it names is reached. *)
 

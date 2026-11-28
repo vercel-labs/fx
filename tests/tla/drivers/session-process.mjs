@@ -206,6 +206,12 @@ const methods = {
   stopAtDeadline({ sessionId }) {
     walk.agent[durableInternals].stopAtDeadline(sessionId);
   },
+  // The host hands this server's process off (agent.handOff()); resolves once
+  // the running turn has the request to stop at its next safe point.
+  async handOff({ sessionId }) {
+    void walk.agent.handOff().catch(() => {});
+    if (sessionId) await walk.agent[durableInternals].yielding(sessionId);
+  },
   // Lets the writes held now go; with `settle`, resolves once they settled.
   // The driver hears the held writes before the answer either way.
   async releaseHeld({ settle = true } = {}) {

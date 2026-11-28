@@ -32,6 +32,13 @@ function cutToolCall(model: string, command: string) {
   return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
 }
 
+// A Chat Completions stream sent as given, with or without the closing [DONE].
+function chatStream(chunks: unknown[], done = true) {
+  return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + (done ? "data: [DONE]\n\n" : ""), { headers: { "content-type": "text/event-stream" } });
+}
+
+const streamUsage = { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 };
+
 /** A request from a subagent, which has no subagent tool of its own. */
 function isChildRequest(body: any): boolean {
   return !body.tools?.some((tool: any) => tool.function?.name === "subagent");
@@ -94,34 +101,82 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
-  test("a tool call cut off by the provider's own limit is resent once with fx's limit", async () => {
+  test("a tool call cut off by the provider's own limit is asked for again in smaller steps with fx's limit", async () => {
     let calls = 0;
-    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "finished after the resend"));
+    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "finished after the note"));
     try {
       // No limit in the metadata, so the first request names none.
       (f.settings.providers.local.model_metadata as any)["local-model"] = { context_window: 262144, supports_tool_use: true };
       f.save();
       const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
-      expect(JSON.parse(result.stdout).final_output).toBe("finished after the resend");
+      expect(JSON.parse(result.stdout).final_output).toBe("finished after the note");
       expect(f.requests).toHaveLength(2);
       expect(f.requests[0].body.max_tokens).toBeUndefined();
       expect(f.requests[1].body.max_tokens).toBe(32768);
-      expect(JSON.stringify(f.requests[1].body.messages)).not.toContain("call-cut");
-      expect(result.stderr).toContain("Retrying with a higher limit.");
+      const resent = JSON.stringify(f.requests[1].body.messages);
+      expect(resent).not.toContain("call-cut");
+      expect(resent).toContain("Your last reply reached its output limit before its tool call to shell was complete, so fx did not run it.");
+      expect(result.stderr).toContain("Asking the model to do it in smaller steps. The next requests allow 32768 output tokens.");
       expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
     } finally { f.close(); }
   }, 25000);
 
-  test("a tool call cut off at the model's own limit is not resent when that would repeat the request", async () => {
+  test("the text a cut reply streamed before its cut call reaches the next request intact", async () => {
+    // The stream's buffer is freed before the next request; a borrowed copy
+    // sent freed bytes, and a real provider answered HTTP 400.
+    const said = "I will write the whole file in one call now.";
     let calls = 0;
-    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "a resend must not be sent"));
+    const f = fixture(async body => ++calls === 1
+      ? withReasoning(cutToolCall(body.model, "printf ran > cut.txt"), { content: said })
+      : completion(body.model, "finished after the note"));
     try {
       const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
-      expect(result.code).toBe(1);
-      expect(f.requests).toHaveLength(1);
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(f.requests).toHaveLength(2);
+      const messages = f.requests[1].body.messages as any[];
+      expect(messages.at(-2).role).toBe("assistant");
+      expect(messages.at(-2).content).toBe(said);
+      expect(messages.at(-1).role).toBe("user");
+      expect(JSON.stringify(messages.at(-1))).toContain("before its tool call to shell was complete, so fx did not run it.");
+      expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a cut reply with only reasoning and a cut call sends its note alone", async () => {
+    // The reasoning led to the cut, so it is not sent again.
+    const detail = { type: "reasoning.text", text: "Plan the long write.", signature: "cut-signature", format: "anthropic-claude-v1", index: 0 };
+    let calls = 0;
+    const f = fixture(async body => ++calls === 1
+      ? withReasoning(cutToolCall(body.model, "printf ran > cut.txt"), { reasoning_details: [detail] })
+      : completion(body.model, "finished after the note"));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(f.requests).toHaveLength(2);
+      const messages = f.requests[1].body.messages as any[];
+      expect(messages.at(-1).role).toBe("user");
+      expect(JSON.stringify(messages.at(-1))).toContain("before its tool call to shell was complete, so fx did not run it.");
+      expect(messages.some((message) => message.role === "assistant")).toBe(false);
+      expect(JSON.stringify(messages)).not.toContain("cut-signature");
+      expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a tool call cut off at the model's own limit is asked for again in smaller steps at that limit", async () => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "finished after the note"));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).final_output).toBe("finished after the note");
+      expect(f.requests).toHaveLength(2);
+      // The model's own limit is not fx's to raise.
       expect(f.requests[0].body.max_tokens).toBe(8192);
-      expect(result.stderr).toContain("so I did not run them");
+      expect(f.requests[1].body.max_tokens).toBe(8192);
+      expect(JSON.stringify(f.requests[1].body.messages)).toContain("reached the output limit of 8192 tokens before its tool call to shell was complete");
+      expect(result.stderr).toContain("Asking the model to do it in smaller steps.");
+      expect(result.stderr).not.toContain("The next requests allow");
       expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
     } finally { f.close(); }
   }, 25000);
@@ -208,6 +263,91 @@ describe("configured providers", () => {
       expect(f.requests).toHaveLength(1);
     } finally { f.close(); }
   });
+
+  // Shapes that OpenAI-compatible servers send in otherwise valid replies.
+  const benignStreams: Record<string, { usage: boolean; respond(model: string): Response }> = {
+    "an empty model in every chunk": { usage: true, respond: () => chatStream([
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] },
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: { content: "streamed reply" } }] },
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model: "", choices: [], usage: streamUsage },
+    ]) },
+    "an empty legacy function_call on the finish chunk": { usage: true, respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: { content: "streamed reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: { content: "", role: "assistant", function_call: { name: "", arguments: "" } }, finish_reason: "stop" }], usage: streamUsage },
+    ]) },
+    "no [DONE] after the finished choice": { usage: false, respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "streamed reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: "stop" }] },
+    ], false) },
+    "no [DONE] after the usage trailer": { usage: true, respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "streamed reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model, choices: [], usage: streamUsage },
+    ], false) },
+    "a usage trailer choice without finish_reason": { usage: true, respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "streamed reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {} }], usage: streamUsage },
+    ]) },
+    "a usage trailer choice with a null finish_reason": { usage: true, respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "streamed reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: null }], usage: streamUsage },
+    ]) },
+    "all of them in one reply": { usage: true, respond: () => chatStream([
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] },
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: { content: "streamed reply" } }] },
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: { content: "", role: "assistant", function_call: { name: "", arguments: "" } }, finish_reason: "stop" }] },
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: {} }], usage: streamUsage },
+    ], false) },
+  };
+
+  test.each(Object.keys(benignStreams))("accepts a reply with %s", async shape => {
+    const f = fixture(body => benignStreams[shape].respond(body.model));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(result.stderr).toBe("");
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.final_output).toBe("streamed reply");
+      if (benignStreams[shape].usage) expect(parsed.usage).toMatchObject({ input_tokens: 12, output_tokens: 3 });
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].body.model).toBe("local-model");
+    } finally { f.close(); }
+  }, 25000);
+
+  // The relaxed shapes keep their strict neighbors: a cut-off stream, a legacy
+  // call that says something, and late content in a trailer still fail the turn.
+  const brokenStreams: Record<string, { failure: string; respond(model: string): Response }> = {
+    "a stream that ends before finish_reason": { failure: "IncompleteStream", respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "cut reply" }, finish_reason: null }] },
+    ], false) },
+    "a finish event cut before its blank line": { failure: "IncompleteStream", respond: model => new Response(
+      `data: ${JSON.stringify({ id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "cut reply" }, finish_reason: null }] })}\n\n` +
+      `data: ${JSON.stringify({ id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}`,
+      { headers: { "content-type": "text/event-stream" } }) },
+    "a populated legacy function_call": { failure: "InvalidChunk", respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: { function_call: { name: "read_file", arguments: "{}" } }, finish_reason: "stop" }] },
+    ]) },
+    "late content in a usage trailer without finish_reason": { failure: "InconsistentFinishReason", respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: { content: "late" } }], usage: streamUsage },
+    ]) },
+  };
+
+  test.each(Object.keys(brokenStreams))("fails the turn on %s without resending", async shape => {
+    const f = fixture(body => brokenStreams[shape].respond(body.model));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).toContain(brokenStreams[shape].failure);
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 25000);
 
   test("CLI selection persists a configured name and uses only its credential", async () => {
     const f = fixture();
@@ -516,6 +656,36 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 35000);
 
+  // A thinking endpoint such as DeepSeek's refuses an assistant tool call
+  // without its reasoning_content, or restores the reasoning from the call ID,
+  // so the review sends the exact action and its call ID only as instruction
+  // text (tests/tla/auto_classifier/ReviewPacket.tla NoReasoningToReviewer).
+  test("automatic permission review sends no assistant call or reasoning to the custom connection", async () => {
+    const reasoning = "REVIEW_REASONING_SENTINEL: the agent planned this call.";
+    const f = fixture(body => {
+      if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) return toolCompletion(body.model, "permission_decision", { decision: "clear" });
+      if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "review finished");
+      return withReasoning(toolCompletion(body.model, "shell", { request: { action: "run", command: "python3 -c 'print(42)'" } }, "call-thinking"), { reasoning_content: reasoning });
+    });
+    try {
+      f.settings.permission_mode = "auto";
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "Run the Python snippet"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const reviews = f.requests.filter(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
+      expect(reviews).toHaveLength(1);
+      const review = reviews[0]!.body;
+      expect(review.messages.map((message: any) => message.role)).toEqual(["system", "user"]);
+      expect(review.messages.some((message: any) => message.tool_calls !== undefined || message.tool_call_id !== undefined)).toBe(false);
+      expect(JSON.stringify(review)).not.toContain(reasoning);
+      expect(review.messages[0].content).toContain('target_tool_call_id: "call-thinking"');
+      expect(review.messages[0].content).toContain("command: python3 -c 'print(42)'");
+      // The main loop still replays the reasoning with the call.
+      const main = f.requests.at(-1)!;
+      expect(main.body.messages.find((message: any) => message.role === "assistant")?.reasoning_content).toBe(reasoning);
+    } finally { f.close(); }
+  }, 35000);
+
   test.each(["clear", "caution", "missing", "malformed", "refused", "truncated", "incomplete"])("custom review response recovery preserves %s outcome", async outcome => {
     let marker = "";
     let reviews = 0;
@@ -525,11 +695,13 @@ describe("configured providers", () => {
         if (reviews === 1 || (outcome === "missing" && reviews === 2)) {
           if (outcome === "malformed") return rawToolCalls(body.model, [{ id: "review-1", name: "permission_decision", arguments: "{\"decision\":\"clear\"" }]);
           if (outcome === "refused" || outcome === "truncated" || outcome === "incomplete") {
+            // An incomplete review ends before its finish_reason: a stream
+            // may end without [DONE] once the choice has finished.
             const chunks = [
               { id: "review", model: body.model, choices: [{ index: 0, delta: outcome === "refused" ? { refusal: "Cannot review this." } : { content: "Incomplete review." }, finish_reason: null }] },
-              { id: "review", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: outcome === "truncated" ? "length" : "stop" }] },
+              ...(outcome === "incomplete" ? [] : [{ id: "review", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: outcome === "truncated" ? "length" : "stop" }] }]),
             ];
-            return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join("") + (outcome === "incomplete" ? "" : "data: [DONE]\n\n"), { headers: { "content-type": "text/event-stream" } });
+            return chatStream(chunks, outcome !== "incomplete");
           }
           return completion(body.model, "The action looks safe.");
         }
@@ -608,8 +780,13 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 15000);
 
-  test("truncated tool streams cannot execute a partially delivered call", async () => {
-    const f = fixture(body => new Response(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "partial", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "must-not-exist.txt", content: "unsafe" }) } }] }, finish_reason: "tool_calls" }] })}\n\n`, { headers: { "content-type": "text/event-stream" } }));
+  test.each(["before its finish_reason", "inside its finish event"])("truncated tool streams cannot execute a partially delivered call (cut %s)", async cut => {
+    // A stream may end without [DONE] once the choice has finished, so the
+    // cut comes before the finish event arrives whole.
+    const call = { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "partial", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "must-not-exist.txt", content: "unsafe" }) } }] }, finish_reason: null }] };
+    const finish = { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] };
+    const wire = `data: ${JSON.stringify(call)}\n\n` + (cut === "inside its finish event" ? `data: ${JSON.stringify(finish)}` : "");
+    const f = fixture(() => new Response(wire, { headers: { "content-type": "text/event-stream" } }));
     try {
       f.settings.permission_mode = "full-access";
       (f.settings as any).yolo_acknowledged = true;

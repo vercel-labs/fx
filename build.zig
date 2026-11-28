@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
     // Whether this is a libfx artifact, which leaves out what only the fx
     // binary uses, such as its E2E test controls.
     build_options.addOption(bool, "libfx", false);
+    build_options.addOption(bool, "trace_log", true);
     build_options.addOption(bool, "builtin_tools", true);
 
     const fuzz_corpora = readFuzzCorpora(b);
@@ -202,6 +203,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    benchmark_exports_mod.addImport("build_options", build_options.createModule());
     const file_index_bench = b.addExecutable(.{
         .name = "file-index-bench",
         .root_module = b.createModule(.{
@@ -221,6 +223,27 @@ pub fn build(b: *std.Build) void {
     run_bench.addPassthruArgs();
     const run_bench_step = b.step("run-bench-file-index", "Build and run file_index search benchmark");
     run_bench_step.dependOn(&run_bench.step);
+
+    // --- grep_files scan benchmark ---
+    const grep_bench = b.addExecutable(.{
+        .name = "grep-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/grep_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    grep_bench.root_module.addImport("benchmark_exports", benchmark_exports_mod);
+    const install_grep_bench = b.addInstallArtifact(grep_bench, .{});
+    const bench_grep_step = b.step("bench-grep", "Build the grep_files scan benchmark");
+    bench_grep_step.dependOn(&install_grep_bench.step);
+
+    const run_grep_bench = b.addRunArtifact(grep_bench);
+    run_grep_bench.step.dependOn(&install_grep_bench.step);
+    run_grep_bench.addPassthruArgs();
+    const run_bench_grep_step = b.step("run-bench-grep", "Build and run the grep_files scan benchmark");
+    run_bench_grep_step.dependOn(&run_grep_bench.step);
 
     // --- UI activity progress benchmark ---
     const ui_activity_bench = b.addExecutable(.{
@@ -391,6 +414,10 @@ fn addWasmArtifact(
     wasm_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
+    // The core surface starts with `minimal_kernel`, which never reads
+    // `FX_TRACE*`; only the term surface runs the full app, and the SDK tests
+    // turn tracing on there through `env:`.
+    wasm_options.addOption(bool, "trace_log", surface == .term);
     wasm_options.addOption(bool, "builtin_tools", true);
 
     const wasm_root = switch (surface) {
@@ -438,6 +465,11 @@ fn addNapiArtifact(
     napi_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     napi_options.addOption(NapiSurface, "napi_surface", surface);
     napi_options.addOption(bool, "libfx", true);
+    // The addon starts with `minimal_kernel`, so startup never calls
+    // `configureFromEnv` and nothing sets a log file
+    // (`sdk/tests/test-native-core-misuse.mjs` holds that). The trace log
+    // would only add its formatting at every call site.
+    napi_options.addOption(bool, "trace_log", false);
     // libfx agents run only the host's tools, so the addon leaves fx's out.
     napi_options.addOption(bool, "builtin_tools", false);
 

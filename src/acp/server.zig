@@ -6,6 +6,7 @@ const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+const sandbox_policy = if (host_target.is_wasm) struct {} else @import("../core/runner/runner.zig");
 const runtime_profile = @import("../core/hosts/runtime_profile.zig");
 
 /// Only hosts with `durable_sessions` enabled open an fx v2 session store.
@@ -95,6 +96,7 @@ const AcpMethod = enum {
     libfx_steer,
     libfx_withdraw,
     libfx_handoff,
+    libfx_yield,
     libfx_follow_up,
     libfx_snapshot,
     libfx_journal_open,
@@ -121,6 +123,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
         if (std.mem.eql(u8, method, "libfx/withdraw")) return .libfx_withdraw;
         if (std.mem.eql(u8, method, "libfx/handoff")) return .libfx_handoff;
+        if (std.mem.eql(u8, method, "libfx/yield")) return .libfx_yield;
         if (std.mem.eql(u8, method, "libfx/follow_up")) return .libfx_follow_up;
         if (std.mem.eql(u8, method, "libfx/snapshot")) return .libfx_snapshot;
         if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
@@ -143,6 +146,7 @@ const AcpMethod = enum {
             .libfx_steer,
             .libfx_withdraw,
             .libfx_handoff,
+            .libfx_yield,
             .libfx_follow_up,
             => false,
             .session_list,
@@ -162,7 +166,7 @@ const AcpMethod = enum {
 
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_handoff, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open, .libfx_journal_images => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_handoff, .libfx_yield, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open, .libfx_journal_images => true,
             else => false,
         };
     }
@@ -285,6 +289,9 @@ pub const ActiveSessionState = struct {
     /// so the turn's workspace captures, which watch this, keep running (D98).
     /// Cleared as each prompt starts.
     turn_cancel: std.atomic.Value(bool) = .init(false),
+    /// The host asked the running libfx turn to stop at its next safe point
+    /// (`libfx/yield`). Cleared when a prompt starts.
+    yield_requested: std.atomic.Value(bool) = .init(false),
     pending_prompt_id: ?jsonrpc.RequestId,
     steering: libfx_steering.Runtime = .{},
     /// Set when the host passed a journal; every state change is sent to it.
@@ -385,6 +392,9 @@ pub const ServerState = struct {
     cache_warming: bool = true,
     /// `experimental.workspace_capture`, from startup.
     workspace_capture: bool = false,
+    /// The sandbox policy, loaded when `experimental.sandbox_execution` is on.
+    /// Host only: the WASM core runs no sandbox.
+    sandbox_policy: if (host_target.is_wasm) void else ?*sandbox_policy.Policy = if (host_target.is_wasm) {} else null,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -405,6 +415,8 @@ pub const ServerState = struct {
     /// Open for the whole connection on native hosts; the wasm host keeps
     /// its sessions in the JS host's snapshot store (D63).
     sessions_v2: ?session_adapter.Store = null,
+    /// The v1 roots of the paged `session/list` in progress, owned by `sessions.zig`.
+    session_listing: ?sessions.SessionListing = null,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
@@ -447,7 +459,13 @@ pub const ServerState = struct {
         if (comptime !host_target.is_wasm) mcp_host.waitRetired();
         // Retention's maintenance, if one runs, ends with the server.
         if (comptime turn_capture.supported) turn_capture.finishMaintenance();
+        // The prompts, subagents, and worker that could place a command have ended.
+        if (comptime !host_target.is_wasm) {
+            if (self.sandbox_policy) |loaded| loaded.destroy();
+            self.sandbox_policy = null;
+        }
         if (self.sessions_v2) |*store| store.deinit(self.alloc);
+        if (self.session_listing) |*listing| listing.deinit(self.alloc);
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
@@ -640,6 +658,16 @@ pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provide
             if (provider == .gateway) state.gateway_source_preference else state.credential_source,
         )) orelse return error.ProviderCredentialUnavailable;
     };
+}
+
+test "a second initialize keeps the sandbox policy the first one loaded" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    var state: ServerState = undefined;
+    state.alloc = std.testing.allocator;
+    var loaded: sandbox_policy.Policy = undefined;
+    state.sandbox_policy = &loaded;
+    loadSandboxPolicyOnce(&state);
+    try std.testing.expect(state.sandbox_policy.? == &loaded);
 }
 
 test "ACP credential preparation preserves the existing borrowed credential" {
@@ -925,6 +953,14 @@ fn dropQueuedMail(state: *ServerState, session_id: []const u8, scope: DropScope,
     state.report_calls.shrinkRetainingCapacity(kept);
 }
 
+/// Loads the process's sandbox policy once. A second `initialize` keeps the policy the first one loaded:
+/// active sessions hold its pointer, and loading again would leave the first policy unreleased.
+fn loadSandboxPolicyOnce(state: *ServerState) void {
+    if (comptime host_target.is_wasm) return;
+    if (state.sandbox_policy != null) return;
+    state.sandbox_policy = sandbox_policy.loadForProcess(state.alloc);
+}
+
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
     if (active.title_task) |task| {
@@ -941,6 +977,7 @@ fn destroyActiveSession(state: *ServerState) void {
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
         if (active.mcp_host) |h| h.destroy();
+        if (state.sandbox_policy) |policy| policy.remote.forgetSession(active.session_id);
     }
     active.session_rt.deinit(state.alloc);
     // Before the session closes: a start capture still running uses it.
@@ -1732,6 +1769,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .libfx_steer => handleKernelSteer(state, alloc, msg),
             .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
             .libfx_handoff => handleKernelHandoff(state, alloc, msg),
+            .libfx_yield => handleKernelYield(state, alloc, msg),
             .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
             .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
             .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
@@ -1758,6 +1796,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_steer => handleKernelSteer(state, alloc, msg),
         .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
         .libfx_handoff => handleKernelHandoff(state, alloc, msg),
+        .libfx_yield => handleKernelYield(state, alloc, msg),
         .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
         .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
         .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
@@ -1953,6 +1992,39 @@ fn handleKernelHandoff(
     if (active.steering.requestHandoff(&active.cancel_flag)) {
         debug_trace.logf("acp", "libfx handoff interrupts the streaming reply", .{});
     }
+    try state.writer.writeResponse(alloc, msg.id, "null");
+}
+
+/// A host asks the running libfx turn to stop at its next safe point, the save
+/// before a model request after the turn's first, so a later process continues
+/// it (`tests/tla/sdk/DurableHandOff.tla` Yield). Only a journal can keep the
+/// turn, so a session without one cannot yield.
+fn handleKernelYield(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx yield params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const journaled = journaled: {
+        active.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer active.session_write_mutex.unlock(io_mod.getIo());
+        break :journaled active.journal != null;
+    };
+    if (!journaled) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "libfx/yield needs a journal to keep the turn in",
+    });
+    active.yield_requested.store(true, .seq_cst);
+    debug_trace.logf("acp", "libfx yield requested", .{});
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
@@ -2741,6 +2813,9 @@ fn startPromptWithInputId(
 
     session.turn_cancel.store(false, .seq_cst);
     session.cancel_flag.store(false, .seq_cst);
+    if (session.yield_requested.swap(false, .seq_cst)) {
+        debug_trace.logf("session", "event=libfx_yield_request_cleared session={s} reason=new_prompt", .{session.session_id});
+    }
     session.steering.open(state.alloc);
     if (comptime host_target.is_wasm) {
         unused_v2_input_id = null;
@@ -3415,6 +3490,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.session_titles = startup.session_title_generation;
     state.cache_warming = startup.cache_warming;
     state.workspace_capture = startup.workspace_capture;
+    if (comptime !host_target.is_wasm) {
+        if (startup.sandbox_execution) loadSandboxPolicyOnce(state);
+    }
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
@@ -4854,6 +4932,7 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("libfx/new"));
     try std.testing.expectEqual(AcpMethod.libfx_steer, AcpMethod.parse("libfx/steer"));
     try std.testing.expectEqual(AcpMethod.libfx_handoff, AcpMethod.parse("libfx/handoff"));
+    try std.testing.expectEqual(AcpMethod.libfx_yield, AcpMethod.parse("libfx/yield"));
     try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("workspace/unknown"));
     try std.testing.expect(AcpMethod.libfx_checkpoint.isLibfx());
     try std.testing.expect(AcpMethod.libfx_restore.isLibfx());
@@ -4861,6 +4940,8 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expect(AcpMethod.libfx_steer.isLibfx());
     try std.testing.expect(AcpMethod.libfx_handoff.isLibfx());
     try std.testing.expect(!AcpMethod.libfx_handoff.waitsForActivePrompt());
+    try std.testing.expect(AcpMethod.libfx_yield.isLibfx());
+    try std.testing.expect(!AcpMethod.libfx_yield.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_new.isLibfx());
 }
 
