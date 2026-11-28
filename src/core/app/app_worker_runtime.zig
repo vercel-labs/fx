@@ -1096,12 +1096,22 @@ pub fn Runtime(comptime App: type) type {
             syncState(app, agent, event_handlers.tool_lifecycle);
 
             const now_ms = io_mod.milliTimestamp();
-            _ = advanceVisibleAnimation(
+            const advanced = advanceVisibleAnimation(
                 app,
                 agent,
                 event_handlers.tool_lifecycle,
                 now_ms,
             );
+            if (!advanced) _ = advanceLoadingMarkerBlink(app, now_ms);
+        }
+
+        /// Keeps frames coming while the footer shows a loading marker, such
+        /// as a server that connects in `/mcp`, so the marker blinks with or
+        /// without a turn.
+        fn advanceLoadingMarkerBlink(app: *App, now_ms: i64) bool {
+            if (comptime !@hasField(@TypeOf(app.shell), "loading_marker_active")) return false;
+            if (!app.shell.loading_marker_active) return false;
+            return app.shell.render_requests.requestAnimationDue(now_ms);
         }
 
         fn advanceVisibleAnimation(
@@ -2246,6 +2256,7 @@ const FakeCommandOutputDisplay = struct {
 const FakeShell = struct {
     command_output_display: FakeCommandOutputDisplay = .{},
     shimmer_active: bool = false,
+    loading_marker_active: bool = false,
     native_history_active: bool = false,
     render_requests: render_request.RenderRequestState = .{},
     lifecycle: transcript_runtime.TranscriptRuntime = .{
@@ -3261,6 +3272,24 @@ test "core.app_worker_runtime ticks animation for completed assistant presentati
     app.agent().question_prompt.active = false;
     app.agent().approval_prompt.force_active = true;
     app.shell.render_requests.animation_next_deadline_ms = 1;
+    try tickNoop(&app);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
+}
+
+test "core.app_worker_runtime keeps frames coming for a footer loading marker while idle, and stops when it goes" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    // A server loads in `/mcp`: no turn, no activity row, only the marker.
+    app.shell.loading_marker_active = true;
+    app.shell.render_requests.animation_visible = true;
+    app.shell.render_requests.animation_next_deadline_ms = 1;
+    try tickNoop(&app);
+    try std.testing.expect(app.shell.render_requests.hasReason(.animation));
+
+    // Everything loaded: the next frame showed no marker, so no more frames.
+    app.shell.loading_marker_active = false;
+    app.shell.render_requests = .{ .animation_visible = true, .animation_next_deadline_ms = 1 };
     try tickNoop(&app);
     try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
 }

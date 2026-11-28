@@ -84,6 +84,13 @@ comptime {
     );
 }
 
+/// Whether fx's working marker, the `•` of `• Thinking`, shows at animation
+/// phase `phase`: a steady on/off blink with no fade. Folding in the padding
+/// keeps the phase non-negative so the blink wraps seamlessly across the cycle.
+pub fn markerBlinkVisible(phase: i16) bool {
+    return @mod(phase + animation_padding, 2 * blink_half_period_frames) < blink_half_period_frames;
+}
+
 fn nextAnimationPhase(phase: i16) i16 {
     const next = phase + 1;
     if (next > animation_max_phase) return -animation_padding;
@@ -373,6 +380,17 @@ pub const RenderRequestState = struct {
 fn reasonsAffectApproval(reasons: ReasonSet) bool {
     return reasons.contains(.modal) or reasons.contains(.resize) or
         reasons.contains(.external_damage) or reasons.contains(.first_frame);
+}
+
+test "marker blink is on and off for equal halves of the 40-frame cycle" {
+    var on: usize = 0;
+    var pos: i16 = -8;
+    while (pos <= 31) : (pos += 1) {
+        if (markerBlinkVisible(pos)) on += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 20), on);
+    try std.testing.expect(!markerBlinkVisible(31));
+    try std.testing.expect(markerBlinkVisible(-8));
 }
 
 test "compaction revisions request footer repaint without restarting animation" {

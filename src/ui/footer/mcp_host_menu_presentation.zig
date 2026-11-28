@@ -34,9 +34,33 @@ pub const Projection = struct {
     /// The project config file, as shown. The profile file is named by
     /// `profile_paths.displayText`.
     project_file: []const u8 = ".mcp.json",
+    /// The phase of fx's animation, which blinks the working marker of a
+    /// server that loads.
+    marker_phase: i16 = 0,
 
     pub fn active(p: Projection) bool {
         return p.state.active;
+    }
+
+    /// Whether the menu shows a server that loads, so its marker needs
+    /// frames: on the list, any server the filter keeps, even one scrolled
+    /// out of the window; on a server's screen, that server until its tools
+    /// are in.
+    pub fn showsLoading(p: Projection) bool {
+        if (!p.active()) return false;
+        switch (p.state.screen) {
+            .list => {
+                var buf: [256]menu.Row = undefined;
+                for (menu.viewOf(&p.state, p.rows, p.filter, p.tools, &buf).rows) |r| {
+                    if (loads(r)) return true;
+                }
+                return false;
+            },
+            .server => {},
+            .confirm => if (!asksInPlace(p)) return false,
+        }
+        const r = p.openRow() orelse return false;
+        return loads(r) or menu.toolsFor(r, p.tools) == .loading;
     }
 
     /// The open server, found by name among all servers.
@@ -224,9 +248,9 @@ fn listRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width:
             return title(alloc, "Needs attention", try arena.print("{d}", .{rows.len - first}), width);
         }
         const i = if (line > first) line - heading else line;
-        return serverListRow(alloc, arena, rows[i], i == selected, width, try statusWidth(arena, rows, width));
+        return serverListRow(alloc, arena, rows[i], i == selected, width, try statusWidth(arena, rows, width), p.marker_phase);
     }
-    return serverListRow(alloc, arena, rows[line], line == selected, width, try statusWidth(arena, rows, width));
+    return serverListRow(alloc, arena, rows[line], line == selected, width, try statusWidth(arena, rows, width), p.marker_phase);
 }
 
 /// The width of a row's name column.
@@ -255,7 +279,13 @@ fn statusWidth(arena: Allocator, rows: []const menu.Row, width: u16) !usize {
     return @min(want, @max(room, 22));
 }
 
-fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool, width: u16, status_width: usize) !Row {
+/// A server on its way to ready or to a login: its status shows fx's working
+/// marker.
+fn loads(r: menu.Row) bool {
+    return r.status.signing_in or r.status.state == .connecting or r.status.state == .retrying;
+}
+
+fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool, width: u16, status_width: usize, marker_phase: i16) !Row {
     const show_source = width >= 64;
     const name_width = nameWidth(width);
     const status_col = statusStart(width);
@@ -268,6 +298,8 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     try row_text.appendTerminalSafeSingleLine(alloc, &row, r.status.name, name_width);
     try row.appendSlice(alloc, ui_render.reset_style);
     try row_text.appendSpacesToColumn(alloc, &row, status_col);
+    const marker_width = if (loads(r)) try row_text.appendLoadingMarker(alloc, &row, marker_phase, status_width) else 0;
+    const text_width = status_width - marker_width;
     const needs_you = r.status.needs_login or switch (r.status.state) {
         .failed, .retrying, .waiting_for_approval, .missing_env, .invalid_env => true,
         else => false,
@@ -276,8 +308,8 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     try row.appendSlice(alloc, if (needs_you) ui_render.hint_style else ui_render.dim_style);
     // A refused tool list says so whole where the row has room, and in fewer words where it has not. From 27 columns
     // the shortest still fits whole. Under that the row is cut like any other, and may lose the word that says it.
-    const shown = try verbs.statusThatFits(arena, r.status, status_width);
-    try row_text.appendTerminalSafeSingleLine(alloc, &row, shown, status_width);
+    const shown = try verbs.statusThatFits(arena, r.status, text_width);
+    try row_text.appendTerminalSafeSingleLine(alloc, &row, shown, text_width);
     try row.appendSlice(alloc, ui_render.reset_style);
     if (show_source) {
         try row_text.appendSpacesToColumn(alloc, &row, source_col);
@@ -295,6 +327,32 @@ fn statusFact(arena: Allocator, s: menu.Row) ![]const u8 {
     return verbs.runStatusText(arena, s.status);
 }
 
+/// The status fact, behind fx's working marker while the server loads.
+fn statusFactRow(alloc: Allocator, status: []const u8, server_loads: bool, marker_phase: i16, width: u16) !Row {
+    if (!server_loads) return row_text.composeFactRow(alloc, "status", status, width, fact_col, "");
+    var row = try row_text.composeFactRow(alloc, "status", "", width, fact_col, "");
+    errdefer row.deinit(alloc);
+    const room = @as(usize, width) -| fact_col;
+    const marker_width = try row_text.appendLoadingMarker(alloc, &row, marker_phase, room);
+    try row_text.appendTerminalSafeSingleLine(alloc, &row, status, room - marker_width);
+    return row;
+}
+
+/// A dim line of the screen that waits, such as `Loading tools…`, behind fx's
+/// working marker.
+fn loadingTextRow(alloc: Allocator, text: []const u8, marker_phase: i16, width: u16) !Row {
+    var row: Row = .empty;
+    errdefer row.deinit(alloc);
+    const indent = @min(2, @as(usize, width));
+    try row.appendNTimes(alloc, ' ', indent);
+    const room = @as(usize, width) - indent;
+    const marker_width = try row_text.appendLoadingMarker(alloc, &row, marker_phase, room);
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row_text.appendTerminalSafeSingleLine(alloc, &row, text, room - marker_width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
 /// Line `line` of a server's screen below its title.
 fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l: menu.Layout, line: usize, width: u16) !Row {
     if (line < l.lead) {
@@ -302,7 +360,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
         if (line >= facts) return .empty;
         if (line == 0) return row_text.composeFactRow(alloc, if (r.status.transport == .stdio) "runs" else @tagName(r.status.transport), r.target orelse "", width, fact_col, "");
         if (line == 1) return row_text.composeFactRow(alloc, "file", p.fileOf(r), width, fact_col, "");
-        if (line == 2) return row_text.composeFactRow(alloc, "status", try statusFact(arena, r), width, fact_col, "");
+        if (line == 2) return statusFactRow(alloc, try statusFact(arena, r), loads(r), p.marker_phase, width);
         // Then the facts a server has only sometimes, in the order `fx mcp show` prints them: the tools fx left out, its
         // protocol, its error.
         var later = line - 3;
@@ -382,10 +440,10 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     }
     // From Log in until the address comes, the requests before it can take seconds.
     if (after == 1 and r.status.signing_in and menu.toolsFor(r, p.tools) != .ready)
-        return row_text.composeTextRow(alloc, "Signing in…", width, ui_render.dim_style, 2);
+        return loadingTextRow(alloc, "Signing in…", p.marker_phase, width);
     if (after == 1) {
         const heading: []const u8 = switch (menu.toolsFor(r, p.tools)) {
-            .loading => "Loading tools…",
+            .loading => return loadingTextRow(alloc, "Loading tools…", p.marker_phase, width),
             .needs_login => "Its tools show here once you log in.",
             .needs_approval => "Its tools show here once you approve it.",
             .failed => |reason| try arena.print("Its tools couldn't load: {s}", .{reason}),
@@ -1126,12 +1184,12 @@ test "a login under way says so until its address comes" {
         \\  linear
         \\  http      https://mcp.linear.app/mcp
         \\  file      ~/.fx/mcp.json
-        \\  status    needs login
+        \\  status    • needs login
         \\
         \\› Log in        /mcp login linear
         \\  Remove        /mcp remove linear
         \\
-        \\  Signing in…
+        \\  • Signing in…
         \\
     , text);
     // Its address takes that line's place.
@@ -1152,6 +1210,137 @@ test "a login under way says so until its address comes" {
     defer testing.allocator.free(ready);
     try testing.expect(std.mem.find(u8, ready, "It has no tools.") != null);
     try testing.expect(std.mem.find(u8, ready, "Signing in…") == null);
+}
+
+/// A phase of the shared blink where fx's working marker is off.
+const marker_off_phase: i16 = 2;
+
+test "a server that connects, retries, or signs in blinks fx's working marker before its status in the list" {
+    var ready = testStatus("context7", .ready);
+    ready.tools = 2;
+    var linear = testStatus("linear", .idle);
+    linear.needs_login = true;
+    linear.signing_in = true;
+    const rows = [_]menu.Row{
+        .{ .status = ready },
+        .{ .status = testStatus("slow", .connecting) },
+        .{ .status = testStatus("flaky", .retrying) },
+        .{ .status = linear },
+    };
+    var p: Projection = .{ .rows = &rows };
+    menu.open(&p.state);
+    const on = try render(p, 88);
+    defer testing.allocator.free(on);
+    try testing.expectEqualStrings(
+        \\  MCP servers  4
+        \\› context7                ready, 2 tools          profile
+        \\  flaky                   • retrying              profile
+        \\  slow                    • connecting            profile
+        \\
+        \\  Needs attention  1
+        \\  linear                  • needs login           profile
+        \\
+    , on);
+    // Off, the marker leaves its two columns blank, so the words never move.
+    p.marker_phase = marker_off_phase;
+    const off = try render(p, 88);
+    defer testing.allocator.free(off);
+    try testing.expectEqualStrings(
+        \\  MCP servers  4
+        \\› context7                ready, 2 tools          profile
+        \\  flaky                     retrying              profile
+        \\  slow                      connecting            profile
+        \\
+        \\  Needs attention  1
+        \\  linear                    needs login           profile
+        \\
+    , off);
+    // It is the `• Thinking` marker, in its color.
+    var row = try composeRow(testing.allocator, p, 2, 88, menuRowCount(p, 88, max_inline_rows));
+    defer row.deinit(testing.allocator);
+    p.marker_phase = 0;
+    var lit = try composeRow(testing.allocator, p, 2, 88, menuRowCount(p, 88, max_inline_rows));
+    defer lit.deinit(testing.allocator);
+    const marker = try std.mem.concat(testing.allocator, u8, &.{ ui_render.permission_auto_style, "•" });
+    defer testing.allocator.free(marker);
+    try testing.expect(std.mem.find(u8, lit.items, marker) != null);
+    try testing.expect(std.mem.find(u8, row.items, "•") == null);
+}
+
+test "the working marker keeps a loading row inside 20 and 25 columns" {
+    const rows = [_]menu.Row{ .{ .status = testStatus("slow", .connecting) }, .{ .status = testStatus("flaky", .retrying) } };
+    var p: Projection = .{ .rows = &rows };
+    menu.open(&p.state);
+    for ([_]u16{ 20, 25 }) |width| {
+        const text = try render(p, width);
+        defer testing.allocator.free(text);
+        const slow = rowOfServer(text, "slow") orelse return error.TestExpectedRow;
+        try testing.expect(std.mem.find(u8, slow, "•") != null);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| try testing.expect(try std.unicode.utf8CountCodepoints(line) <= width);
+    }
+}
+
+test "a loading server's screen blinks the marker on its status and on Loading tools, and drops it once ready" {
+    var slow = testStatus("slow", .connecting);
+    var rows = [_]menu.Row{.{ .status = slow, .target = "https://h/mcp" }};
+    var p: Projection = .{ .rows = &rows, .tools = .loading };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    const loading = try render(p, 80);
+    defer testing.allocator.free(loading);
+    try testing.expectEqualStrings(
+        \\  slow
+        \\  http      https://h/mcp
+        \\  file      ~/.fx/mcp.json
+        \\  status    • connecting
+        \\
+        \\› Remove        /mcp remove slow
+        \\
+        \\  • Loading tools…
+        \\
+    , loading);
+    p.marker_phase = marker_off_phase;
+    const off = try render(p, 80);
+    defer testing.allocator.free(off);
+    try testing.expect(std.mem.find(u8, off, "  status      connecting\n") != null);
+    try testing.expect(std.mem.find(u8, off, "\n    Loading tools…\n") != null);
+    try testing.expect(std.mem.find(u8, off, "•") == null);
+
+    slow.state = .ready;
+    slow.tools = 1;
+    rows[0].status = slow;
+    const tools = [_]menu.Tool{.{ .name = "echo", .description = "Echo." }};
+    p.tools = .{ .ready = &tools };
+    p.marker_phase = 0;
+    const ready = try render(p, 80);
+    defer testing.allocator.free(ready);
+    try testing.expect(std.mem.find(u8, ready, "  status    ready\n") != null);
+    try testing.expect(std.mem.find(u8, ready, "Tools 1") != null);
+    try testing.expect(std.mem.find(u8, ready, "•") == null);
+}
+
+test "the menu asks for frames only while it shows a server that loads" {
+    var ready = testStatus("ready", .ready);
+    ready.tools = 1;
+    var rows = [_]menu.Row{ .{ .status = ready }, .{ .status = testStatus("slow", .connecting) } };
+    var p: Projection = .{ .rows = &rows };
+    try testing.expect(!p.showsLoading());
+    menu.open(&p.state);
+    try testing.expect(p.showsLoading());
+    // A filter that hides the loading server hides its marker too.
+    p.filter = "rea";
+    try testing.expect(!p.showsLoading());
+    p.filter = "";
+    rows[1].status.state = .ready;
+    try testing.expect(!p.showsLoading());
+
+    // On a server's screen, until its tools are in.
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    p.tools = .loading;
+    try testing.expect(p.showsLoading());
+    p.tools = .{ .ready = &.{} };
+    try testing.expect(!p.showsLoading());
 }
 
 test "names and errors from config and servers stay inert" {
