@@ -59,9 +59,23 @@ fn field(value: std.json.Value, name: []const u8) ?std.json.Value {
     return value.object.get(name);
 }
 
-fn stringField(value: std.json.Value, name: []const u8) ?[]const u8 {
-    const found = field(value, name) orelse return null;
-    return if (found == .string) found.string else null;
+/// Returns the field `field_name` of `value`, which is parsed from `file_name`. A missing field
+/// prints both names before the test fails, so the failure says what to fix.
+fn requireField(value: std.json.Value, file_name: []const u8, field_name: []const u8) !std.json.Value {
+    return field(value, field_name) orelse {
+        std.debug.print("{s} is missing field {s}\n", .{ file_name, field_name });
+        return error.TestUnexpectedResult;
+    };
+}
+
+/// Like `requireField`, and also fails when the field is not a string.
+fn requireStringField(value: std.json.Value, file_name: []const u8, field_name: []const u8) ![]const u8 {
+    const found = try requireField(value, file_name, field_name);
+    if (found != .string) {
+        std.debug.print("{s} field {s} is not a string\n", .{ file_name, field_name });
+        return error.TestUnexpectedResult;
+    }
+    return found.string;
 }
 
 /// Reports whether `values` is an object with `want` among its string values. ACP's `meta.json`
@@ -110,17 +124,18 @@ test "ACP's method lists are version 1 and the unstable list includes every stab
     const unstable = try parseSpecFile(acp_meta_unstable);
     defer unstable.deinit();
 
-    for ([_]std.json.Value{ stable.value, unstable.value }) |meta| {
-        const version = field(meta, "version") orelse return error.TestUnexpectedResult;
-        try std.testing.expect(version == .integer and version.integer == 1);
-    }
-    try std.testing.expect(hasStringValue(field(stable.value, "agentMethods") orelse .null, "session/prompt"));
-    try std.testing.expect(hasStringValue(field(stable.value, "clientMethods") orelse .null, "session/update"));
+    const stable_version = try requireField(stable.value, acp_meta.path, "version");
+    try std.testing.expect(stable_version == .integer and stable_version.integer == 1);
+    const unstable_version = try requireField(unstable.value, acp_meta_unstable.path, "version");
+    try std.testing.expect(unstable_version == .integer and unstable_version.integer == 1);
+    try std.testing.expect(hasStringValue(try requireField(stable.value, acp_meta.path, "agentMethods"), "session/prompt"));
+    try std.testing.expect(hasStringValue(try requireField(stable.value, acp_meta.path, "clientMethods"), "session/update"));
 
     for ([_][]const u8{ "agentMethods", "clientMethods", "protocolMethods" }) |list| {
-        const stable_list = field(stable.value, list) orelse return error.TestUnexpectedResult;
-        const unstable_list = field(unstable.value, list) orelse return error.TestUnexpectedResult;
+        const stable_list = try requireField(stable.value, acp_meta.path, list);
+        const unstable_list = try requireField(unstable.value, acp_meta_unstable.path, list);
         try std.testing.expect(stable_list == .object);
+        try std.testing.expect(unstable_list == .object);
         for (stable_list.object.values()) |method| {
             try std.testing.expect(method == .string);
             if (!hasStringValue(unstable_list, method.string)) {
@@ -137,8 +152,8 @@ test "the unstable ACP schema includes every stable type" {
     const unstable = try parseSpecFile(acp_schema_unstable);
     defer unstable.deinit();
 
-    const stable_defs = field(stable.value, "$defs") orelse return error.TestUnexpectedResult;
-    const unstable_defs = field(unstable.value, "$defs") orelse return error.TestUnexpectedResult;
+    const stable_defs = try requireField(stable.value, acp_schema.path, "$defs");
+    const unstable_defs = try requireField(unstable.value, acp_schema_unstable.path, "$defs");
     try std.testing.expect(stable_defs == .object and unstable_defs == .object);
     try std.testing.expect(stable_defs.object.count() > 0);
     for (stable_defs.object.keys()) |name| {
@@ -155,10 +170,10 @@ test "sh-fx.schema.json uses the JSON Schema draft of ACP's schema" {
     const fx = try parseSpecFile(fx_schema);
     defer fx.deinit();
 
-    const acp_draft = stringField(acp.value, "$schema") orelse return error.TestUnexpectedResult;
-    const fx_draft = stringField(fx.value, "$schema") orelse return error.TestUnexpectedResult;
+    const acp_draft = try requireStringField(acp.value, acp_schema.path, "$schema");
+    const fx_draft = try requireStringField(fx.value, fx_schema.path, "$schema");
     try std.testing.expectEqualStrings(acp_draft, fx_draft);
 
-    const fx_defs = field(fx.value, "$defs") orelse return error.TestUnexpectedResult;
+    const fx_defs = try requireField(fx.value, fx_schema.path, "$defs");
     try std.testing.expect(fx_defs == .object);
 }
