@@ -6063,6 +6063,7 @@ test {
     _ = @import("builtins/commands.zig");
     _ = @import("builtins/mcp.zig");
     _ = @import("builtins/modes.zig");
+    _ = @import("builtins/providers.zig");
     _ = @import("builtins/tools.zig");
     _ = @import("tools/agent/ask_user_question.zig");
     _ = @import("builtins/browser_workspace_tools.zig");

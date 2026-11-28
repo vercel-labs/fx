@@ -2832,6 +2832,7 @@ fn resolveModelOverride(
     const session = if (ctx.state.active_session) |*active| active else return .no_catalog;
     const route = ctx.routeView(session);
     const bundle = ctx.state.cfg.provider_set.select(route.provider);
+    if (!bundle.capabilities.authoritative_model_catalog) return .no_catalog;
     var sign_in_arena = std.heap.ArenaAllocator.init(ctx.state.alloc);
     defer sign_in_arena.deinit();
     const sign_in = try ctx.toolSignIn(sign_in_arena.allocator());

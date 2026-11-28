@@ -37,3 +37,10 @@ pub const native = provider_set.Set{
         .permission_reviewer = xai_grok_permission_reviewer.provider,
     },
 };
+
+test "only the gateway and Codex catalogs are authoritative for subagent overrides" {
+    const std = @import("std");
+    try std.testing.expect(native.gateway.capabilities.authoritative_model_catalog);
+    try std.testing.expect(native.codex.capabilities.authoritative_model_catalog);
+    try std.testing.expect(!native.grok.capabilities.authoritative_model_catalog);
+}
