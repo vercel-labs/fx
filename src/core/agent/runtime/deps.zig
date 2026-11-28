@@ -308,6 +308,7 @@ pub const AgentRuntimeDeps = struct {
     /// Admission consumes `prepared`; callers must not retry the same value through the raw callback.
     request_prepared_file_mutation_permission: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) anyerror!command_admission.PermissionOutcome = null,
     resolve_tool_action_display_target: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
+    resolve_command_placement: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?types.CommandPlacement = null,
     describe_tool_action: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     describe_tool_action_completed: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     describe_tool_action_denied: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
@@ -377,7 +378,7 @@ pub const AgentRuntimeDeps = struct {
     /// session after a main-model completion and before its tool calls run.
     /// Another process may have taken the session over.
     confirm_session_writer: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-    propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
+    propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,
     push_reasoning_delta: ?*const fn (ctx: *anyopaque, delta: []const u8) anyerror!void = null,

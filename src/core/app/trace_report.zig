@@ -68,7 +68,8 @@
 //!   `turn_id`, `detail`}, for the newest 3 failures; `mcp_server` {`issue`
 //!   (`failed`, `retrying`, `missing_env`, `invalid_env`, or `needs_login`),
 //!   `name`, `variable`, `error` (masked)}; `model_catalog` {`event`,
-//!   `detail`}, for the newest 3 failures.
+//!   `detail`}, for the newest 3 failures; `sign_in` {`at`, `event`,
+//!   `detail`}, for the newest 3 failed `sign_in_event` records.
 //! - `last_shutdown`: `status` (`recorded`, `none`, or `unreadable`),
 //!   `total_ms`, `recorded_at`, and `stages`, a list of {`name`, `step_ms`}.
 //! - `last_crash`: `status` (`recorded`, `none`, `too_large`, `unreadable`, `stale`, `future`, or `undated`), the crash
@@ -175,6 +176,29 @@
 //!   session. Then a `failed_model_catalog_event` per kept failure, oldest
 //!   first, with the `model_catalog_event` fields and the same `sequence`;
 //!   the `model_catalog` problems come from these.
+//! - `sign_in`: `events`, the events the bounded ring holds, at most 32;
+//!   `session_events`, every event this session; `kept_failures`, the failed
+//!   events kept apart from the ring, at most 32, which later successful
+//!   events never push out (a newer failure replaces the oldest);
+//!   `session_failures`, every failed event this session. Then a
+//!   `sign_in_event` per retained event, oldest first: `at`, `sequence`,
+//!   `event`, `failed`, `detail`, and `truncated`, whether the detail was cut
+//!   when recorded. Then a `failed_sign_in_event` per kept failure, oldest
+//!   first, with the same fields and `sequence`. `event` is `lock_wait`, a
+//!   wait for the fx login's `auth.lock` that every fx process sharing the
+//!   login takes (`outcome` `taken`, `given_up`, or the name of another lock
+//!   error, `waited_ms`, and for a failure `limit_ms`);
+//!   `refresh`, one refresh of the saved fx login (`mode`, `outcome`
+//!   `rotated`, `saved_login_used`, `no_saved_login`, or `failed` with the
+//!   `step` and `err` where it stopped, `ms`); `issuer`, its request to the
+//!   issuer (`outcome`, `step`, `err`, `ms`, `login_deleted`, whether fx
+//!   deleted the saved login after the issuer refused it); or `prompt`, a
+//!   prompt that stopped for its credential or went on after a sign-in
+//!   (`outcome`, `screen` `main` or `subagent`, `turn_id`, and for a failure
+//!   `source`, `reason`, `retryable`, `err`, and `notice` `shown` or
+//!   `not_shown`). A `detail` holds only these names, counts, and
+//!   durations, never a token or an account. Sign-in events are recorded
+//!   even when `FX_TRACE` is off.
 //! - `tool_calls`: `retained`, `outcomes` {`succeeded`, `rejected`,
 //!   `command_failed`, `tool_failed`, `runtime_failed`}, `total_ms`, `session`
 //!   {`calls`, `outcomes`, `total_ms`}, `complete`, `web_search_retained`,
@@ -361,6 +385,7 @@ const os_error_problems_shown: usize = 3;
 const tool_problems_shown: usize = 5;
 const compaction_problems_shown: usize = 3;
 const model_catalog_problems_shown: usize = 3;
+const sign_in_problems_shown: usize = 3;
 const output_limit_problems_shown: usize = 5;
 const trace_tail_bytes: usize = 6 * 1024;
 const trace_max_lines: usize = 80;
@@ -596,6 +621,7 @@ fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     try writeSubagents(r, app);
     try writeNetwork(r);
     try writeModelCatalog(r, app);
+    try writeSignIn(r);
     try writeToolCalls(r, history, shell_view);
     try writePermissions(r, permission_grants);
     try writeAutoReviews(r);
@@ -615,11 +641,17 @@ fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     try writeRendererState(r, app, &secrets, &masking);
     try writeRendererEvents(r);
     try writeTranscript(r, transcript);
-    if (debug_trace.activeLogPath() orelse io_mod.getenv("FX_TRACE_LOG")) |path| {
+    if (traceLogPath()) |path| {
         try writeTraceLog(r, path);
     }
     try writeEnd(r);
     return .{ .bytes = try out.toOwnedSlice(), .crash = records.included_crash };
+}
+
+/// The trace log path a report names: only a path that a trace actually opened.
+/// A refused path is never reported, even when `FX_TRACE_LOG` names it.
+fn traceLogPath() ?[]const u8 {
+    return debug_trace.activeLogPath();
 }
 
 fn writeHeader(r: *Records, fx_version: []const u8, now_ms: i64) !void {
@@ -742,7 +774,7 @@ noinline fn writeCurrentState(r: *Records, app: anytype, crash_report: bool) !vo
         try r.endObject();
     }
     try r.boolean("fx_trace", envTruthy("FX_TRACE"));
-    if (debug_trace.activeLogPath() orelse io_mod.getenv("FX_TRACE_LOG")) |path| try r.masked("trace_log", path);
+    if (traceLogPath()) |path| try r.masked("trace_log", path);
     if (comptime agents.hasAgentField(App, "stream")) {
         const stream = &agent.stream;
         try r.beginObject("stream");
@@ -910,6 +942,7 @@ noinline fn writeProblems(r: *Records, app: anytype) !void {
     try writeCompactionProblems(p);
     try writeMcpHostProblems(p, app);
     try writeModelCatalogProblems(p);
+    try writeSignInProblems(p);
     try writeOutputLimitProblems(p);
 
     try r.begin("problems");
@@ -1070,6 +1103,24 @@ fn writeModelCatalogProblems(p: *Records) !void {
         const event = &events[index];
         reported += 1;
         try beginProblem(p, "model_catalog");
+        try p.text("event", event.name());
+        try p.optionalText("detail", event.detail());
+        try p.end();
+    }
+}
+
+/// The newest failed sign-in events: a refresh, an issuer request, or an
+/// `auth.lock` wait that failed, or a prompt that waits for a sign-in. They
+/// come from the kept failures, so later sign-in events never remove them.
+fn writeSignInProblems(p: *Records) !void {
+    var events: [diagnostics.failed_sign_in_event_capacity]diagnostics.SignInEvent = undefined;
+    const count = diagnostics.snapshotFailedSignInEvents(&events);
+    var index = count;
+    while (index > count -| sign_in_problems_shown) {
+        index -= 1;
+        const event = &events[index];
+        try beginProblem(p, "sign_in");
+        try p.time("at", event.timestamp_ms);
         try p.text("event", event.name());
         try p.optionalText("detail", event.detail());
         try p.end();
@@ -1797,6 +1848,43 @@ fn writeModelCatalog(r: *Records, app: anytype) !void {
         try writeModelCatalogEventFields(r, event);
         try r.end();
     }
+}
+
+/// The always-on sign-in events and the failed ones kept apart from them, so
+/// a shared trace shows why a prompt waited for a sign-in without FX_TRACE.
+fn writeSignIn(r: *Records) !void {
+    var events: [diagnostics.sign_in_ring_capacity]diagnostics.SignInEvent = undefined;
+    const count = diagnostics.snapshotSignInEvents(&events);
+    const kept = try r.arena.alloc(diagnostics.SignInEvent, diagnostics.failed_sign_in_event_capacity);
+    const kept_count = diagnostics.snapshotFailedSignInEvents(kept);
+
+    try r.begin("sign_in");
+    try r.number("events", count);
+    // Read after the snapshots, so neither is ever less than what they hold.
+    try r.number("session_events", diagnostics.signInEventCount());
+    try r.number("kept_failures", kept_count);
+    try r.number("session_failures", diagnostics.signInFailureCount());
+    try r.end();
+
+    for (events[0..count]) |*event| {
+        try r.begin("sign_in_event");
+        try writeSignInEventFields(r, event);
+        try r.end();
+    }
+    for (kept[0..kept_count]) |*event| {
+        try r.begin("failed_sign_in_event");
+        try writeSignInEventFields(r, event);
+        try r.end();
+    }
+}
+
+fn writeSignInEventFields(r: *Records, event: *const diagnostics.SignInEvent) !void {
+    try r.time("at", event.timestamp_ms);
+    try r.number("sequence", event.sequence);
+    try r.text("event", event.name());
+    try r.boolean("failed", event.failed);
+    try r.optionalText("detail", event.detail());
+    try r.boolean("truncated", event.truncated);
 }
 
 fn writeModelCatalogEventFields(r: *Records, event: *const diagnostics.ModelCatalogEvent) !void {
@@ -4348,6 +4436,56 @@ test "trace failed compaction details keep whole characters past the ring's boun
     }
 }
 
+test "trace sign-in records each lock wait and refresh, and keeps the failures as problems" {
+    const sign_in_trace = @import("../auth/sign_in_trace.zig");
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    const empty = try TestWriter.create();
+    defer empty.destroy();
+    try writeSignIn(&empty.records);
+    var empty_trace = try empty.trace();
+    defer empty_trace.deinit();
+    const none = try empty_trace.one("sign_in");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(none, "events"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(none, "kept_failures"));
+
+    sign_in_trace.record(.lock_wait, false, "outcome=taken waited_ms={d}", .{4_200});
+    sign_in_trace.record(.issuer, true, "outcome=failed step=token err={s} ms={d} login_deleted=false", .{ "Timeout", 15_000 });
+    sign_in_trace.record(.refresh, true, "mode=if_needed outcome=failed step=issuer err={s} ms={d}", .{ "Timeout", 19_200 });
+    sign_in_trace.record(.prompt, true, "outcome=waits_for_sign_in screen=subagent turn_id={d}", .{5});
+    // Later events that succeed never push the failures out.
+    for (0..diagnostics.sign_in_ring_capacity) |_| sign_in_trace.record(.lock_wait, false, "outcome=taken waited_ms={d}", .{0});
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSignIn(&w.records);
+    try writeSignInProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("sign_in");
+    try std.testing.expectEqual(@as(i64, diagnostics.sign_in_ring_capacity), try testInt(summary, "events"));
+    try std.testing.expectEqual(@as(i64, diagnostics.sign_in_ring_capacity + 4), try testInt(summary, "session_events"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "kept_failures"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "session_failures"));
+    try std.testing.expectEqual(diagnostics.sign_in_ring_capacity, trace.count("sign_in_event"));
+
+    try std.testing.expectEqual(@as(usize, 3), trace.count("failed_sign_in_event"));
+    const issuer = try trace.nth("failed_sign_in_event", 0);
+    try std.testing.expectEqualStrings("issuer", try testString(issuer, "event"));
+    try std.testing.expect(try testBool(issuer, "failed"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(issuer, "sequence"));
+    try std.testing.expectEqualStrings("outcome=failed step=token err=Timeout ms=15000 login_deleted=false", try testString(issuer, "detail"));
+
+    // Problems list the newest failure first.
+    try std.testing.expectEqual(@as(usize, sign_in_problems_shown), trace.count("problem"));
+    const newest = try trace.nth("problem", 0);
+    try std.testing.expectEqualStrings("sign_in", try testString(newest, "kind"));
+    try std.testing.expectEqualStrings("prompt", try testString(newest, "event"));
+    try std.testing.expectEqualStrings("outcome=waits_for_sign_in screen=subagent turn_id=5", try testString(newest, "detail"));
+    try std.testing.expectEqualStrings("issuer", try testString(try trace.nth("problem", 2), "event"));
+}
+
 test "trace model catalog records events and its problems" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -6298,8 +6436,8 @@ test "trace permissions and MCP servers become records with errors masked" {
         .{ .name = "env", .state = .missing_env, .transport = .stdio, .tools = 0, .signed_in = false, .needs_login = false, .missing = "API_TOKEN" },
     } };
     const grants = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("exa_search"), .target_path = @constCast("*") },
-        .{ .tool_name = @constCast("shell"), .target_path = @constCast("zig build") },
+        .{ .tool_name = @constCast("exa_search"), .target_path = @constCast("*"), .shell_epoch = 0 },
+        .{ .tool_name = @constCast("shell"), .target_path = @constCast("zig build"), .shell_epoch = 0 },
     };
     const w = try TestWriter.create();
     defer w.destroy();
@@ -7119,4 +7257,35 @@ test "trace stays well formed with every ring full and a long transcript" {
     try expectStartsWith(last_text, "AI_GATEWAY_API_KEY=[redacted]");
     try std.testing.expect(std.mem.find(u8, last_text, "\\xff\\xc3") != null);
     try expectEndsWith(last_text, "\nred line");
+}
+
+test "trace log path for a report never falls back to a refused FX_TRACE_LOG" {
+    const alloc = std.testing.allocator;
+    io_mod.resetEnvironForTest();
+    defer io_mod.resetEnvironForTest();
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const fifo = try std.Io.Dir.path.join(alloc, &.{ dir, "trace.log" });
+    defer alloc.free(fifo);
+    const fifo_z = try alloc.allocSentinel(u8, fifo.len, 0);
+    defer alloc.free(fifo_z);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("FX_TRACE_LOG", fifo);
+    io_mod.setEnvironMap(&env);
+
+    // Configuring refuses the FIFO without blocking, so no file sink is active.
+    try debug_trace.configureForTest(alloc, fifo);
+    try std.testing.expectEqual(@as(?[]const u8, null), debug_trace.activeLogPath());
+    try std.testing.expectEqual(@as(?[]const u8, null), traceLogPath());
 }

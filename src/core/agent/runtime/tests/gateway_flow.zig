@@ -12184,3 +12184,71 @@ test "400 and 422 still end after one request" {
         try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     }
 }
+
+test "processQueuedPrompt lets cancel win when cancel arrives between stream_error check and exhausted budget" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .stream_error = error.ReadFailed },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.cancel_on_settled_checkpoint = &fixture.cancel_flag;
+    var config = fixture.config();
+    config.recovery_retry_budget_ms = 100;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);
+}
+
+test "processQueuedPrompt sets recovery_retry_budget_exhausted only when the budget ran out" {
+    const alloc = std.testing.allocator;
+    // Retry once (503) then fail with 400: route_recovery_statuses publishes
+    // `failed`, yet recovery_retry_budget_exhausted stays false.
+    {
+        const completions = [_]FakeCompletion{
+            .{ .status = .service_unavailable, .retry_after_seconds = 0, .err_body = "{\"error\":{\"message\":\"unavailable\"}}" },
+            .{ .status = .bad_request, .err_body = "{\"error\":{\"message\":\"bad input\"}}" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var budget_exhausted = true;
+        var config = fixture.config();
+        config.recovery_retry_budget_ms = 300_000;
+        config.recovery_retry_budget_exhausted = &budget_exhausted;
+
+        try runFakePrompt(&gateway, &hooks, config, fixture.job());
+        try std.testing.expect(!budget_exhausted);
+        const last = hooks.route_recovery_statuses.items[hooks.route_recovery_statuses.items.len - 1];
+        try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.failed, last.kind);
+    }
+    // Fail 503 with budget exhausted: recovery_retry_budget_exhausted becomes true.
+    {
+        const completions = [_]FakeCompletion{
+            .{ .status = .service_unavailable, .retry_after_seconds = 1, .err_body = "{\"error\":{\"message\":\"unavailable\"}}" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var budget_exhausted = false;
+        var config = fixture.config();
+        config.recovery_retry_budget_ms = 100;
+        config.recovery_retry_budget_exhausted = &budget_exhausted;
+
+        try runFakePrompt(&gateway, &hooks, config, fixture.job());
+        try std.testing.expect(budget_exhausted);
+        const last = hooks.route_recovery_statuses.items[hooks.route_recovery_statuses.items.len - 1];
+        try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.failed, last.kind);
+    }
+}

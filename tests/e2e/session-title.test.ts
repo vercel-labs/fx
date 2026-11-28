@@ -20,7 +20,6 @@ import {
   startUpgradeServer,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 
 const MAIN_MODEL = "openai/gpt-5.5";
@@ -666,7 +665,7 @@ test.skipIf(SKIP_TMUX)("tui titles a session once, from its first prompt, when t
     await tui.sendText("now write the regression test for it");
     await waitUntil(() => held.cancelled, "the interrupted first turn");
     await waitUntil(() => traceHas(tracePath, "event=title_generation_skipped reason=already_started"), "the gate to refuse a second title");
-    await tui.waitForPane((pane) => pane.includes("SECOND_ANSWER_OK") && turnSettled(pane), 20000);
+    await tui.waitForReplyAndTurnEnd("SECOND_ANSWER_OK", 20000);
     expect(gateway.titleRequests).toHaveLength(1);
     expect(gateway.titleRequests[0]!.body).toContain("refactor the renderer loop");
     expect(sessionTitles(root)).not.toContain(GENERATED_TITLE);
@@ -695,7 +694,7 @@ test.skipIf(SKIP_TMUX)("tui titles the next session after /new when the first se
     });
     await tui.waitForStableComposer(15000);
     await tui.sendText(FIRST_PROMPT);
-    await tui.waitForPane((pane) => pane.includes("MAIN_ANSWER_OK") && turnSettled(pane), 20000);
+    await tui.waitForReplyAndTurnEnd("MAIN_ANSWER_OK", 20000);
     await waitUntil(() => gateway.titleRequests.length === 1, "the first title request");
     await tui.sendText("/new");
     await tui.waitForStableComposer(15000);

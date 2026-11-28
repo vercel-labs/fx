@@ -260,6 +260,8 @@ class PgsoPipelineTests(unittest.TestCase):
             "llvm_profdata": tool_root / "llvm-profdata",
             "llvm_ar": tool_root / "llvm-ar",
             "llvm_nm": tool_root / "llvm-nm",
+            "llvm_link": tool_root / "llvm-link",
+            "llvm_split": tool_root / "llvm-split",
             "clang": tool_root / "clang",
             "libllvm": self.root / "libLLVM.dylib",
             "ir_size": tool_root / "ir_size.py",

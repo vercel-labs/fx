@@ -259,6 +259,9 @@ const version_usage = "usage: fx --version\n";
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
+    /// The build's number on main, or 0 when unknown
+    /// (`update_target.CurrentBuild.build`).
+    build_number: u32 = 0,
     build_channel: update_target.Channel = .stable,
     auth_mode: credentials.AuthMode = .local,
     command_catalog: CommandCatalog,
@@ -2526,6 +2529,7 @@ fn runNonInteractiveWithDeps(
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
+                .build = cfg.build_number,
             }, channel, switch (opts.format) {
                 .text => .text,
                 .json => .json,
@@ -4536,7 +4540,7 @@ fn runConfig(alloc: Allocator, cfg: Config, deps: RunDeps, opts: cli_config.Opti
         loaded.entries.items;
 
     const matches: ?[]settings_entries.Entry = if (opts.key) |key|
-        try settings_entries.lookup(alloc, shown, key)
+        try cli_config.lookupEntries(alloc, shown, key)
     else
         null;
     defer if (matches) |found| alloc.free(found);
@@ -4546,7 +4550,7 @@ fn runConfig(alloc: Allocator, cfg: Config, deps: RunDeps, opts: cli_config.Opti
         .unknown = if (opts.key == null) loaded.unknown else &.{},
         .workspace_root = workspace_root,
         .show_origin = opts.show_origin,
-        .value_only = opts.key != null and entries.len == 1 and std.mem.eql(u8, entries[0].key, opts.key.?),
+        .value_only = opts.key != null and entries.len == 1 and cli_config.sameEntryKey(entries[0].key, opts.key.?),
     };
     if (opts.format == .text) {
         for (snapshot.unknown) |unknown| {
