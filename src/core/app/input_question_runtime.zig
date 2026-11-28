@@ -136,21 +136,22 @@ pub fn QuestionRuntime(comptime App: type) type {
         }
 
         fn finalizeQuestionTranscript(app: *App, agent: *AppAgent, cancelled: bool) !void {
-            const text = try question_ui.composeQuestionResolutions(
-                app.alloc,
-                &agent.question_prompt,
-                cancelled,
-                app.shell.layout.cols,
-            );
-            defer app.alloc.free(text);
-            try appendQuestionResolution(app, text, cancelled);
-        }
-
-        fn appendQuestionResolution(app: *App, body: []const u8, cancelled: bool) !void {
-            _ = if (cancelled)
-                try app.appendReplaceableTranscriptLineClassified(body, .question_resolution)
-            else
-                try app.appendReplaceableTranscriptLine(body);
+            if (cancelled) {
+                const text = try question_ui.composeQuestionResolutions(
+                    app.alloc,
+                    &agent.question_prompt,
+                    true,
+                    app.shell.layout.cols,
+                );
+                defer app.alloc.free(text);
+                _ = try app.appendReplaceableTranscriptLineClassified(text, .question_resolution);
+            } else {
+                // The transcript keeps the answers, not rows, so the block
+                // re-wraps when the terminal is resized.
+                const answers = try question_ui.resolvedAnswers(app.alloc, &agent.question_prompt);
+                defer app.alloc.free(answers);
+                _ = try app.appendQuestionAnswers(answers);
+            }
             app.shell.render_requests.request(.modal);
         }
 

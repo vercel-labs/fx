@@ -76,7 +76,6 @@ const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const resume_projection = @import("../../ui/transcript/resume_projection.zig");
 const tool_group_projection = @import("../../ui/transcript/tool_group_projection.zig");
-const question_ui = @import("../../ui/footer/question_ui.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
@@ -4297,9 +4296,7 @@ pub fn Runtime(comptime App: type) type {
                     self: *Self,
                     answers: []const types.QuestionAnswer,
                 ) !u32 {
-                    const text = try self.app.prepareHistoricalQuestionResolution(answers);
-                    defer self.app.alloc.free(text);
-                    return self.projection.appendReplaceableLine(text);
+                    return self.projection.appendQuestionAnswers(answers);
                 }
 
                 fn appendDiff(self: *Self, payload: diff.DiffEntryPayload) !void {
@@ -6948,14 +6945,6 @@ const TestApp = struct {
 
     fn historicalToolActivityKind(self: *TestApp, _: anytype, call: types.ToolCall) types.ToolActivityKind {
         return tool_dispatch.toolActivityKindForCall(self.alloc, builtin_tools.advertisement_set.registry, call);
-    }
-
-    fn prepareHistoricalQuestionResolution(self: *TestApp, answers: []const types.QuestionAnswer) ![]u8 {
-        return question_ui.composeResolvedQuestionAnswers(
-            self.alloc,
-            answers,
-            self.shell.layout.cols,
-        );
     }
 
     pub fn snapshotMcpToolNames(self: *TestApp, alloc: Allocator) ![][]u8 {
@@ -13506,9 +13495,6 @@ const Eb03SwitchApp = struct {
     }
     fn historicalToolActivityKind(self: *Eb03SwitchApp, _: anytype, call: types.ToolCall) types.ToolActivityKind {
         return tool_dispatch.toolActivityKindForCall(self.alloc, builtin_tools.advertisement_set.registry, call);
-    }
-    fn prepareHistoricalQuestionResolution(self: *Eb03SwitchApp, answers: []const types.QuestionAnswer) ![]u8 {
-        return question_ui.composeResolvedQuestionAnswers(self.alloc, answers, self.shell.layout.cols);
     }
 };
 

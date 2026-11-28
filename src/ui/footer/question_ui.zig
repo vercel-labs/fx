@@ -8,6 +8,10 @@ const render_engine = @import("../render_engine.zig");
 const question_freeform_layout = @import("question_freeform_layout.zig");
 
 const markdown_document = render_engine.markdown_document;
+const question_resolution = render_engine.question_resolution;
+const markdownStyles = question_resolution.markdownStyles;
+const WrappedTextLine = question_resolution.WrappedTextLine;
+const nextWrappedTextLine = question_resolution.nextWrappedTextLine;
 
 const Allocator = std.mem.Allocator;
 
@@ -148,15 +152,6 @@ fn composeQuestionRows(
         // to, shows as it was written.
     }
     return composePlainQuestionRows(alloc, entry.question, cols);
-}
-
-/// Styles for Markdown shown outside the transcript, in the active theme.
-fn markdownStyles() render_engine.transcript_blocks.Styles {
-    return .{
-        .reset_style = ui_render.reset_style,
-        .dim_style = ui_render.dim_style,
-        .code_highlight_theme = if (ui_render.is_light) .light else .dark,
-    };
 }
 
 fn composePlainQuestionRows(alloc: Allocator, question: []const u8, cols: u16) ![]u8 {
@@ -624,41 +619,6 @@ fn questionOptionLabelWidths(
     };
 }
 
-const WrappedTextLine = struct {
-    content_end: usize,
-    next_start: usize,
-};
-
-fn nextWrappedTextLine(text: []const u8, start: usize, content_width: usize) WrappedTextLine {
-    if (start >= text.len) return .{ .content_end = text.len, .next_start = text.len };
-
-    const newline = std.mem.findScalar(u8, text[start..], '\n');
-    const segment_end = if (newline) |relative| start + relative else text.len;
-    const segment = text[start..segment_end];
-    const prefix = display_width.wrapCutIgnoringAnsi(segment, content_width);
-    if (prefix.len < segment.len) {
-        if (prefix.len > 0) {
-            const content_end = start + prefix.len;
-            var next_start = content_end;
-            while (next_start < segment_end and
-                (text[next_start] == ' ' or text[next_start] == '\t'))
-            {
-                next_start += 1;
-            }
-            return .{ .content_end = content_end, .next_start = next_start };
-        }
-
-        const unit = display_width.displayUnitAt(text, start);
-        const end = @min(start + unit.byte_len, segment_end);
-        return .{ .content_end = end, .next_start = end };
-    }
-
-    return .{
-        .content_end = segment_end,
-        .next_start = if (segment_end < text.len) segment_end + 1 else segment_end,
-    };
-}
-
 fn writeSelectedFreeformOptionLines(
     writer: *std.Io.Writer,
     entry: question_prompt.EntryProjection,
@@ -765,125 +725,26 @@ pub fn composeQuestionResolutions(
         return out.toOwnedSlice();
     }
 
-    var answers: std.ArrayList(types.QuestionAnswer) = .empty;
-    defer answers.deinit(alloc);
-    try answers.ensureTotalCapacity(alloc, prompt.entries.items.len);
-    for (prompt.entries.items) |entry| {
-        answers.appendAssumeCapacity(.{
-            .question = entry.question,
-            .answer = entry.answer orelse "",
-        });
-    }
+    const answers = try resolvedAnswers(alloc, prompt);
+    defer alloc.free(answers);
+    return composeResolvedQuestionAnswers(alloc, answers, cols);
+}
 
-    return composeResolvedQuestionAnswers(alloc, answers.items, cols);
+/// Each question of `prompt` with its answer. The strings are borrowed from
+/// `prompt`; the caller owns and frees the slice.
+pub fn resolvedAnswers(
+    alloc: Allocator,
+    prompt: *const question_prompt.QuestionPrompt,
+) ![]types.QuestionAnswer {
+    const answers = try alloc.alloc(types.QuestionAnswer, prompt.entries.items.len);
+    for (prompt.entries.items, answers) |entry, *answer| {
+        answer.* = .{ .question = entry.question, .answer = entry.answer orelse "" };
+    }
+    return answers;
 }
 
 /// Terminal block rendered after a completed question batch resolves.
-/// The answer pairs are borrowed and must outlive this call.
-pub fn composeResolvedQuestionAnswers(
-    alloc: Allocator,
-    answers: []const types.QuestionAnswer,
-    cols: u16,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    for (answers, 0..) |answer, index| {
-        try writeQuestionAnswerResolution(alloc, &out.writer, answer.question, answer.answer, index + 1, cols);
-    }
-
-    return out.toOwnedSlice();
-}
-
-fn writeQuestionAnswerResolution(
-    alloc: Allocator,
-    writer: *std.Io.Writer,
-    question: []const u8,
-    answer: []const u8,
-    number: usize,
-    cols: u16,
-) !void {
-    // The question is numbered by its position in the batch; the muted
-    // answer hangs beneath, aligned under the question text. Pure
-    // typography, so the block never reads as a tool group.
-    var prefix_buf: [16]u8 = undefined;
-    const question_prefix = std.mem.print(&prefix_buf, "  {d}) ", .{number}) catch "  ";
-    var indent_buf: [16]u8 = undefined;
-    const indent = blk: {
-        const width = @min(display_width.visibleWidth(question_prefix), indent_buf.len);
-        @memset(indent_buf[0..width], ' ');
-        break :blk indent_buf[0..width];
-    };
-    if (!try writeResolutionMarkdown(alloc, writer, question_prefix, indent, question, cols)) {
-        try writeResolutionField(writer, question_prefix, indent, question, cols, null);
-    }
-    try writeResolutionField(writer, indent, indent, answer, cols, ui_render.statusline_style);
-}
-
-/// Writes the question as Markdown, as the prompt showed it, with its rows
-/// hanging under the first text column. Returns false, with nothing written,
-/// when the Markdown draws nothing or the terminal is too narrow for it.
-fn writeResolutionMarkdown(
-    alloc: Allocator,
-    writer: *std.Io.Writer,
-    first_prefix: []const u8,
-    indent: []const u8,
-    question: []const u8,
-    cols: u16,
-) !bool {
-    // Rendered rows start after the transcript's gutter, which the ordinal
-    // prefix takes the place of.
-    const gutter: usize = 2;
-    if (indent.len < gutter or cols < indent.len + 4) return false;
-    const render_cols: u16 = @intCast(cols - (indent.len - gutter));
-    if (markdown_document.gutterWidth(render_cols) != gutter) return false;
-
-    const rendered = try markdown_document.renderRows(alloc, question, render_cols, markdownStyles());
-    defer alloc.free(rendered);
-    if (rendered.len == 0) return false;
-
-    var rows = std.mem.splitScalar(u8, rendered, '\n');
-    var first = true;
-    while (rows.next()) |row| {
-        if (!markdown_document.isBlankRow(row)) {
-            try writer.writeAll(if (first) first_prefix else indent);
-            try writer.writeAll(if (std.mem.startsWith(u8, row, "  ")) row[gutter..] else row);
-        }
-        try writer.writeByte('\n');
-        first = false;
-    }
-    return true;
-}
-
-// Wraps like the main transcript: soft wrap at word boundaries inside each
-// hard line, with continuation rows hanging under the field's first text
-// column. Long fields never trail off with an ellipsis.
-fn writeResolutionField(
-    writer: *std.Io.Writer,
-    first_prefix: []const u8,
-    continuation_prefix: []const u8,
-    text: []const u8,
-    cols: u16,
-    style: ?[]const u8,
-) !void {
-    var start: usize = 0;
-    var first = true;
-    while (first or start < text.len) {
-        const prefix = if (first) first_prefix else continuation_prefix;
-        const budget = @as(usize, cols) -| display_width.visibleWidth(prefix);
-        const line = nextWrappedTextLine(text, start, budget);
-
-        if (style) |row_style| try writer.writeAll(row_style);
-        try writer.writeAll(prefix);
-        try writer.writeAll(text[start..line.content_end]);
-        if (style != null) try writer.writeAll(ui_render.reset_style);
-        try writer.writeByte('\n');
-
-        if (text.len == 0) break;
-        first = false;
-        start = line.next_start;
-    }
-}
+pub const composeResolvedQuestionAnswers = question_resolution.compose;
 
 fn writeCancelledResolution(writer: *std.Io.Writer) !void {
     try writer.writeAll(ui_render.red_style);

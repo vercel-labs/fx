@@ -8067,6 +8067,11 @@ pub const TranscriptRuntime = struct {
         return transcript_store.appendAssistantThematicRule(self, alloc);
     }
 
+    /// Copies `answers`; the caller keeps its own.
+    pub fn appendQuestionAnswers(self: *TranscriptRuntime, alloc: Allocator, answers: []const types.QuestionAnswer) !u32 {
+        return transcript_store.appendQuestionAnswers(self, alloc, answers);
+    }
+
     /// Walk `entries` and return a pointer to the segments of the
     /// assistant-turn entry with `id`, or null if no such entry exists
     /// (including when `id` belongs to a `raw_bytes` or `user_turn`

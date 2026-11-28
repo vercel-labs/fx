@@ -71,6 +71,7 @@ const prompt_history_store = @import("../session/prompt_history_store.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const render_request = @import("../../ui/render_request.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const question_resolution = @import("../../ui/render_engine/question_resolution.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const input_history_runtime = @import("input_history_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
@@ -3725,6 +3726,12 @@ const FakeApprovalCancelApp = struct {
         return self.appendReplaceableTranscriptLine(content);
     }
 
+    pub fn appendQuestionAnswers(self: *FakeApprovalCancelApp, answers: []const types.QuestionAnswer) !u32 {
+        const text = try question_resolution.compose(self.alloc, answers, self.shell.layout.cols);
+        defer self.alloc.free(text);
+        return self.appendReplaceableTranscriptLine(text);
+    }
+
     pub fn fileCompletions(
         _: *FakeApprovalCancelApp,
         _: []const u8,
@@ -4300,6 +4307,12 @@ const RoutingFakeApp = struct {
     pub fn appendReplaceableTranscriptLineClassified(self: *RoutingFakeApp, content: []const u8, class: transcript_runtime.RawEntryClass) !u32 {
         self.last_replaceable_class = class;
         return self.appendReplaceableTranscriptLine(content);
+    }
+
+    pub fn appendQuestionAnswers(self: *RoutingFakeApp, answers: []const types.QuestionAnswer) !u32 {
+        const text = try question_resolution.compose(self.alloc, answers, self.shell.layout.cols);
+        defer self.alloc.free(text);
+        return self.appendReplaceableTranscriptLine(text);
     }
 
     pub fn writeTranscriptClassified(self: *RoutingFakeApp, content: []const u8, _: bool, _: transcript_runtime.RawEntryClass) !void {

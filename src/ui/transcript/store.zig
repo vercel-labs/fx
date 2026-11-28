@@ -27,6 +27,7 @@ const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const command_output_runtime = @import("command_output_runtime.zig");
 const render_engine = @import("../render_engine.zig");
+const question_resolution = render_engine.question_resolution;
 const assistant_wrap = @import("../render_engine/assistant_wrap.zig");
 const source_preparation = @import("source_preparation.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
@@ -207,6 +208,7 @@ fn entryRetainedBytes(entry: TranscriptEntry) usize {
         .assistant_table => |e| tableRetainedBytes(e.table),
         .assistant_code_block => |e| e.block.language.len + e.block.code.len,
         .assistant_thematic_rule => 0,
+        .question_answers => |e| question_resolution.answersRetainedBytes(e.answers),
     };
 }
 
@@ -1932,6 +1934,12 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
             .created_at_ms = assistant.created_at_ms,
             .inline_hidden = assistant.inline_hidden,
         } },
+        .question_answers => |resolved| .{ .question_answers = .{
+            .id = resolved.id,
+            .created_at_ms = resolved.created_at_ms,
+            .inline_hidden = resolved.inline_hidden,
+            .answers = try question_resolution.dupeAnswers(alloc, resolved.answers),
+        } },
     };
 }
 
@@ -2643,6 +2651,18 @@ pub fn appendAssistantThematicRule(self: anytype, alloc: Allocator) !u32 {
     return appendAssistantBlockAtomic(self, alloc, entry, "assistant_rule_append", "append_assistant_thematic_rule");
 }
 
+/// Copies `answers`; the caller keeps its own.
+pub fn appendQuestionAnswers(self: anytype, alloc: Allocator, answers: []const types.QuestionAnswer) !u32 {
+    const owned = try question_resolution.dupeAnswers(alloc, answers);
+    errdefer question_resolution.freeAnswers(alloc, owned);
+    const entry: TranscriptEntry = .{ .question_answers = .{
+        .id = self.notebook.next_entry_id,
+        .created_at_ms = io_mod.milliTimestamp(),
+        .answers = owned,
+    } };
+    return appendAssistantBlockAtomic(self, alloc, entry, "question_answers_append", "append_question_answers");
+}
+
 pub fn lookupAssistantSegments(self: anytype, id: u32) ?*AssistantTurnSegments {
     for (self.notebook.entries.items) |*entry| {
         switch (entry.*) {
@@ -3067,6 +3087,7 @@ fn finalizedPublicationEntry(self: anytype, next: anytype, entry: TranscriptEntr
             (next.notebook.entries.items.len == 0 or next.notebook.entries.items[next.notebook.entries.items.len - 1].id() != entry.id() or !self.notebook.transcript_release.assistant_tail_writable),
         .user_turn => |user| !user.inline_hidden,
         .assistant_table, .assistant_code_block, .assistant_thematic_rule => true,
+        .question_answers => |resolved| !resolved.inline_hidden,
     };
 }
 
@@ -3203,6 +3224,7 @@ pub fn streamAssistantChunk(
         .assistant_table => "assistant_table",
         .assistant_code_block => "assistant_code_block",
         .assistant_thematic_rule => "assistant_thematic_rule",
+        .question_answers => "question_answers",
     };
     const admission = try commitAssistantStreamChunkFast(self, alloc, metrics, text);
 
@@ -3258,7 +3280,7 @@ pub fn retintEntriesForTheme(
                 }
             },
             // Drawn from their source when painted, in the active theme.
-            .semantic_notice, .user_turn, .assistant_code_block, .assistant_thematic_rule => {},
+            .semantic_notice, .user_turn, .assistant_code_block, .assistant_thematic_rule, .question_answers => {},
         }
     }
 

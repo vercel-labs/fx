@@ -164,7 +164,6 @@ const url_opener = @import("core/hosts/url_opener.zig");
 const event_loop = @import("ui/event_loop.zig");
 const loop_timeout = @import("ui/loop_timeout.zig");
 const footer_runtime = @import("ui/footer/runtime.zig");
-const question_ui = @import("ui/footer/question_ui.zig");
 const ui_input = @import("ui/input/runtime.zig");
 const input_action = @import("core/input/input_action.zig");
 const paste_framing = @import("core/input/paste_framing.zig");
@@ -2950,24 +2949,7 @@ const App = struct {
         self: *App,
         answers: []const types.QuestionAnswer,
     ) !u32 {
-        const text = try question_ui.composeResolvedQuestionAnswers(
-            self.alloc,
-            answers,
-            self.shell.layout.cols,
-        );
-        defer self.alloc.free(text);
-        return self.appendReplaceableTranscriptLine(text);
-    }
-
-    pub fn prepareHistoricalQuestionResolution(
-        self: *App,
-        answers: []const types.QuestionAnswer,
-    ) ![]u8 {
-        return question_ui.composeResolvedQuestionAnswers(
-            self.alloc,
-            answers,
-            self.shell.layout.cols,
-        );
+        return self.appendQuestionAnswers(answers);
     }
 
     pub fn attachHistoricalToolCallWithoutResult(
@@ -3013,6 +2995,11 @@ const App = struct {
 
     pub fn appendReplaceableTranscriptLine(self: *App, text: []const u8) !u32 {
         return self.shell.appendReplaceableTranscriptLine(self.alloc, &self.metrics, text);
+    }
+
+    /// Copies `answers`; the caller keeps its own.
+    pub fn appendQuestionAnswers(self: *App, answers: []const types.QuestionAnswer) !u32 {
+        return self.shell.appendQuestionAnswers(self.alloc, answers);
     }
 
     pub fn appendReplaceableTranscriptLineClassified(self: *App, text: []const u8, class: transcript_runtime.RawEntryClass) !u32 {

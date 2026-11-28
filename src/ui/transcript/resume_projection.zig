@@ -8,6 +8,7 @@ const command_output_runtime = @import("command_output_runtime.zig");
 const source_preparation = @import("source_preparation.zig");
 const transcript_runtime = @import("runtime.zig");
 const transcript_store = @import("store.zig");
+const question_resolution = @import("../render_engine/question_resolution.zig");
 
 const Allocator = std.mem.Allocator;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
@@ -125,12 +126,6 @@ pub const ResumeProjection = struct {
         } });
     }
 
-    pub fn appendReplaceableLine(self: *ResumeProjection, text: []const u8) !u32 {
-        const entry_id = try self.appendRawClassified(text, .unknown_raw);
-        if (entry_id != 0) self.runtime.notebook.replaceable_last_line = true;
-        return entry_id;
-    }
-
     pub fn appendToolStatus(
         self: *ResumeProjection,
         kind: types.ToolOutcomeKind,
@@ -179,6 +174,17 @@ pub const ResumeProjection = struct {
             .id = self.runtime.notebook.next_entry_id,
             .created_at_ms = self.created_at_ms,
             .block = block,
+        } });
+    }
+
+    /// Copies `answers`; the caller keeps its own.
+    pub fn appendQuestionAnswers(self: *ResumeProjection, answers: []const types.QuestionAnswer) !u32 {
+        const owned = try question_resolution.dupeAnswers(self.alloc, answers);
+        errdefer question_resolution.freeAnswers(self.alloc, owned);
+        return self.appendEntry(.{ .question_answers = .{
+            .id = self.runtime.notebook.next_entry_id,
+            .created_at_ms = self.created_at_ms,
+            .answers = owned,
         } });
     }
 
