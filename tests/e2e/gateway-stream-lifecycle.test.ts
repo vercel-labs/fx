@@ -17410,7 +17410,7 @@ test("symlink retarget mid-step explains why read_file did not run and lets the 
   writeFileSync(join(root.workspace, "new", "target.txt"), "NEW_SYMLINK_TARGET_PAYLOAD\n");
   symlinkSync("old", join(root.workspace, "link"), "dir");
   const expectedReason =
-    "Not executed: an earlier call in this step changed the target of this call. " +
+    "Not executed: the target of this call changed after this step was prepared. " +
     "Reissue the call to run it on the current target.";
   const responses = [
     fakeGatewaySse([

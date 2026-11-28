@@ -421,6 +421,9 @@ pub fn ordinaryApplicableTargetFreshnessInScope(
         .registered => if (candidate.applicable_targets.len == 0) return .fresh,
         .legacy_target_resolution => {},
     }
+    // prepareReadyCall already looked up `call.name` in the same immutable
+    // batch tool_registry before producing `.registered` or
+    // `.legacy_target_resolution`, so a lookup miss is unreachable mid-step.
     const tool = tool_registry.lookup(call.name) orelse return .target_unavailable;
 
     const current_preparation = try prepareRegisteredApplicableTargets(
@@ -431,6 +434,9 @@ pub fn ordinaryApplicableTargetFreshnessInScope(
         tool.*,
     );
     const current = switch (current_preparation) {
+        // `candidate.kind == .registered` resolved targets at preparation, so
+        // `.legacy_candidate` here means re-resolving the target or command
+        // `cwd` failed mid-step (for example, deleted path or broken symlink).
         .legacy_candidate => return if (candidate.kind == .legacy_target_resolution)
             .fresh
         else
