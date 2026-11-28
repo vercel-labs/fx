@@ -21,6 +21,7 @@ test {
     _ = @import("core/auth/grok_oauth.zig");
     _ = @import("core/cli/cli_flags.zig");
     _ = @import("core/config/configured_provider.zig");
+    _ = @import("core/execution/process_tree.zig");
     _ = @import("core/shortcuts/shortcut_map.zig");
     _ = @import("core/app/app_agents_runtime.zig");
     _ = @import("core/app/app_session_runtime.zig");
