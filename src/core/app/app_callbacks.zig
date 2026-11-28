@@ -3617,7 +3617,7 @@ const CommitSplitTestApp = struct {
     }
     pub fn writeCommandOutputChunk(_: *@This(), _: command_output_content.Stream, _: []const u8, _: bool) !void {}
     pub fn flushCommandOutputSummary(_: *@This(), _: bool) !void {}
-    pub fn allowToolForSession(_: *@This(), _: anytype, _: []const u8, _: []const u8) !void {}
+    pub fn allowToolForSession(_: *@This(), _: anytype, _: []const u8, _: []const u8, _: u64) !void {}
     pub fn registerAndEmitDiffBlock(_: *@This(), _: anytype, payload: diff_mod.DiffEntryPayload) !void {
         diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
     }
