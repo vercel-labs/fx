@@ -11808,6 +11808,84 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP bash fx tool web redacts url credentials and signed query parameters in session/update rows (R4.8)",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-bash-web-redact-");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          experimental: { bash_tool: true },
+          permission: { bash: "allow", web_fetch: "allow" },
+        }),
+      );
+      const credPass = "ACP_SECRET_URL_PASS_555";
+      const sigVal = "ACP_SECRET_AMZ_SIG_987";
+      const tokVal = "ACP_SECRET_TOK_123";
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes('"name":"permission_decision"')) return fakeGatewayPermissionDecision("clear");
+        if (body.includes('"toolCallId":"acp_web_redact"')) return finalText("ACP_WEB_REDACT_DONE");
+        if (body.includes("Fetch secret URLs.")) {
+          return fakeGatewayToolCall("acp_web_redact", "bash", {
+            command: 'web "$CRED_URL" || true; web "$SIGNED_URL" || true',
+          });
+        }
+        return finalText("ACP_OTHER");
+      });
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_SOUND: "0",
+            CRED_URL: `https://alice:${credPass}@example.com/private`,
+            SIGNED_URL: `http://10.0.0.1/private?X-Amz-Signature=${sigVal}&token=${tokVal}`,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const run = await runPrompt(client, "Fetch secret URLs.", 60_000);
+        expect(run.promptResult.result.stopReason).toBe("end_turn");
+
+        const updatesJson = JSON.stringify(run.messages);
+        expect(updatesJson).toContain("web_fetch refuses credential-bearing URLs");
+        expect(updatesJson).toContain("web_fetch only fetches known public HTTP(S) URLs");
+        for (const secret of [credPass, sigVal, tokVal]) {
+          expect(updatesJson).not.toContain(secret);
+        }
+
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+
+        const sessionsDir = join(root.home, ".fx", "sessions");
+        const walk = (dir: string): string[] =>
+          existsSync(dir)
+            ? readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+                const full = join(dir, entry.name);
+                if (entry.isDirectory()) return walk(full);
+                if (entry.isFile()) return [full];
+                return [];
+              })
+            : [];
+        for (const file of walk(sessionsDir)) {
+          const content = readFileSync(file, "utf8");
+          for (const secret of [credPass, sigVal, tokVal]) {
+            expect(content).not.toContain(secret);
+          }
+        }
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  test(
     "ACP bash runs skill list and agent status, and the result holds the skill line and the agent status",
     async () => {
       const root = createIsolatedRoot("fx-acp-bash-skill-agent-");

@@ -2310,3 +2310,70 @@ test.skipIf(!tmuxAvailable())(
   },
   60_000,
 );
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash bridged web_fetch redacts url credentials and signed query parameters in rows and saved session log (R4.8)",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-web-redact-", {
+      permission_mode: "full-access",
+      experimental: { bash_tool: true },
+    });
+    const credPass = "SUPER_SECRET_URL_PASS_555555";
+    const sigVal = "SUPER_SECRET_AMZ_SIG_987654321";
+    const tokVal = "SUPER_SECRET_QUERY_TOK_123456789";
+    const credUrl = `https://alice:${credPass}@example.com/private`;
+    const signedUrl = `http://10.0.0.1/private?X-Amz-Signature=${sigVal}&token=${tokVal}`;
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("tui_web_redact", "bash", {
+        command: 'web "$CRED_URL" || true\nweb "$SIGNED_URL" || true',
+      }),
+      fakeGatewayFinalText("TUI_WEB_REDACT_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, {
+      FX_PERMISSION_MODE: "full-access",
+      CRED_URL: credUrl,
+      SIGNED_URL: signedUrl,
+    });
+
+    await active.sendText("Run secret URLs.");
+    await active.waitForText("TUI_WEB_REDACT_DONE", TIMEOUT);
+
+    const scrollback = await active.captureFullScrollback();
+    const grid = (await active.capturePaneGrid()).join("\n");
+    expect(scrollback).toContain("Couldn't fetch");
+    expect(scrollback).toContain("[redacted]@example.com/private");
+    expect(scrollback).toContain("X-Amz-Signature=[redacted]&token=[redacted]");
+    for (const secret of [credPass, sigVal, tokVal]) {
+      expect(scrollback).not.toContain(secret);
+      expect(grid).not.toContain(secret);
+    }
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+    const sessionsDir = join(fixture.home, ".fx", "sessions");
+    const walk = (dir: string): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) return walk(full);
+        if (entry.isFile()) return [full];
+        return [];
+      });
+    const sessionFiles = walk(sessionsDir);
+    expect(sessionFiles.length).toBeGreaterThan(0);
+    for (const file of sessionFiles) {
+      const content = readFileSync(file, "utf8");
+      for (const secret of [credPass, sigVal, tokVal]) {
+        expect(content).not.toContain(secret);
+      }
+    }
+    const logFile = sessionFiles.find((f) => f.endsWith("log.jsonl"));
+    expect(logFile).toBeDefined();
+    const logText = readFileSync(logFile!, "utf8");
+    expect(logText).toContain("mcp_bridge_call");
+    expect(logText).toContain("[redacted]");
+  },
+  60_000,
+);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const toolbox = @import("toolbox.zig");
+const execution_memory = @import("../agent/execution_memory.zig");
 const observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -1647,9 +1648,13 @@ fn bashToolRowInfo(arena: Allocator, specs: tool_dispatch.Registry, operation: m
                 .target = try rowPath(arena, agent),
             },
         },
-        .web_fetch => |req| .{
-            .tool = "web_fetch",
-            .action = try webRowAction(arena, specs, "web_fetch", try rowPath(arena, req.url)),
+        .web_fetch => |req| blk: {
+            // Redact credentials and signed query values before building any row or saved summary (RULES.md R1.8, R4.8).
+            const display_url = try text_utils.redactUrlForDisplay(arena, req.url);
+            break :blk .{
+                .tool = "web_fetch",
+                .action = try webRowAction(arena, specs, "web_fetch", try rowPath(arena, display_url)),
+            };
         },
         .web_search => |req| .{
             .tool = "web_search",
@@ -2250,7 +2255,7 @@ const BridgeCallRow = struct {
                 .reconciles_provisional_call_id = null,
                 .tool_name = self.tool,
                 .activity_kind = action.activity_kind,
-                .arguments_json = if (arguments_json.len <= max_argument_bytes) try text_utils.maskSecrets(arena, arguments_json) else null,
+                .arguments_json = if (arguments_json.len <= max_argument_bytes) try execution_memory.redactToolArgumentsJson(arena, self.tool, arguments_json) else null,
                 .resolved_display_target = if (action.target.len > 0) action.target else null,
             } });
             try self.publisher.push(.{ .progress = .{
@@ -3877,6 +3882,140 @@ test "a failed bridged web row says Failed once with its target terminal-safe, a
     try std.testing.expect(std.mem.find(u8, rows.lines.items[5], "● Failed\x1b[0m ") != null);
     try std.testing.expect(std.mem.find(u8, rows.lines.items[5], "Failed search") == null);
     try std.testing.expect(std.mem.find(u8, rows.lines.items[5], "\x1b[31m") == null);
+}
+
+test "bridged web_fetch rows, saved summaries, and started arguments redact url userinfo and signed query values" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Recorder = struct {
+        alloc: Allocator,
+        started_args: std.ArrayList(?[]u8) = .empty,
+        started_targets: std.ArrayList(?[]u8) = .empty,
+        lines: std.ArrayList([]u8) = .empty,
+        saved_summaries: std.ArrayList(?[]u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.started_args.items) |v| if (v) |s| self.alloc.free(s);
+            self.started_args.deinit(self.alloc);
+            for (self.started_targets.items) |v| if (v) |s| self.alloc.free(s);
+            self.started_targets.deinit(self.alloc);
+            for (self.lines.items) |s| self.alloc.free(s);
+            self.lines.deinit(self.alloc);
+            for (self.saved_summaries.items) |v| if (v) |s| self.alloc.free(s);
+            self.saved_summaries.deinit(self.alloc);
+        }
+
+        fn push(raw: *anyopaque, event: types.ToolLifecycleEvent) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .authoritative_started => |started| {
+                    try self.started_args.append(
+                        self.alloc,
+                        if (started.arguments_json) |json| try self.alloc.dupe(u8, json) else null,
+                    );
+                    try self.started_targets.append(
+                        self.alloc,
+                        if (started.resolved_display_target) |target| try self.alloc.dupe(u8, target) else null,
+                    );
+                },
+                .progress => |progress| try self.lines.append(self.alloc, try self.alloc.dupe(u8, progress.text)),
+                .terminal => |terminal| try self.lines.append(self.alloc, try self.alloc.dupe(u8, terminal.outcome.summary)),
+                else => {},
+            }
+        }
+
+        fn save(raw: *anyopaque, record: types.BridgeCallRecord) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.saved_summaries.append(
+                self.alloc,
+                if (record.summary) |s| try self.alloc.dupe(u8, s) else null,
+            );
+        }
+    };
+
+    var fetch_runtime = web_fetch_runtime.Runtime.init(.{ .allocator = alloc });
+    defer fetch_runtime.deinit(alloc);
+    const ok_url = "https://example.com/p?X-Amz-Signature=SECRET_AMZ_1&token=SECRET_TOK_1";
+    const fail_url = "http://u:SECRET_PASS_2@10.0.0.1/p?X-Amz-Signature=SECRET_AMZ_2&token=SECRET_TOK_2";
+    try fetch_runtime.insert(alloc, .{
+        .submitted_url = ok_url,
+        .final_url = ok_url,
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "cached page",
+    });
+
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{
+        .workspace_root = "/unused",
+        .permission_mode = .yolo,
+        .nested_tool_registry = test_builtin_tools.registry,
+        .web_fetch_runtime = &fetch_runtime,
+    };
+    defer rt.deinit(alloc);
+
+    var rec = Recorder{ .alloc = alloc };
+    defer rec.deinit();
+    var ctx = rt.context();
+    ctx.nested_tool_lifecycle = .{ .context = @ptrCast(&rec), .push_fn = Recorder.push, .save_bridge_call_fn = Recorder.save };
+    ctx.output_chunk_lifecycle_id = .{ .turn_id = 6, .call_id = "shell-call-redact" };
+    var state = McpCallBridgeState{ .runtime = ctx, .file_ops = true };
+
+    const ok_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-100", .{ .web_fetch = .{ .url = ok_url } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const ok_outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-100", "web_fetch", "", ok_allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, ok_outcome.status);
+
+    const fail_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-101", .{ .web_fetch = .{ .url = fail_url } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const fail_outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-101", "web_fetch", "", fail_allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, fail_outcome.status);
+
+    const expected_ok = "https://example.com/p?X-Amz-Signature=[redacted]&token=[redacted]";
+    const expected_fail = "http://[redacted]@10.0.0.1/p?X-Amz-Signature=[redacted]&token=[redacted]";
+    const secrets = [_][]const u8{
+        "SECRET_AMZ_1",
+        "SECRET_TOK_1",
+        "SECRET_PASS_2",
+        "SECRET_AMZ_2",
+        "SECRET_TOK_2",
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), rec.started_args.items.len);
+    try std.testing.expectEqual(@as(usize, 4), rec.lines.items.len);
+    try std.testing.expectEqual(@as(usize, 2), rec.saved_summaries.items.len);
+
+    for (rec.started_args.items, [_][]const u8{ expected_ok, expected_fail }) |maybe_args, expected| {
+        const args = maybe_args orelse return error.TestExpectedEqual;
+        for (secrets) |secret| try std.testing.expect(std.mem.find(u8, args, secret) == null);
+        try std.testing.expect(std.mem.find(u8, args, expected) != null);
+    }
+    for (rec.started_targets.items, [_][]const u8{ expected_ok, expected_fail }) |maybe_target, expected| {
+        const target = maybe_target orelse return error.TestExpectedEqual;
+        for (secrets) |secret| try std.testing.expect(std.mem.find(u8, target, secret) == null);
+        try std.testing.expectEqualStrings(expected, target);
+    }
+    for (rec.lines.items) |line| {
+        for (secrets) |secret| try std.testing.expect(std.mem.find(u8, line, secret) == null);
+    }
+    // Running, done, and failed rows carry the redacted URL.
+    try std.testing.expect(std.mem.find(u8, rec.lines.items[0], expected_ok) != null);
+    try std.testing.expect(std.mem.find(u8, rec.lines.items[1], expected_ok) != null);
+    try std.testing.expect(std.mem.find(u8, rec.lines.items[2], expected_fail) != null);
+    try std.testing.expect(std.mem.find(u8, rec.lines.items[3], expected_fail) != null);
+    for (rec.saved_summaries.items, [_][]const u8{ expected_ok, expected_fail }) |maybe_summary, expected| {
+        const summary = maybe_summary orelse return error.TestExpectedEqual;
+        for (secrets) |secret| try std.testing.expect(std.mem.find(u8, summary, secret) == null);
+        try std.testing.expect(std.mem.find(u8, summary, expected) != null);
+    }
 }
 
 test "bridged web_fetch under a domain deny rule is refused when the bash session's registry lacks web_fetch" {
@@ -8878,7 +9017,6 @@ test "run_command timeout returns model-visible failure" {
 
     const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
     const runtime_config = @import("../agent/runtime/config.zig");
-    const execution_memory = @import("../agent/execution_memory.zig");
     const session_codec = @import("../session/session_codec.zig");
 
     var cancel = std.atomic.Value(bool).init(false);
