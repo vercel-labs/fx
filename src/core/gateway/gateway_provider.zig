@@ -303,6 +303,32 @@ pub const CapabilityResolver = struct {
         return self.resolve(alloc, provider, input, model, fallback);
     }
 
+    /// Starts the load that `resolveWithin` or `refreshWithin` would run, on
+    /// its own thread, and returns at once. Their next call waits on it, from
+    /// its start, as `loadWithin` describes. It starts nothing when the
+    /// catalog needs no load, a load already runs, or the provider loads only
+    /// on the caller's thread; the next call then loads as before.
+    pub fn startLoad(
+        self: *CapabilityResolver,
+        alloc: Allocator,
+        provider: model_catalog.Provider,
+        input: model_catalog.FetchInput,
+    ) void {
+        if (comptime builtin.single_threaded) return;
+        if (!provider.reports_connection or self.pending_load != null) return;
+        if (!self.loadDue(provider, .init(input.access), model_catalog.clockMs())) return;
+        self.pending_load = CatalogLoad.start(alloc, provider, input) catch |err| {
+            debug_trace.logf("gateway", "model catalog load not started early err={s}", .{@errorName(err)});
+            return;
+        };
+    }
+
+    /// Whether the first load runs, from `startLoad` or a wait that was
+    /// cancelled, and nothing has loaded yet.
+    pub fn firstLoadRunning(self: *const CapabilityResolver) bool {
+        return self.state == .idle and self.pending_load != null;
+    }
+
     /// `refreshIfDue` for a caller that must not wait out a refresh that
     /// cannot reach the catalog. A due load runs as `loadWithin` describes;
     /// one given up on fails as any failed refresh does, so the catalog
@@ -342,6 +368,12 @@ pub const CapabilityResolver = struct {
         if (!provider.reports_connection) return self.refreshIfDue(alloc, provider, input);
         self.freeEndedAbandonedLoads(alloc);
         const kind: []const u8 = if (self.state == .idle) "first load" else "refresh";
+        // A load started for another provider or access, such as by
+        // `startLoad`, would answer for the wrong catalog.
+        if (self.pending_load) |pending| if (!pending.serves(provider, input.access)) {
+            debug_trace.logf("gateway", "model catalog {s} left: started for another provider or access", .{kind});
+            self.abandonPendingLoad();
+        };
         const load = self.pending_load orelse started: {
             const started = CatalogLoad.start(alloc, provider, input) catch |err| {
                 debug_trace.logf("gateway", "model catalog {s} runs inline err={s}", .{ kind, @errorName(err) });
@@ -356,10 +388,7 @@ pub const CapabilityResolver = struct {
             }
             const waited_ms = model_catalog.clockMs() - load.started_ms;
             if (waited_ms >= wait_ms and !load.connected.load(.acquire)) {
-                load.cancel_requested.store(true, .seq_cst);
-                self.pending_load = null;
-                load.next = self.abandoned_loads;
-                self.abandoned_loads = load;
+                self.abandonPendingLoad();
                 debug_trace.logf("gateway", "model catalog {s} abandoned before it connected waited_ms={d}", .{ kind, waited_ms });
                 const requested = model_catalog.AccessMetadata.init(load.input.access);
                 return self.adopt(alloc, provider, requested, load.started_ms, .{ .failed = .{
@@ -374,6 +403,15 @@ pub const CapabilityResolver = struct {
         const requested = model_catalog.AccessMetadata.init(load.input.access);
         const started_ms = load.started_ms;
         try self.adopt(alloc, provider, requested, started_ms, load.finish(alloc));
+    }
+
+    /// Cancels the pending load and keeps it until it ends, unadopted.
+    fn abandonPendingLoad(self: *CapabilityResolver) void {
+        const load = self.pending_load orelse return;
+        load.cancel_requested.store(true, .seq_cst);
+        self.pending_load = null;
+        load.next = self.abandoned_loads;
+        self.abandoned_loads = load;
     }
 
     fn freeEndedAbandonedLoads(self: *CapabilityResolver, alloc: Allocator) void {
@@ -531,6 +569,11 @@ const CatalogLoad = struct {
     fn run(self: *CatalogLoad, alloc: Allocator) void {
         self.result = model_catalog.fetchWithPublicFallback(self.provider, alloc, self.input);
         self.finished.store(true, .release);
+    }
+
+    fn serves(self: *const CatalogLoad, provider: model_catalog.Provider, access: credentials.CatalogAccess) bool {
+        return std.meta.eql(self.provider.provider_id, provider.provider_id) and
+            std.meta.eql(model_catalog.AccessMetadata.init(self.input.access), model_catalog.AccessMetadata.init(access));
     }
 
     /// Joins a finished load, frees it, and returns its result.
@@ -1095,6 +1138,66 @@ test "a catalog that answers after its wait ended is freed, not adopted" {
     // The testing allocator fails the test if the late catalog leaks.
     resolver.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), gated.calls.load(.seq_cst));
+}
+
+test "a catalog load started before the first lookup returns at once, and the lookup waits on it" {
+    const alloc = std.testing.allocator;
+    var gated: GatedCatalog = .{ .connects = true };
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+    const input = model_catalog.FetchInput{ .endpoint = "/v1/models" };
+
+    // The catalog is held, yet the start returns with the load running.
+    resolver.startLoad(alloc, gated.provider(), input);
+    try std.testing.expect(resolver.firstLoadRunning());
+    // A second start leaves the one load running.
+    resolver.startLoad(alloc, gated.provider(), input);
+
+    gated.released.store(true, .seq_cst);
+    const capabilities = try resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{}, 60_000);
+    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
+    try std.testing.expect(!resolver.firstLoadRunning());
+    try std.testing.expectEqual(@as(usize, 1), gated.calls.load(.seq_cst));
+
+    // A catalog that loaded and is not due starts nothing.
+    resolver.startLoad(alloc, gated.provider(), input);
+    try std.testing.expect(resolver.pending_load == null);
+}
+
+test "a catalog load started early for another provider is left, and the lookup loads its own" {
+    const alloc = std.testing.allocator;
+    var early: GatedCatalog = .{ .connects = true };
+    var own = FakeCatalog{ .outcome = .ready };
+    var own_provider = reportingProvider(&own);
+    own_provider.provider_id = .codex;
+    var resolver: CapabilityResolver = .{};
+    const input = model_catalog.FetchInput{ .endpoint = "/v1/models" };
+
+    resolver.startLoad(alloc, early.provider(), input);
+    // Lets the early load answer later, so a lookup that wrongly waits on it
+    // ends and fails the checks below instead of hanging.
+    const releaser = try early.releaseAfter(300);
+    defer releaser.join();
+    const capabilities = try resolver.resolveWithin(alloc, own_provider, input, "provider/model", .{}, 60_000);
+    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
+    try std.testing.expectEqual(@as(usize, 1), own.calls);
+    try std.testing.expect(std.meta.eql(resolver.provider_id, own_provider.provider_id));
+
+    // The early load is cancelled and freed, never adopted.
+    resolver.deinit(alloc);
+    try std.testing.expect(early.saw_cancel.load(.seq_cst));
+}
+
+test "a provider that does not report its connection starts no early catalog load" {
+    const alloc = std.testing.allocator;
+    var gated: GatedCatalog = .{ .reports_connection = false, .released = .init(true) };
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+
+    // Its first lookup loads on the caller's thread, as `resolve` does.
+    resolver.startLoad(alloc, gated.provider(), .{ .endpoint = "/v1/models" });
+    try std.testing.expect(!resolver.firstLoadRunning());
+    try std.testing.expectEqual(@as(usize, 0), gated.calls.load(.seq_cst));
 }
 
 test "a first catalog load that finishes within its wait is adopted" {
