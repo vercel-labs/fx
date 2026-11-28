@@ -12,6 +12,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
 const session_presence = @import("session_presence.zig");
+const sign_in_trace = @import("sign_in_trace.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -920,15 +921,26 @@ fn lockMutationWithBackend(
     var fx_dir = open_fx_dir;
     errdefer fx_dir.close();
 
+    const started = io_mod.awakeMilliTimestamp();
     const taken = leased_lock.acquire(
         &fx_dir,
         mutation_lock_file_name,
-        io_mod.awakeMilliTimestamp(),
+        started,
         wait_ms,
         ops,
         "auth",
         "fx login",
-    ) catch |err| return session_presence.storageError(auth_file_name, err);
+    ) catch |err| {
+        // A lock fx only tries (`wait_ms` 0) is not a wait, and its busy
+        // answer is expected.
+        if (wait_ms > 0) sign_in_trace.record(.lock_wait, true, "outcome={s} waited_ms={d} limit_ms={d}", .{
+            if (err == error.LockBusy) "given_up" else @errorName(err),
+            io_mod.awakeMilliTimestamp() - started,
+            wait_ms,
+        });
+        return session_presence.storageError(auth_file_name, err);
+    };
+    if (wait_ms > 0) sign_in_trace.record(.lock_wait, false, "outcome=taken waited_ms={d}", .{taken.stamp_ms - started});
     var lock = taken.lock;
     errdefer lock.release();
 
@@ -1894,6 +1906,53 @@ test "OAuth session mutation lock serializes independent handles" {
             .{},
         ),
     );
+}
+
+test "the fx login lock records each wait it makes, and none for a lock it only tries" {
+    sign_in_trace.reset();
+    defer sign_in_trace.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A lock fx only tries (wait 0) is no wait: taken or busy, it records nothing.
+    var held = try lockMutationWithOps(.{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, 0, .{});
+    try std.testing.expectError(
+        error.LockBusy,
+        lockMutationWithOps(.{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, 0, .{}),
+    );
+    var events: [sign_in_trace.ring_capacity]sign_in_trace.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), sign_in_trace.snapshot(&events));
+
+    // A wait that runs out while another holds the lock gives up.
+    try std.testing.expectError(
+        error.LockBusy,
+        lockMutationWithOps(.{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, 50, .{}),
+    );
+    held.deinit();
+
+    // A free lock is taken; any other lock error is recorded by name.
+    var taken = try lockMutationWithOps(.{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, 50, .{});
+    taken.deinit();
+    const Denied = struct {
+        fn tryLock(_: ?*anyopaque, _: std.Io.File) anyerror!bool {
+            return error.AccessDenied;
+        }
+    };
+    // The caller sees a storage failure; the record keeps the lock's own error.
+    try std.testing.expectError(
+        error.CredentialStorageUnavailable,
+        lockMutationWithOps(.{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) }, 50, .{ .try_lock = Denied.tryLock }),
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), sign_in_trace.snapshot(&events));
+    try std.testing.expect(events[0].failed);
+    try std.testing.expect(std.mem.startsWith(u8, events[0].detail(), "outcome=given_up waited_ms="));
+    try std.testing.expect(std.mem.endsWith(u8, events[0].detail(), " limit_ms=50"));
+    try std.testing.expect(!events[1].failed);
+    try std.testing.expect(std.mem.startsWith(u8, events[1].detail(), "outcome=taken waited_ms="));
+    try std.testing.expect(events[2].failed);
+    try std.testing.expect(std.mem.startsWith(u8, events[2].detail(), "outcome=AccessDenied waited_ms="));
+    for (events[0..3]) |*event| try std.testing.expectEqualStrings("lock_wait", event.name());
 }
 
 test "oauth E2E issuer override accepts loopback HTTP only" {

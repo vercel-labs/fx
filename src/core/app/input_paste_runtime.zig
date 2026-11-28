@@ -6,6 +6,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const image_attachments = @import("../images/image_attachments.zig");
+const image_commands = @import("../images/image_commands.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const gesture_state = @import("../input/gesture_state.zig");
 const input_limit_rejection = @import("../input/input_limit_rejection.zig");
@@ -362,18 +363,32 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         /// The model picker lends the composer out as its query box: the
-        /// catalog, then a Ctrl+P flow's inline stages. An image attached
-        /// there would outlive the query, so image input stays out of it.
+        /// catalog, then a Ctrl+P flow's inline stages. The `/effort` menu
+        /// does too. An image attached there would outlive the query, so
+        /// image input stays out of it.
         pub fn modelPickerBorrowsComposer(app: *const App) bool {
             if (comptime @hasField(@TypeOf(app.input_runtime), "model_picker_draft")) {
                 if (app.input_runtime.model_picker_draft != null) return true;
+            }
+            if (comptime @hasField(@TypeOf(app.input_runtime), "effort_menu")) {
+                if (app.input_runtime.effort_menu.active) return true;
             }
             if (comptime !@hasField(App, "model_cache")) return false;
             return app.model_cache.menu.active;
         }
 
+        /// xterm.js terminals send an empty paste for Cmd+V when the clipboard holds only an image.
+        fn checkClipboardOnEmptyPaste(app: *App) !void {
+            if (modelPickerBorrowsComposer(app)) {
+                debug_trace.logf("input", "composer paste empty action=none reason=model_picker_borrows_composer", .{});
+                return;
+            }
+            debug_trace.logf("input", "composer paste empty action=clipboard_image", .{});
+            try image_commands.Commands(App).attachClipboard(app);
+        }
+
         pub fn finalizePastedBlock(app: *App, agent: *AppAgent, max_input_len: usize) !void {
-            if (app.input_runtime.paste.buffer.items.len == 0) return;
+            if (app.input_runtime.paste.buffer.items.len == 0) return checkClipboardOnEmptyPaste(app);
 
             // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
@@ -643,6 +658,10 @@ pub fn PasteEditRuntime(comptime App: type) type {
         fn maybeOpenPastedSkillMenu(app: *App, start: usize, end: usize) void {
             if (comptime !@hasField(App, "skills")) return;
             if (app.skills.menu.active) return;
+            // A pasted `$name` is part of the open `/effort` menu's query.
+            if (comptime @hasField(@TypeOf(app.input_runtime), "effort_menu")) {
+                if (app.input_runtime.effort_menu.active) return;
+            }
 
             const input = app.input_runtime.edit_state.input.items;
             var index = @min(start, input.len);

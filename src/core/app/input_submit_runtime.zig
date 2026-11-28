@@ -8,6 +8,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const sign_in_trace = @import("../auth/sign_in_trace.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -71,7 +72,7 @@ fn buildPendingPromptDraft(
     };
 }
 
-const restart_held_submit_notice = "fx restarts for the upgrade once the running turns stop and the prompt is empty; send this after the restart";
+const restart_held_submit_notice = "fx restarts for the update once the running turns stop and the prompt is empty; send this after the restart";
 
 /// What a prompt sent while fx waits to restart for an upgrade gets. Ctrl+G
 /// cancels a restart only while it waits for its turns, not once the held
@@ -185,7 +186,21 @@ pub fn SubmitRuntime(comptime App: type) type {
                 "trigger={s}",
                 .{trigger},
             );
+            sign_in_trace.record(.prompt, false, "outcome=resumed screen={s} turn_id={d} trigger={s}", .{
+                sign_in_trace.screenName(agent),
+                pending.draft.turn_id,
+                trigger,
+            });
             return true;
+        }
+
+        /// A held prompt now waits for a sign-in: only Enter, a sign-in, or a
+        /// change of source or team sends it on.
+        fn recordPromptWaitsForSignIn(agent: *const AppAgent, turn_id: anytype) void {
+            sign_in_trace.record(.prompt, true, "outcome=waits_for_sign_in screen={s} turn_id={d}", .{
+                sign_in_trace.screenName(agent),
+                turn_id,
+            });
         }
 
         pub fn resumePromptAfterAuth(app: *App, agent: *AppAgent, max_prompt_history: usize) !void {
@@ -338,6 +353,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                                 "",
                                 .{},
                             );
+                            recordPromptWaitsForSignIn(agent, pending.draft.turn_id);
                             return;
                         },
                     }
@@ -357,6 +373,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                             "",
                             .{},
                         );
+                        recordPromptWaitsForSignIn(agent, pending.draft.turn_id);
                         return;
                     }
                 }
@@ -645,7 +662,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (app.upgrader.restart != .none and !submitsQuit(app)) {
                     debug_trace.logf("input", "submit held reason=upgrade_restart_waits input_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
                     try app.writeDomainNotice(.{
-                        .topic = "upgrade",
+                        .topic = "update",
                         .tone = .neutral,
                         .body = restartHeldSubmitNotice(app.upgrader.restart == .waiting),
                     }, true);
@@ -671,10 +688,11 @@ pub fn SubmitRuntime(comptime App: type) type {
                     {
                         if (comptime @hasDecl(App, "retryPendingPromptCredential")) {
                             switch (try App.retryPendingPromptCredential(app, agents.screenAgentOf(app))) {
+                                // The prompt waits for a new refresh again, and
+                                // its `/trace` record says it went on.
                                 .pending => {
-                                    agents.screenAgentOf(app).submission.retry_after_auth = false;
-                                    agents.screenAgentOf(app).submission.pending.?.phase = .adopted;
-                                    app.shell.render_requests.request(.footer);
+                                    const resumed = resumePendingPromptAfterAuth(app, agents.screenAgentOf(app), "retry");
+                                    std.debug.assert(resumed);
                                 },
                                 .current => {
                                     const resumed = resumePendingPromptAfterAuth(app, agents.screenAgentOf(app), "submit");
@@ -2613,6 +2631,25 @@ test "Ctrl+C cancels pending ownership from every pre-worker phase" {
     try std.testing.expectEqual(@as(?u64, null), queued.agent().worker.queued_turn_id);
     try std.testing.expectEqual(@as(usize, 1), queued.agent().worker.delete_count);
     try std.testing.expectEqual(@as(usize, 1), queued.agent().worker.release_count);
+}
+
+test "a prompt that waited for a sign-in records that it went on" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    sign_in_trace.reset();
+    defer sign_in_trace.reset();
+    var app = try pendingLifecycleFake(std.testing.allocator, 807);
+    defer app.deinit();
+    Runtime.noteCommittedFrame(&app, (&app).agent());
+    app.agent().submission.pending.?.phase = .awaiting_auth;
+
+    try std.testing.expect(Runtime.resumePendingPromptAfterAuth(&app, (&app).agent(), "auth_completion"));
+    try std.testing.expectEqual(PendingPhase.adopted, app.agent().submission.pending.?.phase);
+    var events: [1]sign_in_trace.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), sign_in_trace.snapshot(&events));
+    try std.testing.expectEqualStrings("prompt", events[0].name());
+    try std.testing.expect(!events[0].failed);
+    try std.testing.expectEqualStrings("outcome=resumed screen=main turn_id=807 trigger=auth_completion", events[0].detail());
+    try std.testing.expect(Runtime.cancelPendingSubmission(&app, (&app).agent()));
 }
 
 test "Ctrl+C on a queued prompt gives back the stale shell handles note it carried (D93)" {

@@ -9,6 +9,7 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const token_pass_check = @import("token_pass_check.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
+const personal_shortcut_runtime = @import("personal_shortcut_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -676,13 +677,13 @@ pub fn Runtime(comptime App: type) type {
             return error.ContextCompactionPersistenceUnavailable;
         }
 
-        pub fn propagateGrant(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
+        pub fn propagateGrant(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
             if (comptime @hasDecl(App, "propagateGrant")) {
-                try app.propagateGrant(tool_name, target_path);
+                try app.propagateGrant(tool_name, target_path, shell_epoch);
                 return;
             }
-            try app_permission_runtime.Runtime(App).allowAtOnce(app, agent, tool_name, target_path);
-            try agent.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path);
+            try app_permission_runtime.Runtime(App).allowAtOnce(app, agent, tool_name, target_path, shell_epoch);
+            try agent.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path, shell_epoch);
         }
 
         pub fn pushEvent(app: *App, agent: *AppAgent, event: WorkerEvent) !void {
@@ -1658,6 +1659,14 @@ pub fn Runtime(comptime App: type) type {
                         try handlers.error_text(handlers.ctx, notice);
                     },
                     .restore_failed_prompt => |prompt| {
+                        // An open `/effort` menu holds only its query in the
+                        // composer; it closes first and gives back the draft
+                        // it set aside, so the rule below sees the real draft.
+                        if (comptime @hasDecl(@TypeOf(app.input_runtime), "cancelEffortMenu")) {
+                            if (app.input_runtime.cancelEffortMenu(app.alloc, "failed_prompt_restored")) {
+                                app.shell.render_requests.request(.footer);
+                            }
+                        }
                         // Never clobber a draft the user typed while the doomed
                         // turn was still retrying; only an empty composer gets
                         // the failed prompt back.
@@ -1766,6 +1775,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime agents.hasAgentField(App, "child_run")) {
                 if (lifecycle == .turn_finished) app_agents_runtime.Runtime(App).noteChildTurnFinished(app, agent, lifecycle.turn_finished);
             }
+            if (lifecycle == .turn_finished) personal_shortcut_runtime.Runtime(App).reloadAfterTurn(app);
             if (transition.applied_activity_kind) |kind| {
                 applyToolActivity(&agent.stream, kind);
             }
@@ -2116,7 +2126,7 @@ const FakeWorker = struct {
         self.propagated_history_turns += 1;
     }
 
-    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
+    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8, _: u64) !void {
         _ = alloc;
         _ = tool_name;
         _ = target_path;
