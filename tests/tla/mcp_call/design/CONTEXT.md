@@ -6,7 +6,7 @@ This describes the code on `6bb36a928` (`origin/main` when this workspace was ma
 
 | Entry point | Where | What it does |
 | --- | --- | --- |
-| A model's MCP tool call | `src/core/tooling/tool_mcp_runtime.zig:379-405` (`isAvailableDynamicTool`, `callAdvertisedDynamicTool`) | Runs a dynamic tool only if the model step advertised it, through the runtime's `call_tool` capability |
+| A model's MCP tool call | `src/core/tooling/tool_mcp_runtime.zig:379-405` (`isAvailableDynamicTool`) and `src/core/tooling/tool_mcp_registry.zig` (`resolve`, `call`) | Runs a dynamic tool only if the model step advertised it, through the runtime's `call_tool` capability |
 | The app's MCP call | `src/core/app/app_agent_runtime.zig:466` (`callMcpTool`) → `src/core/app/app_mcp_runtime.zig:920-931` (`State.callTool`) | Leases the MCP host and calls its catalog |
 | The catalog call | `src/core/mcp_host/model.zig:195-235` (`Catalog.callTool`) | Checks access and the runtime generation, finds the server, reports the call to the UI observer (`:219`), and runs it |
 | The engine call | `src/core/mcp_host/runtime.zig:647-667` (`call`, `callObserved`), `:708-735` (`submit`) | Queues the call to the runtime's owner thread, waits, and sends a cancel once when the cancel flag is set, then waits for that too |
@@ -20,7 +20,7 @@ This describes the code on `6bb36a928` (`origin/main` when this workspace was ma
 2. **Admission.** `tool_admission.requestPermissionOutcome` (`src/core/tooling/tool_admission.zig:1278`) decides the call. An MCP tool never takes the fast paths that skip review (`:1114-1124`, `:1333`), so it always meets the configured rules, then a saved-session rule, then the prompt or, in auto mode, the reviewer. Subagent workers prompt through `workerPrompter` (`:2101`).
 3. **Execution.** `Catalog.callTool` refuses when `access` does not allow the tool (`model.zig:203`, `:566-573`), when the advertised binding changed (`:204`), or when the authority's runtime generation changed (`:205`). It then calls `runtime.callObserved`.
 4. **Result.** `render` (`model.zig:835-853`) wraps the engine's answer, and `tool_result.extract` (`src/core/mcp/tool_result.zig:29-60`) parses it under a cap of `max(max_tool_result_bytes, 8 MiB)` (`:35`, `src/core/images/image_data.zig:7`). `serialize_capped` cuts the model's copy to `max_tool_result_bytes` and marks it truncated (`tool_result.zig:245-267`). The default is 64 KiB (`src/core/tooling/tool_result_limits.zig:7`).
-5. **Context.** `prepareCapturedToolModelOutput` (`src/core/agent/runtime/execution_memory.zig:655`) hands the result to `result_store.prepare` (`src/core/session/result_store.zig:66-96`). Above 16 KiB the model sees a 4 KiB preview and a handle (`:14-15`, `:458-463`). By then the MCP result is at most 64 KiB, so a larger result is already cut.
+5. **Context.** `prepareCapturedToolModelOutput` (`src/core/agent/runtime/execution_memory.zig`) hands the result to `result_store.prepare` (`src/core/session/result_store.zig`, `prepare`). Above 16 KiB the model sees a 4 KiB preview and a handle (`large_result_threshold_bytes`, `preview_bytes`). By then the MCP result is at most 64 KiB, so a larger result is already cut.
 
 ## Who owns each piece of state
 

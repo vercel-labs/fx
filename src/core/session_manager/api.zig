@@ -48,6 +48,7 @@ pub const ForkPoint = session_mod.ForkPoint;
 pub const Verified = session_mod.Verified;
 pub const VerifyOptions = session_mod.VerifyOptions;
 pub const Stop = session_mod.Stop;
+pub const LockStatus = session_mod.LockStatus;
 pub const Summary = catalog_mod.Summary;
 pub const ListPage = catalog_mod.Page;
 pub const ListCursor = catalog_mod.Cursor;
@@ -468,6 +469,14 @@ pub const Manager = struct {
         return session_mod.isBusy(&m.env, id);
     }
 
+    /// Whether another process has session `id` open for writing, and its PID
+    /// when recorded (`session.zig` `lockStatus`).
+    pub fn lockStatus(m: *Manager, id: []const u8) OpenError!LockStatus {
+        try checkId(id);
+        if (!try readyToRead(m)) return error.NotFound;
+        return session_mod.lockStatus(&m.env, id);
+    }
+
     pub fn getBlob(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
         try checkId(id);
         if (!schema.validBlobHash(hash)) return error.InvalidArgument;
@@ -613,6 +622,17 @@ pub const Session = struct {
     /// An owned copy of the folded state; free with `State.deinit`.
     pub fn state(s: Session, gpa: std.mem.Allocator) error{OutOfMemory}!State {
         return s.inner.stateCopy(gpa);
+    }
+
+    /// Whether every turn of the session ran in `workspace`: the session was
+    /// made there and never resumed from another folder, which a `set
+    /// workspace` line records. A saved path relative to a turn's workspace
+    /// then names a file in `workspace`.
+    pub fn ranOnlyIn(s: Session, gpa: std.mem.Allocator, workspace: []const u8) error{OutOfMemory}!bool {
+        if (!std.mem.eql(u8, s.inner.identity.workspace, workspace)) return false;
+        var copy = try s.state(gpa);
+        defer copy.deinit(gpa);
+        return copy.workspace == null;
     }
 
     /// Interrupts an open turn, appends `closed`, syncs, updates the index
@@ -769,8 +789,32 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             if (c.outcome == .lost and !import) return error.InvalidArgument;
             if (c.data) |data| try checkChildData(gpa, data);
         },
+        .input_accepted => |a| {
+            if (a.id == 0 or a.text.len == 0) return error.InvalidArgument;
+            if (a.text.len > max_value_bytes) return error.TooLarge;
+            if (!std.unicode.utf8ValidateSlice(a.text)) return error.InvalidArgument;
+            for (a.blobs) |hash| if (!schema.validBlobHash(hash)) return error.InvalidArgument;
+            if (a.images.len > max_accepted_images) return error.TooLarge;
+            for (a.images) |img| {
+                if (img.id == 0) return error.InvalidArgument;
+                if (img.path.len == 0 or img.path.len > max_image_ref_bytes) return error.InvalidArgument;
+                if (img.media_type.len == 0 or img.media_type.len > max_image_media_type_bytes) return error.InvalidArgument;
+                if (img.snapshot_path.len == 0 or img.snapshot_path.len > max_image_ref_bytes) return error.InvalidArgument;
+                if (!std.unicode.utf8ValidateSlice(img.path) or
+                    !std.unicode.utf8ValidateSlice(img.media_type) or
+                    !std.unicode.utf8ValidateSlice(img.snapshot_path)) return error.InvalidArgument;
+                if (!schema.validBlobHash(img.snapshot_sha256)) return error.InvalidArgument;
+            }
+        },
+        .input_delivered, .input_withdrawn => |r| {
+            if (r.id == 0) return error.InvalidArgument;
+        },
     };
 }
+
+const max_accepted_images = 64;
+const max_image_ref_bytes = std.Io.Dir.max_path_bytes;
+const max_image_media_type_bytes = 128;
 
 /// Folded into every snapshot for each child, so kept small (D22).
 fn checkChildData(gpa: std.mem.Allocator, raw: []const u8) AppendError!void {
@@ -1169,6 +1213,32 @@ const api_tests = struct {
         const c = try m.openResume(.{ .target = .{ .last_opened = .app }, .workspace = "/x", .host = .app });
         try testing.expectEqualStrings(id, c.id());
         c.release();
+    }
+
+    test "a session ran only in its workspace until it is resumed from another" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, .turn_committed });
+        try testing.expect(try s.ranOnlyIn(gpa, "/w"));
+        try testing.expect(!try s.ranOnlyIn(gpa, "/x"));
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+        const same = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
+        try testing.expect(try same.ranOnlyIn(gpa, "/w"));
+        same.release();
+        // Once resumed from /x, its turns may have run there, even after it
+        // comes back to /w.
+        const moved = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/x", .host = .app });
+        try testing.expect(!try moved.ranOnlyIn(gpa, "/x"));
+        try testing.expect(!try moved.ranOnlyIn(gpa, "/w"));
+        moved.release();
+        const back = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
+        try testing.expect(!try back.ranOnlyIn(gpa, "/w"));
+        back.release();
     }
 
     test "lastOpened names the app's session from the index, and isBusy sees its writer" {
@@ -2271,6 +2341,102 @@ const api_tests = struct {
         defer st.deinit(gpa);
         try testing.expectEqualStrings("\"You run inside Mini.\"", st.client_prompt.?);
         try testing.expectEqualStrings("{\"mcp_mini_read\":{\"server\":\"mini\",\"tool\":\"read\"}}", st.tool_identities.?);
+    }
+
+    test "Manager.read decodes input_accepted, input_delivered, and input_withdrawn lines" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+
+        const id = "rawapiread01";
+        const session_dir_path = try std.Io.Dir.path.join(gpa, &.{ f.root, id });
+        defer gpa.free(session_dir_path);
+        try std.Io.Dir.cwd().createDirPath(io, session_dir_path);
+        var session_dir = try std.Io.Dir.cwd().openDir(io, session_dir_path, .{});
+        defer session_dir.close(io);
+
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        const payloads = [_][]const u8{
+            "{\"v\":1,\"seq\":1,\"ts\":1,\"kind\":\"session_created\",\"id\":\"rawapiread01\",\"workspace\":\"/w\",\"role\":\"root\",\"host\":\"app\"",
+            "{\"v\":1,\"seq\":2,\"ts\":2,\"kind\":\"input_accepted\",\"id\":1,\"text\":\"hello\"",
+            "{\"v\":1,\"seq\":3,\"ts\":3,\"kind\":\"input_delivered\",\"id\":1",
+            "{\"v\":1,\"seq\":4,\"ts\":4,\"kind\":\"input_withdrawn\",\"id\":2",
+            "{\"v\":1,\"seq\":5,\"ts\":5,\"kind\":\"closed\"",
+        };
+        for (payloads) |p| try log_mod.appendFramed(gpa, &bytes, p);
+        try session_dir.writeFile(io, .{ .sub_path = "log.jsonl", .data = bytes.items });
+
+        var page = try f.manager.read(gpa, id, .start, .forward, 10);
+        defer page.deinit();
+        try testing.expectEqual(@as(usize, 5), page.entries.len);
+        for (page.entries) |entry| {
+            try testing.expect(entry.kind != null);
+            try testing.expect(entry.body != null);
+        }
+    }
+
+    test "input_accepted, input_delivered, and input_withdrawn validate id, text UTF-8, and max_value_bytes" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        defer s.release();
+
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 0, .text = "hi" } }}));
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 1, .text = "" } }}));
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 1, .text = "\xff" } }}));
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_delivered = .{ .id = 0 } }}));
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_withdrawn = .{ .id = 0 } }}));
+
+        const too_large = try gpa.alloc(u8, api.max_value_bytes + 1);
+        defer gpa.free(too_large);
+        @memset(too_large, 'a');
+        try testing.expectError(error.TooLarge, s.append(&.{.{ .input_accepted = .{ .id = 1, .text = too_large } }}));
+
+        const at_limit = try gpa.alloc(u8, api.max_value_bytes);
+        defer gpa.free(at_limit);
+        @memset(at_limit, 'a');
+        _ = try s.append(&.{
+            .{ .input_accepted = .{ .id = 1, .text = at_limit } },
+            .{ .turn_started = {} },
+            .{ .input_delivered = .{ .id = 1 } },
+            .{ .input_accepted = .{ .id = 2, .text = "steer" } },
+            .{ .input_withdrawn = .{ .id = 2 } },
+            .{ .turn_committed = {} },
+        });
+    }
+
+    test "input_accepted validates optional image references" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const s = try f.manager.openNew(.{ .workspace = "/w", .host = .app });
+        defer s.release();
+
+        const valid_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const valid_img = [_]schema.Body.InputAcceptedImage{.{
+            .id = 1,
+            .path = "/Users/example/a.png",
+            .media_type = "image/png",
+            .snapshot_path = "/tmp/fx-snap/a.bin",
+            .snapshot_sha256 = valid_sha,
+        }};
+        _ = try s.append(&.{.{ .input_accepted = .{ .id = 1, .text = "hi [Image #1]", .images = &valid_img } }});
+
+        var bad = valid_img;
+        bad[0].id = 0;
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 2, .text = "x", .images = &bad } }}));
+        bad = valid_img;
+        bad[0].snapshot_sha256 = "not-a-hash";
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 2, .text = "x", .images = &bad } }}));
+        bad = valid_img;
+        bad[0].snapshot_path = "";
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 2, .text = "x", .images = &bad } }}));
+        bad = valid_img;
+        bad[0].media_type = "\xff";
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 2, .text = "x", .images = &bad } }}));
     }
 };
 

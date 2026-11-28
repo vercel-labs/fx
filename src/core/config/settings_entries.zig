@@ -145,37 +145,7 @@ fn appendSettings(alloc: Allocator, list: *std.ArrayList(Entry), object: std.jso
         }
         // Workspace overrides are shown as their own origin.
         if (std.mem.eql(u8, name, "workspaces")) continue;
-        if (key.renamed_to) |current| {
-            try appendRenamed(alloc, list, entry.value_ptr.*, object.get(current), settings_keys.find(current).?, origin);
-            continue;
-        }
         try appendValue(alloc, list, name, entry.value_ptr.*, origin, key);
-    }
-}
-
-/// Shows a setting saved under its older name, such as `statusLine`, under its
-/// current one, leaving out each value the current key also sets, since that
-/// one wins.
-fn appendRenamed(
-    alloc: Allocator,
-    list: *std.ArrayList(Entry),
-    older: std.json.Value,
-    current: ?std.json.Value,
-    key: settings_keys.Key,
-    origin: Origin,
-) !void {
-    if (older != .object) {
-        if (current == null) try appendValue(alloc, list, key.name, older, origin, key);
-        return;
-    }
-    const shadow: ?std.json.ObjectMap = if (current) |value| (if (value == .object) value.object else null) else null;
-    var iterator = older.object.iterator();
-    while (iterator.next()) |child| {
-        if (!key.hasChild(child.key_ptr.*)) continue;
-        if (shadow) |object| if (object.contains(child.key_ptr.*)) continue;
-        const child_key = try std.mem.concat(alloc, u8, &.{ key.name, ".", child.key_ptr.* });
-        defer alloc.free(child_key);
-        try appendValue(alloc, list, child_key, child.value_ptr.*, origin, null);
     }
 }
 
@@ -211,7 +181,7 @@ test "entries follow precedence and flatten nested values" {
     const alloc = std.testing.allocator;
     var profile = try parseForTest(
         \\{"fast_mode":true,"maxxing_mode":1,"fast_mdoe":2,"model":"a/b",
-        \\ "statusLine":{"context":true,"contxt":false},
+        \\ "status_line":{"context":true,"contxt":false},
         \\ "models":{"codex":"gpt"},"provider_order":["x","y"],
         \\ "workspaces":{"/w":{"fast_mode":false,"effort":"high"},"/other":{"effort":"low"}}}
     );
@@ -240,28 +210,6 @@ test "entries follow precedence and flatten nested values" {
         try std.testing.expectEqual(want.origin, got.origin);
     }
     try std.testing.expect(entries.items[5].value == .array);
-}
-
-test "an older name shows under the current one, which wins any value both set" {
-    const alloc = std.testing.allocator;
-    var profile = try parseForTest(
-        \\{"status_line":{"context":true},"statusLine":{"context":false,"session":true},
-        \\ "notifications":{"max":true}}
-    );
-    defer profile.deinit();
-    var entries = try collect(alloc, .{ .profile = profile.value, .workspace_root = "/w" }, .all);
-    defer entries.deinit(alloc);
-
-    const expected = [_]struct { key: []const u8, value: bool }{
-        .{ .key = "status_line.context", .value = true },
-        .{ .key = "status_line.session", .value = true },
-        .{ .key = "sound.max", .value = true },
-    };
-    try std.testing.expectEqual(expected.len, entries.items.len);
-    for (expected, entries.items) |want, got| {
-        try std.testing.expectEqualStrings(want.key, got.key);
-        try std.testing.expectEqual(want.value, got.value.bool);
-    }
 }
 
 test "scopes pick the profile's own settings or this workspace's override" {
@@ -294,7 +242,7 @@ test "scopes pick the profile's own settings or this workspace's override" {
 test "lookup keeps the entry fx uses for each key under the name" {
     const alloc = std.testing.allocator;
     var profile = try parseForTest(
-        \\{"fast_mode":true,"statusLine":{"context":true,"session":true},
+        \\{"fast_mode":true,"status_line":{"context":true,"session":true},
         \\ "provider":"codex","provider_order":["x"],
         \\ "workspaces":{"/w":{"fast_mode":false,"status_line":{"context":false}}}}
     );
@@ -328,7 +276,7 @@ test "lookup keeps the entry fx uses for each key under the name" {
 
 test "collect frees its keys when it runs out of memory" {
     var profile = try parseForTest(
-        \\{"fast_mode":true,"statusLine":{"context":true},"models":{"codex":"gpt"},
+        \\{"fast_mode":true,"status_line":{"context":true},"models":{"codex":"gpt"},
         \\ "workspaces":{"/w":{"effort":"high"}}}
     );
     defer profile.deinit();

@@ -126,8 +126,9 @@ await waitFor(
   "gateway response",
   () => `commits=${commits}, fetches=${fetchCalls}, output=${JSON.stringify(first.capture.text().slice(-1000))}`,
 );
+// A one-request turn commits twice: the save before its model request, then the whole turn.
 await waitFor(
-  () => commits === 1,
+  () => commits === 2,
   "completed-turn session commit",
   () => `commits=${commits}, fetches=${fetchCalls}, output=${JSON.stringify(first.capture.text().slice(-1000))}`,
 );
@@ -160,7 +161,8 @@ const sentBefore = requestBodies.length;
 const commitsBefore = commits;
 restored.runtime.write("what did I ask you to remember\r");
 await waitFor(
-  () => requestBodies.length === sentBefore + 1 && commits === commitsBefore + 1,
+  // The same two commits as the first turn: the save before its request, then the whole turn.
+  () => requestBodies.length === sentBefore + 1 && commits === commitsBefore + 2,
   "the restored session's next turn",
   () => `commits=${commits}, fetches=${fetchCalls}, output=${JSON.stringify(restored.capture.text().slice(-1000))}`,
 );

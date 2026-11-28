@@ -3,9 +3,11 @@
 //! its ID (`T12:`, or `T3–T7:` for calls that share a line), then the
 //! sections Rules, Facts, Decisions, Status and Open, and Earlier when a
 //! compaction folds the one before it (`ledger.writeRequest`). Each call
-//! noted and each section begun is one step of the count, read with the
-//! notes reader's own line rules (`ledger.lineStart`). Only the start of each
-//! line is read, so a chunk can end anywhere, even inside an ID.
+//! noted and each section begun moves the count, read with the notes
+//! reader's own line rules (`ledger.lineStart`). A call's line is short and
+//! a section holds many entries, so in a large compaction the sections
+//! together weigh a third of the calls (`Counter.percent`). Only the start
+//! of each line is read, so a chunk can end anywhere, even inside an ID.
 
 const std = @import("std");
 const ledger = @import("ledger.zig");
@@ -16,17 +18,28 @@ const Allocator = std.mem.Allocator;
 pub const TextSink = struct {
     context: *anyopaque,
     write_fn: *const fn (context: *anyopaque, chunk: []const u8) void,
+    /// Told when a request is about to be sent, before any of its reply.
+    asked_fn: ?*const fn (context: *anyopaque) void = null,
 
     pub fn write(self: TextSink, chunk: []const u8) void {
         self.write_fn(self.context, chunk);
     }
+
+    pub fn asked(self: TextSink) void {
+        if (self.asked_fn) |tell| tell(self.context);
+    }
 };
 
-/// Receives the count, from 1 to 99, each time it goes up. It never sees
-/// 100: the notes are not done until fx has read and saved them.
+/// Receives the share of the notes written, from 1 to 100, each time it
+/// goes up. The row that shows it holds it below 100% until fx has saved
+/// the notes.
 pub const Sink = struct {
     context: *anyopaque,
     written_fn: *const fn (context: *anyopaque, percent: u8) void,
+    /// Told when a summary request is about to be sent: the first one, a
+    /// follow-up for turns the notes left out, another model after a
+    /// failure, and each part of a conversation too large for one request.
+    asked_fn: ?*const fn (context: *anyopaque) void = null,
 };
 
 /// The sections every request asks for, and Earlier.
@@ -36,8 +49,8 @@ const section_count = @typeInfo(ledger.Section).@"enum".field_names.len;
 /// or a section heading, with Markdown around them, fits.
 const line_start_bytes = 64;
 
-/// The highest count before the notes are saved.
-pub const most_before_saved = 99;
+/// A tool call's weight in the count; see `Counter.percent`.
+const call_weight = 3;
 
 pub const Counter = struct {
     sink: ?Sink = null,
@@ -94,12 +107,17 @@ pub const Counter = struct {
     }
 
     pub fn textSink(self: *Counter) TextSink {
-        return .{ .context = self, .write_fn = writeChunk };
+        return .{ .context = self, .write_fn = writeChunk, .asked_fn = requestAsked };
     }
 
     fn writeChunk(context: *anyopaque, chunk: []const u8) void {
         const self: *Counter = @ptrCast(@alignCast(context));
         self.feed(chunk);
+    }
+
+    fn requestAsked(context: *anyopaque) void {
+        const self: *Counter = @ptrCast(@alignCast(context));
+        if (self.sink) |sink| if (sink.asked_fn) |tell| tell(sink.context);
     }
 
     /// Reads one chunk of a reply and reports the count when it went up.
@@ -124,12 +142,16 @@ pub const Counter = struct {
         if (self.sink) |sink| sink.written_fn(sink.context, now);
     }
 
-    /// The share of the notes written so far, from 0 to 99.
+    /// The share of the notes written so far, from 0 to 100. A call's line is
+    /// short and a section holds many entries: in a large compaction the
+    /// sections are about a quarter of the notes. So a call weighs
+    /// `call_weight`, and the sections together weigh as much as a third of
+    /// the calls, and never less than a call each.
     pub fn percent(self: *const Counter) u8 {
-        const total = self.total_tools + self.total_sections;
-        if (total == 0) return 0;
-        const done = self.tools_before + self.covered_count + self.seen_count;
-        return @intCast(@min(most_before_saved, done * 100 / total));
+        const calls = self.total_tools * call_weight;
+        const sections = @max(self.total_sections * call_weight, self.total_tools);
+        const done = (self.tools_before + self.covered_count) * call_weight + sections * self.seen_count / self.total_sections;
+        return @intCast(done * 100 / (calls + sections));
     }
 
     fn endLine(self: *Counter) void {
@@ -245,9 +267,9 @@ test "each tool call noted and each section begun is one step" {
     counter.feed("- **T4**: fixed it\n\nRules:\nnone\n\n## Facts\nF1 (T1): x\n");
     try testing.expectEqual(@as(u8, 66), counter.percent());
     counter.feed("Decisions:\nnone\n\nStatus:\nS1: y\n\nOpen:\nnone");
-    // Everything is written, but the notes are not saved yet.
-    try testing.expectEqual(@as(u8, 99), counter.percent());
-    try testing.expectEqualSlices(u8, &.{ 11, 33, 66, 99 }, reports.values[0..reports.len]);
+    // Every call is noted and every section begun.
+    try testing.expectEqual(@as(u8, 100), counter.percent());
+    try testing.expectEqualSlices(u8, &.{ 11, 33, 66, 100 }, reports.values[0..reports.len]);
 }
 
 test "a chunk can end anywhere, even inside an ID or a dash" {
@@ -261,7 +283,7 @@ test "a chunk can end anywhere, even inside an ID or a dash" {
         counter.feed(sample_notes[split..]);
         try testing.expectEqual(whole.percent(), counter.percent());
     }
-    try testing.expectEqual(@as(u8, 99), whole.percent());
+    try testing.expectEqual(@as(u8, 100), whole.percent());
 }
 
 test "a range is clipped to the part's calls, and a call noted twice counts once" {
@@ -360,7 +382,7 @@ test "a compaction in two parts counts every call, and only the last part's sect
     counter.feed("T5: e\nRules:\nnone\n");
     try testing.expectEqual(@as(u8, 54), counter.percent());
     counter.feed("T6: f\nFacts:\nDecisions:\nStatus:\nOpen:\n");
-    try testing.expectEqual(@as(u8, 99), counter.percent());
+    try testing.expectEqual(@as(u8, 100), counter.percent());
 }
 
 test "a part with more calls than counted at the start never lowers the count" {
@@ -415,7 +437,54 @@ test "ten thousand calls, one byte at a time" {
     counter.sink = reports.sink();
     for (text.items) |byte| counter.feed(&.{byte});
     try testing.expectEqual(@as(usize, tools), counter.covered_count);
-    try testing.expectEqual(@as(u8, 99), counter.percent());
-    // Reported only when the count went up, never once per byte.
-    try testing.expectEqual(@as(usize, 99), reports.len);
+    try testing.expectEqual(@as(u8, 100), counter.percent());
+    // Reported only when the count went up, never once per byte: 75 times
+    // for the calls, a percent at a time, and once for each of the five
+    // sections.
+    try testing.expectEqual(@as(usize, 80), reports.len);
+}
+
+test "in a large compaction the sections weigh a quarter of the notes" {
+    var covered: [410]bool = undefined;
+    var counter = onePart(&covered, 583, true);
+    counter.feed("T583\u{2013}T992: every call\n");
+    // 410 calls and six sections: the calls are three quarters.
+    try testing.expectEqual(@as(u8, 75), counter.percent());
+    const steps = [_]struct { heading: []const u8, percent: u8 }{
+        .{ .heading = "Rules:\n", .percent = 79 },
+        .{ .heading = "Facts:\n", .percent = 83 },
+        .{ .heading = "Decisions:\n", .percent = 87 },
+        .{ .heading = "Status:\n", .percent = 91 },
+        .{ .heading = "Open:\n", .percent = 95 },
+        .{ .heading = "Earlier:\n", .percent = 100 },
+    };
+    for (steps) |step| {
+        counter.feed(step.heading);
+        try testing.expectEqual(step.percent, counter.percent());
+    }
+}
+
+test "a request about to be sent is passed on to the sink" {
+    const Told = struct {
+        asked: usize = 0,
+
+        fn sink(self: *@This()) Sink {
+            return .{ .context = self, .written_fn = written, .asked_fn = requestSent };
+        }
+
+        fn written(_: *anyopaque, _: u8) void {}
+
+        fn requestSent(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.asked += 1;
+        }
+    };
+    var told: Told = .{};
+    var counter: Counter = .{};
+    // Without a sink nothing is told.
+    counter.textSink().asked();
+    counter.sink = told.sink();
+    counter.textSink().asked();
+    counter.textSink().asked();
+    try testing.expectEqual(@as(usize, 2), told.asked);
 }

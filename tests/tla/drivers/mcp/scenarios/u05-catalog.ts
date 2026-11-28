@@ -143,6 +143,31 @@ export const scenarios: Scenario[] = [
     check: (lines, _, log) => same(events(lines), ["fail", "fail"], "catalog results") ?? same(received(log), ["server/discover", "tools/list", "tools/list"], "requests"),
   }),
   catalogScenario({
+    name: "u05-refusal-survives-an-unanswered-listing-and-ends-with-a-new-process",
+    description: "A page the server answered with an error is a refusal; a listing it never answers (it dies) leaves that as it was; a new process clears it, and its first page is refused again (the fake's rules start over with each process). Each step's `refused` is matched against the model (RefusedIffLastAnswerRefused)",
+    rules: [
+      discover,
+      { method: "tools/list", times: 1, error: { code: -32603, message: "Internal error" } },
+      { method: "tools/list", times: 1, noReply: true, then: "crash" },
+    ],
+    labFlags: ["--backoff-ms", "20"],
+    script: [...START, "tools", "expect catalog-idle", "tools", "expect catalog-idle", "expect idle", "start", "expect era-modern", "tools", "expect catalog-idle", ...STOP],
+    check: (lines, final, log) =>
+      same(events(lines), ["fail", "fail", "fail"], "catalog results") ??
+      same(received(log), ["server/discover", "tools/list", "tools/list", "server/discover", "tools/list"], "requests") ??
+      expectFinal(final, { catalog: "none", tools: 0 }),
+  }),
+  catalogScenario({
+    name: "u05-refusal-ends-with-a-list",
+    description: "A refused page, then a page the server answers well: the published list ends the refusal. Each step's `refused` is matched against the model (RefusedIffLastAnswerRefused)",
+    rules: [discover, { method: "tools/list", times: 1, error: { code: -32603, message: "Internal error" } }, { method: "tools/list", result: page(["a"], { ttlMs: 60000 }) }],
+    script: [...START, "tools", "expect catalog-idle", "tools", "expect catalog-fresh", ...STOP],
+    check: (lines, final, log) =>
+      same(events(lines), ["fail", "publish a"], "catalog results") ??
+      same(received(log), ["server/discover", "tools/list", "tools/list"], "requests") ??
+      expectFinal(final, { catalog: "fresh", tools: 1 }),
+  }),
+  catalogScenario({
     name: "u05-page-expires-during-listing",
     description: "A page whose TTL runs out before the listing ends leaves the list stale at once: each page is fresh for its own TTL from its own arrival",
     rules: [

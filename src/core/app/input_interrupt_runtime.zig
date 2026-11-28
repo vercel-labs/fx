@@ -107,6 +107,7 @@ pub fn InterruptRuntime(comptime App: type) type {
             } else {
                 agent.worker.requestCancel();
             }
+            try app.shell.freezeAssistantTail(app.alloc, "cancel");
             app_worker_runtime.Runtime(App).clearPacer(app, agent, "cancel");
             if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
             if (compacting) {
@@ -263,6 +264,7 @@ test "a cancel drops the finished turn the pacer held, so a later report is not 
             render_requests: struct {
                 fn request(_: *@This(), _: anytype) void {}
             } = .{},
+            fn freezeAssistantTail(_: *@This(), _: std.mem.Allocator, _: []const u8) !void {}
         } = .{},
     };
     var app: App = .{ .alloc = alloc };

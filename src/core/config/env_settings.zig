@@ -106,7 +106,7 @@ pub fn collect(arena: Allocator, provider: model_provider.ProviderId) ![]Overrid
         const value: std.json.Value = if (std.math.cast(i64, steps)) |fits|
             .{ .integer = fits }
         else
-            .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{steps}) };
+            .{ .number_string = try arena.print("{d}", .{steps}) };
         try list.append(arena, .{ .variable = "FX_MAX_AGENT_STEPS", .key = "max_agent_steps", .value = value });
     }
     if (compactor.parsePercent(getenv("FX_AUTO_COMPACT_PERCENT"))) |percent| {

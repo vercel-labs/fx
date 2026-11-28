@@ -19,8 +19,8 @@
   },
   {
     "description": "The write comes before the check: a refused add has already changed the file",
-    "old": "       THEN /\\ UNCHANGED <<st, ent, added, wroteTypo>>\n            /\\ last' = \"refused\"\n            /\\ same' = TRUE",
-    "new": "       THEN /\\ st' = [st EXCEPT ![f] = \"ok\"]\n            /\\ ent' = [ent EXCEPT ![f][n] = c]\n            /\\ UNCHANGED <<added, wroteTypo>>\n            /\\ last' = \"refused\"\n            /\\ same' = FALSE",
+    "old": "       THEN /\\ UNCHANGED <<st, ent, added, wroteTypo, wroteDeep>>\n            /\\ last' = \"refused\"\n            /\\ same' = TRUE",
+    "new": "       THEN /\\ st' = [st EXCEPT ![f] = \"ok\"]\n            /\\ ent' = [ent EXCEPT ![f][n] = c]\n            /\\ UNCHANGED <<added, wroteTypo, wroteDeep>>\n            /\\ last' = \"refused\"\n            /\\ same' = FALSE",
     "invariant": "RefusedLeavesFile"
   },
   {
@@ -34,5 +34,59 @@
     "old": "            ELSE /\\ ent' = [ent EXCEPT ![f][n] = NoEntry]",
     "new": "            ELSE /\\ ent' = [ent EXCEPT ![f] = [m \\in Names |-> IF ent[f][m] = ent[f][n] THEN NoEntry ELSE ent[f][m]]]",
     "invariant": "OthersKept"
+  },
+  {
+    "description": "A remove of a name that only the misspelled key holds gives no hint: it says only that no server has the name",
+    "old": "       THEN /\\ last' = IF HintFor(f, n) THEN \"hinted\" ELSE \"missing\"",
+    "new": "       THEN /\\ last' = \"missing\"",
+    "invariant": "HintMatchesHeldName"
+  },
+  {
+    "description": "A remove gives the hint for every name it can't find, whether or not the misspelled key holds it",
+    "old": "       THEN /\\ last' = IF HintFor(f, n) THEN \"hinted\" ELSE \"missing\"",
+    "new": "       THEN /\\ last' = \"hinted\"",
+    "invariant": "HintMatchesHeldName"
+  },
+  {
+    "description": "A remove of a name that only the misspelled key holds takes it out of that key and writes the profile",
+    "old": "       THEN /\\ last' = IF HintFor(f, n) THEN \"hinted\" ELSE \"missing\"\n            /\\ heldHit' = HintFor(f, n)\n            /\\ same' = TRUE\n            /\\ others' = TRUE\n            /\\ UNCHANGED <<st, ent, added, wroteTypo, wroteDeep>>",
+    "new": "       THEN /\\ last' = IF HintFor(f, n) THEN \"removed\" ELSE \"missing\"\n            /\\ heldHit' = FALSE\n            /\\ same' = ~HintFor(f, n)\n            /\\ others' = TRUE\n            /\\ wroteTypo' = (wroteTypo \\/ HintFor(f, n))\n            /\\ UNCHANGED <<st, ent, added, wroteDeep>>",
+    "invariant": "NoRewriteOfMisspelled"
+  },
+  {
+    "description": "An add never looks at how deep the file is: it renders a file nested past the limit, where the JSON writer aborts",
+    "old": "BaseRefused(f, n) == st[f] \\in {\"broken\", \"deep\"} \\/ (f = \"profile\" /\\ both) \\/ ent[f][n] # NoEntry",
+    "new": "BaseRefused(f, n) == st[f] = \"broken\" \\/ (f = \"profile\" /\\ both) \\/ ent[f][n] # NoEntry",
+    "invariant": "NoWriteOfDeep"
+  },
+  {
+    "description": "A remove never looks at how deep the file is: it renders a file nested past the limit, where the JSON writer aborts",
+    "old": "       ELSE IF st[f] = \"deep\"",
+    "new": "       ELSE IF FALSE",
+    "invariant": "NoWriteOfDeep"
+  },
+  {
+    "description": "The inspection fails the whole profile on one bad entry, and hides the project's servers with it, as fx status and fx doctor did",
+    "old": "InspectShown(f) == IF InspectFailed THEN {} ELSE LoadedNames(f)",
+    "new": "InspectShown(f) == IF InspectFailed \\/ SkippedNames(\"profile\") # {} THEN {} ELSE LoadedNames(f)",
+    "invariant": "InspectKeepsGood"
+  },
+  {
+    "description": "The inspection leaves out a skipped entry of the profile without a note",
+    "old": "InspectNoted(f) == IF InspectFailed THEN {} ELSE SkippedNames(f)",
+    "new": "InspectNoted(f) == IF InspectFailed \\/ f = \"profile\" THEN {} ELSE SkippedNames(f)",
+    "invariant": "InspectNotesSkipped"
+  },
+  {
+    "description": "An ACP session that asks for the profile's servers loses all of them when one entry is bad, as it did before it read the profile as the terminal app does",
+    "old": "AcpRuns(f) == HostLoads(f)",
+    "new": "AcpRuns(f) == IF SkippedNames(\"profile\") # {} THEN {} ELSE HostLoads(f)",
+    "invariant": "AcpKeepsGood"
+  },
+  {
+    "description": "An ACP session runs an entry the terminal app skips",
+    "old": "AcpRuns(f) == HostLoads(f)",
+    "new": "AcpRuns(f) == HostLoads(f) \\cup SkippedNames(f)",
+    "invariant": "AcpRunsWhatTheTerminalRuns"
   }
 ]

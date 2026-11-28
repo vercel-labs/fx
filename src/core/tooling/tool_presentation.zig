@@ -182,6 +182,12 @@ pub fn subagentStreamedAgent(json: []const u8) ?[]const u8 {
     return streamedStringField(json, "agent", 1, 2);
 }
 
+/// The `action` a `subagent` call names, read as `subagentStreamedAgent`
+/// reads its `agent`, so a streaming row can say what the call does.
+pub fn subagentStreamedAction(json: []const u8) ?[]const u8 {
+    return streamedStringField(json, "action", 1, 2);
+}
+
 /// The value a builtin call's row names, read from its arguments while they
 /// still stream in: the top-level string its label kind names, such as a
 /// read's `path` or a web search's `query`. Null until that value is a
@@ -397,6 +403,24 @@ test "a streaming subagent call names its agent once the whole name arrives" {
         const got = subagentStreamedAgent(case.json);
         if (case.agent) |want| {
             try std.testing.expectEqualStrings(want, got orelse return error.TestExpectedAgent);
+        } else {
+            try std.testing.expect(got == null);
+        }
+    }
+}
+
+test "a streaming subagent call names its action once the whole action arrives" {
+    const cases = [_]struct { json: []const u8, action: ?[]const u8 }{
+        .{ .json = "{\"request\":{\"agent\":\"reviewer\",\"act", .action = null },
+        .{ .json = "{\"request\":{\"action\":\"wai", .action = null },
+        .{ .json = "{\"request\":{\"action\":\"wait\"", .action = "wait" },
+        .{ .json = "{\"agent\":\"tester\",\"action\":\"close\"", .action = "close" },
+        .{ .json = "{\"request\":{\"message\":\"\\\"action\\\":\\\"close\\\"\",\"action\":\"message\"", .action = "message" },
+    };
+    for (cases) |case| {
+        const got = subagentStreamedAction(case.json);
+        if (case.action) |want| {
+            try std.testing.expectEqualStrings(want, got orelse return error.TestExpectedAction);
         } else {
             try std.testing.expect(got == null);
         }

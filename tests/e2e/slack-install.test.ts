@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FX_BIN } from '../evals/eval-helpers';
+import { FX_BIN, fxChildEnv } from '../evals/eval-helpers';
 
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
@@ -47,7 +47,7 @@ function fixture() {
   } });
   cleanup.push(() => server.stop(true));
   const origin = `http://127.0.0.1:${server.port}`;
-  const env = { ...process.env, HOME: home, FX_NO_OPEN_BROWSER: '1', FX_TEST_SLACK_ORIGIN: origin, FX_DISABLE_KEYCHAIN: '1', FX_AUTO_UPGRADE: '0', FX_TEST_SKIP_ONBOARDING: '1', FX_SOUND: '0', AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined };
+  const env = fxChildEnv({ HOME: home, FX_NO_OPEN_BROWSER: '1', FX_TEST_SLACK_ORIGIN: origin, FX_DISABLE_KEYCHAIN: '1', FX_AUTO_UPGRADE: '0', FX_TEST_SKIP_ONBOARDING: '1', FX_SOUND: '0' });
   const file = join(home, '.fx/slack/installation.json');
   function spawn(action: string) {
     const proc = Bun.spawn([FX_BIN, 'slack', action, '--json'], { env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });

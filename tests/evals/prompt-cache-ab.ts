@@ -22,6 +22,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { requireAbsoluteExecutableBinary } from "./agent-quality-ab";
+import { fxChildEnv } from "./eval-helpers";
 
 export const DEFAULT_UPSTREAM = "https://ai-gateway.vercel.sh";
 
@@ -334,8 +335,7 @@ export async function runScenario(
   writeFixtureRepo(repo);
   const proxy = startRecordingProxy(opts.upstream);
   const run: ScenarioRun = { scenario: scenario.name, side: opts.side, model: opts.model, turns: [], requests: proxy.requests };
-  const env: Record<string, string | undefined> = {
-    ...process.env,
+  const env: Record<string, string | undefined> = fxChildEnv({
     HOME: home,
     NO_COLOR: "1",
     FX_SOUND: "0",
@@ -343,7 +343,7 @@ export async function runScenario(
     FX_MAX_AGENT_STEPS: "40",
     FX_GATEWAY_CHAT_URL: `${proxy.url}/v4/ai/language-model`,
     FX_GATEWAY_BASE_URL: proxy.url,
-  };
+  }, { keepCredentials: true });
   const turn = async (prompt: string, resume: boolean, fullAccess: boolean) => {
     const args = ["ask", ...(fullAccess ? ["--full-access"] : []), "--json", ...(resume ? ["--resume", "last"] : []), "--", prompt];
     const result = await runAsk(opts.binary, args, { cwd: repo, env, timeoutMs: opts.timeoutMs });

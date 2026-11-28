@@ -31,6 +31,7 @@ from scripts.pgso.pipeline import (
     GENERATION_FLAGS,
     PipelinePaths,
     apply_profile,
+    exempt_cold_startup_functions,
     link_candidate,
     merge_profile_batch,
     verify_candidate,
@@ -494,14 +495,45 @@ def _validate_toolchain(identity: BuildIdentity, toolchain: Toolchain) -> None:
     verify_identity(identity, actual)
 
 
-def _require_distributed_support(toolchain: Toolchain) -> None:
-    # Training shards don't hand the startup scenarios' profiles to the
-    # candidate, so a platform with a startup exemption can't build this way.
-    if toolchain.platform.STARTUP_SCENARIOS:
-        raise PgsoError(
-            "distributed builds do not carry the startup profiles that "
-            f"{toolchain.platform.DISPLAY_NAME} candidates need"
+def shard_startup_scenarios(
+    platform_scenarios: Sequence[str],
+    assigned: Sequence[str],
+) -> tuple[str, ...]:
+    """The platform's startup scenarios that this training shard runs."""
+    return tuple(name for name in platform_scenarios if name in assigned)
+
+
+def collect_startup_profiles(
+    manifest_paths: Sequence[pathlib.Path],
+    documents: Sequence[Mapping[str, object]],
+    expected_names: Sequence[str],
+    destination: pathlib.Path,
+) -> dict[str, str]:
+    """Copy each startup scenario's profile from the training shard that ran it.
+
+    Every expected scenario must come from exactly one shard and match the
+    hash that shard recorded. Returns each profile's SHA-256 by scenario name.
+    """
+    found: dict[str, tuple[pathlib.Path, str]] = {}
+    for manifest_path, document in zip(manifest_paths, documents, strict=True):
+        recorded = _mapping(
+            document.get("startup_profiles", {}),
+            "training shard startup profiles",
         )
+        for name, digest in recorded.items():
+            if name not in expected_names:
+                raise PgsoError(f"unexpected startup profile: {name}")
+            if name in found:
+                raise PgsoError(f"duplicate startup profile: {name}")
+            profile = manifest_path.parent / "profiles" / "startup" / f"{name}.profdata"
+            found[name] = profile, _require_hash(profile, digest, f"{name} startup profile")
+    missing = sorted(set(expected_names) - set(found))
+    if missing:
+        raise PgsoError("missing startup profile: " + ", ".join(missing))
+    destination.mkdir(parents=True, exist_ok=True)
+    for name, (profile, _digest) in found.items():
+        shutil.copy2(profile, destination / f"{name}.profdata")
+    return {name: found[name][1] for name in expected_names}
 
 
 def _require_version(
@@ -794,7 +826,6 @@ def run_training_shard(arguments: argparse.Namespace) -> pathlib.Path:
     seed_paths, seed_evidence, identity = _load_seed(arguments.seed_dir, corpus, log_dir)
     toolchain = Toolchain.discover(arguments.zig, arguments.llvm_bin, identity.target)
     _validate_toolchain(identity, toolchain)
-    _require_distributed_support(toolchain)
     bun = _require_version(
         arguments.bun,
         REQUIRED_BUN_VERSION,
@@ -804,6 +835,11 @@ def run_training_shard(arguments: argparse.Namespace) -> pathlib.Path:
     _require_version("tmux", "", "tmux", log_dir / "tmux-version.json")
     names = _parse_names(arguments.scenarios)
     selected = select_corpus(corpus, "training", names)
+    startup_scenarios = shard_startup_scenarios(
+        toolchain.platform.STARTUP_SCENARIOS,
+        names,
+    )
+    startup_profile_dir = output / "profiles" / "startup"
     instrumented = _mapping(
         seed_evidence.get("instrumented"),
         "seed instrumented evidence",
@@ -818,6 +854,8 @@ def run_training_shard(arguments: argparse.Namespace) -> pathlib.Path:
             output / "profile.profdata",
             toolchain=toolchain,
             bun=bun,
+            startup_scenarios=startup_scenarios,
+            startup_profile_dir=startup_profile_dir,
         )
         payload: dict[str, object] = {
             "schema_version": 1,
@@ -829,6 +867,10 @@ def run_training_shard(arguments: argparse.Namespace) -> pathlib.Path:
             "assigned_scenarios": list(names),
             "result": dataclasses.asdict(result),
             "profile_sha256": sha256_file(output / "profile.profdata"),
+            "startup_profiles": {
+                name: sha256_file(startup_profile_dir / f"{name}.profdata")
+                for name in startup_scenarios
+            },
         }
     except CorpusRunError as error:
         payload = {
@@ -859,7 +901,6 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
     )
     toolchain = Toolchain.discover(arguments.zig, arguments.llvm_bin, identity.target)
     _validate_toolchain(identity, toolchain)
-    _require_distributed_support(toolchain)
     manifest_paths = _artifact_document_paths(arguments.shards_dir)
     documents = tuple(_read_json(path, "shard manifest") for path in manifest_paths)
     instrumented = _mapping(
@@ -891,6 +932,19 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
     )
     if merged_count != len(documents):
         raise PgsoError("distributed profile merge count mismatch")
+    startup_scenarios = toolchain.platform.STARTUP_SCENARIOS
+    startup_profiles = collect_startup_profiles(
+        manifest_paths,
+        documents,
+        startup_scenarios,
+        paths.startup_profiles,
+    )
+
+    # Linux links the candidate by replaying the seed control's link, which
+    # names the seed's C runtime and libc by path and checks their hashes.
+    control_link = seed_paths.logs / "control-link.json"
+    if control_link.is_file():
+        shutil.copy2(control_link, paths.logs / control_link.name)
 
     linked_benchmarks = build_profile_linked_benchmarks(
         toolchain,
@@ -903,7 +957,24 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
     # verified bitcode, which the training profiles were collected from.
     shutil.copy2(seed_paths.bitcode, paths.bitcode)
     _require_hash(paths.bitcode, identity.bitcode_sha256, "candidate bitcode")
-    apply_profile(toolchain, paths, identity.bitcode_sha256)
+    startup_exemption = None
+    if startup_scenarios:
+        benchmark_profiles = [linked.pair.merged_profile for linked in linked_benchmarks.values()]
+        if any(profile is None for profile in benchmark_profiles):
+            raise PgsoError("benchmark training profile is incomplete")
+        startup_exemption = exempt_cold_startup_functions(
+            toolchain,
+            paths,
+            identity.bitcode_sha256,
+            startup_scenarios,
+            benchmark_profiles=benchmark_profiles,
+        )
+    apply_profile(
+        toolchain,
+        paths,
+        identity.bitcode_sha256,
+        no_outline_functions=paths.startup_order if startup_scenarios else None,
+    )
     link_candidate(toolchain, paths)
     linked_benchmarks = relink_profile_linked_benchmarks(
         toolchain,
@@ -951,6 +1022,9 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
         + int(smoke_profile.get("merged_raw_profiles", 0)),
         "supplements": supplement_evidence,
     }
+    if startup_exemption is not None:
+        profile["startup_profiles"] = startup_profiles
+        profile["startup_exemption"] = startup_exemption
     payload = {
         "schema_version": 1,
         "status": "passed",

@@ -1,8 +1,10 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const types = @import("../shared/types.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
 const editor_state = @import("../input/editor_state.zig");
 const paste_framing = @import("../input/paste_framing.zig");
@@ -11,6 +13,8 @@ pub const ApplyOutcome = enum {
     not_ready,
     unavailable,
     relaunch_requested,
+    /// The relaunch waits for the running turns to stop between steps or end.
+    waiting,
 };
 
 const CurrentExecutablePathFn = *const fn (
@@ -23,6 +27,20 @@ pub const Deps = struct {
     current_executable_path: CurrentExecutablePathFn = currentExecutablePathDefault,
 };
 
+/// What Ctrl+G says while the relaunch waits: a turn on the AI Gateway stops
+/// at its next step and goes on after the restart, and a turn on another
+/// provider runs to its end (`orchestrator.zig` `canStopForRestart`).
+const restart_waits_notice = "fx restarts for the upgrade when the running turns stop or end";
+const restart_waits_for_subagents_notice = "fx restarts for the upgrade when the running turns stop or end and the subagents finish";
+
+/// Whether `App` can stop running turns between steps for the restart.
+/// Without it, Ctrl+G still refuses while a response streams.
+/// A host that never upgrades itself, such as the browser terminal, has no restart to wait for.
+fn supportsYield(comptime App: type) bool {
+    return runtime_profile.allows(App, .auto_upgrade) and @hasDecl(App, "anyTurnRunning") and @hasDecl(App, "requestTurnYields") and
+        @hasField(App, "upgrader") and @hasField(@FieldType(App, "upgrader"), "restart_waits");
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -31,6 +49,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn collectUpgradeFacts(app: *App) void {
+            finishWaitingRestart(app);
             if (!autoUpgradeEnabled(app)) return;
 
             if (comptime @hasField(App, "upgrader")) {
@@ -40,21 +59,112 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// The notice for a restart that waits: it names the subagents while
+        /// one works, since the restart waits for them to finish.
+        fn restartWaitsNotice(app: *App) []const u8 {
+            if (comptime @hasDecl(App, "anySubagentWorking")) {
+                if (app.anySubagentWorking()) return restart_waits_for_subagents_notice;
+            }
+            return restart_waits_notice;
+        }
+
+        /// Exits for the relaunch Ctrl+G asked for once every turn has
+        /// stopped and nothing typed would be lost with the process.
+        fn finishWaitingRestart(app: *App) void {
+            if (comptime !supportsYield(App)) return;
+            if (!app.upgrader.restart_waits) return;
+            if (app.anyTurnRunning() or draftPending(app)) return;
+            app.upgrader.restart_waits = false;
+            if (comptime @hasDecl(App, "logHeldWorkForRestart")) app.logHeldWorkForRestart();
+            debug_trace.logf("upgrade", "event=restart_after_yield", .{});
+            if (comptime @hasField(App, "should_exit")) app.should_exit = true;
+            requestFooterRender(app);
+        }
+
+        /// What the composer holds that exiting would lose, as the notice
+        /// that names it, or null: a paste, typed text, images, or a prompt
+        /// sent but not yet started. Ctrl+G refuses with it
+        /// (`upgradeUnavailableNotice`), and a waiting restart holds its exit
+        /// while one is there (`draftPending`).
+        fn draftNotice(app: *App, agent: *AppAgent) ?[]const u8 {
+            if (comptime @hasField(App, "input_runtime")) {
+                if (app.input_runtime.paste.active()) return "finish the paste before upgrading";
+                if (app.input_runtime.edit_state.input.items.len > 0) return "submit or clear the current prompt before upgrading";
+            }
+            if (comptime agents.hasAgentField(App, "pending_images")) {
+                if (agent.pending_images.items.len > 0) return "submit or clear pending images before upgrading";
+            }
+            // The worker holds its queue while it yields, so a sent prompt
+            // that has not started would wait there until fx exits.
+            if (submissionPending(app)) return "upgrade is unavailable while a sent prompt waits to go out";
+            return null;
+        }
+
+        /// Whether the composer holds something exiting would lose
+        /// (`draftNotice`). Ctrl+G refuses while it does, and the wait holds
+        /// new text in the composer, so this only guards the exit.
+        fn draftPending(app: *App) bool {
+            return draftNotice(app, agents.screenAgentOf(app)) != null;
+        }
+
+        /// A prompt sent but not yet started by its agent's worker, on main
+        /// or another instance (`submission.pending`, every phase): it waits
+        /// for a frame, for sign-in, or for the worker to take it, and lives
+        /// only in memory until then.
+        fn submissionPending(app: *App) bool {
+            if (comptime !agents.hasAgentField(App, "submission")) return false;
+            if (app.main_agent.submission.pending != null) return true;
+            if (comptime @hasField(App, "child_agents")) {
+                for (app.child_agents.items) |child| {
+                    if (child.agent.role == .instance and child.agent.submission.pending != null) return true;
+                }
+            }
+            return false;
+        }
+
         pub fn applyReadyUpgradeWithDeps(
             app: *App,
             agent: *AppAgent,
             deps: Deps,
         ) !ApplyOutcome {
+            // A host that never upgrades itself, such as the browser
+            // terminal, says so at once: nothing after this runs there.
+            if (comptime !runtime_profile.allows(App, .auto_upgrade)) {
+                try writeUpgradeNotice(app, .neutral, "auto-upgrade is disabled");
+                return .not_ready;
+            }
+            // A second Ctrl+G while the relaunch waits changes nothing.
+            if (comptime supportsYield(App)) {
+                if (app.upgrader.restart_waits) {
+                    try writeUpgradeNotice(app, .neutral, restartWaitsNotice(app));
+                    return .waiting;
+                }
+            }
             if (upgradeUnavailableNotice(app, agent)) |notice| {
                 try writeUpgradeNotice(app, .neutral, notice);
                 return .unavailable;
             }
-            // The upgrade restarts fx, which would stop every other agent
-            // of the process too: subagents and other instances.
-            if (comptime @hasDecl(App, "busyAgentElsewhere")) {
+            // The upgrade restarts fx. Ctrl+G asks the main agent and other
+            // instances to stop between steps, and the restart waits until
+            // working subagents finish. An agent that waits for the user gets
+            // its answer first.
+            if (comptime @hasDecl(App, "needsUserElsewhere")) {
                 var name_buf: [32]u8 = undefined;
-                if (app.busyAgentElsewhere(&name_buf)) |busy| {
+                if (app.needsUserElsewhere(&name_buf)) |busy| {
                     const notice = try app.alloc.print("upgrade is unavailable while {s} {s}", .{ busy.name, busyPhrase(busy.doing) });
+                    defer app.alloc.free(notice);
+                    try writeUpgradeNotice(app, .neutral, notice);
+                    return .unavailable;
+                }
+            }
+
+            // Main and other instances hold their queued work while they
+            // yield, and the restart drops it with the process, so a queue
+            // elsewhere refuses as the one on screen does.
+            if (comptime @hasDecl(App, "queuedWorkElsewhere")) {
+                var queue_name_buf: [32]u8 = undefined;
+                if (app.queuedWorkElsewhere(&queue_name_buf)) |name| {
+                    const notice = try app.alloc.print("upgrade is unavailable while {s} has queued prompts", .{name});
                     defer app.alloc.free(notice);
                     try writeUpgradeNotice(app, .neutral, notice);
                     return .unavailable;
@@ -107,6 +217,19 @@ pub fn Runtime(comptime App: type) type {
                 return .unavailable;
             };
             app.requestResumeHandoffForUpgrade(agent);
+            // Everything that can fail is done. A running turn stops at its
+            // next step boundary, saved so the relaunched fx continues it
+            // (`tests/tla/recovery/Resume.tla` Upgrade, Relaunch), and fx
+            // exits once none runs (`collectUpgradeFacts`).
+            if (comptime supportsYield(App)) {
+                if (app.anyTurnRunning()) {
+                    app.requestTurnYields();
+                    app.upgrader.restart_waits = true;
+                    debug_trace.logf("upgrade", "event=restart_waits_for_turns", .{});
+                    try writeUpgradeNotice(app, .neutral, restartWaitsNotice(app));
+                    return .waiting;
+                }
+            }
             if (comptime @hasField(App, "should_exit")) app.should_exit = true;
             return .relaunch_requested;
         }
@@ -116,14 +239,14 @@ pub fn Runtime(comptime App: type) type {
                 .needs_approval => "needs approval",
                 .has_question => "has a question",
                 .needs_you => "needs you",
-                .working => "is working",
-                // `busyAgentElsewhere` never names an idle agent.
-                .idle => unreachable,
+                // `needsUserElsewhere` never names a working or idle agent.
+                .working, .idle => unreachable,
             };
         }
 
         fn upgradeUnavailableNotice(app: *App, agent: *AppAgent) ?[]const u8 {
-            if (comptime agents.hasAgentField(App, "stream")) {
+            // A host that stops turns between steps waits for them instead.
+            if (comptime agents.hasAgentField(App, "stream") and !supportsYield(App)) {
                 if (agent.stream.active) return "upgrade is unavailable until the response finishes";
             }
             if (comptime agents.hasAgentField(App, "worker")) {
@@ -153,13 +276,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "terminal")) {
                 if (app.terminal.fullTranscriptScreenActive()) return "close the transcript view before upgrading";
             }
-            if (comptime @hasField(App, "input_runtime")) {
-                if (app.input_runtime.paste.active()) return "finish the paste before upgrading";
-                if (app.input_runtime.edit_state.input.items.len > 0) return "submit or clear the current prompt before upgrading";
-            }
-            if (comptime agents.hasAgentField(App, "pending_images")) {
-                if (agent.pending_images.items.len > 0) return "submit or clear pending images before upgrading";
-            }
+            if (draftNotice(app, agent)) |notice| return notice;
             if (comptime @hasField(App, "terminal_input_runtime")) {
                 if (app.terminal_input_runtime.hasPendingTerminalAction()) return "finish the key sequence before upgrading";
             }
@@ -199,6 +316,7 @@ const TestUpgrader = struct {
     state: auto_upgrade.State = .idle,
     stop_count: usize = 0,
     render_dirty: bool = false,
+    restart_waits: bool = false,
 
     fn getState(self: *TestUpgrader) auto_upgrade.State {
         return self.state;
@@ -260,6 +378,7 @@ const TestApp = struct {
     main_agent: struct {
         worker: TestWorker = .{},
         stream: struct { active: bool = false } = .{},
+        submission: struct { pending: ?u8 = null } = .{},
     } = .{},
     input_runtime: TestInputRuntime = .{},
     terminal_input_runtime: TestTerminalInputRuntime = .{},
@@ -273,7 +392,12 @@ const TestApp = struct {
     relaunch_path_len: usize = 0,
     prepare_error: ?anyerror = null,
     relaunch_error: ?error{NameTooLong} = null,
-    busy_elsewhere: ?app_agents_runtime.BusyAgent = null,
+    needs_user_elsewhere: ?app_agents_runtime.BusyAgent = null,
+    queued_elsewhere: ?[]const u8 = null,
+    turn_running: bool = false,
+    subagent_working: bool = false,
+    yield_request_count: usize = 0,
+    held_work_logs: usize = 0,
 
     fn deinit(self: *TestApp) void {
         self.input_runtime.edit_state.deinit(self.alloc);
@@ -297,8 +421,28 @@ const TestApp = struct {
         self.request_handoff_count += 1;
     }
 
-    pub fn busyAgentElsewhere(self: *TestApp, _: []u8) ?app_agents_runtime.BusyAgent {
-        return self.busy_elsewhere;
+    pub fn needsUserElsewhere(self: *TestApp, _: []u8) ?app_agents_runtime.BusyAgent {
+        return self.needs_user_elsewhere;
+    }
+
+    pub fn queuedWorkElsewhere(self: *TestApp, _: []u8) ?[]const u8 {
+        return self.queued_elsewhere;
+    }
+
+    pub fn anyTurnRunning(self: *TestApp) bool {
+        return self.turn_running;
+    }
+
+    pub fn anySubagentWorking(self: *TestApp) bool {
+        return self.subagent_working;
+    }
+
+    pub fn requestTurnYields(self: *TestApp) void {
+        self.yield_request_count += 1;
+    }
+
+    pub fn logHeldWorkForRestart(self: *TestApp) void {
+        self.held_work_logs += 1;
     }
 
     fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
@@ -306,6 +450,28 @@ const TestApp = struct {
     }
 
     pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+};
+
+/// An app that cannot stop its turns between steps: it has no restart wait,
+/// so Ctrl+G still refuses while a response streams.
+const StreamOnlyApp = struct {
+    alloc: std.mem.Allocator,
+    main_agent: struct {
+        stream: struct { active: bool = false } = .{},
+    } = .{},
+    notices: std.ArrayList(u8) = .empty,
+
+    fn prepareResumeHandoffForUpgrade(_: *StreamOnlyApp, _: anytype) !void {}
+    fn requestUpgradeRelaunch(_: *StreamOnlyApp, _: []const u8) !void {}
+    fn requestResumeHandoffForUpgrade(_: *StreamOnlyApp, _: anytype) void {}
+
+    fn writeDomainNotice(self: *StreamOnlyApp, notice: types.SemanticNotice, _: bool) !void {
+        try self.notices.appendSlice(self.alloc, notice.body);
+    }
+
+    pub fn agent(self: *StreamOnlyApp) @TypeOf(&self.main_agent) {
         return &self.main_agent;
     }
 };
@@ -335,16 +501,35 @@ fn currentExecutablePathForTest(
     return executable_buf[0..executable_path.len];
 }
 
-test "app_upgrade_runtime refuses while another agent is busy, and names it" {
+test "app_upgrade_runtime refuses while another agent needs the user, and names it" {
     var app = TestApp{ .alloc = std.testing.allocator };
     defer app.deinit();
     app.upgrader.state = .ready;
-    app.busy_elsewhere = .{ .name = "reviewer", .doing = .working };
+    app.needs_user_elsewhere = .{ .name = "reviewer", .doing = .needs_approval };
     var deps_state = TestDepsState{};
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
 
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
-    try std.testing.expectEqualStrings("upgrade is unavailable while reviewer is working", app.notices.items);
+    try std.testing.expectEqualStrings("upgrade is unavailable while reviewer needs approval", app.notices.items);
+    try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
+    try std.testing.expect(!app.should_exit);
+}
+
+test "app_upgrade_runtime refuses while another instance has queued prompts, and names it" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    // A turn runs, so without the refusal fx would ask it to yield.
+    app.turn_running = true;
+    app.queued_elsewhere = "fx 2";
+    var deps_state = TestDepsState{};
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+
+    try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
+    try std.testing.expectEqualStrings("upgrade is unavailable while fx 2 has queued prompts", app.notices.items);
+    try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
+    try std.testing.expect(!app.upgrader.restart_waits);
     try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
     try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
     try std.testing.expect(!app.should_exit);
@@ -497,17 +682,6 @@ test "app_upgrade_runtime requires an active session before reload" {
 }
 
 test "app_upgrade_runtime rejects busy app state before reload" {
-    var stream_app = TestApp{ .alloc = std.testing.allocator };
-    defer stream_app.deinit();
-    stream_app.upgrader.state = .ready;
-    stream_app.agent().stream.active = true;
-    var stream_deps = TestDepsState{};
-
-    const stream_outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&stream_app, (&stream_app).agent(), stream_deps.deps());
-    try std.testing.expectEqual(ApplyOutcome.unavailable, stream_outcome);
-    try std.testing.expectEqual(@as(usize, 0), stream_deps.path_count);
-    try std.testing.expect(std.mem.find(u8, stream_app.notices.items, "response finishes") != null);
-
     var composer_app = TestApp{ .alloc = std.testing.allocator };
     defer composer_app.deinit();
     composer_app.upgrader.state = .ready;
@@ -518,6 +692,185 @@ test "app_upgrade_runtime rejects busy app state before reload" {
     try std.testing.expectEqual(ApplyOutcome.unavailable, composer_outcome);
     try std.testing.expectEqual(@as(usize, 0), composer_deps.path_count);
     try std.testing.expect(std.mem.find(u8, composer_app.notices.items, "current prompt") != null);
+}
+
+test "app_upgrade_runtime still refuses while a response streams in an app that cannot stop turns between steps" {
+    var stream_app = StreamOnlyApp{ .alloc = std.testing.allocator };
+    defer stream_app.notices.deinit(std.testing.allocator);
+    stream_app.agent().stream.active = true;
+    var stream_deps = TestDepsState{};
+
+    const stream_outcome = try Runtime(StreamOnlyApp).applyReadyUpgradeWithDeps(&stream_app, (&stream_app).agent(), stream_deps.deps());
+    try std.testing.expectEqual(ApplyOutcome.unavailable, stream_outcome);
+    try std.testing.expectEqual(@as(usize, 0), stream_deps.path_count);
+    try std.testing.expect(std.mem.find(u8, stream_app.notices.items, "response finishes") != null);
+}
+
+const NoUpgradeUpgrader = struct {
+    state: auto_upgrade.State = .ready,
+    restart_waits: bool = false,
+
+    fn getState(self: *NoUpgradeUpgrader) auto_upgrade.State {
+        return self.state;
+    }
+};
+
+/// A host that never upgrades itself, such as the browser terminal. A turn
+/// can run on it, but nothing restarts the host, so it asks no turn to stop.
+const NoUpgradeHostApp = struct {
+    pub const host_profile = runtime_profile.wasm;
+
+    alloc: std.mem.Allocator,
+    main_agent: struct {} = .{},
+    upgrader: NoUpgradeUpgrader = .{},
+    notices: std.ArrayList(u8) = .empty,
+    turn_running: bool = false,
+    yield_request_count: usize = 0,
+
+    pub fn anyTurnRunning(self: *NoUpgradeHostApp) bool {
+        return self.turn_running;
+    }
+
+    pub fn requestTurnYields(self: *NoUpgradeHostApp) void {
+        self.yield_request_count += 1;
+    }
+
+    fn prepareResumeHandoffForUpgrade(_: *NoUpgradeHostApp, _: anytype) !void {}
+    fn requestUpgradeRelaunch(_: *NoUpgradeHostApp, _: []const u8) !void {}
+    fn requestResumeHandoffForUpgrade(_: *NoUpgradeHostApp, _: anytype) void {}
+
+    fn writeDomainNotice(self: *NoUpgradeHostApp, notice: types.SemanticNotice, _: bool) !void {
+        try self.notices.appendSlice(self.alloc, notice.body);
+    }
+
+    pub fn agent(self: *NoUpgradeHostApp) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+};
+
+test "app_upgrade_runtime on a host that never upgrades itself says so and asks no turn to stop" {
+    var app = NoUpgradeHostApp{ .alloc = std.testing.allocator };
+    defer app.notices.deinit(std.testing.allocator);
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(NoUpgradeHostApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.not_ready, outcome);
+    try std.testing.expectEqualStrings("auto-upgrade is disabled", app.notices.items);
+    try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
+    try std.testing.expect(!app.upgrader.restart_waits);
+    try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
+}
+
+test "app_upgrade_runtime asks running turns to yield and exits once they stop" {
+    const alloc = std.testing.allocator;
+    var app = TestApp{ .alloc = alloc };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    // A response on screen no longer refuses the upgrade.
+    app.agent().stream.active = true;
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.waiting, outcome);
+    try std.testing.expectEqual(@as(usize, 1), app.yield_request_count);
+    try std.testing.expect(app.upgrader.restart_waits);
+    try std.testing.expect(!app.should_exit);
+    // Everything that can fail ran before any turn stopped.
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 1), deps_state.path_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", app.relaunch_path[0..app.relaunch_path_len]);
+    try std.testing.expectEqual(@as(usize, 1), app.request_handoff_count);
+
+    // While a turn runs, the tick waits.
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+
+    // A second Ctrl+G changes nothing.
+    const again = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.waiting, again);
+    try std.testing.expectEqual(@as(usize, 1), app.yield_request_count);
+    try std.testing.expectEqual(@as(usize, 1), deps_state.path_count);
+
+    // The turns stopped, but a draft typed meanwhile holds the exit.
+    app.turn_running = false;
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "draft");
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.input_runtime.edit_state.input.clearRetainingCapacity();
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
+    try std.testing.expect(!app.upgrader.restart_waits);
+    try std.testing.expectEqual(@as(usize, 1), app.held_work_logs);
+}
+
+test "app_upgrade_runtime holds the restart while a sent prompt waits for sign-in" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    app.main_agent.stream.active = true;
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.waiting, outcome);
+
+    // The turn stopped, but a prompt sent while sign-in is pending holds the exit.
+    app.turn_running = false;
+    app.main_agent.submission.pending = 1;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+
+    app.main_agent.submission.pending = null;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
+}
+
+test "app_upgrade_runtime refuses while a sent prompt waits to go out" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.submission.pending = 1;
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "while a sent prompt waits to go out") != null);
+    try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
+    try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
+    try std.testing.expect(!app.should_exit);
+
+    // Once the prompt has gone out, Ctrl+G relaunches at once, as with no turn.
+    app.main_agent.submission.pending = null;
+    const again = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.relaunch_requested, again);
+    try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
+    try std.testing.expect(app.should_exit);
+}
+
+test "app_upgrade_runtime says the restart also waits for working subagents" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    app.subagent_working = true;
+    var deps_state = TestDepsState{};
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.waiting, outcome);
+    try std.testing.expectEqualStrings(restart_waits_for_subagents_notice, app.notices.items);
+}
+
+test "app_upgrade_runtime relaunches at once when no turn runs" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    var deps_state = TestDepsState{};
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.relaunch_requested, outcome);
+    try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
+    try std.testing.expect(app.should_exit);
 }
 
 test "app_upgrade_runtime rejects mid key sequence before reload" {

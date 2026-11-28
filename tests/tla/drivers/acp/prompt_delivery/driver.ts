@@ -54,6 +54,8 @@ const PLANS: Plan[] = [
 ];
 
 const KIND: Record<Label, "plain" | "steer" | "queue"> = { P: "plain", M: "plain", S1: "steer", S2: "steer", I: "steer", Q1: "queue", Q2: "queue" };
+// The model's NoDelivery: an answer with no sh.fx/delivery result.
+const NO_DELIVERY = "no delivery result";
 const marker = (label: string) => `${label}-mk7`;
 
 function promptParams(sessionId: string, label: Label, next: boolean): Record<string, unknown> {
@@ -72,7 +74,7 @@ function promptParams(sessionId: string, label: Label, next: boolean): Record<st
 function answerOf(response: any, next: boolean): Answer {
   if (response?.error) return { kind: "err", stop: "", delivery: "", code: Number(response.error.code) };
   const meta = response?.result?._meta ?? {};
-  const delivery = (next ? meta["sh.fx/steeringDelivery"] : meta?.fx?.steering) ?? "none";
+  const delivery = (next ? meta["sh.fx/steeringDelivery"] : meta?.fx?.steering) ?? NO_DELIVERY;
   return { kind: "ok", stop: String(response?.result?.stopReason ?? ""), delivery: String(delivery), code: 0 };
 }
 
@@ -226,7 +228,7 @@ function syntheticTrace(): Observation[] {
     step("stream_end", "none", null, null),
     step("reply_end", "none", null, null),
     step("stop_input", "none", null, null),
-    step("finish", "none", { P: ok("end_turn", "none"), S1: ok("end_turn", "absorbed") }, null),
+    step("finish", "none", { P: ok("end_turn", NO_DELIVERY), S1: ok("end_turn", "absorbed") }, null),
   ];
 }
 

@@ -888,6 +888,9 @@ fn usedBy(arena: Allocator, call: Call) Allocator.Error!?Found {
         const name = if (resource.len == 0) location else try arena.print("{s} {s}", .{ location, resource });
         return .{ .kind = .skill, .name = name };
     }
+    // The v1 client's `mcp_features` tool is gone (#1353), but sessions saved
+    // before it was removed still hold its calls, and a compaction of one must
+    // keep counting them as MCP use (R3.5).
     if (std.mem.eql(u8, call.name, "mcp_features")) {
         const server = try stringArgument(arena, call.arguments, "server") orelse "";
         const action = try stringArgument(arena, call.arguments, "action") orelse "";

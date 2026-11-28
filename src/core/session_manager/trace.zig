@@ -363,7 +363,7 @@ pub const TurnTraces = struct {
             .turn_interrupted => "interrupt",
             .set => "set",
             .closed => "closed",
-            .snapshot, .child_spawned, .child_finished => null,
+            .snapshot, .child_spawned, .child_finished, .input_accepted, .input_delivered, .input_withdrawn => null,
         };
     }
 
@@ -400,4 +400,11 @@ fn readSessionLog(gpa: std.mem.Allocator, io: Io, root: Io.Dir, id: []const u8) 
     if (root.readFileAlloc(io, direct, gpa, .limited(64 << 20))) |bytes| return bytes else |_| {}
     const staged = std.mem.print(&buf, ".tmp/{s}/log.jsonl", .{id}) catch return null;
     return root.readFileAlloc(io, staged, gpa, .limited(64 << 20)) catch null;
+}
+
+test "specKind leaves input records out of TurnLifecycle trace kinds" {
+    try std.testing.expectEqual(@as(?[]const u8, null), TurnTraces.specKind(.input_accepted));
+    try std.testing.expectEqual(@as(?[]const u8, null), TurnTraces.specKind(.input_delivered));
+    try std.testing.expectEqual(@as(?[]const u8, null), TurnTraces.specKind(.input_withdrawn));
+    try std.testing.expectEqualStrings("item", TurnTraces.specKind(.item).?);
 }

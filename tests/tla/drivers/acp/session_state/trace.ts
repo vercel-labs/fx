@@ -9,7 +9,7 @@ export type StatusAnswer = { kind: "ok" | "unknown" | "no_method" | "busy" | "no
 
 /// One step of the run, with what the driver observed.
 export type Observation = {
-  act: "open" | "close" | "prompt" | "end" | "list" | "status" | "sync";
+  act: "open" | "close" | "prompt" | "end" | "list" | "peer" | "status" | "sync";
   s: string;
   stop: string;
   f: string;

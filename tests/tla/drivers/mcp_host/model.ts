@@ -6,7 +6,8 @@
 //   PASS     exit 0, the completed marker, an empty queue
 //   CAUGHT   a planted bug: exit 12 naming its invariant, or exit 13 for its property
 //   FINDING  a findings config: exit 12 naming the stated invariant (13 for a property)
-// Anything else is FAIL. Usage: bun model.ts OUTPUT_DIR [--model NAME]
+// Anything else is FAIL. Usage: bun model.ts OUTPUT_DIR [--model NAME | --model -NAME]
+// (one model alone, or every model but one).
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { configWith, runTlc, sha256, sha256Text, tlaDir, tools, type TlcRun } from "./tlc";
@@ -33,13 +34,20 @@ function verdictOf(run: TlcRun, expect?: { invariant?: string; property?: string
   return run.exit === 13 && run.temporal && run.violated === undefined ? "CAUGHT" : "FAIL";
 }
 
+// `only` is one module's name, or `-NAME` for every module but that one. A name that is not in the catalog
+// fails: it would run nothing, or, after the `-`, everything.
 export async function runModels(outDir: string, only?: string): Promise<GateResult[]> {
+  if (only !== undefined) {
+    const name = only.startsWith("-") ? only.slice(1) : only;
+    const names = catalog().map((entry) => entry.module);
+    if (!names.includes(name)) throw new Error(`No model named '${name}' in catalog.json. Models: ${names.join(", ")}`);
+  }
   mkdirSync(outDir, { recursive: true, mode: 0o700 });
   const { java, jar, jarSha256 } = tools();
   const results: GateResult[] = [];
   const save = () => writeFileSync(join(outDir, "gate.json"), JSON.stringify({ java, jar, jarSha256, results }, null, 2));
   for (const entry of catalog()) {
-    if (only && entry.module !== only) continue;
+    if (only && (only.startsWith("-") ? entry.module === only.slice(1) : entry.module !== only)) continue;
     const model = join(tlaDir, `${entry.module}.tla`);
     const record = (kind: GateResult["kind"], run: TlcRun, verdict: GateResult["verdict"], cfgText: string, extra: Partial<GateResult> = {}) => {
       const r: GateResult = {
@@ -87,8 +95,10 @@ export async function runModels(outDir: string, only?: string): Promise<GateResu
 
 if (import.meta.main) {
   const out = process.argv[2];
-  if (!out) throw new Error("Usage: bun model.ts NEW_OUTPUT_DIRECTORY [--model NAME]");
+  const usage = "Usage: bun model.ts NEW_OUTPUT_DIRECTORY [--model NAME | --model -NAME]";
+  if (!out) throw new Error(usage);
   const at = process.argv.indexOf("--model");
+  if (at > 0 && !process.argv[at + 1]) throw new Error(usage);
   const results = await runModels(resolve(out), at > 0 ? process.argv[at + 1] : undefined);
   const failed = results.filter((r) => r.verdict === "FAIL");
   console.log(`${results.length} runs, ${failed.length} failed`);

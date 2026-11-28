@@ -23,6 +23,10 @@ pub const supported = switch (builtin.target.os.tag) {
 /// on one HTTP message (`src/mcp/io/http.zig` `max_message`).
 pub const max_result_bytes: usize = 16 * 1024 * 1024;
 
+/// The bridge works only while the shell call that ran the command runs, so a
+/// slow check must be a shell call of its own.
+pub const short_checks_advice = "To check a slow job, run each check as its own shell call, not one long loop, such as: sleep 10; fx mcp call TOOL_NAME '<JSON arguments>'.";
+
 pub const Authorization = union(enum) {
     /// The check allowed the call, for the tool definition it checked.
     allow: struct { binding: ?types.McpToolBinding = null },

@@ -58,6 +58,7 @@ MCAcpPromptDelivery AcpPromptDeliveryToday-interrupt NoSteerWaitsOnReply
 MCAcpPromptDelivery AcpPromptDeliveryToday-lost NothingLost
 MCAcpPromptDelivery AcpPromptDeliveryToday-dropped DeliveryValues
 MCAcpPromptDelivery AcpPromptDeliveryToday-late LateRunTogether
+MCAcpPromptDelivery AcpPromptDeliveryToday-withdraw PendingRefused
 MCAcpFollow MCAcpFollow -
 MCAcpFollow AcpFollowToday-busy JoinWorks
 MCAcpFollow AcpFollowToday-ids StableIds
@@ -76,6 +77,7 @@ MCAcpSharedSession AcpSharedSessionToday-request RequestReachesAll
 MCAcpSharedSession AcpSharedSessionToday-prompts EchoComplete
 MCAcpSharedSession AcpSharedSessionToday-clients RosterCurrent
 MCAcpSharedSession AcpSharedSessionToday-cancel CancelStops
+MCAcpSharedSession AcpSharedSessionToday-stop StopEffect
 MCAcpSubagents MCAcpSubagents -
 MCAcpSubagents AcpSubagentsToday-ids ChildIdUsed
 MCAcpSubagents AcpSubagentsToday-replay ReplayComplete

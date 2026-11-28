@@ -16,7 +16,8 @@ else
 const Allocator = std.mem.Allocator;
 const ambiguous_skill_suffix_fmt = "; {d} additional advertised location{s} omitted by the {d}-byte tool-result limit. Refresh available skills and retry with an advertised name and location.";
 const discovery_model_notice = "<skill_discovery_warning details=\"context_notice\" />\n";
-const content_name_prefix = "<skill_content name=\"";
+/// How a skill's text starts when a call opens the skill.
+pub const content_name_prefix = "<skill_content name=\"";
 const test_workspace_roots = [_]skill_contract.RootSpec{
     .{ .source = .workspace_shared, .path = "skills" },
 };

@@ -14,6 +14,8 @@ const secret = @import("../core/auth/secret.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const request_deadlines = @import("request_deadlines.zig");
 const sse = @import("sse.zig");
+const catalog_fetch_failure = @import("catalog_fetch_failure.zig");
+const raw_answer_testing = @import("raw_answer_testing.zig");
 const Allocator = std.mem.Allocator;
 
 /// fx's own bounds, for a connection whose settings name none.
@@ -294,7 +296,7 @@ const ModelsOperation = struct {
         var response_writer = std.Io.Writer.fixed(body_buffer);
         const extra = try std.mem.concat(self.alloc, std.http.Header, &.{ &.{.{ .name = "accept", .value = "application/json" }}, self.headers });
         defer self.alloc.free(extra);
-        const result = client_mod.fetchOnOpenJob(.{
+        const result = client_mod.fetchWholeBodyOnOpenJob(.{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = request_headers,
@@ -310,6 +312,11 @@ const ModelsOperation = struct {
         return .{ .status = result.status, .body = try self.alloc.dupe(u8, body) };
     }
 };
+
+/// A cut-off or broken answer is `malformed`; any other failure to get one is `transport`.
+fn modelsFailureFor(err: anyerror) ModelsFailure {
+    return if (catalog_fetch_failure.classify(err).category == .malformed_response) .malformed else .transport;
+}
 
 /// Asks the connection's server for its model list (`GET {base_url}/models`)
 /// with the connection's own key and headers, read from the environment here
@@ -350,7 +357,7 @@ pub fn fetchModelIds(alloc: Allocator, definition: *const definitions.Definition
             return .{ .failure = .timeout };
         },
         error.ModelListTooLarge => return .{ .failure = .malformed },
-        else => return .{ .failure = .transport },
+        else => |other| return .{ .failure = modelsFailureFor(other) },
     };
     defer response.deinit(alloc);
     if (response.status != .ok) return .{ .failure = .http_status };
@@ -437,4 +444,48 @@ fn testParseAllocations(alloc: Allocator) !void {
 
 test "model list parsing releases its ids on any allocation failure" {
     try std.testing.checkAllAllocationFailures(@import("../core/shared/testing_allocator.zig").no_resize, testParseAllocations, .{});
+}
+
+/// Asks a custom connection for its model list through a loopback server that
+/// sends `answer`, or a closed port when `answer` is null. The result must be
+/// the failure `expected`.
+fn expectModelListFailure(answer: ?[]const u8, expected: ModelsFailure) !void {
+    const alloc = std.testing.allocator;
+    var server: ?raw_answer_testing.AnswerServer = null;
+    if (answer) |bytes| server = try raw_answer_testing.AnswerServer.start(alloc, bytes);
+    const base_url = if (server) |running|
+        try running.url(alloc, "/v1")
+    else
+        try alloc.dupe(u8, "http://127.0.0.1:1/v1");
+    defer alloc.free(base_url);
+    const json = try alloc.print(
+        "{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"{s}\",\"auth\":{{\"type\":\"none\"}},\"fetch_models\":true}}}}",
+        .{base_url},
+    );
+    defer alloc.free(json);
+    var registry = try definitions.Registry.parse_json(alloc, json);
+    defer registry.deinit(alloc);
+    var result = try fetchModelIds(alloc, registry.get("local").?, null);
+    if (server) |running| try running.finish();
+    switch (result) {
+        .failure => |failure| try std.testing.expectEqual(expected, failure),
+        .ids => |*ids| {
+            freeIds(alloc, ids);
+            return error.TestExpectedModelListFailure;
+        },
+    }
+}
+
+test "configured model list cut inside its Content-Length is malformed, not an empty list" {
+    const answer: []const u8 = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"data\":[]}";
+    try expectModelListFailure(answer, .malformed);
+}
+
+test "configured model list gzip that is not gzip is malformed" {
+    const answer: []const u8 = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}";
+    try expectModelListFailure(answer, .malformed);
+}
+
+test "configured model list refused before it connects is a transport failure" {
+    try expectModelListFailure(null, .transport);
 }

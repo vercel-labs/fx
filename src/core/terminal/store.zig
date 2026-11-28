@@ -486,6 +486,11 @@ pub const ProfileStore = struct {
     options: Options,
     mutex: std.Io.Mutex = .init,
     residents: std.ArrayList(*DurableSession) = .empty,
+    /// The ids of this process's starts that have not returned. A start's
+    /// record is on disk before the registry can find its session, so
+    /// `open_terminal` refuses these ids and `ownerCatalog` leaves them out
+    /// (`tests/tla/terminal/TerminalLifecycle.tla` `NoIndexBeforeStartReturns`).
+    starting: std.ArrayList([]u8) = .empty,
 
     pub fn init(
         alloc: Allocator,
@@ -542,6 +547,8 @@ pub const ProfileStore = struct {
     pub fn deinit(self: *ProfileStore) void {
         std.debug.assert(self.residents.items.len == 0);
         self.residents.deinit(self.alloc);
+        for (self.starting.items) |session_id| self.alloc.free(session_id);
+        self.starting.deinit(self.alloc);
         self.alloc.free(self.display_sessions_path);
         for (self.display_outside_paths) |path| self.alloc.free(path);
         self.sessions_dir.close();
@@ -549,10 +556,13 @@ pub const ProfileStore = struct {
         self.* = undefined;
     }
 
+    const RegisterResidentError = Allocator.Error || error{TerminalSessionResident};
+
+    /// `TerminalSessionResident` means another resident already holds the id.
     pub fn register_resident(
         self: *ProfileStore,
         session: *DurableSession,
-    ) Allocator.Error!void {
+    ) RegisterResidentError!void {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
@@ -562,17 +572,60 @@ pub const ProfileStore = struct {
     fn register_resident_locked(
         self: *ProfileStore,
         session: *DurableSession,
-    ) Allocator.Error!void {
+    ) RegisterResidentError!void {
         for (self.residents.items) |resident| {
             if (resident == session) return;
-            std.debug.assert(!std.mem.eql(
+            if (std.mem.eql(
                 u8,
                 resident.record.session_id,
                 session.record.session_id,
-            ));
+            )) return error.TerminalSessionResident;
         }
         try self.residents.append(self.alloc, session);
         session.registered = true;
+    }
+
+    /// Marks `session_id` as a start that has not finished, until `end_start`.
+    /// Returns the profile's own copy of the id, which stays valid until then.
+    pub fn begin_start(
+        self: *ProfileStore,
+        session_id: []const u8,
+    ) Allocator.Error![]const u8 {
+        const owned = try self.alloc.dupe(u8, session_id);
+        errdefer self.alloc.free(owned);
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        try self.starting.append(self.alloc, owned);
+        return owned;
+    }
+
+    /// Ends the mark of `session_id`, which may be the store's own copy or
+    /// the id the start's caller received.
+    pub fn end_start(self: *ProfileStore, session_id: []const u8) void {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        for (self.starting.items, 0..) |owned, index| {
+            if (!std.mem.eql(u8, owned, session_id)) continue;
+            _ = self.starting.swapRemove(index);
+            self.alloc.free(owned);
+            return;
+        }
+    }
+
+    pub fn is_starting(self: *ProfileStore, session_id: []const u8) bool {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        return self.starting_locked(session_id);
+    }
+
+    fn starting_locked(self: *ProfileStore, session_id: []const u8) bool {
+        for (self.starting.items) |owned| {
+            if (std.mem.eql(u8, owned, session_id)) return true;
+        }
+        return false;
     }
 
     pub fn unregister_resident(
@@ -768,6 +821,8 @@ pub const ProfileStore = struct {
         };
     }
 
+    /// Opens a detached copy of a saved terminal. A terminal this process holds
+    /// is refused: a resident, or a start that has not returned.
     pub fn open_terminal(
         self: *ProfileStore,
         terminal_session_id: []const u8,
@@ -776,7 +831,9 @@ pub const ProfileStore = struct {
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
         try contracts.validate_session_id(terminal_session_id);
-        if (self.resident_by_id(terminal_session_id) != null) {
+        if (self.resident_by_id(terminal_session_id) != null or
+            self.starting_locked(terminal_session_id))
+        {
             return error.TerminalSessionResident;
         }
         var result: ?DurableSession = null;
@@ -837,6 +894,7 @@ pub const ProfileStore = struct {
         defer names.deinit();
         for (names.names) |name| {
             const terminal_id = terminal_id_from_record_name(name) orelse continue;
+            if (self.starting_locked(terminal_id)) continue;
             var record = load_record(self.alloc, &capability, terminal_id) catch continue;
             defer record.deinit(self.alloc);
             if (!std.mem.eql(
@@ -6314,6 +6372,85 @@ test "owner catalog enumerates the exact durable owner without a terminal anchor
         error.InvalidHolderProof,
         fixture.profile.ownerCatalog(forged),
     );
+}
+
+fn expect_open_refused(profile: *ProfileStore, terminal_session_id: []const u8) !void {
+    const copy = profile.open_terminal(terminal_session_id) catch |err| {
+        try std.testing.expectEqual(error.TerminalSessionResident, err);
+        return;
+    };
+    profile.release_terminal(copy);
+    return error.TestUnexpectedResult;
+}
+
+test "start in flight: open_terminal refuses it and the owner catalog skips it until the start returns" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var saved = try fixture.create("terminal-in-flight");
+    defer saved.deinit();
+    var owner = try fixture.owner_capability("terminal-store-owner", .writable);
+    defer owner.deinit();
+    var claim = try loadOrCreateOwnerCatalogClaim(alloc, &owner, .{
+        .profile_user = "profile-user",
+        .durable_session_id = "terminal-store-owner",
+        .workspace_root = "/workspace",
+        .transport_role = .interactive,
+        .actor = .agent,
+    });
+    defer claim.deinit();
+
+    const in_flight = try fixture.profile.begin_start("terminal-in-flight");
+    try std.testing.expect(fixture.profile.is_starting("terminal-in-flight"));
+    try expect_open_refused(&fixture.profile, "terminal-in-flight");
+    {
+        var catalog = try fixture.profile.ownerCatalog(claim.view());
+        defer catalog.deinit();
+        try std.testing.expectEqual(@as(usize, 0), catalog.entries.items.len);
+    }
+
+    fixture.profile.end_start(in_flight);
+    try std.testing.expect(!fixture.profile.is_starting("terminal-in-flight"));
+    {
+        var catalog = try fixture.profile.ownerCatalog(claim.view());
+        defer catalog.deinit();
+        try std.testing.expectEqual(@as(usize, 1), catalog.entries.items.len);
+        try std.testing.expectEqualStrings("terminal-in-flight", catalog.entries.items[0].facts.session_id);
+    }
+    const reopened = try fixture.profile.open_terminal("terminal-in-flight");
+    fixture.profile.release_terminal(reopened);
+}
+
+test "start in flight: ending one start leaves the others in flight" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    const first = try fixture.profile.begin_start("terminal-first");
+    const second = try fixture.profile.begin_start("terminal-second");
+    fixture.profile.end_start(first);
+    try std.testing.expect(!fixture.profile.is_starting("terminal-first"));
+    try std.testing.expect(fixture.profile.is_starting("terminal-second"));
+    fixture.profile.end_start(second);
+    try std.testing.expect(!fixture.profile.is_starting("terminal-second"));
+}
+
+test "start in flight: a second resident with the same id is refused with an error" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestStoreFixture.init(alloc, test_options());
+    defer fixture.deinit();
+    var first = try fixture.create("terminal-twice");
+    defer first.deinit();
+    try fixture.profile.register_resident(&first);
+
+    var copy = try fixture.profile.open_existing("terminal-store-owner", "terminal-twice");
+    defer copy.deinit();
+    try std.testing.expectError(
+        error.TerminalSessionResident,
+        fixture.profile.register_resident(&copy),
+    );
+    try std.testing.expect(!copy.registered);
+    try std.testing.expectEqual(@as(usize, 1), fixture.profile.residents.items.len);
+    try std.testing.expect(fixture.profile.residents.items[0] == &first);
 }
 
 /// Treats only pid 4242 as a running process.

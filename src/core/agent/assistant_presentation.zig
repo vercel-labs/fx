@@ -9,6 +9,7 @@ const tu = @import("presentation/text_util.zig");
 const bp = @import("presentation/block_parse.zig");
 const payload = @import("presentation/payload.zig");
 const inline_render = @import("presentation/inline_render.zig");
+pub const builds_previews = inline_render.builds_previews;
 const block_render = @import("presentation/block_render.zig");
 
 /// Prevents OSC 8 hyperlinks from coalescing across wrapped terminal rows.
@@ -36,10 +37,17 @@ pub const Event = union(enum) {
     /// An answer attempt starts. It waits for earlier text to show, so the
     /// host knows where the attempt's output begins.
     attempt_start,
+    /// The text before it is a line fx wrote between steps, such as the
+    /// empty-reply nudge, not the model's. It waits for that text to show,
+    /// so the host can mark the entry that holds it.
+    operational_text_shown,
     /// The attempt broke off and the answer starts over. The host replaces
     /// what it showed of the attempt when it still can, and otherwise shows
     /// this line after it.
     attempt_restart: []u8,
+    /// The unfinished tail of the answer, shown until the text it follows is
+    /// committed. It replaces the tail sent before it.
+    assistant_tail: []Event,
 
     pub fn clone(self: Event, alloc: Allocator) Allocator.Error!Event {
         return switch (self) {
@@ -48,14 +56,16 @@ pub const Event = union(enum) {
             .code_block => |block| .{ .code_block = try block.clone(alloc) },
             .thematic_rule => .thematic_rule,
             .attempt_start => .attempt_start,
+            .operational_text_shown => .operational_text_shown,
             .attempt_restart => |text| .{ .attempt_restart = try alloc.dupe(u8, text) },
+            .assistant_tail => |events| .{ .assistant_tail = try cloneEventSlice(alloc, events) },
         };
     }
 
     pub fn requiresTextDrain(self: Event) bool {
         return switch (self) {
-            .text, .attempt_restart => false,
-            .table, .code_block, .thematic_rule, .attempt_start => true,
+            .text, .attempt_restart, .assistant_tail => false,
+            .table, .code_block, .thematic_rule, .attempt_start, .operational_text_shown => true,
         };
     }
 
@@ -71,8 +81,13 @@ pub const Event = union(enum) {
                 break :blk total;
             },
             .code_block => |block| block.language.len +| block.code.len,
-            .thematic_rule, .attempt_start => 1,
+            .thematic_rule, .attempt_start, .operational_text_shown => 1,
             .attempt_restart => |text| text.len,
+            .assistant_tail => |events| blk: {
+                var total: usize = 0;
+                for (events) |event| total +|= event.retainedByteCount();
+                break :blk total;
+            },
         };
     }
 
@@ -81,12 +96,32 @@ pub const Event = union(enum) {
             .text => |text| alloc.free(text),
             .table => |*table| table.deinit(alloc),
             .code_block => |*block| block.deinit(alloc),
-            .thematic_rule, .attempt_start => {},
+            .thematic_rule, .attempt_start, .operational_text_shown => {},
             .attempt_restart => |text| alloc.free(text),
+            .assistant_tail => |events| freeEventSlice(alloc, events),
         }
         self.* = undefined;
     }
 };
+
+fn cloneEventSlice(alloc: Allocator, source: []const Event) Allocator.Error![]Event {
+    const out = try alloc.alloc(Event, source.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |*event| event.deinit(alloc);
+        alloc.free(out);
+    }
+    while (cloned < source.len) : (cloned += 1) {
+        out[cloned] = try source[cloned].clone(alloc);
+    }
+    return out;
+}
+
+/// Frees every event in `events` and the slice itself.
+pub fn freeEventSlice(alloc: Allocator, events: []Event) void {
+    for (events) |*event| event.deinit(alloc);
+    alloc.free(events);
+}
 
 pub const renderCodeBlockPayload = block_render.renderCodeBlockPayload;
 pub const renderTablePayload = block_render.renderTablePayload;
@@ -177,6 +212,16 @@ pub const MarkdownProcessor = struct {
     active_definition: bool = false,
     footnotes: std.ArrayList(Footnote) = .empty,
     active_footnote: ?ActiveFootnote = null,
+    /// Preview clone only: how the open line renders. Committed text stays committed.
+    open_line_mode: inline_render.Mode = .committed,
+    /// Preview clone only: the footnote whose last body line is still open.
+    open_body_note: ?usize = null,
+    /// Preview clone only: the line index of a header row the preview completes while it is open.
+    open_pipe_row: ?usize = null,
+    /// Preview clone only: set when an open-end rule changes the open line.
+    open_end_fired: bool = false,
+    /// Where new OSC 8 link ids come from. A preview points it at its own counter, so the shared counter never moves.
+    link_ids: *u32 = &link_id_counter,
     next_footnote_number: usize = 0,
     previous_line_was_blank: bool = true,
     /// Innermost last; each entry's shift already includes its parents'.
@@ -211,6 +256,100 @@ pub const MarkdownProcessor = struct {
         self.active_footnote = null;
         self.next_footnote_number = 0;
         self.previous_line_was_blank = true;
+    }
+
+    /// A deep copy of the held state, so flushing the copy never touches this processor.
+    fn cloneForPreview(self: *const MarkdownProcessor, alloc: Allocator, link_ids: *u32) !MarkdownProcessor {
+        var copy = MarkdownProcessor{
+            .link_ids = link_ids,
+            .in_code_block = self.in_code_block,
+            .code_fence = self.code_fence,
+            .in_pipe_block = self.in_pipe_block,
+            .pipe_last_line_has_lf = self.pipe_last_line_has_lf,
+            .active_blockquote = self.active_blockquote,
+            .active_definition = self.active_definition,
+            .active_footnote = self.active_footnote,
+            .next_footnote_number = self.next_footnote_number,
+            .previous_line_was_blank = self.previous_line_was_blank,
+        };
+        errdefer copy.deinit(alloc);
+        try copy.line_buf.appendSlice(alloc, self.line_buf.items);
+        try copy.safe_line.appendSlice(alloc, self.safe_line.items);
+        try copy.pending_top_level_line.appendSlice(alloc, self.pending_top_level_line.items);
+        try copy.pipe_buf.appendSlice(alloc, self.pipe_buf.items);
+        try copy.code_buf.appendSlice(alloc, self.code_buf.items);
+        try copy.code_language.appendSlice(alloc, self.code_language.items);
+        try copy.open_ordered_items.appendSlice(alloc, self.open_ordered_items.items);
+        for (self.footnotes.items) |note| {
+            const label = try alloc.dupe(u8, note.label);
+            copy.footnotes.append(alloc, .{
+                .label = label,
+                .number = note.number,
+                .has_definition = note.has_definition,
+            }) catch |err| {
+                alloc.free(label);
+                return err;
+            };
+            const body = &copy.footnotes.items[copy.footnotes.items.len - 1].body;
+            try body.appendSlice(alloc, note.body.items);
+        }
+        return copy;
+    }
+
+    /// Renders what the held text would commit, as the events a flush of this
+    /// processor produces, without changing this processor
+    /// (tests/tla/assistant_stream/StreamTail.tla CommittedIsPrefixOfFinal). The
+    /// caller owns the events appended to `tail`.
+    pub fn renderProvisional(
+        self: *const MarkdownProcessor,
+        alloc: Allocator,
+        tail: *std.ArrayList(Event),
+    ) !ProvisionalResult {
+        const first = tail.items.len;
+        errdefer deinitEventsFrom(alloc, tail, first);
+        var preview_link_id = self.link_ids.*;
+        var preview = try self.cloneForPreview(alloc, &preview_link_id);
+        defer preview.deinit(alloc);
+        preview.open_line_mode = .{ .open_end = &preview.open_end_fired };
+        var result = ProvisionalResult{};
+        if (!preview.in_code_block) {
+            const held_bytes = preview.line_buf.items.len;
+            dropIncompleteUtf8(&preview.line_buf);
+            result.open_end_applied = preview.line_buf.items.len != held_bytes;
+            if (preview.line_buf.items.len > 0 and opensWithBlockMarkersOnly(preview.line_buf.items)) {
+                preview.line_buf.clearRetainingCapacity();
+                result.open_end_applied = true;
+            }
+            result.table_header_completed = try completeOpenTableHeader(alloc, &preview);
+        }
+        var collector = EventCollector{ .alloc = alloc, .events = tail };
+        const completions = collector.completions();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        try preview.flushWithCompletions(alloc, &out, completions);
+        try collector.appendPendingText(&out);
+        result.open_end_applied = result.open_end_applied or preview.open_end_fired;
+        return result;
+    }
+
+    /// The mode for a line: a finished line commits as it is, and the open line of the preview is open text.
+    fn inlineMode(self: *const MarkdownProcessor, line_has_lf: bool) inline_render.Mode {
+        return if (line_has_lf) .committed else self.open_line_mode;
+    }
+
+    /// Marks the footnote body whose last line is the open line, so the preview renders it as open text.
+    fn markOpenBodyLine(self: *MarkdownProcessor, line_has_lf: bool) void {
+        const active = self.active_footnote orelse return;
+        if (!line_has_lf and active.append_body) self.open_body_note = active.index;
+    }
+
+    /// The held table rows that the stream has not finished. Committed text has none.
+    fn openRows(self: *const MarkdownProcessor) block_render.OpenRows {
+        if (!self.open_line_mode.isOpenEnd()) return .{};
+        if (self.open_pipe_row) |first| return .{ .first = first, .mode = self.open_line_mode };
+        if (self.pipe_last_line_has_lf) return .{};
+        const lines = std.mem.count(u8, self.pipe_buf.items, "\n");
+        return .{ .first = lines -| 1, .mode = self.open_line_mode };
     }
 
     pub fn push(self: *MarkdownProcessor, alloc: Allocator, input: []const u8, out: *std.ArrayList(u8)) !void {
@@ -360,6 +499,7 @@ pub const MarkdownProcessor = struct {
                     var note = &self.footnotes.items[active.index];
                     try note.body.append(alloc, '\n');
                     try note.body.appendSlice(alloc, body);
+                    self.markOpenBodyLine(line_has_lf);
                 }
                 return;
             }
@@ -370,20 +510,21 @@ pub const MarkdownProcessor = struct {
             self.active_definition = false;
             try self.flushPendingTopLevelLine(alloc, out);
             try self.beginFootnoteDefinition(alloc, definition);
+            self.markOpenBodyLine(line_has_lf);
             return;
         }
 
         if (completions.thematic_rule != null and self.pending_top_level_line.items.len > 0) {
             if (bp.parseSetextUnderline(line)) |level| {
                 self.active_definition = false;
-                try block_render.writeHeading(alloc, level, tu.withoutTerminalHardBreakMarker(self.pending_top_level_line.items, true), out, &fs, &link_id_counter);
+                try block_render.writeHeading(alloc, level, tu.withoutTerminalHardBreakMarker(self.pending_top_level_line.items, true), out, &fs, self.link_ids, .committed);
                 try out.append(alloc, '\n');
                 self.pending_top_level_line.clearRetainingCapacity();
                 return;
             }
             if (bp.definitionMarkerBody(line)) |body| {
                 try self.flushPendingTopLevelLine(alloc, out);
-                try block_render.writeDefinitionLine(alloc, body, line_has_lf, out, &fs, &link_id_counter);
+                try block_render.writeDefinitionLine(alloc, body, line_has_lf, out, &fs, self.link_ids, self.inlineMode(line_has_lf));
                 self.active_definition = true;
                 return;
             }
@@ -394,7 +535,7 @@ pub const MarkdownProcessor = struct {
         if (self.active_blockquote) |blockquote| {
             self.active_definition = false;
             if (bp.isLazyBlockquoteContinuation(line)) {
-                try block_render.writeBlockquoteLine(alloc, blockquote, line, line_has_lf, out, &fs, &link_id_counter);
+                try block_render.writeBlockquoteLine(alloc, blockquote, line, line_has_lf, out, &fs, self.link_ids, self.inlineMode(line_has_lf));
                 try out.append(alloc, '\n');
                 return;
             }
@@ -442,7 +583,7 @@ pub const MarkdownProcessor = struct {
 
         if (self.active_definition) {
             if (bp.definitionMarkerBody(line)) |body| {
-                try block_render.writeDefinitionLine(alloc, body, line_has_lf, out, &fs, &link_id_counter);
+                try block_render.writeDefinitionLine(alloc, body, line_has_lf, out, &fs, self.link_ids, self.inlineMode(line_has_lf));
                 return;
             }
         }
@@ -510,7 +651,7 @@ pub const MarkdownProcessor = struct {
         }
 
         if (bp.parseHeader(tu.withoutTerminalHardBreakMarker(line, line_has_lf))) |header| {
-            try block_render.writeHeading(alloc, header.level, header.content, out, &fs, &link_id_counter);
+            try block_render.writeHeading(alloc, header.level, header.content, out, &fs, self.link_ids, self.inlineMode(line_has_lf));
             return;
         }
 
@@ -520,12 +661,12 @@ pub const MarkdownProcessor = struct {
                 .depth = parsed.depth,
             };
             self.active_blockquote = if (bp.isBlockquoteParagraph(parsed.content)) blockquote else null;
-            try block_render.writeBlockquoteLine(alloc, blockquote, parsed.content, line_has_lf, out, &fs, &link_id_counter);
+            try block_render.writeBlockquoteLine(alloc, blockquote, parsed.content, line_has_lf, out, &fs, self.link_ids, self.inlineMode(line_has_lf));
             return;
         }
 
         try out.appendNTimes(alloc, ' ', shift);
-        if (try block_render.writeListLine(alloc, line, line_has_lf, .right_aligned, out, &fs, &link_id_counter)) {
+        if (try block_render.writeListLine(alloc, line, line_has_lf, .right_aligned, out, &fs, self.link_ids, self.inlineMode(line_has_lf))) {
             if (bp.parseOrderedList(line)) |item| {
                 try self.open_ordered_items.append(alloc, .{
                     .content_column = item.indent.len + item.marker.len + 1,
@@ -535,7 +676,7 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
-        try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(line, line_has_lf), out, false, &fs, &link_id_counter);
+        try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(line, line_has_lf), out, false, &fs, self.link_ids, self.inlineMode(line_has_lf));
     }
 
     /// Returns how far padded ordered markers move `line`, first closing the
@@ -565,14 +706,14 @@ pub const MarkdownProcessor = struct {
 
         if (bp.isValidTable(self.pipe_buf.items)) {
             if (completion) |sink| {
-                var table = try block_render.parseTablePayloadWithFootnotes(alloc, self.pipe_buf.items, &fs, &link_id_counter);
+                var table = try block_render.parseTablePayloadWithFootnotes(alloc, self.pipe_buf.items, &fs, self.link_ids, self.openRows());
                 var delivered = false;
                 errdefer if (!delivered) table.deinit(alloc);
                 try sink.deliver(sink.ctx, table, out);
                 delivered = true;
                 return;
             }
-            try block_render.renderTable(alloc, self.pipe_buf.items, out, &fs, &link_id_counter);
+            try block_render.renderTable(alloc, self.pipe_buf.items, out, &fs, self.link_ids, self.openRows());
             return;
         }
 
@@ -682,15 +823,217 @@ pub const MarkdownProcessor = struct {
 
         var number: usize = 1;
         while (number <= self.next_footnote_number) : (number += 1) {
-            for (self.footnotes.items) |*note| {
+            for (self.footnotes.items, 0..) |*note, index| {
                 if (note.number != number or !note.has_definition) continue;
                 try block_render.writeFootnoteDefinitionMarker(alloc, out, number);
-                try block_render.writeFootnoteBody(alloc, note.body.items, out, &fs, number, &link_id_counter);
+                const last_line_mode = if (self.open_body_note == index) self.open_line_mode else .committed;
+                try block_render.writeFootnoteBody(alloc, note.body.items, out, &fs, number, self.link_ids, last_line_mode);
                 break;
             }
         }
     }
 };
+
+const pipe_byte: u8 = '|';
+const delimiter_row_lead = "|";
+const delimiter_cell = " --- |";
+const max_utf8_sequence_bytes = 4;
+
+const block_marker_bytes = "-=*#>|`_+~";
+
+/// A line made only of block markers and spaces, or of one number and a dot or
+/// a parenthesis, shows nothing until it has text. Such a line would otherwise
+/// reach the block parser, which reads `** **` as a thematic break.
+fn opensWithBlockMarkersOnly(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    const digits = digitPrefixLength(trimmed);
+    if (digits > 0 and digits < trimmed.len and (trimmed[digits] == '.' or trimmed[digits] == ')')) {
+        return std.mem.trim(u8, trimmed[digits + 1 ..], " \t").len == 0;
+    }
+    for (trimmed) |byte| {
+        if (byte == ' ' or byte == '\t') continue;
+        if (std.mem.findScalar(u8, block_marker_bytes, byte) == null) return false;
+    }
+    return true;
+}
+
+fn digitPrefixLength(text: []const u8) usize {
+    var length: usize = 0;
+    while (length < text.len and std.ascii.isDigit(text[length])) length += 1;
+    return length;
+}
+
+/// What a provisional render found on the held text.
+pub const ProvisionalResult = struct {
+    /// An open-end rule, a hidden block-marker line, or split UTF-8 changed the open line.
+    open_end_applied: bool = false,
+    /// The held pipe row was completed with a display delimiter row.
+    table_header_completed: bool = false,
+};
+
+/// Frees the events from `first` on, then removes them from `events`.
+pub fn deinitEventsFrom(alloc: Allocator, events: *std.ArrayList(Event), first: usize) void {
+    for (events.items[first..]) |*event| event.deinit(alloc);
+    events.shrinkRetainingCapacity(first);
+}
+
+/// Frees every event in `events`, then the list.
+pub fn deinitEvents(alloc: Allocator, events: *std.ArrayList(Event)) void {
+    deinitEventsFrom(alloc, events, 0);
+    events.deinit(alloc);
+}
+
+/// Collects a flush as events in stream order: the text before each table,
+/// code block, or rule, then that block. Its completions are the ones the
+/// stream uses for committed text.
+const EventCollector = struct {
+    alloc: Allocator,
+    events: *std.ArrayList(Event),
+    table_sink: TableCompletion = undefined,
+    code_sink: CodeBlockCompletion = undefined,
+    rule_sink: ThematicRuleCompletion = undefined,
+
+    fn completions(self: *EventCollector) MarkdownCompletions {
+        self.table_sink = .{ .ctx = self, .deliver = deliverTable };
+        self.code_sink = .{ .ctx = self, .deliver = deliverCode };
+        self.rule_sink = .{ .ctx = self, .deliver = deliverRule };
+        return .{ .table = &self.table_sink, .code = &self.code_sink, .thematic_rule = &self.rule_sink };
+    }
+
+    fn appendPendingText(self: *EventCollector, out: *std.ArrayList(u8)) !void {
+        if (out.items.len == 0) return;
+        const text = try self.alloc.dupe(u8, out.items);
+        errdefer self.alloc.free(text);
+        try self.events.append(self.alloc, .{ .text = text });
+        out.clearRetainingCapacity();
+    }
+
+    /// On error the caller still owns the payload and frees it.
+    fn deliverTable(raw: *anyopaque, table: TablePayload, out: *std.ArrayList(u8)) anyerror!void {
+        const self: *EventCollector = @ptrCast(@alignCast(raw));
+        try self.appendPendingText(out);
+        try self.events.append(self.alloc, .{ .table = table });
+    }
+
+    /// On error the caller still owns the payload and frees it.
+    fn deliverCode(raw: *anyopaque, block: CodeBlockPayload, out: *std.ArrayList(u8)) anyerror!void {
+        const self: *EventCollector = @ptrCast(@alignCast(raw));
+        try self.appendPendingText(out);
+        try self.events.append(self.alloc, .{ .code_block = block });
+    }
+
+    fn deliverRule(raw: *anyopaque, out: *std.ArrayList(u8)) anyerror!void {
+        const self: *EventCollector = @ptrCast(@alignCast(raw));
+        try self.appendPendingText(out);
+        try self.events.append(self.alloc, .thematic_rule);
+    }
+};
+
+/// A pipe row with no delimiter row yet is a table header the stream has not
+/// finished. The preview adds a display-only delimiter row with the same
+/// column count, so the header shows as a table and never as raw pipes.
+fn completeOpenTableHeader(alloc: Allocator, preview: *MarkdownProcessor) !bool {
+    if (preview.in_pipe_block) {
+        if (!isSingleHeaderLine(preview.pipe_buf.items)) return false;
+        if (!acceptsDelimiterNext(preview.line_buf.items)) return false;
+        const header = std.mem.trimEnd(u8, preview.pipe_buf.items, "\n");
+        try appendDelimiterRow(alloc, &preview.pipe_buf, tableColumnCount(header));
+        preview.pipe_last_line_has_lf = true;
+        return true;
+    }
+    const open = preview.line_buf.items;
+    if (open.len == 0 or !bp.isPipeLine(open) or bp.isSeparatorLine(open)) return false;
+    const columns = tableColumnCount(open);
+    if (!try wouldFormTable(alloc, preview, columns)) return false;
+    try preview.pipe_buf.appendSlice(alloc, open);
+    try preview.pipe_buf.append(alloc, '\n');
+    preview.open_pipe_row = std.mem.count(u8, preview.pipe_buf.items, "\n") - 1;
+    preview.line_buf.clearRetainingCapacity();
+    preview.in_pipe_block = true;
+    try appendDelimiterRow(alloc, &preview.pipe_buf, columns);
+    preview.pipe_last_line_has_lf = true;
+    return true;
+}
+
+/// True when the committed path turns the open pipe row into a table once a
+/// delimiter row follows it. It runs the committed path on a copy, so the context
+/// the row sits in (a footnote, a quote, a list) decides, as it does for the commit.
+fn wouldFormTable(alloc: Allocator, preview: *const MarkdownProcessor, columns: usize) !bool {
+    var copy_link_id = preview.link_ids.*;
+    var copy = try preview.cloneForPreview(alloc, &copy_link_id);
+    defer copy.deinit(alloc);
+    var found: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &found);
+    var collector = EventCollector{ .alloc = alloc, .events = &found };
+    const completions = collector.completions();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var delimiter: std.ArrayList(u8) = .empty;
+    defer delimiter.deinit(alloc);
+    try delimiter.append(alloc, '\n');
+    try delimiter.append(alloc, pipe_byte);
+    for (0..columns) |_| try delimiter.appendSlice(alloc, "---|");
+    try delimiter.append(alloc, '\n');
+    try copy.pushWithCompletions(alloc, delimiter.items, &out, completions);
+    try copy.flushWithCompletions(alloc, &out, completions);
+    for (found.items) |event| {
+        if (event == .table) return true;
+    }
+    return false;
+}
+
+fn isSingleHeaderLine(pipe_buf: []const u8) bool {
+    return pipe_buf.len > 0 and std.mem.findScalar(u8, pipe_buf, '\n') == pipe_buf.len - 1;
+}
+
+/// The open line may be the delimiter row that is still arriving. Then the
+/// preview waits for it, so it does not add a second one.
+fn acceptsDelimiterNext(open: []const u8) bool {
+    if (open.len == 0) return true;
+    return bp.isPipeLine(open) and !bp.isSeparatorLine(open);
+}
+
+/// Counts the columns of a header row: the unescaped pipes between its outer pipes, plus one.
+fn tableColumnCount(row: []const u8) usize {
+    var body = std.mem.trim(u8, row, " \t");
+    if (body.len > 0 and body[0] == pipe_byte) body = body[1..];
+    if (body.len > 0 and body[body.len - 1] == pipe_byte and !tu.isEscapedPunctuationAt(body, body.len - 1)) {
+        body = body[0 .. body.len - 1];
+    }
+    var pipes: usize = 0;
+    for (body, 0..) |byte, index| {
+        if (byte == pipe_byte and !tu.isEscapedPunctuationAt(body, index)) pipes += 1;
+    }
+    return pipes + 1;
+}
+
+fn appendDelimiterRow(alloc: Allocator, buf: *std.ArrayList(u8), columns: usize) !void {
+    try buf.appendSlice(alloc, delimiter_row_lead);
+    for (0..columns) |_| try buf.appendSlice(alloc, delimiter_cell);
+    try buf.append(alloc, '\n');
+}
+
+/// Drops the bytes of a multi-byte character that has not finished arriving,
+/// so the preview never shows them as escapes.
+fn dropIncompleteUtf8(held: *std.ArrayList(u8)) void {
+    held.shrinkRetainingCapacity(withoutIncompleteUtf8(held.items).len);
+}
+
+fn withoutIncompleteUtf8(text: []const u8) []const u8 {
+    var index = text.len;
+    var scanned: usize = 0;
+    while (index > 0 and scanned < max_utf8_sequence_bytes) : (scanned += 1) {
+        index -= 1;
+        if (isUtf8Continuation(text[index])) continue;
+        const length = std.unicode.utf8ByteSequenceLength(text[index]) catch return text;
+        return if (text.len - index < length) text[0..index] else text;
+    }
+    return text;
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return byte & 0xc0 == 0x80;
+}
 
 fn registerFootnoteThunk(ctx: *anyopaque, alloc: Allocator, label: []const u8) anyerror!usize {
     const self: *MarkdownProcessor = @ptrCast(@alignCast(ctx));
@@ -733,6 +1076,25 @@ test "markdown link destination keeps balanced parentheses" {
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "a preview counts link ids in its own counter and never writes the shared one" {
+    const alloc = std.testing.allocator;
+    link_id_counter = 1;
+    const shared_before = link_id_counter;
+    var processor_link_id: u32 = 4242;
+    var processor = MarkdownProcessor{ .link_ids = &processor_link_id };
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(alloc);
+    try processor.push(alloc, "see [docs](https://example.com) please", &committed);
+
+    var preview: std.ArrayList(u8) = .empty;
+    defer preview.deinit(alloc);
+    try renderPreviewDisplay(alloc, &processor, &preview);
+    try std.testing.expect(std.mem.find(u8, preview.items, "id=fx-4242;https://example.com") != null);
+    try std.testing.expectEqual(@as(u32, 4242), processor_link_id);
+    try std.testing.expectEqual(shared_before, link_id_counter);
 }
 
 test "markdown link drops its title and unwraps angle destinations" {
@@ -4180,4 +4542,832 @@ test "pipe table inside code block stays literal" {
 
     try std.testing.expect(std.mem.find(u8, out.items, "| not | a |") != null);
     try std.testing.expect(std.mem.find(u8, out.items, "| table | really |") != null);
+}
+
+const PreviewDoc = struct { name: []const u8, source: []const u8 };
+
+const preview_docs = [_]PreviewDoc{
+    .{ .name = "s1-reply", .source = "Streaming **bold words** and `inline code` with a [link](https://example.com) here.\n\n## Heading\n\n- item one\n- item two\n\n```zig\nconst x = 1;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nTitle line\n===\n\nEnd *italic* text.\n" },
+    .{ .name = "setext-thematic", .source = "Workspace *overview*\n===\nInstallation **guide**\n---\n\n---\n" },
+    .{ .name = "setext-eof", .source = "ordinary title\n" },
+    .{ .name = "definition-list", .source = "Status\n: **Running**\n: second definition\n" },
+    .{ .name = "footnote", .source = "The cache is scoped to this request.[^cache]\n[^cache]: It is discarded after the request completes.\n" },
+    .{ .name = "nested-fence", .source = "````md\n```zig\ninner\n```\n````\nafter\n" },
+    .{ .name = "blockquote", .source = "> ## Note\n> - one\n> 2. two\n> - [x] done\n> plain\n" },
+    .{ .name = "list-with-fence", .source = "1. step\n   ```sh\n   ls -la\n     nested\n   ```\n- next\n" },
+    .{ .name = "ordered-list", .source = "1. step one\n" },
+    .{ .name = "bold-italic", .source = "hi **there** friend\nuse *this* quickly\n" },
+    .{ .name = "nested-strong", .source = "**outer __inner__ suffix** __outer **inner** suffix__\n" },
+    .{ .name = "heading-code-span", .source = "## Run ``**raw**`` now\n" },
+    .{ .name = "link-osc8", .source = "see [docs](https://example.com) please\n" },
+    .{ .name = "link-parens", .source = "[w](https://en.wikipedia.org/wiki/Foo_(bar)) tail\n" },
+    .{ .name = "image", .source = "![](https://example.com/diagram.png)\n" },
+    .{ .name = "autolinks", .source = "see <https://example.com/docs\\_literal> and <dev@example.com> plus <git+ssh://example.com/repo>\n" },
+    .{ .name = "table", .source = "Before table.\n| Name | Age |\n|------|-----|\n| Ana  | 30  |\n| Bob  | 7   |\nAfter table.\n" },
+    .{ .name = "table-links", .source = "| Link |\n|------|\n| [first](https://first.example) |\n" },
+    .{ .name = "s4-table-code", .source = "Before the table.\n\n| Key | Value |\n|-----|-------|\n| mode | **fast** |\n\n```sh\nls -la\n```\n\nAfter the code.\n" },
+};
+
+const equal_docs = [_]PreviewDoc{
+    .{ .name = "tall-table", .source = "| Item | Count | Note |\n|------|------:|------|\n| item-1 | 3 | **note 1** |\n| item-2 | 6 | **note 2** |\n| item-3 | 9 | **note 3** |\n| item-4 | 12 | **note 4** |\n| item-5 | 15 | **note 5** |\n| item-6 | 18 | **note 6** |\n| item-7 | 21 | **note 7** |\n| item-8 | 24 | **note 8** |\n| item-9 | 27 | **note 9** |\n| item-10 | 30 | **note 10** |\n| item-11 | 33 | **note 11** |\n| item-12 | 36 | **note 12** |\n| item-13 | 39 | **note 13** |\n| item-14 | 42 | **note 14** |\n| item-15 | 45 | **note 15** |\n| item-16 | 48 | **note 16** |\n| item-17 | 51 | **note 17** |\n| item-18 | 54 | **note 18** |\n| item-19 | 57 | **note 19** |\n| item-20 | 60 | **note 20** |\n| item-21 | 63 | **note 21** |\n| item-22 | 66 | **note 22** |\n| item-23 | 69 | **note 23** |\n| item-24 | 72 | **note 24** |\n| item-25 | 75 | **note 25** |\n| item-26 | 78 | **note 26** |\n| item-27 | 81 | **note 27** |\n| item-28 | 84 | **note 28** |\n| item-29 | 87 | **note 29** |\n| item-30 | 90 | **note 30** |\n| item-31 | 93 | **note 31** |\n| item-32 | 96 | **note 32** |\n| item-33 | 99 | **note 33** |\n| item-34 | 102 | **note 34** |\n| item-35 | 105 | **note 35** |\n| item-36 | 108 | **note 36** |\n| item-37 | 111 | **note 37** |\n| item-38 | 114 | **note 38** |\n| item-39 | 117 | **note 39** |\n| item-40 | 120 | **note 40** |\n" },
+    .{ .name = "table-marks-links", .source = "| `code` | [link](https://a.example) | **bold** |\n|---|---|---|\n| x | y | z |\n" },
+    .{ .name = "table-then-text", .source = "| A | B |\n|---|---|\n| 1 | 2 |\nAfter the table.\n" },
+    .{ .name = "table-alignment", .source = "| Left | Center | Right |\n|:-----|:------:|------:|\n| a | b | c |\n" },
+    .{ .name = "table-ragged", .source = "| a | b |\n|---|---|\n| c |\n| d | e | f |\n" },
+    .{ .name = "table-escaped-pipe", .source = "| a | b \\| c |\n|---|---|\n| 1 | 2 |\n" },
+    .{ .name = "two-tables", .source = "| a |\n|---|\n| 1 |\n\n| b |\n|---|\n| 2 |\n" },
+    .{ .name = "table-header-only", .source = "| Only | Header |\n|------|--------|\n" },
+    .{ .name = "table-then-code", .source = "| a |\n|---|\n| 1 |\n```sh\nls\n```\n" },
+    .{ .name = "fence-language", .source = "```zig\nconst x = 1;\n```\n" },
+    .{ .name = "fence-unclosed", .source = "```sh\nls -la\necho **raw**\n" },
+    .{ .name = "fence-tall", .source = "```txt\nline 1 of the block\nline 2 of the block\nline 3 of the block\nline 4 of the block\nline 5 of the block\nline 6 of the block\nline 7 of the block\nline 8 of the block\nline 9 of the block\nline 10 of the block\nline 11 of the block\nline 12 of the block\nline 13 of the block\nline 14 of the block\nline 15 of the block\nline 16 of the block\nline 17 of the block\nline 18 of the block\nline 19 of the block\nline 20 of the block\nline 21 of the block\nline 22 of the block\nline 23 of the block\nline 24 of the block\nline 25 of the block\nline 26 of the block\nline 27 of the block\nline 28 of the block\nline 29 of the block\nline 30 of the block\nline 31 of the block\nline 32 of the block\nline 33 of the block\nline 34 of the block\nline 35 of the block\nline 36 of the block\nline 37 of the block\nline 38 of the block\nline 39 of the block\nline 40 of the block\n```\n" },
+    .{ .name = "fence-after-text", .source = "Intro text.\n\n```py\nprint('hi')\n```\nOutro.\n" },
+    .{ .name = "indented-code", .source = "    indented one\n    indented two\n" },
+    .{ .name = "fence-marks", .source = "```md\n**not bold** `x` [a](b)\n```\n" },
+    .{ .name = "fence-empty", .source = "```\n```\n" },
+    .{ .name = "tilde-fence", .source = "~~~js\nlet y = 2\n~~~\n" },
+};
+
+/// Every document the commit checks use: the reply documents, then tables and code.
+const commit_documents = preview_docs ++ equal_docs;
+
+const Chunking = enum { byte1, byte3, word, whole };
+
+const PreviewCheck = enum { none, state, marks, words };
+
+const PreviewTally = struct {
+    renders: usize = 0,
+    marks_checked: usize = 0,
+    marks_skipped: usize = 0,
+    words_checked: usize = 0,
+};
+
+fn nextChunkEnd(source: []const u8, start: usize, chunking: Chunking) usize {
+    return switch (chunking) {
+        .byte1 => start + 1,
+        .byte3 => @min(start + 3, source.len),
+        .whole => source.len,
+        .word => blk: {
+            var end = start;
+            while (end < source.len) {
+                end += 1;
+                if (source[end - 1] == ' ' or source[end - 1] == '\n') break;
+            }
+            break :blk end;
+        },
+    };
+}
+
+/// Pushes `bytes`, or flushes when null, and collects the events it commits.
+fn commitCollect(alloc: Allocator, processor: *MarkdownProcessor, bytes: ?[]const u8, events: *std.ArrayList(Event)) !void {
+    var collector = EventCollector{ .alloc = alloc, .events = events };
+    const completions = collector.completions();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    if (bytes) |input| {
+        try processor.pushWithCompletions(alloc, input, &out, completions);
+    } else {
+        try processor.flushWithCompletions(alloc, &out, completions);
+    }
+    try collector.appendPendingText(&out);
+}
+
+/// Renders the provisional tail of `processor` as the text a reader sees.
+fn renderPreviewDisplay(alloc: Allocator, processor: *const MarkdownProcessor, out: *std.ArrayList(u8)) !void {
+    var tail: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &tail);
+    _ = try processor.renderProvisional(alloc, &tail);
+    for (tail.items) |event| try appendEventDisplay(alloc, event, out);
+}
+
+fn displayOf(alloc: Allocator, events: []const Event) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (events) |event| try appendEventDisplay(alloc, event, &out);
+    return out.toOwnedSlice(alloc);
+}
+
+fn appendEventDisplay(alloc: Allocator, event: Event, out: *std.ArrayList(u8)) !void {
+    switch (event) {
+        .text => |text| try out.appendSlice(alloc, text),
+        .attempt_restart => |text| try out.appendSlice(alloc, text),
+        .table => |table| try renderTablePayload(alloc, table, out),
+        .code_block => |block| try renderCodeBlockPayload(alloc, block, out),
+        .thematic_rule => try writeHorizontalRule(alloc, out),
+        .attempt_start, .operational_text_shown, .assistant_tail => {},
+    }
+}
+
+/// The shown text of `events` with ANSI removed: text, then table cells. Code
+/// lines count only with `with_code`, since code may show marks on purpose.
+fn plainOf(alloc: Allocator, events: []const Event, with_code: bool) ![]u8 {
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    for (events) |event| switch (event) {
+        .text => |text| try raw.appendSlice(alloc, text),
+        .table => |table| try appendTableCells(alloc, &raw, table),
+        .code_block => |block| if (with_code) try raw.appendSlice(alloc, block.code),
+        else => {},
+    };
+    if (with_code) return stripEscapes(alloc, raw.items);
+    const unlinked = try withoutInlineCode(alloc, raw.items);
+    defer alloc.free(unlinked);
+    return stripEscapes(alloc, unlinked);
+}
+
+/// Removes inline code spans, whose marks show on purpose.
+fn withoutInlineCode(alloc: Allocator, bytes: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var rest = bytes;
+    while (std.mem.find(u8, rest, ansi.inline_code_open)) |start| {
+        try out.appendSlice(alloc, rest[0..start]);
+        const after = rest[start + ansi.inline_code_open.len ..];
+        const end = std.mem.find(u8, after, ansi.inline_code_close) orelse after.len;
+        rest = after[@min(end + ansi.inline_code_close.len, after.len)..];
+    }
+    try out.appendSlice(alloc, rest);
+    return out.toOwnedSlice(alloc);
+}
+
+fn appendTableCells(alloc: Allocator, raw: *std.ArrayList(u8), table: TablePayload) !void {
+    for (table.rows) |row| {
+        for (row.cells) |cell| {
+            try raw.appendSlice(alloc, cell);
+            try raw.append(alloc, ' ');
+        }
+        try raw.append(alloc, '\n');
+    }
+}
+
+/// A copy of `events` with adjacent text merged and empty text dropped, so two
+/// runs that split text differently compare equal.
+fn normalizedEvents(alloc: Allocator, events: []const Event) !std.ArrayList(Event) {
+    var out: std.ArrayList(Event) = .empty;
+    errdefer deinitEvents(alloc, &out);
+    for (events) |event| {
+        if (event == .text and event.text.len == 0) continue;
+        if (event == .text and out.items.len > 0 and std.meta.activeTag(out.items[out.items.len - 1]) == .text) {
+            const last = &out.items[out.items.len - 1];
+            const old_len = last.text.len;
+            const merged = try alloc.realloc(last.text, old_len + event.text.len);
+            @memcpy(merged[old_len..], event.text);
+            last.text = merged;
+            continue;
+        }
+        var copy = try event.clone(alloc);
+        errdefer copy.deinit(alloc);
+        try out.append(alloc, copy);
+    }
+    return out;
+}
+
+fn expectSameEvents(alloc: Allocator, expected: []const Event, actual: []const Event) !void {
+    var want = try normalizedEvents(alloc, expected);
+    defer deinitEvents(alloc, &want);
+    var got = try normalizedEvents(alloc, actual);
+    defer deinitEvents(alloc, &got);
+    try std.testing.expectEqualDeep(want.items, got.items);
+}
+
+fn countTag(events: []const Event, tag: std.meta.Tag(Event)) usize {
+    var count: usize = 0;
+    for (events) |event| count += @intFromBool(std.meta.activeTag(event) == tag);
+    return count;
+}
+
+/// Feeds `source` in `chunking` pieces and returns the committed events. With
+/// `check`, every push also renders a provisional tail and checks it.
+fn runPreviewDocument(alloc: Allocator, source: []const u8, chunking: Chunking, check: PreviewCheck, tally: *PreviewTally) !std.ArrayList(Event) {
+    link_id_counter = 1;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var events: std.ArrayList(Event) = .empty;
+    errdefer deinitEvents(alloc, &events);
+    var pos: usize = 0;
+    while (pos < source.len) {
+        const end = nextChunkEnd(source, pos, chunking);
+        try commitCollect(alloc, &processor, source[pos..end], &events);
+        pos = end;
+        if (check != .none) try checkPreview(alloc, &processor, check, tally);
+    }
+    try commitCollect(alloc, &processor, null, &events);
+    return events;
+}
+
+fn checkPreview(alloc: Allocator, processor: *const MarkdownProcessor, check: PreviewCheck, tally: *PreviewTally) !void {
+    const before = try heldState(alloc, processor);
+    defer alloc.free(before);
+    const counter_before = link_id_counter;
+    var tail: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &tail);
+    _ = try processor.renderProvisional(alloc, &tail);
+    const after = try heldState(alloc, processor);
+    defer alloc.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expectEqual(counter_before, link_id_counter);
+    tally.renders += 1;
+    if (check == .state) return;
+    if (check == .marks) {
+        const shown = try plainOf(alloc, tail.items, false);
+        defer alloc.free(shown);
+        tally.marks_checked += 1;
+        try expectNoRawMarks(shown);
+        return;
+    }
+    const shown = try plainOf(alloc, tail.items, true);
+    defer alloc.free(shown);
+    tally.words_checked += try expectHeldWordsShown(processor, shown);
+}
+
+/// Everything the processor holds, so a preview that changes any of it fails.
+fn heldState(alloc: Allocator, p: *const MarkdownProcessor) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    const parts = [_][]const u8{ p.line_buf.items, p.pending_top_level_line.items, p.pipe_buf.items, p.code_buf.items, p.code_language.items };
+    for (parts) |part| {
+        try buf.appendSlice(alloc, part);
+        try buf.append(alloc, 0);
+    }
+    try buf.append(alloc, @intFromBool(p.in_code_block));
+    try buf.append(alloc, @intFromBool(p.in_pipe_block));
+    try buf.append(alloc, @intFromBool(p.active_definition));
+    try buf.append(alloc, @intFromBool(p.previous_line_was_blank));
+    const footnote_count = p.footnotes.items.len;
+    try buf.appendSlice(alloc, std.mem.asBytes(&footnote_count));
+    try buf.appendSlice(alloc, std.mem.asBytes(&p.next_footnote_number));
+    for (p.footnotes.items) |note| {
+        try buf.appendSlice(alloc, note.label);
+        try buf.append(alloc, 0);
+        try buf.appendSlice(alloc, note.body.items);
+        try buf.append(alloc, 0);
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+fn stripEscapes(alloc: Allocator, bytes: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < bytes.len) {
+        if (bytes[i] != 0x1b) {
+            try out.append(alloc, bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= bytes.len) break;
+        if (bytes[i] == '[') {
+            i += 1;
+            while (i < bytes.len and (bytes[i] < 0x40 or bytes[i] > 0x7e)) i += 1;
+            i += 1;
+            continue;
+        }
+        if (bytes[i] == ']') {
+            i += 1;
+            while (i < bytes.len and bytes[i] != 0x07 and bytes[i] != 0x1b) i += 1;
+            if (i < bytes.len and bytes[i] == 0x1b) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Checks the shown preview text: no raw `**`, `~~`, or `](`, no unpaired
+/// backtick, no line that starts with a pipe, and no visible byte escape.
+fn expectNoRawMarks(plain: []const u8) !void {
+    for ([_][]const u8{ "**", "~~", "](", "\\x" }) |needle| {
+        if (std.mem.find(u8, plain, needle) != null) return error.RawMarkShown;
+    }
+    var ticks: usize = 0;
+    for (plain) |byte| ticks += @intFromBool(byte == '`');
+    if (ticks % 2 == 1) return error.RawMarkShown;
+    var lines = std.mem.splitScalar(u8, plain, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.trimStart(u8, line, " \t").len > 0 and std.mem.trimStart(u8, line, " \t")[0] == pipe_byte) {
+            return error.RawPipeShown;
+        }
+    }
+}
+
+/// Counts the held words and checks each is in the preview. A line that
+/// rule 4 hides, such as "1.", holds a digit but shows nothing.
+fn expectHeldWordsShown(p: *const MarkdownProcessor, plain: []const u8) !usize {
+    var checked: usize = 0;
+    const open_line_hidden = p.line_buf.items.len > 0 and opensWithBlockMarkersOnly(p.line_buf.items);
+    const parts = [_][]const u8{ p.pending_top_level_line.items, if (open_line_hidden) "" else p.line_buf.items, p.pipe_buf.items, p.code_buf.items };
+    for (parts) |held| {
+        var i: usize = 0;
+        while (i < held.len) {
+            if (held[i] == '[' and i + 1 < held.len and held[i + 1] == '^') {
+                i = (std.mem.findScalarPos(u8, held, i, ']') orelse held.len - 1) + 1;
+                continue;
+            }
+            if (held[i] == ']' and i + 1 < held.len and held[i + 1] == '(') {
+                i = (std.mem.findScalarPos(u8, held, i, ')') orelse held.len - 1) + 1;
+                continue;
+            }
+            if (held[i] == '[' and i + 2 < held.len and held[i + 2] == ']' and
+                std.mem.findScalar(u8, " xX", held[i + 1]) != null and
+                (i + 3 == held.len or held[i + 3] == ' '))
+            {
+                i += 3;
+                continue;
+            }
+            if (!std.ascii.isAlphanumeric(held[i])) {
+                i += 1;
+                continue;
+            }
+            const start = i;
+            while (i < held.len and std.ascii.isAlphanumeric(held[i])) i += 1;
+            const word = held[start..i];
+            checked += 1;
+            if (std.mem.find(u8, plain, word) == null) return error.WordNotShown;
+        }
+    }
+    return checked;
+}
+
+test "provisional render never changes committed output" {
+    const alloc = std.testing.allocator;
+    var tally = PreviewTally{};
+    for (preview_docs) |doc| {
+        var whole = try runPreviewDocument(alloc, doc.source, .whole, .none, &tally);
+        defer deinitEvents(alloc, &whole);
+        for ([_]Chunking{ .byte1, .byte3, .word }) |chunking| {
+            var plain = try runPreviewDocument(alloc, doc.source, chunking, .none, &tally);
+            defer deinitEvents(alloc, &plain);
+            try expectSameEvents(alloc, whole.items, plain.items);
+            var previewed = try runPreviewDocument(alloc, doc.source, chunking, .state, &tally);
+            defer deinitEvents(alloc, &previewed);
+            try expectSameEvents(alloc, whole.items, previewed.items);
+        }
+    }
+}
+
+test "provisional text shows no raw marks" {
+    const alloc = std.testing.allocator;
+    var tally = PreviewTally{};
+    for (commit_documents) |doc| {
+        for ([_]Chunking{ .byte1, .byte3, .word }) |chunking| {
+            var events = try runPreviewDocument(alloc, doc.source, chunking, .marks, &tally);
+            deinitEvents(alloc, &events);
+        }
+    }
+}
+
+test "provisional text shows every received word" {
+    const alloc = std.testing.allocator;
+    var tally = PreviewTally{};
+    for (commit_documents) |doc| {
+        var events = try runPreviewDocument(alloc, doc.source, .word, .words, &tally);
+        deinitEvents(alloc, &events);
+    }
+}
+
+/// Counts what the cut-point check compared and skipped.
+const CutTally = struct {
+    cuts: usize = 0,
+    compared: usize = 0,
+    compared_with_table: usize = 0,
+    compared_with_code: usize = 0,
+    compared_table_header: usize = 0,
+    skipped_open_end: usize = 0,
+};
+
+/// Adds the delimiter row the preview shows under a held header, and returns the bytes to commit.
+fn withDelimiterRow(alloc: Allocator, held: *const MarkdownProcessor, prefix: []const u8, out: *std.ArrayList(u8)) ![]const u8 {
+    if (held.in_pipe_block) {
+        const header_line = held.pipe_buf.items[0..std.mem.findScalar(u8, held.pipe_buf.items, '\n').?];
+        const header_end = prefix.len - held.line_buf.items.len;
+        try out.appendSlice(alloc, prefix[0..header_end]);
+        try appendLiteralDelimiter(alloc, out, tableColumnCount(header_line));
+        try out.appendSlice(alloc, prefix[header_end..]);
+    } else {
+        try out.appendSlice(alloc, prefix);
+        try out.append(alloc, '\n');
+        try appendLiteralDelimiter(alloc, out, tableColumnCount(held.line_buf.items));
+    }
+    return out.items;
+}
+
+fn appendLiteralDelimiter(alloc: Allocator, out: *std.ArrayList(u8), columns: usize) !void {
+    try out.append(alloc, '|');
+    for (0..columns) |_| try out.appendSlice(alloc, "---|");
+    try out.append(alloc, '\n');
+}
+
+/// Checks one cut point: the provisional tail of the first `cut` bytes equals the
+/// events the processor commits for those bytes, unless an open-end rule changed the open line.
+fn expectTailMatchesCommit(alloc: Allocator, source: []const u8, cut: usize, tally: *CutTally) !void {
+    tally.cuts += 1;
+    link_id_counter = 1;
+    var held = MarkdownProcessor{};
+    defer held.deinit(alloc);
+    var pushed: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &pushed);
+    try commitCollect(alloc, &held, source[0..cut], &pushed);
+    var tail: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &tail);
+    const result = try held.renderProvisional(alloc, &tail);
+    if (result.open_end_applied) {
+        tally.skipped_open_end += 1;
+        return;
+    }
+    var completed: std.ArrayList(u8) = .empty;
+    defer completed.deinit(alloc);
+    const input = if (result.table_header_completed) try withDelimiterRow(alloc, &held, source[0..cut], &completed) else source[0..cut];
+    link_id_counter = 1;
+    var fresh = MarkdownProcessor{};
+    defer fresh.deinit(alloc);
+    var committed: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &committed);
+    try commitCollect(alloc, &fresh, input, &committed);
+    try commitCollect(alloc, &fresh, null, &committed);
+    // What the reader sees: what was committed before the cut, then the tail.
+    var shown: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &shown);
+    try appendCopies(alloc, &shown, pushed.items);
+    try appendCopies(alloc, &shown, tail.items);
+    try expectSameEvents(alloc, committed.items, shown.items);
+    tally.compared += 1;
+    tally.compared_with_table += @intFromBool(countTag(tail.items, .table) > 0);
+    tally.compared_with_code += @intFromBool(countTag(tail.items, .code_block) > 0);
+    tally.compared_table_header += @intFromBool(result.table_header_completed);
+}
+
+fn appendCopies(alloc: Allocator, dest: *std.ArrayList(Event), src: []const Event) !void {
+    for (src) |event| {
+        var copy = try event.clone(alloc);
+        errdefer copy.deinit(alloc);
+        try dest.append(alloc, copy);
+    }
+}
+
+test "preview equals commit at every cut point" {
+    const alloc = std.testing.allocator;
+    var tally = CutTally{};
+    for (commit_documents) |doc| {
+        for (1..doc.source.len + 1) |cut| {
+            try expectTailMatchesCommit(alloc, doc.source, cut, &tally);
+        }
+    }
+}
+
+test "provisional preview of a one megabyte line completes" {
+    const alloc = std.testing.allocator;
+    var collected: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &collected);
+    var collector = EventCollector{ .alloc = alloc, .events = &collected };
+    const completions = collector.completions();
+    const megabyte = 1024 * 1024;
+    const unit = "word **b** ";
+    const source = try alloc.alloc(u8, megabyte);
+    defer alloc.free(source);
+    for (source, 0..) |*byte, index| byte.* = unit[index % unit.len];
+
+    link_id_counter = 1;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(alloc);
+    const chunk = 64 * 1024;
+    var pos: usize = 0;
+    while (pos < source.len) : (pos += chunk) {
+        try processor.pushWithCompletions(alloc, source[pos..@min(pos + chunk, source.len)], &committed, completions);
+    }
+    try std.testing.expectEqual(@as(usize, 0), committed.items.len);
+
+    var preview: std.ArrayList(u8) = .empty;
+    defer preview.deinit(alloc);
+    try renderPreviewDisplay(alloc, &processor, &preview);
+    const plain = try stripEscapes(alloc, preview.items);
+    defer alloc.free(plain);
+    try expectNoRawMarks(plain);
+    try std.testing.expect(std.mem.find(u8, plain, "word") != null);
+}
+
+test "UTF-8 split across chunks never shows partial bytes" {
+    const alloc = std.testing.allocator;
+    var tally = PreviewTally{};
+    const source = "Caf\u{e9} \u{2615} **bold** end\n";
+    var whole_events = try runPreviewDocument(alloc, source, .whole, .none, &tally);
+    defer deinitEvents(alloc, &whole_events);
+    const whole = try displayOf(alloc, whole_events.items);
+    defer alloc.free(whole);
+    var split_events = try runPreviewDocument(alloc, source, .byte1, .marks, &tally);
+    defer deinitEvents(alloc, &split_events);
+    const split = try displayOf(alloc, split_events.items);
+    defer alloc.free(split);
+    try std.testing.expectEqualStrings(whole, split);
+}
+
+test "unclosed bold stays literal at the end and never shows in a preview" {
+    const alloc = std.testing.allocator;
+    var tally = PreviewTally{};
+    const source = "Start **bold never closed";
+    var whole_events = try runPreviewDocument(alloc, source, .whole, .none, &tally);
+    defer deinitEvents(alloc, &whole_events);
+    const whole = try displayOf(alloc, whole_events.items);
+    defer alloc.free(whole);
+    try std.testing.expect(std.mem.find(u8, whole, "**bold never closed") != null);
+    var split_events = try runPreviewDocument(alloc, source, .byte1, .marks, &tally);
+    defer deinitEvents(alloc, &split_events);
+    const split = try displayOf(alloc, split_events.items);
+    defer alloc.free(split);
+    try std.testing.expectEqualStrings(whole, split);
+}
+
+test "footnote definitions stay held and preview with their body" {
+    const alloc = std.testing.allocator;
+    var collected: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &collected);
+    var collector = EventCollector{ .alloc = alloc, .events = &collected };
+    const completions = collector.completions();
+    var tally = PreviewTally{};
+    const source = "Cache[^c] is short.\n[^c]: Scoped to the **request** lifetime.\n";
+    var whole_events = try runPreviewDocument(alloc, source, .whole, .none, &tally);
+    defer deinitEvents(alloc, &whole_events);
+    const whole = try displayOf(alloc, whole_events.items);
+    defer alloc.free(whole);
+    var split_events = try runPreviewDocument(alloc, source, .byte1, .marks, &tally);
+    defer deinitEvents(alloc, &split_events);
+    const split = try displayOf(alloc, split_events.items);
+    defer alloc.free(split);
+    try std.testing.expectEqualStrings(whole, split);
+
+    link_id_counter = 1;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(alloc);
+    try processor.pushWithCompletions(alloc, source, &committed, completions);
+    var preview: std.ArrayList(u8) = .empty;
+    defer preview.deinit(alloc);
+    try renderPreviewDisplay(alloc, &processor, &preview);
+    const plain = try stripEscapes(alloc, preview.items);
+    defer alloc.free(plain);
+    try std.testing.expect(std.mem.find(u8, plain, "lifetime") != null);
+    try expectNoRawMarks(plain);
+}
+
+const fuzz_preview_pieces = [_][]const u8{
+    "**",        "*",     "~~",   "`",      "[",   "](", ")",       "|",
+    "| --- |\n", "\n",    " ",    "- ",     "1. ", "> ", "# ",      "[^a]: ",
+    "[^a]",      "```\n", "word", "\u{e9}", "\\",  "_",  "| a |\n",
+};
+
+fn fuzzProvisionalPreviews(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    for (0..smith.valueRangeAtMost(u8, 0, 48)) |_| {
+        try source.appendSlice(alloc, fuzz_preview_pieces[smith.index(fuzz_preview_pieces.len)]);
+    }
+    var tally = PreviewTally{};
+    var whole = try runPreviewDocument(alloc, source.items, .whole, .none, &tally);
+    defer deinitEvents(alloc, &whole);
+
+    link_id_counter = 1;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &committed);
+    var preview: std.ArrayList(u8) = .empty;
+    defer preview.deinit(alloc);
+    var start: usize = 0;
+    while (start < source.items.len) {
+        const len: usize = smith.valueRangeAtMost(u16, 1, @intCast(source.items.len - start));
+        try commitCollect(alloc, &processor, source.items[start..][0..len], &committed);
+        preview.clearRetainingCapacity();
+        try renderPreviewDisplay(alloc, &processor, &preview);
+        start += len;
+    }
+    try commitCollect(alloc, &processor, null, &committed);
+    try expectSameEvents(alloc, whole.items, committed.items);
+    var cuts = CutTally{};
+    const cut: usize = smith.valueRangeAtMost(u32, 0, @intCast(source.items.len));
+    try expectTailMatchesCommit(alloc, source.items, cut, &cuts);
+}
+
+test "an empty fuzz document previews as nothing and matches its commit" {
+    var smith: std.testing.Smith = .{ .in = "" };
+    try fuzzProvisionalPreviews({}, &smith);
+}
+
+test "provisional previews keep committed output for fuzzed splits" {
+    try std.testing.fuzz({}, fuzzProvisionalPreviews, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "**bold\n| a | b |\n",
+            "```sh\nls\n",
+            "Cafe\xcc\x81 [^a]",
+        })),
+    });
+}
+
+const OpenCase = struct {
+    input: []const u8,
+    visible: []const u8,
+    /// A styled run that must appear in the preview, such as `ansi.bold_open ++ "bold"`.
+    styled: []const u8 = "",
+    /// A word that must sit inside inline code.
+    code: []const u8 = "",
+    source: []const u8,
+};
+
+const open_cases = [_]OpenCase{
+    .{ .input = "Text with **bold", .visible = "Text with bold", .styled = ansi.bold_open ++ "bold", .source = "remend bold L6" },
+    .{ .input = "**incomplete", .visible = "incomplete", .styled = ansi.bold_open ++ "incomplete", .source = "remend bold L7" },
+    .{ .input = "Text with **bold text**", .visible = "Text with bold text", .styled = ansi.bold_open ++ "bold text", .source = "remend bold L12" },
+    .{ .input = "**bold1** and **bold2**", .visible = "bold1 and bold2", .styled = ansi.bold_open ++ "bold1", .source = "remend bold L17" },
+    .{ .input = "**first** and **second", .visible = "first and second", .styled = ansi.bold_open ++ "second", .source = "remend bold L21" },
+    .{ .input = "Here is some **bold tex", .visible = "Here is some bold tex", .styled = ansi.bold_open ++ "bold tex", .source = "remend bold L25" },
+    .{ .input = "**xxx*", .visible = "xxx", .styled = ansi.italic_open ++ "xxx", .source = "remend bold L31: the single closer is italic" },
+    .{ .input = "**bold text*", .visible = "bold text", .styled = ansi.italic_open ++ "bold text", .source = "remend bold L32" },
+    .{ .input = "Text with **bold*", .visible = "Text with bold", .styled = ansi.italic_open ++ "bold", .source = "remend bold L33" },
+    .{ .input = "This is **bold text*", .visible = "This is bold text", .styled = ansi.italic_open ++ "bold text", .source = "remend bold L34" },
+    .{ .input = "Text with `code", .visible = "Text with code", .code = "code", .source = "remend inline-code L6" },
+    .{ .input = "`incomplete", .visible = "incomplete", .code = "incomplete", .source = "remend inline-code L7" },
+    .{ .input = "Text with `inline code`", .visible = "Text with inline code", .code = "inline code", .source = "remend inline-code L12" },
+    .{ .input = "`code1` and `code2`", .visible = "code1 and code2", .code = "code2", .source = "remend inline-code L17" },
+    .{ .input = "```code```", .visible = "", .source = "remend inline-code L42: a fence line is structure" },
+    .{ .input = "Text with __italic", .visible = "Text with italic", .styled = ansi.bold_open ++ "italic", .source = "remend italic L6: a double underscore is strong" },
+    .{ .input = "__incomplete", .visible = "incomplete", .styled = ansi.bold_open ++ "incomplete", .source = "remend italic L7" },
+    .{ .input = "__first__ and __second", .visible = "first and second", .styled = ansi.bold_open ++ "second", .source = "remend italic L16" },
+    .{ .input = "__xxx_", .visible = "xxx", .styled = ansi.italic_open ++ "xxx", .source = "remend italic L22" },
+    .{ .input = "__bold text_", .visible = "bold text", .styled = ansi.italic_open ++ "bold text", .source = "remend italic L23" },
+    .{ .input = "Text with *italic", .visible = "Text with italic", .styled = ansi.italic_open ++ "italic", .source = "remend italic L31" },
+    .{ .input = "*incomplete", .visible = "incomplete", .styled = ansi.italic_open ++ "incomplete", .source = "remend italic L32" },
+    .{ .input = "~~strikethrough~~", .visible = "strikethrough", .styled = ansi.strike_open ++ "strikethrough", .source = "remend single-tilde L18" },
+    .{ .input = "~hello", .visible = "~hello", .source = "remend single-tilde L22: one tilde is text" },
+    .{ .input = "hello ~ world", .visible = "hello ~ world", .source = "remend single-tilde L27" },
+    .{ .input = "Text with ~~strike", .visible = "Text with strike", .styled = ansi.strike_open ++ "strike", .source = "remend strikethrough L6" },
+    .{ .input = "~~incomplete", .visible = "incomplete", .styled = ansi.strike_open ++ "incomplete", .source = "remend strikethrough L7" },
+    .{ .input = "~~first~~ and ~~second", .visible = "first and second", .styled = ansi.strike_open ++ "second", .source = "remend strikethrough L21" },
+    .{ .input = "~~xxx~", .visible = "xxx", .styled = ansi.strike_open ++ "xxx", .source = "remend strikethrough L27" },
+    .{ .input = "~~strike text~", .visible = "strike text", .styled = ansi.strike_open ++ "strike text", .source = "remend strikethrough L28" },
+    .{ .input = "***first*** and ***second", .visible = "first and second", .styled = ansi.bold_open ++ "first", .source = "remend bold-italic L23" },
+    .{ .input = "***incomplete", .visible = "incomplete", .styled = ansi.bold_open ++ "incomplete", .source = "remend bold-italic L9" },
+    .{ .input = "*italic* **bold** ***both", .visible = "italic bold both", .styled = ansi.bold_open ++ "both", .source = "remend bold-italic L29" },
+    .{ .input = "Check out [this lin", .visible = "Check out this lin", .source = "remend links L45: link text only" },
+    .{ .input = "Text [partial", .visible = "Text partial", .source = "remend links L9: link text only" },
+    .{ .input = "[link with [brackets] inside](https://example.com)", .visible = "[link with [brackets] inside](https://example.com)", .source = "remend links L41: complete, unchanged" },
+    .{ .input = "[link1](url1) and [link2](url2)", .visible = "link1 and link2", .source = "remend links L21: complete links" },
+    .{ .input = "[w](https://en.wikipedia.org/wiki/Foo_(bar", .visible = "w", .source = "the destination stays open until its parenthesis closes" },
+    .{ .input = "[w](https://en.wikipedia.org/wiki/Foo_(bar))", .visible = "w", .source = "complete link is unchanged" },
+    .{ .input = "snake_case_name", .visible = "snake_case_name", .source = "remend emphasis-delimiters: intraword underscore" },
+    .{ .input = "* Single item", .visible = "• Single item", .source = "remend lists L12" },
+    .{ .input = "* Item with *italic* text", .visible = "• Item with italic text", .styled = ansi.italic_open ++ "italic", .source = "remend lists L22" },
+    .{ .input = "-", .visible = "", .source = "block markers only show nothing" },
+    .{ .input = "1.", .visible = "", .source = "a number and a dot show nothing" },
+    .{ .input = "|", .visible = "", .source = "block markers only show nothing" },
+    .{ .input = "``````", .visible = "", .source = "backticks only show nothing" },
+    .{ .input = "hello~", .visible = "hello", .source = "a lone end mark is hidden" },
+    .{ .input = "trailing mark *", .visible = "trailing mark ", .source = "a lone end mark is hidden" },
+    .{ .input = "Price is 5 _", .visible = "Price is 5 ", .source = "a lone end mark is hidden" },
+    .{ .input = "Text with **", .visible = "Text with ", .source = "an open mark with no content is hidden" },
+    .{ .input = "```sh", .visible = "", .source = "a fence line is structure" },
+    .{ .input = "`a``", .visible = "a``", .code = "a``", .source = "fuzz: a closer must not merge with a backtick in the content" },
+    .{ .input = "**bold\t", .visible = "bold\t", .styled = ansi.bold_open ++ "bold", .source = "fuzz: a closer must follow a non-space byte" },
+    .{ .input = "a](`b) c", .visible = "a](b) c", .code = "b) c", .source = "fuzz: a backtick inside a destination is an unpartnered run" },
+    .{ .input = "e_case *snake_case *a* _", .visible = "e_case snake_case a ", .styled = ansi.italic_open ++ "a", .source = "fuzz: two closers of one mark must not join" },
+    .{ .input = "*one *two*", .visible = "one two", .styled = ansi.italic_open ++ "two", .source = "fuzz: adjacent single-star closers" },
+    .{ .input = "_one _two_", .visible = "one two", .styled = ansi.italic_open ++ "two", .source = "fuzz: adjacent single-underscore closers" },
+    .{ .input = "~~one ~~two~~", .visible = "one two", .styled = ansi.strike_open ++ "two", .source = "fuzz: adjacent double-tilde closers" },
+    .{ .input = "word** end", .visible = "word** end", .source = "fuzz: a closer with no opener stays literal, as in committed text" },
+    .{ .input = "**bold \\", .visible = "bold ", .styled = ansi.bold_open ++ "bold", .source = "fuzz: a lone trailing backslash shows nothing" },
+};
+
+fn expectPreviewHas(bytes: []const u8, needle: []const u8) !void {
+    if (std.mem.find(u8, bytes, needle) == null) return error.OpenStyleMissing;
+}
+
+// Each named open line previews as its visible text, and as styled text where
+// the case names a style. The preview of an open line never commits anything.
+test "named open lines preview as open text" {
+    const alloc = std.testing.allocator;
+    for (open_cases) |case| {
+        var processor = MarkdownProcessor{};
+        defer processor.deinit(alloc);
+        var committed: std.ArrayList(u8) = .empty;
+        defer committed.deinit(alloc);
+        try processor.push(alloc, case.input, &committed);
+        try std.testing.expectEqualStrings("", committed.items);
+
+        var preview: std.ArrayList(u8) = .empty;
+        defer preview.deinit(alloc);
+        try renderPreviewDisplay(alloc, &processor, &preview);
+        const plain = try stripEscapes(alloc, preview.items);
+        defer alloc.free(plain);
+        try std.testing.expectEqualStrings(case.visible, plain);
+        if (case.styled.len > 0) try expectPreviewHas(preview.items, case.styled);
+        if (case.code.len > 0) {
+            const needle = try alloc.print("{s}{s}", .{ ansi.inline_code_open, case.code });
+            defer alloc.free(needle);
+            try expectPreviewHas(preview.items, needle);
+        }
+    }
+}
+
+// Cells of a held table row that the stream has not finished show open text,
+// and only that row: the finished rows above it stay committed.
+test "an open marker-only line never previews as a rule" {
+    const alloc = std.testing.allocator;
+    const open_lines = [_][]const u8{
+        "** **",
+        "---",
+        "***",
+        "___",
+        "```",
+        "- ",
+        "1. ",
+        "> ",
+        "# ",
+    };
+    for (open_lines) |open_line| {
+        var processor = MarkdownProcessor{};
+        defer processor.deinit(alloc);
+        var committed: std.ArrayList(Event) = .empty;
+        defer deinitEvents(alloc, &committed);
+        const held = try alloc.print("w1\n{s}", .{open_line});
+        defer alloc.free(held);
+        try commitCollect(alloc, &processor, held, &committed);
+        var tail: std.ArrayList(Event) = .empty;
+        defer deinitEvents(alloc, &tail);
+        _ = try processor.renderProvisional(alloc, &tail);
+        for (tail.items) |event| {
+            if (std.meta.activeTag(event) == .thematic_rule) return error.RulePreviewed;
+        }
+        const shown = try displayOf(alloc, tail.items);
+        defer alloc.free(shown);
+        try std.testing.expectEqualStrings("w1\n", shown);
+    }
+}
+
+test "an open line with control bytes previews escaped, as committed text shows them" {
+    const alloc = std.testing.allocator;
+    const open_line = "Streaming \x1b[31mred\x1b[0m \x1b]0;title\x07 done";
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &committed);
+    try commitCollect(alloc, &processor, open_line, &committed);
+    var tail: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &tail);
+    _ = try processor.renderProvisional(alloc, &tail);
+    const shown = try displayOf(alloc, tail.items);
+    defer alloc.free(shown);
+
+    var reference_processor = MarkdownProcessor{};
+    defer reference_processor.deinit(alloc);
+    var reference_events: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &reference_events);
+    try commitCollect(alloc, &reference_processor, open_line ++ "\n", &reference_events);
+    try commitCollect(alloc, &reference_processor, null, &reference_events);
+    const reference = try displayOf(alloc, reference_events.items);
+    defer alloc.free(reference);
+
+    try std.testing.expect(std.mem.find(u8, shown, "\x1b]0;") == null);
+    try std.testing.expect(std.mem.find(u8, shown, "\x1b[31m") == null);
+    try std.testing.expect(std.mem.find(u8, shown, "\x07") == null);
+    const trimmed = std.mem.trimEnd(u8, reference, "\n");
+    try std.testing.expect(std.mem.find(u8, trimmed, shown) != null);
+}
+
+test "an open marker line that gains text previews as text, not as a rule" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &committed);
+    try commitCollect(alloc, &processor, "w1\n** ****w5", &committed);
+    var tail: std.ArrayList(Event) = .empty;
+    defer deinitEvents(alloc, &tail);
+    _ = try processor.renderProvisional(alloc, &tail);
+    for (tail.items) |event| {
+        try std.testing.expect(std.meta.activeTag(event) != .thematic_rule);
+    }
+    const shown = try displayOf(alloc, tail.items);
+    defer alloc.free(shown);
+    try std.testing.expect(std.mem.find(u8, shown, "w5") != null);
+}
+
+test "open table row shows its open marks as styled text" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(alloc);
+    try processor.push(alloc, "| a | b |\n|---|---|\n| c | **d", &committed);
+    var preview: std.ArrayList(u8) = .empty;
+    defer preview.deinit(alloc);
+    try renderPreviewDisplay(alloc, &processor, &preview);
+    try std.testing.expect(std.mem.find(u8, preview.items, "**") == null);
+    try expectPreviewHas(preview.items, ansi.bold_open ++ "d");
 }

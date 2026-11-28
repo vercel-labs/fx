@@ -526,21 +526,37 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             "\n  build-linux-aarch64:", 1
         )[0]
         check_script = textwrap.dedent(check_job.split("        run: |\n", 1)[1])
-        for validate, tag_exists, expected_needed, expected_publish in (
-            ("true", True, "true", "false"),
-            ("true", False, "true", "false"),
-            ("false", True, "false", "false"),
-            ("false", False, "true", "true"),
+        # A push starts a release only when it changes the version; a later
+        # push under the same version skips, and a manual run still releases.
+        for event, validate, tag_exists, previous, expected_needed, expected_publish in (
+            ("workflow_dispatch", "true", True, "0.0.8", "true", "false"),
+            ("workflow_dispatch", "true", False, "0.0.8", "true", "false"),
+            ("push", "false", True, "0.0.7", "false", "false"),
+            ("push", "false", False, "0.0.7", "true", "true"),
+            ("push", "false", False, "0.0.8", "false", "false"),
+            ("push", "false", False, None, "true", "true"),
+            ("workflow_dispatch", "false", False, "0.0.8", "true", "true"),
         ):
-            with self.subTest(validate=validate, tag_exists=tag_exists):
+            with self.subTest(event=event, validate=validate, tag_exists=tag_exists, previous=previous):
                 with tempfile.TemporaryDirectory(prefix="fx-release-check-") as tmp:
                     root = pathlib.Path(tmp)
                     (root / "src").mkdir()
                     (root / "src/main.zig").write_text(
                         'pub const version = "0.0.8";\n'
                     )
+                    shown = (
+                        f"printf 'pub const version = \"{previous}\";\\n'"
+                        if previous is not None
+                        else "exit 128"
+                    )
                     git = root / "git"
-                    git.write_text(f"#!/bin/sh\nexit {0 if tag_exists else 1}\n")
+                    git.write_text(
+                        "#!/bin/sh\n"
+                        'case "$1" in\n'
+                        f"  rev-parse) exit {0 if tag_exists else 1} ;;\n"
+                        f"  show) {shown} ;;\n"
+                        "esac\n"
+                    )
                     git.chmod(0o755)
                     output = root / "outputs"
                     env = dict(
@@ -548,6 +564,8 @@ class MacosSigningWorkflowTests(unittest.TestCase):
                         PATH=f"{root}:{os.environ['PATH']}",
                         GITHUB_OUTPUT=str(output),
                         VALIDATE_ONLY=validate,
+                        EVENT_NAME=event,
+                        BEFORE_SHA="before",
                     )
                     result = subprocess.run(
                         ["bash", "-euo", "pipefail", "-c", check_script],
@@ -731,7 +749,7 @@ class LinuxReleaseWorkflowTests(unittest.TestCase):
                 workflow = workflow_path.read_text(encoding="utf-8")
                 triggers = workflow.split("\njobs:\n", 1)[0]
                 self.assertIn("  workflow_call:\n", triggers)
-                self.assertIn("value: ${{ jobs.candidate.outputs.artifact-id }}", triggers)
+                self.assertIn("value: ${{ jobs.aggregate.outputs.artifact-id }}", triggers)
                 self.assertIn("artifact-id: ${{ steps.upload.outputs.artifact-id }}", workflow)
                 self.assertIn(
                     "retention-days: ${{ inputs.evidence-retention-days || 14 }}", workflow
@@ -766,28 +784,24 @@ class LinuxReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("          name: fx-${{ matrix.name }}\n", package)
 
     def test_the_evidence_artifact_keeps_the_candidate_at_its_root(self) -> None:
-        # upload-artifact roots an artifact at the deepest directory its paths
-        # share, and package-linux reads candidate/fx and manifest.json from
-        # that root, so every evidence path stays under fx-pgso/.
+        # package-linux reads candidate/fx and manifest.json from the root of
+        # the evidence artifact, which is the folder `distributed aggregate`
+        # writes them to.
         for workflow_path in (PGSO_LINUX_WORKFLOW_PATH, PGSO_LINUX_X86_64_WORKFLOW_PATH):
             with self.subTest(workflow=workflow_path.name):
                 workflow = workflow_path.read_text(encoding="utf-8")
-                evidence = workflow.split("      - name: Upload evidence\n", 1)[1].split(
-                    "\n      - name:", 1
-                )[0]
-                block = evidence.split("          path: |\n", 1)[1].split(
-                    "\n          if-no-files-found:", 1
-                )[0]
-                paths = [line.strip() for line in block.splitlines()]
-                self.assertIn("${{ runner.temp }}/fx-pgso/candidate/fx", paths)
-                self.assertIn("${{ runner.temp }}/fx-pgso/manifest.json", paths)
-                self.assertEqual("${{ runner.temp }}/fx-pgso", os.path.commonpath(paths))
+                aggregate = workflow.split("\n  aggregate:\n", 1)[1]
+                self.assertIn('--output-dir "$RUNNER_TEMP/fx-pgso-aggregate"', aggregate)
+                evidence = aggregate.split("      - name: Upload evidence\n", 1)[1]
+                self.assertIn("        id: upload\n", evidence)
+                self.assertIn("          path: ${{ runner.temp }}/fx-pgso-aggregate\n", evidence)
                 logs = workflow.split("      - name: Upload unit test logs\n", 1)[1].split(
-                    "\n      - name:", 1
+                    "\n  seed:\n", 1
                 )[0]
                 self.assertIn("if: always()", logs)
                 self.assertIn("path: ${{ runner.temp }}/fx-pgso-unit-tests/logs\n", logs)
                 self.assertNotIn("id: upload", logs)
+                self.assertIn("needs: [unit-tests, candidate, behavior, startup, heavy]", aggregate)
 
     def test_release_rejects_a_candidate_that_is_not_the_qualified_binary(self) -> None:
         package = self.release_job("package-linux")

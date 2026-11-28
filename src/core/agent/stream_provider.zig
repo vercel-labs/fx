@@ -225,6 +225,10 @@ pub const RequestData = struct {
     model: []const u8,
     instructions: []const types.ChatMessage = &.{},
     messages: []const types.ChatMessage,
+    /// This turn's messages so far, borrowed. Compaction can take some of
+    /// them out of `messages`; a reply's calls still may not take their ids
+    /// (`src/gateway/tool_call_ids.zig` ReplyIds).
+    current_turn_messages: []const types.ChatMessage = &.{},
     tools: ToolSelection = .{},
     tool_choice: types.ToolChoice,
     vision_mode: VisionMode = .unavailable,
@@ -436,6 +440,10 @@ pub const ModelRequest = struct {
     retry_count: usize,
     instructions: []const types.ChatMessage = &.{},
     messages: []const types.ChatMessage,
+    /// This turn's messages so far, borrowed. Compaction can take some of
+    /// them out of `messages`; a reply's calls still may not take their ids
+    /// (`src/gateway/tool_call_ids.zig` ReplyIds).
+    current_turn_messages: []const types.ChatMessage = &.{},
     tools: ToolSelection = .{},
     tool_choice: types.ToolChoice,
     vision_mode: VisionMode = .unavailable,
@@ -465,6 +473,7 @@ pub const ModelRequest = struct {
             .model = self.model,
             .instructions = self.instructions,
             .messages = self.messages,
+            .current_turn_messages = self.current_turn_messages,
             .tools = self.tools,
             .tool_choice = self.tool_choice,
             .vision_mode = self.vision_mode,
@@ -743,6 +752,21 @@ pub const Provider = struct {
     /// The largest request body this provider's transport can carry, when it
     /// has its own limit below any provider's.
     max_request_bytes: ?usize = null,
+    /// Whose own on-demand compaction writes `model`'s compaction block
+    /// through this provider; null when none does.
+    provider_compaction_fn: ?*const fn (model: []const u8) ?model_capabilities.ProviderCompaction = null,
+    /// A reply's provider replay parts hold one compaction block.
+    holds_compaction_block_fn: ?*const fn (alloc: Allocator, parts_json: []const u8) bool = null,
+
+    pub fn providerCompaction(self: Provider, model: []const u8) ?model_capabilities.ProviderCompaction {
+        const find = self.provider_compaction_fn orelse return null;
+        return find(model);
+    }
+
+    pub fn holdsCompactionBlock(self: Provider, alloc: Allocator, parts_json: []const u8) bool {
+        const holds = self.holds_compaction_block_fn orelse return false;
+        return holds(alloc, parts_json);
+    }
     /// Borrows unchanged payloads; projected payloads live in the caller's arena.
     pub fn projectReplay(self: Provider, arena: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
         if (replay == null) return null;

@@ -2,6 +2,17 @@
 
 Names the maintainers already settled. Reuse them; don't add another spelling. "Planned" means not built yet: design toward it, but don't tell users to run it.
 
+## Groups and verbs
+
+| Concept | Name | Status |
+|---|---|---|
+| List verb | `list`, with `ls` in every group | Partly built |
+| Remove verb | `remove`, with `rm` in every group | `remove` built, `rm` planned |
+| Sessions | One `fx session` group with `list`, `last`, `resume`, `recover`, and `convert`, also reached as `fx sessions`. `fx session <last\|id>` reads one session | Planned as one group |
+| Models | `fx model list`, also reached as `fx models` | Planned |
+
+SKILL.md's table "Built today and planned" says what works today.
+
 ## Resume
 
 | Spelling | Opens | Status |
@@ -33,7 +44,7 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 | `--workspace` | This folder's entry in the profile |
 | `--project` | A committed file in the repo, only for commands that write one (`fx mcp` and `.mcp.json`) |
 
-`fx mcp --profile` still works as `--global`, and `/allowlist` still takes `user` (the profile's top level) and `local` (this folder's entry) for `global` and `workspace`; each warns and stops working in fx 0.0.18, and fx always shows the new words.
+Removed. `fx mcp --profile` fails with exit 2 and names `--global`. `/allowlist user` and `/allowlist local` are refused with the usage line, which names `global` and `workspace`.
 
 ## Settings and their surfaces
 
@@ -55,7 +66,7 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 | Concept | Name |
 |---|---|
 | Sign in, including pasting an AI Gateway key | `fx login [vercel\|codex\|grok]` |
-| Paste an AI Gateway API key | `fx login vercel --api-key`; in a session, `/login` offers sign-in or an API key. `fx setup` and `/setup` warn, stop working in fx 0.0.18, and are hidden from help |
+| Paste an AI Gateway API key | `fx login vercel --api-key`; in a session, `/login` offers sign-in or an API key. Removed. `fx setup` fails with exit 2 and names `fx login vercel --api-key`; `/setup` is refused and names `/provider` |
 | Choose the active provider | `fx provider <name>`, `/provider` |
 
 ## Other

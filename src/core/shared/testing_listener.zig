@@ -298,9 +298,9 @@ const Waiter = struct {
     }
 };
 
-/// Two threads that wait on one loopback listener through
-/// `acceptUnlessStopping`, for the test of a connection only one of them
-/// can take.
+/// Two threads that wait on one loopback listener through `acceptUntilStop`
+/// in its `.wait` mode, for the test of a connection only one of them can
+/// take.
 const Rivals = struct {
     backend: std.Io.Threaded = .init_single_threaded,
     server: std.Io.net.Server = undefined,

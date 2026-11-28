@@ -152,11 +152,12 @@ pub const Report = struct {
     /// The child's last reply for the work, as it wrote it.
     output: []const u8,
     /// How many of the parent's messages waiting for the child the user's
-    /// stop dropped. A report with no `work_id` is the notice
-    /// of that drop when the stopped work owed no report.
+    /// stop dropped. A cancelled report with no `work_id` is the notice of
+    /// that drop when the stopped work owed no report. A failed report with
+    /// no `work_id` tells of messages fx lost and cannot name.
     dropped: usize = 0,
-    /// Who started the work and why it was cancelled, so the parent
-    /// needn't guess.
+    /// Who started the work and why it was cancelled, or that the user
+    /// closed a completed work, so the parent needn't guess.
     end: child_state.EndFacts = .{},
     /// Whether the child is idle once the report goes, so the report tells
     /// the parent to send it related work or close it.
@@ -370,6 +371,15 @@ pub fn row(alloc: Allocator, user: types.UserTurn) error{OutOfMemory}!?Row {
         .failed, .interrupted, .lost => true,
     } else false;
     return .{ .outcome = if (failed) .failed else .completed, .status = status, .text = try alloc.dupe(u8, body) };
+}
+
+test "a completed work the user closed names the close beside the count" {
+    const alloc = std.testing.allocator;
+    const text = try message(alloc, .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .completed, .output = "done", .dropped = 1, .end = .{ .cause = .user_close } }, 4096);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "\"outcome\":\"completed\"") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\"dropped\":1") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\"cause\":\"user_close\"") != null);
 }
 
 test "a report names a turn the user started and why its work was cancelled" {

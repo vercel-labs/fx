@@ -90,11 +90,18 @@ pub fn build_request(alloc: Allocator, request: stream_provider.RequestData, opt
     try std.json.Stringify.value(request.model, .{}, writer);
     // fx keeps the conversation itself, so the server stores nothing.
     try writer.writeAll(",\"stream\":true,\"store\":false");
-    if (instructions.written().len > 0) {
-        try writer.writeAll(",\"instructions\":");
-        try std.json.Stringify.value(instructions.written(), .{}, writer);
-    }
     try writer.writeAll(",\"input\":[");
+    // The system text leads `input`, so its bytes stay the same from turn to turn.
+    const has_system = instructions.written().len > 0;
+    var system_end: usize = 0;
+    if (has_system) {
+        try writer.writeAll("{\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":");
+        try std.json.Stringify.value(instructions.written(), .{}, writer);
+        try writer.writeAll("}]}");
+        system_end = out.written().len;
+        try writer.writeByte(',');
+    }
+    const items_start = out.written().len;
     // Replay and image scratch must not grow the body's own buffer, as the
     // ChatGPT and Grok adapters keep it apart.
     try responses_protocol.writeInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, .{
@@ -103,6 +110,8 @@ pub fn build_request(alloc: Allocator, request: stream_provider.RequestData, opt
         .tool_arguments_bytes = max_tool_arguments_bytes,
         .provider_state_bytes = max_provider_state_bytes,
     }, budget);
+    // No message wrote an item, so drop the separator: JSON has no trailing comma.
+    if (has_system and out.written().len == items_start) out.shrinkRetainingCapacity(system_end);
     try writer.writeByte(']');
     const tool_count = if (request.tool_choice == .none) 0 else try responses_protocol.writeTools(writer, alloc, tools.selection);
     if (tool_count > 0) {
@@ -169,7 +178,7 @@ fn selectTools(alloc: Allocator, request: stream_provider.RequestData) !Selected
 /// Reads a successful streamed reply. The result owns the completion.
 pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: stream_provider.ModelRequest, progress: ?sse.Progress) !stream_provider.Result {
     var events = request.events;
-    var reducer = responses_protocol.Reducer.init(alloc);
+    var reducer = try responses_protocol.Reducer.init(alloc, .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages });
     defer reducer.deinit(alloc);
     var lines: sse.Reader = .{ .max_event_bytes = max_event_bytes, .max_total_bytes = max_stream_bytes, .progress = progress };
     defer lines.deinit(alloc);
@@ -243,14 +252,14 @@ test "configured responses body has fx's fields, then the model's, with a declar
     try std.testing.expectEqualStrings("qwen2.5:1.5b", fields.get("model").?.string);
     try std.testing.expect(fields.get("stream").?.bool);
     try std.testing.expect(!fields.get("store").?.bool);
-    try std.testing.expectEqualStrings("first\n\nsecond", fields.get("instructions").?.string);
+    try std.testing.expect(fields.get("instructions") == null);
     try std.testing.expectEqual(@as(i64, 512), fields.get("max_output_tokens").?.integer);
     try std.testing.expectEqualStrings("high", fields.get("reasoning").?.object.get("effort").?.string);
     try std.testing.expectEqual(@as(f64, 0.7), fields.get("temperature").?.float);
     try std.testing.expectEqual(@as(f64, 0.9), fields.get("top_p").?.float);
     try std.testing.expect(fields.get("tools") == null);
     const input = fields.get("input").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expectEqual(@as(usize, 2), input.len);
 
     // No level chosen: the level's fields stay out, the model's stay in.
     request.provider_options = .{};
@@ -260,6 +269,88 @@ test "configured responses body has fx's fields, then the model's, with a declar
     defer plain_parsed.deinit();
     try std.testing.expect(plain_parsed.value.object.get("reasoning") == null);
     try std.testing.expectEqual(@as(f64, 0.2), plain_parsed.value.object.get("temperature").?.float);
+}
+
+test "configured responses sends the joined instructions as the first input item, not as instructions" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    const body = try build_request(alloc, test_request(), .{ .provider = &provider });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const fields = parsed.value.object;
+    try std.testing.expect(fields.get("instructions") == null);
+    const input = fields.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), input.len);
+    try std.testing.expectEqualStrings("system", input[0].object.get("role").?.string);
+    const part = input[0].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("input_text", part.get("type").?.string);
+    try std.testing.expectEqualStrings("first\n\nsecond", part.get("text").?.string);
+    try std.testing.expectEqualStrings("user", input[1].object.get("role").?.string);
+}
+
+test "configured responses writes no system item when there are no instructions" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    var request = test_request();
+    request.instructions = &.{};
+    const body = try build_request(alloc, request, .{ .provider = &provider });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const fields = parsed.value.object;
+    try std.testing.expect(fields.get("instructions") == null);
+    const input = fields.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expectEqualStrings("user", input[0].object.get("role").?.string);
+}
+
+test "configured responses sends instructions alone as one system input item" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    var request = test_request();
+    request.messages = &.{};
+    const body = try build_request(alloc, request, .{ .provider = &provider });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expectEqualStrings("system", input[0].object.get("role").?.string);
+    const part = input[0].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("first\n\nsecond", part.get("text").?.string);
+}
+
+test "configured responses sends no item for an empty assistant message after instructions" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    var request = test_request();
+    request.messages = &.{.{ .role = .assistant }};
+    const body = try build_request(alloc, request, .{ .provider = &provider });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expectEqualStrings("system", input[0].object.get("role").?.string);
+}
+
+test "configured responses keeps the system item byte-identical from one turn to the next" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    const item = "\"input\":[{\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":\"first\\n\\nsecond\"}]},";
+    const first = try build_request(alloc, test_request(), .{ .provider = &provider });
+    defer alloc.free(first);
+    var later = test_request();
+    later.messages = &.{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = "first answer" },
+        .{ .role = .user, .content = "second question" },
+    };
+    const second = try build_request(alloc, later, .{ .provider = &provider });
+    defer alloc.free(second);
+    try std.testing.expect(std.mem.find(u8, first, item) != null);
+    try std.testing.expect(std.mem.find(u8, second, item) != null);
 }
 
 test "configured responses asks for encrypted reasoning only for a model that reasons" {
@@ -327,6 +418,10 @@ const RecordedEvents = struct {
 };
 
 fn test_consume(alloc: Allocator, bytes: []const u8, recorded: *RecordedEvents) !stream_provider.Result {
+    return test_consume_in(alloc, bytes, recorded, &.{});
+}
+
+fn test_consume_in(alloc: Allocator, bytes: []const u8, recorded: *RecordedEvents, messages: []const types.ChatMessage) !stream_provider.Result {
     var reader = std.Io.Reader.fixed(bytes);
     var cancel = std.atomic.Value(bool).init(false);
     var delivery = stream_provider.DeliveryCertainty.init();
@@ -335,7 +430,7 @@ fn test_consume(alloc: Allocator, bytes: []const u8, recorded: *RecordedEvents) 
         .credential = .{ .direct = .{ .source = .configured } },
         .model = "qwen2.5:0.5b",
         .retry_count = 0,
-        .messages = &.{},
+        .messages = messages,
         .tool_choice = .auto,
         .provider_options = .{},
         .trace_ctx = .{},
@@ -370,6 +465,77 @@ test "configured responses reads a real server's text reply with its cached and 
     try std.testing.expectEqual(@as(?u64, 2), completion.usage.output_tokens);
     try std.testing.expectEqual(@as(?u64, 12), completion.usage.cache_read_tokens);
     try std.testing.expectEqual(@as(?u64, 1), completion.usage.reasoning_tokens);
+}
+
+fn test_function_call(comptime index: []const u8, comptime call_id_field: []const u8) []const u8 {
+    const item = "{\"type\":\"function_call\"" ++ call_id_field ++ ",\"name\":\"read_file\",\"arguments\":\"{}\"}";
+    return "data: {\"type\":\"response.output_item.added\",\"output_index\":" ++ index ++ ",\"item\":" ++ item ++ "}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":" ++ index ++ ",\"item\":" ++ item ++ "}\n\n";
+}
+
+const test_completed = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+
+fn test_call_ids(alloc: Allocator, completion: types.ModelCompletion) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (completion.tool_calls) |call| try out.print(alloc, "{s};", .{call.id});
+    return out.toOwnedSlice(alloc);
+}
+
+test "configured responses gives a call the id an earlier step used an fx id" {
+    const alloc = std.testing.allocator;
+    const earlier = [_]types.ToolCall{.{ .id = "dup", .name = "read_file", .arguments_json = "{\"path\":\"old\"}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "dup", .tool_name = "read_file", .content = "read" },
+    };
+    var recorded: RecordedEvents = .{};
+    defer recorded.content.deinit(alloc);
+    var result = try test_consume_in(alloc, comptime test_function_call("0", ",\"call_id\":\"dup\"") ++ test_completed, &recorded, &messages);
+    defer result.deinit(alloc);
+    const ids = try test_call_ids(alloc, result.completed.completion);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("fx_call_1;", ids);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(result.completed.completion));
+}
+
+test "configured responses keeps the id of a call sent again with an earlier call's id, tool, and arguments" {
+    const alloc = std.testing.allocator;
+    const earlier = [_]types.ToolCall{.{ .id = "dup", .name = "read_file", .arguments_json = "{ }" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "dup", .tool_name = "read_file", .content = "read" },
+    };
+    var recorded: RecordedEvents = .{};
+    defer recorded.content.deinit(alloc);
+    const wire = comptime test_function_call("0", ",\"call_id\":\"dup\"") ++ test_function_call("1", ",\"call_id\":\"dup\"") ++ test_completed;
+    var result = try test_consume_in(alloc, wire, &recorded, &messages);
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    const ids = try test_call_ids(alloc, completion);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("dup;fx_call_2;", ids);
+    try std.testing.expectEqualStrings("fx_call_1", completion.tool_calls[0].provisional_id.?);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(completion));
+}
+
+test "configured responses gives repeated, missing, and empty call ids fx ids" {
+    const alloc = std.testing.allocator;
+    const wire = comptime test_function_call("0", ",\"call_id\":\"same\"") ++
+        test_function_call("1", ",\"call_id\":\"same\"") ++
+        test_function_call("2", "") ++
+        test_function_call("3", ",\"call_id\":\"\"") ++
+        test_completed;
+    var recorded: RecordedEvents = .{};
+    defer recorded.content.deinit(alloc);
+    var result = try test_consume_in(alloc, wire, &recorded, &.{});
+    defer result.deinit(alloc);
+    const ids = try test_call_ids(alloc, result.completed.completion);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("same;fx_call_1;fx_call_2;fx_call_3;", ids);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(result.completed.completion));
 }
 
 test "configured responses fails a reply that never finishes" {

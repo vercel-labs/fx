@@ -107,30 +107,21 @@ The full list, with `std.ascii`, bit sets, packed ints, and ZON, is in [std](ref
 
 ## Deprecated: still compiles, do not write it
 
+[`scripts/check_deprecated.py`](scripts/check_deprecated.py) holds the list:
+its tables name each deprecated std declaration it checks, and each finding
+prints the replacement. Most forward to their replacement, so the rename cannot
+change behavior. Three can: `copyForwards` (`@memmove` needs equal lengths),
+`utf8Decode` (validation), and the deprecated `DebugAllocator`, which is not an
+alias of `SafeAllocator`.
+
+It does not check these `std.Build` methods:
+
 | Deprecated | Use |
 |---|---|
-| `std.fmt.allocPrint(gpa, f, a)` | `gpa.print(f, a)` (same error set) |
-| `std.fmt.bufPrint`, `bufPrintSentinel`, `BufPrintError` | `std.mem.print`, `std.mem.printSentinel`, `std.mem.PrintError` |
-| `std.mem.indexOf*`, `lastIndexOf*` | `std.mem.find`, `findScalar`, `findAny`, `findPos`, `findLast`, `findScalarLast`, `findLastAny` |
-| `std.mem.copyForwards(T, d, s)`, `copyBackwards` | `@memmove(d[0..s.len], s)`; `@memmove` requires equal lengths |
-| anything in `std.fs` | `std.Io.Dir.path`, `std.Io.Dir.max_path_bytes`, `std.Io.Dir.max_name_bytes` |
-| `path.resolve`, `path.relative` | `std.Io.Dir.path.resolveAlloc`, `relativeAlloc` |
-| `@import("builtin").os`, `.cpu`, `.abi`, `.object_format` | `builtin.target.os`, `.target.cpu`, `.target.abi`, `.target.ofmt` |
-| `builtin.mode`, `std.debug.runtime_safety` | `builtin.optimize`, `builtin.optimize.runtimeSafety()` |
-| `std.builtin`, `std.lang.OptimizeMode` | `std.lang`, `std.lang.Optimize` |
-| `@intFromEnum`, `@enumFromInt` | `@backingInt`, `@fromBackingInt` (`zig fmt` rewrites them) |
-| `std.ArrayListUnmanaged`, `*ArrayHashMapUnmanaged`, `*BitSet*` | `std.ArrayList`, `std.array_hash_map.String`/`Auto`/`Custom`, `std.bit_set.Integer`/`Array`/`Static`/`Dynamic` |
-| `list.getLast()`, `getLastOrNull()` | `list.last().?`, `list.last()` |
-| `std.heap.DebugAllocator` (deprecated) | `std.heap.SafeAllocator` |
-| `std.unicode.utf8Decode` | Validate with `utf8ByteSequenceLength`, then `utf8Decode2/3/4` |
-| `std.meta.fieldNames`, `fieldInfo`, `fieldTypes` | `@typeInfo` |
 | Run `addArtifactArg`, `addFileArg`, `addPrefixed*Arg`, ... | `addArtifactArg2(x, .{ .prefix = "-p" })`, `addFileArg2`, ... |
 | `b.addTranslateC` | The translate-c package |
 
-Most rows forward to their replacement, so the rename cannot change behavior.
-Three can: `copyForwards` (lengths), `utf8Decode` (validation), and
-`DebugAllocator`, which is not an alias of `SafeAllocator`. Rarer deprecations
-are in [std](references/std.md).
+Rarer deprecations and the reasons for each are in [std](references/std.md).
 
 ## Entry point, I/O, and allocators
 
@@ -165,8 +156,9 @@ pub fn main(init: std.process.Init) !void {
 
 ## Writing, migrating, and reviewing
 
-**New code:** use only the right-hand columns above, and before reporting it
-done, require exit 0 from the scanner (no finding to fix, every path read):
+**New code:** use the replacements above and the ones the scanner prints, and
+before reporting it done, require exit 0 from it (no finding to fix, every
+path read):
 
 ```sh
 python3 <this skill>/scripts/check_deprecated.py <files or directories>

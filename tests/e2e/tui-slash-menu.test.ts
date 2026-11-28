@@ -27,6 +27,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { savedSessionIds } from "./saved-sessions";
 
@@ -974,7 +975,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       await session.sendLiteralText(" apply it");
       await session.sendKeys("Enter");
-      await session.waitForText("LINKED_MENU_COMPLETE", 10_000);
+      await session.waitForPane((pane) => pane.includes("LINKED_MENU_COMPLETE") && turnSettled(pane), 10_000);
 
       expect(gateway.requests).toHaveLength(1);
       expect(gatewayPromptText(gateway.requests[0]!.body)).toContain(
@@ -1025,7 +1026,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       await session.sendLiteralText(" apply it");
       await session.sendKeys("Enter");
-      await session.waitForText("LINKED_METADATA_COMPLETE", 10_000);
+      await session.waitForPane((pane) => pane.includes("LINKED_METADATA_COMPLETE") && turnSettled(pane), 10_000);
 
       expect(gateway.requests).toHaveLength(1);
       expect(gatewayPromptText(gateway.requests[0]!.body)).toContain(
@@ -1241,7 +1242,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       // The first prompt's derived title becomes the tab title.
       await session.sendText("generate the release notes");
-      await session.waitForText("TITLE_RENAME_COMPLETE", 30_000);
+      await session.waitForPane((pane) => pane.includes("TITLE_RENAME_COMPLETE") && turnSettled(pane), 30_000);
       await session.waitForStableComposer();
       await waitForPaneTitle(session, "generate the release notes", 5_000);
 
@@ -2025,7 +2026,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(
         settingsPath,
         `${JSON.stringify({
-          statusLine: { workspace: false },
+          status_line: { workspace: false },
         })}\n`,
       );
 
@@ -2152,7 +2153,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(
         settingsPath,
         `${JSON.stringify({
-          statusLine: { sandbox: false, context: false, workspace: false },
+          status_line: { sandbox: false, context: false, workspace: false },
         })}\n`,
       );
 
@@ -3479,7 +3480,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       // The session starts on the built-in default.
       await session.sendText("Hello.");
-      await session.waitForText("PLAIN_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("PLAIN_REPLY") && turnSettled(pane), 10_000);
       expect(gateway.requests.map(chatModelOf)).toEqual(["spacexai/grok-4.7"]);
 
       // The catalog's order, no headings, no tags, and Fast mode.
@@ -3554,7 +3555,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       // not mark GLM 5.3 Flash, fx's Token Pass title model, so the title
       // keeps fx's usual model.
       await session.sendText("Use Token Pass.");
-      await session.waitForText("TOKEN_PASS_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("TOKEN_PASS_REPLY") && turnSettled(pane), 10_000);
       expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
       const titleDeadline = Date.now() + 5_000;
       while (gateway.titleRequests.length === 0 && Date.now() < titleDeadline) await Bun.sleep(50);
@@ -3652,7 +3653,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       // The saved answer decides the model while the check is still out.
       await session.sendText("Use the saved answer.");
-      await session.waitForText("SAVED_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("SAVED_REPLY") && turnSettled(pane), 10_000);
       expect(creditsAnsweredAt).toBe(0);
       expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
 
@@ -3666,7 +3667,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
       await session.sendText("Keep going.");
-      await session.waitForText("AFTER_CHECK_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("AFTER_CHECK_REPLY") && turnSettled(pane), 10_000);
       expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash"]);
       // Only a saved answer ever said the team has Token Pass, so the
       // transcript never did.
@@ -3707,7 +3708,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await waitForTokenPassAnswer(tracePath, "no_pass");
       await session.waitForPane((pane) => pane.includes("grok-4.7"), 10_000);
       await session.sendText("Use the built-in default.");
-      await session.waitForText("ENDED_PASS_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("ENDED_PASS_REPLY") && turnSettled(pane), 10_000);
       expect(gateway.requests.map(chatModelOf)).toEqual(["spacexai/grok-4.7"]);
       expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("no_pass");
       expect(await session.captureFullScrollback()).not.toContain("Token Pass is active");
@@ -3746,7 +3747,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await waitForTokenPassAnswer(tracePath, "has_pass");
       await session.waitForText(notice, 10_000);
       await session.sendText("Use the Token Pass default.");
-      await session.waitForText("CONFIRMED_PASS_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("CONFIRMED_PASS_REPLY") && turnSettled(pane), 10_000);
       expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
       expect((await session.captureFullScrollback()).split(notice).length - 1).toBe(1);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -3783,7 +3784,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("Do not wait long.");
-      await session.waitForText("UNWAITED_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("UNWAITED_REPLY") && turnSettled(pane), 10_000);
       // The prompt waited about two seconds from the check's start, then
       // went out on the built-in default before the check answered.
       expect(creditsRequestedAt).toBeGreaterThan(0);
@@ -3847,7 +3848,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(trace).toContain("start model settled reason=model_choice");
       expect(trace).not.toContain("start model=");
       await session.sendText("Use the picked model.");
-      await session.waitForText("PICKED_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("PICKED_REPLY") && turnSettled(pane), 10_000);
       expect(gateway.requests.map(chatModelOf)).toEqual([picked]);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
@@ -3934,7 +3935,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       // The marks start the session on the Token Pass default without
       // waiting for the credits check.
       await session.sendText("Use the catalog's answer.");
-      await session.waitForText("CATALOG_PASS_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("CATALOG_PASS_REPLY") && turnSettled(pane), 10_000);
       expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
       expect(readFileSync(tracePath, "utf8")).not.toContain("first prompt sent before the check answered");
       await session.sendKeys("C-p");
@@ -4132,7 +4133,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText(`/model ${chosen}`);
       await session.waitForText(`Switched to ${chosen}`, 10_000);
       await session.sendText("remember this model");
-      await session.waitForText("RESUME_MODEL_REPLY", 15_000);
+      await session.waitForPane((pane) => pane.includes("RESUME_MODEL_REPLY") && turnSettled(pane), 15_000);
       await session.waitForStableComposer();
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -4351,7 +4352,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(stream.cancelled).toBe(false);
 
       stream.release?.();
-      await session.waitForText("catalog stream completed", 10_000);
+      await session.waitForPane((pane) => pane.includes("catalog stream completed") && turnSettled(pane), 10_000);
       expect(stream.cancelled).toBe(false);
       expect(gateway.requests).toHaveLength(1);
 
@@ -4465,7 +4466,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-[");
-      await session.waitForText("catalog approval completed", 10_000);
+      await session.waitForPane((pane) => pane.includes("catalog approval completed") && turnSettled(pane), 10_000);
       expect(existsSync(target)).toBe(false);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -4578,7 +4579,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         expect(await session.capturePane()).not.toContain("Space details");
 
         await session.sendKeys("Enter");
-        await session.waitForText("raw variable prompt complete", 10_000);
+        await session.waitForPane((pane) => pane.includes("raw variable prompt complete") && turnSettled(pane), 10_000);
         expect(gateway.requests).toHaveLength(1);
         expect(gateway.requests[0]!.body).toContain("Explain echo $HOME please");
 
@@ -4620,7 +4621,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         expect(await session.capturePane()).not.toContain("Space details");
 
         await session.sendKeys("Enter");
-        await session.waitForText("mention space prompt complete", 10_000);
+        await session.waitForPane((pane) => pane.includes("mention space prompt complete") && turnSettled(pane), 10_000);
         expect(gateway.requests).toHaveLength(1);
         expect(gateway.requests[0]!.body).toContain("$man now");
 

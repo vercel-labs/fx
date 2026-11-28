@@ -7,6 +7,7 @@
 //! Usage: engine_lab <trace-path> <script> [--deny TOOL]... [--capabilities JSON]
 //!          [--max-attempts N] [--no-listen] [--preferred V1,V2] [--probe-ms N]
 //!          [--timeout-ms IDLE] [--hard-ms N] [--start-ms N] [--refused-ms N]
+//!          [--stable-ms N] [--idle-ms N]
 //!          [--define NAME=VALUE]... (each {NAME} in the script becomes VALUE)
 //!
 //! Script, one action per line (blank lines and lines starting with # are skipped):
@@ -119,6 +120,7 @@ const Lab = struct {
             .called => |c| lab.arena.print("{s}.called.{d}.{s}", .{ s, lab.number(c.call), @tagName(c.outcome) }),
             .input => |q| lab.arena.print("{s}.input.{d}", .{ s, lab.number(q.call) }),
             .progress => |p| lab.arena.print("{s}.progress.{d}", .{ s, lab.number(p.call) }),
+            .stopped_idle => lab.arena.print("{s}.stopped_idle", .{s}),
             .server => |v| switch (v) {
                 .tools => |t| lab.arena.print("{s}.tools.{s}", .{ s, if (t.ok) "ok" else "fail" }),
                 else => lab.arena.print("{s}.{s}", .{ s, @tagName(v) }),
@@ -164,6 +166,7 @@ const Lab = struct {
                 else => try lab.print("event", .{ .tag = t }),
             },
             .phase => try lab.print("event", .{ .tag = t }),
+            .stopped_idle => try lab.print("event", .{ .tag = t }),
         }
         return t;
     }
@@ -319,6 +322,8 @@ pub fn main(init: std.process.Init) !void {
             options.gate.max_attempts = try std.fmt.parseInt(u8, value, 10);
         } else if (std.mem.eql(u8, flag, "--stable-ms")) {
             options.gate.stable_ms = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--idle-ms")) {
+            options.gate.idle_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--define")) {
             const eq = std.mem.findScalar(u8, value, '=') orelse {
                 std.debug.print("engine_lab: --define needs NAME=VALUE\n", .{});

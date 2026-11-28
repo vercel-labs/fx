@@ -243,7 +243,8 @@ async function runScenario(name) {
     await start();
     for (let turn = 1; turn <= seedTurns; turn++) {
       active.runtime.write(`Seed ordinary historical turn ${turn}.${turn === 1 ? ` ${seedRule}` : ""}\r`);
-      await waitFor(() => commits === turn && grid(active.terminal).includes(`HOST_SEED_DONE_${turn}`) && emptyComposer(grid(active.terminal)), `saved history turn ${turn}`, 20_000);
+      // Each seed turn is one model request with no tool step: the save before the request, then the turn's end. Seeding never compacts, so nothing else commits.
+      await waitFor(() => commits === 2 * turn && grid(active.terminal).includes(`HOST_SEED_DONE_${turn}`) && emptyComposer(grid(active.terminal)), `saved history turn ${turn}`, 20_000);
       assert.equal(ordinary, turn);
       assert.equal(summaries, 0, "seed history must stay below automatic compaction");
     }
@@ -283,6 +284,8 @@ async function runScenario(name) {
       await waitFor(() => hold.aborted, "Ctrl+C reaches summary AbortSignal");
       await waitFor(() => !activity.test(grid(active.terminal)) && grid(active.terminal).includes("Compaction cancelled.") && emptyComposer(grid(active.terminal)), "scoped cancellation feedback");
       if (automatic) {
+        // No model request was sent, so no save before one; the summary's save writes no
+        // checkpoint in this host; and the cancelled turn's end is its one commit.
         await waitFor(() => commits === beforeCommits + 1, "automatic interruption persisted");
         const saved = new TextDecoder().decode(records.get(sessionId).bytes);
         assert.equal(saved.match(/"cancellation_origin"\s*:\s*"compaction"/g)?.length, 1, "save one compaction-origin interruption");

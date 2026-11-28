@@ -118,7 +118,7 @@ pub const Scalar = struct {
 
 test "a scalar format argument writes the name as writeScalar does" {
     var buffer: [64]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buffer, "No tool named {f}.", .{scalar("a\x00b\nc")});
+    const text = try std.mem.print(&buffer, "No tool named {f}.", .{scalar("a\x00b\nc")});
     try std.testing.expectEqualStrings("No tool named a&#x00;b&#x0a;c.", text);
 }
 

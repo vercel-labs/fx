@@ -54,11 +54,13 @@ pub const Outcome = enum { completed, failed, cancelled, interrupted, lost };
 
 /// Why a work ended cancelled, when fx knows: the user stopped its turn,
 /// fx quit while it ran, or the user closed the child from the agent list.
+/// A work that completed, and that the user closed while it ran or just
+/// after it returned, also has `user_close`.
 pub const Cause = enum { user_stop, fx_quit, user_close };
 
-/// Who started a finished work and why it was cancelled. A finish that
-/// owes a report saves them, so a report posted after a restart still
-/// says so.
+/// Who started a finished work and why it was cancelled, or that the user
+/// closed a work that completed. A finish that owes a report saves them, so
+/// a report posted after a restart still says so.
 pub const EndFacts = struct {
     started_by: reports.StartedBy = .parent,
     cause: ?Cause = null,
@@ -152,8 +154,8 @@ pub const Child = struct {
     /// Whether the last finished work owes the parent a report, recorded
     /// on its `child_finished` line.
     last_report_owed: bool = false,
-    /// Who started the last finished work and why it was cancelled, kept
-    /// only when it owes a report.
+    /// Who started the last finished work and why it was cancelled, or that
+    /// the user closed a work that completed, kept only when it owes a report.
     last_end: EndFacts = .{},
     /// When the child reports back on its own. Set by its parent's
     /// messages, and recorded on each spawn line.
@@ -959,8 +961,9 @@ pub fn finishOwesFlag(data: ?[]const u8) ?bool {
 
 /// fx's data on a `child_finished` line. Older fx skips `report`, and a
 /// line without it owes nothing, so an upgrade wakes no parent. `by` names
-/// who started a work the parent didn't, and `cause` why it was
-/// cancelled; a line that owes no report has neither.
+/// who started a work the parent didn't, and `cause` why it was cancelled
+/// or that the user closed a completed work; a line that owes no report has
+/// neither.
 const FinishData = struct {
     failure: ?[]const u8 = null,
     report: ?bool = null,
@@ -1034,7 +1037,7 @@ fn endFactsOf(by: ?[]const u8, cause: ?[]const u8) EndFacts {
 }
 
 /// Pure: who started the work a `child_finished` line's `data` ends, and
-/// why it was cancelled.
+/// why it was cancelled, or that the user closed a completed work.
 pub fn finishEndFacts(data: ?[]const u8) EndFacts {
     const bytes = data orelse return .{};
     var buf: [256]u8 = undefined;
@@ -1111,6 +1114,16 @@ test "a finish that owes a report saves who started its work and why it was canc
     try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true}"));
     try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true,\"by\":\"robot\",\"cause\":\"meteor\"}"));
     try std.testing.expectEqual(EndFacts{}, finishEndFacts(null));
+}
+
+test "a completed work the user closed keeps its cause through the session log" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const end: EndFacts = .{ .cause = .user_close };
+    const back = finishEndFacts((try finishData(arena, null, true, end)).?);
+    try std.testing.expectEqual(end, back);
+    try std.testing.expectEqual(@as(?Cause, .user_close), back.cause);
 }
 
 test "a fork's copy of a child owes no report, keeps a failure, and ends open work as cancelled (D97)" {

@@ -150,6 +150,7 @@ const TRACE_CFG = [
   "  Recovery = FALSE",
   "  Faults = FALSE",
   "  FailedCommits = FALSE",
+  "  Continues = FALSE",
   '  Mutant = "none"',
   "INIT TraceInit",
   "NEXT TraceNext",

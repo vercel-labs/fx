@@ -90,13 +90,57 @@ const MUTANTS: Mutant[] = [
     to: `    /\\ IF c = turn`,
     expect: "CancelStops",
   },
+  {
+    id: "cancel-ignored-while-asking",
+    note: "under the rules, a client that isn't the sender can't stop a turn that waits for a permission",
+    from: `    /\\ IF Rules \\/ c = turn`,
+    to: `    /\\ IF (Rules /\\ ~Waiting) \\/ c = turn`,
+    expect: "CancelStops",
+  },
+  {
+    id: "prompt-to-closed-client",
+    note: "a prompt goes to the other clients that don't have the session open too",
+    from: `IF Rules /\\ open[d] /\\ d # c THEN Append(chan[d], Echo(k)) ELSE chan[d]]`,
+    to: `IF Rules /\\ d # c THEN Append(chan[d], Echo(k)) ELSE chan[d]]`,
+    expect: "EchoOnlyWhileOpen",
+  },
+  {
+    id: "joiner-gets-others-old-prompts",
+    note: "a client that opens the session gets the prompts other clients sent before it opened",
+    from: `IF d = c THEN chan[d] \\o ask \\o RosterOut(d, now)`,
+    to: `IF d = c THEN chan[d] \\o LET olds == SelectSeq([i \\in 1..prompts |-> i], LAMBDA i : sentBy[i] # c) IN [j \\in 1..Len(olds) |-> Echo(olds[j])] \\o ask \\o RosterOut(d, now)`,
+    expect: "EchoOnlyWhileOpen",
+  },
+  {
+    id: "close-keeps-sentTo",
+    note: "a client that closes the session still counts as one the request went to",
+    from: `    /\\ sentTo' = sentTo \\ {c}`,
+    to: `    /\\ sentTo' = sentTo`,
+    expect: "RequestOnlyOpen",
+  },
+  {
+    id: "cancel-keeps-turn",
+    note: "session/cancel from a client with the session open doesn't stop the turn",
+    from: `       THEN /\\ turn' = None`,
+    to: `       THEN /\\ turn' = turn`,
+    expect: "StopEffect",
+  },  {
+    id: "roster-to-closed-client",
+    note: "fx sends the list of clients to a client that closed the session",
+    from: `RosterOut(c, now) == IF Rules /\\ now[c] THEN`,
+    to: `RosterOut(c, now) == IF Rules THEN`,
+    expect: "ClosedQuiet",
+  },
 ];
 
 const SPEC_FILES = ["AcpSharedSession.tla", "MCAcpSharedSession.tla", "MCAcpSharedSession.cfg", "MCAcpSharedSessionThree.cfg"];
 
 /// Checks a mutant against its target property alone, so a kill shows that
 /// property catches the mistake whichever one TLC would check first.
+const TEMPORAL_PROPERTIES = new Set(["StopEffect"]);
+
 function targetCfg(target: string): string {
+  const kind = TEMPORAL_PROPERTIES.has(target) ? "PROPERTY" : "INVARIANT";
   return [
     "CONSTANTS",
     "    Rules = TRUE",
@@ -106,7 +150,7 @@ function targetCfg(target: string): string {
     "INIT Init",
     "NEXT Next",
     "CONSTRAINT ChanBound",
-    `INVARIANT ${target}`,
+    `${kind} ${target}`,
     "CHECK_DEADLOCK FALSE",
     "",
   ].join("\n");

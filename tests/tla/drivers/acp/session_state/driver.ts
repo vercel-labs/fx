@@ -10,6 +10,8 @@
 // --model rules checks the sh.fx rules against the same build, and each plan
 // must fail it. The change that lands the rules makes rules the default.
 //
+// A peer step runs session/list in a second fx acp on the same home, which
+// reads the session index the first process writes.
 // The client lists sh.fx/sessionState and sh.fx/listChanges at initialize,
 // which today's fx ignores. The fake Gateway holds each model reply until the
 // driver ends it, so a list or status request arrives while the turn runs.
@@ -17,7 +19,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { binary, worktree } from "../../lib/context";
-import { Fixture, waitFor } from "../prompt_delivery/harness";
+import { Acp, Fixture, waitFor } from "../prompt_delivery/harness";
 import { outDir, sha256File, sha256Text, tlcToolchain, writeJson } from "./tlc";
 import { type Bounds, type Observation, type StatusAnswer, validate } from "./trace";
 
@@ -30,18 +32,19 @@ type Step =
   | { op: "cancel"; s: string }       // session/cancel
   | { op: "close"; s: string }        // session/close
   | { op: "list"; f: "A" | "*" }      // session/list of the workspace, or of every folder
-  | { op: "status"; s: string };      // session/status
+  | { op: "status"; s: string }       // session/status
+  | { op: "peer"; f: "A" | "*" };     // session/list of a second fx process on the same home
 type Plan = { name: string; steps: Step[] };
 
 const PLANS: Plan[] = [
   { name: "d1-list-during-turn", steps: [
-    { op: "new", s: "s1" }, { op: "status", s: "s1" }, { op: "prompt", s: "s1" },
+    { op: "new", s: "s1" }, { op: "status", s: "s1" }, { op: "prompt", s: "s1" }, { op: "peer", f: "A" },
     { op: "list", f: "A" }, { op: "status", s: "s1" }, { op: "end", s: "s1" },
     { op: "list", f: "A" }, { op: "status", s: "s1" },
   ] },
   { name: "d2-two-sessions", steps: [
     { op: "new", s: "s1" }, { op: "prompt", s: "s1" }, { op: "end", s: "s1" },
-    { op: "new", s: "s2" }, { op: "list", f: "*" }, { op: "prompt", s: "s2" },
+    { op: "new", s: "s2" }, { op: "list", f: "*" }, { op: "prompt", s: "s2" }, { op: "peer", f: "*" },
     { op: "list", f: "*" }, { op: "cancel", s: "s2" }, { op: "list", f: "A" },
   ] },
   { name: "d3-close-then-status", steps: [
@@ -90,13 +93,24 @@ async function runPlan(plan: Plan, dir: string) {
     }));
   };
   const nameOf = (sessionId: string) => [...ids.entries()].find(([, id]) => id === sessionId)?.[0];
+  /// The session/list rows of this run's sessions: "absent" when a session isn't listed.
+  const rowsOf = (response: any): Record<string, string> => {
+    const rows: Record<string, string> = Object.fromEntries([...ids.keys()].map((name) => [name, "absent"]));
+    for (const row of response?.result?.sessions ?? []) {
+      const name = nameOf(row.sessionId);
+      if (name) rows[name] = String(row._meta?.["sh.fx/state"] ?? "none");
+    }
+    return rows;
+  };
 
   try {
     await fixture.init();
-    const acp = await fixture.start({
+    const init = {
       protocolVersion: 1,
       clientCapabilities: { _meta: { "sh.fx/sessionState": {}, "sh.fx/listChanges": {} } },
-    });
+    };
+    const acp = await fixture.start(init);
+    let peer: Acp | null = null;
     for (const step of plan.steps) {
       if (step.op === "new") {
         const created = await acp.request("session/new", { cwd: fixture.workspace, mcpServers: [] });
@@ -130,13 +144,13 @@ async function runPlan(plan: Plan, dir: string) {
         const response = await acp.request("session/list", step.f === "A" ? { cwd: fixture.workspace } : {});
         const refused = response?.error?.code === -32600;
         if (response?.error && !refused) throw new Error(`session/list failed: ${JSON.stringify(response.error)}`);
-        const rows: Record<string, string> = Object.fromEntries([...ids.keys()].map((name) => [name, "absent"]));
-        for (const row of response?.result?.sessions ?? []) {
-          const name = nameOf(row.sessionId);
-          if (name) rows[name] = String(row._meta?.["sh.fx/state"] ?? "none");
-        }
-        observations.push(base("list", { f: step.f, refused, rows }));
+        observations.push(base("list", { f: step.f, refused, rows: rowsOf(response) }));
         sync();
+      } else if (step.op === "peer") {
+        peer ??= await fixture.startPeer(init);
+        const response = await peer.request("session/list", step.f === "A" ? { cwd: fixture.workspace } : {});
+        if (response?.error) throw new Error(`peer session/list failed: ${JSON.stringify(response.error)}`);
+        observations.push(base("peer", { f: step.f, rows: rowsOf(response) }));
       } else {
         const response = await acp.request("session/status", { sessionId: ids.get(step.s)! });
         observations.push(base("status", { s: step.s, answer: statusOf(response) }));
