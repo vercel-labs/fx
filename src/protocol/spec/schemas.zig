@@ -128,8 +128,8 @@ test "ACP's method lists are version 1 and the unstable list includes every stab
     try std.testing.expect(stable_version == .integer and stable_version.integer == 1);
     const unstable_version = try requireField(unstable.value, acp_meta_unstable.path, "version");
     try std.testing.expect(unstable_version == .integer and unstable_version.integer == 1);
-    try std.testing.expect(hasStringValue(field(stable.value, "agentMethods") orelse .null, "session/prompt"));
-    try std.testing.expect(hasStringValue(field(stable.value, "clientMethods") orelse .null, "session/update"));
+    try std.testing.expect(hasStringValue(try requireField(stable.value, acp_meta.path, "agentMethods"), "session/prompt"));
+    try std.testing.expect(hasStringValue(try requireField(stable.value, acp_meta.path, "clientMethods"), "session/update"));
 
     for ([_][]const u8{ "agentMethods", "clientMethods", "protocolMethods" }) |list| {
         const stable_list = try requireField(stable.value, acp_meta.path, list);
