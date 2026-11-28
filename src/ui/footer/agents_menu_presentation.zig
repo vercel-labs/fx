@@ -364,7 +364,7 @@ test "the agent list counts the agents, then shows each one's name, title, state
     }
 }
 
-test "a working subagent's row keeps its title, and shows its call's time with its state" {
+test "a working subagent's row keeps its title, and shows its turn's time with its state" {
     const rows = [_]AgentsMenuRow{
         .{ .name = "main", .title = "Fix the login bug", .state = "working", .state_tone = .active, .model = "anthropic/claude-opus-4-7", .effort = "high" },
         .{ .name = "worker", .subagent = true, .title = "Run the auth tests", .state = "working 4m12s", .state_tone = .active, .model = "openai/gpt-5.4-mini" },

@@ -140,6 +140,8 @@ pub const LiveSession = struct {
     saved_model: ?[]const u8,
     state: LiveState,
     agents: []const LiveAgent,
+    /// OS process ID holding the session lock, or null when unavailable.
+    pid: ?i64 = null,
 };
 
 /// `fx sessions --live`, newest first. Every slice lives in `arena`.
@@ -190,6 +192,23 @@ pub const SessionRecoveryResult = struct {
     pub fn deinit(self: *SessionRecoveryResult, alloc: Allocator) void {
         alloc.free(self.source_session_id);
         alloc.free(self.recovered_session_id);
+        self.* = undefined;
+    }
+};
+
+pub const SessionForkResult = struct {
+    source_session_id: []u8,
+    fork_session_id: []u8,
+    workspace_root: []u8,
+    history_len: usize,
+    copied_agents: usize = 0,
+    /// False when a side file could not be copied.
+    files_complete: bool = true,
+
+    pub fn deinit(self: *SessionForkResult, alloc: Allocator) void {
+        alloc.free(self.source_session_id);
+        alloc.free(self.fork_session_id);
+        alloc.free(self.workspace_root);
         self.* = undefined;
     }
 };

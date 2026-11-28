@@ -13,6 +13,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayToolCall,
+  fxChildEnv,
   startFakeGateway,
 } from "../tmux-helpers";
 
@@ -128,8 +129,7 @@ if (authScenario) {
     writeFileSync(join(fakeBin, name), opener, { mode: 0o755 });
   }
 }
-const fxEnv = {
-  ...process.env,
+const fxEnv = fxChildEnv({
   HOME: home,
   PATH: authScenario ? `${fakeBin}:${process.env.PATH ?? ""}` : process.env.PATH,
   ...(authScenario ? { DISPLAY: process.env.DISPLAY || ":0" } : {}),
@@ -147,7 +147,7 @@ const fxEnv = {
   FX_TEST_SKIP_ONBOARDING: "1",
   FX_SOUND: "0",
   NO_COLOR: "1",
-};
+});
 
 async function runFx(args: string[], extraEnv: Record<string, string> = {}) {
   const child = Bun.spawn([fxBin, ...args], {

@@ -9,6 +9,7 @@
 (* session/status answer, or, at a sync, how many state updates and list  *)
 (* hints the client had read once fx answered. Between observations the   *)
 (* client may read messages fx wrote (Deliver), which this module counts. *)
+(* A peer element is a session/list from a second fx process.             *)
 (*                                                                         *)
 (* NotDone is a sentinel: TLC reporting it violated means every            *)
 (* observation matched a step of the model.                                *)
@@ -27,15 +28,21 @@ StepFor(o) ==
       [] o.act = "prompt" -> Prompt("c1", o.s)
       [] o.act = "end"    -> EndTurn(o.s, o.stop)
       [] o.act = "list"   -> List("c1", o.f)
-      [] o.act \in {"status", "sync"} -> UNCHANGED vars
+      [] o.act \in {"status", "sync", "peer"} -> UNCHANGED vars
       [] OTHER            -> FALSE
 
+\* A peer's session/list: another fx process on the same profile, which holds
+\* no session in memory, so its rows carry no state.
 Checked(o) ==
     /\ o.act = "list" =>
          /\ refused' = o.refused
          /\ ~o.refused =>
               \A s \in Sessions : Listed(o, s) =>
                   o.rows[s] = IF saved[s] /\ ~deleted[s] THEN RowState(s) ELSE "absent"
+    /\ o.act = "peer" =>
+         /\ ~o.refused
+         /\ \A s \in Sessions : Listed(o, s) =>
+              o.rows[s] = IF saved[s] /\ ~deleted[s] THEN "none" ELSE "absent"
     /\ o.act = "status" => Answer("c1", o.s) = o.answer
     /\ o.act = "sync" => ~Pending /\ sr = o.states /\ hr = o.hints
 

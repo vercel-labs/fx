@@ -11,6 +11,7 @@ const theme_detection = @import("terminal/theme_detection.zig");
 const theme_protocol = @import("terminal/theme_protocol.zig");
 const shared_theme = @import("../core/shared/theme.zig");
 const visual_layout = @import("input/visual_layout.zig");
+const output_contracts = @import("../core/output/output_contracts.zig");
 const update_target = @import("../core/upgrade/update_target.zig");
 
 pub const TerminalRgb = user_message_card.Rgb;
@@ -180,8 +181,6 @@ pub fn buildInputLineForRow(input: []const u8, cursor: usize, line_index: usize,
 
 const build_channel = update_target.Channel.parse(build_options.update_channel) orelse .stable;
 const welcome_build_label_bytes: usize = 96;
-const dev_revision_bytes: usize = 7;
-
 /// Dev builds ship on every merged PR, so the version alone cannot identify the
 /// binary: the header carries the commit and a brighter `[dev]` tag.
 fn writeBuildLabel(
@@ -191,15 +190,52 @@ fn writeBuildLabel(
     revision: []const u8,
 ) ![]const u8 {
     if (channel != .dev) return std.mem.print(out, "v{s}", .{version_text});
-    if (revision.len < dev_revision_bytes or std.mem.eql(u8, revision, "unknown")) {
-        return std.mem.print(out, "v{s} {s}[dev]{s}", .{ version_text, hint_style, dim_style });
+    if (update_target.displayRevision(revision)) |display| {
+        return std.mem.print(out, "v{s}-{s} {s}[dev]{s}", .{
+            version_text,
+            display,
+            hint_style,
+            dim_style,
+        });
     }
-    return std.mem.print(out, "v{s}-{s} {s}[dev]{s}", .{
-        version_text,
-        revision[0..dev_revision_bytes],
-        hint_style,
-        dim_style,
-    });
+    return std.mem.print(out, "v{s} {s}[dev]{s}", .{ version_text, hint_style, dim_style });
+}
+
+pub const AskHeader = struct {
+    model: []const u8 = "",
+    effort: []const u8 = "",
+    fast_mode: bool = false,
+    ultrafast_mode: bool = false,
+};
+
+/// Caller owns the returned slice.
+pub fn askHeaderMessage(alloc: std.mem.Allocator, header: AskHeader) ![]u8 {
+    var label_buf: [output_contracts.plain_build_label_bytes]u8 = undefined;
+    const build_label = try output_contracts.writePlainBuildLabel(
+        &label_buf,
+        build_channel,
+        build_options.app_version,
+        build_options.git_commit,
+    );
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.print(
+        "{s}𝒇x{s} {s}{s}{s}{s}",
+        .{ subtitle_style, reset_style, hint_style, build_label, reset_style, dim_style },
+    );
+    if (header.model.len > 0) {
+        try out.writer.print(" · {f}", .{text_utils.terminalSafe(header.model)});
+        if (header.effort.len > 0) {
+            try out.writer.print(" · {f}", .{text_utils.terminalSafe(header.effort)});
+        }
+        if (header.ultrafast_mode) {
+            try out.writer.writeAll(" · ultrafast");
+        } else if (header.fast_mode) {
+            try out.writer.writeAll(" · fast");
+        }
+    }
+    try out.writer.writeAll(" · fx ask --help" ++ reset_style ++ "\n\n");
+    return out.toOwnedSlice();
 }
 
 pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
@@ -994,6 +1030,82 @@ test "dev build label drops an unresolved revision" {
     defer std.testing.allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, label);
+}
+
+test "askHeaderMessage shows white version and muted model settings" {
+    initTheme(false, null);
+    const alloc = std.testing.allocator;
+
+    var label_buf: [output_contracts.plain_build_label_bytes]u8 = undefined;
+    const build_label = try output_contracts.writePlainBuildLabel(
+        &label_buf,
+        build_channel,
+        build_options.app_version,
+        build_options.git_commit,
+    );
+
+    const fast = try askHeaderMessage(alloc, .{
+        .model = "anthropic/claude-sonnet-5.5",
+        .effort = "high",
+        .fast_mode = true,
+    });
+    defer alloc.free(fast);
+    const expected_fast = try alloc.print(
+        "{s}𝒇x{s} {s}{s}{s}{s} · anthropic/claude-sonnet-5.5 · high · fast · fx ask --help{s}\n\n",
+        .{ subtitle_style, reset_style, hint_style, build_label, reset_style, dim_style, reset_style },
+    );
+    defer alloc.free(expected_fast);
+    try std.testing.expectEqualStrings(expected_fast, fast);
+    try std.testing.expect(std.mem.find(u8, fast, "Run /help for commands") == null);
+
+    const ultrafast = try askHeaderMessage(alloc, .{
+        .model = "openai/gpt-6-astra",
+        .fast_mode = true,
+        .ultrafast_mode = true,
+    });
+    defer alloc.free(ultrafast);
+    try std.testing.expect(std.mem.find(u8, ultrafast, " · openai/gpt-6-astra · ultrafast · fx ask --help") != null);
+    try std.testing.expect(std.mem.find(u8, ultrafast, " · fast") == null);
+}
+
+test "askHeaderMessage shows help hint without empty model separator" {
+    initTheme(false, null);
+    const alloc = std.testing.allocator;
+
+    var label_buf: [output_contracts.plain_build_label_bytes]u8 = undefined;
+    const build_label = try output_contracts.writePlainBuildLabel(
+        &label_buf,
+        build_channel,
+        build_options.app_version,
+        build_options.git_commit,
+    );
+    const message = try askHeaderMessage(alloc, .{});
+    defer alloc.free(message);
+    const expected = try alloc.print(
+        "{s}𝒇x{s} {s}{s}{s}{s} · fx ask --help{s}\n\n",
+        .{ subtitle_style, reset_style, hint_style, build_label, reset_style, dim_style, reset_style },
+    );
+    defer alloc.free(expected);
+
+    try std.testing.expectEqualStrings(expected, message);
+    try std.testing.expect(std.mem.find(u8, message, " ·  · ") == null);
+    try std.testing.expect(std.mem.find(u8, message, "Run /help for commands") == null);
+}
+
+test "askHeaderMessage sanitizes escape sequences in model and effort" {
+    initTheme(false, null);
+    const alloc = std.testing.allocator;
+
+    const message = try askHeaderMessage(alloc, .{
+        .model = "evil/\x1b[31mred\x1b]0;title\x07",
+        .effort = "hi\x1b[2Jgh",
+    });
+    defer alloc.free(message);
+
+    try std.testing.expect(std.mem.find(u8, message, "\x1b[31m") == null);
+    try std.testing.expect(std.mem.find(u8, message, "\x1b]0;") == null);
+    try std.testing.expect(std.mem.find(u8, message, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, message, "evil/") != null);
 }
 
 test "buildHintLine does not advertise queue or alternate steering shortcuts" {

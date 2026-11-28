@@ -11,6 +11,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fxChildEnv } from "../evals/eval-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 
 const STDOUT = 1;
@@ -122,7 +123,7 @@ export function holdsKeystroke(input: string): boolean {
 export function replayGrids(fxBin: string, tapePath: string, framesRoot: string): Map<number, string[]> {
   execFileSync(fxBin, ["replay", tapePath, "--frames-dir", framesRoot], {
     stdio: "pipe",
-    env: { ...process.env, FX_SOUND: "0" },
+    env: fxChildEnv({ FX_SOUND: "0" }),
   });
   const grids = new Map<number, string[]>();
   for (const frame of frames(tapePath)) {

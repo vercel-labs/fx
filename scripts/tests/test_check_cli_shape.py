@@ -373,6 +373,17 @@ class CheckCliShapeTests(unittest.TestCase):
         self.edit(check_cli_shape.MAIN, '"0.0.14"', '"0.0.17"')
         self.assertOnly(self.run_check(), "removal", "fx 0.0.17 drops the old spellings")
 
+    def test_removal_check_passes_when_no_spelling_is_scheduled(self) -> None:
+        self.edit(check_cli_shape.COMMAND_SPECS, 'pub const old_spelling_removal = "0.0.17";\n', "")
+        self.assertEqual([], self.run_check())
+        self.edit(check_cli_shape.MAIN, '"0.0.14"', '"0.0.18"')
+        self.assertEqual([], self.run_check())
+
+    def test_a_scheduled_removal_still_fails_at_its_version(self) -> None:
+        self.edit(check_cli_shape.COMMAND_SPECS, '"0.0.17"', '"0.0.18"')
+        self.edit(check_cli_shape.MAIN, '"0.0.14"', '"0.0.18"')
+        self.assertOnly(self.run_check(), "removal", "fx 0.0.18 drops the old spellings")
+
     def test_acp_set_config_option_id_needs_a_run_options_row(self) -> None:
         self.edit(check_cli_shape.ACP_SERVER, '"model")) {}\n', '"model")) {}\n    if (std.mem.eql(u8, config_id, "fast")) {}\n')
         self.assertOnly(self.run_check(), "names", 'ACP set_config_option takes "fast"')

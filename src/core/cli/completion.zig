@@ -180,7 +180,7 @@ fn buildModel(arena: Allocator, registry: command_specs.TopLevelRegistry, launch
     _ = try model.node(arena, "");
 
     for (registry.specs) |spec| {
-        if (spec.hidden_from_top_level_help or spec.replaced_by != null) continue;
+        if (spec.hidden_from_top_level_help) continue;
         {
             const root = try model.node(arena, "");
             try addEntry(arena, &root.words, .{ .name = spec.token, .description = spec.summary });

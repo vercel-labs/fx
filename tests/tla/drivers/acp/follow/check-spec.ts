@@ -16,29 +16,29 @@ const MUTANTS: Mutant[] = [
   {
     id: "catch-up-gap",
     note: "a catch-up keeps one turn too few of the client's copy",
-    from: `kept == IF known THEN SubSeq(client[c].has, 1, p.n) ELSE <<>>`,
-    to: `kept == IF known THEN SubSeq(client[c].has, 1, p.n - 1) ELSE <<>>`,
+    from: `THEN Prefix(client[c].has, p) ELSE <<>>`,
+    to: `THEN Prefix(client[c].has, p - 1) ELSE <<>>`,
     expect: "InSync",
   },
   {
     id: "catch-up-repeat",
     note: "a catch-up replays the turn at the client's position again",
-    from: `rest == IF known THEN SubSeq(saved, p.n + 1, Len(saved)) ELSE saved`,
-    to: `rest == IF known THEN SubSeq(saved, IF p.n > 0 THEN p.n ELSE 1, Len(saved)) ELSE saved`,
+    from: `SubSeq(saved, p + 1, Len(saved))`,
+    to: `SubSeq(saved, IF p > 0 THEN p ELSE 1, Len(saved))`,
     expect: "InSync",
   },
   {
-    id: "stale-position-trusted",
-    note: "a position from before a compaction counts as known",
-    from: `known == Rules /\\ withPos /\\ p.gen = gen /\\ 0 <= p.n /\\ p.n <= Len(saved)`,
-    to: `known == Rules /\\ withPos /\\ 0 <= p.n /\\ p.n <= Len(saved)`,
+    id: "compaction-rewrites-log",
+    note: "a compaction rewrites the saved turns, which a compaction must leave as they are",
+    from: `    /\\ saved' = saved`,
+    to: `    /\\ saved' = <<0>>`,
     expect: "InSync",
   },
   {
     id: "live-turn-not-sent",
     note: "a saved turn is not sent to the connections that have the session open",
-    from: `            IF client[c].open\n            THEN [client[c] EXCEPT !.has = Append(@, Live(turnsRun)),`,
-    to: `            IF FALSE\n            THEN [client[c] EXCEPT !.has = Append(@, Live(turnsRun)),`,
+    from: `IF client[c].open`,
+    to: `IF FALSE`,
     expect: "InSync",
   },
   {
@@ -51,7 +51,7 @@ const MUTANTS: Mutant[] = [
   {
     id: "position-not-updated",
     note: "a saved turn doesn't give the connections the session's new position",
-    from: `!.pos = IF Rules THEN [gen |-> gen, n |-> Len(saved) + 1] ELSE @]`,
+    from: `!.pos = IF Rules THEN Len(saved) + 1 ELSE @]`,
     to: `!.pos = @]`,
     expect: "PositionCurrent",
   },
@@ -65,8 +65,8 @@ const MUTANTS: Mutant[] = [
   {
     id: "joiner-sets-folder",
     note: "a client that loads a session open elsewhere replaces its folder",
-    from: `                f == IF OpenElsewhere(c) THEN folder ELSE w\n            IN`,
-    to: `                f == w\n            IN`,
+    from: `f == IF OpenElsewhere(c) THEN folder ELSE w\n            IN`,
+    to: `f == w\n            IN`,
     expect: "KeepsFolder",
   },
   {
@@ -79,9 +79,23 @@ const MUTANTS: Mutant[] = [
   {
     id: "replay-unsaid",
     note: "a load doesn't say how it replayed",
-    from: `replay |-> IF ~Rules THEN "none" ELSE IF known THEN "after_position" ELSE "full",`,
+    from: `replay |-> label,`,
     to: `replay |-> "none",`,
     expect: "ReplaySaid",
+  },
+  {
+    id: "replay-always-after-position",
+    note: "fx answers after_position even when it replays the whole session, so the client keeps its copy and gets the turns twice",
+    from: `label == IF ~Rules THEN "none" ELSE IF known THEN "after_position" ELSE "full"`,
+    to: `label == IF ~Rules THEN "none" ELSE "after_position"`,
+    expect: "InSync",
+  },
+  {
+    id: "forget-sends-old-position",
+    note: "a client that lost its messages sends its old position anyway, so fx replays only the turns after it",
+    from: `(withPos => ~client[c].lost)`,
+    to: `TRUE`,
+    expect: "InSync",
   },
 ];
 

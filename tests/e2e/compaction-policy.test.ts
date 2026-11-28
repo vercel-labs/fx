@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { compactionRecordPath, logLines, logLinesAfterCompaction, sessionDir } from "./saved-sessions";
+import { compactionRecordPath, logLines, sessionDir } from "./saved-sessions";
 
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const { fakeGatewayFinalText, fakeGatewayToolCall, startDynamicFakeGateway } = await import("./tmux-helpers");
@@ -130,7 +130,7 @@ const BIG_REPLY = Array.from({ length: 14_000 }, (_, n) => `Reference line ${n}:
 
 type Script = (request: any, raw: string, phase: string) => Response;
 
-async function toolboxRun(model: string, label: string, phases: { phase: string; prompt: string; resume: boolean; env?: Record<string, string> }[], script: Script, readLog = logLines, exitCode = 0) {
+async function toolboxRun(model: string, label: string, phases: { phase: string; prompt: string; resume: boolean; env?: Record<string, string> }[], script: Script, exitCode = 0) {
   const root = mkdtempSync(join(tmpdir(), "fx-toolbox-menu-")), home = join(root, "home"), cwd = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(cwd, { mode: 0o700 });
@@ -173,7 +173,7 @@ async function toolboxRun(model: string, label: string, phases: { phase: string;
       const found = request.prompt.find((message: any) => message.role === "system" && typeof message.content === "string" && message.content.startsWith(TOOLBOX_MENU));
       return found?.content ?? null;
     });
-    const result = { home, sessionId, bodies: agentBodies, menus, outputs, errors, compactions: readLog(home, sessionId).filter((line: any) => line.kind === "compacted").length };
+    const result = { home, sessionId, bodies: agentBodies, menus, outputs, errors, compactions: logLines(home, sessionId).filter((line: any) => line.kind === "compacted").length };
     passed = true;
     return result;
   } finally {
@@ -200,7 +200,15 @@ for (const model of ["anthropic/claude-sonnet-5.5", "openai/gpt-6.1-sol", "fixtu
     return fakeGatewayFinalText(phase === "seed" ? `SEED_DONE\n${BIG_REPLY}` : `${phase.toUpperCase()}_DONE`);
   });
   expect(run.compactions).toBe(1);
-  expect(run.bodies.length).toBe(3);
+  // Claude 4.6 and later and GPT-6 and later first ask the provider for its
+  // compaction block with the request the turn was about to send, so with its
+  // menu too. This fake answers with text, and fx's own summary follows.
+  const providerRequests = run.bodies.filter((raw) => {
+    const body = JSON.parse(raw);
+    return body.providerOptions?.anthropic?.compaction !== undefined || body.providerOptions?.openai?.compactionTrigger === true;
+  }).length;
+  expect(providerRequests).toBe(model.startsWith("fixture/") ? 0 : 1);
+  expect(run.bodies.length).toBe(3 + providerRequests);
   expectMenuKept(run);
 }, 120_000);
 
@@ -238,9 +246,9 @@ test("overflow recovery in the middle of a turn keeps the toolbox menu the conve
 
 // A tool call's arguments stay in the conversation, so one larger than the
 // model's whole window leaves only compaction, whose request clips them to
-// fit. That compaction folds the turn's own call, so the streamed turn is
-// written again once (tests/tla/session/TurnStream.tla SupersedeExplained),
-// and the turn ends either way.
+// fit. That compaction folds the turn's own call, which the session log
+// keeps (tests/tla/session/TurnStream.tla LogKeepsCutResults), and the turn
+// ends either way.
 for (const refuseFirst of [false, true]) test(`automatic compaction clips a tool call argument larger than the context window${refuseFirst ? " after the provider refuses the first compaction request" : ""}`, async () => {
   const content = "BIG_ARGUMENT_START\n" + "x".repeat(1_000_000) + "\nBIG_ARGUMENT_END";
   const summaries: string[] = [];
@@ -255,7 +263,7 @@ for (const refuseFirst of [false, true]) test(`automatic compaction clips a tool
     }
     agentRequests += 1;
     return agentRequests === 1 ? fakeGatewayToolCall("big-write", "write_file", { path: "big.txt", content }) : fakeGatewayFinalText("BIG_ARGUMENT_DONE");
-  }, logLinesAfterCompaction);
+  });
   expect(run.outputs).toEqual(["BIG_ARGUMENT_DONE"]);
   expect(run.compactions).toBe(1);
   // A refused compaction request is sent again; the one accepted keeps the
@@ -294,7 +302,7 @@ for (const [model, refusal] of Object.entries(tooLongRefusals)) test(`a compacti
     }
     agentRequests += 1;
     return agentRequests === 1 ? fakeGatewayToolCall("big-write", "write_file", { path: "big.txt", content }) : fakeGatewayFinalText("TOO_LONG_RECOVERED");
-  }, logLinesAfterCompaction);
+  });
   expect(run.outputs).toEqual(["TOO_LONG_RECOVERED"]);
   expect(run.compactions).toBe(1);
   // The refused request is followed by a smaller one that fits.
@@ -324,7 +332,7 @@ for (const [label, refusal, requests] of boundCases) test(`a compaction request 
     }
     agentRequests += 1;
     return agentRequests === 1 ? fakeGatewayToolCall("big-write", "write_file", { path: "big.txt", content }) : fakeGatewayFinalText("NOT_REACHED");
-  }, logLinesAfterCompaction, 1);
+  }, 1);
   expect(run.errors).toEqual(["ModelFailed"]);
   expect(summaries.length).toBe(requests);
   expect(run.compactions).toBe(0);

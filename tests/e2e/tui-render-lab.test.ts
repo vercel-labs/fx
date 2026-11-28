@@ -8,8 +8,9 @@ import {
   analyzeRun,
   readQuiescence,
 } from "./render-lab/analyzer";
+import { renderLabPaneCommand, renderLabSessionArgs } from "./render-lab/index";
 import type { RenderLabFrame, RenderLabManifest } from "./render-lab/types";
-import { tmuxAvailable } from "./tmux-helpers";
+import { DEFAULT_UNSET_ENV_KEYS, tmuxAvailable } from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 120_000;
@@ -137,6 +138,55 @@ test("native render-lab scenarios require explicit opt-in", () => {
 
   expect(result.status).not.toBe(0);
   expect(result.stderr).toContain("FX_RENDER_LAB_NATIVE=1");
+});
+
+test.skipIf(SKIP)("a render-lab tmux server ignores the developer's tmux config", () => {
+  outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-tmux-config-test-"));
+  // render-lab reads the whole scrollback, so a short history would cut it.
+  const hostileConfig = "set -g history-limit 1\nset -g remain-on-exit-format 'HOSTILE'\n";
+  writeFileSync(join(outDir, ".tmux.conf"), hostileConfig);
+  mkdirSync(join(outDir, ".config", "tmux"), { recursive: true });
+  writeFileSync(join(outDir, ".config", "tmux", "tmux.conf"), hostileConfig);
+  const socket = `fx-render-lab-config-${process.pid}-${Date.now().toString(36)}`;
+  const referenceSocket = `${socket}-ref`;
+  const state = (socketName: string) => execFileSync(
+    "tmux",
+    ["-L", socketName, "display-message", "-p", "-t", "render-lab", "#{history-limit}|#{remain-on-exit-format}"],
+    { encoding: "utf8" },
+  ).trim();
+  try {
+    execFileSync("tmux", ["-L", socket, ...renderLabSessionArgs("render-lab", 80, 24, outDir, "sleep 30")], {
+      env: { ...process.env, HOME: outDir, XDG_CONFIG_HOME: join(outDir, ".config") },
+    });
+    // tmux's defaults, from a server that loads no config at all.
+    execFileSync("tmux", ["-L", referenceSocket, "-f", "/dev/null", "new-session", "-d", "-s", "render-lab", "sleep 30"]);
+    expect(state(socket)).toBe(state(referenceSocket));
+  } finally {
+    for (const socketName of [socket, referenceSocket]) {
+      try {
+        execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" });
+      } catch {}
+    }
+  }
+});
+
+test("a render-lab pane starts without the names TmuxSession clears and keeps its own values", () => {
+  outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-pane-env-test-"));
+  // The probe takes the shell's place and prints the environment it gets.
+  const probe = join(outDir, "probe");
+  writeFileSync(probe, "#!/bin/sh\nenv\n", { mode: 0o755 });
+  const inherited = Object.fromEntries(DEFAULT_UNSET_ENV_KEYS.map((key) => [key, `stale-${key.toLowerCase()}`]));
+  const command = renderLabPaneCommand(probe, { FX_PERMISSION_MODE: "render-lab-own", HOME: outDir });
+
+  const paneEnv = execFileSync("/bin/sh", ["-c", command], {
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...inherited },
+    encoding: "utf8",
+  }).split("\n");
+
+  expect(DEFAULT_UNSET_ENV_KEYS).toContain("FX_TEST_GREP_RELEASE");
+  expect(paneEnv.filter((row) => row.includes("=stale-"))).toEqual([]);
+  expect(paneEnv).toContain("FX_PERMISSION_MODE=render-lab-own");
+  expect(paneEnv).toContain(`HOME=${outDir}`);
 });
 
 test("render-lab analyzer flags excess gap before transient activity", () => {

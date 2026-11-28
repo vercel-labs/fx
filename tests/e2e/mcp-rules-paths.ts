@@ -6,7 +6,7 @@
 // run saves the session, which subagents need).
 // Shared by tests/e2e/mcp-stdio.test.ts and the TLA+ driver
 // tests/tla/drivers/mcp_host/mcp-rules.test.ts.
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { contentText } from "./conditional-guidance-oracle";
@@ -31,6 +31,8 @@ export interface PathsRun {
   observations: Observation[];
   /** The text of each step's result, by step id, for the words a guard compares. */
   texts: Record<string, string>;
+  /** The tool name of each `tools/call` the small server received, in order. */
+  fixtureCalls: string[];
 }
 export interface PathsOptions {
   /** The fx binary under test. */
@@ -48,8 +50,35 @@ export interface PathsOptions {
   readOnly?: boolean;
   /** The small server never starts (it exits at once). */
   down?: boolean;
+  /**
+   * More servers in the profile: `keyed` is held for a variable that is not set, `locked` answers every request with a 401,
+   * `linear` is held for a variable that is not set, and `linear_dev` runs the small server's fixture, so its name has `linear`'s as a prefix.
+   */
+  extraServers?: Array<"keyed" | "locked" | "linear" | "linear_dev">;
   /** An extra scratch folder name. */
   label?: string;
+  /** Run only these built-in steps, each as `<path>:<tool>` (default: all of them). */
+  only?: string[];
+  /** Steps run after the built-in ones, in the order given. */
+  extra?: ScriptStep[];
+  /** Built-in steps the parent runs before it starts its subagent, each as `<path>:<tool>` (agent "child" only). Their texts are in `texts`, under `parent:<id>`. */
+  parentFirst?: string[];
+  /** The small server renames its tool to this when a step creates `LIST_CHANGE_RELEASE` in the workspace, and says so with `list_changed`. */
+  listChange?: { to: string };
+}
+
+/** The variable the `keyed` server (see `extraServers`) is held for. */
+export const NOT_SET_VARIABLE = "FX_MCP_RULES_PATHS_NOT_SET";
+
+/** The file, in the workspace, that makes the small server change its tool list (see `listChange`). */
+export const LIST_CHANGE_RELEASE = "list-change-release";
+
+/** One call the fake model makes, by its tool call id. */
+export interface ScriptStep { id: string; name: string; args: Record<string, unknown> }
+
+/** A shell command whose two streams are printed after its exit code, so the shell tool's merge of them cannot interleave. */
+export function shellStep(id: string, command: string): ScriptStep {
+  return { id, name: "shell", args: { action: "run", command: `${command} > out.txt 2> err.txt; echo "exit=$?"; cat out.txt; cat err.txt` } };
 }
 
 interface Step { id: string; name: string; args: Record<string, unknown>; path: PathName; tool: string; shown: (text: string) => boolean }
@@ -57,8 +86,7 @@ interface Step { id: string; name: string; args: Record<string, unknown>; path: 
 const hidesTool = (tool: string) => (text: string) => text.includes(tool) && !text.includes("Nothing named") && !text.includes("No tool named") && !text.includes("No MCP tool named");
 
 function steps(bin: string): Step[] {
-  // Each stream goes to a file and is printed after the exit code, so the shell tool's merge of the two cannot interleave them.
-  const sh = (command: string) => ({ action: "run", command: `${command} > out.txt 2> err.txt; echo "exit=$?"; cat out.txt; cat err.txt` });
+  const sh = (command: string) => shellStep("", command).args;
   const mcp = (rest: string) => `"${bin}" mcp call ${rest}`;
   const out: Step[] = [];
   const add = (path: PathName, tool: string, name: string, args: Record<string, unknown>, shown: (text: string) => boolean) =>
@@ -101,16 +129,44 @@ export async function runPaths(options: PathsOptions): Promise<PathsRun> {
   const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-mcp-rules-${options.label ?? options.mode}-`)));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
+  const wireLog = join(root, "mcp-wire.jsonl");
   mkdirSync(join(home, ".fx", "agents", "limited"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   const many = startManyMcpHttpServers({ servers: 1, toolsPerServer: 12, resultText: LARGE_RESULT });
   const fixture = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
+  const locked = options.extraServers?.includes("locked")
+    ? Bun.serve({ port: 0, fetch: () => new Response("", { status: 401, headers: { "WWW-Authenticate": 'Bearer realm="locked"' } }) })
+    : null;
   writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ permission: options.rules }));
   writeFileSync(
     join(home, ".fx", "mcp.json"),
     JSON.stringify({ mcp: {
-      fixture: { type: "local", command: options.down ? [process.execPath, "-e", "process.exit(0)"] : [process.execPath, fixture], enabled: true },
+      fixture: {
+        type: "local",
+        command: options.down ? [process.execPath, "-e", "process.exit(0)"] : [process.execPath, fixture],
+        enabled: true,
+        environment: {
+          FX_MCP_WIRE_LOG: wireLog,
+          ...(options.listChange
+            ? {
+              FX_MCP_MODE: "subscription_cache",
+              FX_MCP_RECOVERED_TOOL_NAME: options.listChange.to,
+              FX_MCP_LIST_CHANGE_RELEASE_PATH: join(workspace, LIST_CHANGE_RELEASE),
+            }
+            : {}),
+        },
+      },
       big: { type: "http", url: many.url(0) },
+      ...(options.extraServers?.includes("keyed")
+        ? { keyed: { type: "http", url: "https://keyed.example/mcp", bearer_token_env: NOT_SET_VARIABLE } }
+        : {}),
+      ...(locked ? { locked: { type: "http", url: `http://127.0.0.1:${locked.port}/mcp` } } : {}),
+      ...(options.extraServers?.includes("linear")
+        ? { linear: { type: "http", url: "https://linear.example/mcp", bearer_token_env: NOT_SET_VARIABLE } }
+        : {}),
+      ...(options.extraServers?.includes("linear_dev")
+        ? { linear_dev: { type: "local", command: [process.execPath, fixture], enabled: true } }
+        : {}),
     } }),
   );
   writeFileSync(
@@ -121,7 +177,16 @@ export async function runPaths(options: PathsOptions): Promise<PathsRun> {
       ...(options.childMode ? { permission_mode: options.childMode === "full" ? "full-access" : options.childMode } : {}),
     }),
   );
-  const all = steps(options.bin).filter((s) => !options.readOnly || s.name === "toolbox" && !("run" in s.args));
+  const built = steps(options.bin);
+  const keyOf = (s: Step) => `${s.path}:${s.tool}`;
+  const pick = (keys: string[]) => keys.map((key) => built.find((s) => keyOf(s) === key) ?? (() => { throw new Error(`no built-in step ${key}`); })());
+  const all = [
+    ...built
+      .filter((s) => !options.readOnly || s.name === "toolbox" && !("run" in s.args))
+      .filter((s) => !options.only || options.only.includes(keyOf(s))),
+    ...(options.extra ?? []).map((s): Step => ({ ...s, path: "bridge_call", tool: s.id, shown: () => false })),
+  ];
+  const first = pick(options.parentFirst ?? []);
   const texts: Record<string, string> = {};
   // The parent's turn waits until the subagent's last step, so fx ask stays alive for it.
   let releaseParent: (response: Response) => void = () => {};
@@ -132,6 +197,11 @@ export async function runPaths(options: PathsOptions): Promise<PathsRun> {
       const parent = agent === "child" && (!body.includes("CHILD_TASK") || body.includes('"toolCallId":"start_child"'));
       if (parent) {
         if (body.includes('"toolCallId":"start_child"')) return parentHold;
+        for (const step of first) {
+          const r = resultOf(body, step.id);
+          if (r !== null) texts[`parent:${step.id}`] = r;
+        }
+        for (const step of first) if (resultOf(body, step.id) === null) return fakeGatewayToolCall(step.id, step.name, step.args);
         return fakeGatewayToolCall("start_child", "subagent", {
           request: { action: "message", agent: "worker", ...(options.childServers || options.childMode ? { profile: "limited" } : {}), message: "CHILD_TASK" },
         });
@@ -174,10 +244,11 @@ export async function runPaths(options: PathsOptions): Promise<PathsRun> {
     const observations = all
       .filter((s) => texts[s.id] !== undefined)
       .map((s) => ({ path: s.path, tool: s.tool, shown: s.shown(texts[s.id]!), text: texts[s.id]! }));
-    return { code, stdout, stderr, observations, texts };
+    return { code, stdout, stderr, observations, texts, fixtureCalls: fixtureCalls(wireLog) };
   } finally {
     gateway.stop();
     many.stop();
+    locked?.stop(true);
   }
 }
 
@@ -186,4 +257,15 @@ export function seen(run: PathsRun, path: PathName, tool: string): Observation {
   const found = run.observations.find((o) => o.path === path && o.tool === tool);
   if (!found) throw new Error(`the run never reached ${path} for ${tool}; exit ${run.code}: ${run.stderr.slice(-300)}`);
   return found;
+}
+
+/** The tool name of each `tools/call` that the small server's wire log shows. */
+function fixtureCalls(wireLog: string): string[] {
+  if (!existsSync(wireLog)) return [];
+  return readFileSync(wireLog, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => (JSON.parse(line) as { message?: { method?: string; params?: { name?: string } } }).message)
+    .filter((message) => message?.method === "tools/call")
+    .map((message) => message?.params?.name ?? "");
 }

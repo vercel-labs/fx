@@ -373,7 +373,7 @@ async function runSchedule(helpers: any, fakes: any, saved: any, s: Schedule, sc
   const workspace = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ statusLine: { session: true } }));
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ status_line: { session: true } }));
   const tracePath = join(root, "trace.log");
   let world!: World;
   const issuer = fakes.startFakeIssuer({ refresh: () => world.refresh() });

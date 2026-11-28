@@ -295,6 +295,12 @@ pub const StartRequest = struct {
     timeout_ms: ?u64 = null,
     dimensions: ?Dimensions = null,
     persistence: ?StartPersistence = null,
+    /// A caller that indexes the terminal itself sets this. The registry
+    /// then keeps the id hidden from the other calls of the process after
+    /// `start` returns, and the caller ends that with `Runtime.endStart`
+    /// once it has indexed the terminal. A start that fails leaves nothing
+    /// to end.
+    retain_in_flight: bool = false,
 };
 
 pub const StartPersistence = struct {
@@ -700,6 +706,7 @@ fn clone_start_request(alloc: Allocator, request: StartRequest) Allocator.Error!
         .timeout_ms = request.timeout_ms,
         .dimensions = request.dimensions,
         .persistence = persistence,
+        .retain_in_flight = request.retain_in_flight,
     };
 }
 

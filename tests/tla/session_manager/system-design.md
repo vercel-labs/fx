@@ -308,9 +308,11 @@ manager:
   `src/core/session/session_event.zig` lines 439 to 482). The types are
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
   `context_note` (D93), `runtime_context` (D94), `model_call` (D96),
-  `mcp_bridge_call` (D99), `cancelled_command` (D100), `turn_end` (files
+  `mcp_bridge_call` (D99), `cancelled_command` (D100), `subagent_started`
+  (D101), `cancelled_wait` (D102), `turn_end` (files
   and turn summary), `interruption` (reason detail, partial text, command
-  refs, origin), `recovery`, `workspace_capture` (D98) and `continues`.
+  refs, origin), `recovery`, `model_recovery` (a model request's recovery
+  status, for reading the log), `workspace_capture` (D98) and `continues`.
 - **Recovery:** the agent loop's checkpoint becomes a small `recovery` item
   (cause, action, tool state, attempts, route, partial text). The pieces it
   used to copy are already in the log (D10).
@@ -1500,7 +1502,15 @@ Settled while removing v1 (2026-10-17):
   messages of the first kept turn that the summary covers
   (`keep_tool_steps`, `keep_steering`), and a resume leaves them out of
   that turn, as fx's history does once it compacts; a later cut inside
-  the same turn counts on from there. The converter takes the same counts
+  the same turn counts on from there. fx streams and commits such a turn
+  whole, the covered steps too (`TurnFinalizationGuard.savedExecution`),
+  so the transcript, Ctrl+O and `session/load` show the turn as it ran;
+  an older fx wrote it again from the cut, superseding the first copy,
+  and a resume reads that copy as it is. When a write still has to
+  supersede such a turn, as after a stream that no longer matches, its
+  fresh copy has a new number, so a resume cannot trim it: that copy holds
+  fx's view after the cut, and a trace line names the steps the transcript
+  loses (`TurnView`, `TurnStream.tla` CopyHoldsView). The converter takes the same counts
   from a v1 checkpoint's coverage, as v1's writer counted them, so a
   converted session shows the model the turn's prompt and the steps after
   the summary, as v1 did. A line without them, or a turn that no longer has
@@ -1971,11 +1981,18 @@ as it was sent):
     with the tool in `trigger_tool`, and its end capture closes the turn
     with the others.
   - **Host order:** the runtime begins the turn's token, then saves the
-    user's prompt through `append_turn_piece`, then takes the start
-    capture, all before the first request. The prompt's write opens the
-    turn for the token, so the start capture is written in it at once, and
-    a process killed during the capture, which can take seconds, keeps the
-    prompt. The end capture runs on the turn's own thread before the
+    user's prompt through `append_turn_piece`, then starts the start
+    capture as its own `std.Io` task, beside the turn's first request, and waits
+    for it to be saved before any tool acts (`AgentRuntimeDeps.executeToolCall`
+    sends `.settle`), before a reached repository's start, before the end
+    capture, before the turn returns however it ends, failed or paused
+    included, and before the next turn begins or the host closes the
+    session. The prompt's write opens the
+    turn for the token, so the start capture is written in it as soon as it
+    is taken, possibly after the first streamed pieces, and a process killed
+    during the capture, which can take seconds, keeps the prompt. A cancel
+    that stops the turn, quitting included, ends a start capture still
+    running as it ends any other. The end capture runs on the turn's own thread before the
     commit. In the app that is the agent's worker, as the turn finishes and
     before its finished prompt reaches the UI, so the UI's commit, which
     may run late in the pacer, only writes what is held. The end capture
@@ -2149,6 +2166,66 @@ as it was sent):
   older fx's strict reader rejects with the whole session; or treating
   every interrupted turn with a command call as a cancelled command,
   which also gives rows to calls that never ran a command.
+- **D101 Decision:** when a `subagent` message makes a new subagent, the
+  turn saves a `subagent_started` item right after the call's
+  `tool_result`: `{"call_id":…}`. A resume then reads the call's row as
+  `Started scout`, as live, and a message to a subagent that already
+  existed as `Messaged scout`.
+  - **Write:** the item goes out in the same batch as the `tool_result`
+    it follows, so it takes the session's lock with it
+    (`tests/tla/session/SessionWrite.tla`). The `tool_result` piece keeps
+    the same bytes. Every host saves it, since any host's session can be
+    resumed in the TUI.
+  - **Reading:** the replay marks the turn's result of that call. An item
+    it can't read, or one that names no `subagent` result of the turn, is
+    left out with a trace line, and the row reads `Messaged`.
+  - **Older sessions:** a session saved before D101 has no item, so its
+    rows read `Messaged`, unless the saved result says the subagent was
+    new.
+  - **Older fx:** an fx from before D101 leaves the item out (D17).
+
+  **Why:** the result the model reads is the same for a message that
+  made a subagent and one that reached an existing one, unless other
+  subagents were idle or the user had closed one of that name, so a
+  resume could not tell them apart. Only the subagent host knows.
+  **Alternative:** a new field in the `tool_result` piece, which an older
+  fx's strict reader rejects with the whole session; new words in the
+  result, which change what the model reads; or the first `child_spawned`
+  of each child, matched to the call through the hash in its work id,
+  which only a resume can read and the live screen cannot.
+- **D102 Decision:** when the user cancels a turn while a `subagent` wait
+  waits, the turn saves a `cancelled_wait` item right before its
+  `interruption`: `{"call_id":…,"subagents":"lander"}`, the wait and the
+  subagents its row named. `subagents` is left out when the host named
+  none. A resume then shows the wait's row as live, `Stopped waiting for
+  lander`.
+  - **Write:** core fills it at the cancel site, which has the names the
+    row showed. The item goes out in the turn's commit, with the
+    `interruption` it comes before, so it takes the session's lock with
+    it (`tests/tla/session/SessionWrite.tla`). The `interruption` piece
+    keeps the same bytes. Every host saves it. Names that are long, not
+    valid UTF-8, or hold a control character are left out.
+  - **Reading:** the replay keeps the item until the `interruption` ends
+    the turn, and gives the turn a cancelled wait only when the item names
+    the turn's own `subagent` call. An item it can't read, or one for
+    another call, is left out with a trace line, and the row names no
+    subagent.
+  - **Other cancelled calls:** a read, a fetch, an MCP call, or any other
+    call that is no command keeps its row on resume from the saved call
+    alone, with no item: `Cancelled` and the call, as live.
+  - **Not in the journal or checkpoints:** their codec rejects a key it
+    does not know, and older fx read them, so a turn rebuilt from them
+    shows the wait's row with no names.
+  - **Older fx:** an fx from before D102 leaves the item out (D17) and
+    shows the turn as before, with no wait row.
+
+  **Why:** a cancelled wait has no result, and the names on its row come
+  from the host, which the saved call does not hold, so a resume could
+  show the row only without them.
+  **Alternative:** a new field in the `interruption` piece, which an older
+  fx's strict reader rejects with the whole session; or the names of the
+  turn's last completed wait, which miss a subagent that started or ended
+  after it.
 
 ## Design Risks And Failure Behavior
 

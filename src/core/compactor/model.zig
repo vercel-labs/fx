@@ -37,13 +37,56 @@ pub const ModelCaller = struct {
     /// cannot write it, chosen by the caller, such as a model the same plan
     /// pays for. Null lets the compactor choose another model family.
     fallback_model: ?[]const u8 = null,
+    /// The conversation's model writes its own compaction block over the
+    /// conversation, and `compact_with_provider` asks for it. Null when it
+    /// cannot (`vercel_model_policy.providerCompaction`).
+    provider_compaction: ?model_capabilities.ProviderCompaction = null,
 
     pub const VTable = struct {
         /// What `model` accepts.
         capabilities: *const fn (context: *anyopaque, model: []const u8) model_capabilities.Capabilities,
         /// Sends one request and waits for the whole reply.
         send: *const fn (context: *anyopaque, alloc: Allocator, call: Call) CallError!Reply,
+        /// Sends the conversation, as the agent sent it, to its own model
+        /// with the provider's compaction option, and waits for the block.
+        compact_with_provider: ?*const fn (context: *anyopaque, alloc: Allocator, call: ProviderCall) CallError!ProviderReply = null,
     };
+
+    /// The model's replies keep their reasoning only after the exact prefix
+    /// they were written after, and its provider writes compaction blocks.
+    /// fx's own summary keeps no turn after it for such a model.
+    pub fn bindsReasoning(self: ModelCaller) bool {
+        return self.provider_compaction != null;
+    }
+
+    /// The provider can write this conversation's compaction block.
+    pub fn compactsWithProvider(self: ModelCaller) bool {
+        return self.provider_compaction != null and self.sends_after_conversation and self.vtable.compact_with_provider != null;
+    }
+};
+
+/// A request for the provider's own compaction block.
+pub const ProviderCall = struct {
+    /// The compacted part as the session projects it, which must be where
+    /// the request the agent was about to send starts; the provider gets
+    /// exactly that start. Null sends that whole request: the turn in
+    /// progress is compacted too.
+    older: ?[]const types.ChatMessage,
+    cancel_flag: *std.atomic.Value(bool),
+    trace_ctx: debug_trace.TraceContext,
+};
+
+pub const ProviderReply = union(enum) {
+    /// The block, allocated with the `alloc` given to `compact_with_provider`.
+    block: struct {
+        /// The provider authority, as `model_provider.ProviderId` names it.
+        provider: []const u8,
+        text: []u8,
+        parts_json: []u8,
+    },
+    /// No block. `detail` names the cause in `key=value` form for the
+    /// trace; allocated with the `alloc` given to `compact_with_provider`.
+    failed: struct { reason: FailureReason, detail: []u8 },
 };
 
 /// One request: a system message and one user message, no tools. Or, with
@@ -150,8 +193,11 @@ pub const Summarizer = struct {
     fn ask(self: *Summarizer, alloc: Allocator, prompt: summarize.Prompt, model_name: []const u8) summarize.ModelError![]u8 {
         const caller = self.caller;
         // Each reply starts on a line of its own, whatever the one before
-        // it left.
-        if (self.on_text) |sink| sink.write("\n");
+        // it left, and the row counts each request's wait from here.
+        if (self.on_text) |sink| {
+            sink.write("\n");
+            sink.asked();
+        }
         const reply = try caller.vtable.send(caller.context, alloc, .{
             .model = model_name,
             .reasoning = if (prompt.after_conversation) null else lowestReasoningEffort(caller.vtable.capabilities(caller.context, model_name)),
@@ -259,6 +305,32 @@ test "a failed or empty summary falls back to another family at its lowest reaso
     const summary_model = summarizer.model();
     try std.testing.expectError(error.ModelFailed, summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt));
     try std.testing.expectEqual(@as(usize, 1), direct.calls.items.len);
+}
+
+test "every summary request is announced before it is sent, the fallback's too" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const prompt: summarize.Prompt = .{ .model = "anthropic/claude-opus-5.5", .system = "s", .user = "u" };
+    const Told = struct {
+        asked: usize = 0,
+
+        fn written(_: *anyopaque, _: u8) void {}
+
+        fn requestSent(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.asked += 1;
+        }
+    };
+    var told: Told = .{};
+    var counter: progress.Counter = .{ .sink = .{ .context = &told, .written_fn = Told.written, .asked_fn = Told.requestSent } };
+    var scripted: ScriptedCaller = .{ .replies = &.{ null, "summary" } };
+    defer scripted.calls.deinit(std.testing.allocator);
+    var summarizer: Summarizer = .{ .caller = scripted.caller(.gateway), .cancel_flag = &cancel, .trace_ctx = .{}, .on_text = counter.textSink() };
+    const summary_model = summarizer.model();
+    const text = try summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqual(@as(usize, 2), scripted.calls.items.len);
+    // The first model's request and the fallback's.
+    try std.testing.expectEqual(@as(usize, 2), told.asked);
 }
 
 test "a refusal as too long outlasts the fallback's own failure" {

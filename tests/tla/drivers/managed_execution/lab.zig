@@ -24,6 +24,7 @@ const Result = struct {
     armed: bool,
     quiet_ms: u64,
     end: ?[]const u8 = null,
+    crossed: ?bool = null,
     ended_armed: ?bool = null,
     times: ?quiet_notice.Times = null,
     @"error": ?[]const u8 = null,
@@ -59,20 +60,36 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         };
         var armed = wait.armed;
         var end: ?[]const u8 = null;
+        var crossed = false;
         if (!lab.running) {
             end = "done";
         } else {
             const step = quiet_notice.poll(wait, op.now, lab.last_output_ms, lab.limit_ms);
             armed = step.wait.armed;
             lab.wait = step.wait;
-            if (step.end) |reason| end = @tagName(reason);
+            if (step.end) |reason| {
+                end = @tagName(reason);
+                crossed = step.crossed;
+            }
         }
         if (end) |reason| {
             lab.wait = null;
             result.end = reason;
+            result.crossed = crossed;
             result.ended_armed = armed;
             result.times = quiet_notice.timesFor(lab.running, op.now, lab.started_ms, lab.last_output_ms, lab.limit_ms);
         }
+    } else if (is(op.op, "steer")) {
+        const wait = lab.wait orelse {
+            result.@"error" = "no wait is open";
+            return;
+        };
+        const crossed = if (lab.running) quiet_notice.crossedAt(wait, op.now, lab.last_output_ms, lab.limit_ms) else false;
+        lab.wait = null;
+        result.end = "steer";
+        result.crossed = crossed;
+        result.ended_armed = wait.armed;
+        result.times = quiet_notice.timesFor(lab.running, op.now, lab.started_ms, lab.last_output_ms, lab.limit_ms);
     } else {
         result.@"error" = "unknown op";
     }

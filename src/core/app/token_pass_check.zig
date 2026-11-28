@@ -342,6 +342,58 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Adopts a Token Pass answer already fetched during team preparation,
+        /// so team selection does not wait for or repeat the background check.
+        pub fn adoptPrepared(
+            app: *App,
+            credits_answer: ?token_pass.Answer,
+            catalog_has_marks: bool,
+        ) !void {
+            if (comptime !@hasField(App, "model_cache") or !@hasDecl(@FieldType(App, "model_cache"), "observeTokenPassAnswer")) return;
+            if (provider_runtime.provider(app) != .gateway) return;
+
+            if (credits_answer) |fresh| {
+                if (comptime @hasField(App, "token_pass_check")) {
+                    const state = &app.token_pass_check;
+                    if (app.auth.queuedPromptCredential()) |credential| {
+                        if (name(app.alloc, credential.source, credential.api_key, credential.account orelse app.auth.accountId(), credential.gateway_team)) |named| {
+                            const same_team = if (state.asked) |asked| std.mem.eql(u8, &asked, &named.asked) else false;
+                            state.lookup.deinit();
+                            state.asked = named.asked;
+                            state.saved_as = named.saved_as;
+                            state.started_ms = null;
+                            if (!same_team) {
+                                state.had_saved = false;
+                                state.answer = null;
+                                state.heard = false;
+                            }
+                        }
+                    }
+                    record(app, fresh, "credits_check");
+                    try applyStartModel(app);
+                    try noteStartModel(app);
+                    state.start_settled = true;
+                    return;
+                }
+                app.model_cache.observeTokenPassAnswer(fresh, "credits_check");
+                return;
+            }
+
+            if (catalog_has_marks) {
+                if (comptime @hasField(App, "token_pass_check")) {
+                    start(app);
+                    record(app, .has_pass, token_pass_team.catalog_source);
+                    try applyStartModel(app);
+                    try noteStartModel(app);
+                    return;
+                }
+                app.model_cache.observeTokenPassAnswer(.has_pass, token_pass_team.catalog_source);
+                return;
+            }
+
+            if (comptime @hasField(App, "token_pass_check")) start(app);
+        }
+
         /// Records what AI Gateway said about the team: the check's answer, a
         /// `/credits` reply, a response Token Pass served, or a Token Pass
         /// denial. fx saves each new answer for the team.

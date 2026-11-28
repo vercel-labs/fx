@@ -1,0 +1,45 @@
+stateDiagram-v2
+    [*] --> Idle
+
+    Idle --> PromptRunning: Client sends prompt
+    PromptRunning --> PromptRunning: Client answers request
+    PromptRunning --> Finished: Turn ends or sees cancel
+    Finished --> Idle: Next prompt starts
+
+    PromptRunning --> AboutToAsk: Prompt decides to ask client
+    AboutToAsk --> WaitingForClient: Request added (input open)
+    WaitingForClient --> PromptRunning: Client answers request
+    WaitingForClient --> Finished: Client cancels request
+
+    PromptRunning --> ClosingSession: Client sends close or load
+    AboutToAsk --> ClosingSession: Client sends close or load
+    WaitingForClient --> ClosingSession: Client sends close or load
+    ClosingSession --> Idle: Waiter cancelled and joined
+
+    PromptRunning --> EofShuttingDown: Input hits EOF
+    AboutToAsk --> EofShuttingDown: Input hits EOF
+    WaitingForClient --> EofShuttingDown: Input hits EOF
+    Idle --> EofShuttingDown: Input hits EOF
+
+    EofShuttingDown --> EofReaping: Cancel existing waiters and close latch
+    EofReaping --> Exited: Prompt thread exits (Design A & B)
+    AboutToAsk --> HungWaiter: Current or unguarded begin adds open request
+    EofReaping --> HungWaiter: Mutant b-no-loop misses late insert
+
+    HungWaiter --> [*]: Breaks NoWaitAfterEof and BoundedExit
+    Exited --> [*]
+
+    note right of HungWaiter
+        Shortest broken path (5 steps in current.cfg):
+        Idle -> PromptRunning -> AboutToAsk -> ClosingSession (or EofReaping) -> HungWaiter
+        Breaks NoWaitAfterEof (request stays open with no sweep) and BoundedExit.
+    end note
+
+    note right of AboutToAsk
+        Design A: begin checks latch and session cancel under outbound_mutex,
+        moving AboutToAsk directly to Finished on EOF or close/load.
+        Design B: reap loops with bounded timeout D to re-sweep HungWaiter.
+        Omitted from chart: session/cancel mid-turn (shares cancel path without
+        closing input), mutant-cancel-latch (breaks ClientStillServed),
+        and the non-atomic unlocked read state (merged into HungWaiter).
+    end note

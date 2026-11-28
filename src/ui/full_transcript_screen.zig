@@ -1161,6 +1161,36 @@ test "full projection keeps arguments that appear only past the first status lin
     try std.testing.expect(std.mem.find(u8, painted, "path: SECOND_LINE_ARGUMENT") != null);
 }
 
+test "full projection shows a call's arguments once it starts, not while it streams in" {
+    const alloc = std.testing.allocator;
+    const entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
+        .id = 1,
+        .bytes = @constCast("● Reading result-1111.txt\n"),
+        .class = .tool_status,
+    } }};
+    var details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = try alloc.dupe(u8, "read_tool_result"),
+        .arguments_json = try alloc.dupe(u8, "{\"handle\":\"result-1111.txt\",\"query\":\"STREAMED_QUERY\"}"),
+        .streaming = true,
+    }};
+    defer details[0].deinit(alloc);
+    const styles: transcript_blocks.Styles = .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" };
+
+    var streaming = try buildProjection(alloc, &entries, &details, &.{}, styles, 80, null);
+    defer streaming.deinit(alloc);
+    const while_streaming = try paintProjectionRowsForTest(alloc, &streaming, 80);
+    defer alloc.free(while_streaming);
+    try std.testing.expect(std.mem.find(u8, while_streaming, "STREAMED_QUERY") == null);
+
+    details[0].streaming = false;
+    var started = try buildProjection(alloc, &entries, &details, &.{}, styles, 80, null);
+    defer started.deinit(alloc);
+    const once_started = try paintProjectionRowsForTest(alloc, &started, 80);
+    defer alloc.free(once_started);
+    try std.testing.expect(std.mem.find(u8, once_started, "query: STREAMED_QUERY") != null);
+}
+
 test "stored result projection streams terminal-safe head middle and tail pages" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6717,6 +6747,9 @@ fn appendFullSemanticArguments(
     cols: u16,
     checkpoint: ?*BuildCheckpoint,
 ) !bool {
+    // A call that streams in already has its whole arguments for the compact
+    // row, but Ctrl+O shows them only once the call starts.
+    if (detail.streaming) return false;
     const arguments_json = detail.arguments_json orelse return false;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch {
         var fallback: std.Io.Writer.Allocating = .init(alloc);

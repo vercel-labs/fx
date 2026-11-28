@@ -191,7 +191,7 @@ pub fn serverLayout(row: Row, tools: Tools, filter: []const u8, window: usize) L
     return .{
         // http or runs, file, status, protocol when known, and error when
         // there is one; then a blank.
-        .lead = 3 + @as(usize, @intFromBool(row.status.version != null)) + @intFromBool(showsError(row)) + 1,
+        .lead = 3 + @as(usize, @intFromBool(row.status.version != null)) + @intFromBool(row.status.dropped.total() > 0) + @intFromBool(showsError(row)) + 1,
         .choices = choices(row, &buf).len,
         // A blank, then the heading or the reason there are no tools.
         .gap = 2,

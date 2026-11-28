@@ -9,7 +9,10 @@
 // shows, and the saved record must match the model's next state. Steps that
 // belong to the world (the network, the gateway, a fault only the user can
 // fix) reach the module only through the next answer, so they change nothing
-// the lab holds.
+// the lab holds. The model starts on either kind of host, one that can ask
+// the user and one that cannot, so the graph has an initial state for each.
+// The module treats both alike; only fx's end of a request that needs the
+// user differs (HostEnds).
 //
 // Usage (from the repository root):
 //   bun tests/tla/drivers/recovery/driver.ts
@@ -25,11 +28,11 @@ import { REPO_ROOT, TLA_ROOT, outDir, runTlc } from "../lib/tlc";
 
 type Model = Record<string, any>;
 type Edge = { to: string; label: string };
-type Graph = { states: Map<string, Model>; next: Map<string, Edge[]>; init: string };
-type Op = Record<string, unknown>;
+type Graph = { states: Map<string, Model>; next: Map<string, Edge[]>; inits: string[] };
+type Op = Record<string, unknown> & { continues?: boolean };
 type Result = {
   plan: { save: boolean; send: { compact: boolean; no_fast: boolean } | null; status: { kind: string; need: string | null } | null; finish: string | null } | null;
-  state: { phase: string; need: string | null; attempt: number; deaths: number; clean: boolean; flowing: boolean };
+  state: { phase: string; need: string | null; attempt: number; deaths: number; clean: boolean; flowing: boolean; streak: number; streak_kind: string | null };
   disk: { ph: string; clean: boolean; deaths: number; need: string | null } | null;
   error: string | null;
 };
@@ -37,9 +40,10 @@ type Step = { label: string; from: string; to: string; ops: Op[] };
 type Walk = { steps: Step[] };
 
 const MaxAttempt = 3; // Recovery.tla MaxAttempt
+const FilterResends = 3; // Recovery.tla FilterResends
 const Active = new Set(["working", "waiting", "need_user"]);
 // Steps after which the model has a send on the wire, when it has one.
-const Sends = new Set(["Init", "TimerFires", "SignInPoll", "UserActs", "Relaunch"]);
+const Sends = new Set(["Init", "TimerFires", "SignInPoll", "UserActs", "Relaunch", "Continue", "Blocked"]);
 
 function flag(name: string): boolean {
   return process.argv.includes(name);
@@ -102,7 +106,7 @@ async function loadGraph(out: string): Promise<Graph> {
   const dot = readFileSync(join(dir, "graph.dot"), "utf8");
   const states = new Map<string, Model>();
   const next = new Map<string, Edge[]>();
-  let init = "";
+  const inits: string[] = [];
   const unescape = (label: string) => label.replace(/\\(.)/g, (_, char) => (char === "n" ? "\n" : char));
   for (const line of dot.split("\n")) {
     const edge = /^(-?\d+) -> (-?\d+) \[label="(\w+)"/.exec(line);
@@ -121,11 +125,11 @@ async function loadGraph(out: string): Promise<Graph> {
       if (match) state[match[1]!] = parseValue(match[2]!.trim());
     }
     states.set(id!, state);
-    if (/style\s*=\s*filled/.test(rest!)) init = id!;
+    if (/style\s*=\s*filled/.test(rest!)) inits.push(id!);
   }
-  if (!init) fail(2, "the graph has no initial state");
+  if (inits.length !== 2) fail(2, `the graph has ${inits.length} initial states, not one for each kind of host`);
   console.log(`graph: ${states.size} states, ${run.durationMs} ms`);
-  return { states, next, init };
+  return { states, next, inits };
 }
 
 // The operations one model step becomes. `Respond` answers as the world
@@ -133,7 +137,9 @@ async function loadGraph(out: string): Promise<Graph> {
 // fix, then a broken gateway, otherwise a complete answer. A broken gateway
 // fails as a 5xx or as a refused login, and a sign-in wait resends at the end
 // of its wait or when the sign-in fx opened closes, by the attempt's parity,
-// so both of each are walked.
+// so both of each are walked. A block is a content filter's failure, and
+// fx ending a request nobody can answer drops the module's state, since
+// that host keeps no record.
 function opsFor(label: string, s: Model): Op[] {
   switch (label) {
     case "Responding": return [{ op: "event", name: "responding" }];
@@ -145,23 +151,29 @@ function opsFor(label: string, s: Model): Op[] {
       return [{ op: "event", name: "succeeded" }];
     case "SignInPoll":
       return s.attempt % 2 === 0 ? [{ op: "event", name: "sign_in_closed" }] : [{ op: "poll" }];
+    case "Blocked": return [{ op: "failed", kind: "content_filter" }];
+    case "HostEnds": return [{ op: "abandon" }];
     case "Drop": return [{ op: "failed", kind: "dropped" }];
     case "TimerFires": return [{ op: "wait" }];
     case "Crash": return [{ op: "exit" }];
     case "Close": return [{ op: "event", name: "closing" }, { op: "exit" }];
     case "Relaunch": return [{ op: "start", resume: true }];
+    case "Yield": return [{ op: "event", name: "closing" }, { op: "exit" }];
+    case "Continue": return [{ op: "start", resume: true, continues: true }];
     case "UserCancels": return [{ op: "event", name: "user_cancel" }];
     case "UserActs": return [{ op: "event", name: "user_continue" }];
     case "NetDown": case "NetUp": case "GatewayBreak": case "GatewayHeal": case "NeedUserFault":
-    case "TroubleClears":
+    case "TroubleClears": case "FilterFault": case "FilterClears":
       return [];
     default:
       throw new Error(`no mapping for model action ${label}`);
   }
 }
 
-const initStep = (graph: Graph): Step =>
-  ({ label: "Init", from: graph.init, to: graph.init, ops: [{ op: "walk" }, { op: "start", resume: false }] });
+const initStep = (graph: Graph, init: string): Step => ({
+  label: "Init", from: init, to: init,
+  ops: [{ op: "walk" }, { op: "start", resume: false }],
+});
 
 // Each walk picks among the possible next steps in proportion to
 // 1 / (1 + how often their action was taken so far), so rare actions such as
@@ -171,8 +183,9 @@ function randomWalks(graph: Graph, seed: number): Walk[] {
   const walks: Walk[] = [];
   const taken = new Map<string, number>();
   for (let w = 0; w < options.walks; w += 1) {
-    const steps: Step[] = [initStep(graph)];
-    let at = graph.init;
+    const init = graph.inits[w % graph.inits.length]!;
+    const steps: Step[] = [initStep(graph, init)];
+    let at = init;
     for (let i = 0; i < options.steps; i += 1) {
       const edges = (graph.next.get(at) ?? []).filter((edge) => edge.to !== at);
       if (edges.length === 0) break;
@@ -196,8 +209,8 @@ function randomWalks(graph: Graph, seed: number): Walk[] {
 // the edge's source, then the edge. Every model transition is checked against
 // the module at least once.
 function edgeWalks(graph: Graph): Walk[] {
-  const parent = new Map<string, { from: string; label: string } | null>([[graph.init, null]]);
-  const queue = [graph.init];
+  const parent = new Map<string, { from: string; label: string } | null>(graph.inits.map((id) => [id, null]));
+  const queue = [...graph.inits];
   for (let at = 0; at < queue.length; at += 1) {
     const id = queue[at]!;
     for (const edge of graph.next.get(id) ?? []) {
@@ -211,11 +224,13 @@ function edgeWalks(graph: Graph): Walk[] {
     for (const edge of graph.next.get(id) ?? []) {
       if (edge.to === id) continue;
       const hops: { from: string; to: string; label: string }[] = [{ from: id, to: edge.to, label: edge.label }];
+      let root = id;
       for (let at = id; parent.get(at); at = parent.get(at)!.from) {
         const link = parent.get(at)!;
         hops.unshift({ from: link.from, to: at, label: link.label });
+        root = link.from;
       }
-      const steps: Step[] = [initStep(graph)];
+      const steps: Step[] = [initStep(graph, root)];
       for (const hop of hops) steps.push({ ...hop, ops: opsFor(hop.label, graph.states.get(hop.from)!) });
       walks.push({ steps });
     }
@@ -278,15 +293,19 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
       expect("send planned", Sends.has(step.label) && t.inflight, sent);
 
       // The status line, which a new process starts without.
-      if (step.label === "Init" || step.label === "Relaunch") shown = "clear";
+      if (step.label === "Init" || step.label === "Relaunch" || step.label === "Continue") shown = "clear";
       for (const result of own) if (result.plan?.status) shown = result.plan.status.kind;
+      // fx's own error replaces the question nobody can answer.
+      if (step.label === "HostEnds") shown = "failed";
       if (!t.alive) shown = "none";
       expect("status", t.status, shown);
 
       const real = last.state;
       if (!t.alive) return;
       if (!Active.has(t.phase)) {
-        expect("finished", t.phase === "done_ok" ? "succeeded" : "cancelled", own.find((x) => x.plan?.finish)?.plan?.finish ?? null);
+        // fx, not the module, ends a request nobody can answer.
+        const finish = { done_ok: "succeeded", done_cancel: "cancelled", done_failed: null }[t.phase as string];
+        expect("finished", finish ?? null, own.find((x) => x.plan?.finish)?.plan?.finish ?? null);
         expect("phase", "idle", real.phase);
         expect("record deleted", null, last.disk);
         return;
@@ -295,9 +314,13 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
       expect("attempt", t.attempt, Math.min(real.attempt, MaxAttempt));
       expect("flowing", t.flowing, real.flowing);
       expect("abrupt deaths", t.seenDeaths, Math.min(real.deaths, options.faults));
+      // The run of blocks is the module's streak while it counts blocks;
+      // the model's saturates one past the resends.
+      expect("blocks in a row", t.filterRun,
+        real.streak_kind === "content_filter" ? Math.min(real.streak, FilterResends + 1) : 0);
       // A relaunch that asks first asks about the crash loop, unless the
       // request was already waiting for the user.
-      if (step.label === "Relaunch" && t.phase === "need_user" && s.phase !== "need_user") {
+      if ((step.label === "Relaunch" || step.label === "Continue") && t.phase === "need_user" && s.phase !== "need_user") {
         expect("need", "crash_loop", real.need);
       }
     });
@@ -362,9 +385,29 @@ if (options.selfCheck) {
       planted: "else if (state.shown != 0 and !state.flowing and now_ms -| state.sent_ms >= handoff_ms and false)",
     },
     {
+      name: "resends every blocked reply",
+      target: "if (state.streak > content_filter_resends) return askUser(state, .content_filter, now_ms);",
+      planted: "if (state.streak > 200) return askUser(state, .content_filter, now_ms);",
+    },
+    {
+      name: "asks the user at the first blocked reply",
+      target: ".content_filter => resendAfterContentFilter(state, now_ms),",
+      planted: ".content_filter => askUser(state, .content_filter, now_ms),",
+    },
+    {
+      name: "keeps the content filter's count when the user continues",
+      target: "    if (state.streak_kind == .content_filter) state.streak = 0;\n",
+      planted: "",
+    },
+    {
       name: "forgets its crashes when the user signs in",
       target: "if (state.need == .crash_loop) state.abrupt_deaths = 0;",
       planted: "state.abrupt_deaths = 0;",
+    },
+    {
+      name: "shows a turn it continues after a restart as a retry",
+      target: "    if (start.continues) return sendPlanned(state, now_ms);\n",
+      planted: "",
     },
   ];
   let mutantsCaught = true;

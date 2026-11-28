@@ -275,13 +275,18 @@ const Lab = struct {
     /// catalog. The engine takes this over in U12.
     fn pageEvent(lab: *Lab, body: @FieldType(wire.Response, "body")) StepError!catalog.Event {
         switch (body) {
-            .failure => |f| return if (f.code == wire.code.invalid_params and lab.catalog.pending == .next) .invalid_cursor else .page_failed,
+            .failure => |f| return if (f.code == wire.code.invalid_params and lab.catalog.pending == .next) .invalid_cursor else .page_refused,
             .result => |r| {
-                if (r.kind != .complete) return .page_failed;
-                const page = tools.parsePage(r.raw) catch return .page_failed;
-                const added = lab.store.addPage(lab.gpa, page) catch return .page_failed;
-                if (added.invalid + added.duplicate > 0) {
-                    try lab.print("tools", .{ .event = "dropped", .invalid = added.invalid, .duplicate = added.duplicate });
+                if (r.kind != .complete) return .page_refused;
+                const page = tools.parsePage(r.raw) catch return .page_refused;
+                const added = lab.store.addPage(lab.gpa, page) catch |err| switch (err) {
+                    error.OutOfMemory => return .page_failed,
+                    else => return .page_refused,
+                };
+                // `invalid` is every tool the page's own reading refused, as it was before the engine counted them by reason.
+                const invalid = added.invalid + added.repeated_field + added.unreadable;
+                if (invalid + added.duplicate > 0) {
+                    try lab.print("tools", .{ .event = "dropped", .invalid = invalid, .duplicate = added.duplicate });
                 }
                 return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms, .now_ms = lab.now() } };
             },

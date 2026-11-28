@@ -72,8 +72,8 @@ test("control: v1's login is never taken over, and v1's store is left as it is (
   const list = await s.run("get", ["mcp", "list", "--json"]);
   expect(list.ran.code).toBe(0);
   expect(list.o).toEqual({ kind: "absent", entries: [], v1: ["web"] });
-  // Independent oracle: web isn't signed in, and v1's file is byte for byte as written.
-  expect(JSON.parse(list.ran.stdout).servers[0].status).not.toBe("signed_in");
+  // Independent oracle: web has no saved login, and v1's file is byte for byte as written.
+  expect(JSON.parse(list.ran.stdout).servers[0].status).not.toBe("saved_login");
   expect(readFileSync(v1Path(s.f), "utf8")).toBe(v1Before);
   const verdict = await s.check(["absent"], []);
   expect(verdict.verdict).toBe("ACCEPTED");

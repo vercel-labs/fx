@@ -4367,6 +4367,68 @@ test "retained context automatic compaction archives oversized parallel results 
     try std.testing.expect(std.mem.find(u8, second, result_b) != null);
 }
 
+test "a turn whose step a compaction summarized hands the session its whole turn, however the turn ends (D87)" {
+    const alloc = std.testing.allocator;
+    const old_text = "OLDER_HISTORY_SENTINEL " ++ text_utils.repeat("o", 52_000);
+    const result_a = "RECENT_EXACT_A\n" ++ text_utils.repeat("a", 13_000);
+    const result_b = "RECENT_EXACT_B\n" ++ text_utils.repeat("b", 13_000);
+    const calls = [_]ToolCall{
+        toolCall("retained-a", "read_file", "{\"path\":\"a.txt\"}"),
+        toolCall("retained-b", "read_file", "{\"path\":\"b.txt\"}"),
+    };
+    const later_calls = [_]ToolCall{toolCall("cut-off", "read_file", "{\"path\":\"c.txt\"}")};
+    const first: FakeCompletion = .{ .tool_calls = &calls };
+    const summary: FakeCompletion = .{ .content = "Turn 1\nIn between: Earlier work established the project facts." };
+    const cut_off: FakeCompletion = .{ .tool_calls = &later_calls, .finish_reason = .length };
+    const Ending = struct { name: []const u8, completions: []const FakeCompletion };
+    // A reply, two empty replies (`finishFailedTurnWithNotice`), and a reply
+    // cut off again after its resend.
+    const endings = [_]Ending{
+        .{ .name = "completed", .completions = &.{ first, summary, .{ .content = "Continued from the observed results." } } },
+        .{ .name = "empty", .completions = &.{ first, summary, .{}, .{} } },
+        .{ .name = "length", .completions = &.{ first, summary, cut_off, cut_off } },
+    };
+    for (endings) |ending| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(result_dir);
+        var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(old_text) }};
+        const history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("previous work") },
+            .assistant = @constCast("previous work done"),
+            .execution = .{ .tool_steps = &old_steps },
+        } }};
+        var gateway = FakeGateway.init(alloc, ending.completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        const model = "provider/retained-context";
+        const context_window = (estimateTextTokens(old_text) + (estimateTextTokens(result_a) + estimateTextTokens(result_b)) / 2) * 5 / 4;
+        const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = @intCast(context_window) } }};
+        hooks.available_capability_overrides = &capabilities;
+        hooks.permission_decisions = &.{ .once, .once };
+        hooks.exec_plans = &.{ .{ .result = .{ .model_output = result_a } }, .{ .result = .{ .model_output = result_b } } };
+        var tool_store = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, result_dir, .tool_results, .writable);
+        defer tool_store.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.session_child_capability = &tool_store;
+        var job = fixture.job();
+        job.model = @constCast(model);
+        job.history = @constCast(&history);
+        try runFakePrompt(&gateway, &hooks, config, job);
+        errdefer std.debug.print("ending {s}\n", .{ending.name});
+        const turn = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
+        // fx's history goes on from the cut; the log gets the step it summarized.
+        try std.testing.expectEqual(@as(usize, 0), turn.execution.tool_steps.len);
+        const whole = turn.saved_execution orelse return error.TestExpectedSavedExecution;
+        try std.testing.expectEqual(@as(usize, 1), whole.tool_steps.len);
+        try std.testing.expectEqualStrings(result_a, whole.tool_steps[0].tool_results[0].output);
+        try std.testing.expectEqualStrings(result_b, whole.tool_steps[0].tool_results[1].output);
+    }
+}
+
 test "retained context compaction preserves recovered historical replay" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4787,6 +4849,15 @@ test "processQueuedPrompt traces why stale controls are omitted" {
     try std.testing.expect(std.mem.find(u8, trace, "reasoning=unsupported_or_missing") != null);
     try std.testing.expect(std.mem.find(u8, trace, "fast=unsupported_or_missing") != null);
 
+    // The Gateway drops an effort its catalog does not list, and says so once,
+    // through the same session notice a custom connection uses. Only a custom
+    // connection's settings can add a level, so the Gateway text has no hint.
+    try std.testing.expectEqual(@as(usize, 1), hooks.session_notices.items.len);
+    try std.testing.expectEqualStrings(
+        "Effort stale-tier is not available for provider/no-live-controls, so it is not sent.",
+        hooks.session_notices.items[0],
+    );
+
     // A reachable catalog that simply lacks fast metadata stays quiet; the
     // notice is reserved for a catalog that failed outright.
     var fast_notice_count: usize = 0;
@@ -4794,6 +4865,47 @@ test "processQueuedPrompt traces why stale controls are omitted" {
         if (std.mem.find(u8, text, "Fast mode is unavailable") != null) fast_notice_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), fast_notice_count);
+}
+
+test "processQueuedPrompt shows control characters in the model name as escapes in the effort notice" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.effort = types.ReasoningEffort.literal("stale-tier");
+    var job = fixture.job();
+    job.model = @constCast("provider/\x1b[31mevil");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.session_notices.items.len);
+    const notice = hooks.session_notices.items[0];
+    try std.testing.expect(std.mem.find(u8, notice, "provider/\\x1b[31mevil") != null);
+    try std.testing.expect(std.mem.findScalar(u8, notice, 0x1b) == null);
+}
+
+test "processQueuedPrompt keeps an effort drop quiet when the Gateway catalog failed" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.catalog_failure = .gateway_unavailable;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.effort = types.ReasoningEffort.literal("stale-tier");
+    var job = fixture.job();
+    job.model = @constCast("provider/no-live-controls");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try expectBodyNotContains(&gateway, 0, "\"reasoning\"");
+    try std.testing.expectEqual(@as(usize, 0), hooks.session_notices.items.len);
 }
 
 test "processQueuedPrompt notifies once when fast mode drops on a failed catalog" {
@@ -7024,10 +7136,13 @@ test "processQueuedPrompt suppresses a repeated confirmed provider tool identity
 test "processQueuedPrompt rejects content filter before tool execution" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}")};
-    const completions = [_]FakeCompletion{.{
+    // The host cannot ask, so the request is sent four times; each block
+    // carries the call, and none of them runs.
+    const blocked: FakeCompletion = .{
         .tool_calls = &calls,
         .finish_reason = .content_filter,
-    }};
+    };
+    const completions = [_]FakeCompletion{ blocked, blocked, blocked, blocked };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -7039,12 +7154,13 @@ test "processQueuedPrompt rejects content filter before tool execution" {
         runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
     );
 
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.finish_event_count);
     try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .content_filter, "⚠ blocked · content_filter · content filter");
+    const statuses = hooks.route_recovery_statuses.items;
+    try expectRouteStatus(&hooks, statuses.len - 1, .content_filter, "⚠ blocked · content_filter · content filter");
 }
 
 test "processQueuedPrompt retries replay-safe provider errors before success" {
@@ -9142,12 +9258,13 @@ test "processQueuedPrompt recovers provider error after streamed tool start" {
     try expectBodyContains(&gateway, 1, "fx did not execute that call");
 }
 
-test "processQueuedPrompt ends a content-filtered turn without a resend when the host cannot ask" {
+test "processQueuedPrompt resends a content-filtered request three times when the host cannot ask, then ends the turn" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{.{
+    const blocked: FakeCompletion = .{
         .finish_reason = .content_filter,
         .provider_failure_detail = "content_filter: filtered",
-    }};
+    };
+    const completions = [_]FakeCompletion{ blocked, blocked, blocked, blocked };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -9161,10 +9278,38 @@ test "processQueuedPrompt ends a content-filtered turn without a resend when the
         runFakePrompt(&gateway, &hooks, config, fixture.job()),
     );
 
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
-    try expectRouteStatus(&hooks, 0, .content_filter, "⚠ blocked · content_filter: filtered · content filter");
+    // Three resends at once, no question nobody could answer, and the same
+    // terminal status as a turn that was never resent.
+    try std.testing.expectEqual(@as(usize, 4), hooks.route_recovery_statuses.items.len);
+    try expectModuleStatus(&hooks, 0, .retrying, "Blocked by the content filter · retrying (1/3)");
+    try expectModuleStatus(&hooks, 1, .retrying, "Blocked by the content filter · retrying (2/3)");
+    try expectModuleStatus(&hooks, 2, .retrying, "Blocked by the content filter · retrying (3/3)");
+    try expectRouteStatus(&hooks, 3, .content_filter, "⚠ blocked · content_filter: filtered · content filter");
+    try std.testing.expect(needUserText(&hooks) == null);
+}
+
+test "processQueuedPrompt answers after two content-filter blocks when the host cannot ask" {
+    const alloc = std.testing.allocator;
+    const blocked: FakeCompletion = .{
+        .finish_reason = .content_filter,
+        .provider_failure_detail = "content_filter: filtered",
+    };
+    const completions = [_]FakeCompletion{ blocked, blocked, .{ .content = "allowed answer" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+    try std.testing.expect(needUserText(&hooks) == null);
+    try expectRecovered(&hooks, 3);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
 /// How many HTTP error notices the turn showed.
@@ -9192,12 +9337,13 @@ fn needUserText(hooks: *const FakeAgentRuntimeDeps) ?[]const u8 {
     return null;
 }
 
-test "processQueuedPrompt waits for the user after a content filter and resends on Enter" {
+test "processQueuedPrompt resends a content-filtered request three times, then waits for the user and resends on Enter" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{ .finish_reason = .content_filter, .provider_failure_detail = "content_filter: filtered" },
-        .{ .content = "allowed answer" },
+    const blocked: FakeCompletion = .{
+        .finish_reason = .content_filter,
+        .provider_failure_detail = "content_filter: filtered",
     };
+    const completions = [_]FakeCompletion{ blocked, blocked, blocked, blocked, .{ .content = "allowed answer" } };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -9210,8 +9356,14 @@ test "processQueuedPrompt waits for the user after a content filter and resends 
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqualStrings("Blocked by the content filter · press Esc and rephrase", needUserText(&hooks).?);
+    // Three resends at once, the question after the fourth block, and the
+    // user's Enter sends the fifth request, which is answered.
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_models.items.len);
+    try expectModuleStatus(&hooks, 0, .retrying, "Blocked by the content filter · retrying (1/3)");
+    try expectModuleStatus(&hooks, 1, .retrying, "Blocked by the content filter · retrying (2/3)");
+    try expectModuleStatus(&hooks, 2, .retrying, "Blocked by the content filter · retrying (3/3)");
+    try expectModuleStatus(&hooks, 3, .need_user, "Blocked by the content filter · press Esc and rephrase");
+    try expectRecovered(&hooks, 5);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
@@ -10063,7 +10215,7 @@ test "processQueuedPrompt stops nonretryable provider outcomes without releasing
     try std.testing.expectEqual(@as(usize, 0), interrupted.execution.tool_steps.len);
 }
 
-test "processQueuedPrompt spacer newline is skipped for ask first tool" {
+test "processQueuedPrompt spacer newline also ends the prose before a question" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"Using tool"};
     const read_calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
@@ -10091,7 +10243,7 @@ test "processQueuedPrompt spacer newline is skipped for ask first tool" {
     defer ask_hooks.deinit();
     var ask_fixture = PromptFixture{};
     try runFakePrompt(&ask_gateway, &ask_hooks, ask_fixture.config(), ask_fixture.job());
-    try std.testing.expectEqual(@as(usize, 1), countText(&ask_hooks, "\n"));
+    try std.testing.expectEqual(@as(usize, 2), countText(&ask_hooks, "\n"));
 }
 
 test "processQueuedPrompt uses configured tool choice only for first call" {
@@ -10751,6 +10903,143 @@ test "tool presentation groups span silent steps and split on visible assistant 
     }
     try std.testing.expectEqual(@as(usize, 2), group_a_terminal_count);
     try std.testing.expect(group_b_start_index != null);
+}
+
+test "tool calls after a question start a new presentation group" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const read_third = [_]ToolCall{toolCall("call_3", "read_file", "{\"path\":\"c\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &ask },
+        .{ .tool_calls = &read_second },
+        .{ .tool_calls = &read_third },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    var groups: [3]types.ToolPresentationGroupId = undefined;
+    var group_count: usize = 0;
+    for (hooks.lifecycle_events.items) |event| {
+        if (event != .authoritative_started) continue;
+        try std.testing.expect(group_count < groups.len);
+        groups[group_count] = event.authoritative_started.presentation_group_id.?;
+        group_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), group_count);
+    try std.testing.expect(!std.meta.eql(groups[0], groups[1]));
+    try std.testing.expectEqual(groups[1], groups[2]);
+}
+
+test "tool calls after a question asked through toolbox start a new presentation group" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const toolbox_ask = [_]ToolCall{toolCall(
+        "call_ask",
+        "toolbox",
+        "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}",
+    )};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const read_third = [_]ToolCall{toolCall("call_3", "read_file", "{\"path\":\"c\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &toolbox_ask },
+        .{ .tool_calls = &read_second },
+        .{ .tool_calls = &read_third },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expect(startedPresentationGroup(&hooks, "call_ask") == null);
+    const first = startedPresentationGroup(&hooks, "call_1").?;
+    const second = startedPresentationGroup(&hooks, "call_2").?;
+    try std.testing.expect(!std.meta.eql(first, second));
+    try std.testing.expectEqual(second, startedPresentationGroup(&hooks, "call_3").?);
+}
+
+test "prose before a question ends its line as it does before any other tool" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_ask", "ask_user_question", "{\"questions\":[]}"),
+        toolCall("call_ask", "toolbox", "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}"),
+        toolCall("call_read", "read_file", "{\"path\":\"a\"}"),
+    };
+    var line_breaks: [calls.len]usize = @splat(0);
+    for (calls, &line_breaks) |call, *count| {
+        const ask = [_]ToolCall{call};
+        const completions = [_]FakeCompletion{
+            .{ .content = "One question first.", .tool_calls = &ask },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        for (hooks.texts.items) |text| {
+            if (std.mem.eql(u8, text, "\n")) count.* += 1;
+        }
+    }
+    // `fx ask` shows no question, so this break is what ends the prose there.
+    try std.testing.expect(line_breaks[2] > 0);
+    try std.testing.expectEqual(line_breaks[2], line_breaks[0]);
+    try std.testing.expectEqual(line_breaks[2], line_breaks[1]);
+}
+
+/// The presentation group of the call `call_id` when it started.
+fn startedPresentationGroup(hooks: *const FakeAgentRuntimeDeps, call_id: []const u8) ?types.ToolPresentationGroupId {
+    for (hooks.lifecycle_events.items) |event| {
+        if (event != .authoritative_started) continue;
+        const started = event.authoritative_started;
+        if (std.mem.eql(u8, started.id.call_id, call_id)) return started.presentation_group_id;
+    }
+    return null;
+}
+
+test "a question dropped from a length-cut reply and sent again leaves the presentation group open" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const cut_ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &cut_ask, .finish_reason = .length },
+        .{ .tool_calls = &read_second },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    for (hooks.executed_names.items) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "ask_user_question"));
+    }
+    try std.testing.expectEqual(
+        startedPresentationGroup(&hooks, "call_1").?,
+        startedPresentationGroup(&hooks, "call_2").?,
+    );
 }
 
 test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {

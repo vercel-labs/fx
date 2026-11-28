@@ -437,7 +437,7 @@ pub const Place = struct {
     /// by tests.
     parent: ?std.Io.Dir = null,
 
-    fn of(source: Source) Place {
+    pub fn of(source: Source) Place {
         // libfx hosts keep logins themselves; the Keychain code is macOS-only.
         if (comptime host_target.is_wasm) return .{ .source = source };
         const in_keychain = source == .fx_login and oauth_session.storesInKeychain();
@@ -783,7 +783,8 @@ fn freeTokens(alloc: Allocator, tokens: [][]u8) void {
     alloc.free(tokens);
 }
 
-fn expectKept(place: Place, expected: []const []const u8) !void {
+/// Checks the sign-outs kept at `place`, for the tests of this file and its callers.
+pub fn expectKept(place: Place, expected: []const []const u8) !void {
     const alloc = testing.allocator;
     const kept = try keptTokens(alloc, place);
     defer freeTokens(alloc, kept);

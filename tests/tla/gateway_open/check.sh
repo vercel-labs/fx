@@ -1,6 +1,6 @@
 #!/bin/sh
 # Model-check a request's connection open racing Esc and the setup deadline
-# (OpenCancel.tla; src/gateway/open_job.zig and OpenJob in
+# (OpenCancel.tla; src/core/shared/open_job.zig and OpenJob in
 # src/gateway/client.zig) with TLC and require each config's expected verdict.
 #
 # open-cancel.cfg is the design and must pass. open-cancel-today.cfg is fx

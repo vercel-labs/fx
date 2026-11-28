@@ -682,6 +682,7 @@ pub fn preservePublicationEntries(
     replacement.finality = try next.finality.clone(alloc);
     if (replacement.finality.mutation_pin_start) |byte| replacement.finality.mutation_pin_start = remapPublicationByte(next, positions, byte);
     if (replacement.finality.assistant_tail_start) |byte| replacement.finality.assistant_tail_start = remapPublicationByte(next, positions, byte);
+    if (replacement.finality.tail_start) |byte| replacement.finality.tail_start = remapPublicationByte(next, positions, byte);
     for (@constCast(replacement.finality.tool_turn_floors)) |*floor| floor.start_byte = remapPublicationByte(next, positions, floor.start_byte);
     next.deinit(alloc);
     next.* = replacement;
@@ -1142,10 +1143,11 @@ fn prepareTranscriptSourceInternal(
 
     var finality: transcript_release.Candidates = .{};
     errdefer finality.deinit(alloc);
-    if (self.notebook.entries.items.len > 0 and self.layout.cols > 0) {
+    if ((self.notebook.entries.items.len > 0 or self.assistant_tail.items.len > 0) and self.layout.cols > 0) {
         rendered_from_entries = true;
         const capture_provenance = true;
         const replaceable_entry_id: ?u32 = if (self.notebook.replaceable_last_line and
+            self.notebook.entries.items.len > 0 and
             self.notebook.entries.items[self.notebook.entries.items.len - 1] == .raw_bytes)
             self.notebook.entries.items[self.notebook.entries.items.len - 1].raw_bytes.id
         else
@@ -1189,6 +1191,7 @@ fn prepareTranscriptSourceInternal(
             .folded_summary_entry_ids = summary_entry_ids,
             .capture_provenance = capture_provenance,
             .entry_actions = entry_actions,
+            .tail = self.assistant_tail.items,
         };
         var resumable_options = render_options;
         resumable_options.resume_from = plan.resume_from;
@@ -1240,6 +1243,7 @@ fn prepareTranscriptSourceInternal(
                 }),
             }
         }
+        finality.tail_start = rendered.tail_start_byte;
         finality.tool_turn_floors = try tool_turn_floors.toOwnedSlice(alloc);
     } else {
         bytes = try alloc.dupe(u8, self.notebook.transcript.items);
@@ -1329,8 +1333,9 @@ fn prepareTranscriptSourceInternal(
         bytes = capped;
     }
 
-    const tail_kind = transcript_blocks.compactTailVisibleBlockKindForProjection(
+    const tail_kind = transcript_blocks.compactTailVisibleBlockKindWithTail(
         self.notebook.entries.items,
+        self.assistant_tail.items,
         omitted_entry_id,
         entry_actions,
     );
@@ -1496,6 +1501,7 @@ fn checkPreparedAgainstFull(
         full.line_provenance.len == rendered.line_provenance.len and
         full.target_entry_start_line == rendered.target_entry_start_line and
         full.target_entry_start_byte == rendered.target_entry_start_byte and
+        full.tail_start_byte == rendered.tail_start_byte and
         full.trailing_boundary_blank_rows == rendered.trailing_boundary_blank_rows and
         std.mem.eql(?usize, floors, options.finality_entry_floor_bytes) and
         for (full.line_provenance, rendered.line_provenance) |a, b| {

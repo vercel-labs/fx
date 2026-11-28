@@ -44,6 +44,7 @@ pub fn persistInterruptedTurnOnce(
         retained_candidate,
         terminal_materializing,
         null,
+        null,
         .turn,
     );
 }
@@ -71,6 +72,7 @@ pub fn persistCompactionInterruptedTurnOnce(
         current_turn_messages,
         retained_candidate,
         terminal_materializing,
+        null,
         null,
         .compaction,
     );
@@ -103,6 +105,42 @@ pub fn persistInterruptedCommandTurnOnce(
         retained_candidate,
         terminal_materializing,
         cancelled_command,
+        null,
+        .turn,
+    );
+}
+
+/// Persists a turn cancelled while its `subagent` wait `active_tool_call`
+/// waited, with the subagents its row named, so a resume shows the row
+/// (D102).
+pub fn persistInterruptedWaitTurnOnce(
+    hooks: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    partial_assistant: ?[]const u8,
+    active_tool_call: ToolCall,
+    completed_tool_names: [][]u8,
+    persisted: *bool,
+    trace_ctx: TraceContext,
+    current_turn_messages: []const types.ChatMessage,
+    retained_candidate: ?[]const u8,
+    terminal_materializing: *bool,
+    cancelled_wait: types.CancelledWaitPresentation,
+) !void {
+    return persistInterruptedTurnWithPresentation(
+        hooks,
+        finalization,
+        job,
+        partial_assistant,
+        active_tool_call,
+        completed_tool_names,
+        persisted,
+        trace_ctx,
+        current_turn_messages,
+        retained_candidate,
+        terminal_materializing,
+        null,
+        cancelled_wait,
         .turn,
     );
 }
@@ -120,6 +158,7 @@ fn persistInterruptedTurnWithPresentation(
     retained_candidate: ?[]const u8,
     terminal_materializing: *bool,
     cancelled_command: ?types.CancelledCommandPresentation,
+    cancelled_wait: ?types.CancelledWaitPresentation,
     cancellation_origin: types.CancellationOrigin,
 ) !void {
     if (persisted.*) return;
@@ -153,13 +192,15 @@ fn persistInterruptedTurnWithPresentation(
         );
         defer if (assistant.presentation) |text| std.heap.c_allocator.free(text);
         const turn: HistoryTurn = .{ .interrupted = .{
-            .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
+            .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
             .assistant = @constCast(assistant.history),
             .tool_call = durable_active_tool_call,
             .completed_tool_names = completed_tool_names,
             .execution = execution,
             .cancelled_command = cancelled_command,
+            .cancelled_wait = cancelled_wait,
             .cancellation_origin = cancellation_origin,
+            .saved_execution = finalization.savedExecution(full_execution),
         } };
         const finished = try types.dupeFinishedPrompt(
             std.heap.c_allocator,
@@ -196,13 +237,15 @@ fn persistInterruptedTurnWithPresentation(
 
     persisted.* = true;
     const turn: HistoryTurn = .{ .interrupted = .{
-        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
+        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
         .assistant = if (partial_assistant) |text| if (text.len > 0) @constCast(text) else null else null,
         .tool_call = durable_active_tool_call,
         .completed_tool_names = completed_tool_names,
         .execution = execution,
         .cancelled_command = cancelled_command,
+        .cancelled_wait = cancelled_wait,
         .cancellation_origin = cancellation_origin,
+        .saved_execution = finalization.savedExecution(full_execution),
     } };
 
     var propagation_error: ?anyerror = null;
@@ -271,10 +314,11 @@ fn persistFailedTurn(
     terminal_materializing.* = true;
 
     const turn: HistoryTurn = .{ .interrupted = .{
-        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
+        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
         .assistant = if (std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0) @constCast(partial_assistant) else null,
         .execution = execution,
         .terminal_reason = .failed,
+        .saved_execution = finalization.savedExecution(full_execution),
     } };
     const finished = try types.dupeFinishedPrompt(
         std.heap.c_allocator,
@@ -379,4 +423,57 @@ fn interruptPersistenceReason(partial_assistant: ?[]const u8, active_tool_call: 
         if (text.len > 0) return "partial_assistant_only";
     }
     return "no_assistant_output";
+}
+
+test "eb03: persistInterruptedTurnOnce and persistFailedPartialTurnOnce carry job.input_id to UserTurn.input_id" {
+    const support = @import("tests/support.zig");
+    const alloc = std.testing.allocator;
+    var fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    const deps = fake.deps();
+
+    const job: QueuedPrompt = .{
+        .turn_id = 1,
+        .input_id = 91,
+        .prompt = @constCast("interrupted prompt"),
+        .images = &.{},
+        .model = @constCast("model"),
+        .api_key = @constCast("key"),
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+    const lc = support.testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, "/tmp");
+
+    // 1. retained_candidate branch
+    {
+        var guard = TurnFinalizationGuard.init(&deps, 1, lc);
+        defer guard.deinit();
+        var persisted = false;
+        var materializing = false;
+        try persistInterruptedTurnOnce(&deps, &guard, job, "partial", null, &.{}, &persisted, .{}, &.{}, "candidate", &materializing);
+    }
+    // 2. fallback branch (no retained_candidate)
+    {
+        var guard = TurnFinalizationGuard.init(&deps, 2, lc);
+        defer guard.deinit();
+        var persisted = false;
+        var materializing = false;
+        try persistInterruptedTurnOnce(&deps, &guard, job, "partial", null, &.{}, &persisted, .{}, &.{}, null, &materializing);
+    }
+    // 3. persistFailedPartialTurnOnce
+    {
+        var guard = TurnFinalizationGuard.init(&deps, 3, lc);
+        defer guard.deinit();
+        var persisted = false;
+        var materializing = false;
+        try persistFailedPartialTurnOnce(&deps, &guard, job, "partial", &persisted, .{}, &.{}, &materializing);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), fake.history_turns.items.len);
+    for (fake.history_turns.items) |turn| {
+        try std.testing.expectEqual(@as(?u64, 91), turn.interrupted.user.input_id);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fake.finish_event_count);
+    try std.testing.expectEqual(@as(?u64, 91), fake.finish_user_input_id);
 }

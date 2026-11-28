@@ -43,6 +43,7 @@ const commands = [
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-core-home-unavailable.mjs", import.meta.url))]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-term.mjs", import.meta.url))]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-term-session-resume.mjs", import.meta.url))]],
+  [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-term-reload-mid-turn.mjs", import.meta.url))]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-term-login.mjs", import.meta.url))]],
 ];
 if (process.versions.bun) {

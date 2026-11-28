@@ -31,10 +31,13 @@
 (*   stale_applies  a write for an older compaction changes the count      *)
 (*   keeps_old      a new compaction starts from the last one's count      *)
 (*                                                                         *)
-(* The row also shows how much of the summary the model has written. The   *)
-(* worker writes the count (State.written, under worker_mutex) as the      *)
-(* summary streams in. The model counts it on a small scale: 0 is 0%, 4 is *)
-(* 100%, and 1 to 3 stand for the values in between.                       *)
+(* The compaction also keeps a count of the summary notes the model has    *)
+(* written. The worker writes it (State.written, under worker_mutex) as    *)
+(* the summary streams in. The model counts it on a small scale: 0 is 0%,  *)
+(* 4 is 100%, and 1 to 3 stand for the values in between. This model owns  *)
+(* whose count it is and that it only rises. The number the row shows,     *)
+(* from that count and from each request's wait, is modeled in             *)
+(* tests/tla/compaction_progress/CompactionProgress.tla.                   *)
 (***************************************************************************)
 EXTENDS Naturals
 
@@ -70,7 +73,7 @@ VARIABLES
     since,      \* StreamState.waiting_since_ms, in seconds; 0 is not waiting
     synced,     \* the UI has synced since the last event
     counted,    \* seconds the turn worked while nothing waited
-    written,    \* Operation.written_percent, as the code keeps it
+    written,    \* Operation.progress.notes, as the code keeps it
     fresh       \* the highest count this compaction itself wrote (ghost)
 
 pct == <<written, fresh>>
@@ -100,8 +103,10 @@ TurnShown == IF started = 0 \/ now < started THEN 0 ELSE Reading - started
 \* showed the turn's clock.
 CompShown == IF Bug = "today_clock" /\ origin = "automatic" THEN TurnShown ELSE now - compStart
 
-\* activity_status.compactionProjection: the count the row shows. Nothing
-\* of the summary has arrived while it prepares, and saving shows 100%.
+\* The count behind the row's number. Nothing of the summary has arrived
+\* while it prepares, and saving shows 100%. With no wait the row shows this
+\* count as it is; CompactionProgress.tla models the number while a request
+\* waits.
 ShownPct ==
     CASE phase = "preparation" -> 0
       [] phase = "summary" -> written

@@ -7,6 +7,10 @@ const image_route = @import("../images/image_route.zig");
 /// `ChatMessage.cache_breakpoint`.
 pub const CacheMarkers = enum { none, anthropic, openai, bedrock };
 
+/// The provider whose own on-demand compaction writes a model's compaction
+/// block (`vercel_model_policy.providerCompaction`).
+pub const ProviderCompaction = enum { anthropic, openai };
+
 pub const ResolvedProviderOptions = struct {
     reasoning: ?types.ReasoningEffort = null,
     fast: bool = false,
@@ -24,6 +28,10 @@ pub const ResolvedProviderOptions = struct {
     /// The model takes one system message, at the start of the conversation,
     /// so the Gateway request joins the leading system messages into one.
     single_system_message: bool = false,
+    /// Asks the provider's own on-demand compaction for this request: its
+    /// reply is the provider's compaction block over the conversation sent,
+    /// not an answer. Only a compaction request sets it.
+    compaction: ?ProviderCompaction = null,
     /// Borrowed gateway provider slugs in preference order. Empty leaves
     /// provider selection to the gateway. The backing memory must outlive
     /// request-body serialization.

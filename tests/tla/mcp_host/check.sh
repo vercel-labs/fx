@@ -1,6 +1,10 @@
 #!/bin/sh
 # Model-check the fx MCP host models (src/core/mcp_host/,
-# src/core/app/app_mcp_runtime.zig) with TLC.
+# src/core/app/app_mcp_runtime.zig, and src/core/shared/net_connect.zig, the TCP
+# connect of the MCP host's HTTP servers) with TLC. Connect.tla sits here, and not
+# in a folder named after the module, because only the MCP CI jobs run this folder's
+# models, and the driver that runs fx's MCP HTTP connects (../drivers/mcp_host/connect.test.ts)
+# is here.
 #
 # catalog.json lists each model's smoke and stress configs, its planted bugs
 # (<Module>.mutants.json), and its findings configs: properties stated for
