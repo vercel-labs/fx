@@ -289,6 +289,20 @@ fn matchOptionValue(args: []const []const u8, index: *usize, comptime flag: []co
     return null;
 }
 
+/// The words `fx tool` runs, in the order its usage lists them. The unknown-command
+/// text is built from this list, so a new word appears there without an edit.
+const verbs = [_][]const u8{ "edit", "write", "skill", "agent", "web", "search" };
+
+/// The verbs as a sentence's list: "a, b, or c".
+const verbs_text: []const u8 = blk: {
+    var text: []const u8 = "";
+    for (verbs, 0..) |verb, index| {
+        text = text ++ if (index == 0) "" else if (index + 1 == verbs.len) ", or " else ", ";
+        text = text ++ verb;
+    }
+    break :blk text;
+};
+
 /// Writes why `err` refused `args`, in the words of the command line.
 pub fn writeUsage(w: *Writer, err: ParseError, args: []const []const u8) Writer.Error!void {
     const verb = if (args.len > 0) args[0] else "";
@@ -338,7 +352,7 @@ pub fn writeUsage(w: *Writer, err: ParseError, args: []const []const u8) Writer.
         error.MissingPath, error.MissingArgument => try w.print("fx tool {s}: give the file to change, as in fx tool {s} PATH.\n", .{ verb, verb }),
         error.TooManyArguments => try w.print("fx tool {s}: give one file, as in fx tool {s} PATH.\n", .{ verb, verb }),
         error.PathIsOption, error.UnknownOption => try w.print("fx tool {s}: the file must be a path, not an option.\n", .{verb}),
-        error.UnknownCommand => try w.print("fx tool: unknown command {f}. Use edit, write, skill, or agent.\n", .{text_utils.terminalSafe(verb)}),
+        error.UnknownCommand => try w.print("fx tool: unknown command {f}. Use {s}.\n", .{ text_utils.terminalSafe(verb), verbs_text }),
         error.MissingOptionValue, error.InvalidReport => try w.print("fx tool {s}: invalid usage.\n", .{verb}),
         error.QueryTooShort, error.InvalidQuery, error.BothDomainKinds, error.TooManyDomains => try w.print("fx tool {s}: invalid usage.\n", .{verb}),
     }
@@ -1012,6 +1026,29 @@ test "fx tool prints a reply's notice on stderr, after its data on stdout" {
     try std.testing.expectEqual(client.exit.ok, code);
     try std.testing.expectEqualStrings("zig\tZig help\n", out.written());
     try std.testing.expectEqualStrings("outside text\n", err.written());
+}
+
+test "the unknown-command text names every word fx tool runs, and each named word parses" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try writeUsage(&out.writer, error.UnknownCommand, &.{"nope"});
+    try std.testing.expect(std.mem.find(u8, out.written(), "Use edit, write, skill, agent, web, or search.") != null);
+
+    const words = [_][]const []const u8{
+        &.{ "edit", "x" },
+        &.{ "write", "x" },
+        &.{ "skill", "list" },
+        &.{ "agent", "wait" },
+        &.{ "web", "https://a.example" },
+        &.{ "search", "zig" },
+    };
+    try std.testing.expectEqual(verbs.len, words.len);
+    for (words, verbs) |args, verb| {
+        try std.testing.expectEqualStrings(verb, args[0]);
+        _ = try parse(args);
+    }
 }
 
 /// A buffered writer whose flushes append to one shared log, as stdout and stderr

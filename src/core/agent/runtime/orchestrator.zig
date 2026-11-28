@@ -3465,11 +3465,62 @@ fn providerExecutedResult(call: ToolCall) ?ToolExecutionResult {
 /// carries. Only a tool the registry marks as a bash session qualifies. Bash never
 /// runs in a parallel batch (its read-only set is empty), so the serial tool result
 /// is the one place that sees it.
-fn bashSessionUsage(registry: tool_dispatch.Registry, tool_name: []const u8, execution: ToolExecutionResult) ?types.Usage {
+fn bashSessionUsage(registry: tool_dispatch.Registry, tool_name: []const u8, execution: ToolExecutionResult) ?types.ToolUsage {
     const tool = registry.lookup(tool_name) orelse return null;
     if (tool.captured_command_host != .bash_session) return null;
-    const spent = execution.inner_usage orelse return null;
-    return .{ .input_tokens = spent.input_tokens, .output_tokens = spent.output_tokens };
+    return execution.inner_usage;
+}
+
+/// Counts a bash session's usage on the agent's turn, and the web search requests its
+/// bridged searches made on the agent's search total. Other tools add nothing.
+fn observeBashSessionUsage(agent: anytype, deps: *const AgentRuntimeDeps, tool_name: []const u8, execution: ToolExecutionResult) void {
+    const spent = bashSessionUsage(deps.tool_registry, tool_name, execution) orelse return;
+    agent.observeUsage(.{ .input_tokens = spent.input_tokens, .output_tokens = spent.output_tokens });
+    if (deps.report_bash_session_search_requests) |report| report(deps.ctx, spent.web_search_requests);
+}
+
+test "a bridged search in a bash session adds its requests to the agent's search total" {
+    const FakeAgent = struct {
+        observed: types.Usage = .{},
+
+        fn observeUsage(self: *@This(), usage: types.Usage) void {
+            self.observed = usage;
+        }
+    };
+    const Counter = struct {
+        fn report(ctx: *anyopaque, web_search_requests: u64) void {
+            const total: *u64 = @ptrCast(@alignCast(ctx));
+            total.* += web_search_requests;
+        }
+    };
+    const bash_tool = tool_dispatch.Tool{
+        .name = "bash",
+        .description = "bash",
+        .model_schema = .{ .name = "bash", .description = "bash" },
+        .captured_command_host = .bash_session,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const session_tools = [_]tool_dispatch.Tool{bash_tool};
+    var total: u64 = 0;
+    var deps: AgentRuntimeDeps = undefined;
+    deps.tool_registry = .{ .tools = &session_tools };
+    deps.ctx = @ptrCast(&total);
+    deps.report_bash_session_search_requests = Counter.report;
+    var agent: FakeAgent = .{};
+    const spent: ToolExecutionResult = .{
+        .status = .success,
+        .model_output = "",
+        .inner_usage = .{ .input_tokens = 5, .output_tokens = 7, .web_search_requests = 1 },
+    };
+
+    observeBashSessionUsage(&agent, &deps, "bash", spent);
+
+    try std.testing.expectEqual(@as(u64, 1), total);
+    try std.testing.expectEqual(@as(?u64, 5), agent.observed.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 7), agent.observed.output_tokens);
 }
 
 test "a bash session's usage counts toward the turn under any name, and any other tool's adds nothing" {
@@ -3499,8 +3550,9 @@ test "a bash session's usage counts toward the turn under any name, and any othe
 
     const session_tools = [_]tool_dispatch.Tool{bash_named_tool};
     const counted = bashSessionUsage(.{ .tools = &session_tools }, "bash", spent) orelse return error.TestExpectedUsage;
-    try std.testing.expectEqual(@as(?u64, 5), counted.input_tokens);
-    try std.testing.expectEqual(@as(?u64, 7), counted.output_tokens);
+    try std.testing.expectEqual(@as(u64, 5), counted.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), counted.output_tokens);
+    try std.testing.expectEqual(@as(u32, 1), counted.web_search_requests);
 
     const renamed_tools = [_]tool_dispatch.Tool{renamed_bash_tool};
     try std.testing.expect(bashSessionUsage(.{ .tools = &renamed_tools }, "shell_session", spent) != null);
@@ -13196,7 +13248,7 @@ fn processQueuedPromptLoop(
             }
 
             runtime_parallel_execution.reportInnerToolUsage(deps, tool_call.name, execution);
-            if (bashSessionUsage(deps.tool_registry, tool_call.name, execution)) |spent| agent.observeUsage(spent);
+            observeBashSessionUsage(agent, deps, tool_call.name, execution);
             if (execution.diff_entry) |payload| {
                 try deps.push_diff_block(deps.ctx, payload);
             }

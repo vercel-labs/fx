@@ -1706,7 +1706,6 @@ fn runBridgeWebSearch(
     usage: ?*BridgeUsage,
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
-    if (ctx.web_search_backend == null) return .{ .status = .tool_error, .bytes = web_search_needs_gateway_text };
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, tool_call);
     dispatch_ctx.cancel_flag = cancel;
     var inner_usage: ?types.ToolUsage = null;

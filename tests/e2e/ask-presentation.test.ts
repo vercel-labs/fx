@@ -3319,6 +3319,42 @@ describe("slice 7: fx tool web and search", () => {
     expect(out).toContain("exit=5");
   }, TIMEOUT);
 
+  test("a subagent child's fx tool search with no deny rule exits 0 and prints its results", async () => {
+    // Search, not web: a web success needs a live fetch, and gate tests use no live network.
+    const root = createRoot();
+    mkdirSync(join(root.home, ".fx", "agents", "helper"), { recursive: true });
+    writeFileSync(join(root.home, ".fx", "agents", "helper", "profile.json"), JSON.stringify({ description: "Helper agent" }));
+    mkdirSync(join(root.home, ".fx"), { recursive: true });
+    writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ permission: { bash: "allow" } }));
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (body.includes('"name":"permission_decision"')) return fakeGatewayPermissionDecision("clear");
+      if (body.includes("gateway.exa_search")) return searchWorkerReply();
+      if (!body.includes('"name":"subagent"')) {
+        if (body.includes('"toolCallId":"child_search"')) return fakeGatewayFinalText("CHILD_DONE");
+        return fakeGatewayToolCall("child_search", "bash", {
+          command: `${JSON.stringify(FX_BIN)} tool search "zig release notes"; echo "exit=$?"`,
+        });
+      }
+      step += 1;
+      if (step === 1) return fakeGatewayToolCall("spawn", "subagent", { action: "message", agent: "helper", message: "run bash" });
+      if (step === 2) return fakeGatewayToolCall("wait_sub", "subagent", { action: "wait" });
+      return fakeGatewayFinalText("Subagent done.\n");
+    });
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Search with the helper."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = toolResultText(gateway.requests.find((request) => request.body.includes('"toolCallId":"child_search"'))!.body, "child_search");
+    expect(out).toContain("exit=0");
+    expect(out).toContain("Zig downloads");
+  }, TIMEOUT);
+
   test("fx tool search prints the results on stdout, its notice on stderr, and its tokens in the usage totals", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([
@@ -3374,16 +3410,24 @@ describe("slice 7: fx tool web and search", () => {
 
   test("a program killed during a search still lets its bash call return", async () => {
     const root = createRoot();
+    // The search reply waits until the bash call has returned and asks the model for its next step.
+    // So the search is still in flight when `timeout 1` kills the program, whatever the timing.
+    let releaseSearchReply!: () => void;
+    const searchReplyReleased = new Promise<void>((resolve) => {
+      releaseSearchReply = resolve;
+    });
     const gateway = startFakeGateway([
       fakeGatewayToolCall("b_search_killed", "bash", {
         command: `timeout 1 ${JSON.stringify(FX_BIN)} tool search "zig release notes"; echo "exit=$?"`,
       }),
       async () => {
-        // Pacing only: the reply comes after `timeout 1` has killed the program, so the search is still in flight.
-        await Bun.sleep(3000);
+        await searchReplyReleased;
         return searchWorkerReply();
       },
-      fakeGatewayFinalText("Killed.\n"),
+      () => {
+        releaseSearchReply();
+        return fakeGatewayFinalText("Killed.\n");
+      },
     ]);
     gateways.push(gateway);
 
