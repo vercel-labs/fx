@@ -379,8 +379,8 @@ jobs:
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
         run: |
           set -euo pipefail
-          # The npm environment can hold this job for approval, so this build
-          # may be behind main and still newer than the dev tag. Dev versions
+          # CI runs on main can finish out of order, so this build may be
+          # behind main and still newer than the dev tag. Dev versions
           # end in .g<first 12 characters of the commit>.
           CURRENT_VERSION=$(npm view libfx dist-tags.dev --registry=https://registry.npmjs.org/) || CURRENT_VERSION=""
           CURRENT_SHA=""

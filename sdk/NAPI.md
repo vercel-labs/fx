@@ -328,8 +328,11 @@ placeholder version of it by hand, then adds two trusted publishers on
 npmjs.com for `vercel-labs/fx` and workflow `publish-libfx.yml`, one for
 environment `npm` and one for environment `npm-dev`, each with `npm publish`
 allowed. Stable publishes run in `npm`, which needs an approval; dev publishes
-run in `npm-dev`, which has no reviewer and may publish only the `dev` tag. npm
-expires a trusted publisher if the workflow does not publish within two days.
+run in `npm-dev`, which has no reviewer. Both environments accept only `main`.
+npm does not limit the tag a trusted publisher may set, so a guard in the
+workflow stops any run that is not stable from publishing a tag other than
+`dev`. npm expires a trusted publisher if the workflow does not publish within
+two days.
 Until every pinned package can be published, the workflow stops before libfx.
 
 Live Vercel qualification is a separate release check. Run
