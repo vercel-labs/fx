@@ -349,8 +349,8 @@ jobs:
   publish:
     needs: [metadata, package]
     runs-on: ubuntu-24.04
-    # Stable publishes wait for approval in npm; dev publishes run in npm-dev, which has no reviewer.
-    environment: ${{ needs.metadata.outputs.channel == 'stable' && 'npm' || 'npm-dev' }}
+    # Only a dev publish that a passing CI run on main starts runs in npm-dev, which has no reviewer; manual runs and stable wait for approval in npm.
+    environment: ${{ github.event_name == 'workflow_run' && needs.metadata.outputs.channel == 'dev' && 'npm-dev' || 'npm' }}
     permissions:
       contents: read
       id-token: write

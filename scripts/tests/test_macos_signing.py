@@ -622,8 +622,8 @@ class MacosSigningWorkflowTests(unittest.TestCase):
 
         self.assertIn("environment: release", release_job)
         self.assertIn(
-            "environment: ${{ needs.metadata.outputs.channel == 'stable' "
-            "&& 'npm' || 'npm-dev' }}",
+            "environment: ${{ github.event_name == 'workflow_run' && "
+            "needs.metadata.outputs.channel == 'dev' && 'npm-dev' || 'npm' }}",
             npm_publish_job,
         )
         self.assertIn(
