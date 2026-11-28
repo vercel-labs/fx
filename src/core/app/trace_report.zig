@@ -3150,6 +3150,9 @@ fn writeCrashReportInner(app: anytype, err: anyerror) !SavedCrashReport {
     defer alloc.free(built.bytes);
     const report = try capCrashReportBytes(alloc, built.bytes, last_crash_max_bytes);
     defer alloc.free(report);
+    if (report.len != built.bytes.len) {
+        debug_trace.logf("core", "crash report truncated original_bytes={d} kept_bytes={d} limit_bytes={d}", .{ built.bytes.len, report.len, last_crash_max_bytes });
+    }
 
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }),
