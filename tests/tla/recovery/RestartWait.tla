@@ -197,6 +197,7 @@ Submit ==
     /\ asked' = None
     /\ released' = None
     /\ st' = [a \in Agents |-> IF st[a] = "held" THEN "run" ELSE st[a]]
+    /\ UNCHANGED passed
 
 \* Planted defect, fx before prompts went out at once: the turns stay asked
 \* and held, so the prompt waits behind them. A config plants it with
@@ -204,7 +205,7 @@ Submit ==
 SubmitKeepsAsks ==
     /\ wait = "waiting"
     /\ wait' = "when_idle"
-    /\ UNCHANGED <<st, asked, released>>
+    /\ UNCHANGED <<st, asked, released, passed>>
 
 \* A tick once no turn runs after a Submit: fx exits for the relaunch. In
 \* fx the tick also waits for subagents, an empty composer, and anything
@@ -213,20 +214,20 @@ IdleExit ==
     /\ wait = "when_idle"
     /\ \A a \in Agents : st[a] = "idle"
     /\ wait' = "exited"
-    /\ UNCHANGED <<st, asked, released>>
+    /\ UNCHANGED <<st, asked, released, passed>>
 
 \* Planted defect: fx exits while a turn still runs. A config plants it
 \* with IdleExit <- IdleExitEarly.
 IdleExitEarly ==
     /\ wait = "when_idle"
     /\ wait' = "exited"
-    /\ UNCHANGED <<st, asked, released>>
+    /\ UNCHANGED <<st, asked, released, passed>>
 
 \* Ctrl+G while the restart waits for idle cancels it.
 CancelWhenIdle ==
     /\ wait = "when_idle"
     /\ wait' = "none"
-    /\ UNCHANGED <<st, asked, released>>
+    /\ UNCHANGED <<st, asked, released, passed>>
 
 Next ==
     \/ \E a \in Agents :

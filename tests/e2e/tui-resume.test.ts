@@ -6331,8 +6331,7 @@ for (const sent of ["prompt", "/new", "/launch"] as const) {
         await soloAskedModel;
         await active.waitForComposer(TIMEOUT);
         await active.sendHexBytes(["07"]);
-        // The footer says "restart waits"; #2481 renames it "restart pending".
-        await active.waitForPane((pane) => /restart (?:waits|pending)/.test(pane), TIMEOUT);
+        await active.waitForText("restart pending · ctrl+g cancel", TIMEOUT);
         const version = (await runFx(["--version"])).stdout.trim();
 
         if (sent !== "/new") {

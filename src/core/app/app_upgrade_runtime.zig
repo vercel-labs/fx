@@ -83,6 +83,10 @@ pub fn Runtime(comptime App: type) type {
                 .when_idle => if (!idleForRestart(app)) return,
             }
             if (app.anyTurnRunning() or draftPending(app)) return;
+            if (terminalInputWaiting(app)) {
+                debug_trace.logf("upgrade", "event=restart_waits_for_typed_input", .{});
+                return;
+            }
             if (app.upgrader.restart == .when_idle and !handOffForIdleRestart(app)) return;
             app.upgrader.restart = .none;
             if (comptime @hasDecl(App, "logHeldWorkForRestart")) app.logHeldWorkForRestart();
@@ -109,6 +113,22 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 },
             }
+        }
+
+        /// Whether keys the person typed wait to be read. The exit puts the
+        /// terminal back with a flush that drops unread input, so the restart
+        /// waits a tick and the loop reads them first: as a draft or a sent
+        /// prompt, they then hold the restart as any other does.
+        fn terminalInputWaiting(app: *App) bool {
+            if (comptime !@hasField(App, "terminal")) return false;
+            if (comptime @hasField(App, "terminal_input_runtime")) {
+                if (app.terminal_input_runtime.hasPendingTerminalInput()) return true;
+            }
+            const state = app.terminal.pollInput(0) catch |err| {
+                debug_trace.logf("upgrade", "event=restart_input_poll_failed err={s}", .{@errorName(err)});
+                return false;
+            };
+            return state.readable;
         }
 
         /// Whether a restart put off by a prompt can run now: nothing Ctrl+G
@@ -483,9 +503,26 @@ const TestInputRuntime = struct {
 
 const TestTerminalInputRuntime = struct {
     terminal_action_pending: bool = false,
+    input_pending: bool = false,
 
     fn hasPendingTerminalAction(self: *const TestTerminalInputRuntime) bool {
         return self.terminal_action_pending;
+    }
+
+    fn hasPendingTerminalInput(self: *const TestTerminalInputRuntime) bool {
+        return self.input_pending;
+    }
+};
+
+const TestTerminal = struct {
+    readable: bool = false,
+
+    fn pollInput(self: TestTerminal, _: i32) !struct { readable: bool } {
+        return .{ .readable = self.readable };
+    }
+
+    fn fullTranscriptScreenActive(_: TestTerminal) bool {
+        return false;
     }
 };
 
@@ -522,6 +559,7 @@ const TestApp = struct {
     child_agents: std.ArrayList(*TestChild) = .empty,
     input_runtime: TestInputRuntime = .{},
     terminal_input_runtime: TestTerminalInputRuntime = .{},
+    terminal: TestTerminal = .{},
     shell: TestShell = .{},
     should_exit: bool = false,
     session_id: ?[]const u8 = "session-123",
@@ -1202,6 +1240,16 @@ test "app_upgrade_runtime lets a prompt sent while the restart waits go on, and 
     Runtime(TestApp).collectUpgradeFacts(&app);
     try std.testing.expect(!app.should_exit);
     app.needs_user_elsewhere = null;
+    // Keys typed but not yet read hold it too: the exit's terminal flush
+    // would drop them, so the loop reads them first.
+    app.terminal.readable = true;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.terminal.readable = false;
+    app.terminal_input_runtime.input_pending = true;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.terminal_input_runtime.input_pending = false;
 
     // Idle: the handoff Ctrl+G asked for still holds, so it is kept, and fx
     // exits for the relaunch.

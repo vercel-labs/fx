@@ -2140,7 +2140,8 @@ pub fn Runtime(comptime App: type) type {
         /// Logs the work each agent still holds as fx exits for an upgrade's
         /// restart. After Ctrl+G's checks only reports can be here: queued
         /// work refuses Ctrl+G (`queuedWorkElsewhere`), a prompt sent during
-        /// the wait stays in the composer, and a message is refused
+        /// the wait goes out and the restart waits until it has run
+        /// (`restartWhenIdleForPrompt`), and a message is refused
         /// (`reserveMessagePlace`, `WorkerRuntime.postMailWith`). Each report
         /// stays owed in its parent's log and comes again after the restart.
         pub fn logHeldWork(app: *App) void {
