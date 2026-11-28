@@ -5274,6 +5274,20 @@ fn discardCompletionProse(
     completed.completion.provider_state_json = if (selected) |value| value.parts_json else null;
 }
 
+/// A request that resumes the one a previous fx process left unfinished, as
+/// opposed to a turn that continues a yielded one. A resume's prompt is the
+/// resume prompt, so the prompt tells a yielded resume apart.
+fn isResumedRequest(job: QueuedPrompt) bool {
+    return job.recovery_resume != null and (!job.continues_yielded_turn or session_runtime.isResumePrompt(job.prompt));
+}
+
+/// The history this turn's requests send: a resumed request leaves out the
+/// resumes a later one replaced. The projection, the turn's effort decision
+/// and the request's effort anchor all read this one (D103).
+fn sentHistory(job: QueuedPrompt) []const HistoryTurn {
+    return if (isResumedRequest(job)) session_runtime.withoutSupersededResumes(job.history) else job.history;
+}
+
 /// Whether `messages`, the part of the running turn a compaction kept, hold
 /// a step the model already answered.
 fn hasAssistantStep(messages: []const ChatMessage) bool {
@@ -7251,8 +7265,8 @@ fn processQueuedPromptInner(
     // projects its history as that turn did, so it is a resumed request when
     // the yielded turn was one. A resume's prompt is the resume prompt, so the
     // prompt tells us which.
-    const resumed_request = job.recovery_resume != null and (!job.continues_yielded_turn or session_runtime.isResumePrompt(job.prompt));
-    const resumed_history = if (resumed_request) session_runtime.withoutSupersededResumes(job.history) else job.history;
+    const resumed_request = isResumedRequest(job);
+    const resumed_history = sentHistory(job);
     if (job.delivery.isContinuation() or resumed_request) {
         try session_runtime.appendSteeringActiveContextHistoryChatMessages(
             arena,
@@ -8765,8 +8779,9 @@ fn processQueuedPromptLoop(
     debug_trace.logf("context", "runtime context saved_copy={} known_update={}", .{ runtime_context.frozen != null, runtime_context.known_update != null });
     // Every request names the session's first effort, and a later change
     // rides as an update before its turn's message (D103).
+    // It reads the history the turn's decision read (`sentHistory`).
     var effort_anchor: ?types.ReasoningEffort = if (finalization.turn_effort) |asked|
-        (try effort_anchor_state.sessionAnchor(arena, job.history)) orelse asked
+        (try effort_anchor_state.sessionAnchor(arena, sentHistory(initial_job))) orelse asked
     else
         null;
     var step: usize = 0;
@@ -9566,7 +9581,12 @@ fn processQueuedPromptLoop(
                         // replaced had set, so a turn with none of its own
                         // steps after it decides again against the new
                         // history (D103). One whose steps the block kept
-                        // keeps the bytes it sent them with.
+                        // keeps the bytes it sent them with, and runs at the
+                        // anchor when its update came from a removed turn,
+                        // which D103 accepts. A changed decision changes the turn's
+                        // saved effort piece, so its next save rewrites the
+                        // open turn whole (`session_adapter.zig`
+                        // streamedPrefix).
                         if (finalization.turn_effort) |asked| if (!hasAssistantStep(within_turn_suffix.items[compacted_suffix_len..])) {
                             const decision = try effort_anchor_state.decide(arena, next_history, request_capabilities.reasoning_efforts.slice(), asked);
                             effort_anchor = decision.anchor;

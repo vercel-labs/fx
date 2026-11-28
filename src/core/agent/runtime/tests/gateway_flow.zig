@@ -3633,6 +3633,45 @@ test "a GPT-6 subagent turn that goes on on another GPT-6 model keeps the anchor
     try expectSavedEffort(&hooks, "low", "low");
 }
 
+test "a resumed GPT-6 request names the anchor its decision read, without the resume it replaces (D103)" {
+    const alloc = std.testing.allocator;
+    const model = "openai/gpt-6.1-sol";
+    const overrides = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 400_000, .reasoning_efforts = .fromSlice(&gpt6_efforts) } }};
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.available_capability_overrides = &overrides;
+    hooks.capability_overrides = &overrides;
+    // A turn on another model saved no effort; then a resume that asked for
+    // medium stopped before it ran anything. This resume replaces it, so no
+    // request sends it, and the session's first effort is this turn's own.
+    var history = [_]HistoryTurn{
+        turnThatAsked(null),
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast(session_runtime.resumed_request_prompt) },
+            .execution = .{ .turn_effort = types.ReasoningEffort.literal("medium"), .effort_update = types.ReasoningEffort.literal("medium") },
+        } },
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.effort = types.ReasoningEffort.literal("high");
+    var job = fixture.job();
+    job.model = @constCast(model);
+    job.prompt = @constCast(session_runtime.resumed_request_prompt);
+    job.recovery_resume = .{};
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "\"reasoning\":\"high\"");
+    try expectBodyNotContains(&gateway, 0, "\"reasoning\":\"medium\"");
+    try expectBodyNotContains(&gateway, 0, "reasoningEffortUpdate");
+    try expectSavedEffort(&hooks, "high", null);
+}
+
 test "a recovered GPT-6 turn sends the update its first attempt saved, not the effort set since (D103)" {
     const alloc = std.testing.allocator;
     const model = "openai/gpt-6.1-sol";

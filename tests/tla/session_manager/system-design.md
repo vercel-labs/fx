@@ -2264,10 +2264,23 @@ not drop the cached prompt):
     the model does not list is never sent and never counts. A resume that a
     later one replaced is never sent, so it never counts either.
   - **Compaction inside a turn:** fx compacts at a turn's first request,
-    after the turn decided. A turn with none of its own steps after the
-    new block or summary decides again against the new history. One whose
-    steps the block kept keeps its bytes, and the rest of that turn can
-    run at the anchor's effort (the model's `stale` case).
+    after the turn decided, or at a later request of the turn. A turn with
+    none of its own steps after the new block or summary decides again
+    against the new history. Its saved `turn_effort` item then no longer
+    matches the one the prompt's save streamed, so its next save closes
+    the open turn as superseded and writes it whole again; the session
+    trace names that a stream mismatch (`session_adapter.zig`
+    streamedPrefix).
+  - **Known gap, accepted (FXC-1610):** a turn whose steps the block kept
+    keeps its bytes and does not decide again. When the update that set
+    its effort was in a turn the block removed, the rest of that turn runs
+    at the anchor's effort, not the one it asked for (the model's `stale`
+    case; `tests/e2e/provider-compaction.test.ts` "a GPT-6 block that keeps
+    the running turn's steps leaves the rest of that turn at the anchor,
+    and the next turn decides again (D103)"). The next turn decides
+    against the block and the kept turns and runs as asked. FXC-1610
+    tracks sending the update after the kept steps, which needs a live
+    provider check.
   - **Recovery:** a recovered turn keeps the effort and update its first
     attempt saved.
   - **Not covered:** the one resend at a lower effort after a reply cut
@@ -2276,8 +2289,12 @@ not drop the cached prompt):
     least effort. Other models name the turn's effort, as before, and so
     does each request a turn sends to another model: a subagent's request
     that goes on on Claude after a wait gets its own effort and no update.
-  - **Older fx:** an fx from before D103 leaves the item out (D17) and
-    names each turn's effort, as it did.
+  - **Older fx:** an fx from before D103 leaves the `turn_effort` item out
+    (D17) and names each turn's effort, as it did. It rejects execution
+    JSON at schema version 13 (`session_codec.zig`
+    parseExecutionMemoryWith), as an fx from before D93 or D94 rejects
+    version 11 or 12: it refuses that saved state and neither rewrites nor
+    migrates it.
 
   **Why:** a changed `reasoning` made GPT-6 read none of the prompt from
   its cache and drop its earlier reasoning; the update kept the cache and

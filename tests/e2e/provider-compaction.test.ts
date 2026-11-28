@@ -392,6 +392,85 @@ describe("provider compaction", () => {
     await effortAfterKeptUpdate(7);
   }, 240_000);
 
+  test("a GPT-6 block that keeps the running turn's steps leaves the rest of that turn at the anchor, and the next turn decides again (D103)", async () => {
+    // Turn 1 asks for high and turns 2 and 3 for low; turns 1 and 2 have long
+    // replies. Turn 3 runs at low through turn 2's update and sends none of
+    // its own. Its first step's text takes its second request past the
+    // compaction point, so fx compacts inside it: the block takes turns 1 and
+    // 2, with turn 2's update, and keeps turn 3 with its step, which fits the
+    // room for kept turns. Accepted for now: the rest of turn 3 runs at the
+    // anchor.
+    const model = FAMILIES.openai.model;
+    const { root, home, cwd } = fixture(model);
+    const turnOf = (request: { body: Body }) => Number(lastUserText(request.body).match(/TURN (\d+)/)?.[1] ?? 0);
+    let turnThreeRequests = 0;
+    const started = startProviderGateway({
+      models: effortModels(() => 400_000),
+      defaultModel: model,
+      step: (request) => {
+        const turn = turnOf(request);
+        if (turn === 3) {
+          turnThreeRequests += 1;
+          if (turnThreeRequests === 1) return { kind: "tool" as const, text: "Step detail kept with its turn. ".repeat(2_000) };
+        }
+        return { kind: "final" as const, text: turn <= 2 ? `Turn ${turn} done. ${OLDER_TEXT}` : `Turn ${turn} done.` };
+      },
+      compaction: () => ({ kind: "block" }),
+    });
+    const { gateway, edits, observed, counts } = started;
+    const env: Record<string, string> = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+      AI_GATEWAY_API_KEY: "synthetic-provider-compaction", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model, FX_TRACE_LOG: join(root, "trace.log"),
+      FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+    let passed = false;
+    try {
+      const first = await ask(env, cwd, root, "t1", ["--effort", "high"], "TURN 1 Start the work.");
+      expect(first.code).toBe(0);
+      const sessionId: string = first.json.session_id;
+      for (let turn = 2; turn <= 4; turn += 1) {
+        const compact = turn === 3 ? { FX_AUTO_COMPACT_PERCENT: "30" } : {};
+        const next = await ask({ ...env, ...compact }, cwd, root, `t${turn}`, ["--resume", sessionId, "--effort", "low"], `TURN ${turn} Continue.`);
+        expect(next.code).toBe(0);
+      }
+      expect(counts.provider).toBe(1);
+      const agent = observed.filter((request) => request.kind === "agent");
+      const third = agent.filter((request) => turnOf(request) === 3).map((request) => request.body as Body & { reasoning?: string });
+      expect(third.length).toBe(2);
+      // Before the block: the anchor, turn 2's update, so turn 3 runs at low.
+      expect(third[0]!.reasoning).toBe("high");
+      expect(effortUpdates(third[0]!)).toEqual(["low before TURN 2"]);
+      expect(runsAt(third[0]!)).toBe("low");
+      // After it: turn 3 and its step, kept as sent, and no update left.
+      const afterBlock = third[1]!;
+      const users = conversationOf(afterBlock).filter((message) => message.role === "user").map((message) => JSON.stringify(message.content));
+      expect(users.some((text) => text.includes("TURN 2"))).toBe(false);
+      expect(users.some((text) => text.includes("TURN 3"))).toBe(true);
+      expect(conversationOf(afterBlock).some((message) => message.role === "tool")).toBe(true);
+      expect(afterBlock.reasoning).toBe("high");
+      expect(effortUpdates(afterBlock)).toEqual([]);
+      expect(runsAt(afterBlock)).toBe("high");
+      // The next turn decides against the block and the kept turn, and sends
+      // its own update.
+      const fourth = agent.filter((request) => turnOf(request) === 4)[0]!.body as Body & { reasoning?: string };
+      expect(fourth.prompt.slice(0, afterBlock.prompt.length)).toEqual(afterBlock.prompt);
+      expect(fourth.reasoning).toBe("high");
+      expect(effortUpdates(fourth)).toEqual(["low before TURN 4"]);
+      expect(runsAt(fourth)).toBe("low");
+      expect(edits).toEqual([]);
+      passed = true;
+    } finally {
+      gateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+      else {
+        writeFileSync(join(root, "requests.json"), JSON.stringify(observed.map((request) => request.body), null, 1));
+        console.error(`provider compaction evidence retained: ${root} edits=${JSON.stringify(edits)} counts=${JSON.stringify(counts)}`);
+      }
+    }
+  }, 240_000);
+
   test("a block written after a model switch keeps the other model's steps as their text", async () => {
     const models = Object.values(FAMILIES).map((family) => ({ id: family.model, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }));
     await withSession(FAMILIES.anthropic.model, { models }, async (session, { observed, counts, edits }) => {

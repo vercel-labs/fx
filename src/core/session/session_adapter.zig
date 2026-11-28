@@ -3862,8 +3862,11 @@ pub const Session = struct {
     }
 
     /// How many of `encoded` the open turn already holds. A streamed piece
-    /// that differs from the final turn is a bug; the stale turn is closed
-    /// as superseded and the whole turn is written afresh, never mixed.
+    /// that differs from the final turn is a bug, except one case: a turn
+    /// that decided its effort again after a compaction inside it changes
+    /// its saved `turn_effort` piece (D103). Either way the stale turn is
+    /// closed as superseded and the whole turn is written afresh, never
+    /// mixed, so the trace line names it a mismatch.
     /// `phase` and `results`, the rebuild's tool result count, only name
     /// the decision in the session trace, which the driver of
     /// `tests/tla/session/TurnStreamTrace.tla` replays.
