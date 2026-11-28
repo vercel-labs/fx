@@ -8682,7 +8682,7 @@ test.skipIf(!tmuxAvailable())(
         UPGRADE_TIMEOUT,
       );
       await active.sendHexBytes(["07"]);
-      await active.waitForText("restart cancelled; Ctrl+G restarts for the upgrade later", TIMEOUT);
+      await active.waitForText("restart cancelled; Ctrl+G restarts for the update later", TIMEOUT);
       await active.waitForText("MAIN_SAW_REPORT", UPGRADE_TIMEOUT);
 
       const solo = gateway.requests.map((request) => request.body).filter(isSoloSubagentRequest);
