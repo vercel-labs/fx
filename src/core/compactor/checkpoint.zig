@@ -156,6 +156,12 @@ pub const Payload = struct {
     /// wrote one: requests to that model send it in place of the compacted
     /// turns, and requests to any other model read the rest of this payload.
     provider: ?ProviderBlock = null,
+    /// The runtime context the requests after fx's own summary are sent
+    /// with, one system message text each, when the summary starts a new
+    /// copy. Later requests send it unchanged, so nothing after the summary
+    /// changes (D94). Empty when the copy is kept elsewhere: in `provider`'s
+    /// block, or with the turn that captured it.
+    runtime_context: []const []const u8 = &.{},
     /// The toolbox menu the conversation sent before this compaction, which
     /// every later request sends unchanged (D103,
     /// `tests/tla/toolbox/Toolbox.tla` MenuFixed). Null in checkpoints written
@@ -207,6 +213,16 @@ pub const ProviderBlock = struct {
 pub fn providerBlock(arena: Allocator, summary: []const u8) Allocator.Error!?ProviderBlock {
     const payload = try parse(arena, summary) orelse return null;
     return payload.provider;
+}
+
+/// The runtime context a checkpoint keeps for the requests after it: its
+/// provider block's, or the one fx's own summary saved. Empty when it keeps
+/// none, as in a checkpoint written before either field. `arena` owns the
+/// result.
+pub fn savedRuntimeContext(arena: Allocator, summary: []const u8) Allocator.Error![]const []const u8 {
+    const payload = try parse(arena, summary) orelse return &.{};
+    if (payload.provider) |block| return block.runtime_context;
+    return payload.runtime_context;
 }
 
 /// The highest number of each kind of entry `payload` has used, in
@@ -875,4 +891,33 @@ test "older checkpoints yield their exact users from the named state file" {
     try testing.expect(try parseLegacyState(arena, ref, state[0 .. state.len - 1]) == null);
     try testing.expect(legacyStateRef(legacy_handoff_open ++ "no state here") == null);
     try testing.expect(legacyStateRef(marker ++ "{}") == null);
+}
+
+test "a payload saved before the summary kept a runtime context reads the same, and a new one keeps its copy apart from the text" {
+    const alloc = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty_field = ",\"runtime_context\":[]";
+    // fx before the field wrote these same bytes without it.
+    const current = try encode(arena, sample_payload);
+    const at = std.mem.find(u8, current, empty_field).?;
+    const older = try std.mem.concat(arena, u8, &.{ current[0..at], current[at + empty_field.len ..] });
+
+    const back = (try parse(arena, older)).?;
+    try testing.expectEqual(@as(usize, 0), back.runtime_context.len);
+    try testing.expectEqual(@as(usize, 0), (try savedRuntimeContext(arena, older)).len);
+    try testing.expectEqualStrings(current, try encode(arena, back));
+    try testing.expectEqualStrings((try modelText(arena, current)).?, (try modelText(arena, older)).?);
+
+    var with_copy = sample_payload;
+    with_copy.runtime_context = &.{ "<fx-turn-context>\nmodel: anthropic/claude-fable-5.2\n</fx-turn-context>", "Runtime context: permission mode is ask." };
+    const saved = try encode(arena, with_copy);
+    try testing.expectEqualStrings(older[0..at], saved[0..at]);
+    try testing.expectEqualStrings(saved, try encode(arena, (try parse(arena, saved)).?));
+    const copy = try savedRuntimeContext(arena, saved);
+    try testing.expectEqual(@as(usize, 2), copy.len);
+    for (with_copy.runtime_context, copy) |want, got| try testing.expectEqualStrings(want, got);
+    try testing.expectEqualStrings((try modelText(arena, older)).?, (try modelText(arena, saved)).?);
+    try testing.expect((try providerBlock(arena, saved)) == null);
 }
