@@ -4,7 +4,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSyn
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
-import { stdoutFrames, type TapeFrame } from "./render-lab/tape";
+import { readTapeFrames, stdoutFrames, type TapeFrame } from "./render-lab/tape";
 import { rootSessionIds, waitForRootTurnCommitted } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
@@ -162,8 +162,23 @@ function countOf(text: string, needle: string): number {
 
 function indexOfNth(text: string, needle: string, nth: number): number {
   let at = -1;
-  for (let i = 0; i < nth; i += 1) at = text.indexOf(needle, at + 1);
+  for (let i = 0; i < nth; i += 1) {
+    at = text.indexOf(needle, at + 1);
+    if (at === -1) return -1;
+  }
   return at;
+}
+
+/// The resume reports on a tape fx may still be writing. A frame cut short at
+/// the end is left out; a tape with no header yet has none.
+function resumeReportsSoFar(tapePath: string): string[] {
+  if (!existsSync(tapePath)) return [];
+  try {
+    return reportsIn(readTapeFrames(tapePath, { ignoreTruncatedTail: true }).filter((frame) => frame.kind === 1));
+  } catch {
+    // fx has not written the tape header yet.
+    return [];
+  }
 }
 
 function processGone(pid: number): boolean {
@@ -182,6 +197,8 @@ async function answerFirstPrompt(session: TmuxSession, fixture: FixtureRoot): Pr
   await session.waitForPane(turnSettled, TIMEOUT);
   await waitForRootTurnCommitted(fixture.home, 0, TIMEOUT);
   await waitUntil("the first resume report", () => countOf(readTrace(fixture.trace), RESUME_TRACE) >= 1);
+  // fx traces the report one line before it writes it, so wait for the tape too.
+  await waitUntil("the first resume report on the tape", () => resumeReportsSoFar(fixture.tape).length >= 1);
 }
 
 function expectResumeRecord(report: string, sessionId: string): Record<string, string> {
@@ -288,7 +305,7 @@ test.skipIf(!tmuxAvailable())(
       await session.sendText(SECOND_PROMPT);
       await session.waitForText(SECOND_ANSWER, TIMEOUT);
       await session.waitForPane(turnSettled, TIMEOUT);
-      await waitForRootTurnCommitted(fixture.home, 0, TIMEOUT);
+      await waitForRootTurnCommitted(fixture.home, 1, TIMEOUT);
 
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -447,14 +464,14 @@ test.skipIf(!tmuxAvailable())(
       await session.waitForStableComposer(TIMEOUT);
 
       await session.sendText(SECOND_PROMPT);
-      await session.waitForPane((pane) => pane.includes(SECOND_ANSWER) && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd(SECOND_ANSWER, TIMEOUT);
       await session.sendKeys("C-o");
       await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await session.waitForText(PROBE_EXIT_LINE, TIMEOUT);
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("esc close · pgup/pgdn scroll"), TIMEOUT);
       await session.waitForStableComposer(15_000);
-      await waitForRootTurnCommitted(fixture.home, 0, TIMEOUT);
+      await waitForRootTurnCommitted(fixture.home, 1, TIMEOUT);
 
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);

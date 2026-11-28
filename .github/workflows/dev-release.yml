@@ -1,27 +1,66 @@
 name: Dev Release
 
+# Every 30 minutes, take main's newest commit, run the jobs of CI a dev build
+# waits for (the dev gate), and publish the commit to the dev channel when
+# they pass. The rest of CI, such as the durable-session model check and the
+# TLA+ models, still runs on every push to main, but a dev build does not wait
+# for it. A manual dispatch runs the gate and the builds on its own branch and
+# never publishes.
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
+  schedule:
+    # GitHub can start a scheduled run some minutes late, and late more often
+    # at the top of the hour.
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-# A run for a CI run that did not pass on a push to main skips every job (the
-# same condition as the jobs' `if`). It gets a group of its own, so it cannot
-# cancel a real run in progress.
+# Runs for different commits overlap, so a slow gate does not hold back the
+# next commit. A second run for the same commit waits for the first.
 concurrency:
-  group: ${{ (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository) && 'dev-release' || format('dev-release-skip-{0}', github.run_id) }}
-  cancel-in-progress: true
+  group: dev-release-${{ github.event_name }}-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.plan.outputs.needed }}
+    steps:
+      - name: Decide whether this commit needs a dev build
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != schedule ]; then
+            echo "A manual dispatch always runs the gate."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CURRENT_SHA=$(curl -fsS --max-time 30 https://releases.fx.sh/dev.json | jq -r '.commit // empty') || CURRENT_SHA=""
+          if [ "$CURRENT_SHA" = "$BUILD_SHA" ]; then
+            echo "The dev channel already names ${BUILD_SHA}."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "The dev channel names ${CURRENT_SHA:-no readable commit}; build ${BUILD_SHA}."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  gate:
+    name: Dev gate
+    needs: plan
+    if: needs.plan.outputs.needed == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      dev_gate: true
+
   build:
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+    needs: plan
+    if: needs.plan.outputs.needed == 'true'
     name: Build ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
@@ -39,7 +78,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          # The build number counts main's history (build.zig readBuildNumber).
+          fetch-depth: 0
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -60,22 +100,18 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fx-${{ matrix.name }}
+          name: dev-fx-${{ matrix.name }}
           path: |
             fx-${{ matrix.name }}.tar.gz
             fx-${{ matrix.name }}.tar.gz.sha256
 
   web:
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+    needs: plan
+    if: needs.plan.outputs.needed == 'true'
     name: Build web artifacts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -101,7 +137,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fx-web
+          name: dev-fx-web
           path: |
             fx-sdk.js
             fx-sdk.js.sha256
@@ -115,22 +151,30 @@ jobs:
             fx-term.wasm.sha256
 
   publish:
-    needs: [build, web]
+    needs: [gate, build, web]
+    if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Gates for different commits can end in any order, so publishes go one at
+    # a time and each reads the channel the one before it wrote.
+    concurrency:
+      group: dev-release-publish
+      cancel-in-progress: false
     env:
-      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+      RELEASE_SHA: ${{ github.sha }}
       BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
       FX_WEB_DEPLOY_HOOK_URL: ${{ secrets.FX_WEB_DEPLOY_HOOK_URL }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
           # The dev channel step compares this commit with the one in dev.json.
           fetch-depth: 0
 
+      # The gate's CI jobs upload artifacts to this run too, such as a
+      # differently built fx-term.wasm, so take only this workflow's own.
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: dev-*
           merge-multiple: true
 
       - name: Publish immutable dev artifacts
@@ -194,18 +238,14 @@ jobs:
         run: |
           set -euo pipefail
           # dev.json is read through the CDN, which caches it for 60 seconds.
-          # Runs go one at a time and each builds for minutes before this
-          # step, so the read sees the previous run's write unless the CDN
-          # serves a copy past that age.
+          # Publishes go one at a time, and each waits until the CDN serves
+          # its write, so the read sees the previous publish's write.
           CURRENT_SHA=$(curl -fsS --max-time 30 https://releases.fx.sh/dev.json | jq -r '.commit // empty') || CURRENT_SHA=""
           if [ -z "$CURRENT_SHA" ]; then
             echo "::warning::could not read a commit from dev.json; only main's newest commit may replace it"
           fi
           MAIN_SHA=$(timeout 60 git ls-remote origin refs/heads/main | cut -f1) || MAIN_SHA=""
-          # The rule comes from this workflow's own commit, since the build's
-          # checkout can be older than the script.
-          git show "${GITHUB_SHA}:scripts/dev-channel-forward.sh" > "$RUNNER_TEMP/dev-channel-forward.sh"
-          bash "$RUNNER_TEMP/dev-channel-forward.sh" "$CURRENT_SHA" "$RELEASE_SHA" "$MAIN_SHA"
+          bash scripts/dev-channel-forward.sh "$CURRENT_SHA" "$RELEASE_SHA" "$MAIN_SHA"
 
       - name: Point dev channel at this commit
         id: point-dev
@@ -213,8 +253,11 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          jq -n --arg version "$VERSION" --arg commit "$RELEASE_SHA" \
-            '{version: $version, commit: $commit}' > /tmp/dev.json
+          # The same number the binary carries (build.zig readBuildNumber).
+          # fx installs a dev build only when this number is higher.
+          BUILD=$(git rev-list --count --first-parent "$RELEASE_SHA")
+          jq -n --arg version "$VERSION" --arg commit "$RELEASE_SHA" --argjson build "$BUILD" \
+            '{version: $version, commit: $commit, build: $build}' > /tmp/dev.json
 
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -X PUT "https://blob.vercel-storage.com/cli/dev.json" \
@@ -230,6 +273,24 @@ jobs:
             exit 1
           fi
           echo "updated=true" >> "$GITHUB_OUTPUT"
+
+      # The next publish reads dev.json through the CDN to decide whether the
+      # channel moves, so hold the publish slot until the CDN serves this write.
+      - name: Wait until releases.fx.sh serves this commit
+        if: steps.point-dev.outputs.updated == 'true'
+        run: |
+          set -uo pipefail
+          attempts=30
+          for attempt in $(seq 1 "$attempts"); do
+            SERVED_SHA=$(curl -fsS --max-time 30 https://releases.fx.sh/dev.json | jq -r '.commit // empty') || SERVED_SHA=""
+            if [ "$SERVED_SHA" = "$RELEASE_SHA" ]; then
+              echo "releases.fx.sh serves ${RELEASE_SHA} after ${attempt} reads"
+              exit 0
+            fi
+            [ "$attempt" -lt "$attempts" ] && sleep 10
+          done
+          echo "::error::after ${attempts} reads, releases.fx.sh still names ${SERVED_SHA:-no readable commit}, not ${RELEASE_SHA}"
+          exit 1
 
       - name: Deploy fx-web
         if: steps.point-dev.outputs.updated == 'true' && env.FX_WEB_DEPLOY_HOOK_URL != ''

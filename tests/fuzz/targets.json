@@ -52,6 +52,7 @@
     {"name": "command_output_content", "module": "fx", "test": "fuzz command output content", "iterations": 160000},
     {"name": "edit_failure_hints", "module": "fx", "test": "edit failure hints stay within their bounds for any file and old_string", "iterations": 900000},
     {"name": "file_index", "module": "fx", "test": "file index raw-list and Unicode query bytes remain bounded", "iterations": 620000},
+    {"name": "grok_access_token", "module": "fx", "test": "a Grok access token gives its Team, none, or a refusal on fuzzed bytes", "iterations": 70000},
     {"name": "responses_text", "module": "fx", "test": "Responses text finalization fuzzes chunking and capture boundaries", "iterations": 430000},
     {"name": "sse_framing", "module": "fx", "test": "provider framing fuzzes chunk-invariant event data", "iterations": 1300000},
     {"name": "responses_stream", "module": "fx", "test": "Responses streams give the same result however they are cut into events and reads", "iterations": 190000},
@@ -108,10 +109,21 @@
     {"name": "turn_clock", "module": "fx", "test": "the turn clock keeps its laws on fuzzed event sequences", "iterations": 2000000},
     {"name": "compaction_progress", "module": "fx", "test": "the notes count keeps its laws on fuzzed replies", "iterations": 2000000},
     {"name": "secret_pieces", "module": "fx", "test": "maskSecretPieces masks every piece of a wrapped value and keeps other bytes on fuzzed rows", "iterations": 400000},
+    {"name": "vercel_auth_json", "module": "fx", "test": "auth.json parses to one of three results, and a token equals its JSON string, on fuzzed bytes", "iterations": 300000},
+    {"name": "vercel_setup_reply", "module": "fx", "test": "a setup API reply parses or is refused, and a parsed id is non-empty and bounded, on fuzzed bytes", "iterations": 300000},
+    {"name": "vercel_sandbox_answer", "module": "fx", "test": "a sandbox answer parses or is refused, and a parsed size and session id are bounded, on fuzzed bytes", "iterations": 200000},
+    {"name": "vercel_state_files", "module": "fx", "test": "sandbox.json, manifest.json, the journal and a pending record parse or are refused, and a parsed one writes back to the same records, on fuzzed bytes", "iterations": 200000},
+    {"name": "vercel_list_page", "module": "fx", "test": "a sandbox list page parses or is refused, and a parsed page has bounded names and a non-empty cursor, on fuzzed bytes", "iterations": 200000},
+    {"name": "vercel_exec_line", "module": "fx", "test": "a command stream line parses or is refused, and a parsed line has a known stream or a non-empty id, on fuzzed bytes", "iterations": 200000},
+    {"name": "vercel_back_archive", "module": "fx", "test": "the bring-back archive decodes and writes only files whose names pass the path rules, on fuzzed bytes", "iterations": 100000},
+    {"name": "vercel_back_text", "module": "fx", "test": "a stderr note and a deferred path parse or are ignored, a deferred path survives its escaping, and an accepted name is clean, on fuzzed bytes", "iterations": 200000},
+    {"name": "vercel_config_remote", "module": "fx", "test": "a remote section parses or is refused on fuzzed bytes, and a parsed remote keeps the strings its JSON gave", "iterations": 200000},
+    {"name": "vercel_wait_answer", "module": "fx", "test": "a wait answer parses or is refused, and a parsed exit code holds when it is written back, on fuzzed bytes", "iterations": 200000},
     {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000},
     {"name": "file_index_snapshot", "module": "fx", "test": "a saved file-index snapshot loads or is refused on fuzzed bytes", "iterations": 3000},
     {"name": "shortcut_map", "module": "fx", "test": "shortcut map parses or is refused on fuzzed bytes", "iterations": 400000},
     {"name": "rex_rule_line", "module": "fx", "test": "rex_rule line edits round-trip", "iterations": 300000},
-    {"name": "rex_rule_records", "module": "fx", "test": "rex_rule records decoder never fails", "iterations": 1000000}
+    {"name": "rex_rule_records", "module": "fx", "test": "rex_rule records decoder never fails", "iterations": 1000000},
+    {"name": "command_environment_evidence", "module": "fx", "test": "command environment evidence keeps its lines on fuzzed shells", "iterations": 30000}
   ]
 }

@@ -48,6 +48,7 @@ const tmuxTest = test.skipIf(!tmuxAvailable());
 const ISOLATED_KEYS = [
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
+  "VERCEL_TOKEN",
   "FX_TEST_GATEWAY_CHAT_URL",
   "FX_TEST_GATEWAY_MODELS_URL",
   "FX_TEST_GATEWAY_CREDITS_URL",
@@ -666,6 +667,18 @@ tmuxTest("pane environment does not poison a shared tmux server", async () => {
   }
 });
 
+test("waitForReplyAndTurnEnd without a timeout waits as long as waitForText does", async () => {
+  const timeouts: Array<number | undefined> = [];
+  const stub = { waitForPane: async (_predicate: (pane: string) => boolean, timeoutMs?: number) => {
+    timeouts.push(timeoutMs);
+    return "";
+  } };
+  await TmuxSession.prototype.waitForReplyAndTurnEnd.call(stub as unknown as TmuxSession, "REPLY");
+  await TmuxSession.prototype.waitForText.call(stub as unknown as TmuxSession, "REPLY");
+  expect(timeouts[0]).toBeDefined();
+  expect(timeouts[0]).toBe(timeouts[1]);
+});
+
 tmuxTest("waitForReplyAndTurnEnd waits for the turn's end, not only the reply's text", async () => {
   const root = mkdtempSync(join(tmpdir(), "fx-tmux-reply-turn-end-"));
   const releasePath = join(root, "release");
@@ -859,7 +872,10 @@ test("fxChildEnv drops every name on the unset list and keeps the caller's own",
     PATH: "/usr/bin",
     AI_GATEWAY_API_KEY: "stale-ai_gateway_api_key",
     VERCEL_OIDC_TOKEN: "stale-vercel_oidc_token",
+    VERCEL_TOKEN: "stale-vercel_token",
   });
+  expect(DEFAULT_UNSET_ENV_KEYS).toContain("FX_TEST_RECOVERY_RETRY_BUDGET_MS");
+  expect(fxChildEnv({ FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500" }, { inherited }).FX_TEST_RECOVERY_RETRY_BUDGET_MS).toBe("1500");
   expect(inherited.FX_TEST_SHELL_YIELD_HELD).toBe("stale-fx_test_shell_yield_held");
 });
 
