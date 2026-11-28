@@ -1719,24 +1719,75 @@ fn requestPermissionOutcomeResolved(
     );
 }
 
+fn appendGrants(
+    arena: Allocator,
+    base: []const PermissionGrant,
+    extra: []const PermissionGrant,
+) ![]const PermissionGrant {
+    if (extra.len == 0) return base;
+    const grants = try arena.alloc(PermissionGrant, base.len + extra.len);
+    @memcpy(grants[0..base.len], base);
+    @memcpy(grants[base.len..], extra);
+    return grants;
+}
+
+fn exactFileMutationGrants(
+    arena: Allocator,
+    tool_name: []const u8,
+    policy_targets: file_mutation_contract.PolicyEvaluatedFileTargets,
+    offer: ?file_mutation_contract.FileGrantOffer,
+    shell_epoch: u64,
+) ![]const PermissionGrant {
+    var grants: std.ArrayList(PermissionGrant) = .empty;
+    const offer_grants = if (offer) |value| value.grants else &.{};
+    if (offer_grants.len == 0) {
+        const permission_name = permissions.permissionNameForTool(tool_name);
+        for (policy_targets.items) |item| {
+            try grants.append(arena, .{
+                .shell_epoch = shell_epoch,
+                .tool_name = try arena.dupe(u8, permission_name),
+                .target_path = try arena.dupe(
+                    u8,
+                    policy_targets.permissionPath(item),
+                ),
+            });
+        }
+        return grants.toOwnedSlice(arena);
+    }
+    for (offer_grants, 0..) |offer_grant, idx| {
+        const seen = for (offer_grants[0..idx]) |prev| {
+            if (std.mem.eql(u8, prev.tool_name, offer_grant.tool_name)) break true;
+        } else false;
+        if (seen) continue;
+        for (policy_targets.items) |item| {
+            try grants.append(arena, .{
+                .shell_epoch = shell_epoch,
+                .tool_name = try arena.dupe(u8, offer_grant.tool_name),
+                .target_path = try arena.dupe(
+                    u8,
+                    policy_targets.permissionPath(item),
+                ),
+            });
+        }
+    }
+    return grants.toOwnedSlice(arena);
+}
+
 fn exactApprovalLocalGrants(
     input: Input,
     arena: Allocator,
     call: ToolCall,
     local_grants: []const PermissionGrant,
     authority: command_admission.ToolExecutionAuthority,
-    shell_epoch: u64,
+    human_approval: command_admission.HumanApprovalProvenance,
 ) ![]const PermissionGrant {
     switch (authority) {
         .file_mutation => |authorization| {
+            if (human_approval.kind == .once) {
+                return appendGrants(arena, local_grants, authorization.approved_once_grants);
+            }
             const offer = authorization.grant_offer orelse return local_grants;
-            const grants = try arena.alloc(
-                PermissionGrant,
-                local_grants.len + offer.grants.len,
-            );
-            @memcpy(grants[0..local_grants.len], local_grants);
-            @memcpy(grants[local_grants.len..], offer.grants);
-            return grants;
+            return appendGrants(arena, local_grants, offer.grants);
         },
         .ordinary, .run_command => {
             var targets = try permissionTargetsForCall(input, arena, call);
@@ -1749,7 +1800,7 @@ fn exactApprovalLocalGrants(
             @memcpy(grants[0..local_grants.len], local_grants);
             for (targets.items, grants[local_grants.len..]) |target, *grant| {
                 grant.* = .{
-                    .shell_epoch = shell_epoch,
+                    .shell_epoch = human_approval.shell_epoch,
                     .tool_name = try arena.dupe(
                         u8,
                         permissions.permissionNameForTool(permission_name),
@@ -1773,7 +1824,7 @@ fn exactApprovalLocalGrants(
             @memcpy(grants[0..local_grants.len], local_grants);
             for (vision_authority.targets, grants[local_grants.len..]) |target, *grant| {
                 grant.* = .{
-                    .shell_epoch = shell_epoch,
+                    .shell_epoch = human_approval.shell_epoch,
                     .tool_name = try arena.dupe(
                         u8,
                         permissions.permissionNameForTool(call.name),
@@ -1812,7 +1863,7 @@ pub fn revalidateLiveActionPermissionOutcome(
             call,
             local_grants,
             authority,
-            human_approval.shell_epoch,
+            human_approval,
         )
     else
         local_grants;
@@ -1874,6 +1925,26 @@ pub fn revalidateLiveActionPermissionOutcome(
         },
     };
     if (human_approval.kind != .none and
+        (outcome.human_approval.kind != .none or
+            outcome.denial_reason == .user_denied or
+            outcome.decision == .permission_required))
+    {
+        const missing_file_grants = authority == .file_mutation and
+            ((human_approval.kind == .once and authority.file_mutation.approved_once_grants.len == 0) or
+                (human_approval.kind != .once and authority.file_mutation.grant_offer == null));
+        const reason = if (missing_file_grants)
+            "missing_grant_offer"
+        else if (authority == .file_mutation)
+            "target_or_policy_changed"
+        else
+            "policy_or_target_changed";
+        debug_trace.logf(
+            "permission",
+            "revalidation_reprompt call_id={s} tool_name={s} authority={s} reason={s} decision={s}",
+            .{ call.id, call.name, @tagName(authority), reason, @tagName(outcome.decision) },
+        );
+    }
+    if (human_approval.kind != .none and
         outcome.tool_failure == null and
         !outcome.decision.isDenied())
     {
@@ -1883,6 +1954,23 @@ pub fn revalidateLiveActionPermissionOutcome(
             .none => unreachable,
         };
         outcome.human_approval = human_approval;
+        if (authority == .file_mutation and outcome.execution_authority != null) {
+            switch (outcome.execution_authority.?) {
+                .file_mutation => |*new_auth| {
+                    // Carry the fixed grants recorded at initial approval without
+                    // recomputing from a newer authority's targets, so a looser
+                    // interim recheck can never transfer .once approval to a new path.
+                    if (human_approval.kind == .once) {
+                        if (new_auth.approved_once_grants.len == 0) {
+                            new_auth.approved_once_grants = authority.file_mutation.approved_once_grants;
+                        }
+                    } else if (new_auth.grant_offer == null) {
+                        new_auth.grant_offer = authority.file_mutation.grant_offer;
+                    }
+                },
+                else => {},
+            }
+        }
     }
     return outcome;
 }
@@ -2035,6 +2123,15 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
                 else => return err,
             };
             defer response.deinit();
+            if (response.decision == .once) {
+                authorization.approved_once_grants = try exactFileMutationGrants(
+                    arena,
+                    call.name,
+                    authorization.policy_targets,
+                    authorization.grant_offer,
+                    shell_epoch,
+                );
+            }
             var outcome: command_admission.PermissionOutcome = .{
                 .decision = response.decision,
                 .execution_authority = if (response.decision.isDenied()) null else .{
@@ -2286,7 +2383,7 @@ fn promptPermissionOutcome(
     // is open makes the next call ask again.
     const shell_epoch = shell_snapshot.processOwner().approvalEpoch();
     const grant_offer = if (try isRunCommandCall(input, arena, call))
-        try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary, shell_epoch)
+        try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary, .{ .kind = .none, .shell_epoch = shell_epoch })
     else
         null;
     var response = prompter.request(
@@ -4638,7 +4735,7 @@ test "exact command approval remains valid across live authority revalidation" {
         call,
         &.{},
         .ordinary,
-        shell_snapshot.processOwner().approvalEpoch(),
+        .{ .kind = .none, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() },
     );
     var targets = try permissionTargetsForCall(input, arena, call);
     defer targets.deinit(arena);
@@ -4671,7 +4768,7 @@ test "exact command approval records the shell epoch it was made under" {
         .name = "shell",
         .arguments_json = "{\"action\":\"run\",\"command\":\"printf approved > marker.txt\"}",
     };
-    const grants = try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary, 1);
+    const grants = try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary, .{ .kind = .none, .shell_epoch = 1 });
 
     try std.testing.expectEqual(@as(usize, 1), grants.len);
     try std.testing.expectEqual(@as(u64, 1), grants[0].shell_epoch);
@@ -4693,7 +4790,7 @@ test "vision approval grants record the shell epoch they were made under" {
         .identity = std.mem.zeroes(file_mutation_contract.FileIdentity),
     }};
     const call: ToolCall = .{ .id = "vision-epoch", .name = "vision", .arguments_json = "{}" };
-    const grants = try exactApprovalLocalGrants(input, arena, call, &.{}, .{ .vision_paths = .{ .targets = &targets } }, 1);
+    const grants = try exactApprovalLocalGrants(input, arena, call, &.{}, .{ .vision_paths = .{ .targets = &targets } }, .{ .kind = .none, .shell_epoch = 1 });
 
     try std.testing.expectEqual(@as(usize, 1), grants.len);
     try std.testing.expectEqual(@as(u64, 1), grants[0].shell_epoch);
@@ -4987,6 +5084,73 @@ test "interactive file admission passes its canonical grant offer to the prompte
             expected_grant.target_path,
             observed_grant.target_path,
         );
+    }
+}
+
+test "always file admission keeps its grant offer across repeated revalidations" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{ .decision = .always };
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    const arguments_json = try arena.print(
+        "{{\"path\":\"{s}/note.txt\",\"content\":\"hello\\n\"}}",
+        .{workspace},
+    );
+    const call: ToolCall = .{
+        .id = "write-always",
+        .name = "write_file",
+        .arguments_json = arguments_json,
+    };
+
+    const initial = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.always, initial.decision);
+    const initial_grants = initial.execution_authority.?.file_mutation.grant_offer.?.grants;
+
+    const first_recheck = try revalidateLiveActionPermissionOutcome(
+        input,
+        arena,
+        call,
+        .ask,
+        &.{},
+        initial.execution_authority.?,
+        initial.human_approval,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.always, first_recheck.decision);
+    try std.testing.expect(first_recheck.execution_authority.?.file_mutation.grant_offer != null);
+
+    const second_recheck = try revalidateLiveActionPermissionOutcome(
+        input,
+        arena,
+        call,
+        .ask,
+        &.{},
+        first_recheck.execution_authority.?,
+        first_recheck.human_approval,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.always, second_recheck.decision);
+    const kept_grants = second_recheck.execution_authority.?.file_mutation.grant_offer.?.grants;
+    try std.testing.expectEqual(initial_grants.len, kept_grants.len);
+    for (initial_grants, kept_grants) |expected_grant, kept_grant| {
+        try std.testing.expectEqualStrings(expected_grant.tool_name, kept_grant.tool_name);
+        try std.testing.expectEqualStrings(expected_grant.target_path, kept_grant.target_path);
     }
 }
 
@@ -8112,6 +8276,96 @@ test "a review gets a reader for stored answers only when a result store exists"
     try std.testing.expect((try storedResultsFor(input, arena_state.allocator())) == null);
     input.review_result_store = .{ .result_dir = "/tmp/fx-review-result-store" };
     try std.testing.expect((try storedResultsFor(input, arena_state.allocator())) != null);
+}
+
+fn retargetWorkspaceFixture(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    try tmp.dir.createDirPath(std.testing.io, "workspace/a");
+    try tmp.dir.createDirPath(std.testing.io, "workspace/b");
+    try tmp.dir.symLink(std.testing.io, "a", "workspace/link", .{ .is_directory = true });
+    return io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+}
+
+fn retargetWorkspaceLink(tmp: *std.testing.TmpDir) !void {
+    try tmp.dir.deleteFile(std.testing.io, "workspace/link");
+    try tmp.dir.symLink(std.testing.io, "b", "workspace/link", .{ .is_directory = true });
+}
+
+test "a once approval of a/ never covers b/ after a looser-policy recheck (yolo then ask)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try retargetWorkspaceFixture(alloc, &tmp);
+    defer alloc.free(workspace);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{ .decision = .once };
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    const call: ToolCall = .{
+        .id = "retarget-write",
+        .name = "write_file",
+        .arguments_json = try arena.print("{{\"path\":\"{s}/link/note.txt\",\"content\":\"x\\n\"}}", .{workspace}),
+    };
+    const initial = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try retargetWorkspaceLink(&tmp);
+    const first = try revalidateLiveActionPermissionOutcome(input, arena, call, .yolo, &.{}, initial.execution_authority.?, initial.human_approval);
+    try std.testing.expect(!first.decision.isDenied());
+    const second = try revalidateLiveActionPermissionOutcome(input, arena, call, .ask, &.{}, first.execution_authority.?, first.human_approval);
+    _ = second;
+    // The person approved only workspace/a/note.txt; b/note.txt in ask mode must ask again.
+    try std.testing.expectEqual(@as(usize, 2), recording.calls);
+}
+
+test "no-op write under a read ask rule keeps once approval across one recheck" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var f = try tmp.dir.createFile(std.testing.io, "secret.txt", .{});
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io, "same\n");
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{ .decision = .once };
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("read_file"),
+        .pattern = @constCast("*"),
+        .action = .ask,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const call: ToolCall = .{
+        .id = "noop-read-ask",
+        .name = "write_file",
+        .arguments_json = try arena.print("{{\"path\":\"{s}/secret.txt\",\"content\":\"same\\n\"}}", .{workspace}),
+    };
+    const initial = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    const first = try revalidateLiveActionPermissionOutcome(
+        input,
+        arena,
+        call,
+        .ask,
+        &.{},
+        initial.execution_authority.?,
+        initial.human_approval,
+    );
+    try std.testing.expect(!first.decision.isDenied());
+    try std.testing.expectEqual(ToolPermissionDecision.once, first.decision);
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
 }
 
 test "the review request carries the environment a shell command runs in" {
