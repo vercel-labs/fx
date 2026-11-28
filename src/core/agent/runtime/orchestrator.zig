@@ -9297,10 +9297,14 @@ fn processQueuedPromptLoop(
                     try deps.push_text(deps.ctx, .{ .operational = "\n" });
                 }
             }
-            // A resend after a reply cut while it reasoned names its lower
-            // effort itself, so that effort applies; the next step names the
-            // anchor again.
-            if (effort_anchor) |anchor| if (resend_effort == null) {
+            // The anchor and the saved updates go only to a model that takes
+            // effort changes as messages: a subagent's request can go on on
+            // another model after a wait (`applyContinuedSelection`), and that
+            // model gets its own effort (D103). A resend after a reply cut
+            // while it reasoned names its lower effort itself, so that effort
+            // applies; the next step names the anchor again.
+            const takes_effort_updates = deps.agent_stream_provider.effortUpdates(gateway_model);
+            if (effort_anchor) |anchor| if (resend_effort == null and takes_effort_updates) {
                 provider_opts = model_capabilities.withEffortUpdates(request_capabilities, provider_opts, anchor);
             };
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
@@ -9496,7 +9500,8 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
                             .runtime_context = try runtimeContextTexts(arena, runtime_context.messages()),
-                            .reasoning_anchor = if (effort_anchor) |*anchor| anchor.label() else null,
+                            // The effort this compaction's request named.
+                            .reasoning_anchor = if (!takes_effort_updates) null else if (effort_anchor) |*anchor| anchor.label() else null,
                         },
                     });
                     // The turn's duration leaves out the compaction, as its

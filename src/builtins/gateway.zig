@@ -204,6 +204,9 @@ pub fn buildAgentRequest(
     var provider_options = request.provider_options;
     provider_options.cache_markers = vercel_model_policy.cacheMarkers(request.model);
     provider_options.single_system_message = vercel_model_policy.singleSystemMessage(request.model);
+    // An effort update is an OpenAI message: no other model gets one, even
+    // when the caller left the anchor's options on (D103).
+    if (!vercel_model_policy.effortUpdates(request.model)) provider_options.effort_updates = null;
 
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
@@ -428,6 +431,34 @@ test "agent request builder keeps default reasoning silent and emits output limi
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("providerOptions") == null);
+}
+
+test "agent request builder sends effort updates only to a model that takes them (D103)" {
+    const alloc = std.testing.allocator;
+    const effort = shared_types.ReasoningEffort.literal;
+    const listed = [_]shared_types.ReasoningEffort{ effort("low"), effort("high") };
+    const messages = [_]shared_types.ChatMessage{
+        .{ .role = .user, .content = "earlier" },
+        .{ .role = .assistant, .content = "answer" },
+        .{ .role = .user, .content = "question", .effort_update = effort("low") },
+    };
+    for ([_]struct { model: []const u8, updates: usize }{
+        .{ .model = "openai/gpt-6.1-sol", .updates = 1 },
+        .{ .model = "anthropic/claude-fable-5.2", .updates = 0 },
+        .{ .model = "openai/gpt-5.6-luna", .updates = 0 },
+    }) |case| {
+        var options = resolveGatewayProviderOptions(case.model, .auto, false);
+        options.effort_updates = .{ .listed = .fromSlice(&listed) };
+        const body = try buildAgentRequest(alloc, .{
+            .model = case.model,
+            .instructions = &.{},
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = options,
+        });
+        defer alloc.free(body);
+        try std.testing.expectEqual(case.updates, std.mem.count(u8, body, "reasoningEffortUpdate"));
+    }
 }
 
 test "agent request builder sends stable cache markers in each family's syntax" {

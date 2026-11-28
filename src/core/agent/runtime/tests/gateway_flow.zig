@@ -3538,6 +3538,101 @@ test "a GPT-6 resend after an empty cut reply sends the lowered effort alone, an
     try expectSavedEffort(&hooks, "medium", "medium");
 }
 
+const switch_claude = "anthropic/claude-fable-5.2";
+const switch_other_gpt6 = "openai/gpt-6-sol";
+const switch_overrides = [_]ModelCapabilityOverride{
+    .{ .model = "openai/gpt-6.1-sol", .capabilities = .{ .context_window = 400_000, .reasoning_efforts = .fromSlice(&gpt6_efforts) } },
+    .{ .model = switch_other_gpt6, .capabilities = .{ .context_window = 400_000, .reasoning_efforts = .fromSlice(&gpt6_efforts) } },
+    .{ .model = switch_claude, .capabilities = .{ .context_window = 400_000, .reasoning_efforts = .fromSlice(&gpt6_efforts) } },
+};
+const retry_after_credits = [_]runtime_deps.OutOfCreditsChoice{.retry};
+
+/// A subagent turn on `from` that asks for low after a turn at high. Its
+/// first request runs out of credits, the person picks `to` on the card, and
+/// the request goes on there (`orchestrator.zig` applyContinuedSelection).
+fn runSwitchedSubagentTurn(gateway: *FakeGateway, hooks: *FakeAgentRuntimeDeps, from: []const u8, to: []const u8) !void {
+    var history = [_]HistoryTurn{turnThatAsked(types.ReasoningEffort.literal("high"))};
+    hooks.available_capability_overrides = &switch_overrides;
+    hooks.capability_overrides = &switch_overrides;
+    hooks.out_of_credits_choices = &retry_after_credits;
+    hooks.continue_model = to;
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    config.origin = .subagent;
+    config.effort = types.ReasoningEffort.literal("low");
+    var job = fixture.job();
+    job.model = @constCast(from);
+    job.history = &history;
+    try runFakePrompt(gateway, hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try std.testing.expectEqualStrings(from, gateway.request_models.items[0]);
+    try std.testing.expectEqualStrings(to, gateway.request_models.items[1]);
+}
+
+test "a GPT-6 subagent turn that goes on on Claude sends Claude its own effort and no update (D103)" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .forbidden, .err_body = out_of_credits_body },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    try runSwitchedSubagentTurn(&gateway, &hooks, "openai/gpt-6.1-sol", switch_claude);
+
+    try expectBodyContains(&gateway, 0, "\"reasoning\":\"high\"");
+    try expectBodyContains(&gateway, 0, effort_update_low);
+    try expectBodyContains(&gateway, 1, "\"reasoning\":\"low\"");
+    try expectBodyNotContains(&gateway, 1, "\"reasoning\":\"high\"");
+    try expectBodyNotContains(&gateway, 1, "reasoningEffortUpdate");
+}
+
+test "a Claude subagent turn that goes on on GPT-6 sends its own effort, as before (D103)" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .forbidden, .err_body = out_of_credits_body },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    try runSwitchedSubagentTurn(&gateway, &hooks, switch_claude, "openai/gpt-6.1-sol");
+
+    for (0..2) |index| {
+        try expectBodyContains(&gateway, index, "\"reasoning\":\"low\"");
+        try expectBodyNotContains(&gateway, index, "reasoningEffortUpdate");
+    }
+    try expectSavedEffort(&hooks, null, null);
+}
+
+test "a GPT-6 subagent turn that goes on on another GPT-6 model keeps the anchor and its update (D103)" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .forbidden, .err_body = out_of_credits_body },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    try runSwitchedSubagentTurn(&gateway, &hooks, "openai/gpt-6.1-sol", switch_other_gpt6);
+
+    const order = [_][]const u8{ "earlier answer", effort_update_low, "user prompt" };
+    for (0..2) |index| {
+        try expectBodyContains(&gateway, index, "\"reasoning\":\"high\"");
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[index], "reasoningEffortUpdate"));
+        try expectBodyContainsInOrder(&gateway, index, &order);
+    }
+    try expectSavedEffort(&hooks, "low", "low");
+}
+
 test "a recovered GPT-6 turn sends the update its first attempt saved, not the effort set since (D103)" {
     const alloc = std.testing.allocator;
     const model = "openai/gpt-6.1-sol";

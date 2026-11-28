@@ -2273,7 +2273,9 @@ not drop the cached prompt):
   - **Not covered:** the one resend at a lower effort after a reply cut
     while it reasoned names its own effort with no updates, as before; the
     next step names the anchor again. fx's own summary request keeps its
-    least effort. Other models name the turn's effort, as before.
+    least effort. Other models name the turn's effort, as before, and so
+    does each request a turn sends to another model: a subagent's request
+    that goes on on Claude after a wait gets its own effort and no update.
   - **Older fx:** an fx from before D103 leaves the item out (D17) and
     names each turn's effort, as it did.
 
