@@ -142,6 +142,7 @@ pub const keys = [_]Key{
     .{ .name = "provider_strict", .where = .project_safe, .kind = .boolean, .description = "Send AI Gateway requests only to the providers in provider_order" },
     .{ .name = "providers", .where = .profile, .kind = .object, .map = true, .top_level_only = true, .description = "Named custom model connections" },
     .{ .name = "review_model", .where = .profile, .kind = .string, .description = "The AI Gateway model that reviews actions in auto mode" },
+    .{ .name = "rex_session_rename", .where = .profile, .kind = .boolean, .description = "In a Rex tab, name the Rex session after the chat's title when Rex lets agents rename sessions" },
     .{ .name = "sandbox", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "session_titles", .where = .profile, .kind = .boolean, .description = "Name each session from its first prompt" },
     .{ .name = "shortcuts", .where = .profile, .kind = .shortcuts, .map = true, .top_level_only = true, .description = "Personal key shortcuts: a key chord such as ctrl+1 or alt+m runs one fx command line, such as \"/fast\", or a saved model preset" },

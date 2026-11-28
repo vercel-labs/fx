@@ -286,6 +286,8 @@ pub const StartupState = struct {
     session_title_generation: bool = true,
     /// Resolved `cache_warming` preference.
     cache_warming: bool = true,
+    /// Resolved `rex_session_rename` preference.
+    rex_session_rename: bool = true,
     notification_turn_end: bool = false,
     /// `experimental.workspace_capture`: capture the repository at each
     /// turn's start and end.
@@ -972,6 +974,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.statusline_workspace = settings.statusline_workspace orelse false;
     state.session_title_generation = settings.session_titles orelse true;
     state.cache_warming = settings.cache_warming orelse true;
+    state.rex_session_rename = settings.rex_session_rename orelse true;
     state.personal_shortcuts = if (settings.shortcuts) |map| map.* else .{};
     const sound_override = soundEnvOverride();
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;

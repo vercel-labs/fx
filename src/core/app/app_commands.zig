@@ -1956,6 +1956,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
     if (comptime @hasField(App, "session_title_generation")) snapshot.session_titles = app.session_title_generation;
+    if (comptime @hasField(App, "rex_session_rename_enabled")) snapshot.rex_session_rename = app.rex_session_rename_enabled;
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
     if (comptime @hasField(App, "prompt_history")) snapshot.prompt_history = app.prompt_history.enabled;
     if (comptime @hasDecl(App, "notificationPreferences")) {
@@ -2094,6 +2095,24 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, agents.screenAgentOf(app), change.value),
         .sound_level => try handleNotificationsCommand(app, change.value),
         .prompt_history => try session_commands.Commands(@TypeOf(app.*)).handleHistory(app, change.value),
+        .rex_session_rename => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            const ChangeApp = @TypeOf(app.*);
+            const current = if (comptime @hasField(ChangeApp, "rex_session_rename_enabled"))
+                app.rex_session_rename_enabled
+            else
+                true;
+            const runtime_changed = enabled != current;
+            if (comptime @hasField(ChangeApp, "rex_session_rename_enabled")) {
+                if (runtime_changed) app.rex_session_rename_enabled = enabled;
+            }
+            try persistUserPreferences(
+                app,
+                "Rex session names",
+                .{ .rex_session_rename = enabled },
+                runtime_changed,
+            );
+        },
     }
 }
 

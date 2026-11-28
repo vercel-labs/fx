@@ -131,6 +131,7 @@ pub const UserSettingsPatch = struct {
     provider_strict: ?bool = null,
     context: ?bool = null,
     cache_warming: ?bool = null,
+    rex_session_rename: ?bool = null,
     /// `experimental.sandbox_execution`, the profile-only switch for sandboxed shell runs.
     experimental_sandbox_execution: ?bool = null,
     /// One `tool_placement.<tool>` entry.
@@ -169,6 +170,7 @@ pub const UserSettingsPatch = struct {
             self.provider_strict == null and
             self.context == null and
             self.cache_warming == null and
+            self.rex_session_rename == null and
             self.experimental_sandbox_execution == null and
             self.tool_placement == null and
             self.shortcut == null and
@@ -1451,6 +1453,7 @@ fn applyUserPatchToRoot(
     if (patch.provider_strict) |value| application.changed = try putBool(arena, &root.object, "provider_strict", value) or application.changed;
     if (patch.context) |value| application.changed = try putBool(arena, &root.object, "context", value) or application.changed;
     if (patch.cache_warming) |value| application.changed = try putBool(arena, &root.object, "cache_warming", value) or application.changed;
+    if (patch.rex_session_rename) |value| application.changed = try putBool(arena, &root.object, "rex_session_rename", value) or application.changed;
     if (patch.tool_placement) |entry| {
         const placements = if (root.object.getPtr("tool_placement")) |value| blk: {
             if (value.* != .object) return error.InvalidSettingsFormat;
@@ -1627,7 +1630,7 @@ fn cleanupLegacyWorkspacePreferences(
 
 /// The settings paths a patch from `fx config set` or `unset` writes that the
 /// `/settings` cleanup above doesn't already cover.
-fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
+fn configWrittenPaths(patch: UserSettingsPatch) [10]?[]const u8 {
     return .{
         if (patch.theme != null) "theme" else null,
         if (patch.auto_upgrade != null) "auto_upgrade" else null,
@@ -1637,6 +1640,7 @@ fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
         if (patch.provider_strict != null) "provider_strict" else null,
         if (patch.context != null) "context" else null,
         if (patch.cache_warming != null) "cache_warming" else null,
+        if (patch.rex_session_rename != null) "rex_session_rename" else null,
         patch.remove,
     };
 }

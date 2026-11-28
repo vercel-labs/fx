@@ -50,6 +50,7 @@ const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
 const sandbox_policy = @import("core/runner/runner.zig");
 const app_trust_runtime = @import("core/app/app_trust_runtime.zig");
 const workspace_trust = @import("core/workspace_trust/workspace_trust.zig");
+const rex_rename = @import("core/rex_rename/rex_rename.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
 const app_permission_runtime = @import("core/app/app_permission_runtime.zig");
 const app_process_runtime = @import("core/app/app_process_runtime.zig");
@@ -590,6 +591,8 @@ const App = struct {
     ),
     /// Folder access gate state; `Gate` owns its state and `app_trust_runtime` owns the app glue.
     trust: workspace_trust.gate.Gate = .{},
+    /// Names the Rex session after the main chat's title, in a Rex tab.
+    rex_rename: rex_rename.Renamer = .{},
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     /// Personal keyboard shortcuts from the profile, reloaded at turn ends.
@@ -705,6 +708,9 @@ const App = struct {
     /// Resolved `session_titles` preference: generate a model-written session
     /// title from the first prompt of a fresh session.
     session_title_generation: bool = true,
+    /// Resolved `rex_session_rename` preference: name the Rex session after
+    /// the main chat's title when Rex lets agents rename sessions.
+    rex_session_rename_enabled: bool = true,
     /// Resolved `cache_warming` preference: ping a waiting Claude
     /// conversation's prompt cache so it stays alive.
     cache_warming: bool = true,
@@ -1104,6 +1110,7 @@ const App = struct {
         main_agent.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(main_agent);
         self.upgrader.stopForProcessExit();
+        self.rex_rename.stopForProcessExit();
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
         main_agent.managed_executions.terminateForProcessExit();
@@ -1189,6 +1196,7 @@ const App = struct {
         main_agent.managed_executions.shutdown();
         self.terminal_client.closeOwnedTerminals();
         self.upgrader.stop();
+        self.rex_rename.deinit();
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
         shutdown_trace.mark("background_stops_requested");
@@ -3531,6 +3539,7 @@ const App = struct {
         }
         if (comptime host_profile.durable_sessions) {
             SessionAppRuntime.collectInterruptedTurnHint(self);
+            SessionAppRuntime.renameRexSessionAfterFirstFrame(self);
             try SessionAppRuntime.pollPendingInputRestore(self, self.screenAgent());
         }
         InputSubmitRuntime.collectPendingSubmissionFacts(self, self.screenAgent());
@@ -5805,6 +5814,7 @@ test {
     _ = @import("core/mcp/tool_lookup.zig");
     _ = @import("core/recovery/recovery.zig");
     _ = @import("core/workspace_trust/workspace_trust.zig");
+    _ = @import("core/rex_rename/rex_rename.zig");
     _ = @import("core/app/app_trust_runtime.zig");
     _ = @import("core/app/personal_shortcut_runtime.zig");
     _ = @import("ui/footer/trust_prompt_ui.zig");
