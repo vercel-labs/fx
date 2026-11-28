@@ -356,6 +356,15 @@ pub fn deniedHint(cause: DeniedCause) []const u8 {
     };
 }
 
+/// What the user can do about `cause`, as notice tree rows; the TUI notice shows these, the CLI keeps `deniedHint`.
+pub fn deniedActionRows(cause: DeniedCause) []const u8 {
+    return switch (cause) {
+        .credit_used_up => "└ This API key spends only Token Pass credit. Wait for the next billing period, or use a standard API key or /login.",
+        .scoped_key_model => "└ This API key works only with Token Pass models at standard speed. Choose one under Token Pass in /models, or use a standard API key.",
+        .no_active_pass => "├ \x1b]8;;" ++ dashboard_url ++ "\x1b\\Subscribe to Token Pass\x1b]8;;\x1b\\\n└ Or switch to the team that has Token Pass: /login",
+    };
+}
+
 /// A team with Token Pass whose catalog marks `ids`, for tests.
 fn testTeam(ids: []const []const u8) Team {
     var team: Team = .{ .has_pass = true };
@@ -510,6 +519,13 @@ test "token pass: denied causes come from the documented messages" {
 test "token pass: the hints point at the picker and the dashboard" {
     try std.testing.expect(std.mem.find(u8, deniedHint(.scoped_key_model), "Token Pass in /models") != null);
     try std.testing.expect(std.mem.find(u8, deniedHint(.no_active_pass), dashboard_url) != null);
+}
+
+test "denied action rows never read as a denial" {
+    const causes = [_]DeniedCause{ .credit_used_up, .scoped_key_model, .no_active_pass };
+    for (causes) |cause| {
+        try std.testing.expect(deniedCause(deniedActionRows(cause)) == null);
+    }
 }
 
 test "token pass: team notice resolves credits, catalog marks, and unknown safely" {

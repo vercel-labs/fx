@@ -5,7 +5,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { logLines, rootSessionIds, savedSessionIds } from "./saved-sessions";
 import {
   CHILD_MARKER,
@@ -26,7 +26,6 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 90_000;
@@ -131,6 +130,17 @@ const LAST_TWO_FAILED: StoryStep[] = [
 const HERE_DOCUMENT: StoryStep[] = [
   { at: 0, calls: [sh("cat > notes.md <<'EOF'\nThe model's notes\nEOF\nwc -l notes.md")] },
   { at: 1, text: "The notes are saved." },
+];
+
+// A command with a space after it, as a real session's model sent it: first
+// long enough that its run returns while it still runs, then quick. It
+// searches the test's own saved sessions.
+const SPACED_COMMAND = `cd ~/.fx/sessions/v2; grep -l -i "Chief Of Staff" */log.jsonl 2>/dev/null | head; `;
+const SPACED_COMMANDS: StoryStep[] = [
+  { at: 0, calls: [{ name: "shell", input: { action: "run", command: `sleep 2; ${SPACED_COMMAND}`, yield_time_ms: 500 } }] },
+  { at: 1, calls: [{ name: "shell", input: { action: "interact", session_id: "shell-1", yield_time_ms: 30_000 } }] },
+  { at: 2, text: "I will search once more.", calls: [{ name: "shell", input: { action: "run", command: SPACED_COMMAND, yield_time_ms: 120_000 } }] },
+  { at: 3, text: "No session log names it." },
 ];
 
 // Commands whose rows name only the programs they run: env unsets two
@@ -330,7 +340,7 @@ async function runStory(
   await session.sendText(options.prompt);
   // The reply's last words show before its turn ends, and the turn-end rows
   // and the saved turn come after them.
-  await session.waitForPane((pane) => pane.includes(options.finalText) && turnSettled(pane), TIMEOUT);
+  await session.waitForReplyAndTurnEnd(options.finalText, TIMEOUT);
   const pane = await session.waitForComposer(TIMEOUT);
   return { root, gateway, session, pane, tape };
 }
@@ -667,7 +677,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("Edit the readme.");
-    await session.waitForPane((pane) => pane.includes("STORY_BAD_REQUEST") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("STORY_BAD_REQUEST", TIMEOUT);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Read it again.");
     await session.waitForText("The readme says hello.", TIMEOUT);
@@ -878,7 +888,7 @@ test.skipIf(!tmuxAvailable())(
     const running = "● Running +6, tail, sh check.sh, sh wait.sh · 12 calls";
     expect(paneLines(await session.waitForText(running, TIMEOUT))).toContain(running);
     writeFileSync(join(root.workspace, "released"), "");
-    await session.waitForPane((pane) => pane.includes("The desktop app has two source files.") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("The desktop app has two source files.", TIMEOUT);
     const ran = "● Ran +6, tail, sh check.sh, sh wait.sh · 12 calls ✓";
     const expectRow = (pane: string, row: string) => {
       expect(paneLines(pane).filter((line) => line.includes(" calls"))).toEqual([row]);
@@ -1021,7 +1031,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("save the notes in a session");
     // While the wait runs, its row names the same programs.
     await session.waitForText("Waiting for cat, sleep, printf", TIMEOUT);
-    await session.waitForPane((pane) => pane.includes("The session saved the notes.") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("The session saved the notes.", TIMEOUT);
     const expectNames = (lines: string[]) => {
       // The session's row names the programs of its launch command, and says
       // it ran once the check found the command ended; the document's text
@@ -1080,7 +1090,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("write the files");
-    await session.waitForPane((pane) => pane.includes("The files are written.") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("The files are written.", TIMEOUT);
     const expectNames = (lines: string[]) => {
       // Each row names its file, and two files with one name stay two rows.
       expect(treeRows(group(lines, /^● Wrote files/))).toEqual([
@@ -1328,7 +1338,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("ask the reviewer");
     await session.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), TIMEOUT);
     sendRead!();
-    await session.waitForPane((pane) => pane.includes("The reviewer is done.") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("The reviewer is done.", TIMEOUT);
 
     const expectOwnLine = (lines: string[]) => {
       // Main's calls share a group; the report is a line of its own after
@@ -1569,7 +1579,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("LAND_IT");
-    await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("LANDED", TIMEOUT);
     const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
     // One line for the waits and the messages they took; the report keeps
     // a line of its own.
@@ -1630,7 +1640,7 @@ async function landerWaitStory(prompt: string, calls: Array<() => Response>) {
   sessions.push(session);
   await session.waitForComposer();
   await session.sendText(prompt);
-  await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
+  await session.waitForReplyAndTurnEnd("LANDED", TIMEOUT);
   const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
   expect(waitsBegun()).toBe(3);
 
@@ -1744,7 +1754,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendInterruptEscapePair(TIMEOUT);
     await session.waitForPane(() => readFileSync(trace, "utf8").includes("event=interrupt_persisted"), TIMEOUT);
     releaseReport();
-    await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("LANDED", TIMEOUT);
     const live = toolLines(await session.waitForComposer(TIMEOUT));
     const liveTranscript = await fullTranscriptOf(session);
 
@@ -1818,7 +1828,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("TWO_AGENTS");
-    await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("LANDED", TIMEOUT);
     const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
     // The last wait's row waits for scout only, so it counts scout's
     // message, and lander's keeps its own line.
@@ -1899,6 +1909,47 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("Both files export their functions.", TIMEOUT);
     expectJoined(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a command sent with a space after it shows its short form while it runs, after it ends, and after resume",
+  async () => {
+    const { root, gateway, session, pane, tape } = await runStory(SPACED_COMMANDS, {
+      prompt: "which session did I rename?",
+      finalText: "No session log names it.",
+      record: true,
+    });
+    const rows = (lines: string[]) => lines.filter((line) => /^(●|├|└) /.test(line));
+    const live = rows(paneLines(pane));
+    expect(live).toEqual(["● Ran sleep, grep · 2 calls ✓", "● Ran grep ✓"]);
+
+    // Every frame fx drew names the command by its steps, also while it ran.
+    const replay = await runFx(["replay", tape!, "--frames"], { cwd: root.workspace, env: { HOME: root.home } });
+    expect(replay.code).toBe(0);
+    const frameRows = rows(replay.stdout.split("\n").map((line) => line.replace(/^\|/, "").replace(/\|$/, "").trimEnd()));
+    expect(frameRows.some((row) => /^● (Running|Still running|Waiting for) sleep, grep\b/.test(row))).toBe(true);
+    expect(frameRows.filter((row) => row.includes("Chief Of Staff"))).toEqual([]);
+
+    // Ctrl+O still shows the whole command.
+    await session.sendKeys("C-o");
+    const full = await session.waitForText("esc close", TIMEOUT);
+    expect(full).toContain(`grep -l -i "Chief Of Staff" */log.jsonl 2>/dev/null | head;`);
+    await session.sendKeys("C-o");
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("No session log names it.", TIMEOUT);
+    expect(rows(paneLines(await resumed.waitForComposer(TIMEOUT)))).toEqual(live);
   },
   TIMEOUT * 3,
 );

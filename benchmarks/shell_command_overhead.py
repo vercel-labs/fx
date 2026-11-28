@@ -30,6 +30,9 @@ ALIASES = 400
 FUNCTIONS = 300
 PATH_EDITS = 40
 FINAL_TEXT = "SHELL_OVERHEAD_COMPLETE"
+TRACE_SCOPES = "mcp-call,mcp-owner,mcp"
+BRIDGE_START_MARKER = "[mcp-call] bridge listening socket="
+MCP_OWNER_START_MARKER = "[mcp-owner] owner started pid="
 
 
 def startup_file(kind, marker, delay):
@@ -48,11 +51,13 @@ def startup_file(kind, marker, delay):
     return "\n".join(lines) + "\n"
 
 
-def write_home(home, marker, delay):
+def write_home(home, marker, delay, with_mcp=False):
     (home / ".fx").mkdir(parents=True, mode=0o700)
     # Background title generation would consume one fixture response and shift
     # the call accounting, so the fixture profile keeps titles off.
     (home / ".fx/settings.json").write_text(json.dumps({"provider": "gateway", "model": "openai/gpt-5.5", "max_agent_steps": 0, "session_titles": False}))
+    if with_mcp:
+        (home / ".fx/mcp.json").write_text(json.dumps({"mcpServers": {"bench": {"command": "/bin/true"}}}))
     for index in range(PATH_EDITS):
         (home / f"bench-path/d{index:02d}").mkdir(parents=True)
     (home / marker).mkdir()
@@ -69,6 +74,32 @@ def line_count(path):
         return len(path.read_text().splitlines())
     except FileNotFoundError:
         return 0
+
+
+def count_bridge_coverage(trace_path):
+    if not trace_path.exists():
+        return {"bridge_registrations": 0, "mcp_owner_starts": 0}
+    bridge_registrations = 0
+    mcp_owner_starts = 0
+    for line in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if BRIDGE_START_MARKER in line:
+            bridge_registrations += 1
+        if MCP_OWNER_START_MARKER in line:
+            mcp_owner_starts += 1
+    return {
+        "bridge_registrations": bridge_registrations,
+        "mcp_owner_starts": mcp_owner_starts,
+    }
+
+
+def check_bridge_coverage(coverage, calls):
+    expected = calls + 1
+    if coverage["bridge_registrations"] == expected:
+        return True, None
+    return False, (
+        f"expected {expected} bridge_registrations in trace, "
+        f"got {coverage['bridge_registrations']}"
+    )
 
 
 def tool_result(body, call_id):
@@ -108,6 +139,7 @@ def main():
     parser.add_argument("--calls", type=int, default=100)
     parser.add_argument("--rc-delay", type=float, default=0.2, help="seconds each startup-file load sleeps")
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--with-mcp", action="store_true", help="configure an MCP server in ~/.fx/mcp.json and verify the fx mcp call bridge runs")
     args = parser.parse_args()
     if args.calls < 1:
         parser.error("--calls must be at least 1")
@@ -120,7 +152,7 @@ def main():
     home, workspace = root / "home", root / "workspace"
     marker = f"fx-bench-marker-{secrets.token_hex(4)}"
     marker_dir = str(home / marker)
-    write_home(home, marker, args.rc_delay)
+    write_home(home, marker, args.rc_delay, with_mcp=args.with_mcp)
     workspace.mkdir()
     (workspace / "README.txt").write_text("shell command overhead fixture\n")
     (workspace / "src").mkdir()
@@ -178,6 +210,9 @@ def main():
         env.pop(key, None)
     base_url = f"http://127.0.0.1:{server.server_port}"
     env.update(HOME=str(home), AI_GATEWAY_API_KEY="fixture-key", FX_GATEWAY_BASE_URL=base_url, FX_TEST_GATEWAY_CHAT_URL=base_url + "/chat", FX_TEST_GATEWAY_MODELS_URL=base_url + "/coding-agent/v1/models", FX_MODEL="openai/gpt-5.5", FX_MAX_AGENT_STEPS="0")
+    trace_log = root / "fx-trace.log"
+    if args.with_mcp:
+        env.update(FX_TRACE_LOG=str(trace_log), FX_TRACE_SCOPES=TRACE_SCOPES)
 
     timed_out = False
     with (root / "stdout.json").open("w") as out, (root / "stderr.log").open("w") as err:
@@ -208,6 +243,12 @@ def main():
         and [call.get("command_result", {}).get("command") for call in calls] == expected_commands
         and all(call.get("name") == "shell" and call.get("status") == "success" and call.get("command_result", {}).get("exit_code") == 0 for call in calls)
     )
+    expected_calls = args.calls + 1
+    coverage = count_bridge_coverage(trace_log) if args.with_mcp else None
+    coverage_ok = True
+    coverage_error = None
+    if args.with_mcp:
+        coverage_ok, coverage_error = check_bridge_coverage(coverage, args.calls)
     completed = (
         not timed_out
         and code == 0
@@ -216,6 +257,7 @@ def main():
         and ls_failures == 0
         and marker_present
         and reported_ok
+        and coverage_ok
     )
 
     kinds = sorted({line.split(" ", 1)[0] for line in rc_log.read_text().splitlines()}) if rc_log.exists() else []
@@ -223,6 +265,7 @@ def main():
     report = {
         "binary": binary,
         "binary_sha256": binary_sha256,
+        "with_mcp": args.with_mcp,
         "calls": args.calls,
         "rc_delay_ms": round(args.rc_delay * 1000, 3),
         "startup_file_contents": {"aliases": ALIASES, "functions": FUNCTIONS, "path_edits": PATH_EDITS},
@@ -242,6 +285,12 @@ def main():
         "per_call_ms": summarize(per_call),
         "path_probe_ms": round((arrivals[args.calls + 1] - arrivals[args.calls]) * 1000, 3) if len(arrivals) > args.calls + 1 else None,
     }
+    if args.with_mcp:
+        report["expected_bridge_registrations"] = expected_calls
+        report["bridge_registrations"] = coverage["bridge_registrations"]
+        report["mcp_owner_starts"] = coverage["mcp_owner_starts"]
+        if coverage_error is not None:
+            report["coverage_error"] = coverage_error
     (root / "measurements.json").write_text(json.dumps(report, indent=2))
     printed = dict(report, per_call_ms={k: v for k, v in report["per_call_ms"].items() if k != "samples"})
     print(json.dumps(printed, indent=2))

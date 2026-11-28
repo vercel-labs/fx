@@ -91,6 +91,7 @@ const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const tool_runtime = @import("../core/tooling/tool_runtime.zig");
 const command_output_content = @import("../core/tooling/command_output_content.zig");
 const builtin_tools = @import("../builtins/tools.zig");
+const shell_projection = @import("../builtins/shell_projection.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
     @import("../builtins/gateway.zig")
 else
@@ -282,8 +283,16 @@ const RouteView = struct {
     effort: types.ReasoningEffort,
     fast_mode: bool,
     ultrafast_mode: bool,
-    credential_source: ?types.CredentialSource,
+};
+
+/// The sign-in one tool call sends. A refresh publishes a new credential and
+/// frees the server's previous one (`src/acp/server.zig` `adoptServerCredential`),
+/// so a call keeps its own copy while it runs (`src/acp/prompt.zig` "a tool call
+/// keeps the sign-in a refresh replaces", "a refresh and a tool call share the
+/// server's sign-in"), and a subagent's turn borrows the copy its run owns.
+const ToolSignIn = struct {
     api_key: []const u8,
+    credential_source: ?types.CredentialSource,
     account_id: ?[]const u8,
     gateway_team: ?[]const u8,
 };
@@ -344,10 +353,22 @@ const ModelRoute = struct {
     }
 };
 
+/// Gives each `session/prompt` its own id for remote setup's decline marks.
+/// It is not the trace's turn counter, which the worker uses, so tracing is unchanged.
+var prompt_turn_ids = std.atomic.Value(u64).init(0);
+
+fn nextPromptTurnId() u64 {
+    // WASM has no 64-bit atomics. A WASM host never runs remote setup (A4), so one id is enough.
+    if (comptime std_builtin.target.os.tag == .wasi) return 1;
+    return prompt_turn_ids.fetchAdd(1, .seq_cst) + 1;
+}
+
 const AcpContext = struct {
     alloc: Allocator,
     state: *server.ServerState,
     session_id: []const u8,
+    /// The turn of this `session/prompt` request (spec U4 decline marks).
+    user_turn_id: u64 = 0,
     /// Tool-call IDs already announced with a pending update, and where each
     /// card stands. Keys are owned copies of provider call ids so the ID
     /// stays stable from permission review through execution.
@@ -390,10 +411,6 @@ const AcpContext = struct {
             .effort = route.effort,
             .fast_mode = route.fast_mode,
             .ultrafast_mode = route.ultrafast_mode,
-            .credential_source = route.credential_source,
-            .api_key = route.api_key,
-            .account_id = route.account_id,
-            .gateway_team = route.gateway_team,
         };
         return .{
             .provider = session.provider,
@@ -401,10 +418,6 @@ const AcpContext = struct {
             .effort = session.effort,
             .fast_mode = session.fast_mode,
             .ultrafast_mode = session.ultrafast_mode,
-            .credential_source = session.credential_source,
-            .api_key = session.api_key,
-            .account_id = session.account_id,
-            .gateway_team = self.state.gateway_team,
         };
     }
 
@@ -545,12 +558,21 @@ const AcpContext = struct {
         defer if (parsed_arguments) |*parsed| parsed.deinit();
         const raw_input = if (parsed_arguments) |*parsed| parsed.value else null;
 
+        // A check for another agent's call says whose it is, so main's screen
+        // never shows it as main's own.
+        var titled: std.Io.Writer.Allocating = .init(arena);
+        defer titled.deinit();
+        const title = if (subagentCardAgent(call.id)) |agent| blk: {
+            try titled.writer.print("{s}: {s}", .{ agent, presentation.title });
+            break :blk titled.writer.buffered();
+        } else presentation.title;
+
         try self.published_tool_calls.ensureUnusedCapacity(self.alloc, 1);
         const owned_id = try self.alloc.dupe(u8, call.id);
         errdefer self.alloc.free(owned_id);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeToolCall(&out.writer, owned_id, name, presentation.title, kind, .pending, raw_input, presentation.meta);
+        try acp_types.writeToolCall(&out.writer, owned_id, name, title, kind, .pending, raw_input, presentation.meta);
         try self.sendUpdate(out.writer.buffered());
         self.published_tool_calls.putAssumeCapacity(
             owned_id,
@@ -620,6 +642,15 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
     }
 
+    fn sendToolCallOutputText(self: *AcpContext, tool_call_id: []const u8, text: []const u8) !void {
+        const plain = try stripAnsiAlloc(self.alloc, text);
+        defer if (plain.ptr != text.ptr) self.alloc.free(plain);
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writeToolCallContentUpdate(&out.writer, tool_call_id, plain);
+        try self.sendUpdate(out.writer.buffered());
+    }
+
     fn sendWebSearchProgress(self: *AcpContext, tool_call_id: []const u8, progress: types.WebSearchProgress) !void {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
@@ -654,25 +685,83 @@ const AcpContext = struct {
         self.markCardFinished(tool_call_id);
     }
 
-    fn toolContext(self: *AcpContext) tool_runtime.Context {
+    /// Copies the route this turn sends as `alloc`'s, in one step under the
+    /// lock a refresh holds while it replaces the server's credential.
+    fn toolSignIn(self: *AcpContext, alloc: Allocator) !ToolSignIn {
+        self.state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state.subagent_authority_mutex.unlock(io_mod.getIo());
+        return self.toolSignInLocked(alloc);
+    }
+
+    /// The same copy with `subagent_authority_mutex` already held. A turn with
+    /// a route copies the route it owns; every other turn copies the session's
+    /// sign-in the way `TurnSignIn.captureLocked` does.
+    fn toolSignInLocked(self: *AcpContext, alloc: Allocator) !ToolSignIn {
+        const session = if (self.state.active_session) |*active| active else unreachable;
+        if (self.route) |route| {
+            const api_key = try alloc.dupe(u8, route.api_key);
+            errdefer secret.zeroAndFree(alloc, api_key);
+            const account_id = if (route.account_id) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (account_id) |value| alloc.free(value);
+            const gateway_team = if (route.gateway_team) |value| try alloc.dupe(u8, value) else null;
+            return .{
+                .api_key = api_key,
+                .credential_source = route.credential_source,
+                .account_id = account_id,
+                .gateway_team = gateway_team,
+            };
+        }
+        const captured = try TurnSignIn.captureLocked(alloc, self.state, session);
+        return .{
+            .api_key = captured.api_key,
+            .credential_source = captured.credential_source,
+            .account_id = captured.account_id,
+            .gateway_team = captured.gateway_team,
+        };
+    }
+
+    /// The tool context a call uses, whose sign-in belongs to `alloc`.
+    ///
+    /// The shared web search runtime is configured inside the same locked
+    /// section, because a refresh publishes and re-points it under
+    /// `subagent_authority_mutex` (`server.publishRefreshedCredential`): a
+    /// configure after the unlock would overwrite that newer key with this
+    /// older copy.
+    fn toolContext(self: *AcpContext, alloc: Allocator) !tool_runtime.Context {
+        self.state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state.subagent_authority_mutex.unlock(io_mod.getIo());
+        const sign_in = try self.toolSignInLocked(alloc);
         const session = if (self.state.active_session) |*active| active else unreachable;
         const route = self.routeView(session);
         const provider_capabilities = self.state.cfg.provider_set.select(route.provider).capabilities;
-        // A subagent's copy of the route is its own: the shared runtime would keep a pointer into it
-        // past the turn. A switch of the model or the credential points the runtime at the new ones.
+        // The runtime copies what it is configured with, so a lease, an
+        // adoption or a switch of the model can free the slices afterwards
+        // (`src/core/tooling/web_search_runtime.zig` "web search keeps its own
+        // copy of what it is configured with").
         if (provider_capabilities.fx_search and self.route == null) {
             self.state.web_search_runtime.configure(.{
-                .api_key = route.api_key,
-                .credential_source = route.credential_source,
-                .gateway_team = route.gateway_team,
+                .api_key = sign_in.api_key,
+                .credential_source = sign_in.credential_source,
+                .gateway_team = sign_in.gateway_team,
                 .worker_model = route.model,
                 .gateway_retry_count = self.state.cfg.gateway_retry_count,
                 .gateway_chat_url = self.state.cfg.gateway_chat_url,
             });
         }
+        return self.toolContextWithSignIn(sign_in);
+    }
+
+    /// The tool context a call uses, with a sign-in the caller already owns:
+    /// a subagent's turn passes its own route copy, which lives as long as the
+    /// run and is zeroed when it ends (`ModelRoute.deinit`).
+    fn toolContextWithSignIn(self: *AcpContext, sign_in: ToolSignIn) tool_runtime.Context {
+        const session = if (self.state.active_session) |*active| active else unreachable;
+        const route = self.routeView(session);
+        const provider_capabilities = self.state.cfg.provider_set.select(route.provider).capabilities;
         var tc: tool_runtime.Context = .{
             .observer = self.observer,
             .workspace_root = self.state.workspace_root,
+            .sandbox_policy = if (comptime !host_target.is_wasm) self.state.sandbox_policy else null,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),
             .ignored_list_entries = self.state.cfg.ignored_list_entries,
             .max_list_entries = self.state.cfg.max_list_entries,
@@ -682,15 +771,15 @@ const AcpContext = struct {
             .max_command_output_bytes = self.state.cfg.max_command_output_bytes,
             .max_tool_result_bytes = session.max_tool_result_bytes,
             .auto_compact_percent = self.state.auto_compact_percent,
-            .api_key = route.api_key,
+            .api_key = sign_in.api_key,
             .agent_stream_provider = server.streamProviderFor(self.state, route.provider),
-            .credential_source = route.credential_source,
-            .account_id = route.account_id,
+            .credential_source = sign_in.credential_source,
+            .account_id = sign_in.account_id,
             .provider = route.provider,
             .provider_capabilities = provider_capabilities,
             .oauth_transport = self.state.cfg.gateway_provider.oauth_transport,
             .secret_store = self.state.cfg.secret_store,
-            .gateway_team = route.gateway_team,
+            .gateway_team = sign_in.gateway_team,
             .model = route.model,
             .gateway_retry_count = self.state.cfg.gateway_retry_count,
             .gateway_chat_url = self.state.cfg.gateway_chat_url,
@@ -709,6 +798,7 @@ const AcpContext = struct {
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
             .subagent_caller_id = session.session_id,
+            .user_turn_id = self.user_turn_id,
             .worker = &self.state.worker,
             .permission_prompter = if (self.state.initialized) .{
                 .observer = self.observer,
@@ -1189,6 +1279,12 @@ const TurnSignIn = struct {
     fn capture(alloc: Allocator, state: *server.ServerState, session: *const server.ActiveSessionState) !TurnSignIn {
         state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
         defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        return captureLocked(alloc, state, session);
+    }
+
+    /// The same copy with `subagent_authority_mutex` already held, for a caller
+    /// that must copy and act under one lock.
+    fn captureLocked(alloc: Allocator, state: *server.ServerState, session: *const server.ActiveSessionState) !TurnSignIn {
         const api_key = try alloc.dupe(u8, session.api_key);
         errdefer secret.zeroAndFree(alloc, api_key);
         const account_id = if (session.account_id) |value| try alloc.dupe(u8, value) else null;
@@ -1387,6 +1483,7 @@ pub fn handlePromptWithInputId(
         .alloc = alloc,
         .state = state,
         .session_id = session.session_id,
+        .user_turn_id = nextPromptTurnId(),
         .captured_mode = captured_mode,
         .captured_permission_mode = captured_permission_mode,
         .current_prompt_input = &prompt_input,
@@ -1488,12 +1585,12 @@ pub fn handlePromptWithInputId(
         try v2.beginTurn();
     }
 
-    var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
+    var tool_projection = try shell_projection.buildModelToolProjection(alloc, state.cfg.mode_registry, activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
         .behind_toolbox = state.toolbox_behind.slice(),
-    });
+    }, .{ .runner = if (comptime host_target.is_wasm) false else state.sandbox_policy != null });
     defer tool_projection.deinit(alloc);
 
     const owned_prompt = try alloc.dupe(
@@ -1783,8 +1880,9 @@ pub fn runSubagentChild(
         child_bridge.work_id = child_bridge.turn_id;
         if (child_bridge.enabled) ctx.observer = &child_bridge.observer;
     }
-    var child_projection = state.cfg.mode_registry.buildModelToolProjection(
+    var child_projection = shell_projection.buildModelToolProjection(
         alloc,
+        state.cfg.mode_registry,
         builtin_tools.advertisement_set,
         captured_mode,
         .{
@@ -1793,14 +1891,24 @@ pub fn runSubagentChild(
             .subagent_available = true,
             .behind_toolbox = state.toolbox_behind.slice(),
         },
+        .{ .runner = if (comptime host_target.is_wasm) false else state.sandbox_policy != null },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
+    // The run's own route copy is the sign-in its tool context sends, so the
+    // context borrows it and nothing is copied or left behind (`route.deinit`
+    // zeroes it when the run ends).
+    const subagent_sign_in: ToolSignIn = .{
+        .api_key = route.api_key,
+        .credential_source = route.credential_source,
+        .account_id = route.account_id,
+        .gateway_team = route.gateway_team,
+    };
     return subagent_agent_adapter.run(.{
         .toolbox_behind = state.toolbox_behind.slice(),
         .host = subagent_host,
-        .tool_context = ctx.toolContext(),
+        .tool_context = ctx.toolContextWithSignIn(subagent_sign_in),
         .provider_set = state.cfg.provider_set,
         .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
@@ -2631,7 +2739,9 @@ fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrp
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return tool_runtime.release_agent_terminal_lease(ctx.toolContext(), session_id);
+    var sign_in = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer sign_in.deinit();
+    return tool_runtime.release_agent_terminal_lease(try ctx.toolContext(sign_in.allocator()), session_id);
 }
 
 fn refreshGatewayCredential(
@@ -2685,15 +2795,21 @@ fn resolveModelCapabilities(
     const session = if (ctx.state.active_session) |*active| active else return .{};
     const route = ctx.routeView(session);
     const bundle = ctx.state.cfg.provider_set.select(route.provider);
+    var sign_in_arena = std.heap.ArenaAllocator.init(ctx.state.alloc);
+    defer sign_in_arena.deinit();
+    const sign_in = ctx.toolSignIn(sign_in_arena.allocator()) catch |err| {
+        debug_trace.logf("acp", "event=model_capabilities_fallback reason=sign_in_copy_failed err={s}", .{@errorName(err)});
+        return bundle.fallbackModelCapabilities(model);
+    };
     return ctx.capabilityResolver().resolveWithin(
         ctx.state.alloc,
         bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
         .{
             .access = credentials.catalogAccessForCredentialAndAccount(
-                route.credential_source,
-                route.api_key,
-                route.gateway_team,
-                route.account_id,
+                sign_in.credential_source,
+                sign_in.api_key,
+                sign_in.gateway_team,
+                sign_in.account_id,
             ),
             .endpoint = ctx.state.cfg.gateway_models_path,
             .cancel_flag = &session.cancel_flag,
@@ -2717,16 +2833,19 @@ fn resolveModelOverride(
     const route = ctx.routeView(session);
     const bundle = ctx.state.cfg.provider_set.select(route.provider);
     if (!bundle.capabilities.authoritative_model_catalog) return .no_catalog;
+    var sign_in_arena = std.heap.ArenaAllocator.init(ctx.state.alloc);
+    defer sign_in_arena.deinit();
+    const sign_in = try ctx.toolSignIn(sign_in_arena.allocator());
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
     _ = ctx.capabilityResolver().resolveWithin(
         ctx.state.alloc,
         catalog_provider,
         .{
             .access = credentials.catalogAccessForCredentialAndAccount(
-                route.credential_source,
-                route.api_key,
-                route.gateway_team,
-                route.account_id,
+                sign_in.credential_source,
+                sign_in.api_key,
+                sign_in.gateway_team,
+                sign_in.account_id,
             ),
             .endpoint = ctx.state.cfg.gateway_models_path,
             .cancel_flag = &session.cancel_flag,
@@ -2791,7 +2910,7 @@ test "a tool call a finished turn left open reads as the turn's outcome" {
     try std.testing.expectEqualStrings("Cancelled", unfinishedToolCallText(.failed, true));
 }
 
-fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     try ctx.state.cfg.context_registry.appendDefaultTransient(.{
@@ -2799,6 +2918,7 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.state.workspace_access.scope(ctx.state.workspace_root),
         .interactive = false,
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
+        .model = model,
         // ACP's turns have no id here, so its list is read afresh at each
         // step; its reports never join a turn, so a change shows at once.
         .subagents = if (ctx.state.subagent_host) |team_host| try team_host.teamNote(arena, 0) else null,
@@ -2816,12 +2936,12 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
 
 fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return tool_runtime.snapshotMcpDefinition(ctx.toolContext(), arena, name, known);
+    return tool_runtime.snapshotMcpDefinition(try ctx.toolContext(arena), arena, name, known);
 }
 
 fn resolveUnselectedMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return tool_runtime.resolveUnselectedMcpTool(ctx.toolContext(), arena, name);
+    return tool_runtime.resolveUnselectedMcpTool(try ctx.toolContext(arena), arena, name);
 }
 
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -2832,17 +2952,17 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
             return .{ .failure = reason };
         }
     }
-    return tool_runtime.validateToolCall(ctx.toolContext(), arena, call);
+    return tool_runtime.validateToolCall(try ctx.toolContext(arena), arena, call);
 }
 
 fn checkToolAvailability(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return tool_runtime.checkToolAvailability(ctx.toolContext(), arena, call);
+    return tool_runtime.checkToolAvailability(try ctx.toolContext(arena), arena, call);
 }
 
 fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    var tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(ctx.toolContext(), advertised_dynamic_tool_names);
+    var tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(try ctx.toolContext(arena), advertised_dynamic_tool_names);
     tool_ctx.permission_review_turn = review_turn;
     const admission = tool_ctx.admissionInputWithLiveAuthority(live_authority);
     return tool_admission.requestPreparedFileMutationPermissionOutcome(
@@ -2857,7 +2977,7 @@ fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, a
 
 fn requestToolPermissionOutcome(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, permission_mode: PermissionMode, local_grants: []const PermissionGrant, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(ctx.toolContext(), advertised_dynamic_tool_names);
+    const tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(try ctx.toolContext(arena), advertised_dynamic_tool_names);
     return tool_admission.requestPermissionOutcome(
         tool_ctx.admissionInput(),
         arena,
@@ -2869,7 +2989,7 @@ fn requestToolPermissionOutcome(raw_ctx: *anyopaque, arena: Allocator, call: Too
 
 fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    var tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(ctx.toolContext(), advertised_dynamic_tool_names);
+    var tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(try ctx.toolContext(arena), advertised_dynamic_tool_names);
     tool_ctx.permission_review_turn = review_turn;
     tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     const admission = tool_ctx.admissionInputWithLiveAuthority(live_authority);
@@ -2914,6 +3034,18 @@ const TestReviewTurn = struct {
     }
 };
 
+/// The subagent whose call `call_id` is, for a check the parent answers
+/// (`SubagentApprovalCheck` builds `subagent:<name>:<call>`), or null for
+/// main's own call.
+fn subagentCardAgent(call_id: []const u8) ?[]const u8 {
+    const prefix = "subagent:";
+    if (!std.mem.startsWith(u8, call_id, prefix)) return null;
+    const rest = call_id[prefix.len..];
+    const end = std.mem.findScalar(u8, rest, ':') orelse return null;
+    if (end == 0) return null;
+    return rest[0..end];
+}
+
 fn requestAcpPermission(
     raw_ctx: *anyopaque,
     alloc: Allocator,
@@ -2941,6 +3073,11 @@ fn requestAcpPermission(
 
     var pending_arena = std.heap.ArenaAllocator.init(alloc);
     defer pending_arena.deinit();
+    // A card the call already has (a shell call's, for `fx mcp call`) is
+    // finished by that call's own transport; a card this check creates is
+    // finished here, with the answer.
+    const had_card = ctx.published_tool_calls.getKey(call.id) != null;
+    const for_subagent = subagentCardAgent(call.id) != null;
     const tool_call_id = try ctx.sendToolCallPending(pending_arena.allocator(), call);
 
     var params: std.Io.Writer.Allocating = .init(alloc);
@@ -2972,6 +3109,16 @@ fn requestAcpPermission(
         params.writer.buffered(),
     );
     const decision = server.awaitPermissionDecision(ctx.state, request_id);
+    if (for_subagent and !had_card) {
+        switch (decision) {
+            // A failed update costs only the card's status: the answer is
+            // already decided, and the child reads it either way.
+            .once, .always => ctx.sendToolCallCompletedWithCommandResult(tool_call_id, "The parent's check allowed this call.", null) catch |err|
+                debug_trace.logf("acp", "approval check card not finished call_id={s} err={s}", .{ tool_call_id, @errorName(err) }),
+            else => ctx.sendToolCallError(tool_call_id, "The parent's check refused this call.") catch |err|
+                debug_trace.logf("acp", "approval check card not failed call_id={s} err={s}", .{ tool_call_id, @errorName(err) }),
+        }
+    }
     return permission_request.OwnedPermissionResponse.init(alloc, decision, null);
 }
 
@@ -3061,7 +3208,7 @@ fn dynamicMcpToolAvailable(registry: tool_dispatch.Registry, name: []const u8, a
 fn permissionTargetForCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(
-        ctx.toolContext(),
+        try ctx.toolContext(arena),
         advertised_dynamic_tool_names,
     );
     return tool_admission.permissionTargetForCall(tool_ctx.admissionInput(), arena, call);
@@ -3076,14 +3223,19 @@ fn executeToolCall(
     const acp_id = ctx.sendToolCallPending(request.call_allocator, request.call) catch "call_unknown";
     ctx.sendToolCallProgressText(acp_id, null) catch {};
 
-    var tool_ctx = ctx.toolContext();
+    // The call's own copy of the sign-in lives in this arena, which frees it on
+    // every path: success, error, and cancel.
+    var tool_sign_in = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer tool_sign_in.deinit();
+    var tool_ctx = try ctx.toolContext(tool_sign_in.allocator());
     var elicitation_responder = AcpElicitationResponderContext{
         .acp = ctx,
         .tool_call_id = acp_id,
         .operation_cancel_flag = tool_ctx.cancel_flag,
     };
     defer elicitation_responder.deinit();
-    tool_ctx.mcp_input_responder = elicitation_responder.responder();
+    // WASM runs no MCP servers (allow_acp_mcp is false) and no remote setup (A4), so nothing asks it.
+    if (comptime !host_target.is_wasm) tool_ctx.mcp_input_responder = elicitation_responder.responder();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
     tool_ctx.root_user_messages = request.root_user_messages;
     tool_ctx.root_user_evidence_complete = request.root_user_evidence_complete;
@@ -3530,9 +3682,12 @@ fn runReportTurns(
 ) !?TerminalOutcome {
     const tree = state.subagent_host orelse return null;
     while (true) {
-        switch (tree.awaitMailOrQuiet(&state.worker, &session.cancel_flag)) {
+        switch (tree.awaitMailOrQuiet(&state.worker, &session.cancel_flag, false)) {
             .quiet, .stopped => return null,
             .mail => {},
+            // ACP never asks for the fallback: a person can still answer the
+            // approval there, so it keeps waiting.
+            .approvals_unanswered => {},
         }
         const next = state.worker.takeQueuedPrompt(std.heap.c_allocator) orelse continue;
         defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, next);
@@ -3867,12 +4022,12 @@ fn clearJournalProgress(raw_ctx: *anyopaque) !void {
 }
 
 /// Stores grants on the active ACP session without persisting them.
-fn retainAcpGrant(raw_ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
+fn retainAcpGrant(raw_ctx: *anyopaque, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     ctx.state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.state.subagent_authority_mutex.unlock(io_mod.getIo());
     const session = if (ctx.state.active_session) |*active| active else return;
-    try session.retainGrant(ctx.alloc, tool_name, target_path);
+    try session.retainGrant(ctx.alloc, tool_name, target_path, shell_epoch);
 }
 
 fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
@@ -4006,7 +4161,8 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
 fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId, _: command_output_content.Stream, chunk: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const id = lifecycle_id orelse return;
-    try ctx.sendToolCallProgressText(id.call_id, chunk);
+    // No status: a yielded `run` can print after its card completed, and a status would reopen it.
+    try ctx.sendToolCallOutputText(id.call_id, chunk);
 }
 
 fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
@@ -4042,8 +4198,9 @@ fn respondToAcpMcpInput(
     required: tool_mcp_runtime.InputRequired,
 ) anyerror![]const u8 {
     const responder: *AcpElicitationResponderContext = @ptrCast(@alignCast(raw_ctx));
-    const requests = try mrtr.parseRequestJsonForWire(
+    const requests = try mrtr.readRequests(
         alloc,
+        required.requests,
         required.input_requests_json,
         origin.wire,
         .{},
@@ -4091,7 +4248,7 @@ fn respondToAcpMcpInput(
     try out.writer.writeByte('{');
     for (responses, 0..) |response, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(response.key, .{}, &out.writer);
+        try out.writer.writeAll(response.key);
         try out.writer.writeByte(':');
         try out.writer.writeAll(response.json);
     }
@@ -4143,7 +4300,7 @@ fn requestAcpElicitation(
     defer if (legacy_source_id != null and !legacy_url_retained) {
         server.removeLegacyUrl(state, url_id.?);
     };
-    const display_message = try formatAcpElicitationMessage(alloc, origin.server_name, input_request);
+    const display_message = try formatAcpElicitationMessage(alloc, origin, input_request);
     defer alloc.free(display_message);
     const params = try mcp_elicitation.projectToAcpCreateParams(
         alloc,
@@ -4163,7 +4320,7 @@ fn requestAcpElicitation(
         .external_id = outbound_id,
         .prompt = display_message,
         .schema_json = input_request.requested_schema_json,
-        .server_name = origin.server_name,
+        .server_name = waitServerName(origin),
     }) else null;
     var wait_finished = false;
     var wait_outcome: observation.WaitOutcome = .failed;
@@ -4219,13 +4376,13 @@ fn requestAcpElicitation(
     var transition_state: mcp_elicitation.RequestState = .pending;
     // The MCP engine ties an answer to the call that asked, and drops it once that
     // call has ended, so its server counts as live here.
-    const host_session = responder.acp.mcpHost() != null;
+    const server_live = serverLive(origin, responder.acp.mcpHost() != null);
     const transition = mcp_elicitation.decideTransition(
         transition_state,
-        bindingForAcpInput(responder, origin),
-        answerBindingForAcpInput(responder, origin, null),
+        bindingForAcpInput(responder, origin, outbound_id),
+        answerBindingForAcpInput(responder, origin, null, outbound_id),
         acpAwakeMillis(),
-        host_session,
+        server_live,
     );
     switch (transition) {
         .consume => transition_state = .consumed,
@@ -4238,7 +4395,7 @@ fn requestAcpElicitation(
             const sink = server.legacyUrlCompletionSink(state);
             // The MCP host has no generations to check: the sink takes the
             // consent itself.
-            if (!host_session) return error.McpInputRequired;
+            if (!server_live) return error.McpInputRequired;
             const accept_result = sink.settleAccept(sink.accept(sink.context, origin, url_id.?)) orelse return error.McpInputRequired;
             if (accept_result == .awaiting_completion) {
                 const retained_acp_id = try state.alloc.dupe(u8, url_id.?);
@@ -4261,9 +4418,11 @@ fn requestAcpElicitation(
 
 fn formatAcpElicitationMessage(
     alloc: Allocator,
-    server_name: []const u8,
+    origin: tool_mcp_runtime.InputOrigin,
     request: mcp_elicitation.Request,
 ) ![]u8 {
+    if (origin.kind == .host) return alloc.print("fx asks: {s}", .{request.message});
+    const server_name = origin.server_name;
     return switch (request.mode) {
         .form => alloc.print(
             "fx received a form request from MCP server {s}. {s}",
@@ -4277,16 +4436,37 @@ fn formatAcpElicitationMessage(
     };
 }
 
+/// A host prompt names no server, so its wait record names none either.
+fn waitServerName(origin: tool_mcp_runtime.InputOrigin) ?[]const u8 {
+    return if (origin.kind == .mcp_server) origin.server_name else null;
+}
+
+/// Whether the server that asked is still live, so an answer may be taken. A
+/// host prompt names no server, so no server can be removed under it.
+fn serverLive(origin: tool_mcp_runtime.InputOrigin, mcp_host_present: bool) bool {
+    return origin.kind == .host or mcp_host_present;
+}
+
+/// The scope an answer must match. A host prompt is bound to its own ACP
+/// request id, and an MCP prompt keeps its session and tool call.
+fn acpInputScope(
+    kind: tool_mcp_runtime.OriginKind,
+    session_id: []const u8,
+    tool_call_id: []const u8,
+    request_id: u64,
+) mcp_elicitation.Scope {
+    if (kind == .host) return .{ .acp_request = .{ .integer = @intCast(request_id) } };
+    return .{ .acp_session = .{ .session_id = session_id, .tool_call_id = tool_call_id } };
+}
+
 fn bindingForAcpInput(
     responder: *AcpElicitationResponderContext,
     origin: tool_mcp_runtime.InputOrigin,
+    request_id: u64,
 ) mcp_elicitation.Binding {
     return .{
         .server_name = origin.server_name,
-        .scope = .{ .acp_session = .{
-            .session_id = responder.acp.session_id,
-            .tool_call_id = responder.tool_call_id,
-        } },
+        .scope = acpInputScope(origin.kind, responder.acp.session_id, responder.tool_call_id, request_id),
         .runtime_generation = origin.runtime_generation,
         .connection_generation = origin.connection_generation,
         .client_generation = origin.client_generation,
@@ -4301,6 +4481,7 @@ fn answerBindingForAcpInput(
     responder: *AcpElicitationResponderContext,
     origin: tool_mcp_runtime.InputOrigin,
     witness: ?tool_mcp_runtime.InputIdentityWitness,
+    request_id: u64,
 ) mcp_elicitation.AnswerBinding {
     const current: tool_mcp_runtime.InputIdentityWitness = witness orelse .{
         .runtime_generation = origin.runtime_generation,
@@ -4311,10 +4492,7 @@ fn answerBindingForAcpInput(
     };
     return .{
         .server_name = origin.server_name,
-        .scope = .{ .acp_session = .{
-            .session_id = responder.acp.session_id,
-            .tool_call_id = responder.tool_call_id,
-        } },
+        .scope = acpInputScope(origin.kind, responder.acp.session_id, responder.tool_call_id, request_id),
         .runtime_generation = current.runtime_generation,
         .connection_generation = current.connection_generation,
         .client_generation = current.client_generation,
@@ -4472,6 +4650,159 @@ test "ACP shell title uses the call-aware action label" {
     });
     defer alloc.free(title);
     try std.testing.expectEqualStrings("Stopping", title);
+}
+
+fn testInputOrigin(kind: tool_mcp_runtime.OriginKind, server_name: []const u8) tool_mcp_runtime.InputOrigin {
+    return .{
+        .wire = .modern_mcp,
+        .kind = kind,
+        .server_name = server_name,
+        .operation = .{ .tools_call = "" },
+        .connection_generation = 1,
+        .client_generation = 1,
+        .catalog_generation = 1,
+        .request_generation = 1,
+        .auth_generation = 1,
+        .deadline_ms = 1000,
+    };
+}
+
+fn testInputBinding(scope: mcp_elicitation.Scope) mcp_elicitation.Binding {
+    return .{
+        .server_name = "",
+        .scope = scope,
+        .connection_generation = 1,
+        .client_generation = 1,
+        .catalog_generation = 1,
+        .request_generation = 1,
+        .auth_generation = 1,
+        .deadline_ms = 1000,
+    };
+}
+
+fn testInputAnswer(scope: mcp_elicitation.Scope) mcp_elicitation.AnswerBinding {
+    return .{
+        .server_name = "",
+        .scope = scope,
+        .connection_generation = 1,
+        .client_generation = 1,
+        .catalog_generation = 1,
+        .request_generation = 1,
+        .auth_generation = 1,
+    };
+}
+
+fn transitionName(transition: mcp_elicitation.Transition) []const u8 {
+    return switch (transition) {
+        .consume => "consume",
+        .reject => |reason| @tagName(reason),
+    };
+}
+
+test "ACP input binding: a host answer and an MCP answer never satisfy each other, even with the same server name" {
+    const host_origin = testInputOrigin(.host, "");
+    const mcp_origin = testInputOrigin(.mcp_server, "");
+    const host_request_7 = acpInputScope(host_origin.kind, "session-1", "call-1", 7);
+    const host_request_8 = acpInputScope(host_origin.kind, "session-1", "call-1", 8);
+    const mcp_request = acpInputScope(mcp_origin.kind, "session-1", "call-1", 7);
+
+    try std.testing.expectEqualStrings("wrong_scope", transitionName(mcp_elicitation.decideTransition(
+        .pending,
+        testInputBinding(host_request_7),
+        testInputAnswer(mcp_request),
+        0,
+        true,
+    )));
+    try std.testing.expectEqualStrings("wrong_scope", transitionName(mcp_elicitation.decideTransition(
+        .pending,
+        testInputBinding(mcp_request),
+        testInputAnswer(host_request_7),
+        0,
+        true,
+    )));
+    try std.testing.expectEqualStrings("wrong_scope", transitionName(mcp_elicitation.decideTransition(
+        .pending,
+        testInputBinding(host_request_7),
+        testInputAnswer(host_request_8),
+        0,
+        true,
+    )));
+    try std.testing.expectEqualStrings("consume", transitionName(mcp_elicitation.decideTransition(
+        .pending,
+        testInputBinding(host_request_7),
+        testInputAnswer(host_request_7),
+        0,
+        true,
+    )));
+    try std.testing.expectEqualStrings("consume", transitionName(mcp_elicitation.decideTransition(
+        .pending,
+        testInputBinding(mcp_request),
+        testInputAnswer(mcp_request),
+        0,
+        true,
+    )));
+}
+
+test "ACP input: a host prompt is never refused as a removed server, and an MCP prompt still is" {
+    const host_origin = testInputOrigin(.host, "");
+    const mcp_origin = testInputOrigin(.mcp_server, "Profile");
+    try std.testing.expect(serverLive(host_origin, false));
+    try std.testing.expect(!serverLive(mcp_origin, false));
+    try std.testing.expect(serverLive(mcp_origin, true));
+}
+
+test "ACP input wait record: a host prompt names no server, and an MCP prompt names its server" {
+    const host_origin = testInputOrigin(.host, "");
+    const mcp_origin = testInputOrigin(.mcp_server, "Profile");
+    try std.testing.expect(waitServerName(host_origin) == null);
+    try std.testing.expectEqualStrings("Profile", waitServerName(mcp_origin).?);
+}
+
+test "ACP elicitation text: fx asks for the host, an MCP server names itself, and a server cannot pick the host" {
+    const alloc = std.testing.allocator;
+    var message = "Pick a project".*;
+    var raw = [_]u8{};
+    const request: mcp_elicitation.Request = .{
+        .wire = .modern_mcp,
+        .mode = .form,
+        .message = &message,
+        .raw_params_json = &raw,
+    };
+    const mcp: tool_mcp_runtime.InputOrigin = .{
+        .wire = .modern_mcp,
+        .server_name = "Profile",
+        .operation = .{ .tools_call = "tool" },
+        .connection_generation = 1,
+        .client_generation = 1,
+        .catalog_generation = 1,
+        .request_generation = 1,
+        .auth_generation = 1,
+        .deadline_ms = std.math.maxInt(i64),
+    };
+    const mcp_text = try formatAcpElicitationMessage(alloc, mcp, request);
+    defer alloc.free(mcp_text);
+    try std.testing.expectEqualStrings("fx received a form request from MCP server Profile. Pick a project", mcp_text);
+
+    var host_origin = mcp;
+    host_origin.kind = .host;
+    host_origin.server_name = "";
+    const host_text = try formatAcpElicitationMessage(alloc, host_origin, request);
+    defer alloc.free(host_text);
+    try std.testing.expectEqualStrings("fx asks: Pick a project", host_text);
+
+    var spoof_message = "fx asks: Pick a project".*;
+    const spoof: mcp_elicitation.Request = .{
+        .wire = .modern_mcp,
+        .mode = .form,
+        .message = &spoof_message,
+        .raw_params_json = &raw,
+    };
+    const spoof_text = try formatAcpElicitationMessage(alloc, mcp, spoof);
+    defer alloc.free(spoof_text);
+    try std.testing.expectEqualStrings(
+        "fx received a form request from MCP server Profile. fx asks: Pick a project",
+        spoof_text,
+    );
 }
 
 test "ACP lifecycle action preserves dynamic MCP availability boundaries" {
@@ -5184,9 +5515,12 @@ test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
         .state = &state,
         .session_id = "session_1",
     };
+    var sign_in_arena = std.heap.ArenaAllocator.init(alloc);
+    defer sign_in_arena.deinit();
+    const arena = sign_in_arena.allocator();
     try std.testing.expectEqual(
         types.CredentialSource.vercel_oidc_token,
-        ctx.toolContext().credential_source.?,
+        (try ctx.toolContext(arena)).credential_source.?,
     );
 
     const deps = agentRuntimeDeps(&ctx);
@@ -5249,7 +5583,11 @@ test "ACP plan mode validates registered tools against mode policy" {
         .session_id = state.active_session.?.session_id,
     };
 
-    const allowed = try validateToolCall(&ctx, alloc, .{
+    var validation_arena = std.heap.ArenaAllocator.init(alloc);
+    defer validation_arena.deinit();
+    const arena = validation_arena.allocator();
+
+    const allowed = try validateToolCall(&ctx, arena, .{
         .id = "call_read",
         .name = "read_file",
         .arguments_json = "{\"path\":\"README.md\"}",
@@ -5259,14 +5597,14 @@ test "ACP plan mode validates registered tools against mode policy" {
         else => return error.TestExpectedEqual,
     }
 
-    const denied = try validateToolCall(&ctx, alloc, .{
+    const denied = try validateToolCall(&ctx, arena, .{
         .id = "call_write",
         .name = "write_file",
         .arguments_json = "{}",
     });
     switch (denied) {
         .failure => |body| {
-            defer alloc.free(body);
+            // The validation arena owns `body`.
             try std.testing.expect(std.mem.find(u8, body, "\"tool_name\":\"write_file\"") != null);
             try std.testing.expect(std.mem.find(u8, body, "Plan mode only allows read-only workspace inspection tools.") != null);
         },
@@ -5360,6 +5698,88 @@ fn testServerConfig() server.Config {
         .context_registry = test_acp_context_registry,
         .mode_registry = test_acp_mode_registry,
     };
+}
+
+test "a subagent's tool context borrows the sign-in its run already owns" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+
+    // What `runSubagentChild` passes: the slices of its own `ModelRoute`.
+    const sign_in = ToolSignIn{
+        .api_key = "route-key",
+        .credential_source = .ai_gateway_api_key,
+        .account_id = "route-account",
+        .gateway_team = "route-team",
+    };
+    // Nothing is allocated here, so `std.testing.allocator` would report a
+    // leak if this path copied the sign-in into memory nobody frees.
+    const tool_ctx = ctx.toolContextWithSignIn(sign_in);
+    try std.testing.expectEqualStrings("route-key", tool_ctx.api_key);
+    try std.testing.expect(tool_ctx.api_key.ptr == sign_in.api_key.ptr);
+}
+
+test "a refresh and a tool call share the server's sign-in" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+
+    const Caller = struct {
+        fn run(context: *AcpContext, a: Allocator, seen: *std.atomic.Value(usize)) void {
+            for (0..100) |_| {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const tool_ctx = context.toolContext(arena.allocator()) catch return;
+                _ = seen.fetchAdd(tool_ctx.api_key.len, .monotonic);
+            }
+        }
+    };
+    const Adopter = struct {
+        fn run(server_state: *server.ServerState, a: Allocator) void {
+            for (0..100) |_| {
+                var credential: credentials.Credential = .{
+                    .token = a.dupe(u8, "rotating-token") catch return,
+                    .source = .ai_gateway_api_key,
+                };
+                server_state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+                defer server_state.subagent_authority_mutex.unlock(io_mod.getIo());
+                server.adoptServerCredential(server_state, &credential);
+            }
+        }
+    };
+    var seen = std.atomic.Value(usize).init(0);
+    const caller = try std.Thread.spawn(.{}, Caller.run, .{ &ctx, alloc, &seen });
+    const adopter = try std.Thread.spawn(.{}, Adopter.run, .{ &state, alloc });
+    caller.join();
+    adopter.join();
+    try std.testing.expect(seen.load(.monotonic) > 0);
+}
+
+test "a tool call keeps the sign-in a refresh replaces" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+
+    var sign_in_arena = std.heap.ArenaAllocator.init(alloc);
+    defer sign_in_arena.deinit();
+    const tool_ctx = try ctx.toolContext(sign_in_arena.allocator());
+
+    var refreshed: credentials.Credential = .{
+        .token = try alloc.dupe(u8, "refreshed-token"),
+        .source = .ai_gateway_api_key,
+    };
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    server.adoptServerCredential(&state, &refreshed);
+    state.subagent_authority_mutex.unlock(io_mod.getIo());
+
+    // The call still sends the sign-in it started with, and the server holds
+    // the new one. Its own copy is the arena's, so the test's allocator would
+    // report a leak if nobody freed it.
+    try std.testing.expectEqualStrings("test-api-key", tool_ctx.api_key);
+    try std.testing.expectEqualStrings("refreshed-token", state.api_key);
 }
 
 fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: PermissionMode) !server.ServerState {
@@ -5768,9 +6188,9 @@ test "ACP propagateGrant stores deduped runtime session grants" {
         .session_id = "session_1",
     };
 
-    try retainAcpGrant(&ctx, "run_command", "git status*");
-    try retainAcpGrant(&ctx, "run_command", "git status*");
-    try retainAcpGrant(&ctx, "write_file", "/tmp/workspace/**");
+    try retainAcpGrant(&ctx, "run_command", "git status*", 0);
+    try retainAcpGrant(&ctx, "run_command", "git status*", 0);
+    try retainAcpGrant(&ctx, "write_file", "/tmp/workspace/**", 0);
 
     const session = &state.active_session.?;
     try std.testing.expectEqual(@as(usize, 2), session.session_grants.len);
@@ -5778,7 +6198,10 @@ test "ACP propagateGrant stores deduped runtime session grants" {
     try std.testing.expectEqualStrings("git status*", session.session_grants[0].target_path);
     try std.testing.expectEqualStrings("write_file", session.session_grants[1].tool_name);
 
-    const tool_ctx = ctx.toolContext();
+    var sign_in_arena = std.heap.ArenaAllocator.init(alloc);
+    defer sign_in_arena.deinit();
+    const arena = sign_in_arena.allocator();
+    const tool_ctx = try ctx.toolContext(arena);
     try std.testing.expectEqual(session.session_grants.len, tool_ctx.permission_grants.len);
     try std.testing.expect(tool_ctx.permission_grants.ptr == session.session_grants.ptr);
 }
@@ -5811,12 +6234,17 @@ test "a subagent's model route is its own copy, which a switch of the session le
     session.account_id = null;
     session.fast_mode = false;
 
+    var sign_in_arena = std.heap.ArenaAllocator.init(alloc);
+    defer sign_in_arena.deinit();
+    const arena = sign_in_arena.allocator();
+
     var child = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1", .route = &route };
     const kept = child.routeView(session);
     try std.testing.expectEqual(model_provider.ProviderId.codex, kept.provider);
-    try std.testing.expectEqual(@as(?types.CredentialSource, .chatgpt_subscription), kept.credential_source);
-    try std.testing.expectEqualStrings(first_key, kept.api_key);
-    try std.testing.expectEqualStrings(first_account, kept.account_id.?);
+    const kept_sign_in = try child.toolSignIn(arena);
+    try std.testing.expectEqual(@as(?types.CredentialSource, .chatgpt_subscription), kept_sign_in.credential_source);
+    try std.testing.expectEqualStrings(first_key, kept_sign_in.api_key);
+    try std.testing.expectEqualStrings(first_account, kept_sign_in.account_id.?);
     try std.testing.expect(kept.fast_mode);
     try std.testing.expect(kept.effort == .auto);
     try std.testing.expect(child.capabilityResolver() == &route.resolver);
@@ -5825,7 +6253,7 @@ test "a subagent's model route is its own copy, which a switch of the session le
     var own = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
     const live = own.routeView(session);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, live.provider);
-    try std.testing.expectEqualStrings("second-key", live.api_key);
+    try std.testing.expectEqualStrings("second-key", (try own.toolSignIn(arena)).api_key);
     try std.testing.expect(own.capabilityResolver() == &state.capability_resolver);
 }
 
@@ -5940,7 +6368,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
     try messages.append(arena, .{ .role = .system, .content = "base system" });
 
     try deps.append_static_context.?(deps.ctx, arena, &messages);
-    try deps.append_runtime_context(deps.ctx, arena, &messages);
+    try deps.append_runtime_context(deps.ctx, arena, "", &messages);
 
     try std.testing.expectEqual(@as(usize, 3), messages.items.len);
     try std.testing.expectEqualStrings("base system", messages.items[0].content.?);
@@ -5953,13 +6381,13 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
         AcpContextRegistryFixture.transient_permission_mode orelse return error.TestExpectedEqual,
     );
 
-    const tool_context = ctx.toolContext();
+    const tool_context = try ctx.toolContext(arena);
     try std.testing.expectEqual(PermissionMode.auto, tool_context.permission_mode);
     try std.testing.expectEqualStrings("test.acp_context", tool_context.context_registry.defaultProvider().id);
 
     state.context_enabled = false;
     try std.testing.expectEqualStrings("", ctx.modelVisibleProjectContext());
-    try std.testing.expect(!ctx.toolContext().context_enabled);
+    try std.testing.expect(!(try ctx.toolContext(arena)).context_enabled);
     try std.testing.expect(!agentRuntimeDeps(&ctx).context_enabled);
 }
 
@@ -6054,6 +6482,24 @@ test "ACP deps reject malformed native web_search calls" {
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", result.failure);
 }
 
+const web_search_runtime_mod = @import("../core/tooling/web_search_runtime.zig");
+
+/// What the runtime holds now, read the way a request reads it: one owned
+/// snapshot taken under the config lock.
+fn expectWebSearchInputs(alloc: Allocator, runtime: *web_search_runtime_mod.Runtime, want: struct {
+    api_key: []const u8,
+    worker_model: []const u8,
+    gateway_retry_count: usize,
+    gateway_chat_url: []const u8,
+}) !void {
+    var live = try runtime.inputsSnapshot(alloc);
+    defer live.deinit(alloc);
+    try std.testing.expectEqualStrings(want.api_key, live.api_key);
+    try std.testing.expectEqualStrings(want.worker_model, live.worker_model);
+    try std.testing.expectEqual(want.gateway_retry_count, live.gateway_retry_count);
+    try std.testing.expectEqualStrings(want.gateway_chat_url, live.gateway_chat_url);
+}
+
 test "ACP prompt projection configures web search then blocks native execution" {
     const alloc = std.testing.allocator;
     const web_search_contract = @import("../core/tooling/web_search_contract.zig");
@@ -6106,9 +6552,13 @@ test "ACP prompt projection configures web search then blocks native execution" 
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
     try append_static(deps.ctx, arena, &messages);
-    try deps.append_runtime_context(deps.ctx, arena, &messages);
+    try deps.append_runtime_context(deps.ctx, arena, state.active_session.?.model, &messages);
 
-    try std.testing.expectEqualStrings("stale-key", state.web_search_runtime.api_key);
+    {
+        var live = try state.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("stale-key", live.api_key);
+    }
 
     const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
     const validation = try validate(deps.ctx, arena, .{
@@ -6118,10 +6568,12 @@ test "ACP prompt projection configures web search then blocks native execution" 
     });
     const session = state.active_session orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
-    try std.testing.expectEqualStrings(session.api_key, state.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
+    try expectWebSearchInputs(alloc, &state.web_search_runtime, .{
+        .api_key = session.api_key,
+        .worker_model = session.model,
+        .gateway_retry_count = state.cfg.gateway_retry_count,
+        .gateway_chat_url = state.cfg.gateway_chat_url,
+    });
 
     const execute = deps.execute_tool_call;
     const execution = try execute(deps.ctx, .{
@@ -6137,10 +6589,12 @@ test "ACP prompt projection configures web search then blocks native execution" 
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = session.max_tool_result_bytes,
     });
-    try std.testing.expectEqualStrings(session.api_key, state.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
+    try expectWebSearchInputs(alloc, &state.web_search_runtime, .{
+        .api_key = session.api_key,
+        .worker_model = session.model,
+        .gateway_retry_count = state.cfg.gateway_retry_count,
+        .gateway_chat_url = state.cfg.gateway_chat_url,
+    });
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }
@@ -6154,7 +6608,10 @@ test "ACP ChatGPT route removes Gateway-backed auxiliary capabilities" {
     state.active_session.?.api_key = "chatgpt-secret";
     var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
 
-    const tool_ctx = ctx.toolContext();
+    var sign_in_arena = std.heap.ArenaAllocator.init(alloc);
+    defer sign_in_arena.deinit();
+    const arena = sign_in_arena.allocator();
+    const tool_ctx = try ctx.toolContext(arena);
     try std.testing.expect(tool_ctx.web_search_backend == null);
     try std.testing.expect(tool_ctx.permission_reviewer_provider == null);
     try std.testing.expect(!tool_ctx.auto_classifier.enabled());
@@ -6635,17 +7092,24 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expectEqualStrings("acp custom tool guidance", config.custom_tool_guidance);
     try std.testing.expectEqualStrings("ACP test model overlay", config.model_prompt_overlay.?);
     var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
-    const tool_ctx = ctx.toolContext();
+    var sign_in_arena = std.heap.ArenaAllocator.init(alloc);
+    defer sign_in_arena.deinit();
+    const arena = sign_in_arena.allocator();
+    const tool_ctx = try ctx.toolContext(arena);
     try std.testing.expect(!tool_ctx.web_search_runtime_ready);
     try std.testing.expect(tool_ctx.web_search_backend != null);
     try std.testing.expect(state.web_search_runtime.provider.?.execute_fn == state.cfg.provider_set.gateway.fx_search.?.execute_fn);
     try std.testing.expect(state.web_search_runtime.provider.?.preferred_backends_fn == state.cfg.provider_set.gateway.fx_search.?.preferred_backends_fn);
     try std.testing.expect(tool_ctx.web_fetch_runtime.? == &state.web_fetch_runtime);
     try std.testing.expectEqualStrings("team_123", tool_ctx.gateway_team.?);
-    try std.testing.expectEqualStrings("team_123", state.web_search_runtime.gateway_team.?);
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
+    {
+        var live = try state.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("team_123", live.gateway_team.?);
+        try std.testing.expectEqualStrings(session.model, live.worker_model);
+        try std.testing.expectEqual(state.cfg.gateway_retry_count, live.gateway_retry_count);
+        try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, live.gateway_chat_url);
+    }
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try std.testing.expect(tool_ctx.ultrafast_mode);
 }

@@ -28,6 +28,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permissions = @import("../permissions/permissions.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const prompt_policy_contract = @import("../config/prompt_policy.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -37,6 +38,7 @@ const session_child_store = @import("../session/session_child_store.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
+const app_auth_runtime = @import("app_auth_runtime.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_authority = @import("../subagent/authority.zig");
@@ -238,6 +240,7 @@ pub fn Runtime(comptime App: type) type {
         /// not stop a call to it; `childLiveToolAuthority` refuses any tool
         /// outside the admission.
         fn applyChildToolContext(app: *App, ctx: *tool_runtime.Context, run: *agents.ChildRun) void {
+            ctx.remote_setup_allowed = false;
             ctx.session_grants = run.admission.grants;
             ctx.permission_state_override = &run.admission.permission_state;
             ctx.advertised_dynamic_tool_names = run.admission.integration_names;
@@ -247,9 +250,15 @@ pub fn Runtime(comptime App: type) type {
                 .disabled;
             // A child's `subagent` calls go to its own host, which the tool
             // context already holds, as main's go to main's.
-            // A child's approvals and questions go to its own worker, as
-            // main's do, for main's runs and the user's alike; main's screen
-            // borrows them while the child is hidden.
+            // A run main started asks through its turn, so the request is
+            // registered and main is told; it still waits on this child's own
+            // worker, whose screen shows it too. A turn the person typed has no
+            // turn of main's, so it keeps the worker's prompter and stays with
+            // the person (`tests/tla/subagent/TuiParentApproval.tla`
+            // TypedStaysWithPerson).
+            if (run.turn) |turn| {
+                if (run.startedByParent()) ctx.permission_prompter = turn.permissionPrompter();
+            }
             ctx.interactive = false;
             ctx.ask_user_questions = true;
             ctx.provider = run.admission.provider;
@@ -387,6 +396,7 @@ pub fn Runtime(comptime App: type) type {
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace.root,
+                .sandbox_policy = if (comptime @hasField(App, "sandbox_policy")) app.sandbox_policy else null,
                 .access_scope = workspace.access_scope,
                 .ignored_list_entries = ignored_list_entries,
                 .max_list_entries = max_list_entries,
@@ -396,14 +406,19 @@ pub fn Runtime(comptime App: type) type {
                 .max_command_output_bytes = max_command_output_bytes,
                 .max_tool_result_bytes = agent_settings.max_tool_result_bytes,
                 .auto_compact_percent = agent_settings.auto_compact_percent,
-                .api_key = app.auth.apiKey() orelse "",
+                // The call's own sign-in comes from its lease
+                // (`applyCredentialLease`): the app replaces and frees the one
+                // it holds on its own thread (`src/core/app/app_agent_runtime.zig`
+                // "a tool call keeps the sign-in a refresh replaces, and web
+                // search follows the app's").
+                .api_key = "",
                 .agent_stream_provider = if (comptime @hasDecl(App, "agentStreamProvider"))
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
-                .gateway_team = app.auth.gatewayTeam(),
+                .gateway_team = null,
                 .credential_source = app.auth.credentialSource(),
-                .account_id = app.auth.accountId(),
+                .account_id = null,
                 .provider = selected_provider,
                 .provider_capabilities = provider_capabilities,
                 .oauth_transport = app.auth.oauthTransport(),
@@ -466,13 +481,6 @@ pub fn Runtime(comptime App: type) type {
                 } else .none,
                 .permission_reviewer_provider = if (comptime @hasDecl(App, "permissionReviewerProvider")) app.permissionReviewerProvider() else null,
                 .tracker = &agent.change_tracker,
-                .mcp_ctx = @ptrCast(app),
-                .mcp_has_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpHasTool else null,
-                .mcp_validate_tool = if (comptime runtime_profile.allows(App, .mcp)) validateMcpTool else null,
-                .mcp_call_tool = if (comptime runtime_profile.allows(App, .mcp)) callMcpTool else null,
-                .mcp_search_tools = if (comptime runtime_profile.allows(App, .mcp)) searchMcpTools else null,
-                .mcp_tool_schema = if (comptime runtime_profile.allows(App, .mcp)) mcpToolSchemaJson else null,
-                .mcp_snapshot_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpSnapshotTool else null,
                 .mcp_progress_ctx = @ptrCast(agent),
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
                 .tool_progress_ctx = @ptrCast(agent),
@@ -485,6 +493,7 @@ pub fn Runtime(comptime App: type) type {
                 .subagent_status_renderer = app_callbacks.Bindings(App).subagentStatusRenderer(agent),
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app, agent).scope,
+                .user_turn_id = agent.worker.activeTurnId(),
             };
             if (comptime @hasField(App, "web_fetch_runtime")) {
                 ctx.web_fetch_runtime = &app.web_fetch_runtime;
@@ -495,20 +504,13 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasField(App, "web_search_runtime")) {
                 if (provider_capabilities.fx_search) {
-                    app.web_search_runtime.configure(.{
-                        .api_key = app.auth.apiKey() orelse "",
-                        .credential_source = app.auth.credentialSource(),
-                        .gateway_team = app.auth.gatewayTeam(),
-                        .worker_model = provider_runtime.modelOf(app, agent),
-                        .gateway_retry_count = gateway_retry_count,
-                        .gateway_chat_url = gateway_chat_url,
-                    });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 }
                 ctx.web_search_runtime_ready = false;
                 ctx.web_search_progress_ctx = @ptrCast(agent);
                 ctx.on_web_search_progress = app_callbacks.Bindings(App).onWebSearchProgress;
             }
+            if (comptime runtime_profile.allows(App, .mcp)) app.wireMcp(&ctx);
             if (comptime runtime_profile.allows(App, .mcp) and
                 @hasDecl(@TypeOf(agent.worker), "requestMcpElicitationAnswerBlocking") and
                 @hasDecl(App, "urlOpener"))
@@ -661,48 +663,6 @@ pub fn Runtime(comptime App: type) type {
                 std.math.maxInt(i64);
         }
 
-        fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Access) bool {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            return app.hasMcpTool(name, access);
-        }
-
-        fn validateMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasDecl(App, "validateMcpTool")) {
-                return app.validateMcpTool(arena, name, arguments_json, access);
-            }
-            return .not_available;
-        }
-
-        fn callMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_tool_result_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            return app.callMcpTool(arena, name, arguments_json, max_tool_result_bytes, options);
-        }
-
-        fn searchMcpTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasDecl(App, "searchMcpTools")) {
-                return app.searchMcpTools(arena, request, permission_rules, access, cancel_flag);
-            }
-            return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
-        }
-
-        fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasField(App, "mcp")) {
-                return app.mcp.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
-            }
-            return .unavailable;
-        }
-
-        fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasDecl(App, "mcpToolSchemaJson")) {
-                return app.mcpToolSchemaJson(arena, name, permission_rules, access, cancel_flag);
-            }
-            return null;
-        }
-
         pub fn resolveToolActionDisplayTarget(
             app: *App,
             agent: *AppAgent,
@@ -739,6 +699,24 @@ pub fn Runtime(comptime App: type) type {
                 ctx.managed_executions,
                 call,
             );
+        }
+
+        pub fn resolveCommandPlacement(
+            app: *App,
+            agent: *AppAgent,
+            arena: Allocator,
+            call: ToolCall,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) !?types.CommandPlacement {
+            const ctx = toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            return tool_admission.runCommandPlacement(ctx.admissionInput(), arena, call);
         }
 
         pub fn releaseAgentTerminalLease(
@@ -997,6 +975,26 @@ pub fn Runtime(comptime App: type) type {
             return tool_runtime.resolveUnselectedMcpTool(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, name);
         }
 
+        /// Whether the tool `name` the model was shown is still the one `known`
+        /// describes, as the agent's own tool context sees MCP.
+        pub fn snapshotMcpDefinition(
+            app: *App,
+            agent: *AppAgent,
+            arena: Allocator,
+            name: []const u8,
+            known: tool_mcp_runtime.Binding,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) !tool_mcp_runtime.DefinitionSnapshot {
+            return tool_runtime.snapshotMcpDefinition(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, name, known);
+        }
+
         pub fn checkToolAvailability(
             app: *App,
             agent: *AppAgent,
@@ -1070,7 +1068,10 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) void {
-            const credential_secret = credential.secret() orelse return;
+            // The turn owns this sign-in (`TurnSignIn`), so the call sends
+            // bytes that outlive an adoption on the app's thread. A
+            // host-managed credential keeps no local key.
+            const credential_secret = credential.secret() orelse "";
             const credential_source = credential.credentialSource();
             ctx.api_key = credential_secret;
             ctx.credential_source = credential_source;
@@ -1125,6 +1126,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             agent: *AppAgent,
             arena: Allocator,
+            model: []const u8,
             messages: *std.ArrayList(ChatMessage),
             ignored_list_entries: []const []const u8,
             max_list_entries: usize,
@@ -1161,6 +1163,7 @@ pub fn Runtime(comptime App: type) type {
                 .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
+                .model = model,
                 .subagents = subagents,
             }, arena, messages);
         }
@@ -1440,6 +1443,7 @@ pub fn Runtime(comptime App: type) type {
                     .records = if (app_session_runtime.Runtime(App).childCapability(agent)) |capability| result_store.compactorStore(capability) else null,
                     .cancel_flag = &agent.worker.worker_cancel_requested,
                     .trace_ctx = .{ .turn_id = job.turn_id },
+                    .toolbox_menu = try agent.session.agent.compactionToolboxMenu(arena, job.history),
                 },
             }) catch |err| {
                 if (err == error.Cancelled and agent.worker.worker_cancel_requested.load(.seq_cst)) return;
@@ -1507,7 +1511,12 @@ pub fn Runtime(comptime App: type) type {
             var run = try prepareChildRun(app, turn, message, admission);
             var completion: agents.ChildRunCompletion = .{};
             run.completion = &completion;
-            var post = app_agents_runtime.Post{ .turn = turn, .run = run, .message = message.content };
+            var post = app_agents_runtime.Post{
+                .turn = turn,
+                .run = run,
+                .message = message.content,
+                .continues_yielded = if (comptime runtime_profile.allows(App, .auto_upgrade)) message.continues_yielded else false,
+            };
             defer if (post.run) |*unsent| {
                 unsent.completion = null;
                 unsent.turn = null;
@@ -1808,13 +1817,17 @@ fn formatToolAction(
     };
     if (try tool_presentation.formatRunCommandActivity(arena, ctx.tool_registry, ctx.workspace_root, call)) |activity| {
         defer arena.free(activity.detail);
-        const label = if (activity.compatibility_tool) |compatibility_tool|
+        const base_label = if (activity.compatibility_tool) |compatibility_tool|
             specLabel(compatibility_tool, state, denied_label)
         else switch (state) {
             .active => "Running",
             .completed => "Ran",
             .denied => denied_label.?,
         };
+        const label = if (activity.compatibility_tool == null)
+            try tool_presentation.formatCommandPlacementLabel(arena, base_label, call.command_placement)
+        else
+            base_label;
         return formatCommandActionValue(
             arena,
             label,
@@ -2214,14 +2227,21 @@ const FakeApp = struct {
         self.lifecycle_runtime.deinit();
     }
 
-    fn hasMcpTool(self: *FakeApp, name: []const u8, _: tool_mcp_runtime.Access) bool {
+    fn wireMcp(self: *FakeApp, tc: *tool_runtime.Context) void {
+        tc.mcp_ctx = @ptrCast(self);
+        tc.mcp_has_tool = fakeHasTool;
+        tc.mcp_call_tool = fakeCallTool;
+    }
+
+    fn fakeHasTool(raw: *anyopaque, name: []const u8, _: tool_mcp_runtime.Access) bool {
+        const self: *FakeApp = @ptrCast(@alignCast(raw));
         self.mcp_has_tool_calls += 1;
         return std.mem.eql(u8, name, self.mcp_name);
     }
 
-    fn callMcpTool(self: *FakeApp, arena: Allocator, name: []const u8, arguments_json: []const u8, _: usize, _: tool_mcp_runtime.CallOptions) !?tool_mcp_runtime.CallResult {
-        _ = arguments_json;
-        if (!self.hasMcpTool(name, .unrestricted)) return null;
+    fn fakeCallTool(raw: *anyopaque, arena: Allocator, name: []const u8, _: []const u8, _: usize, _: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
+        const self: *FakeApp = @ptrCast(@alignCast(raw));
+        if (!fakeHasTool(raw, name, .unrestricted)) return null;
         return .{ .model_output = try arena.dupe(u8, self.mcp_result) };
     }
 
@@ -2296,9 +2316,9 @@ const FakeApp = struct {
         };
     }
 
-    pub fn appendRuntimeContextMessage(self: *FakeApp, _: anytype, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+    pub fn appendRuntimeContextMessage(self: *FakeApp, _: anytype, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
         self.append_context_count += 1;
-        try Runtime(FakeApp).appendTransientRuntimeContextMessage(self, self.agent(), arena, messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        try Runtime(FakeApp).appendTransientRuntimeContextMessage(self, self.agent(), arena, model, messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
     pub fn requestToolPermissionSync(self: *FakeApp, arena: Allocator, call: ToolCall, permission_mode: PermissionMode, local_grants: []const PermissionGrant) !command_admission.PermissionOutcome {
@@ -2477,14 +2497,14 @@ test "a merge of approvals makes one copy of the instance's list: a slice and tw
     var app = try FakeApp.init(std.testing.allocator);
     defer app.deinit();
     const own = [_]PermissionGrant{
-        .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a") },
-        .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/b") },
+        .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a"), .shell_epoch = 0 },
+        .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/b"), .shell_epoch = 0 },
     };
     var held: usize = 0;
     for ([_]usize{ 1, 20, 200 }) |count| {
         while (held < count) : (held += 1) {
             var buf: [24]u8 = undefined;
-            try app.permission_engine.allow(std.testing.allocator, "skill", try std.mem.print(&buf, "t-{d}", .{held}));
+            try app.permission_engine.allow(std.testing.allocator, "skill", try std.mem.print(&buf, "t-{d}", .{held}), 0);
         }
         var counting = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
         const alloc = counting.allocator();
@@ -2511,7 +2531,7 @@ fn callsAgainstTurnArena(count: usize, limit: usize) !void {
     defer app.deinit();
     for (0..count) |i| {
         var buf: [24]u8 = undefined;
-        try app.permission_engine.allow(std.testing.allocator, "skill", try std.mem.print(&buf, "t-{d}", .{i}));
+        try app.permission_engine.allow(std.testing.allocator, "skill", try std.mem.print(&buf, "t-{d}", .{i}), 0);
     }
     const buffer = try std.testing.allocator.alloc(u8, limit);
     defer std.testing.allocator.free(buffer);
@@ -2553,8 +2573,8 @@ test "the request an execution runs under holds the call's approvals, then the i
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc);
     defer app.deinit();
-    try app.permission_engine.allow(alloc, "skill", "granted");
-    var own = [_]PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own") }};
+    try app.permission_engine.allow(alloc, "skill", "granted", 0);
+    var own = [_]PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own"), .shell_epoch = 0 }};
     const request: agent_runtime.ToolExecutionRequest = .{
         .call_allocator = alloc,
         .result_allocator = alloc,
@@ -2593,7 +2613,7 @@ test "an approval in the instance's list never makes a tool that main's turn doe
     // What the turn offers decides, and the list of approvals does not enter
     // into it: a merged approval skips a prompt, and grants no tool.
     try std.testing.expect((try app.validateToolCall({}, arena, call)) == .not_registered);
-    try app.permission_engine.allow(alloc, "mcp_unoffered", "anything");
+    try app.permission_engine.allow(alloc, "mcp_unoffered", "anything", 0);
     try std.testing.expect((try app.validateToolCall({}, arena, call)) == .not_registered);
 }
 
@@ -2609,11 +2629,17 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
         .fast_mode = true,
         .effort = types.ReasoningEffort.literal("high"),
     };
-    try app.permission_engine.allow(alloc, "run_command", "/tmp/workspace::zig build");
+    try app.permission_engine.allow(alloc, "run_command", "/tmp/workspace::zig build", 0);
 
+    var web_search_before = try app.web_search_runtime.inputsSnapshot(alloc);
+    defer web_search_before.deinit(alloc);
     const ctx = testToolContext(&app);
     try std.testing.expectEqualStrings("/tmp/workspace", ctx.workspace_root);
-    try std.testing.expectEqualStrings("api-key", ctx.api_key);
+    // The call's sign-in comes from its own lease (`applyCredentialLease`), so
+    // a context built here never holds the app's slices
+    // (`src/core/app/app_agent_runtime.zig` "a tool call keeps the sign-in a
+    // refresh replaces, and web search follows the app's").
+    try std.testing.expectEqual(@as(usize, 0), ctx.api_key.len);
     try std.testing.expectEqualStrings("test-model", ctx.model);
     try std.testing.expect(ctx.tool_registry.lookup("web_search") != null);
     try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
@@ -2623,7 +2649,7 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     var copy_arena = std.heap.ArenaAllocator.init(alloc);
     defer copy_arena.deinit();
     // A check reads the turn's own approvals, then a copy of the instance's.
-    var own = [_]PermissionGrant{.{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/own") }};
+    var own = [_]PermissionGrant{.{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/own"), .shell_epoch = 0 }};
     const merged = Runtime(FakeApp).mergeLiveGrants(&app, app.agent(), copy_arena.allocator(), &own);
     try std.testing.expectEqual(@as(usize, 2), merged.len);
     try std.testing.expectEqualStrings("read_file", merged[0].tool_name);
@@ -2643,9 +2669,15 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     try std.testing.expect(ctx.web_fetch_runtime.? == &app.web_fetch_runtime);
     try std.testing.expect(ctx.web_fetch_progress_ctx != null);
     try std.testing.expect(ctx.on_web_fetch_progress != null);
-    try std.testing.expectEqualStrings("test-model", app.web_search_runtime.worker_model);
-    try std.testing.expectEqual(ctx.gateway_retry_count, app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.gateway_chat_url, app.web_search_runtime.gateway_chat_url);
+    // Building a context leaves the shared web-search runtime as it is: the
+    // call configures it from its own sign-in when it runs
+    // (`src/core/app/app_agent_runtime.zig` "a tool call keeps the sign-in a
+    // refresh replaces, and web search follows the app's").
+    var web_search_after = try app.web_search_runtime.inputsSnapshot(alloc);
+    defer web_search_after.deinit(alloc);
+    try std.testing.expectEqualStrings(web_search_before.worker_model, web_search_after.worker_model);
+    try std.testing.expectEqual(web_search_before.gateway_retry_count, web_search_after.gateway_retry_count);
+    try std.testing.expectEqualStrings(web_search_before.gateway_chat_url, web_search_after.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", ctx.gateway_models_path);
     try std.testing.expectEqual(@as(usize, 4096), ctx.max_tool_result_bytes);
     try std.testing.expectEqual(types.ToolChoice.none, ctx.first_call_tool_choice);
@@ -2782,9 +2814,13 @@ test "app prompt projection configures web search then blocks native execution" 
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try app.appendRuntimeContextMessage(app.agent(), arena, &messages);
+    try app.appendRuntimeContextMessage(app.agent(), arena, app.selected_model.items, &messages);
 
-    try std.testing.expectEqualStrings("stale-key", app.web_search_runtime.api_key);
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("stale-key", live.api_key);
+    }
 
     const validation = try app.validateToolCall(app.agent(), arena, .{
         .id = "search",
@@ -2792,11 +2828,23 @@ test "app prompt projection configures web search then blocks native execution" 
         .arguments_json = "{\"query\":\"x\"}",
     });
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
-    try std.testing.expectEqualStrings(app.auth.apiKey().?, app.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(app.selected_model.items, app.web_search_runtime.worker_model);
-    try std.testing.expectEqual(@as(usize, 2), app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(test_gateway_chat_url, app.web_search_runtime.gateway_chat_url);
+    // The projection and the check configure nothing: the app's sign-in is not
+    // borrowed, so the runtime keeps what it was last given
+    // (`src/core/app/app_agent_runtime.zig` "a tool call keeps the sign-in a
+    // refresh replaces, and web search follows the app's").
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("stale-key", live.api_key);
+        try std.testing.expectEqualStrings("stale-model", live.worker_model);
+        try std.testing.expectEqual(@as(usize, 99), live.gateway_retry_count);
+        try std.testing.expectEqualStrings("https://stale.invalid/chat", live.gateway_chat_url);
+    }
 
+    // The call configures it from the turn's own copy of the sign-in, which its
+    // queued prompt owns.
+    const turn_key = try alloc.dupe(u8, "turn-key");
+    defer alloc.free(turn_key);
     const execution = try app.executeToolCall(app.agent(), .{
         .call_allocator = arena,
         .result_allocator = arena,
@@ -2809,13 +2857,33 @@ test "app prompt projection configures web search then blocks native execution" 
         .session_grants = &.{},
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = 2048,
+        .credential = .{ .direct = .{ .secret_bytes = turn_key, .source = .ai_gateway_api_key } },
     });
-    try std.testing.expectEqualStrings(app.auth.apiKey().?, app.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(app.selected_model.items, app.web_search_runtime.worker_model);
-    try std.testing.expectEqual(@as(usize, 2), app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(test_gateway_chat_url, app.web_search_runtime.gateway_chat_url);
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings(turn_key, live.api_key);
+        try std.testing.expectEqualStrings(app.selected_model.items, live.worker_model);
+        try std.testing.expectEqual(@as(usize, 2), live.gateway_retry_count);
+        try std.testing.expectEqualStrings(test_gateway_chat_url, live.gateway_chat_url);
+    }
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
+}
+
+test "a host-managed lease leaves the call and web search without a key" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var ctx = testToolContext(&app);
+    Runtime(FakeApp).applyCredentialLease(&app, app.agent(), &ctx, .host_managed, 2, test_gateway_chat_url);
+
+    try std.testing.expectEqual(@as(usize, 0), ctx.api_key.len);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, ctx.credential_source.?);
+    var live = try app.web_search_runtime.inputsSnapshot(alloc);
+    defer live.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), live.api_key.len);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, live.credential_source.?);
 }
 
 test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
@@ -2844,6 +2912,49 @@ test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
     );
     try std.testing.expect(ctx.web_search_backend == null);
     try std.testing.expect(ctx.permission_reviewer_provider == null);
+}
+
+test "a tool call keeps the sign-in a refresh replaces, and web search follows the app's" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    var first = credentials.Credential{
+        .token = try alloc.dupe(u8, "first-token"),
+        .source = .ai_gateway_api_key,
+    };
+    defer first.deinit(alloc);
+    _ = app.auth.adoptCredential(alloc, &first);
+
+    var ctx = testToolContext(&app);
+    // With no lease yet the context holds no sign-in at all: it never borrows
+    // the app's, which the app frees when it adopts another.
+    try std.testing.expectEqual(@as(usize, 0), ctx.api_key.len);
+    // The turn owns its own copy of the sign-in, which its queued prompt frees.
+    const turn_token = try alloc.dupe(u8, "first-token");
+    defer alloc.free(turn_token);
+    Runtime(FakeApp).applyCredentialLease(&app, (&app).agent(), &ctx, .{ .direct = .{
+        .secret_bytes = turn_token,
+        .source = .ai_gateway_api_key,
+    } }, 2, test_gateway_chat_url);
+
+    var second = credentials.Credential{
+        .token = try alloc.dupe(u8, "second-token"),
+        .source = .ai_gateway_api_key,
+    };
+    defer second.deinit(alloc);
+    var prepared = try second.clone(alloc);
+    _ = app.auth.adoptPreparedCredential(alloc, &prepared);
+
+    // The call still sends the sign-in it started with, and the runtime it
+    // pointed at holds that sign-in as its own copy, not as the lease's slice.
+    try std.testing.expectEqualStrings("first-token", ctx.api_key);
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("first-token", live.api_key);
+        try std.testing.expect(live.api_key.ptr != turn_token.ptr);
+    }
 }
 
 test "app agent runtime tool context combines active settings with live permission mode" {
@@ -3329,7 +3440,7 @@ test "app agent runtime appends static and transient context through configured 
     app.permission_engine.mode = .auto;
 
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, (&app).agent(), arena, app.selected_model.items, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
@@ -3766,6 +3877,7 @@ test "subagent tool context uses immutable admission authority" {
         .action = .allow,
     }};
     const admission_grants = [_]types.PermissionGrant{.{
+        .shell_epoch = shell_snapshot.processOwner().approvalEpoch(),
         .tool_name = @constCast("run_command"),
         .target_path = @constCast("/tmp/workspace::zig build"),
     }};
@@ -3966,4 +4078,39 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
+}
+
+test "app agent runtime formats shell run labels for remote, isolated, local, and unplaced calls" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    const base_call: ToolCall = .{
+        .id = "1",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"uname -a\"}",
+    };
+
+    var remote_call = base_call;
+    remote_call.command_placement = .remote;
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, remote_call), "● Running on remote\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, remote_call), "● Ran on remote\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionDenied(app.agent(), arena, remote_call, "Exited 1"), "● Exited 1 on remote\x1b[0m "));
+
+    var isolated_call = base_call;
+    isolated_call.command_placement = .isolated;
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, isolated_call), "● Running on isolated\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, isolated_call), "● Ran on isolated\x1b[0m "));
+
+    var local_call = base_call;
+    local_call.command_placement = .local;
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, local_call), "● Running\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, local_call), "● Ran\x1b[0m "));
+
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, base_call), "● Running\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, base_call), "● Ran\x1b[0m "));
 }

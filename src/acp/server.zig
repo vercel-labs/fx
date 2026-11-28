@@ -6,6 +6,7 @@ const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+const sandbox_policy = if (host_target.is_wasm) struct {} else @import("../core/runner/runner.zig");
 const runtime_profile = @import("../core/hosts/runtime_profile.zig");
 
 /// Only hosts with `durable_sessions` enabled open an fx v2 session store.
@@ -303,10 +304,12 @@ pub const ActiveSessionState = struct {
     /// prompt, and what a running session held must reopen.
     staging_needed: StagedTotals = .{},
 
-    pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
-        for (self.session_grants) |grant| {
-            if (std.mem.eql(u8, grant.tool_name, tool_name) and
-                std.mem.eql(u8, grant.target_path, target_path)) return;
+    pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
+        for (self.session_grants) |*grant| {
+            if (!std.mem.eql(u8, grant.tool_name, tool_name) or
+                !std.mem.eql(u8, grant.target_path, target_path)) continue;
+            if (!permissions.grantAppliesInShellEpoch(grant.*, shell_epoch)) grant.shell_epoch = shell_epoch;
+            return;
         }
 
         const name_copy = try alloc.dupe(u8, tool_name);
@@ -319,7 +322,7 @@ pub const ActiveSessionState = struct {
             @memmove(next[0..self.session_grants.len], self.session_grants);
             alloc.free(self.session_grants);
         }
-        next[next.len - 1] = .{ .tool_name = name_copy, .target_path = target_copy };
+        next[next.len - 1] = .{ .tool_name = name_copy, .target_path = target_copy, .shell_epoch = shell_epoch };
         self.session_grants = next;
     }
 };
@@ -391,6 +394,9 @@ pub const ServerState = struct {
     cache_warming: bool = true,
     /// `experimental.workspace_capture`, from startup.
     workspace_capture: bool = false,
+    /// The sandbox policy, loaded when `experimental.sandbox_execution` is on.
+    /// Host only: the WASM core runs no sandbox.
+    sandbox_policy: if (host_target.is_wasm) void else ?*sandbox_policy.Policy = if (host_target.is_wasm) {} else null,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -411,6 +417,8 @@ pub const ServerState = struct {
     /// Open for the whole connection on native hosts; the wasm host keeps
     /// its sessions in the JS host's snapshot store (D63).
     sessions_v2: ?session_adapter.Store = null,
+    /// The v1 roots of the paged `session/list` in progress, owned by `sessions.zig`.
+    session_listing: ?sessions.SessionListing = null,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
@@ -453,7 +461,13 @@ pub const ServerState = struct {
         if (comptime !host_target.is_wasm) mcp_host.waitRetired();
         // Retention's maintenance, if one runs, ends with the server.
         if (comptime turn_capture.supported) turn_capture.finishMaintenance();
+        // The prompts, subagents, and worker that could place a command have ended.
+        if (comptime !host_target.is_wasm) {
+            if (self.sandbox_policy) |loaded| loaded.destroy();
+            self.sandbox_policy = null;
+        }
         if (self.sessions_v2) |*store| store.deinit(self.alloc);
+        if (self.session_listing) |*listing| listing.deinit(self.alloc);
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
@@ -646,6 +660,16 @@ pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provide
             if (provider == .gateway) state.gateway_source_preference else state.credential_source,
         )) orelse return error.ProviderCredentialUnavailable;
     };
+}
+
+test "a second initialize keeps the sandbox policy the first one loaded" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    var state: ServerState = undefined;
+    state.alloc = std.testing.allocator;
+    var loaded: sandbox_policy.Policy = undefined;
+    state.sandbox_policy = &loaded;
+    loadSandboxPolicyOnce(&state);
+    try std.testing.expect(state.sandbox_policy.? == &loaded);
 }
 
 test "ACP credential preparation preserves the existing borrowed credential" {
@@ -931,6 +955,14 @@ fn dropQueuedMail(state: *ServerState, session_id: []const u8, scope: DropScope,
     state.report_calls.shrinkRetainingCapacity(kept);
 }
 
+/// Loads the process's sandbox policy once. A second `initialize` keeps the policy the first one loaded:
+/// active sessions hold its pointer, and loading again would leave the first policy unreleased.
+fn loadSandboxPolicyOnce(state: *ServerState) void {
+    if (comptime host_target.is_wasm) return;
+    if (state.sandbox_policy != null) return;
+    state.sandbox_policy = sandbox_policy.loadForProcess(state.alloc);
+}
+
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
     if (active.title_task) |task| {
@@ -947,6 +979,7 @@ fn destroyActiveSession(state: *ServerState) void {
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
         if (active.mcp_host) |h| h.destroy();
+        if (state.sandbox_policy) |policy| policy.remote.forgetSession(active.session_id);
     }
     active.session_rt.deinit(state.alloc);
     // Before the session closes: a start capture still running uses it.
@@ -3459,6 +3492,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.session_titles = startup.session_title_generation;
     state.cache_warming = startup.cache_warming;
     state.workspace_capture = startup.workspace_capture;
+    if (comptime !host_target.is_wasm) {
+        if (startup.sandbox_execution) loadSandboxPolicyOnce(state);
+    }
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
@@ -5649,6 +5685,31 @@ test "ACP rejects refreshed Codex tokens for another account" {
         false,
     ));
     try std.testing.expectEqualStrings("stale-token", state.api_key);
+}
+
+test "a non-bash approval made again after a shell refresh is retained once" {
+    const alloc = std.testing.allocator;
+    var active: ActiveSessionState = undefined;
+    active.session_grants = &.{};
+    defer types.freePermissionGrantSlice(alloc, active.session_grants);
+
+    try active.retainGrant(alloc, "edit", "/tmp/workspace/a.zig", 0);
+    try active.retainGrant(alloc, "edit", "/tmp/workspace/a.zig", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), active.session_grants.len);
+}
+
+test "a bash approval made again after a shell refresh keeps one row at the new epoch" {
+    const alloc = std.testing.allocator;
+    var active: ActiveSessionState = undefined;
+    active.session_grants = &.{};
+    defer types.freePermissionGrantSlice(alloc, active.session_grants);
+
+    try active.retainGrant(alloc, "bash", "git status", 0);
+    try active.retainGrant(alloc, "bash", "git status", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), active.session_grants.len);
+    try std.testing.expectEqual(@as(u64, 1), active.session_grants[0].shell_epoch);
 }
 
 test "eb03: ACP steering records input_accepted unless session journal declares inputs_durable" {

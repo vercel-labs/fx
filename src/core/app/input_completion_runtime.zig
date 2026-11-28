@@ -8,7 +8,6 @@ const horizontal_navigation = @import("../input/horizontal_navigation.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -34,6 +33,7 @@ const render_input = @import("../../ui/footer/render_input.zig");
 const skills_menu_presentation = @import("../../ui/footer/skills_menu_presentation.zig");
 const model_menu_presentation = @import("../../ui/footer/model_menu_presentation.zig");
 const resume_menu_presentation = @import("../../ui/footer/resume_menu_presentation.zig");
+const effort_menu = @import("../input/effort_menu.zig");
 const effort_menu_presentation = @import("../../ui/footer/effort_menu_presentation.zig");
 const fork_menu_presentation = @import("../../ui/footer/fork_menu_presentation.zig");
 const agents_menu_presentation = @import("../../ui/footer/agents_menu_presentation.zig");
@@ -793,6 +793,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (comptime @hasField(App, "model_cache")) {
                 if (app.model_cache.menu.active) return true;
             }
+            if (app.input_runtime.effort_menu.active) return true;
             if (comptime agents.hasAgentField(App, "session_persistence")) {
                 if (agent.session_persistence.session_picker.active) return true;
             }
@@ -1308,8 +1309,8 @@ pub fn CompletionRuntime(comptime App: type) type {
                         try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
                         try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, false, .fast);
                     } else {
-                        try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, pickerFastMode(app, model), false);
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                        try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, pickerFastMode(app, model), false);
                     }
                     app.shell.render_requests.request(.footer);
                     return true;
@@ -1323,8 +1324,8 @@ pub fn CompletionRuntime(comptime App: type) type {
                         return true;
                     };
                     const effort = model_capabilities.reasoningEffortAtIndex(model_capabilities.resolveForApp(App, app, model), app.input_runtime.picker.model_picker_effort_index);
-                    try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, speed.fast_mode, speed.ultrafast_mode);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, speed.fast_mode, speed.ultrafast_mode);
                     app.shell.render_requests.request(.footer);
                     return true;
                 },
@@ -1373,6 +1374,17 @@ pub fn CompletionRuntime(comptime App: type) type {
             return buf[idx];
         }
 
+        /// Opens the model picker for `agent`: the choice changes that
+        /// agent's model, not the one on screen (`app.model_choice_target`).
+        pub fn openModelPickerForAgent(app: *App, agent: *AppAgent) !void {
+            if (comptime @hasField(App, "model_choice_target")) app.model_choice_target = agent;
+            // The picker borrows the composer as its query box. The person's
+            // draft goes back when the pick or the close is done, so a choice
+            // made for a subagent never costs them what they typed.
+            if (comptime @hasField(App, "input_runtime")) app.input_runtime.stashModelPickerDraft();
+            try openCurrentModelPicker(app);
+        }
+
         pub fn openCurrentModelPicker(app: *App) !void {
             try app.input_runtime.textReplacementState().replace(app.alloc, "/model ");
             app.input_runtime.picker.model_completion_anchor_current = true;
@@ -1387,8 +1399,10 @@ pub fn CompletionRuntime(comptime App: type) type {
             const supports_speed = supports_fast or supports_ultrafast;
 
             if (!supports_effort and !supports_speed) {
-                try session_commands.Commands(App).selectModelFromPicker(app, agent, model, agent.effort, pickerFastMode(app, model), false);
+                // The query text leaves the composer first, so the choice can
+                // give the person's draft back in its place.
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                try session_commands.Commands(App).selectModelFromPicker(app, agent, model, agent.effort, pickerFastMode(app, model), false);
                 app.shell.render_requests.request(.footer);
                 return;
             }
@@ -1517,24 +1531,9 @@ pub fn CompletionRuntime(comptime App: type) type {
         ) usize {
             const capabilities = model_capabilities.resolveForApp(App, app, model orelse return 0);
             const count = model_capabilities.reasoningEffortOptionCount(capabilities);
-            if (count == 0) return 0;
-
-            // A named level keeps its label inline, so the labels slice
-            // into `efforts`, which outlives the filter.
-            var efforts: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
-            var labels: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
-            for (efforts[0..count], labels[0..count], 0..) |*effort, *label, i| {
-                effort.* = model_capabilities.reasoningEffortAtIndex(capabilities, i);
-                label.* = effort.displayLabel();
-            }
-            const kept: fuzzy_match.Filter(fuzzy_match.LabelMatches) = .init(.{ .labels = labels[0..count], .query = query }, count);
-            var result_count: usize = 0;
-            for (efforts[0..count], 0..) |effort, i| {
-                if (!kept.keeps(i)) continue;
-                out[result_count] = effort;
-                result_count += 1;
-            }
-            return result_count;
+            var efforts: [effort_menu.max_options]types.ReasoningEffort = undefined;
+            for (efforts[0..count], 0..) |*effort, i| effort.* = model_capabilities.reasoningEffortAtIndex(capabilities, i);
+            return effort_menu.filterLevels(efforts[0..count], query, out);
         }
 
         fn exactEffortCompletion(app: *App, model: ?[]const u8, raw_query: []const u8) ?types.ReasoningEffort {

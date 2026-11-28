@@ -11,6 +11,7 @@ const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const subscription_logout = @import("subscription_logout.zig");
+const ui_terminal = @import("../../ui/terminal/terminal.zig");
 
 const Allocator = std.mem.Allocator;
 const FormBody = oauth.FormBody;
@@ -393,20 +394,37 @@ const StdinManualCodeReader = struct {
     closed: bool = false,
 
     fn poll(self: *StdinManualCodeReader) !?[]const u8 {
+        return self.pollFd(std.posix.STDIN_FILENO);
+    }
+
+    fn pollFd(self: *StdinManualCodeReader, fd: std.posix.fd_t) !?[]const u8 {
         if (self.closed) return null;
         var fds = [_]std.posix.pollfd{.{
-            .fd = std.posix.STDIN_FILENO,
+            .fd = fd,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
-        const ready = try std.posix.poll(&fds, 0);
-        if (ready == 0 or
-            (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) == 0) return null;
+        const ready = std.posix.poll(&fds, 0) catch |err| {
+            if (ui_terminal.terminalGone(fd, err)) return error.TerminalHungUp;
+            return err;
+        };
+        if (ready == 0) return null;
+        if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0 and
+            ui_terminal.terminalInputGone(fd))
+        {
+            return error.TerminalHungUp;
+        }
+        // POLLNVAL is what macOS reports for /dev/null, an open device, so read it to see end of file.
+        if ((fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.NVAL)) == 0) return null;
 
         var chunk: [512]u8 = undefined;
         defer @memset(&chunk, 0);
-        const read_len = try std.posix.read(std.posix.STDIN_FILENO, &chunk);
+        const read_len = std.posix.read(fd, &chunk) catch |err| {
+            if (ui_terminal.terminalGone(fd, err)) return error.TerminalHungUp;
+            return err;
+        };
         if (read_len == 0) {
+            if (ui_terminal.terminalInputGone(fd)) return error.TerminalHungUp;
             self.closed = true;
             return if (self.len == 0) null else self.buffer[0..self.len];
         }
@@ -499,6 +517,14 @@ fn refreshSession(
     try form.append(&body.writer, "grant_type", "refresh_token");
     try form.append(&body.writer, "client_id", client_id);
     try form.append(&body.writer, "refresh_token", session.refresh_token);
+    appendTeamPrincipal(alloc, &form, &body.writer, session.access_token) catch |err| switch (err) {
+        error.InvalidGrokAccessToken => {
+            debug_trace.logf("auth", "retiring Grok session whose saved token names no usable Team", .{});
+            try retireRefreshSession(mutation);
+            return error.CredentialRefreshRejected;
+        },
+        else => return err,
+    };
     // Each request has its whole budget from a fresh stamp, so another fx
     // waits for this one however slowly xAI answers.
     mutation.restamp();
@@ -685,6 +711,7 @@ fn configuredEndpoint(alloc: Allocator, env_name: []const u8, default_url: []con
     };
 }
 
+/// The account `access_token` belongs to. Caller owns the returned id. Pass
 /// `outlives_cancel` for a refresh, which has already retired the old
 /// refresh token by the time it asks (`oauth_transport.Request`).
 fn fetchAccountId(
@@ -693,6 +720,9 @@ fn fetchAccountId(
     access_token: []const u8,
     outlives_cancel: bool,
 ) ![]u8 {
+    // userinfo has no personal identity for a Team token (#461).
+    if (try teamPrincipalId(alloc, access_token)) |team_id| return team_id;
+
     const endpoint_url = try configuredEndpoint(alloc, e2e_userinfo_url_env, userinfo_url);
     defer alloc.free(endpoint_url);
     const authorization = try alloc.print("Bearer {s}", .{access_token});
@@ -714,6 +744,59 @@ fn fetchAccountId(
     errdefer alloc.free(account_id);
     if (!grok_session.validAccountId(account_id)) return error.InvalidGrokUserInfoResponse;
     return account_id;
+}
+
+const team_principal_type = "Team";
+
+/// The Grok Team `access_token` was issued for, from its `principal_type`
+/// and `principal_id` claims, or null for a personal account or a token
+/// without them. A Team token with no usable id is
+/// `error.InvalidGrokAccessToken`. The token comes straight from xAI's token
+/// endpoint over TLS, so its signature is not checked here. Caller owns the
+/// returned id. (`tests/tla/grok_oauth/GrokIdentity.tla` UsableSignInCompletes)
+fn teamPrincipalId(alloc: Allocator, access_token: []const u8) !?[]u8 {
+    var parts = std.mem.splitScalar(u8, access_token, '.');
+    _ = parts.next(); // the header
+    const encoded = parts.next() orelse return null;
+    _ = parts.next() orelse return null; // the signature
+    if (parts.next() != null) return null;
+
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const payload = try alloc.alloc(u8, decoder.calcSizeForSlice(encoded) catch return null);
+    defer secret.zeroAndFree(alloc, payload);
+    decoder.decode(payload, encoded) catch return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const claims = parsed.value.object;
+
+    const principal_type = claims.get("principal_type") orelse claims.get("principalType") orelse return null;
+    if (principal_type != .string or !std.mem.eql(u8, principal_type.string, team_principal_type)) return null;
+    const principal_id = claims.get("principal_id") orelse claims.get("principalId") orelse
+        return error.InvalidGrokAccessToken;
+    if (principal_id != .string or !grok_session.validAccountId(principal_id.string)) {
+        return error.InvalidGrokAccessToken;
+    }
+    return try alloc.dupe(u8, principal_id.string);
+}
+
+/// Names the Team `access_token` was issued for in a refresh form. Without
+/// it xAI refreshes into the person's own account, which fx then rejects as
+/// another account. A personal token adds nothing.
+/// (`tests/tla/grok_oauth/GrokIdentity.tla` RefreshKeepsAccount)
+fn appendTeamPrincipal(
+    alloc: Allocator,
+    form: *FormBody,
+    writer: *std.Io.Writer,
+    access_token: []const u8,
+) !void {
+    const team_id = (try teamPrincipalId(alloc, access_token)) orelse return;
+    defer alloc.free(team_id);
+    try form.append(writer, "principal_type", team_principal_type);
+    try form.append(writer, "principal_id", team_id);
 }
 
 pub fn revokeToken(
@@ -822,7 +905,11 @@ fn queryValueAlloc(alloc: Allocator, query: []const u8, key: []const u8) ![]u8 {
 }
 
 fn writeStdout(text: []const u8) !void {
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text) catch |err| {
+        if (err == error.BrokenPipe) return error.OutputReaderGone;
+        if (ui_terminal.terminalGone(std.posix.STDOUT_FILENO, err)) return error.TerminalHungUp;
+        return err;
+    };
 }
 
 test "Grok E2E OAuth endpoint overrides accept only loopback HTTP" {
@@ -869,6 +956,197 @@ test "Grok account identity rejects unsafe userinfo bytes" {
             false,
         ),
     );
+}
+
+/// Writes an access token whose payload is `payload`, between a header and a
+/// signature that fx never checks.
+fn writeTestAccessToken(writer: *std.Io.Writer, payload: []const u8) !void {
+    try writer.writeAll("eyJhbGciOiJSUzI1NiJ9.");
+    try std.base64.url_safe_no_pad.Encoder.encodeWriter(writer, payload);
+    try writer.writeAll(".signature");
+}
+
+fn testAccessToken(alloc: Allocator, payload: []const u8) ![]u8 {
+    var token: std.Io.Writer.Allocating = .init(alloc);
+    errdefer token.deinit();
+    try writeTestAccessToken(&token.writer, payload);
+    return token.toOwnedSlice();
+}
+
+/// A userinfo endpoint that counts its requests. With `refuse_all` it answers
+/// 403, as the reporters of #461 say xAI's does for a Team token.
+const TestUserInfo = struct {
+    refuse_all: bool,
+    requests: usize = 0,
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+        const self: *TestUserInfo = @ptrCast(@alignCast(raw.?));
+        self.requests += 1;
+        if (self.refuse_all) {
+            return .{ .disposition = .rejected, .body = try alloc.dupe(u8, "{\"error\":\"insufficient_scope\"}") };
+        }
+        return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{\"sub\":\"user_from_userinfo\"}") };
+    }
+
+    fn transport(self: *TestUserInfo) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+};
+
+test "a Grok Team account is named by the principal in its access token, not userinfo" {
+    const alloc = std.testing.allocator;
+    const text_utils = @import("../shared/text_utils.zig");
+    const longest_id = text_utils.repeat("t", 1024);
+    const payloads = [_][]const u8{
+        "{\"principal_type\":\"Team\",\"principal_id\":\"team_test\"}",
+        "{\"principalType\":\"Team\",\"principalId\":\"team_test\"}",
+        "{\"sub\":\"user\",\"principal_type\":\"Team\",\"principal_id\":\"team_test\",\"exp\":1}",
+        "{\"principal_type\":\"Team\",\"principal_id\":\"" ++ longest_id ++ "\"}",
+    };
+    const ids = [_][]const u8{ "team_test", "team_test", "team_test", longest_id };
+    for (payloads, ids) |payload, id| {
+        const token = try testAccessToken(alloc, payload);
+        defer alloc.free(token);
+        var userinfo: TestUserInfo = .{ .refuse_all = true };
+        const account_id = try fetchAccountId(alloc, userinfo.transport(), token, false);
+        defer alloc.free(account_id);
+        try std.testing.expectEqualStrings(id, account_id);
+        try std.testing.expectEqual(@as(usize, 0), userinfo.requests);
+    }
+}
+
+test "a Grok Team token without a usable principal_id is refused" {
+    const alloc = std.testing.allocator;
+    const text_utils = @import("../shared/text_utils.zig");
+    const payloads = [_][]const u8{
+        "{\"principal_type\":\"Team\"}",
+        "{\"principal_type\":\"Team\",\"principal_id\":\"\"}",
+        "{\"principal_type\":\"Team\",\"principal_id\":\"team test\"}",
+        "{\"principal_type\":\"Team\",\"principal_id\":\"team\\ninjected\"}",
+        "{\"principal_type\":\"Team\",\"principal_id\":42}",
+        "{\"principal_type\":\"Team\",\"principal_id\":\"" ++ text_utils.repeat("t", 1025) ++ "\"}",
+    };
+    for (payloads) |payload| {
+        const token = try testAccessToken(alloc, payload);
+        defer alloc.free(token);
+        var userinfo: TestUserInfo = .{ .refuse_all = true };
+        try std.testing.expectError(error.InvalidGrokAccessToken, fetchAccountId(alloc, userinfo.transport(), token, false));
+        try std.testing.expectEqual(@as(usize, 0), userinfo.requests);
+    }
+}
+
+test "Grok personal and claimless tokens keep the userinfo path" {
+    const alloc = std.testing.allocator;
+    const payloads = [_][]const u8{
+        "{\"principal_type\":\"User\",\"principal_id\":\"user_from_claim\"}",
+        "{\"principal_type\":\"team\",\"principal_id\":\"user_from_claim\"}",
+        "{\"sub\":\"user_from_claim\"}",
+        "[\"principal_type\",\"Team\"]",
+        "not json",
+    };
+    for (payloads) |payload| {
+        const token = try testAccessToken(alloc, payload);
+        defer alloc.free(token);
+        var userinfo: TestUserInfo = .{ .refuse_all = false };
+        const account_id = try fetchAccountId(alloc, userinfo.transport(), token, false);
+        defer alloc.free(account_id);
+        try std.testing.expectEqualStrings("user_from_userinfo", account_id);
+        try std.testing.expectEqual(@as(usize, 1), userinfo.requests);
+    }
+    // Tokens that are not a three-part JWT, or whose payload is not base64url.
+    for ([_][]const u8{ "access-token", "header.payload", "a.b.c.d", "header.!!!.signature", "header..signature" }) |token| {
+        var userinfo: TestUserInfo = .{ .refuse_all = false };
+        const account_id = try fetchAccountId(alloc, userinfo.transport(), token, false);
+        defer alloc.free(account_id);
+        try std.testing.expectEqualStrings("user_from_userinfo", account_id);
+        try std.testing.expectEqual(@as(usize, 1), userinfo.requests);
+    }
+}
+
+test "a Grok Team refresh names its Team, and a personal one names no principal" {
+    const alloc = std.testing.allocator;
+    const team_form = "refresh_token=r&principal_type=Team&principal_id=team-test";
+    const cases = [_]struct { payload: []const u8, form: []const u8 }{
+        .{ .payload = "{\"principal_type\":\"Team\",\"principal_id\":\"team-test\"}", .form = team_form },
+        .{ .payload = "{\"principalType\":\"Team\",\"principalId\":\"team-test\"}", .form = team_form },
+        .{ .payload = "{\"principal_type\":\"User\",\"principal_id\":\"user_test\"}", .form = "refresh_token=r" },
+        .{ .payload = "{\"sub\":\"user_test\"}", .form = "refresh_token=r" },
+    };
+    for (cases) |case| {
+        const token = try testAccessToken(alloc, case.payload);
+        defer alloc.free(token);
+        var body: std.Io.Writer.Allocating = .init(alloc);
+        defer body.deinit();
+        var form: FormBody = .{};
+        try form.append(&body.writer, "refresh_token", "r");
+        try appendTeamPrincipal(alloc, &form, &body.writer, token);
+        try std.testing.expectEqualStrings(case.form, body.written());
+    }
+
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    var form: FormBody = .{};
+    try appendTeamPrincipal(alloc, &form, &body.writer, "access-token");
+    try std.testing.expectEqualStrings("", body.written());
+
+    const unusable = try testAccessToken(alloc, "{\"principal_type\":\"Team\",\"principal_id\":\"team test\"}");
+    defer alloc.free(unusable);
+    try std.testing.expectError(error.InvalidGrokAccessToken, appendTeamPrincipal(alloc, &form, &body.writer, unusable));
+}
+
+fn fuzzTeamPrincipal(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var raw: [256]u8 = undefined;
+    const bytes = raw[0..smith.slice(&raw)];
+    var token: std.Io.Writer.Allocating = .init(alloc);
+    defer token.deinit();
+    // What a token built from chosen claims must give.
+    var want: ?enum { none, team, refused } = null;
+    switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        // Arbitrary bytes as the whole token.
+        0 => try token.writer.writeAll(bytes),
+        // Arbitrary bytes as the payload of a three-part token.
+        1 => try writeTestAccessToken(&token.writer, bytes),
+        // Claims with a chosen principal_type, spelled either way, and an
+        // ASCII principal_id, so it survives JSON unchanged.
+        else => {
+            for (bytes) |*byte| byte.* &= 0x7f;
+            const types = [_][]const u8{ team_principal_type, "User", "team", "" };
+            const principal_type = types[smith.valueRangeAtMost(u8, 0, types.len - 1)];
+            var claims: std.Io.Writer.Allocating = .init(alloc);
+            defer claims.deinit();
+            if (smith.valueRangeAtMost(u8, 0, 1) == 0) {
+                try std.json.Stringify.value(.{ .principal_type = principal_type, .principal_id = bytes }, .{}, &claims.writer);
+            } else {
+                try std.json.Stringify.value(.{ .principalType = principal_type, .principalId = bytes }, .{}, &claims.writer);
+            }
+            try writeTestAccessToken(&token.writer, claims.written());
+            want = if (!std.mem.eql(u8, principal_type, team_principal_type))
+                .none
+            else if (grok_session.validAccountId(bytes)) .team else .refused;
+        },
+    }
+
+    const team_id = teamPrincipalId(alloc, token.written()) catch |err| {
+        try std.testing.expect(err == error.InvalidGrokAccessToken);
+        if (want) |expected| try std.testing.expect(expected == .refused);
+        return;
+    } orelse {
+        if (want) |expected| try std.testing.expect(expected == .none);
+        return;
+    };
+    defer alloc.free(team_id);
+    try std.testing.expect(grok_session.validAccountId(team_id));
+    if (want) |expected| {
+        try std.testing.expect(expected == .team);
+        try std.testing.expectEqualStrings(bytes, team_id);
+    }
+}
+
+test "a Grok access token gives its Team, none, or a refusal on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzTeamPrincipal, .{
+        .corpus = &(@import("fuzz_seed").slices(.{""}) ++ @import("fuzz_corpus").grok_access_token.*),
+    });
 }
 
 test "Grok refresh uses form encoding and accepts omitted token rotation" {
@@ -1027,4 +1305,21 @@ test "a Grok refresh's account lookup is never cut off by a cancel" {
     });
     defer replacement.deinit(alloc);
     try std.testing.expect(state.outlives_cancel);
+}
+
+test "Grok StdinManualCodeReader returns TerminalHungUp on a closed TestPty" {
+    const shell_runtime = @import("../../ui/shell_runtime.zig");
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |f| f.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+    master.?.close(io_mod.getIo());
+    master = null;
+
+    var reader: StdinManualCodeReader = .{};
+    defer reader.deinit();
+    try std.testing.expectError(error.TerminalHungUp, reader.pollFd(slave.handle));
 }

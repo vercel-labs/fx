@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 import { FX_BIN, fxChildEnv, REPO_ROOT, runFx, pinnedClientVersions } from "../evals/eval-helpers";
 import { closeStatusPanel, panelAuth, readStatusPanel, waitForStatusPanel } from "./info-panel";
-import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER, turnSettled } from "./tmux-helpers";
+import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
 import { rotateFxLogin, startFakeIssuer, storedFxLoginToken, writeFxLogin } from "./fx-login-fakes";
@@ -797,9 +797,31 @@ function startFakeGrokOAuth(options: {
   revokeDrip?: boolean;
   userinfoSub?: string;
   modelsResponse?: () => Promise<Response | void>;
+  /**
+   * Sign in a Grok Team, as the reporters of #461 describe xAI: its access
+   * tokens name the Team in principal_type and principal_id claims, userinfo
+   * refuses them, and a refresh that doesn't name the Team gets a token for
+   * the person's own account.
+   */
+  teamPrincipalId?: string;
+  /**
+   * The account a refresh reply names instead of the Team: a string gives a
+   * Team token for that id, and null gives a personal (non-Team) token.
+   */
+  refreshTeamPrincipalId?: string | null;
 } = {}) {
-  const initialAccessToken = "grok-initial-access-token";
-  const refreshedAccessToken = "grok-refreshed-access-token";
+  const team = options.teamPrincipalId;
+  const teamAccessToken = (tag: string, principalId: string | undefined = team) =>
+    `${Buffer.from('{"alg":"RS256"}').toString("base64url")}.` +
+    `${Buffer.from(JSON.stringify({ principal_type: "Team", principal_id: principalId, jti: tag })).toString("base64url")}.${tag}`;
+  const initialAccessToken = team ? teamAccessToken("grok-initial") : "grok-initial-access-token";
+  const refreshedAccessToken = team ? teamAccessToken("grok-refreshed") : "grok-refreshed-access-token";
+  const otherAccountAccessToken =
+    options.refreshTeamPrincipalId === undefined
+      ? undefined
+      : options.refreshTeamPrincipalId === null
+      ? "grok-personal-access-token"
+      : teamAccessToken("grok-refreshed-other", options.refreshTeamPrincipalId);
   const requests: Array<{
     method: string;
     path: string;
@@ -873,14 +895,20 @@ function startFakeGrokOAuth(options: {
         if (refresh && options.rejectRefresh) {
           return Response.json({ error: "invalid_grant" }, { status: 400 });
         }
+        const keepsTeam = form.get("principal_type") === "Team" && form.get("principal_id") === team;
+        const refreshedTo = otherAccountAccessToken ?? (team && !keepsTeam ? "grok-personal-access-token" : refreshedAccessToken);
         return Response.json({
-          access_token: refresh ? refreshedAccessToken : initialAccessToken,
+          access_token: !refresh ? initialAccessToken : refreshedTo,
           refresh_token: refresh ? "grok-refresh-next" : "grok-refresh",
           expires_in: 3600,
         });
       }
       if (url.pathname === "/oauth2/userinfo") {
-        if (!request.headers.get("authorization")?.startsWith("Bearer grok-")) {
+        const authorization = request.headers.get("authorization");
+        if (team && (authorization === `Bearer ${initialAccessToken}` || authorization === `Bearer ${refreshedAccessToken}`)) {
+          return Response.json({ error: "insufficient_scope" }, { status: 403 });
+        }
+        if (!authorization?.startsWith("Bearer grok-")) {
           return Response.json({ error: "unauthorized" }, { status: 401 });
         }
         return Response.json({ sub: options.userinfoSub ?? "acct_grok_e2e" });
@@ -1472,7 +1500,7 @@ for (const provider of ["codex", "grok"] as const) {
       await session.sendKeys("Escape");
       await session.sendKeys("C-u");
       await session.sendText("Use the remaining provider.");
-      await session.waitForPane((pane) => pane.includes("LOGOUT_GATEWAY_RESPONSE") && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd("LOGOUT_GATEWAY_RESPONSE", TIMEOUT);
       expect(gateway.requests).toHaveLength(1);
       await session.sendText("/quit");
       await session.waitForSessionEnd(TIMEOUT);
@@ -3512,7 +3540,7 @@ tmuxTest(
     const refused = await session.captureFullScrollback();
     expect(refused).toContain("not allowed for this team");
     expect(refused).toContain("Vercel team example-internal-team");
-    expect(refused).toContain("press Esc twice, run /login, choose another team, and send it again");
+    expect(refused).toContain("Wrong team? Press Esc twice, run /login, choose another team, and send it again");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -4400,7 +4428,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     expect(Date.now() - cancelStarted).toBeLessThan(500);
     expect(cancelledPane).toContain("▪ Cancelled");
-    expect(cancelledPane).not.toContain("system: cancelled");
+    expect(cancelledPane).not.toContain("⊘ Cancelled");
     expect(cancelledPane).not.toContain("Cancelling");
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -5215,7 +5243,7 @@ tmuxTest(
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     expect(JSON.parse(readFileSync(authPath, "utf8")).team_slug).toBe("vercel-labs");
     await session.sendText("use the remembered credential after restart");
-    await session.waitForPane((pane) => pane.includes(RESTART_RESPONSE) && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd(RESTART_RESPONSE, TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
 
@@ -6143,6 +6171,136 @@ test(
     } finally {
       grok.stop();
     }
+  },
+  60_000,
+);
+
+test(
+  "Grok CLI browser login signs in a Team account from its access token and keeps the Team on refresh",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-cli-team-"));
+    gateway = startFakeGateway([]);
+    const team = "team_grok_e2e";
+    const grok = startFakeGrokOAuth({ unauthorizedResponses: 1, teamPrincipalId: team });
+    try {
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: ENV_TOKEN,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_NO_OPEN_BROWSER: "1",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        ...grok.env,
+      };
+
+      const login = await runGrokLoginWithBrowser(env);
+      expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+      expect(login.stdout).toContain("Signed in with Grok.");
+      expect(login.stderr).toBe("");
+      const authPath = join(home, ".fx", "grok-auth.json");
+      expect(JSON.parse(readFileSync(authPath, "utf8")).account_id).toBe(team);
+      const catalog = grok.requests.filter((request) => request.path === "/v1/models");
+      expect(catalog.length).toBeGreaterThan(0);
+      for (const request of catalog) expect(request.userId).toBe(team);
+
+      // The first model request gets a 401, so fx refreshes the Team login and sends it again.
+      const ask = await runFx(["ask", "--json", "--auto", "Answer directly."], { env, timeoutMs: TIMEOUT });
+      expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(0);
+      expect(ask.stdout).toContain("GROK_DIRECT_RESPONSE");
+      const refreshes = grok.requests.filter((request) =>
+        request.path === "/oauth2/token" && new URLSearchParams(request.body ?? "").get("grant_type") === "refresh_token"
+      );
+      expect(refreshes).toHaveLength(1);
+      const form = new URLSearchParams(refreshes[0]!.body ?? "");
+      expect(form.get("principal_type")).toBe("Team");
+      expect(form.get("principal_id")).toBe(team);
+      const responses = grok.requests.filter((request) => request.path === "/v1/responses");
+      expect(responses).toHaveLength(2);
+      expect(responses[0]!.authorization).toBe(`Bearer ${grok.initialAccessToken}`);
+      expect(responses[1]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+      for (const request of responses) expect(request.grokUserId).toBe(team);
+      expect(JSON.parse(readFileSync(authPath, "utf8")).account_id).toBe(team);
+      // userinfo refuses Team tokens, so fx never asks it.
+      expect(grok.requests.filter((request) => request.path === "/oauth2/userinfo")).toHaveLength(0);
+      expect(grok.tokenCalls()).toBe(2);
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+/**
+ * Signs in a Grok Team, then sends a request that gets a 401. fx refreshes the
+ * login, and the refresh reply names `refreshTeamPrincipalId` instead of the Team.
+ */
+async function runGrokTeamRefreshRefusal(refreshTeamPrincipalId: string | null): Promise<void> {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-cli-team-refused-"));
+  gateway = startFakeGateway([]);
+  const team = "team_grok_e2e";
+  const grok = startFakeGrokOAuth({ unauthorizedResponses: 1, teamPrincipalId: team, refreshTeamPrincipalId });
+  try {
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: ENV_TOKEN,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_NO_OPEN_BROWSER: "1",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      ...grok.env,
+    };
+
+    const login = await runGrokLoginWithBrowser(env);
+    expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+    expect(login.stdout).toContain("Signed in with Grok.");
+    const authPath = join(home, ".fx", "grok-auth.json");
+    expect(JSON.parse(readFileSync(authPath, "utf8")).account_id).toBe(team);
+
+    // The first model request gets a 401, so fx refreshes the login, and the refresh is refused.
+    const tracePath = join(home, "trace.log");
+    const ask = await runFx(["ask", "--json", "--auto", "Answer directly."], {
+      env: { ...env, FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "auth" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(1);
+    expect(ask.stdout).toContain("Grok subscription authentication failed");
+    expect(ask.stdout).not.toContain("GROK_DIRECT_RESPONSE");
+    expect(readFileSync(tracePath, "utf8")).toContain("reason=GrokAccountChanged");
+
+    const refreshes = grok.requests.filter((request) =>
+      request.path === "/oauth2/token" && new URLSearchParams(request.body ?? "").get("grant_type") === "refresh_token"
+    );
+    expect(refreshes).toHaveLength(1);
+    // The other account's token is never sent, so the request is not replayed.
+    const responses = grok.requests.filter((request) => request.path === "/v1/responses");
+    expect(responses).toHaveLength(1);
+    expect(responses[0]!.authorization).toBe(`Bearer ${grok.initialAccessToken}`);
+    expect(existsSync(authPath)).toBe(false);
+    expect(gateway.requests).toHaveLength(0);
+    expect(grok.tokenCalls()).toBe(2);
+  } finally {
+    grok.stop();
+  }
+}
+
+test(
+  "a Grok Team login whose refresh returns another Team is refused, and its saved login is retired",
+  async () => {
+    await runGrokTeamRefreshRefusal("team_grok_other");
+  },
+  60_000,
+);
+
+test(
+  "a Grok Team login whose refresh returns a personal account is refused, and its saved login is retired",
+  async () => {
+    await runGrokTeamRefreshRefusal(null);
   },
   60_000,
 );
@@ -7144,16 +7302,16 @@ tmuxTest(
         FX_TEST_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
       });
       await session.waitForComposer(TIMEOUT);
-      const failureVisible = session.waitForText("request failed: reply too large to read", TIMEOUT);
+      const failureVisible = session.waitForText("Request failed: reply too large to read", TIMEOUT);
       await session.sendText("Recover from a bounded Grok response.");
       await failureVisible;
       await session.sendText("Accept another prompt after recovery.");
-      await session.waitForPane((pane) => pane.includes("GROK_LIMIT_RECOVERED") && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd("GROK_LIMIT_RECOVERED", TIMEOUT);
       await session.sendText("Accept one more prompt after recovery.");
       await session.waitForText("GROK_AFTER_LIMIT_OK", TIMEOUT);
 
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain("request failed: reply too large to read");
+      expect(scrollback).toContain("Request failed: reply too large to read");
       expect(scrollback).not.toContain("XaiGrokSseEventTooLarge");
       expect(grok.bodies).toHaveLength(3);
       expect(gateway.requests).toHaveLength(0);
@@ -8087,7 +8245,7 @@ tmuxTest(
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Read enough lines to complete the capacity loop.");
-      await session.waitForPane((pane) => pane.includes("CODEX_CAPACITY_65_OK") && turnSettled(pane), 120_000);
+      await session.waitForReplyAndTurnEnd("CODEX_CAPACITY_65_OK", 120_000);
       expect(codex.bodies).toHaveLength(65);
 
       await session.sendText("Confirm the same process remains usable.");
@@ -8678,7 +8836,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await selectFxLoginCredential(session);
     await session.sendText("prove fx login is active before logout");
-    await session.waitForPane((pane) => pane.includes(LOGIN_RESPONSE) && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd(LOGIN_RESPONSE, TIMEOUT);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
 
     await session.sendText("/logout");
@@ -9039,9 +9197,9 @@ tmuxTest(
     }, home);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Remember COMPACT_AUTH_FIRST.");
-    await session.waitForPane((pane) => pane.includes("COMPACT_AUTH_FIRST_REPLY") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("COMPACT_AUTH_FIRST_REPLY", TIMEOUT);
     await session.sendText("Remember COMPACT_AUTH_SECOND.");
-    await session.waitForPane((pane) => pane.includes("COMPACT_AUTH_SECOND_REPLY") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("COMPACT_AUTH_SECOND_REPLY", TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
     await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
@@ -9076,7 +9234,7 @@ tmuxTest(
     expect(records.filter((record) => record.kind === "compacted")).toHaveLength(1);
     await session.sendKeys("C-u");
     await session.sendText("Continue after the manual compaction.");
-    await session.waitForPane((pane) => pane.includes("COMPACT_AUTH_CONTINUED") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("COMPACT_AUTH_CONTINUED", TIMEOUT);
     expect(gateway.requests).toHaveLength(5);
     await session.sendText("/quit");
     await session.waitForSessionEnd(TIMEOUT);
@@ -9109,9 +9267,9 @@ for (const outcome of ["failure", "cancel"] as const) {
     }, home);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Remember AUTH_BOUNDARY_FIRST.");
-    await session.waitForPane((pane) => pane.includes("AUTH_BOUNDARY_FIRST_REPLY") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("AUTH_BOUNDARY_FIRST_REPLY", TIMEOUT);
     await session.sendText("Remember AUTH_BOUNDARY_SECOND.");
-    await session.waitForPane((pane) => pane.includes("AUTH_BOUNDARY_SECOND_REPLY") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("AUTH_BOUNDARY_SECOND_REPLY", TIMEOUT);
     const sessionIds = rootSessionIds(home);
     expect(sessionIds).toHaveLength(1);
     const historyPath = join(sessionDir(home, sessionIds[0]!), "log.jsonl");
@@ -9140,7 +9298,7 @@ for (const outcome of ["failure", "cancel"] as const) {
     await selectEnvKeyCredential(session);
     expect(gateway.requests).toHaveLength(2);
     await session.sendText("Continue the original conversation without tools.");
-    await session.waitForPane((pane) => pane.includes("AUTH_BOUNDARY_RECOVERED") && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd("AUTH_BOUNDARY_RECOVERED", TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
     expect(readFileSync(historyPath, "utf8")).not.toContain('"kind":"compacted"');
@@ -9516,7 +9674,7 @@ tmuxTest(
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
 
     await session.sendText("refresh login and answer");
-    await session.waitForPane((pane) => pane.includes(REFRESH_RECOVERY_RESPONSE) && turnSettled(pane), TIMEOUT);
+    await session.waitForReplyAndTurnEnd(REFRESH_RECOVERY_RESPONSE, TIMEOUT);
     await waitForModelRequestCount(gateway, 2);
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
       "GET /.well-known/openid-configuration",
@@ -10458,7 +10616,7 @@ for (const outcome of ["cancel", "failure"] as const) {
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).models.gateway).toBe("openai/gpt-5.6-sol");
       await session.sendText("Use the validated team.");
-      await session.waitForPane((pane) => pane.includes("TEAM_PREPARATION_OK") && turnSettled(pane), TIMEOUT);
+      await session.waitForReplyAndTurnEnd("TEAM_PREPARATION_OK", TIMEOUT);
       expect(gateway.requests).toHaveLength(1);
       expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

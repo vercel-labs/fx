@@ -33,15 +33,15 @@ fn settleCompactionWorkFailure(worker: *worker_runtime.WorkerRuntime, work: work
 /// upgrade's restart. As an `error_text` event it also ends the screen's
 /// turn, which no finished prompt does for a turn that yielded.
 const yielded_notice: types.SemanticNotice = .{
-    .topic = "upgrade",
+    .topic = "update",
     .tone = .neutral,
-    .body = "stopped between steps for the upgrade; this turn goes on after fx restarts",
+    .body = "stopped between steps for the update; this turn goes on after fx restarts",
 };
 
 /// What the transcript says when a turn held for an upgrade's restart could
 /// not save its next request again after the restart was cancelled
 /// (`RequestRecovery.reopenAfterYield`).
-const reopen_failed_text = "The turn stopped because fx could not save its next request after the upgrade restart was cancelled. Send a prompt to go on.";
+const reopen_failed_text = "The turn stopped because fx could not save its next request after the update restart was cancelled. Send a prompt to go on.";
 
 /// Whether `App` runs its agent on the main loop, without worker threads.
 pub fn cooperativeHost(comptime App: type) bool {
@@ -117,10 +117,10 @@ pub fn Runtime(comptime App: type) type {
                 } else if (err == error.TurnYielded) {
                     try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = yielded_notice });
                 } else if (err != error.RouteRecoveryStopped) {
-                    const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
+                    const body = try formatErrorBody(std.heap.c_allocator, "Request failed", err);
                     defer std.heap.c_allocator.free(body);
                     try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
-                        .topic = "system",
+                        .topic = "",
                         .tone = .@"error",
                         .body = body,
                     } });
@@ -209,10 +209,10 @@ pub fn Runtime(comptime App: type) type {
 
         fn runWorkerLoop(app: *App, agent: *AppAgent) void {
             workerLoop(app, agent) catch |err| {
-                const body = formatErrorBody(std.heap.c_allocator, "worker loop crashed", err) catch return;
+                const body = formatErrorBody(std.heap.c_allocator, "fx hit an internal error", err) catch return;
                 defer std.heap.c_allocator.free(body);
                 agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
-                    .topic = "system",
+                    .topic = "",
                     .tone = .@"error",
                     .body = body,
                 } }) catch return;
@@ -233,10 +233,10 @@ pub fn Runtime(comptime App: type) type {
                     } else if (err == error.TurnYielded) {
                         try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = yielded_notice });
                     } else if (err != error.RouteRecoveryStopped) {
-                        const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
+                        const body = try formatErrorBody(std.heap.c_allocator, "Request failed", err);
                         defer std.heap.c_allocator.free(body);
                         try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
-                            .topic = "system",
+                            .topic = "",
                             .tone = .@"error",
                             .body = body,
                         } });
@@ -375,7 +375,7 @@ test "formatErrorBody says why a turn stopped after a cancelled restart and what
     const body = try Runtime(DummyApp).formatErrorBody(alloc, "request failed", error.RecordNotSaved);
     defer alloc.free(body);
     try std.testing.expectEqualStrings(
-        "The turn stopped because fx could not save its next request after the upgrade restart was cancelled. Send a prompt to go on.",
+        "The turn stopped because fx could not save its next request after the update restart was cancelled. Send a prompt to go on.",
         body,
     );
 }
@@ -500,9 +500,9 @@ test "worker thread reports queued prompt failures as worker events" {
         switch (event) {
             .error_text => |notice| {
                 saw_error = true;
-                try std.testing.expectEqualStrings("system", notice.topic);
+                try std.testing.expectEqualStrings("", notice.topic);
                 try std.testing.expectEqual(types.NoticeTone.@"error", notice.tone);
-                try std.testing.expect(std.mem.find(u8, notice.body, "request failed") != null);
+                try std.testing.expect(std.mem.find(u8, notice.body, "Request failed") != null);
                 try std.testing.expect(std.mem.find(u8, notice.body, "invalid JSON syntax") != null);
                 // The raw error name goes only to the trace.
                 try std.testing.expect(std.mem.find(u8, notice.body, "SyntaxError") == null);
@@ -553,7 +553,7 @@ test "worker continues after project context selector failures" {
         for (events.items) |event| switch (event) {
             .error_text => |notice| {
                 error_count += 1;
-                try std.testing.expect(std.mem.find(u8, notice.body, "request failed") != null);
+                try std.testing.expect(std.mem.find(u8, notice.body, "Request failed") != null);
                 var words: [128]u8 = undefined;
                 const plain = types.plainErrorText(@errorName(expected_error), &words);
                 try std.testing.expect(std.mem.find(u8, notice.body, plain) != null);
@@ -565,7 +565,7 @@ test "worker continues after project context selector failures" {
     }
 }
 
-test "a turn that yielded ends with a neutral upgrade notice" {
+test "a turn that yielded ends with a neutral update notice" {
     try std.testing.expectEqual(types.NoticeTone.neutral, yielded_notice.tone);
-    try std.testing.expectEqualStrings("upgrade", yielded_notice.topic);
+    try std.testing.expectEqualStrings("update", yielded_notice.topic);
 }

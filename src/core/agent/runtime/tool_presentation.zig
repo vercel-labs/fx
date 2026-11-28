@@ -17,6 +17,7 @@ const result_store = @import("../../session/result_store.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+const tool_result_notice = @import("../../tooling/shell_result_notice.zig");
 const tool_result_display = @import("../../tooling/tool_result_display.zig");
 const read_result_presentation = @import("../../tooling/read_tool_result_presentation.zig");
 const command_result_mapping = if (@import("builtin").is_test)
@@ -1186,6 +1187,21 @@ test "read_tool_result rows name the earlier call whose output they read" {
     try std.testing.expect(try readToolResultDisplayTarget(arena, registry, other, sources) == null);
 }
 
+/// The command placement that admission approved for `authority`, or null when
+/// `authority` is not a command authority.
+pub fn commandPlacementFromAuthority(
+    authority: ?command_admission.ToolExecutionAuthority,
+) ?types.CommandPlacement {
+    const value = authority orelse return null;
+    return switch (value) {
+        .run_command => |command_auth| switch (command_auth) {
+            .direct_only => |fingerprint| fingerprint.placement,
+            .shell_allowed => |allowed| allowed.fingerprint.placement,
+        },
+        .ordinary, .file_mutation, .vision_paths => null,
+    };
+}
+
 pub noinline fn startToolVisibleLifecycle(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -1214,6 +1230,7 @@ pub noinline fn startToolVisibleLifecycle(
         .arguments_json = redacted_arguments,
         .place_after_current_transcript = false,
         .resolved_display_target = call.resolved_display_target,
+        .command_placement = call.command_placement,
     } });
     if (activity_line) |line| {
         try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
@@ -1299,6 +1316,11 @@ fn finishDeniedToolStatusInternal(
         try commandArtifactHandle(arena, command_result_json)
     else
         null;
+    const presentation_memory: ?types.ToolResultMemory = if (result_memory != null or call.command_placement != null) blk: {
+        var memory = result_memory orelse types.ToolResultMemory{};
+        if (call.command_placement) |placement| memory.command_placement = placement;
+        break :blk memory;
+    } else null;
     try hooks.push_tool_lifecycle(hooks.ctx, .{
         .terminal = .{
             .id = .{ .turn_id = turn_id, .call_id = call.id },
@@ -1312,7 +1334,7 @@ fn finishDeniedToolStatusInternal(
                 .summary = denied_line,
             },
             .result = safe_result,
-            .result_memory = result_memory,
+            .result_memory = presentation_memory,
             .command_artifact_handle = command_artifact_handle,
         },
     });
@@ -1354,13 +1376,18 @@ pub fn finishCancelledToolStatus(
         }
     else
         null;
+    const cancelled_memory: ?types.ToolResultMemory = if (result.tool_result_memory != null or call.command_placement != null) blk: {
+        var memory = result.tool_result_memory orelse types.ToolResultMemory{};
+        if (call.command_placement) |placement| memory.command_placement = placement;
+        break :blk memory;
+    } else null;
     try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },
         .outcome = .{
             .kind = .cancelled,
             .summary = line,
         },
-        .result_memory = result.tool_result_memory,
+        .result_memory = cancelled_memory,
         .command_artifact_handle = command_artifact_handle,
     } });
 }
@@ -1548,6 +1575,10 @@ pub fn finishExecutedToolStatus(
     if (shell_command) {
         presentation_memory.output_handle = null;
         presentation_memory.preview = presentation_result;
+        presentation_memory.notice = try tool_result_notice.visibleNotice(arena, result.model_output);
+    }
+    if (call.command_placement) |placement| {
+        presentation_memory.command_placement = placement;
     }
     const command_artifact_handle = if (activity_kind == .command and
         !shell_command)
@@ -1603,6 +1634,40 @@ test "a finished read tells the transcript the file core read" {
     const search = ToolCall{ .id = "search", .name = "grep_files", .arguments_json = "{\"pattern\":\"a\"}" };
     try finishExecutedToolStatus(&hooks, arena_state.allocator(), 4, search, true, null, .{ .status = .success, .model_output = output }, output, .{}, null, &.{});
     try std.testing.expect(capture.events.items[2].terminal.resolved_path == null);
+}
+
+test "shell lifecycle start and end carry command placement" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const call = ToolCall{
+        .id = "shell-remote",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"uname -a\"}",
+        .command_placement = .remote,
+    };
+    try std.testing.expect(try startToolVisibleLifecycle(&hooks, arena, 5, null, call, null, &.{}));
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .remote), capture.events.items[0].authoritative_started.command_placement);
+
+    const out = "{\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"Linux\\n\"}";
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        5,
+        call,
+        true,
+        null,
+        .{ .status = .success, .model_output = out },
+        out,
+        .{ .command_process_presentation = .{ .exit_code = 0 } },
+        null,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .remote), capture.events.items[2].terminal.result_memory.?.command_placement);
 }
 
 fn presentedToolResult(
@@ -2193,7 +2258,7 @@ const ProvisionalStatusTestCapture = struct {
         };
     }
 
-    fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(types.ChatMessage)) !void {}
+    fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: []const u8, _: *std.ArrayList(types.ChatMessage)) !void {}
     fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: types.PermissionMode, _: []const types.PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }
@@ -2213,7 +2278,7 @@ const ProvisionalStatusTestCapture = struct {
         return .{ .diff = .skipped, .tracker = .skipped };
     }
     fn noopPropagateHistoryTurn(_: *anyopaque, _: types.HistoryTurn) !void {}
-    fn noopPropagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+    fn noopPropagateGrant(_: *anyopaque, _: []const u8, _: []const u8, _: u64) !void {}
     fn noopPushEvent(_: *anyopaque, _: @import("../worker_runtime.zig").WorkerEvent) !void {}
     fn noopPushText(_: *anyopaque, _: runtime_deps.TextEmission) !void {}
     fn noopPushDiffBlock(_: *anyopaque, _: DiffEntryPayload) !void {}

@@ -1736,6 +1736,18 @@ test "bounded command approval previews route by complete command fit" {
     ));
 }
 
+test "zero-width command approval routes to review screen" {
+    try std.testing.expect(try needsScreen(
+        std.testing.allocator,
+        .{
+            .label = "shell.run printf short",
+            .command = "printf short",
+        },
+        testLayout(150, 1),
+        0,
+    ));
+}
+
 test "command and file approval screen routing preserves short inline and file review behavior" {
     try std.testing.expect(!try needsScreen(
         std.testing.allocator,
@@ -1861,7 +1873,7 @@ test "file approval screen exposes a scrollable full review" {
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     var first = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 32), true);
     defer first.deinit(alloc);
@@ -1901,7 +1913,7 @@ test "file approval screen anchors transcript and review at the document tail" {
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     var tail = try paintTest(alloc, approval.projection().?, &screen_state, entries.items, .{}, testLayout(14, 100), true);
     defer tail.deinit(alloc);
@@ -1999,7 +2011,7 @@ test "large file approval paints a bounded tail before hydrating the full docume
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     var first_frame_storage: [64 * 1024]u8 = undefined;
     var first_frame_allocator = std.heap.FixedBufferAllocator.init(&first_frame_storage);
@@ -2071,7 +2083,7 @@ test "file approval document separates transcript, diff, and controls" {
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     var screen = try paintTest(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(14, 48), true);
     defer screen.deinit(alloc);
@@ -2116,7 +2128,7 @@ test "file approval transcript uses the current rail presentation" {
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     var screen = try paintTest(
         alloc,
@@ -2161,12 +2173,12 @@ test "file approval top-aligns a fitting welcome document and clears below" {
 
     var grid = try vt_emulator.Grid.init(alloc, 80, 24);
     defer grid.deinit();
-    try std.testing.expect(approval.syncReview(&previous_review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &previous_review, try diff_mod.OwnedReview.init(alloc, &previous_review)));
     var previous = try paintTest(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(24, 80), true);
     defer previous.deinit(alloc);
     try grid.feed(previous.bytes);
 
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     var screen = try paintTest(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(24, 80), false);
     defer screen.deinit(alloc);
     try grid.feed(screen.bytes);
@@ -2219,7 +2231,7 @@ test "file approval transcript viewport resumes styled links without leaking int
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     var screen = try paintTest(alloc, approval.projection().?, &screen_state, &entries, .{}, testLayout(14, 12), true);
     defer screen.deinit(alloc);
@@ -2255,7 +2267,7 @@ test "file approval screen wraps changed source without omitting bytes" {
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     var first = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(12, 12), true);
     defer first.deinit(alloc);
@@ -2283,7 +2295,7 @@ test "file approval renders exact unchanged-line elision markers" {
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, testFileRequest()));
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     var screen = try paintTest(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(40, 80), true);
     defer screen.deinit(alloc);
@@ -2315,7 +2327,7 @@ test "file approval readiness retains an observed change for the same request" {
     defer approval.deinit(alloc);
     const request = testFileRequest();
     try std.testing.expect(try approval.syncRequest(alloc, request));
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     var shell = struct {
         render_requests: render_request.RenderRequestState = .{},
@@ -2350,7 +2362,7 @@ test "file approval readiness retains an observed change for the same request" {
     replacement.id += 1;
     try std.testing.expect(try approval.syncRequest(alloc, replacement));
     screen_state.clear();
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     screen_state.recordScreenCommit(approval.request.?.id, .{
         .request_id = replacement.id,
         .rows = shell.layout.rows,
@@ -2380,7 +2392,7 @@ test "file approval renders controls ready after inspecting a changed row" {
     defer approval.deinit(alloc);
     const request = testFileRequest();
     try std.testing.expect(try approval.syncRequest(alloc, request));
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     screen_state.recordScreenCommit(approval.request.?.id, .{
         .request_id = request.id,
         .rows = 14,
@@ -2423,7 +2435,7 @@ test "file approval readiness requires a committed matching screen" {
     defer approval.deinit(alloc);
     const request = testFileRequest();
     try std.testing.expect(try approval.syncRequest(alloc, request));
-    try std.testing.expect(approval.syncReview(&review));
+    try std.testing.expect(approval.adoptReview(alloc, approval.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     var shell = struct {
         render_requests: render_request.RenderRequestState = .{},

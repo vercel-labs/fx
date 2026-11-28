@@ -1,0 +1,54 @@
+{
+  "covers": [
+    "V9"
+  ],
+  "title": "A file the command deletes in the sandbox loses its record at the bring back, and the Mac copy stays.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false
+      }
+    },
+    "teams": "one",
+    "surface": "interactive",
+    "login": "valid",
+    "configured": true,
+    "configValid": true,
+    "answers": [],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "remote"
+      ]
+    },
+    "prompts": 0,
+    "writes": 0
+  },
+  "run": {
+    "events": [
+      "push_ok",
+      "send_ran",
+      "id_arrives",
+      "cmd_deletes",
+      "cmd_exits",
+      "stream_end",
+      "bring_back_gone",
+      "exit_cmd"
+    ]
+  },
+  "tamper": {
+    "setup": "outcome-as-local",
+    "run": "gone-record-kept"
+  },
+  "drive": {
+    "command": "rm -f gone.txt; exit 0",
+    "file": "gone.txt",
+    "deletes": true
+  }
+}

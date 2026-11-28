@@ -77,6 +77,9 @@ const GracefulExitSigintGuard = if (host_target.is_wasm) struct {
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
+    /// The build's number on main, or 0 when unknown
+    /// (`update_target.CurrentBuild.build`).
+    build_number: u32 = 0,
     build_channel: update_target.Channel = .stable,
     auth_mode: credentials.AuthMode = .local,
     command_catalog: command_specs.TopLevelRegistry,
@@ -256,6 +259,7 @@ fn initFailure(deps: RunDeps, launch: *cli_surface.InteractiveLaunch, alloc: All
         error.RecordingFileTooBig,
         error.RecordingAccessDenied,
         error.RecordingReadOnly,
+        error.RecordingPathUnsafe,
         => {
             writeStderr(deps, recordingStartMessage(err));
             return .{ .exit = 1 };
@@ -480,7 +484,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         } else {
             writeStderr(
                 deps,
-                "fx: upgrade installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
+                "fx: update installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
             );
         }
         return .{ .exit = 1 };
@@ -552,9 +556,9 @@ fn writeUpgradeRelaunchFailure(
     var words: [128]u8 = undefined;
     const message = std.mem.print(
         &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nResume this session with:\nfx --resume {s}\n",
+        "fx: update installed, but relaunch failed: {s}\nResume this session with:\nfx --resume {s}\n",
         .{ types.plainErrorText(@errorName(err), &words), session_id },
-    ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
+    ) catch "fx: update installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
 }
 
@@ -589,6 +593,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
     return .{
         .version = cfg.version,
         .revision = cfg.revision,
+        .build_number = cfg.build_number,
         .build_channel = cfg.build_channel,
         .auth_mode = cfg.auth_mode,
         .command_catalog = cfg.command_catalog,
@@ -688,6 +693,7 @@ fn recordingStartMessage(err: anyerror) []const u8 {
         error.RecordingFileTooBig => "fx: unable to start terminal recording: a file-size limit was reached.\n",
         error.RecordingAccessDenied => "fx: unable to start terminal recording: permission denied.\n",
         error.RecordingReadOnly => "fx: unable to start terminal recording: the disk is read-only.\n",
+        error.RecordingPathUnsafe => "fx: unable to start terminal recording: FX_RECORD must name a regular file, not a FIFO, device, or folder. Unset FX_RECORD, or name a regular file.\n",
         else => "fx: unable to start terminal recording.\n",
     };
 }
@@ -798,10 +804,21 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
 /// The status a shell reports for a process SIGPIPE ended: 128 + 13.
 const output_reader_gone_exit_code: u8 = 141;
 
+/// The status a shell reports for a process SIGHUP ended: 128 + 1.
+const terminal_hung_up_exit_code: u8 = if (host_target.is_wasm)
+    1
+else
+    128 + @as(u8, @intCast(@backingInt(std.posix.SIG.HUP)));
+
 /// How a command that ended on `err` exits. One whose output reader went
 /// away, as `head` does, ends quietly with SIGPIPE's status, as the commands
-/// that finish before fx's I/O starts do when SIGPIPE ends them.
+/// that finish before fx's I/O starts do when SIGPIPE ends them. A command whose
+/// terminal hung up ends quietly with SIGHUP's status (`tests/tla/cli_hangup/CliHangup.tla`).
 fn commandFailure(deps: RunDeps, err: anyerror) BeforeInteractiveResult {
+    if (isTerminalHangUp(err)) {
+        debug_trace.logf("core", "command ended after its terminal hung up err={s}", .{@errorName(err)});
+        return .{ .exit = terminal_hung_up_exit_code };
+    }
     if (err == error.OutputReaderGone) {
         debug_trace.logf("core", "command ended after its output reader went away", .{});
         return .{ .exit = output_reader_gone_exit_code };
@@ -1417,6 +1434,10 @@ test "app entry relaunches only after teardown with the validated handoff" {
         capture.stderr.written(),
         "relaunch failed: invalid exe\nResume this session with:\nfx --resume session-123\n",
     ) != null);
+    try std.testing.expectEqualStrings(
+        "fx: update installed, but relaunch failed: invalid exe\nResume this session with:\nfx --resume session-123\n",
+        capture.stderr.written(),
+    );
     try expectEvents(&.{
         "init:none",
         "rebind-after-init",
@@ -1429,6 +1450,19 @@ test "app entry relaunches only after teardown with the validated handoff" {
         "deinit",
         "stderr-attempt",
     });
+}
+
+test "app entry falls back to doctor hint when relaunch failure message overflows" {
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    const long_id: [768]u8 = @splat('s');
+
+    writeUpgradeRelaunchFailure(capture.deps(), error.InvalidExe, &long_id);
+
+    try std.testing.expectEqualStrings(
+        "fx: update installed, but relaunch failed; run `fx doctor`.\n",
+        capture.stderr.written(),
+    );
 }
 
 test "app entry carries the previous revision through upgrade relaunch" {
@@ -1531,6 +1565,10 @@ test "app entry never relaunches without a validated handoff" {
         capture.stderr.written(),
         "no validated resume handoff",
     ) != null);
+    try std.testing.expectEqualStrings(
+        "fx: update installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
+        capture.stderr.written(),
+    );
 }
 
 test "app entry ignores resume handoff stdout failures" {
@@ -1581,6 +1619,19 @@ test "a command whose output reader went away ends quietly with SIGPIPE's status
     const outcome = try runWithDeps(TestApp, alloc, &.{"ask"}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunOutcome{ .exit = 141 }, outcome);
     try std.testing.expectEqualStrings("", capture.stderr.written());
+}
+
+test "a command whose terminal hung up ends quietly with SIGHUP's status" {
+    const alloc = std.testing.allocator;
+    for ([_]anyerror{ error.TerminalHungUp, error.TerminalInputClosed }) |err| {
+        var capture = TestCapture.init(.{ .interactive = .{} });
+        defer capture.deinit();
+        capture.cli_error = err;
+
+        const outcome = try runWithDeps(TestApp, alloc, &.{"status"}, testConfig(), capture.deps());
+        try std.testing.expectEqual(RunOutcome{ .exit = 129 }, outcome);
+        try std.testing.expectEqualStrings("", capture.stderr.written());
+    }
 }
 
 test "app entry reports unexpected init errors once and preserves identity" {
@@ -2087,6 +2138,7 @@ test "app entry says why a terminal recording could not start" {
         .{ .init_error = error.RecordingFileTooBig, .message = "fx: unable to start terminal recording: a file-size limit was reached.\n" },
         .{ .init_error = error.RecordingAccessDenied, .message = "fx: unable to start terminal recording: permission denied.\n" },
         .{ .init_error = error.RecordingReadOnly, .message = "fx: unable to start terminal recording: the disk is read-only.\n" },
+        .{ .init_error = error.RecordingPathUnsafe, .message = "fx: unable to start terminal recording: FX_RECORD must name a regular file, not a FIFO, device, or folder. Unset FX_RECORD, or name a regular file.\n" },
     };
     for (cases) |case| {
         var capture = TestCapture.init(.{ .interactive = .{} });
