@@ -490,7 +490,7 @@ fn startV2Session(
     // The new session replaces the active one, so its prompt ends first and
     // the wait below holds no prompt's `session/cancel` or EOF.
     server.cancelAndReapActivePrompt(state);
-    server.awaitTokenPassForNewSession(state);
+    try server.awaitTokenPassForNewSession(state);
     const v2 = session_adapter.Session.create(alloc, v2_store, workspace_root, .acp, .{
         .preferences = .{
             .provider = state.provider,

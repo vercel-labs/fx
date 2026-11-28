@@ -3235,10 +3235,12 @@ fn takeTokenPassAnswer(state: *ServerState) void {
 /// Clients read a new session's model from the `session/new` reply, so it
 /// waits for the answer when nothing chose the model. Called once the
 /// request is checked, so a request that fails never waits, and once the
-/// session it replaces has ended its prompt.
-pub fn awaitTokenPassForNewSession(state: *ServerState) void {
+/// session it replaces has ended its prompt. A catalog with Token Pass marks
+/// answers for the team, so the catalog comes first.
+pub fn awaitTokenPassForNewSession(state: *ServerState) model_capabilities.ResolveError!void {
     if (comptime host_target.is_wasm) return;
     std.debug.assert(state.active_prompt == null);
+    try awaitFirstCatalogLoad(state);
     settleTokenPassAnswer(state, if (state.token_pass_start != null) .wait else .take);
 }
 
@@ -3383,7 +3385,7 @@ test "ACP's reader waits for an unanswered Token Pass check only in a new sessio
     // A model that the profile or a flag chose does not wait on the answer.
     const start = state.token_pass_start;
     state.token_pass_start = null;
-    awaitTokenPassForNewSession(state);
+    try awaitTokenPassForNewSession(state);
     try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
     state.token_pass_start = start;
 }
@@ -3399,7 +3401,7 @@ test "ACP session/new waits for an unanswered Token Pass check until the wait fr
     // The client lists its sessions first; on the fake clock this sleep
     // only moves the time on.
     io_mod.sleep(500 * std.time.ns_per_ms);
-    awaitTokenPassForNewSession(state);
+    try awaitTokenPassForNewSession(state);
 
     try std.testing.expectEqual(token_pass_check.first_prompt_wait_ms, FakeAwakeClock.elapsedMs());
     try std.testing.expect(fixture.check().lookup.task != null);
@@ -3420,7 +3422,7 @@ test "ACP session/new takes a Token Pass answer that arrived after initialize an
     startTokenPassCheck(state, state.alloc, .compiled_default);
 
     fixture.answer();
-    awaitTokenPassForNewSession(state);
+    try awaitTokenPassForNewSession(state);
 
     try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
     try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
@@ -3443,7 +3445,7 @@ test "ACP session/new takes the catalog's Token Pass marks without waiting for t
         .{ .id = @constCast(token_pass.default_model), .model_type = @constCast("language"), .token_pass = true },
     };
     @import("../core/gateway/token_pass_team.zig").publishCatalog(&entries);
-    awaitTokenPassForNewSession(state);
+    try awaitTokenPassForNewSession(state);
 
     try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
     try std.testing.expect(fixture.check().lookup.task != null);
@@ -3527,7 +3529,7 @@ test "ACP session/new wakes as soon as the Token Pass answer arrives, not at its
 
     // The credits reply comes 3 ms into the new session's wait.
     FakeAwakeClock.deliverAt(3, &fixture.credits.released, fixture.lookupDone());
-    awaitTokenPassForNewSession(state);
+    try awaitTokenPassForNewSession(state);
 
     try std.testing.expectEqual(@as(i64, 3), FakeAwakeClock.elapsedMs());
     try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
@@ -3560,7 +3562,7 @@ test "ACP session/new wakes on the Token Pass answer with the real clock" {
 
     const releaser = try std.Thread.spawn(.{}, HeldCredits.releaseOnceWaiting, .{ &fixture.credits, fixture.lookupDone(), 2 * token_pass_check.first_prompt_wait_ms });
     const started_ms = io_mod.awakeMilliTimestamp();
-    awaitTokenPassForNewSession(state);
+    try awaitTokenPassForNewSession(state);
     const waited_ms = io_mod.awakeMilliTimestamp() - started_ms;
     releaser.join();
 
@@ -3800,10 +3802,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
                 .code = ErrorCode.invalid_request,
                 .message = "Selected provider is unavailable in this host",
             });
-        _ = try resolveSelectedModelCapabilities(state, startup_catalog);
-        // The catalog just loaded; its Token Pass marks can answer for the
-        // team when the credits check could not.
-        if (comptime !host_target.is_wasm) takeTokenPassAnswer(state);
+        // Nothing in the reply needs the catalog, so its first load runs
+        // while the client goes on (`awaitFirstCatalogLoad`).
+        var no_cancel = std.atomic.Value(bool).init(false);
+        state.capability_resolver.startLoad(state.alloc, startup_catalog, serverCatalogInput(state, &no_cancel));
     }
 
     if (state.cfg.effort_override) |raw| {
@@ -3866,23 +3868,41 @@ fn resolveSelectedModelCapabilities(
     return state.capability_resolver.resolveWithin(
         state.alloc,
         provider,
-        .{
-            .access = if (state.cfg.auth_mode == .host_managed)
-                .host_managed
-            else
-                credentials.catalogAccessForCredentialAndAccount(
-                    state.credential_source,
-                    state.api_key,
-                    state.gateway_team,
-                    state.account_id,
-                ),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &cancel_flag,
-        },
+        serverCatalogInput(state, &cancel_flag),
         state.selected_model,
         state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
         gateway_provider.catalog_connect_wait_ms,
     );
+}
+
+/// The catalog request for the server's own credential.
+fn serverCatalogInput(state: *const ServerState, cancel_flag: *std.atomic.Value(bool)) model_catalog.FetchInput {
+    return .{
+        .access = if (state.cfg.auth_mode == .host_managed)
+            .host_managed
+        else
+            credentials.catalogAccessForCredentialAndAccount(
+                state.credential_source,
+                state.api_key,
+                state.gateway_team,
+                state.account_id,
+            ),
+        .endpoint = state.cfg.gateway_models_path,
+        .cancel_flag = cancel_flag,
+    };
+}
+
+/// Takes the catalog's first load once it ends, or loads the catalog when
+/// none ran, for the server's own provider and credential, as `initialize`
+/// did before it stopped waiting. Bounded as
+/// `resolveSelectedModelCapabilities` says. Replies that list models wait on
+/// the same load through `refreshModelCatalogForOptions`. A libfx core loads
+/// no catalog at start.
+fn awaitFirstCatalogLoad(state: *ServerState) model_capabilities.ResolveError!void {
+    if (!state.initialized or state.cfg.minimal_kernel) return;
+    if (state.capability_resolver.state != .idle) return;
+    const provider = catalogProviderFor(state, state.provider) orelse return;
+    _ = try resolveSelectedModelCapabilities(state, provider);
 }
 
 /// Applies a host-supplied reasoning effort override to sessions created after
@@ -3897,9 +3917,10 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
-        // libfx cores skip the startup catalog resolve; explicit effort and
-        // fast overrides are the creation-time consumers that need it.
+    if (state.capability_resolver.state == .idle) {
+        // `initialize` does not wait for the catalog's first load, and a
+        // libfx core starts none; explicit effort and fast overrides are the
+        // creation-time consumers that need it.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
         capabilities = try resolveSelectedModelCapabilities(state, catalog_provider);
     } else {
@@ -4003,7 +4024,7 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+    if (state.capability_resolver.state == .idle) {
         // Shares the effort override's one-shot catalog resolve: creation is
         // the only point that can reject before any turn runs.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;

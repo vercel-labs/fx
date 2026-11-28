@@ -2109,6 +2109,162 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP answers initialize, session/list, and requests it rejects before the model catalog arrives, and session/new waits for it",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-catalog-late-");
+      let releaseCatalog = () => {};
+      const catalogReleased = new Promise<void>((resolve) => { releaseCatalog = resolve; });
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_LATE_CATALOG_OK"), {
+        models: () => catalogReleased.then(() => [{
+          id: FAKE_GATEWAY_MODEL,
+          type: "language",
+          tags: ["tool-use"],
+          context_window: 128_000,
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }]),
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        // The catalog is held, so a reply that waits for it times out here.
+        await client.request("initialize", { protocolVersion: 1 }, 1, 1_000);
+        await waitForCondition("the catalog request", () => gateway.modelRequests.length === 1);
+        const listed = await client.request("session/list", { cwd: root.workspace }, 2, 1_000) as any;
+        expect(listed.error).toBeUndefined();
+        // Requests whose checks reject them never wait for the catalog.
+        const badNew = await client.request("session/new", { mcpServers: [], systemPromptMode: "append" }, 4, 1_000) as any;
+        expect(badNew.error.message).toBe("systemPromptMode requires systemPrompt");
+        const badLoad = await client.request("session/load", { sessionId: "missing-session", cwd: root.workspace, mcpServers: [] }, 5, 1_000) as any;
+        expect(badLoad.error).toBeDefined();
+
+        let repliedAt = 0;
+        const created = (client.request("session/new", { mcpServers: [] }, 3) as Promise<any>)
+          .then((reply) => { repliedAt = Date.now(); return reply; });
+        // Paces the release: a reply that does not wait comes well within it.
+        await Bun.sleep(200);
+        const releasedAt = Date.now();
+        releaseCatalog();
+        const reply = await created;
+        expect(repliedAt).toBeGreaterThanOrEqual(releasedAt);
+        // The reply lists what the catalog says of the model.
+        const effort = reply.result.configOptions.find((option: any) => option.id === "effort");
+        expect(effort.options.map((option: any) => option.value)).toEqual(["auto", "low", "high"]);
+        // The start fetched the catalog once.
+        expect(gateway.modelRequests.length).toBe(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        releaseCatalog();
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP exits at once on EOF while the model catalog's first load still runs",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-catalog-eof-");
+      // The catalog never answers.
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_CATALOG_EOF_OK"), {
+        models: () => new Promise<never>(() => {}),
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1, 1_000);
+        await waitForCondition("the catalog request", () => gateway.modelRequests.length === 1);
+        const closedAt = Date.now();
+        client.endStdin();
+        expect(await client.waitForExit(8_000)).toBe(0);
+        expect(Date.now() - closedAt).toBeLessThan(1_000);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP session/new takes the Token Pass marks of a catalog that arrives after initialize, without waiting for the credits check",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-catalog-marks-late-");
+      const tracePath = join(root.root, "trace.log");
+      const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+      let releaseCatalog = () => {};
+      const catalogReleased = new Promise<void>((resolve) => { releaseCatalog = resolve; });
+      let releaseCredits = () => {};
+      const creditsReleased = new Promise<void>((resolve) => { releaseCredits = resolve; });
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_LATE_MARKS_OK"), {
+        models: () => catalogReleased.then(() => tokenPassCatalog(true)),
+        usage: (url) => url.pathname === "/coding-agent/v1/credits"
+          ? creditsReleased.then(() => Response.json({ balance: "5.00", token_pass: { remaining: "79.92906" } }))
+          : null,
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: undefined, FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "token_pass" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1, 1_000);
+        const created = client.request("session/new", { mcpServers: [] }, 2) as Promise<any>;
+        // Paces the release, so session/new is read before the catalog lands.
+        await Bun.sleep(100);
+        const releasedAt = Date.now();
+        releaseCatalog();
+        const model = (await created).result.configOptions.find((option: any) => option.id === "model");
+        // The marks answer for the team, so the credits check, still held,
+        // holds nothing; waiting for it first would take 2 s.
+        expect(Date.now() - releasedAt).toBeLessThan(1_000);
+        expect(model.currentValue).toBe("deepseek/deepseek-v4.1-flash");
+        expect(trace()).toContain("check answered answer=has_pass source=catalog");
+        expect(trace()).not.toContain("check wait");
+        expect(client.stderr).toBe("");
+      } finally {
+        releaseCatalog();
+        releaseCredits();
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP checks --effort against the model catalog, which arrives after initialize starts",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-catalog-effort-flag-");
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_EFFORT_FLAG_OK"), {
+        models: () => Bun.sleep(150).then(() => [{
+          id: FAKE_GATEWAY_MODEL,
+          type: "language",
+          tags: ["tool-use"],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }]),
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway), args: ["acp", "--effort", "xhigh"] });
+        const reply = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(reply.error.message).toBe(`Reasoning effort "xhigh" is not available for model "${FAKE_GATEWAY_MODEL}" (available: low, high)`);
+        expect(gateway.modelRequests.length).toBe(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP titles a session with the login another fx refreshed after session/new",
     async () => {
       const root = createIsolatedRoot("fx-acp-title-rotated-login-");
