@@ -9,6 +9,7 @@ const session_runtime = @import("../../../session/session.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 
 const test_support = @import("support.zig");
+const runtime_execution_memory = @import("../execution_memory.zig");
 const runtime_finalization = @import("../finalization.zig");
 const runtime_orchestrator = @import("../orchestrator.zig");
 const runtime_telemetry = @import("../telemetry.zig");
@@ -2802,4 +2803,92 @@ test "eb03: full turn carries job.input_id to UserTurn.input_id and steering bou
     try std.testing.expectEqual(@as(?u64, 10), deps.history_turns.items[0].assistant.user.input_id);
     try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items[0].assistant.execution.steering.len);
     try std.testing.expectEqual(@as(?u64, 11), deps.history_turns.items[0].assistant.execution.steering[0].input_id);
+}
+
+test "parent post with work_id taken mid-turn uses user steering frame while parent steer without work_id keeps parent frame" {
+    const alloc = std.testing.allocator;
+    const PostAndSteerDuringStop = struct {
+        alloc: std.mem.Allocator,
+        worker: *worker_runtime.WorkerRuntime,
+        calls: usize = 0,
+
+        fn run(
+            raw: *anyopaque,
+            _: lifecycle_hooks.StopInput,
+        ) lifecycle_hooks.HandlerError!lifecycle_hooks.StopAction {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1) {
+                var steer = ownedWorkerPrompt(self.alloc, "parent steer without work_id") catch return error.Failed;
+                steer.author = .parent;
+                self.worker.postMail(self.alloc, steer) catch {
+                    worker_runtime.freeQueuedPrompt(self.alloc, steer);
+                    return error.Failed;
+                };
+
+                var post = ownedWorkerPrompt(self.alloc, "main post with work_id") catch return error.Failed;
+                post.author = .parent;
+                post.work_id = self.alloc.dupe(u8, "work-1") catch {
+                    worker_runtime.freeQueuedPrompt(self.alloc, post);
+                    return error.Failed;
+                };
+                self.worker.admitInteractivePrompt(self.alloc, post) catch {
+                    worker_runtime.freeQueuedPrompt(self.alloc, post);
+                    return error.Failed;
+                };
+            }
+            return .allow;
+        }
+    };
+
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    try worker.admitInteractivePrompt(alloc, try ownedWorkerPrompt(alloc, "initial prompt"));
+    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedQueuedWork;
+    defer worker_runtime.freeWorkItem(alloc, work);
+
+    var gateway = FakeGateway.init(alloc, &.{ .{ .content = "First answer" }, .{ .content = "Updated answer" } });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    deps.steering_worker = &worker;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.cancel_flag = &worker.worker_cancel_requested;
+    var job = work.prompt;
+    job.grants = &.{};
+    var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer lifecycle_runtime.deinit();
+    var handler = PostAndSteerDuringStop{ .alloc = alloc, .worker = &worker };
+    try lifecycle_runtime.registerStop(.{
+        .name = "post-and-steer-during-stop",
+        .ctx = &handler,
+        .run = PostAndSteerDuringStop.run,
+    });
+
+    try runFakePromptWithLifecycle(
+        &gateway,
+        &deps,
+        config,
+        job,
+        testLifecycleContext(lifecycle_runtime.freeze(), alloc, fixture.workspace_root),
+    );
+    worker.finishProcessing();
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    const second_request = gateway.request_bodies.items[1];
+    const expected_post = try runtime_execution_memory.steeringMessage(alloc, "main post with work_id");
+    defer alloc.free(expected_post);
+    const expected_steer = try runtime_execution_memory.parentSteeringMessage(alloc, "parent steer without work_id");
+    defer alloc.free(expected_steer);
+    var post_json: std.Io.Writer.Allocating = .init(alloc);
+    defer post_json.deinit();
+    try std.json.Stringify.value(expected_post, .{}, &post_json.writer);
+    var steer_json: std.Io.Writer.Allocating = .init(alloc);
+    defer steer_json.deinit();
+    try std.json.Stringify.value(expected_steer, .{}, &steer_json.writer);
+    try std.testing.expect(std.mem.find(u8, second_request, post_json.written()) != null);
+    try std.testing.expect(std.mem.find(u8, second_request, steer_json.written()) != null);
+    try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 2), deps.history_turns.items[0].assistant.execution.steering.len);
 }

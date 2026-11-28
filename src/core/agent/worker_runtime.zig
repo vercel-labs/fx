@@ -104,6 +104,7 @@ pub const MessageAuthor = types.MessageAuthor;
 pub const SteeringMessage = struct {
     text: []u8,
     author: MessageAuthor = .user,
+    has_work_id: bool = false,
     input_id: ?u64 = null,
 };
 
@@ -2060,7 +2061,7 @@ pub const WorkerRuntime = struct {
         }
         for (self.queued_prompts.items) |prompt| {
             if (prompt.delivery.activeTurnId() != turn_id) continue;
-            messages[copied] = .{ .text = try result_alloc.dupe(u8, prompt.prompt), .author = prompt.author, .input_id = prompt.input_id };
+            messages[copied] = .{ .text = try result_alloc.dupe(u8, prompt.prompt), .author = prompt.author, .has_work_id = prompt.work_id != null, .input_id = prompt.input_id };
             copied += 1;
             // Every steer the turn takes gets its card, a parent's too, so the screen shows what the model read.
             const text = try alloc.dupe(u8, prompt.prompt);
