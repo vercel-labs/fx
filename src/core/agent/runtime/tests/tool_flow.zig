@@ -3882,6 +3882,98 @@ test "fx's own summary in a turn that sent an earlier turn's runtime context cap
     try std.testing.expect(third_hooks.history_turns.items[0].assistant.execution.runtime_context == null);
 }
 
+test "a GPT-6 turn that fx's own summary cuts decides its effort again and captures the current turn context (D94, D104)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const effort = types.ReasoningEffort.literal;
+    const efforts = [_]types.ReasoningEffort{ effort("none"), effort("low"), effort("medium"), effort("high"), effort("xhigh") };
+    const before = "<fx-turn-context>\nmodel: openai/gpt-6.1-sol\n</fx-turn-context>";
+    const after = "<fx-turn-context>\nmodel: openai/gpt-6-sol\n</fx-turn-context>";
+    const answer = [_]FakeCompletion{.{ .content = "Final" }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The first turn saves its turn context; the session started at high.
+    var first_gateway = FakeGateway.init(alloc, &answer);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.runtime_context_text = before;
+    var first = fixture.job();
+    first.prompt = @constCast("First.");
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first);
+    first_hooks.history_turns.items[0].assistant.execution.turn_effort = effort("high");
+
+    // The second turn asks for low on another GPT-6 model. It sends the first
+    // turn's copy, then a large tool result fills the window. The provider
+    // answers the compaction request without a block, so fx writes its own
+    // summary, which takes the first turn and the turn's own step.
+    var second_gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{toolCall("large-read", "read_file", "{\"path\":\"large.txt\"}")} },
+        .{ .content = "Turn in progress\nIn between: The read completed." },
+        .{ .content = "Turn in progress\nIn between: The read completed." },
+        .{ .content = "Completed after the summary." },
+    });
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.runtime_context_text = after;
+    const model = "openai/gpt-6-sol";
+    const capabilities = [_]test_support.ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 3_000, .reasoning_efforts = .fromSlice(&efforts) } }};
+    second_hooks.available_capability_overrides = &capabilities;
+    second_hooks.capability_overrides = &capabilities;
+    second_hooks.permission_decisions = &.{.once};
+    second_hooks.exec_plans = &.{.{ .result = .{ .model_output = "LARGE\n" ++ text_utils.repeat("r", 10_000) } }};
+    var config = fixture.config();
+    config.effort = effort("low");
+    var second = fixture.job();
+    second.model = @constCast(model);
+    second.prompt = @constCast("Second.");
+    second.history = first_hooks.history_turns.items[0..1];
+    try runFakePrompt(&second_gateway, &second_hooks, config, second);
+    try std.testing.expectEqual(@as(usize, 4), second_gateway.request_bodies.items.len);
+
+    // Before the summary: the session's first effort with an update to low,
+    // and the first turn's copy of the turn context.
+    for (0..2) |index| {
+        try expectBodyContains(&second_gateway, index, "\"reasoning\":\"high\"");
+        try expectBodyContains(&second_gateway, index, "\"reasoningEffortUpdate\":\"low\"");
+        const leading = try leadingSystemContents(arena, second_gateway.request_bodies.items[index]);
+        try std.testing.expectEqual(@as(usize, 1), countInstruction(leading.items, before));
+    }
+    try expectBodyContains(&second_gateway, 1, "\"compactionTrigger\":true");
+    try expectBodyContains(&second_gateway, 2, "\"toolChoice\":{\"type\":\"none\"}");
+
+    // After the summary: the turn's own effort with no update, and the
+    // current turn context with no update note.
+    const after_summary_body = second_gateway.request_bodies.items[3];
+    try expectBodyContains(&second_gateway, 3, "compacted_conversation");
+    try expectBodyContains(&second_gateway, 3, "\"reasoning\":\"low\"");
+    try expectBodyNotContains(&second_gateway, 3, "reasoningEffortUpdate");
+    const after_summary = try leadingSystemContents(arena, after_summary_body);
+    try std.testing.expectEqual(@as(usize, 1), countInstruction(after_summary.items, after));
+    try std.testing.expectEqual(@as(usize, 0), countInstruction(after_summary.items, before));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, after_summary_body, "fx-context-update>"));
+
+    // The turn saves the effort it sent after the summary, and the summary
+    // saves the turn context.
+    const turns = second_hooks.history_turns.items;
+    try std.testing.expectEqual(@as(usize, 2), turns.len);
+    const kept = try compactor.savedRuntimeContext(arena, turns[0].compacted_summary.summary);
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqualStrings(after, kept[0]);
+    const execution = turns[1].assistant.execution;
+    try std.testing.expectEqualStrings("low", execution.turn_effort.?.label());
+    try std.testing.expect(execution.effort_update == null);
+    try std.testing.expect(execution.runtime_context == null);
+}
+
 test "a named skill's text rides on its turn's message and the turn saves it as sent (D95)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
