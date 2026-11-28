@@ -372,6 +372,7 @@ const tool_presentation = @import("../tooling/tool_presentation.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig");
+const question_resolution = @import("../../ui/render_engine/question_resolution.zig");
 const crash_panic = @import("crash_panic.zig");
 
 pub const format_version: u32 = 1;
@@ -2832,6 +2833,7 @@ fn writeTranscriptEntry(
         .assistant_table => "assistant_table",
         .assistant_code_block => "assistant_code_block",
         .assistant_thematic_rule => "assistant_thematic_rule",
+        .question_answers => "question_answers",
         .semantic_notice => "semantic_notice",
     };
     const text = try entryText(arena, entry);
@@ -2854,6 +2856,11 @@ fn writeTranscriptEntry(
     try r.end();
 }
 
+/// The width an answered question block is laid out at in a report. A
+/// Markdown rule or code block in a question fills the width, so it is not
+/// unbounded.
+const question_answers_cols: u16 = 80;
+
 /// The text one transcript entry holds, before it is masked.
 fn entryText(arena: std.mem.Allocator, entry: anytype) ![]const u8 {
     return switch (entry) {
@@ -2875,6 +2882,7 @@ fn entryText(arena: std.mem.Allocator, entry: anytype) ![]const u8 {
             try assistant_presentation.writeHorizontalRule(arena, &rule_text);
             break :blk rule_text.items;
         },
+        .question_answers => |e| try question_resolution.compose(arena, e.answers, question_answers_cols),
         .semantic_notice => |e| try transcript_blocks.renderSemanticNotice(
             arena,
             .{

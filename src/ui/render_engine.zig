@@ -10,6 +10,7 @@ pub const frame_surface = @import("render_engine/frame_surface.zig");
 pub const footer_layout = @import("render_engine/footer_layout.zig");
 pub const markdown_document = @import("render_engine/markdown_document.zig");
 pub const paint_plan = @import("render_engine/paint_plan.zig");
+pub const question_resolution = @import("render_engine/question_resolution.zig");
 pub const terminal_diff = @import("render_engine/terminal_diff.zig");
 pub const transcript_blocks = @import("render_engine/transcript_blocks.zig");
 pub const ui_observer = @import("render_engine/ui_observer.zig");

@@ -4256,6 +4256,71 @@ test "cancel notice keeps one blank row before idle footer" {
     try expectExactlyOneBlankRowBetween(&h, cancel_row, footer_row);
 }
 
+const answered_question = "Should the whole monitor tool stay behind the experimental flag until the 日本語の team approves it, or only the new indicator?";
+const answered_answer = "Whole tool behind the flag for now, and remove the flag once the team approves the functionality in a later café review";
+
+/// Reads the answered question block on the grid: its first row opens with
+/// the ordinal, every later row hangs under the question text, and the words
+/// read in order, so no word was split across rows. Returns its row count.
+fn expectAnsweredBlockRows(h: *Harness) !usize {
+    var expected: std.ArrayList([]const u8) = .empty;
+    defer expected.deinit(h.alloc);
+    var expected_words = std.mem.tokenizeScalar(u8, answered_question ++ " " ++ answered_answer, ' ');
+    while (expected_words.next()) |word| try expected.append(h.alloc, word);
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(h.alloc);
+    var row = try findRowContaining(h, "  1) ");
+    var rows: usize = 0;
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(h.alloc);
+    while (row <= h.vt.rows) : (row += 1) {
+        row_text.clearRetainingCapacity();
+        try h.vt.rowTextTrimmed(row, &row_text);
+        if (row_text.items.len == 0) break;
+        if (rows == 0) {
+            try std.testing.expect(std.mem.startsWith(u8, row_text.items, "  1) "));
+            try text.appendSlice(h.alloc, row_text.items["  1) ".len..]);
+        } else {
+            if (!std.mem.startsWith(u8, row_text.items, "     ") or row_text.items[5] == ' ') {
+                std.debug.print("row {d} does not hang under the question: '{s}'\n", .{ row, row_text.items });
+                return error.TestExpectedHangingRow;
+            }
+            try text.append(h.alloc, ' ');
+            try text.appendSlice(h.alloc, row_text.items);
+        }
+        rows += 1;
+    }
+
+    var words = std.mem.tokenizeScalar(u8, text.items, ' ');
+    for (expected.items) |want| {
+        const got = words.next() orelse return error.TestExpectedMoreWords;
+        try std.testing.expectEqualStrings(want, got);
+    }
+    try std.testing.expect(words.next() == null);
+    return rows;
+}
+
+test "answered question block re-wraps at word boundaries when the terminal resizes" {
+    var h = try Harness.init(std.testing.allocator, 72, 30, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    const answers = [_]types.QuestionAnswer{.{ .question = answered_question, .answer = answered_answer }};
+    _ = try h.shell.appendQuestionAnswers(h.alloc, &answers);
+    _ = try h.shell.appendRawTranscriptEntryClassified(h.alloc, "after the answer\n", .subagent_status);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    const wide_rows = try expectAnsweredBlockRows(&h);
+
+    try h.driveResize(40, 30, 4, true);
+    const narrow_rows = try expectAnsweredBlockRows(&h);
+    try std.testing.expect(narrow_rows > wide_rows);
+
+    try h.driveResize(72, 30, 4, true);
+    try std.testing.expectEqual(wide_rows, try expectAnsweredBlockRows(&h));
+}
+
 test "settled cancel projection keeps the retained transcript aligned with the footer" {
     var h = try Harness.init(std.testing.allocator, 125, 37, 4);
     defer h.deinit();

@@ -3789,6 +3789,80 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "answered question re-wraps at word boundaries on resize and on resume",
+    async () => {
+      const question =
+        "Should the whole monitor tool stay behind the experimental flag until the team approves it, or only the new indicator and the slash command?";
+      const answer =
+        "Whole tool behind the flag for now, and remove the flag once the team approves the functionality in a later pull request";
+      const handled = "answered wrap question handled";
+      const ctx = await launchScenario([
+        outerToolCalls([
+          {
+            id: "answered_wrap_question_1",
+            name: "ask_user_question",
+            input: { questions: [{ question, options: [{ label: "Whole tool" }, { label: "Only the UI" }] }] },
+          },
+        ]),
+        outerText(handled),
+      ]);
+      await ctx.session.sendText("Ask me the flag question.");
+      await waitForQuestionPane(ctx.session, "answered wrap question", (value) =>
+        value.includes("esc cancel"),
+      );
+      await ctx.session.sendLiteralText("3");
+      await waitForQuestionPane(ctx.session, "answered wrap freeform", (value) =>
+        hasQuestionSelection(value, 3, ""),
+      );
+      await ctx.session.sendLiteralText(answer);
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText(handled, TIMEOUT);
+
+      // Each row fits the width, every row after the first hangs under the
+      // question text, and no word is split across rows.
+      const expectAnsweredBlock = async (label: string, width: number) => {
+        const grid = await waitForGridState(ctx.session, label, (rows) =>
+          rows.some((row) => row.startsWith("  1) ")) && rows.some((row) => row.includes(handled)),
+        );
+        const rows = grid.map((row) => row.trimEnd());
+        const first = rows.findIndex((row) => row.startsWith("  1) "));
+        const end = rows.findIndex((row, index) => index > first && row === "");
+        const block = rows.slice(first, end);
+        for (const row of block) expect(row.length).toBeLessThanOrEqual(width);
+        for (const row of block.slice(1)) expect(row).toMatch(/^ {5}\S/);
+        const words = block.join(" ").trim().split(/\s+/).slice(1);
+        expect(words).toEqual([...question.split(" "), ...answer.split(" ")]);
+        return block;
+      };
+
+      const wide = await expectAnsweredBlock("answered at 120", 120);
+      await ctx.session.resizeWindow(52, 40);
+      const narrow = await expectAnsweredBlock("answered after resize to 52", 52);
+      expect(narrow.length).toBeGreaterThan(wide.length);
+      await ctx.session.resizeWindow(120, 40);
+      expect(await expectAnsweredBlock("answered after resize back to 120", 120)).toEqual(wide);
+      await assertProcessAliveAndClean(ctx);
+
+      const id = onlySessionId(ctx.root.home);
+      await ctx.session.kill();
+      session = await TmuxSession.create({
+        cmd: `env -u VERCEL_OIDC_TOKEN ${FX_BIN} --resume ${id} 2>${ctx.stderrPath}`,
+        cwd: ctx.root.workspace,
+        env: definedStringEnv(fakeGatewayEnv(ctx.root, ctx.gateway)),
+        width: 52,
+        height: 40,
+      });
+      ctx.session = session;
+      await session.waitForComposer(TIMEOUT);
+      expect(await expectAnsweredBlock("resumed at 52", 52)).toEqual(narrow);
+      await session.resizeWindow(120, 40);
+      expect(await expectAnsweredBlock("resumed, then resized to 120", 120)).toEqual(wide);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "markdown question shows control bytes as text on every line",
     async () => {
       const ctx = await launchScenario([

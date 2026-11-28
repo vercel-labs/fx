@@ -202,6 +202,7 @@ pub fn transientAssistantGapRows(self: anytype) u16 {
             .assistant_table => return default_block_gap_policy.default_gap_rows,
             .assistant_code_block => return default_block_gap_policy.default_gap_rows,
             .assistant_thematic_rule => return default_block_gap_policy.default_gap_rows,
+            .question_answers => return default_block_gap_policy.gapBetween(.unknown_raw, .assistant_turn),
             .semantic_notice => |e| return default_block_gap_policy.gapBetween(
                 transcript_blocks.blockKindForNoticeTone(e.tone),
                 .assistant_turn,

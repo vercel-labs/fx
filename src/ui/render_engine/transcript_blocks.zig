@@ -11,6 +11,7 @@ const assistant_wrap = @import("assistant_wrap.zig");
 const assistant_pacer = @import("../assistant/pacer.zig");
 const transcript_measure = @import("transcript_measure.zig");
 const user_message_card = @import("../assistant/user_message_card.zig");
+const question_resolution = @import("question_resolution.zig");
 const input_visual_layout = @import("../input/visual_layout.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
@@ -273,6 +274,7 @@ fn blockKindForEntry(entry: TranscriptEntry) TranscriptBlockKind {
         .assistant_table => .assistant_table,
         .assistant_code_block => .assistant_code_block,
         .assistant_thematic_rule => .assistant_thematic_rule,
+        .question_answers => .unknown_raw,
     };
 }
 
@@ -290,6 +292,7 @@ pub fn entryClassForEntry(entry: TranscriptEntry) TranscriptEntryClass {
         .assistant_table => .assistant_table,
         .assistant_code_block => .assistant_code_block,
         .assistant_thematic_rule => .assistant_thematic_rule,
+        .question_answers => .unknown_raw,
         .semantic_notice => |notice| switch (notice.tone) {
             .information, .success, .warning, .neutral => if (std.ascii.eqlIgnoreCase(notice.topic, "context"))
                 .context_notice
@@ -366,6 +369,9 @@ pub const TranscriptEntry = union(enum) {
     /// One completed Markdown thematic rule, retained semantically so it
     /// can fill the active terminal width.
     assistant_thematic_rule: AssistantThematicRuleEntry,
+    /// One answered question batch, retained as its question and answer
+    /// pairs so the block re-wraps at the active terminal width.
+    question_answers: QuestionAnswersEntry,
 
     pub const RawBytesEntry = struct {
         id: u32,
@@ -430,6 +436,14 @@ pub const TranscriptEntry = union(enum) {
         inline_hidden: bool = false,
     };
 
+    pub const QuestionAnswersEntry = struct {
+        id: u32,
+        created_at_ms: i64 = 0,
+        inline_hidden: bool = false,
+        /// Owned by the entry, strings included (`question_resolution.dupeAnswers`).
+        answers: []const types.QuestionAnswer,
+    };
+
     pub fn hideInline(self: *TranscriptEntry) void {
         switch (self.*) {
             inline else => |*payload| payload.inline_hidden = true,
@@ -445,6 +459,7 @@ pub const TranscriptEntry = union(enum) {
             .assistant_table => |e| e.id,
             .assistant_code_block => |e| e.id,
             .assistant_thematic_rule => |e| e.id,
+            .question_answers => |e| e.id,
         };
     }
 
@@ -457,6 +472,7 @@ pub const TranscriptEntry = union(enum) {
             .assistant_table => |e| e.created_at_ms,
             .assistant_code_block => |e| e.created_at_ms,
             .assistant_thematic_rule => |e| e.created_at_ms,
+            .question_answers => |e| e.created_at_ms,
         };
     }
 
@@ -482,6 +498,7 @@ pub const TranscriptEntry = union(enum) {
             .assistant_table => |*e| e.table.deinit(alloc),
             .assistant_code_block => |*e| e.block.deinit(alloc),
             .assistant_thematic_rule => {},
+            .question_answers => |e| question_resolution.freeAnswers(alloc, e.answers),
         }
     }
 };
@@ -2333,6 +2350,10 @@ fn renderEntryToBlockForPresentationInterruptible(
                 .owned = true,
             };
         },
+        .question_answers => |e| blk: {
+            const rendered = try question_resolution.compose(alloc, e.answers, cols);
+            break :blk try normalizeOwnedRenderedBlock(alloc, kind, rendered);
+        },
     };
 }
 
@@ -2529,7 +2550,7 @@ pub fn leadingWelcomeCutLine(alloc: Allocator, entries: []const TranscriptEntry,
     for (entries[1..]) |entry| {
         switch (entry) {
             .user_turn, .assistant_turn, .assistant_table, .assistant_code_block, .assistant_thematic_rule => return null,
-            .raw_bytes, .semantic_notice => {},
+            .raw_bytes, .semantic_notice, .question_answers => {},
         }
     }
     const boundary = try leadingWelcomeBoundary(alloc, entries, cols, styles) orelse return null;
@@ -3519,6 +3540,7 @@ fn tailVisibleBlockKindOmittingEntries(
             .assistant_table => return .assistant_table,
             .assistant_code_block => return .assistant_code_block,
             .assistant_thematic_rule => return .assistant_thematic_rule,
+            .question_answers => return .unknown_raw,
         }
     }
     return null;
