@@ -8273,12 +8273,16 @@ describe("fx ask --json recovery", () => {
         }
       }
 
-      // (b) partial text on all 4: attempt 4, "partial": true, exit 1
+      // (b) partial text on all 4: attempt 4, "partial": true, exit 1 (both --json and --stream-events)
       {
         const home = createIsolatedTestHome();
         const workspace = join(home, "workspace");
         mkdirSync(workspace, { recursive: true });
         const gateway = startFakeGateway([
+          sseContentFilter("PARTIAL_1 "),
+          sseContentFilter("PARTIAL_2 "),
+          sseContentFilter("PARTIAL_3 "),
+          sseContentFilter("PARTIAL_4"),
           sseContentFilter("PARTIAL_1 "),
           sseContentFilter("PARTIAL_2 "),
           sseContentFilter("PARTIAL_3 "),
@@ -8304,6 +8308,24 @@ describe("fx ask --json recovery", () => {
           expect(json.partial).toBe(true);
           expect(json.error).toBe("ModelError");
           expect(json.recovery).toMatchObject({ state: "failed", attempt: 4, cause: "content_filter" });
+
+          const streamRes = await runFx(["ask", "--stream-events", "--no-save", "partial 4x"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+          expect(streamRes.code).toBe(1);
+          const streamLines = streamRes.stdout.trimEnd().split("\n");
+          expect(streamLines).toHaveLength(2);
+          expect(JSON.parse(streamLines[0]!).type).toBe("turn_start");
+          const resultLine = streamLines[1]!;
+          expect(resultLine.startsWith('{"type":"result",')).toBe(true);
+          expect(`{${resultLine.slice('{"type":"result",'.length)}\n`).toBe(res.stdout);
+          expect(JSON.parse(resultLine)).toMatchObject({
+            type: "result",
+            exit_code: 1,
+            output: "PARTIAL_4",
+            final_output: "",
+            partial: true,
+            error: "ModelError",
+            recovery: { state: "failed", attempt: 4, cause: "content_filter" },
+          });
         } finally {
           gateway.stop();
           cleanupIsolatedTestHome(home);

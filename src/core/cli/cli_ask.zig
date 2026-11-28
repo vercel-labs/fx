@@ -10393,6 +10393,11 @@ test "renderFinalJsonResult sets partial true only when failed with output and e
     const partial_field = parsed_partial.value.object.get("partial") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(true, partial_field.bool);
 
+    const partial_stream = try renderResultObject(alloc, partial_fail, true);
+    defer alloc.free(partial_stream);
+    try std.testing.expect(std.mem.startsWith(u8, partial_stream, "{\"type\":\"result\","));
+    try std.testing.expectEqualStrings(partial_json[1..], partial_stream["{\"type\":\"result\",".len..]);
+
     // Failed without output: partial must be omitted.
     const empty_fail = PromptRunResult{
         .exit_code = 1,
