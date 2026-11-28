@@ -12504,16 +12504,32 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
         !latestUserIsReport(request.body))!;
       const resumedChild = gateway.requests.find((request) =>
         !request.body.includes('"name":"subagent"') && promptText(request.body).includes(secondMessage))!;
-      const parentCatalog = taggedBlock(resumedParent.body, "toolbox");
-      const childCatalog = taggedBlock(resumedChild.body, "toolbox");
+      const firstParent = gateway.requests.find((request) =>
+        promptText(request.body).includes("RESUME_PERSISTENT_FIRST") &&
+        !promptText(request.body).includes("RESUME_PERSISTENT_SECOND") &&
+        !hasCurrentToolResult(request.body, "persistent_resume_one") &&
+        !latestUserIsReport(request.body))!;
+      const firstChild = gateway.requests.find((request) =>
+        !request.body.includes('"name":"subagent"') &&
+        promptText(request.body).includes(firstMessage) &&
+        !promptText(request.body).includes(secondMessage))!;
       expect(resumedParent.headers.get("ai-language-model-id")).toBe(smallModel);
       expect(resumedChild.headers.get("ai-language-model-id")).toBe(MODEL);
-      for (const catalog of [parentCatalog, childCatalog]) {
-        expect(catalog).not.toContain("original-workspace-only");
-        for (const name of skillNames) expect(catalog).toContain(`- ${name}:`);
+      // A resume, here in another workspace with a smaller model, sends the
+      // menu each conversation sent first, byte for byte, and the toolbox it
+      // holds now arrives as a change note at the end of the new turn
+      // (tests/tla/toolbox/Toolbox.tla MenuFixed and Informed, D103). The
+      // persistent child resumes its own saved conversation the same way.
+      for (const [first, resumed] of [[firstParent, resumedParent], [firstChild, resumedChild]] as const) {
+        const firstMenu = taggedBlock(first.body, "toolbox");
+        expect(firstMenu).toContain("- original-workspace-only:");
+        for (const name of skillNames) expect(firstMenu).not.toContain(name);
+        expect(taggedBlock(resumed.body, "toolbox")).toBe(firstMenu);
+        const turnEnd = contentText(gatewayRequest(resumed.body).prompt.at(-1)!.content);
+        expect(turnEnd).toContain("The toolbox now holds something other than the toolbox menu above lists.");
+        for (const name of skillNames) expect(turnEnd).toContain(name);
+        expect(turnEnd).not.toContain("original-workspace-only");
       }
-      // Each menu gives a skill one short line, so the two models' windows
-      // change it only when the budget forces a cut.
 
       const directChildResume = await runFx(
         [
@@ -17335,3 +17351,68 @@ test("a subagent started with its own model names that child model in its turn c
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 45_000);
+
+test("a repeated subagent message with the same model and effort is delivered and completes", async () => {
+  const root = createFixtureRoot("subagent-repeat-same-settings");
+  const childModel = "anthropic/claude-opus-4.6";
+  let secondSendToolResult = "";
+  const sendWithSettings = (id: string, message: string) =>
+    fakeGatewaySse([
+      {
+        type: "tool-call",
+        toolCallId: id,
+        toolName: "subagent",
+        input: {
+          request: {
+            action: "message",
+            agent: "reviewer",
+            message,
+            model: childModel,
+            effort: "low",
+          },
+        },
+      },
+      finishWithUsage("tool-calls", 100, 10, 1),
+    ]);
+  const gateway = startDynamicFakeGateway((body) => {
+    if (!body.includes('"name":"subagent"')) {
+      if (body.includes("SECOND_REVIEW_TASK")) return fakeGatewayFinalText("REVIEW_TWO_DONE");
+      return fakeGatewayFinalText("REVIEW_ONE_DONE");
+    }
+    if (hasCurrentToolResult(body, "send_two")) {
+      secondSendToolResult = toolResultOutput(body, "send_two");
+      return fakeGatewayFinalText("SECOND_DISPATCHED");
+    }
+    const reports = allReports(body);
+    if (reports.some((report) => String(report.output).includes("REVIEW_TWO_DONE"))) {
+      return fakeGatewayFinalText("ALL_REVIEWS_DONE");
+    }
+    if (reports.some((report) => String(report.output).includes("REVIEW_ONE_DONE"))) {
+      return sendWithSettings("send_two", "SECOND_REVIEW_TASK");
+    }
+    if (hasCurrentToolResult(body, "send_one")) return fakeGatewayFinalText("FIRST_DISPATCHED");
+    return sendWithSettings("send_one", "FIRST_REVIEW_TASK");
+  }, {
+    classifierDecision: "clear",
+    models: [
+      { id: MODEL, type: "language", tags: ["tool-use"] },
+      { id: childModel, type: "language", tags: ["tool-use"] },
+    ],
+  });
+
+  try {
+    const result = await runFx(["ask", "--yolo", "--json", "--", "Send two tasks to reviewer with the same model and effort."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(secondSendToolResult).toContain('"ok":true');
+    expect(secondSendToolResult).not.toContain("override_after_create");
+    const json = parseAskJson(result.stdout);
+    expect(json.final_output).toBe("ALL_REVIEWS_DONE");
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 60_000);

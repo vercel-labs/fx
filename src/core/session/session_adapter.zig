@@ -61,6 +61,7 @@ const session_display_metadata = @import("session_display_metadata.zig");
 const session_store = @import("session_store.zig");
 const session_summary_codec = @import("session_summary_codec.zig");
 const v1_conversion = @import("v1_conversion.zig");
+const session_catalog_cache = @import("session_catalog_cache.zig");
 const child_state = @import("../subagent/child_state.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const artifact_digest = @import("artifact_digest.zig");
@@ -616,6 +617,37 @@ pub fn listPage(
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
 ) !session_store.SessionListPage {
+    var v1_roots = try readV1Roots(store, alloc);
+    defer v1_roots.deinit(alloc);
+    return listPageWithV1Roots(store, alloc, &v1_roots, workspace, continuation, limit);
+}
+
+/// v1's roots not converted yet (D59), newest first. One read serves every
+/// page of a listing. Free with `deinit`.
+pub const V1Roots = struct {
+    catalog: session_catalog_cache.ActionableSessionCatalog,
+
+    pub fn deinit(roots: *V1Roots, alloc: Allocator) void {
+        roots.catalog.deinit(alloc);
+    }
+};
+
+/// Reads v1's roots, sorted newest first. Caller owns the result.
+pub fn readV1Roots(store: *Store, alloc: Allocator) !V1Roots {
+    const catalog = try v1_conversion.listRoots(alloc, store.home, null);
+    session_summary_codec.sortSummariesNewestFirst(catalog.summaries.items);
+    return .{ .catalog = catalog };
+}
+
+/// `listPage` on roots read before, so the pages of one listing share one read of v1's folder.
+pub fn listPageWithV1Roots(
+    store: *Store,
+    alloc: Allocator,
+    v1_roots: *const V1Roots,
+    workspace: ?[]const u8,
+    continuation: ?session_store.ResumableSessionContinuation,
+    limit: usize,
+) !session_store.SessionListPage {
     if (limit == 0 or limit > session_store.session_list_max_limit) return error.InvalidSessionListLimit;
     var candidates: std.ArrayList(session_store.SessionSummary) = .empty;
     defer {
@@ -626,11 +658,8 @@ pub fn listPage(
     session_summary_codec.sortSummariesNewestFirst(candidates.items);
     const v2_count = candidates.items.len;
 
-    var v1_roots = try v1_conversion.listRoots(alloc, store.home, null);
-    defer v1_roots.deinit(alloc);
-    session_summary_codec.sortSummariesNewestFirst(v1_roots.summaries.items);
     var added: usize = 0;
-    for (v1_roots.summaries.items) |summary| {
+    for (v1_roots.catalog.summaries.items) |summary| {
         if (workspace) |root| if (!std.mem.eql(u8, summary.workspace_root orelse continue, root)) continue;
         if (continuation) |position| if (!session_summary_codec.summaryFollowsContinuation(summary, position)) continue;
         // After `limit` newer ones, this one and every later one is off the page.
@@ -646,7 +675,7 @@ pub fn listPage(
     // workspace is unknown, and counts them as v1 did; the profile-wide
     // listing shows them instead (D61).
     if (workspace != null and continuation == null) {
-        for (v1_roots.summaries.items) |summary| {
+        for (v1_roots.catalog.summaries.items) |summary| {
             if (summary.workspace_root == null) page.skipped_invalid += 1;
         }
     }
@@ -6572,6 +6601,13 @@ fn mergeContinued(alloc: Allocator, earlier: types.HistoryTurn, later: types.His
     if (tail.runtime_context) |texts| {
         if (runtime_context == null) runtime_context = texts else types.freeRuntimeContext(alloc, texts);
     }
+    // So does the toolbox menu of the turn that kept it, and the newer note
+    // wins (D103).
+    var toolbox_menu = head.execution.toolbox_menu;
+    if (tail.toolbox_menu) |menu| {
+        if (toolbox_menu == null) toolbox_menu = menu else alloc.free(menu.text);
+    }
+    const toolbox_noted = tail.toolbox_noted orelse head.execution.toolbox_noted;
     const turn_summary = tail.turn_summary orelse head.execution.turn_summary;
     const execution: types.ExecutionMemory = .{
         .tool_steps = tool_steps,
@@ -6579,6 +6615,8 @@ fn mergeContinued(alloc: Allocator, earlier: types.HistoryTurn, later: types.His
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        .toolbox_menu = toolbox_menu,
+        .toolbox_noted = toolbox_noted,
         .turn_summary = turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,
@@ -6806,6 +6844,8 @@ noinline fn replay(
                         .steering => |value| try builder.appendSteering(value.text),
                         .context_note => |value| try builder.appendContextNote(value.text, value.sources),
                         .runtime_context => |value| try builder.setRuntimeContext(value.messages),
+                        .toolbox_menu => |value| try builder.setToolboxMenu(value.text, value.entries_hash),
+                        .toolbox_noted => |value| try builder.setToolboxNoted(value),
                         .turn_completed => |value| {
                             const finished = try presentStoredResults(src, alloc, try builder.finishAssistant(value));
                             // Numbered as its chain's first turn when it continues one (RULES R1.8).
@@ -7704,9 +7744,12 @@ fn itemType(kind: PieceKind) ?[]const u8 {
         .turn_completed => "turn_end",
         .interrupted => "interruption",
         .context_checkpoint => null,
-        // An older fx leaves out an item type it does not know (D17, D93, D94).
+        // An older fx leaves out an item type it does not know (D17, D93, D94,
+        // D103).
         .context_note => "context_note",
         .runtime_context => "runtime_context",
+        .toolbox_menu => "toolbox_menu",
+        .toolbox_noted => "toolbox_noted",
         .model_call => "model_call",
     };
 }
@@ -12354,6 +12397,81 @@ test "a turn's runtime context comes back on resume, saved once right after its 
     for (captured, execution.runtime_context.?) |want, got| try testing.expectEqualStrings(want, got);
     // A later turn that used the saved copy saves none.
     try testing.expect(restored.history[1].assistant.execution.runtime_context == null);
+}
+
+test "a turn's toolbox menu and noted hash come back on resume and in a fork, saved right after its user message (D103)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var captured = [_][]u8{@constCast("Runtime context: permission mode is ask.")};
+    const menu: types.SavedToolboxMenu = .{ .text = @constCast("TOOLBOX_MENU_BYTES"), .entries_hash = std.math.maxInt(u64) };
+    const noted: types.ToolboxNoted = .{ .entries_hash = 9, .compaction_count = 1 };
+    const lang = types.ConversationLanguage.default();
+    const user: types.UserTurn = .{ .text = @constCast("first turn") };
+    // The menu is kept before the first step, and every save of the turn
+    // carries it, so the streamed pieces stay a prefix of the committed turn.
+    try s.appendProgress(user, .{ .toolbox_menu = menu }, .{});
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..1], .runtime_context = &captured, .toolbox_menu = menu }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .runtime_context = &captured, .toolbox_menu = menu },
+    } }, lang);
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("noted turn") },
+        .assistant = @constCast("noted"),
+        .execution = .{ .toolbox_noted = noted },
+    } }, lang);
+    try s.commitTurn(assistantTurn("plain", "turn"), lang);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "TOOLBOX_MENU_BYTES"));
+    const user_at = std.mem.find(u8, bytes, "first turn").?;
+    const menu_at = std.mem.find(u8, bytes, "\"type\":\"toolbox_menu\"").?;
+    const runtime_at = std.mem.find(u8, bytes, "\"type\":\"runtime_context\"").?;
+    try testing.expect(user_at < menu_at and menu_at < runtime_at);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes[user_at..menu_at], "\n"));
+    try testing.expect(std.mem.find(u8, bytes, "\"type\":\"toolbox_noted\",\"data\":{\"entries_hash\":9,\"compaction_count\":1}") != null);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    {
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 3), restored.history.len);
+        const first = restored.history[0].assistant.execution;
+        try testing.expectEqual(@as(usize, 2), first.tool_steps.len);
+        try testing.expectEqualStrings(menu.text, first.toolbox_menu.?.text);
+        try testing.expectEqual(menu.entries_hash, first.toolbox_menu.?.entries_hash);
+        try testing.expect(first.toolbox_noted == null);
+        try testing.expect(restored.history[1].assistant.execution.toolbox_menu == null);
+        try testing.expectEqual(@as(?types.ToolboxNoted, noted), restored.history[1].assistant.execution.toolbox_noted);
+        try testing.expect(restored.history[2].assistant.execution.toolbox_menu == null);
+        try testing.expect(restored.history[2].assistant.execution.toolbox_noted == null);
+    }
+
+    // A fork copies the turns before its point with their items.
+    const points = try r.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, points);
+    const copy = try r.fork(testing.allocator, .{ .before_turn = points[2].turn, .workspace = "/w", .host = .app });
+    defer copy.close();
+    var forked = try copy.restore(testing.allocator);
+    defer forked.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), forked.history.len);
+    try testing.expectEqualStrings(menu.text, forked.history[0].assistant.execution.toolbox_menu.?.text);
+    try testing.expectEqual(@as(?types.ToolboxNoted, noted), forked.history[1].assistant.execution.toolbox_noted);
 }
 
 test "a turn's model call records come back on resume at their steps, each saved once" {

@@ -305,6 +305,10 @@ pub const Context = struct {
             .context_limits = self.context_limits,
             .auto_classifier = self.admissionAutoClassifier(),
             .terminal_review_context = self.terminalReviewContext(),
+            .review_result_store = .{
+                .capability = self.session_child_capability,
+                .result_dir = self.tool_result_dir,
+            },
             .host_sandbox_default = self.host_sandbox_default,
         };
         if (self.permission_state_override != null) {
