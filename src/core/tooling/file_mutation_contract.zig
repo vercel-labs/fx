@@ -617,6 +617,7 @@ pub const FileExecutionAuthorization = struct {
     policy_targets: PolicyEvaluatedFileTargets,
     prepared: ?PreparedFileMutation = null,
     grant_offer: ?FileGrantOffer = null,
+    approved_once_grants: []const types.PermissionGrant = &.{},
     approval_intent: ?FileApprovalIntent = null,
     read_disclosure_required: bool = false,
     edit_failure_detail: EditFailureDetail = .plain,

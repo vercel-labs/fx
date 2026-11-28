@@ -1704,6 +1704,37 @@ fn requestPermissionOutcomeResolved(
     );
 }
 
+fn appendGrants(
+    arena: Allocator,
+    base: []const PermissionGrant,
+    extra: []const PermissionGrant,
+) ![]const PermissionGrant {
+    if (extra.len == 0) return base;
+    const grants = try arena.alloc(PermissionGrant, base.len + extra.len);
+    @memcpy(grants[0..base.len], base);
+    @memcpy(grants[base.len..], extra);
+    return grants;
+}
+
+fn exactFileMutationGrants(
+    arena: Allocator,
+    tool_name: []const u8,
+    policy_targets: file_mutation_contract.PolicyEvaluatedFileTargets,
+) ![]const PermissionGrant {
+    const permission_name = permissions.permissionNameForTool(tool_name);
+    const grants = try arena.alloc(PermissionGrant, policy_targets.items.len);
+    for (policy_targets.items, grants) |item, *grant| {
+        grant.* = .{
+            .tool_name = try arena.dupe(u8, permission_name),
+            .target_path = try arena.dupe(
+                u8,
+                policy_targets.permissionPath(item),
+            ),
+        };
+    }
+    return grants;
+}
+
 fn exactApprovalLocalGrants(
     input: Input,
     arena: Allocator,
@@ -1714,32 +1745,11 @@ fn exactApprovalLocalGrants(
 ) ![]const PermissionGrant {
     switch (authority) {
         .file_mutation => |authorization| {
-            const offer = authorization.grant_offer orelse return local_grants;
             if (human_approval == .once) {
-                const permission_name = permissions.permissionNameForTool(call.name);
-                const grants = try arena.alloc(
-                    PermissionGrant,
-                    local_grants.len + authorization.policy_targets.items.len,
-                );
-                @memcpy(grants[0..local_grants.len], local_grants);
-                for (authorization.policy_targets.items, grants[local_grants.len..]) |item, *grant| {
-                    grant.* = .{
-                        .tool_name = try arena.dupe(u8, permission_name),
-                        .target_path = try arena.dupe(
-                            u8,
-                            authorization.policy_targets.permissionPath(item),
-                        ),
-                    };
-                }
-                return grants;
+                return appendGrants(arena, local_grants, authorization.approved_once_grants);
             }
-            const grants = try arena.alloc(
-                PermissionGrant,
-                local_grants.len + offer.grants.len,
-            );
-            @memcpy(grants[0..local_grants.len], local_grants);
-            @memcpy(grants[local_grants.len..], offer.grants);
-            return grants;
+            const offer = authorization.grant_offer orelse return local_grants;
+            return appendGrants(arena, local_grants, offer.grants);
         },
         .ordinary, .run_command => {
             var targets = try permissionTargetsForCall(input, arena, call);
@@ -1879,7 +1889,10 @@ pub fn revalidateLiveActionPermissionOutcome(
             outcome.denial_reason == .user_denied or
             outcome.decision == .permission_required))
     {
-        const reason = if (authority == .file_mutation and authority.file_mutation.grant_offer == null)
+        const missing_file_grants = authority == .file_mutation and
+            ((human_approval == .once and authority.file_mutation.approved_once_grants.len == 0) or
+                (human_approval != .once and authority.file_mutation.grant_offer == null));
+        const reason = if (missing_file_grants)
             "missing_grant_offer"
         else if (authority == .file_mutation)
             "target_or_policy_changed"
@@ -1904,10 +1917,14 @@ pub fn revalidateLiveActionPermissionOutcome(
         if (authority == .file_mutation and outcome.execution_authority != null) {
             switch (outcome.execution_authority.?) {
                 .file_mutation => |*new_auth| {
-                    // Keep the approved exact target grants for any later
-                    // generation bump; a target change misses those grants and
-                    // still reprompts.
-                    if (new_auth.grant_offer == null) {
+                    // Carry the fixed grants recorded at initial approval without
+                    // recomputing from a newer authority's targets, so a looser
+                    // interim recheck can never transfer .once approval to a new path.
+                    if (human_approval == .once) {
+                        if (new_auth.approved_once_grants.len == 0) {
+                            new_auth.approved_once_grants = authority.file_mutation.approved_once_grants;
+                        }
+                    } else if (new_auth.grant_offer == null) {
                         new_auth.grant_offer = authority.file_mutation.grant_offer;
                     }
                 },
@@ -2065,6 +2082,13 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
                 else => return err,
             };
             defer response.deinit();
+            if (response.decision == .once) {
+                authorization.approved_once_grants = try exactFileMutationGrants(
+                    arena,
+                    call.name,
+                    authorization.policy_targets,
+                );
+            }
             var outcome: command_admission.PermissionOutcome = .{
                 .decision = response.decision,
                 .execution_authority = if (response.decision.isDenied()) null else .{
@@ -7042,4 +7066,47 @@ test "a review gets a reader for stored answers only when a result store exists"
     try std.testing.expect((try storedResultsFor(input, arena_state.allocator())) == null);
     input.review_result_store = .{ .result_dir = "/tmp/fx-review-result-store" };
     try std.testing.expect((try storedResultsFor(input, arena_state.allocator())) != null);
+}
+
+fn gateRetargetFixture(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    try tmp.dir.createDirPath(std.testing.io, "workspace/a");
+    try tmp.dir.createDirPath(std.testing.io, "workspace/b");
+    try tmp.dir.symLink(std.testing.io, "a", "workspace/link", .{ .is_directory = true });
+    return io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+}
+
+fn gateRetarget(tmp: *std.testing.TmpDir) !void {
+    try tmp.dir.deleteFile(std.testing.io, "workspace/link");
+    try tmp.dir.symLink(std.testing.io, "b", "workspace/link", .{ .is_directory = true });
+}
+
+test "gate 2582: a once approval of a/ never covers b/ after a looser-policy recheck (yolo then ask)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try gateRetargetFixture(alloc, &tmp);
+    defer alloc.free(workspace);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{ .decision = .once };
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    const call: ToolCall = .{
+        .id = "gate-retarget",
+        .name = "write_file",
+        .arguments_json = try arena.print("{{\"path\":\"{s}/link/note.txt\",\"content\":\"x\\n\"}}", .{workspace}),
+    };
+    const initial = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try gateRetarget(&tmp);
+    const first = try revalidateLiveActionPermissionOutcome(input, arena, call, .yolo, &.{}, initial.execution_authority.?, .once);
+    try std.testing.expect(!first.decision.isDenied());
+    const second = try revalidateLiveActionPermissionOutcome(input, arena, call, .ask, &.{}, first.execution_authority.?, .once);
+    _ = second;
+    // The person approved only workspace/a/note.txt; b/note.txt in ask mode must ask again.
+    try std.testing.expectEqual(@as(usize, 2), recording.calls);
 }
