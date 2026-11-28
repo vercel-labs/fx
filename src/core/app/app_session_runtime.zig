@@ -2461,6 +2461,7 @@ pub fn Runtime(comptime App: type) type {
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
                 try app.installResumeProjection(agent, &projection, holds_previous);
+                setResumedArchiveBoundary(app, agent, holds_previous);
                 const install_finished_ns = io_mod.nanoTimestamp();
                 debug_trace.logf(
                     "session",
@@ -4508,15 +4509,14 @@ pub fn Runtime(comptime App: type) type {
             if (read.pendingFor(back, generation)) return;
             const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
             const started_ns = io_mod.nanoTimestamp();
-            const newest = (try v2.previousCompactionCursor(app.alloc, null)).cursor orelse return error.TranscriptArchiveUnavailable;
-            const holds_previous = app.shell.transcriptWindowHoldsPreviousCycle();
+            const held_start = agent.session_persistence.resumed_archive_boundary orelse return error.TranscriptArchiveUnavailable;
             const cache = &agent.session_persistence.transcript_archive_boundaries;
-            const stale = if (cache.key) |key| !std.meta.eql(key.newest, newest) or key.holds_previous != holds_previous else true;
+            const stale = if (cache.key) |key| !std.meta.eql(key.newest, held_start) else true;
             if (stale) {
                 cache.starts.clearRetainingCapacity();
-                cache.key = .{ .newest = newest, .holds_previous = holds_previous };
+                cache.key = .{ .newest = held_start, .holds_previous = false };
                 cache.damaged_from = null;
-                cache.held_start = if (holds_previous) cache.startOf(1, try v2.previousCompactionCursor(app.alloc, newest)) else newest;
+                cache.held_start = held_start;
             }
             while (cache.starts.items.len < back) {
                 // Below `back`, a u32, so the cast holds.
@@ -4667,18 +4667,31 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// Whether Ctrl+O can page into older compaction cycles: the window
-        /// holds only the newest cycle, and the log holds the older ones.
+        fn setResumedArchiveBoundary(app: *App, agent: *AppAgent, holds_previous: bool) void {
+            agent.session_persistence.resumed_archive_boundary = null;
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
+            const v2 = agent.session_persistence.v2 orelse return;
+            const newest = v2.previousCompactionCursor(app.alloc, null) catch return;
+            const boundary = if (!holds_previous)
+                newest.cursor
+            else if (newest.cursor) |cursor|
+                (v2.previousCompactionCursor(app.alloc, cursor) catch return).cursor
+            else
+                null;
+            agent.session_persistence.resumed_archive_boundary = boundary;
+        }
+
+        /// Whether Ctrl+O can page into older compaction cycles: only when a
+        /// resume left older cycles unloaded in the session log.
         fn syncTranscriptArchiveAvailable(app: *App, agent: *AppAgent) void {
             if (comptime !@hasField(App, "shell")) return;
             if (comptime !@hasField(@TypeOf(app.shell), "transcript_archive_available")) return;
             if (!transcriptInContext(app, agent)) return;
-            const v2 = agent.session_persistence.v2 orelse {
+            if (agent.session_persistence.v2 == null) {
                 app.shell.transcript_archive_available = false;
                 return;
-            };
-            const newest = v2.previousCompactionCursor(app.alloc, null) catch null;
-            app.shell.transcript_archive_available = if (newest) |found| found.cursor != null else false;
+            }
+            app.shell.transcript_archive_available = agent.session_persistence.resumed_archive_boundary != null;
         }
 
         /// Builds the notebook of the agent in context from `history`, as
@@ -4710,6 +4723,7 @@ pub fn Runtime(comptime App: type) type {
             scratch.swapSlot(&slot);
             app.shell.swapSlot(&slot);
             transcript_runtime.TranscriptRuntime.deinitSlot(&slot, app.alloc);
+            setResumedArchiveBoundary(app, agent, holds_previous);
             syncTranscriptArchiveAvailable(app, agent);
         }
 
@@ -5901,6 +5915,7 @@ pub fn Runtime(comptime App: type) type {
             clearAcceptedInputHooks(agent);
             const handoff_intent = agent.session_persistence.resume_handoff_intent;
             agent.session_persistence.resume_handoff_intent = .none;
+            agent.session_persistence.resumed_archive_boundary = null;
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             discardAnyPendingCancelledCommand(app, agent, "writable_session_close");

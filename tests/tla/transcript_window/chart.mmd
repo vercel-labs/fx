@@ -1,0 +1,38 @@
+stateDiagram-v2
+    [*] --> IdleFullSession : Start fresh session (held from 0)
+
+    IdleFullSession --> TurnRunning : User sends prompt
+    TurnRunning --> TurnRunning : Tool opens, changes, or finishes
+    TurnRunning --> TurnRunning : Mid-turn compaction (keeps all blocks)
+    TurnRunning --> IdleFullSession : Turn ends (keeps all blocks)
+    IdleFullSession --> IdleFullSession : Compaction between turns (keeps all blocks)
+
+    IdleFullSession --> ReprintingSession : Terminal resizes (reprints 0..end)
+    TurnRunning --> ReprintingSession : Terminal resizes (reprints 0..end)
+    ReprintingSession --> IdleFullSession : Reprint finishes (turn closed)
+    ReprintingSession --> TurnRunning : Reprint finishes (turn open)
+
+    IdleFullSession --> CtrlOInMemory : Open Ctrl+O (reads 0..end from memory)
+    TurnRunning --> CtrlOInMemory : Open Ctrl+O (reads 0..end from memory)
+    CtrlOInMemory --> CtrlOInMemory : PageUp / PageDown inside memory
+    CtrlOInMemory --> IdleFullSession : Close Ctrl+O
+
+    IdleFullSession --> IdleFullSession : /new or /clear drops old session
+    TurnRunning --> IdleFullSession : /new or /clear drops old session
+    IdleFullSession --> Crashed : Process crashes
+    TurnRunning --> Crashed : Process crashes
+    Crashed --> ResumedCycle : Restart (--resume from last cycle)
+    IdleFullSession --> ResumedCycle : /new or /clear then /resume
+
+    ResumedCycle --> ResumedCycle : Compactions keep resumed cycle..end
+    ResumedCycle --> CtrlOReadingLog : Open Ctrl+O and scroll past resumed start
+    CtrlOReadingLog --> CtrlOReadingLog : Log read completes or fails
+    CtrlOReadingLog --> ResumedCycle : Close Ctrl+O
+
+    note right of IdleFullSession
+        Rule breaks caught by planted bugs:
+        - Drop on turn end breaks NoDropDuringSession
+        - Compaction advances held start breaks HeldIsCurrentSession / CompactionKeepsHistory
+        - Clear without drop breaks OldSessionDroppedOnChange
+        - Live drop breaks LiveNeverDropped
+    end note

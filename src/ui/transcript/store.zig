@@ -189,7 +189,10 @@ pub fn retainedStructuredBytes(self: anytype) usize {
 
 fn entryRetainedBytes(entry: TranscriptEntry) usize {
     return switch (entry) {
-        .raw_bytes => |e| e.bytes.len,
+        .raw_bytes => |e| e.bytes.len + switch (e.turn_recap) {
+            .text => |recap| recap.len,
+            .uncomputed, .empty => 0,
+        },
         .semantic_notice => |e| e.topic.len + e.body.len + e.detail.len,
         .user_turn => |e| blk: {
             var total = e.turn.text.len;
@@ -1861,14 +1864,24 @@ fn cloneEntries(
 
 pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !TranscriptEntry {
     return switch (entry) {
-        .raw_bytes => |raw| .{ .raw_bytes = .{
-            .id = raw.id,
-            .created_at_ms = raw.created_at_ms,
-            .inline_hidden = raw.inline_hidden,
-            .bytes = try alloc.dupe(u8, raw.bytes),
-            .class = raw.class,
-            .lifecycle_pinned = raw.lifecycle_pinned,
-        } },
+        .raw_bytes => |raw| blk: {
+            const bytes = try alloc.dupe(u8, raw.bytes);
+            errdefer alloc.free(bytes);
+            const turn_recap: transcript_blocks.TurnRecap = switch (raw.turn_recap) {
+                .uncomputed => .uncomputed,
+                .empty => .empty,
+                .text => |recap| .{ .text = try alloc.dupe(u8, recap) },
+            };
+            break :blk .{ .raw_bytes = .{
+                .id = raw.id,
+                .created_at_ms = raw.created_at_ms,
+                .inline_hidden = raw.inline_hidden,
+                .bytes = bytes,
+                .class = raw.class,
+                .lifecycle_pinned = raw.lifecycle_pinned,
+                .turn_recap = turn_recap,
+            } };
+        },
         .semantic_notice => |notice| blk: {
             const owned = try types.dupeSemanticNotice(alloc, .{
                 .topic = notice.topic,
@@ -2008,6 +2021,10 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
     errdefer if (mcp_server) |value| alloc.free(value);
     const mcp_tool = if (source.mcp_tool) |value| try alloc.dupe(u8, value) else null;
     errdefer if (mcp_tool) |value| alloc.free(value);
+    const failure_reason = if (source.failure_reason) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (failure_reason) |value| alloc.free(value);
+    const command_session_id = if (source.command_session_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (command_session_id) |value| alloc.free(value);
 
     return .{
         .entry_id = source.entry_id,
@@ -2038,6 +2055,11 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .command_placement = source.command_placement,
         .mcp_server = mcp_server,
         .mcp_tool = mcp_tool,
+        .failure_reason = failure_reason,
+        .command_session_id = command_session_id,
+        .stopped_question = source.stopped_question,
+        .toolbox_opened_skill = source.toolbox_opened_skill,
+        .invalid_field_count = source.invalid_field_count,
     };
 }
 

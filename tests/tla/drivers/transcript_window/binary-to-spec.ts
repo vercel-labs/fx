@@ -70,6 +70,7 @@ export function eventOf(text: string, ids: Map<string, number>): Event {
     case "compacted":
     case "resized":
     case "reprint_tick":
+    case "session_cleared":
       return { event: name };
     case "block_opened":
     case "block_changed":
@@ -181,8 +182,8 @@ async function runScenario(bin: string, dir: string) {
       await session.waitForPane((pane) => !/Compacting|Stopping compaction/.test(pane), TIMEOUT);
       await session.waitForComposer(TIMEOUT);
     }
-    // A resize clears the screen and scrollback and replays what the window
-    // holds: the newest cycle only, the compaction on.
+    // A resize clears the screen and scrollback and replays the entire current
+    // session across compactions.
     await session.resizeWindow(80, 30);
     await session.resizeWindow(100, 30);
     await session.waitForComposer(TIMEOUT);
@@ -238,7 +239,7 @@ export async function binaryToSpec(options: { bin: string; dir: string }): Promi
   expect("Ctrl+O live", shown.live ?? [], ORDER);
   expect("Ctrl+O after resume", shown.resumed ?? [], ORDER);
   expect("the resumed main screen", shown.resumedMain ?? [], ["CYCLE2_A", "CYCLE2_B"]);
-  expect("the main screen after a resize", shown.resizedMain ?? [], ["CYCLE2_A", "CYCLE2_B"]);
+  expect("the main screen after a resize", shown.resizedMain ?? [], ORDER);
   if (result.rejected > 0) result.problem ??= `the binary traced ${result.rejected} rejected window events`;
 
   const harness = buildHarness(join(options.dir, "harness"));

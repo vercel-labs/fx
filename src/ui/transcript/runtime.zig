@@ -168,6 +168,97 @@ const JoinedPageStore = struct {
         if (index < self.heldStart()) return self.archived[index - self.trimmed].id();
         return self.held[index - self.heldStart()].id();
     }
+
+    fn isEmptyTrimmedCommandOutput(entry: TranscriptEntry) bool {
+        return entry == .raw_bytes and
+            entry.raw_bytes.class == .command_output and
+            entry.raw_bytes.bytes.len == 0;
+    }
+
+    fn countsTowardPage(self: JoinedPageStore, index: usize) bool {
+        if (index < self.trimmed) return true;
+        const entry = if (index < self.heldStart())
+            self.archived[index - self.trimmed]
+        else
+            self.held[index - self.heldStart()];
+        return !isEmptyTrimmedCommandOutput(entry);
+    }
+
+    pub const max_page_source_bytes: usize = 36 * 1024;
+
+    fn entryBytes(self: JoinedPageStore, index: usize) usize {
+        if (index < self.trimmed) return 0;
+        const entry = if (index < self.heldStart())
+            self.archived[index - self.trimmed]
+        else
+            self.held[index - self.heldStart()];
+        if (isEmptyTrimmedCommandOutput(entry)) return 0;
+        return transcript_store.entrySnapshotRetainedBytes(entry) -| @sizeOf(TranscriptEntry);
+    }
+
+    fn sourceRange(self: JoinedPageStore, request: full_transcript_page.Request) full_transcript_page.SourceRange {
+        const total = self.len();
+        if (total == 0) return .{ .start = 0, .end = 0 };
+        const limit = full_transcript_page.max_source_entries;
+        switch (request.anchor) {
+            .tail => {
+                var start = total;
+                var kept: usize = 0;
+                var bytes: usize = 0;
+                while (start > 0 and kept < limit) {
+                    const next_bytes = self.entryBytes(start - 1);
+                    if (kept > 0 and next_bytes > 0 and bytes +| next_bytes > max_page_source_bytes) break;
+                    start -= 1;
+                    if (self.countsTowardPage(start)) {
+                        kept += 1;
+                        bytes +|= next_bytes;
+                    }
+                }
+                return .{ .start = start, .end = total };
+            },
+            .entry_index, .archive => {
+                const requested_index = switch (request.anchor) {
+                    .entry_index => |index| index,
+                    .archive => |archive| archive.entry_index,
+                    .tail => unreachable,
+                };
+                const anchor = @min(requested_index, total - 1);
+                var start = anchor;
+                var end = anchor + 1;
+                var total_kept: usize = @intFromBool(self.countsTowardPage(anchor));
+                var bytes: usize = self.entryBytes(anchor);
+
+                while (start > 0 and total_kept < limit / 2 + 1) {
+                    const next_bytes = self.entryBytes(start - 1);
+                    if (total_kept > 0 and next_bytes > 0 and bytes +| next_bytes > max_page_source_bytes / 2) break;
+                    start -= 1;
+                    if (self.countsTowardPage(start)) {
+                        total_kept += 1;
+                        bytes +|= next_bytes;
+                    }
+                }
+                while (end < total and total_kept < limit) {
+                    const next_bytes = self.entryBytes(end);
+                    if (total_kept > 0 and next_bytes > 0 and bytes +| next_bytes > max_page_source_bytes) break;
+                    if (self.countsTowardPage(end)) {
+                        total_kept += 1;
+                        bytes +|= next_bytes;
+                    }
+                    end += 1;
+                }
+                while (start > 0 and total_kept < limit) {
+                    const next_bytes = self.entryBytes(start - 1);
+                    if (total_kept > 0 and next_bytes > 0 and bytes +| next_bytes > max_page_source_bytes) break;
+                    start -= 1;
+                    if (self.countsTowardPage(start)) {
+                        total_kept += 1;
+                        bytes +|= next_bytes;
+                    }
+                }
+                return .{ .start = start, .end = end };
+            },
+        }
+    }
 };
 
 /// An older compaction cycle replayed from the session log for Ctrl+O.
@@ -6631,6 +6722,32 @@ pub const TranscriptRuntime = struct {
                 detail.resolved_path = path;
                 owned_resolved_path = null;
             }
+            tool_group_projection.extractProjectionFlagsFromResult(alloc, detail);
+            const has_stored_replay = if (detail.command_output_replay) |replay| replay == .available else false;
+            const has_stored_copy = detail.result_handle != null or
+                detail.command_artifact_handle != null or
+                has_stored_replay;
+            if (has_stored_copy) {
+                if (detail.result) |old| {
+                    alloc.free(old);
+                    detail.result = null;
+                }
+            }
+            if (record.activity_kind == .command and
+                (detail.command_artifact_handle != null or has_stored_replay))
+            {
+                for (self.notebook.command_output_blocks.items, 0..) |block, block_index| {
+                    const same_entry = detail.command_output_entry_id != null and
+                        block.entry_id == detail.command_output_entry_id;
+                    const same_lifecycle = command_output_runtime.sameLifecycleId(block.lifecycle_id, id);
+                    if (same_entry or same_lifecycle) {
+                        _ = command_output_runtime.trimFinishedCommandOutputBlock(self, alloc, block_index) catch |err| {
+                            debug_trace.logf("command_output", "trim skipped err={s}", .{@errorName(err)});
+                        };
+                        break;
+                    }
+                }
+            }
         }
         return null;
     }
@@ -7727,8 +7844,16 @@ pub const TranscriptRuntime = struct {
         var line_buf: [128]u8 = undefined;
         const line = formatTurnSummaryLine(&line_buf, summary);
         const entry = try alloc.print("{s}{s}{s}\n", .{ ui_render.dim_style, line, ui_render.reset_style });
-        // The notebook owns `entry` once the append succeeds, so only a failed
-        // append frees it.
+        const turn_recap = tool_group_projection.computeTurnRecap(
+            alloc,
+            self.notebook.entries.items,
+            self.notebook.tool_details.items,
+        ) catch |err| {
+            alloc.free(entry);
+            return err;
+        };
+        // The notebook owns `entry` and `turn_recap` once the append succeeds,
+        // so only a failed append frees them here.
         const entry_id = transcript_store.appendRawBytesEntryClassifiedAt(
             self,
             alloc,
@@ -7736,12 +7861,24 @@ pub const TranscriptRuntime = struct {
             .turn_summary,
             if (summary.completed_at_ms > 0) summary.completed_at_ms else io_mod.milliTimestamp(),
         ) catch |err| {
+            switch (turn_recap) {
+                .text => |text| alloc.free(text),
+                .uncomputed, .empty => {},
+            }
             alloc.free(entry);
             return err;
         };
+        self.notebook.entries.items[self.notebook.entries.items.len - 1].raw_bytes.turn_recap = turn_recap;
+        self.shrinkSpareEntriesCapacity(alloc);
         self.markTranscriptContentDirtyFrom(entry_id);
         try self.syncTranscriptWindow(alloc);
         return entry_id;
+    }
+
+    fn shrinkSpareEntriesCapacity(self: *TranscriptRuntime, alloc: Allocator) void {
+        if (self.notebook.entries.capacity > self.notebook.entries.items.len) {
+            self.notebook.entries.shrinkAndFree(alloc, self.notebook.entries.items.len);
+        }
     }
 
     /// Hands retention to the transcript window: entries leave only when the
@@ -7792,9 +7929,8 @@ pub const TranscriptRuntime = struct {
 
     /// The session compacted its context, after the session log committed it.
     pub fn transcriptWindowCompacted(self: *TranscriptRuntime, alloc: Allocator) !void {
-        // A new newest compaction: the cycle Ctrl+O read as "one back" is
-        // now two back.
         self.invalidateTranscriptArchive("compacted");
+        self.shrinkSpareEntriesCapacity(alloc);
         const window = if (self.transcript_window) |*value| value else return;
         const held = window.pending_drops.items.len;
         try window.compacted(alloc, self.notebook.entries.items, &window.pending_drops);
@@ -7838,7 +7974,6 @@ pub const TranscriptRuntime = struct {
         }
         const kept = window.pending_drops.items.len - ready.items.len;
         if (kept > 0) debug_trace.logf("transcript_window", "drop held entries={d} on screen", .{kept});
-        try self.keepTurnsOfStayingSummaries(alloc, &ready);
         if (ready.items.len == 0) return 0;
 
         var going: transcript_store.EntryIdSet = .empty;
@@ -7941,45 +8076,6 @@ pub const TranscriptRuntime = struct {
             if (owner) |id| try set.put(alloc, id, {});
         }
         return .{ .entries = set };
-    }
-
-    /// Takes out of `ready` every entry of each turn whose summary stays, back
-    /// to the turn's prompt. A turn summary recaps its turn from the turn's
-    /// entries (`tool_group_projection.recapTurnSummary`), so a turn leaves only
-    /// together with its summary. The kept entries stay pending.
-    fn keepTurnsOfStayingSummaries(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-        ready: *std.ArrayList(u32),
-    ) !void {
-        if (ready.items.len == 0) return;
-        var leaving: std.AutoHashMapUnmanaged(u32, void) = .empty;
-        defer leaving.deinit(alloc);
-        for (ready.items) |id| try leaving.put(alloc, id, {});
-        var keep: std.AutoHashMapUnmanaged(u32, void) = .empty;
-        defer keep.deinit(alloc);
-        const entries = self.notebook.entries.items;
-        for (entries, 0..) |entry, index| {
-            const raw = switch (entry) {
-                .raw_bytes => |value| value,
-                else => continue,
-            };
-            if (raw.class != .turn_summary or leaving.contains(raw.id)) continue;
-            var start = tool_group_projection.turnSummaryTurnStart(entries, index);
-            if (start > 0 and std.meta.activeTag(entries[start - 1]) == .user_turn) start -= 1;
-            for (entries[start..index]) |held| {
-                if (leaving.contains(held.id())) try keep.put(alloc, held.id(), {});
-            }
-        }
-        if (keep.count() == 0) return;
-        var still: usize = 0;
-        for (ready.items) |id| {
-            if (keep.contains(id)) continue;
-            ready.items[still] = id;
-            still += 1;
-        }
-        ready.shrinkRetainingCapacity(still);
-        debug_trace.logf("transcript_window", "drop kept turn entries={d} for their summary", .{keep.count()});
     }
 
     /// Swap the bytes of the `raw_bytes` entry with `entry_id` to a dup of
@@ -8360,12 +8456,11 @@ pub const TranscriptRuntime = struct {
         self.resetFullTranscriptPageNavigation();
     }
 
-    /// Whether the newest Ctrl+O pages show the cycle before the held one
-    /// with it: the session log holds a compaction and the window no longer
-    /// holds that cycle in memory (when it does, the held entries already
-    /// span both).
+    /// Whether the newest Ctrl+O pages join an older cycle from the session
+    /// log (`transcript_archive_available` is set only when resume left older
+    /// cycles unloaded).
     pub fn ctrlOJoinsPreviousCycle(self: *const TranscriptRuntime) bool {
-        return self.transcript_archive_available and !self.transcriptWindowHoldsPreviousCycle();
+        return self.transcript_archive_available;
     }
 
     /// The newest older cycle Ctrl+O shows on pages of its own.
@@ -8634,6 +8729,13 @@ pub const TranscriptRuntime = struct {
         const after = held.runtime.notebook.entries.items;
         if (after.len != keep) return error.TranscriptArchiveTrimKeptEntries;
         if (first_kept) |id| if (after[0].id() != id) return error.TranscriptArchiveTrimKeptEntries;
+        if (after.len == 0) {
+            held.runtime.notebook.entries.shrinkAndFree(held.alloc, 0);
+            held.runtime.notebook.transcript.shrinkAndFree(held.alloc, 0);
+            held.runtime.notebook.tool_details.shrinkAndFree(held.alloc, 0);
+            held.runtime.notebook.command_output_blocks.shrinkAndFree(held.alloc, 0);
+            held.runtime.notebook.folded_command_blocks.shrinkAndFree(held.alloc, 0);
+        }
         held.trimmed += drop_count;
         debug_trace.logf("full_transcript_cache", "archive_trimmed back=1 dropped={d} kept={d} trimmed={d}", .{ drop_count, keep, held.trimmed });
     }
@@ -8648,12 +8750,11 @@ pub const TranscriptRuntime = struct {
         return !window.state.turn_open;
     }
 
-    /// Whether the transcript window still holds the cycle before the newest
-    /// compaction, which it does until the first turn end after it, once the
-    /// log holds that cycle.
+    /// The current session always keeps all held blocks, so no previous cycle
+    /// waits to be dropped at turn end.
     pub fn transcriptWindowHoldsPreviousCycle(self: *const TranscriptRuntime) bool {
-        const window = if (self.transcript_window) |*value| value else return false;
-        return window.state.prev_first != null;
+        _ = self;
+        return false;
     }
 
     fn resetFullTranscriptPageNavigation(self: *TranscriptRuntime) void {
@@ -13217,7 +13318,7 @@ pub const TranscriptRuntime = struct {
             return source;
         }
         const store = self.joinedPageStore() orelse return error.TranscriptArchiveNotLoaded;
-        const range = full_transcript_page.sourceRange(request, store.len());
+        const range = store.sourceRange(request);
         // A page that reaches into the part a trimmed cycle let go needs the
         // whole cycle, which loads at the same indexes.
         if (range.start < store.trimmed) return error.TranscriptArchiveNotLoaded;
@@ -13318,6 +13419,7 @@ pub const TranscriptRuntime = struct {
             @min(self.notebook.command_output_blocks.items.len, range.len()),
         );
         for (self.notebook.entries.items[range.start..range.end]) |entry| {
+            if (JoinedPageStore.isEmptyTrimmedCommandOutput(entry)) continue;
             if (pending_drops.len > 0 and std.mem.findScalar(u32, pending_drops, entry.id()) != null) continue;
             source.entries.appendAssumeCapacity(
                 try transcript_store.cloneEntryForSnapshot(alloc, entry),
@@ -13419,6 +13521,7 @@ pub const TranscriptRuntime = struct {
         const entries = self.notebook.entries.items[range.start..range.end];
         var total: usize = entries.len *| @sizeOf(TranscriptEntry);
         for (entries) |entry| {
+            if (JoinedPageStore.isEmptyTrimmedCommandOutput(entry)) continue;
             total +|= transcript_store.entrySnapshotRetainedBytes(entry);
             if (full_diff_resolver) |resolver| {
                 const raw = switch (entry) {

@@ -270,7 +270,9 @@ fn statusNamesAsk(entry: TranscriptEntry, detail: ?*const ToolDetailRecord) bool
 fn stoppedQuestionRow(alloc: std.mem.Allocator, detail: ?*const ToolDetailRecord, entry_id: u32, cols: u16, style: SummaryStyle) !?GroupBlock {
     const record = detail orelse return null;
     if (record.outcome != .failed) return null;
-    if (!std.mem.eql(u8, record.result orelse return null, session_adapter.unfinished_tool_output)) return null;
+    if (!record.stopped_question) {
+        if (!std.mem.eql(u8, record.result orelse return null, session_adapter.unfinished_tool_output)) return null;
+    }
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
@@ -1700,6 +1702,7 @@ fn toolboxOpensSkill(scratch: std.mem.Allocator, record: *const ToolDetailRecord
     if (storyArgString(scratch, record, "kind")) |kind| return std.mem.eql(u8, kind, "skill");
     const target = storyArgString(scratch, record, "open") orelse return false;
     if (std.mem.startsWith(u8, target, "skill:") or std.Io.Dir.path.isAbsolute(target)) return true;
+    if (record.toolbox_opened_skill) return true;
     const result = record.result orelse return false;
     return std.mem.startsWith(u8, result, skill_invocation.content_name_prefix);
 }
@@ -4482,6 +4485,7 @@ noinline fn storyRowCallFailed(scratch: std.mem.Allocator, detail: ?*const ToolD
 /// model's own mistake, not a command that failed, and it reads as one.
 fn shellCallNeverRan(scratch: std.mem.Allocator, record: *const ToolDetailRecord) bool {
     if (record.outcome != .failed or !isShellCommandCall(scratch, record)) return false;
+    if (record.invalid_field_count > 0) return true;
     const result = record.result orelse return false;
     const correction = tool_result_errors.inspectTerminalActionFieldCorrection(scratch, result) catch return false;
     return correction != null;
@@ -4498,9 +4502,13 @@ fn addCallNotices(scratch: std.mem.Allocator, row: *StoryRow, detail: ?*const To
 /// Why a shell call never ran, as core's status says it, such as
 /// "2 invalid fields". Null when its result names no wrong field.
 fn neverRanReason(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
-    const result = record.result orelse return null;
-    const correction = tool_result_errors.inspectTerminalActionFieldCorrection(scratch, result) catch return null;
-    const count = (correction orelse return null).invalid_field_count;
+    const count: usize = if (record.invalid_field_count > 0)
+        record.invalid_field_count
+    else blk: {
+        const result = record.result orelse return null;
+        const correction = tool_result_errors.inspectTerminalActionFieldCorrection(scratch, result) catch return null;
+        break :blk (correction orelse return null).invalid_field_count;
+    };
     if (count == 0) return null;
     return try countNote(scratch, "", count, if (count == 1) " invalid field" else " invalid fields");
 }
@@ -4560,6 +4568,7 @@ const mcp_result_server_field = "{\"server\":";
 /// result that names none, such as a failure fx reported itself.
 fn mcpResultServer(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
     if (record.activity_kind != .mcp) return null;
+    if (record.mcp_server) |server| if (server.len > 0) return server;
     const result = record.result orelse return null;
     if (!std.mem.startsWith(u8, result, mcp_result_server_field)) return null;
     // A result cut short still names the server whole, since it comes first.
@@ -4571,6 +4580,49 @@ fn mcpResultServer(scratch: std.mem.Allocator, record: *const ToolDetailRecord) 
         .string => |server| if (server.len > 0) server else null,
         else => null,
     };
+}
+
+pub fn extractProjectionFlagsFromResult(alloc: std.mem.Allocator, detail: *ToolDetailRecord) void {
+    const res = detail.result orelse return;
+    if (std.mem.eql(u8, res, session_adapter.unfinished_tool_output)) {
+        detail.stopped_question = true;
+    }
+    if (std.mem.startsWith(u8, res, skill_invocation.content_name_prefix)) {
+        detail.toolbox_opened_skill = true;
+    }
+    if (detail.outcome == .completed and
+        std.mem.eql(u8, detail.tool_name, "subagent") and
+        !detail.subagent_report and
+        std.mem.find(u8, res, new_subagent_result_marker) != null)
+    {
+        detail.subagent_started = true;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const scratch = arena_state.allocator();
+    if (detail.outcome == .failed and isShellCommandCall(scratch, detail)) {
+        if (tool_result_errors.inspectTerminalActionFieldCorrection(scratch, res) catch null) |correction| {
+            detail.invalid_field_count = @intCast(@min(correction.invalid_field_count, std.math.maxInt(u16)));
+        }
+    }
+    if (detail.activity_kind == .mcp and detail.mcp_server == null) {
+        if (mcpResultServer(scratch, detail) catch null) |server| {
+            detail.mcp_server = alloc.dupe(u8, server) catch null;
+        }
+    }
+    if (detail.activity_kind == .command and detail.command_session_id == null) {
+        if (jsonField(scratch, res, "session_id")) |field| switch (field) {
+            .string => |id| if (id.len > 0) {
+                detail.command_session_id = alloc.dupe(u8, id) catch null;
+            },
+            else => {},
+        };
+    }
+    if (detail.failure_reason == null and storyCallFailed(detail)) {
+        if (storyFailureReason(scratch, detail) catch null) |reason| {
+            detail.failure_reason = alloc.dupe(u8, reason) catch null;
+        }
+    }
 }
 
 /// Whether `text` starts with `segment`, then "_" and more.
@@ -4959,6 +5011,7 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
             if (record.outcome) |outcome| if (outcome == .denied or outcome == .cancelled) return .{};
             if (shellCallNeverRan(scratch, record)) return .{};
             if (storyArgString(scratch, record, "session_id")) |id| return .{ .kind = .session, .key = id };
+            if (record.command_session_id) |id| if (id.len > 0) return .{ .kind = .session, .key = id };
             if (record.result) |result| if (jsonField(scratch, result, "session_id")) |field| switch (field) {
                 .string => |id| if (id.len > 0) return .{ .kind = .session, .key = id },
                 else => {},
@@ -5977,6 +6030,7 @@ const story_reason_max_bytes = 160;
 fn storyFailureReason(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !?[]const u8 {
     const record = detail orelse return null;
     if (!storyCallFailed(detail)) return null;
+    if (record.failure_reason) |reason| return try scratch.dupe(u8, reason);
 
     const is_command = record.activity_kind == .command;
     const line: ?[]const u8 = if (record.result) |result| blk: {
@@ -6128,7 +6182,7 @@ fn formatTurnRecap(scratch: std.mem.Allocator, tally: StoryTally) ![]const u8 {
 /// Index of the first entry of the turn that the turn summary at
 /// `summary_index` ends: the entry after its prompt, or after the turn
 /// summary or cancellation before it when the prompt is gone.
-pub fn turnSummaryTurnStart(entries: []const TranscriptEntry, summary_index: usize) usize {
+fn turnSummaryTurnStart(entries: []const TranscriptEntry, summary_index: usize) usize {
     var turn_start = summary_index;
     while (turn_start > 0) {
         const boundary = switch (entries[turn_start - 1]) {
@@ -6140,6 +6194,45 @@ pub fn turnSummaryTurnStart(entries: []const TranscriptEntry, summary_index: usi
         turn_start -= 1;
     }
     return turn_start;
+}
+
+fn computeTurnRecapText(
+    scratch: std.mem.Allocator,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    summary_index: usize,
+) ![]const u8 {
+    const turn_start = turnSummaryTurnStart(entries, summary_index);
+    var tally: StoryTally = .{};
+    for (entries[turn_start..summary_index]) |entry| {
+        const entry_id = toolStatusEntryId(entry) orelse continue;
+        const detail = detailForEntry(details, detail_indices, entry_id, null);
+        if (statusNamesAsk(entry, detail)) continue;
+        try tally.observe(scratch, entry, detail);
+    }
+    return formatTurnRecap(scratch, tally);
+}
+
+/// Computes the recap for a turn summary about to be appended after `entries`.
+/// Caller owns any `.text` slice returned.
+pub fn computeTurnRecap(
+    alloc: std.mem.Allocator,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+) !transcript_blocks.TurnRecap {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const scratch = scratch_state.allocator();
+
+    var detail_indices: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+    for (details, 0..) |detail, detail_index| {
+        const result = try detail_indices.getOrPut(scratch, detail.entry_id);
+        if (!result.found_existing) result.value_ptr.* = detail_index;
+    }
+    const recap = try computeTurnRecapText(scratch, entries, details, &detail_indices, entries.len);
+    if (recap.len == 0) return .empty;
+    return .{ .text = try alloc.dupe(u8, recap) };
 }
 
 /// Inserts the turn recap before the first visible character of a turn
@@ -6154,32 +6247,28 @@ fn recapTurnSummary(
     summary_index: usize,
     cols: u16,
 ) !?[]u8 {
-    const summary_bytes = switch (entries[summary_index]) {
-        .raw_bytes => |raw| raw.bytes,
+    const raw = switch (entries[summary_index]) {
+        .raw_bytes => |value| value,
         else => return null,
     };
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
-    const turn_start = turnSummaryTurnStart(entries, summary_index);
-    var tally: StoryTally = .{};
-    for (entries[turn_start..summary_index]) |entry| {
-        const entry_id = toolStatusEntryId(entry) orelse continue;
-        const detail = detailForEntry(details, detail_indices, entry_id, null);
-        if (statusNamesAsk(entry, detail)) continue;
-        try tally.observe(scratch, entry, detail);
-    }
-    const recap = try formatTurnRecap(scratch, tally);
+    const recap = switch (raw.turn_recap) {
+        .empty => return null,
+        .text => |text| text,
+        .uncomputed => try computeTurnRecapText(scratch, entries, details, detail_indices, summary_index),
+    };
     if (recap.len == 0) return null;
 
     var insert_at: usize = 0;
-    while (insert_at < summary_bytes.len) {
-        if (skipSgrSequence(summary_bytes, &insert_at)) continue;
-        if (summary_bytes[insert_at] != ' ') break;
+    while (insert_at < raw.bytes.len) {
+        if (skipSgrSequence(raw.bytes, &insert_at)) continue;
+        if (raw.bytes[insert_at] != ' ') break;
         insert_at += 1;
     }
-    const recapped = try std.mem.concat(scratch, u8, &.{ summary_bytes[0..insert_at], recap, summary_bytes[insert_at..] });
+    const recapped = try std.mem.concat(scratch, u8, &.{ raw.bytes[0..insert_at], recap, raw.bytes[insert_at..] });
     if (display_width.visibleWidthIgnoringAnsi(std.mem.trimEnd(u8, recapped, "\n")) > cols) return null;
     return try alloc.dupe(u8, recapped);
 }

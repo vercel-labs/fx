@@ -73,7 +73,7 @@ fn drawEvent(draws: anytype, state: *const tw.State) Draw {
         state.ctrlo.pending
     else
         @intCast(draws.below(state.next_token + 2, 15));
-    return .{ .event = switch (draws.below(18, 10)) {
+    return .{ .event = switch (draws.below(19, 10)) {
         0 => .turn_started,
         1 => .turn_ended,
         2 => .{ .block_opened = id },
@@ -88,7 +88,8 @@ fn drawEvent(draws: anytype, state: *const tw.State) Draw {
         13 => .ctrlo_closed,
         14 => .{ .log_read_done = .{ .token = token, .count = @intCast(draws.below(state.config.read_step + 3, 18)) } },
         15 => .{ .log_read_failed = token },
-        16 => return .crash,
+        16 => .session_cleared,
+        17 => return .crash,
         else => return .resume_in_place,
     } };
 }
@@ -119,16 +120,26 @@ fn checkStep(before: tw.State, event: tw.Event, out: tw.Output, world: *World) !
             try std.testing.expect(after.ctrlo.lo >= before.heldFirst());
         },
         .log_read_failed => |token| try std.testing.expectEqual(before.ctrlo.pending, token),
-        .resized, .resumed => world.painted = .empty,
+        .resized, .resumed, .session_cleared => world.painted = .empty,
         else => {},
+    }
+    if (event != .session_cleared and event != .resumed) {
+        // L1: held_first never advances within an active session.
+        try std.testing.expectEqual(before.held_first, after.held_first);
+    }
+    if (event == .compacted) {
+        // L22: a compaction keeps all history and emits no drop.
+        try std.testing.expectEqual(before.held_first, after.held_first);
+        try std.testing.expect(out.effect == null);
     }
     if (out.effect) |effect| switch (effect) {
         .drop => |range| {
+            // L2, L3, L14, L18: drops occur only on session_cleared and free [old_held_first, old_next_seq).
+            try std.testing.expectEqual(tw.Event.session_cleared, event);
+            try std.testing.expect(range.from == before.held_first and range.to == before.next_seq);
             try std.testing.expect(range.from < range.to);
-            try std.testing.expect(range.to <= after.cycle_first); // L2
-            if (config.saved) try std.testing.expect(range.to <= world.log_saved); // L3
-            try std.testing.expect(!after.turn_open); // L18
-            try std.testing.expect(event != .compacted); // L22
+            try std.testing.expect(after.live.len == 0 and !after.turn_open);
+            try std.testing.expect(after.next_seq == 0 and after.held_first == 0);
         },
         .paint_final => |seq| {
             try std.testing.expectEqual(after.next_seq - 1, seq); // L5
@@ -148,10 +159,9 @@ fn checkStep(before: tw.State, event: tw.Event, out: tw.Output, world: *World) !
         },
         else => {},
     };
-    // L1
-    if (!after.turn_open and !after.prev_waits_turn_end and (!config.saved or after.saved_through >= after.cycle_first)) try std.testing.expect(after.prev_first == null);
-    // L22
-    if (after.prev_waits_turn_end) try std.testing.expect(after.prev_first != null);
+    if (event == .session_cleared and before.held_first < before.next_seq) {
+        try std.testing.expectEqual(tw.Effect{ .drop = .{ .from = before.held_first, .to = before.next_seq } }, out.effect.?);
+    }
     if (after.reprinting) {
         // L6
         try std.testing.expect(after.heldFirst() <= after.painted_through and after.painted_through <= after.next_seq);
@@ -186,21 +196,33 @@ fn driveCore(draws: anytype) !void {
             .crash, .resume_in_place => restart: {
                 // An unsaved session has no log to resume from, as in the model.
                 if (!config.saved) continue;
-                // A crash starts a new process; a /resume keeps this one.
-                if (drawn == .crash) before = tw.State.init(config);
                 const saved = world.log_saved;
-                break :restart .{ .resumed = .{ .cycle = state.cycle, .cycle_first = world.lastStart(saved), .next_seq = saved } };
+                const cycle_first = world.lastStart(saved);
+                if (drawn == .crash) {
+                    before = tw.State.init(config);
+                } else {
+                    const cleared = tw.step(before, .session_cleared);
+                    try checkStep(before, .session_cleared, cleared, &world);
+                    before = cleared.state;
+                }
+                break :restart .{ .resumed = .{ .cycle = state.cycle, .cycle_first = cycle_first, .next_seq = saved } };
             },
         };
         if (event == .saved_through and config.saved) world.log_saved = @max(world.log_saved, @min(event.saved_through, before.next_seq));
         const out = tw.step(before, event);
         try checkStep(before, event, out, &world);
+        if (event == .session_cleared) {
+            world.log_saved = 0;
+            world.starts = 0;
+            world.addStart(0);
+        }
         if (event == .resumed) {
             // L13: everything held is in the log, and nothing earlier survives.
             const after = out.state;
             try std.testing.expectEqual(world.log_saved, after.next_seq);
             try std.testing.expectEqual(world.log_saved, after.saved_through);
-            try std.testing.expect(after.prev_first == null and !after.prev_waits_turn_end and after.live.len == 0 and !after.turn_open);
+            try std.testing.expectEqual(after.cycle_first, after.held_first);
+            try std.testing.expect(after.live.len == 0 and !after.turn_open);
             try std.testing.expect(!after.ctrlo.open and after.ctrlo.pending == 0);
         }
         if (event == .compacted) world.addStart(before.next_seq);

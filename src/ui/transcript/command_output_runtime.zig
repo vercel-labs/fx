@@ -103,6 +103,7 @@ pub const CommandOutputBlock = struct {
     overflow_open_records: [2]bool = .{ false, false },
     overflow_record_visible: [2]bool = .{ false, false },
     retention_overflow: bool = false,
+    tail_trimmed: bool = false,
     /// First retained record whose text became incomplete at the structured
     /// cap. Records before this index are stable for active Ctrl-O projection.
     overflow_line_index: ?usize = null,
@@ -120,7 +121,8 @@ pub const CommandOutputBlock = struct {
     }
 
     pub fn canReconstructEntries(self: CommandOutputBlock) bool {
-        return self.pruned_ranges.items.len == 0 and
+        return !self.tail_trimmed and
+            self.pruned_ranges.items.len == 0 and
             self.lines.items.len >= self.live_entry_ids.items.len and
             self.lines.items.len >= self.source_entry_ids.items.len;
     }
@@ -2271,6 +2273,70 @@ test "compact process row names timeout and output capture causes" {
         defer alloc.free(row);
         try std.testing.expectEqualStrings(case.expected, row);
     }
+}
+
+pub fn trimFinishedCommandOutputBlock(shell: anytype, alloc: Allocator, index: usize) !bool {
+    if (index >= shell.notebook.command_output_blocks.items.len) return false;
+    var block = &shell.notebook.command_output_blocks.items[index];
+    var visible_seen: usize = 0;
+    var keep_end: usize = block.lines.items.len;
+    for (block.lines.items, 0..) |line, line_index| {
+        if (line.visible) {
+            visible_seen += 1;
+            if (visible_seen >= compact_output_row_limit) {
+                keep_end = line_index + 1;
+                break;
+            }
+        }
+    }
+    if (keep_end == 0 or keep_end >= block.lines.items.len) return false;
+
+    var entry_indices: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+    defer entry_indices.deinit(alloc);
+    for (shell.notebook.entries.items, 0..) |entry, entry_idx| {
+        if (entry != .raw_bytes) continue;
+        const res = try entry_indices.getOrPut(alloc, entry.raw_bytes.id);
+        if (!res.found_existing) res.value_ptr.* = entry_idx;
+    }
+
+    for (block.lines.items[keep_end..], keep_end..) |line, line_index| {
+        const entry_id = commandOutputLineEntryId(block.*, line_index);
+        std.debug.assert(block.retained_text_bytes >= line.text.len);
+        block.retained_text_bytes -= line.text.len;
+        alloc.free(line.text);
+        if (entry_id) |id| {
+            if (entry_indices.get(id)) |entry_idx| {
+                var raw = &shell.notebook.entries.items[entry_idx].raw_bytes;
+                if (raw.bytes.len > 0) {
+                    alloc.free(raw.bytes);
+                    raw.bytes = &.{};
+                }
+            }
+            removeEntryId(&block.live_entry_ids, id);
+            removeEntryId(&block.source_entry_ids, id);
+        }
+    }
+    for (&block.open_line_indices) |*open_index| {
+        if (open_index.*) |open| {
+            if (open >= keep_end) open_index.* = null;
+        }
+    }
+    if (block.overflow_line_index) |overflow_index| {
+        if (overflow_index >= keep_end) block.overflow_line_index = null;
+    }
+    block.tail_trimmed = true;
+    block.lines.shrinkAndFree(alloc, keep_end);
+    block.live_entry_ids.shrinkAndFree(alloc, block.live_entry_ids.items.len);
+    block.source_entry_ids.shrinkAndFree(alloc, block.source_entry_ids.items.len);
+    _ = try syncCommandOutputBlockEntries(shell, alloc);
+    if (comptime @hasDecl(@TypeOf(shell.*), "rebuildTranscriptCacheAfterStructuredRewrite")) {
+        try shell.rebuildTranscriptCacheAfterStructuredRewrite(alloc, "trim finished command output");
+    } else {
+        try shell.rebuildTranscriptCacheFromEntries(alloc, "trim finished command output");
+    }
+    shell.recomputeCursorFromTranscript();
+    requestTranscriptPaint(shell, commandBlockDirtyEntryId(block.*));
+    return true;
 }
 
 pub fn syncCommandOutputBlockEntries(shell: anytype, alloc: Allocator) !bool {

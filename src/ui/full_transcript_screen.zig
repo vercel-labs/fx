@@ -5855,6 +5855,7 @@ const ProjectionSourceIndex = struct {
     fn renderableCommandBlockIndexForEntry(self: *const ProjectionSourceIndex, entry_id: u32) ?usize {
         const block_index = self.commandBlockIndexForEntry(entry_id) orelse return null;
         const block = self.command_blocks[block_index];
+        if (block.tail_trimmed) return null;
         return if (block.canReconstructEntries() or block.retention_overflow) block_index else null;
     }
 
@@ -6890,6 +6891,7 @@ fn appendDetailContent(
         null;
     const deferred_command_source = if (owned_command_block_index) |block_index| blk: {
         const block = command_blocks[block_index];
+        if (block.tail_trimmed) break :blk false;
         break :blk (block.canReconstructEntries() or block.retention_overflow) and
             if (commandDeferredAnchorEntryId(block)) |entry_id|
                 transcriptHasEntry(entries, entry_id)
@@ -6954,7 +6956,7 @@ fn appendDetailContent(
             var fallback: std.Io.Writer.Allocating = .init(alloc);
             errdefer fallback.deinit();
             const block = command_blocks[block_index];
-            _ = if (block.canReconstructEntries())
+            _ = if (block.canReconstructEntries() or block.tail_trimmed)
                 try appendCommandBlock(&fallback.writer, alloc, block, styles, builder.projection_cols)
             else
                 try appendRetainedCommandEntries(&fallback.writer, entries, block);
@@ -7068,7 +7070,7 @@ fn degradedInlineCommandFallback(
 
     if (owned_command_block_index) |block_index| {
         const block = command_blocks[block_index];
-        _ = if (block.canReconstructEntries())
+        _ = if (block.canReconstructEntries() or block.tail_trimmed)
             try appendCommandBlock(&fallback.writer, alloc, block, styles, cols)
         else
             try appendRetainedCommandEntries(&fallback.writer, entries, block);
