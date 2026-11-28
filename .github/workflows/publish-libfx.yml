@@ -349,7 +349,8 @@ jobs:
   publish:
     needs: [metadata, package]
     runs-on: ubuntu-24.04
-    environment: npm
+    # Stable publishes wait for approval in npm; dev publishes run in npm-dev, which has no reviewer.
+    environment: ${{ needs.metadata.outputs.channel == 'stable' && 'npm' || 'npm-dev' }}
     permissions:
       contents: read
       id-token: write
@@ -400,8 +401,13 @@ jobs:
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
           NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
+          CHANNEL: ${{ needs.metadata.outputs.channel }}
         run: |
           set -euo pipefail
+          if [ "$CHANNEL" != stable ] && [ "$NPM_TAG" != dev ]; then
+            echo "::error::a run on the ${CHANNEL:-unknown} channel may publish only the dev tag, not '$NPM_TAG'"
+            exit 1
+          fi
           if npm view "libfx@${LIBFX_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
             echo "libfx@${LIBFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
             exit 0
