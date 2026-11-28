@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { contentText } from "./conditional-guidance-oracle";
 import { SMALL_RESULT, SMALL_TOOL } from "./mcp-rules-paths";
-import { fakeGatewayFinalText, fakeGatewayToolCall, startFakeGateway, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
+import { fakeGatewayFinalText, fakeGatewayToolCall, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const MODEL = "openai/gpt-5";
 const FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
@@ -139,7 +139,7 @@ test.skipIf(!tmuxAvailable())("in the TUI a deny rule cannot be saved for an MCP
   const got: Record<string, string> = {};
   await launch("full-access", {}, [fakeGatewayFinalText("SESSION_SAVED"), ...turn(1, "SAVED_RULE_DONE", got)]);
   await tui!.sendText("Save this session first.");
-  await tui!.waitForPane((pane) => pane.includes("SESSION_SAVED") && turnSettled(pane), 45_000);
+  await tui!.waitForReplyAndTurnEnd("SESSION_SAVED", 45_000);
   await tui!.waitForStableComposer(STEP);
   await tui!.sendText(`/permissions remember deny ${SMALL_TOOL} ${JSON.stringify({ text: "hello" })}`);
   await tui!.waitForText("could not prepare that exact permission action without executing it", STEP);

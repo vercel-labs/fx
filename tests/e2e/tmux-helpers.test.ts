@@ -48,6 +48,7 @@ const tmuxTest = test.skipIf(!tmuxAvailable());
 const ISOLATED_KEYS = [
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
+  "VERCEL_TOKEN",
   "FX_TEST_GATEWAY_CHAT_URL",
   "FX_TEST_GATEWAY_MODELS_URL",
   "FX_TEST_GATEWAY_CREDITS_URL",
@@ -69,6 +70,8 @@ const ISOLATED_KEYS = [
   "FX_TEST_SESSION_WRITE_RELEASE",
   "FX_TEST_SHELL_YIELD_HELD",
   "FX_TEST_SHELL_YIELD_RELEASE",
+  "FX_TEST_SHUTDOWN_RELEASE_HELD",
+  "FX_TEST_SHUTDOWN_RELEASE_RELEASE",
   "FX_TEST_SUBAGENT_CLOSE_HELD",
   "FX_TEST_SUBAGENT_CLOSE_RELEASE",
   "FX_TEST_SUBAGENT_END_HELD",
@@ -659,6 +662,55 @@ tmuxTest("pane environment does not poison a shared tmux server", async () => {
   }
 });
 
+tmuxTest("waitForReplyAndTurnEnd waits for the turn's end, not only the reply's text", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fx-tmux-reply-turn-end-"));
+  const releasePath = join(root, "release");
+  const scriptPath = join(root, "pane.sh");
+  writeFileSync(scriptPath, [
+    "printf 'REPLY_TEXT_DONE\\nGenerating (1s)\\n'",
+    `while [ ! -e '${releasePath}' ]; do sleep 0.05; done`,
+    "clear",
+    "printf 'REPLY_TEXT_DONE\\n'",
+    "sleep 60",
+    "",
+  ].join("\n"));
+  let session: TmuxSession | undefined;
+  try {
+    session = await TmuxSession.create({ cmd: `/bin/sh ${scriptPath}`, startupWaitMs: 0 });
+    await session.waitForPane(
+      (pane) => pane.includes("REPLY_TEXT_DONE") && pane.includes("Generating ("),
+      10_000,
+    );
+    // The pane now shows the text and a live turn until the release file exists. A second
+    // capture means the helper's first check of that pane did not return, while a helper that
+    // checked only the text would return at the first one.
+    const capture = session.capturePane.bind(session);
+    let captures = 0;
+    let secondCapture!: () => void;
+    const sawSecondCapture = new Promise<void>((resolve) => { secondCapture = resolve; });
+    session.capturePane = async (...args: Parameters<TmuxSession["capturePane"]>) => {
+      const pane = await capture(...args);
+      captures += 1;
+      if (captures === 2) secondCapture();
+      return pane;
+    };
+    let settledPane: string | undefined;
+    const settled = session.waitForReplyAndTurnEnd("REPLY_TEXT_DONE", 10_000).then((pane) => {
+      settledPane = pane;
+    });
+    await Promise.race([sawSecondCapture, settled]);
+    expect(settledPane).toBeUndefined();
+
+    writeFileSync(releasePath, "");
+    await settled;
+    expect(settledPane).toContain("REPLY_TEXT_DONE");
+    expect(settledPane).not.toContain("Generating (");
+  } finally {
+    await session?.kill();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 tmuxTest("minimum history lines survive a fresh tmux server restart", async () => {
   const socketName = `fx-history-limit-${process.pid}-${Date.now()}`;
   let first: TmuxSession | undefined;
@@ -803,6 +855,7 @@ test("fxChildEnv drops every name on the unset list and keeps the caller's own",
     PATH: "/usr/bin",
     AI_GATEWAY_API_KEY: "stale-ai_gateway_api_key",
     VERCEL_OIDC_TOKEN: "stale-vercel_oidc_token",
+    VERCEL_TOKEN: "stale-vercel_token",
   });
   expect(inherited.FX_TEST_SHELL_YIELD_HELD).toBe("stale-fx_test_shell_yield_held");
 });
