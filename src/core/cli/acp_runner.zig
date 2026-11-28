@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const config_runtime = @import("../config/config_runtime.zig");
 const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -68,13 +70,42 @@ pub const Config = struct {
     tool_placement_overrides: []const config_runtime.tool_placement.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
-    allow_acp_mcp: bool = true,
-    allow_native_tools: bool = true,
-    minimal_kernel: bool = false,
+    /// The ACP kernel's switches. Unit tests run both kernels in one
+    /// binary, so they set these per config; every other build takes them
+    /// from `build_options.libfx_kernel`, so a kernel's unused branches are
+    /// not compiled in. Read them through `minimalKernel`, `allowsAcpMcp`
+    /// and `allowsNativeTools`.
+    allow_acp_mcp: KernelSwitch = kernelSwitch(true),
+    allow_native_tools: KernelSwitch = kernelSwitch(true),
+    minimal_kernel: KernelSwitch = kernelSwitch(false),
     /// Raw prompt image and checkpoint bytes from a libfx host. Null for
     /// hosts that only speak standard ACP, such as `fx acp`.
     host_attachments: ?host_attachments.Store = null,
+
+    /// libfx's kernel: fx-core.wasm and the Node addon. `fx acp` runs the full one.
+    pub inline fn minimalKernel(self: *const Config) bool {
+        if (comptime builtin.is_test) return self.minimal_kernel;
+        return build_options.libfx_kernel;
+    }
+
+    pub inline fn allowsAcpMcp(self: *const Config) bool {
+        if (comptime builtin.is_test) return self.allow_acp_mcp;
+        return !build_options.libfx_kernel;
+    }
+
+    pub inline fn allowsNativeTools(self: *const Config) bool {
+        if (comptime builtin.is_test) return self.allow_native_tools;
+        return !build_options.libfx_kernel;
+    }
 };
+
+/// A kernel switch holds a value only in unit tests, so no other build can
+/// set one that disagrees with `build_options.libfx_kernel`.
+const KernelSwitch = if (builtin.is_test) bool else void;
+
+fn kernelSwitch(comptime value: bool) KernelSwitch {
+    return if (builtin.is_test) value else {};
+}
 
 pub const RunFn = *const fn (?*anyopaque, Allocator, Config) anyerror!void;
 

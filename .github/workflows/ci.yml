@@ -315,6 +315,19 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # The SDK package guards job reports code size per area from this
+      # build, which keeps the function names the shipped module leaves out.
+      - name: Build fx-core.wasm with function names
+        run: zig build fx-core-wasm -Dwasm-surface=core -Doptimize=ReleaseSmall -Dlibfx-symbols=true --prefix zig-out/size-report
+
+      - name: Share it with SDK package guards
+        uses: actions/upload-artifact@v4
+        with:
+          name: size-report-wasm
+          path: zig-out/size-report/bin/fx-core.wasm
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Save Zig cache
         uses: ./.github/actions/save-zig-cache
         with:
@@ -364,6 +377,21 @@ jobs:
         with:
           name: sdk-napi-${{ matrix.platform }}
           path: native-addons/libfx.${{ matrix.platform }}.node
+          if-no-files-found: error
+          retention-days: 1
+
+      # The SDK package guards job reports code size per area from this
+      # build, which keeps the function names the shipped module leaves out.
+      - name: Build the addon with function names
+        if: matrix.platform == 'linux-x64'
+        run: zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe ${{ matrix.target_flags }} -Dlibfx-symbols=true --prefix zig-out/size-report
+
+      - name: Share it with SDK package guards
+        if: matrix.platform == 'linux-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: size-report-napi
+          path: zig-out/size-report/lib/libfx.node
           if-no-files-found: error
           retention-days: 1
 
@@ -702,6 +730,19 @@ jobs:
 
       - name: Check package sizes
         run: node sdk/tests/test-package-size.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native
+
+      # Information only: which areas the libfx builds ship, as code bytes
+      # per Zig namespace, in the job summary.
+      - name: Download the builds with function names
+        uses: actions/download-artifact@v4
+        with:
+          pattern: size-report-*
+          path: size-report
+          merge-multiple: true
+
+      - name: Report code size per area
+        continue-on-error: true
+        run: node sdk/scripts/report-namespace-sizes.mjs size-report/fx-core.wasm size-report/libfx.node
 
       # The subpaths other than libfx and libfx/node have always been ES
       # modules only, which require() loads on the Node.js versions libfx

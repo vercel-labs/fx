@@ -1739,7 +1739,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         return state.writer.writeResponse(alloc, msg.id, "null");
     }
 
-    if (method.isLibfx() and !state.cfg.minimal_kernel) {
+    if (method.isLibfx() and !state.cfg.minimalKernel()) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.method_not_found,
             .message = "Method not found",
@@ -1857,7 +1857,7 @@ fn handleRequestCancellation(
         }
     }
     const session = if (state.active_session) |*active| active else return;
-    if (state.cfg.minimal_kernel) return;
+    if (state.cfg.minimalKernel()) return;
     const withdrawn = withdrawn: {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -2082,7 +2082,7 @@ fn sessionInputsDurable(session: *const ActiveSessionState) bool {
 /// here never waits on work that needs this reader.
 fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
     // libfx kernel hosts steer through `libfx/steer`.
-    if (state.cfg.minimal_kernel) return writePromptInProgress(state, alloc, msg.id);
+    if (state.cfg.minimalKernel()) return writePromptInProgress(state, alloc, msg.id);
     const params = msg.params_raw orelse return writePromptInProgress(state, alloc, msg.id);
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
         return writePromptInProgress(state, alloc, msg.id);
@@ -3281,7 +3281,7 @@ fn applyTokenPassStartModel(state: *ServerState) void {
 }
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
-    if (state.cfg.minimal_kernel) {
+    if (state.cfg.minimalKernel()) {
         var startup = try app_lifecycle.loadLibfxStartupState(
             alloc,
             state.cfg.workspace_root_override orelse "/",
@@ -3337,7 +3337,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     var request = parseInitializeRequest(
         alloc,
         msg.params_raw,
-        state.cfg.minimal_kernel,
+        state.cfg.minimalKernel(),
     ) catch {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -3363,7 +3363,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             if (auth_runtime.preparationError(auth_runtime.classifyCredentialFailure(failure.source, failure.err))) |err| return err;
         }
     }
-    if (!state.cfg.minimal_kernel) {
+    if (!state.cfg.minimalKernel()) {
         try app_lifecycle.applyWorkspaceLaunch(
             &startup,
             alloc,
@@ -3482,7 +3482,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     configureUltrafastStartup(state, &startup);
     if (comptime !host_target.is_wasm) {
-        if (!state.cfg.minimal_kernel) startTokenPassCheck(state, alloc, startup.model_source);
+        if (!state.cfg.minimalKernel()) startTokenPassCheck(state, alloc, startup.model_source);
     }
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
@@ -3495,7 +3495,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     }
 
     if (comptime !host_target.is_wasm) {
-        if (!state.cfg.minimal_kernel) {
+        if (!state.cfg.minimalKernel()) {
             var loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
             errdefer loaded_skills.deinit(alloc);
             skill_runtime.traceDiagnostics("acp_startup", loaded_skills.diagnostics);
@@ -3504,7 +3504,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         }
     }
 
-    if (!state.cfg.minimal_kernel) {
+    if (!state.cfg.minimalKernel()) {
         const startup_catalog = catalogProviderFor(state, state.provider) orelse
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
@@ -3552,9 +3552,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     defer out.deinit();
     try acp_types.writeInitializeResponse(&out.writer, .{
         .image_prompts = !host_target.is_wasm,
-        .mcp_servers = state.cfg.allow_acp_mcp,
-        .steering = !host_target.is_wasm and !state.cfg.minimal_kernel,
-        .system_prompt = !host_target.is_wasm and !state.cfg.minimal_kernel,
+        .mcp_servers = state.cfg.allowsAcpMcp(),
+        .steering = !host_target.is_wasm and !state.cfg.minimalKernel(),
+        .system_prompt = !host_target.is_wasm and !state.cfg.minimalKernel(),
         // fx takes only what ACP v1 defines and fx's MCP engine speaks: stdio and
         // HTTP.
         .mcp_over_acp = false,
@@ -3607,7 +3607,7 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+    if (state.cfg.minimalKernel() and state.capability_resolver.state == .idle) {
         // libfx cores skip the startup catalog resolve; explicit effort and
         // fast overrides are the creation-time consumers that need it.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
@@ -3713,7 +3713,7 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
     var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
+    if (state.cfg.minimalKernel() and state.capability_resolver.state == .idle) {
         // Shares the effort override's one-shot catalog resolve: creation is
         // the only point that can reject before any turn runs.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
@@ -3972,7 +3972,7 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
         state.worker.nudgeWaiter();
         // A libfx turn keeps its queued steering until it ends, which hands
         // back what never reached the model.
-        if (state.cfg.minimal_kernel) session.steering.cancelForUser(&session.cancel_flag);
+        if (state.cfg.minimalKernel()) session.steering.cancelForUser(&session.cancel_flag);
     }
     cancelPendingOutbound(state, notify_client);
     clearPendingLegacyUrls(state);
@@ -4393,7 +4393,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
 /// seconds its DNS lookup or connect takes to fail.
 pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     if (comptime host_target.is_wasm) return;
-    if (state.cfg.minimal_kernel) return;
+    if (state.cfg.minimalKernel()) return;
     const active = if (state.active_session) |*session| session else return;
     const provider = catalogProviderFor(state, active.provider) orelse return;
     std.debug.assert(state.active_prompt == null);
@@ -4552,7 +4552,7 @@ fn storeSessionUltrafast(
     session: *ActiveSessionState,
     ultrafast: bool,
 ) !bool {
-    if (state.cfg.minimal_kernel and session.v2 == null and session.wasm_state == null) {
+    if (state.cfg.minimalKernel() and session.v2 == null and session.wasm_state == null) {
         session.ultrafast_mode = ultrafast;
         return true;
     }
@@ -4605,7 +4605,7 @@ fn storeSessionFast(
     session: *ActiveSessionState,
     fast: bool,
 ) !bool {
-    if (state.cfg.minimal_kernel and session.v2 == null and session.wasm_state == null) {
+    if (state.cfg.minimalKernel() and session.v2 == null and session.wasm_state == null) {
         session.fast_mode = fast;
         return true;
     }
@@ -4809,7 +4809,7 @@ fn selectSessionMode(
 fn saveSessionPermissionMode(state: *ServerState, alloc: Allocator, mode: types.PermissionMode) void {
     state.permission_mode = mode;
     if (comptime !host_target.is_wasm) {
-        if (state.cfg.minimal_kernel) return;
+        if (state.cfg.minimalKernel()) return;
         const label = permissions.permissionModeLabel(mode);
         const home = state.cfg.home_override orelse io_mod.homeDir() orelse {
             debug_trace.logf("acp", "permission_mode_save_failed mode={s} err=HomeNotSet", .{label});
@@ -4835,7 +4835,7 @@ pub const StartingMode = struct {
 /// that applies it, or the default mode when none does.
 pub fn loadStartingMode(state: *ServerState, alloc: Allocator) StartingMode {
     if (comptime !host_target.is_wasm) {
-        if (!state.cfg.minimal_kernel and state.workspace_root.len > 0) {
+        if (!state.cfg.minimalKernel() and state.workspace_root.len > 0) {
             if (app_lifecycle.loadSavedPermissionMode(alloc, state.cfg.home_override, state.workspace_root)) |saved| {
                 state.permission_mode = saved;
             } else |err| {

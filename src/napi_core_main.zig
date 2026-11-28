@@ -119,6 +119,9 @@ comptime {
     if (build_options.napi_surface != .core) {
         @compileError("libfx N-API core requires -Dnapi-surface=core");
     }
+    if (!build_options.libfx_kernel) {
+        @compileError("the Node addon runs libfx's kernel; build it with libfx_kernel true");
+    }
 }
 
 const InputQueue = struct {
@@ -778,9 +781,6 @@ const Runtime = struct {
                 .ultrafast_override = self.ultrafast,
                 .home_override = self.home,
                 .workspace_root_override = self.workspace_root,
-                .allow_acp_mcp = false,
-                .allow_native_tools = false,
-                .minimal_kernel = true,
                 .host_attachments = self.attachments.store(),
             },
             jsonrpc.Reader.initCallback(self, Runtime.readInput),

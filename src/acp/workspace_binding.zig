@@ -56,7 +56,7 @@ pub fn prepareErrorMessage(err: PrepareError) []const u8 {
 /// Stages the workspace named by `cwd`. Returns null when `cwd` is absent,
 /// names the current workspace, or the host pins the workspace root.
 pub fn prepare(state: *const server.ServerState, alloc: Allocator, params_raw: ?[]const u8) PrepareError!?Binding {
-    if (state.cfg.minimal_kernel or state.cfg.workspace_root_override != null) return null;
+    if (state.cfg.minimalKernel() or state.cfg.workspace_root_override != null) return null;
     const raw = params_raw orelse return null;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
