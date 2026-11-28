@@ -6333,6 +6333,84 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "a dev release with a lower build number never replaces the one installed",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-build-number-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ update_channel: "dev" }));
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+    // Build numbers far above any real count of main's commits, so the first
+    // release installs whatever number this build carries.
+    const firstRevision = "1111111111111111111111111111111111111111";
+    const staleRevision = "3333333333333333333333333333333333333333";
+    const newestRevision = "2222222222222222222222222222222222222222";
+    const installed = () => readFileSync(installedFx, "utf8");
+
+    let active: TmuxSession | null = null;
+    const gateway = startFakeGateway([]);
+    const release = startUpgradeServer(root, argvLogPath, { revision: firstRevision, build: 10_000_005 });
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      expect(installed()).toContain(`# fake fx release ${firstRevision}`);
+
+      // A stale manifest names an older build with another commit. Three more
+      // checks read it, and none installs it.
+      release.setRevision(staleRevision, 10_000_003);
+      const checked = release.devChecks() + 3;
+      for (const deadline = Date.now() + UPGRADE_TIMEOUT; release.devChecks() < checked; await Bun.sleep(50)) {
+        if (Date.now() > deadline) throw new Error("fx stopped reading dev.json");
+      }
+      expect(installed()).toContain(`# fake fx release ${firstRevision}`);
+      expect(installed()).not.toContain(staleRevision);
+
+      // A newer build replaces it.
+      release.setRevision(newestRevision, 10_000_007);
+      const deadline = Date.now() + UPGRADE_TIMEOUT;
+      while (!installed().includes(`# fake fx release ${newestRevision}`)) {
+        if (Date.now() > deadline) throw new Error(`the newer dev release was never installed:\n${installed().slice(0, 200)}`);
+        await Bun.sleep(100);
+      }
+      expect(await active.capturePane()).toContain("update ready: ctrl+g to reload");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      release.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
   "TTY upgrade prints bold fx version header before output",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-upgrade-tty-header-")));
