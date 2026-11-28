@@ -92,6 +92,15 @@ zig build libfx-napi -Dnapi-surface=core
 npm ci --prefix sdk/durable
 ```
 
+## Resuming a stopped turn
+
+These checks cover how fx continues a turn that a crash, a closed window, or a yield stopped, in addition to what the table says for each folder:
+
+- `recovery/Resume.tla` also checks `SameTurn`: a launch after a crash or a closed window continues the stopped turn as the same turn, with its work. Its planted `note_turn` bug, a send that starts a new turn with a note as fx once did, must be caught by `SameTurn`, in addition to the planted bugs the `recovery/` row counts.
+- `session/TurnStream.tla` also lets a crash or a closed window end a turn that the next turn continues, and its read-back joins the two once, as for a Ctrl+G yield. Its planted `reader_drops_crashed` bug must be caught.
+- `durable/Resumption.tla` also holds the one resume notice a turn keeps however often it resumes, where the model first saw it, and none after a yield (`resumeCheckpoint` in `src/acp/libfx_journal.zig`). `Resumption-each.cfg` and `Resumption-moved.cfg` hold the rules of #1584 and #1615, which `durable/check.sh` requires to fail.
+- `bun tests/tla/drivers/durable/resume_notice.ts --self-check` runs libfx processes on the built native addon or `fx-core.wasm` (`--backend wasm`) through crashes, fenced appends, dropped requests, yields, and lost turn ends, and has TLC replay every scenario through `durable/ResumptionTrace.tla`. `--fuzz N`, `--stress N`, and `--direct`, which checks the same rules without TLC, run longer. It runs on request.
+
 ## MCP in CI
 
 CI runs MCP in four parallel jobs, on `main` and on pull requests that change MCP code, these models, their drivers, or the files the drivers load. `TLA+ MCP engine models and driver` runs each engine model's smoke config (`mcp/run.py check`) and the engine driver (`drivers/mcp/driver.ts`). `TLA+ MCP host SignIn model` and `TLA+ MCP host other models` run `models.test.ts`, which checks the host models and runs every host model's smoke and stress configs, planted bugs, findings, and repair witnesses: the catalog `mcp_host/check.sh` runs by hand, so CI doesn't run that script too. SignIn is half of the TLC time, so it has its own job (`FX_MCP_HOST_MODELS=SignIn`); the other job checks every other model (`FX_MCP_HOST_MODELS=-SignIn`) and runs the file's bridge controls. `TLA+ MCP host drivers` runs every other test file in `drivers/mcp_host/`. The engine models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.

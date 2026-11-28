@@ -207,8 +207,8 @@ async function heldScenario() {
   // Only the resent request came before the barrier, and the resumed turn's two commits plus the barrier's save make three.
   expectCount(barrier2.before, 1, "requests before the follow-up prompt");
   expectCount(barrier2.commits, 3, "commits when the follow-up prompt's request arrived");
-  if (!resumed.bodies[0].includes(MARKER) || !resumed.bodies[0].includes("<session_resumed>")) {
-    throw new Error("the resumed request lacks the prompt or the session_resumed note");
+  if (!resumed.bodies[0].includes(MARKER) || !resumed.bodies[0].includes("Resuming from unexpected session interruption.")) {
+    throw new Error("the resumed request lacks the prompt or the resume notice");
   }
   reload(second.runtime);
 

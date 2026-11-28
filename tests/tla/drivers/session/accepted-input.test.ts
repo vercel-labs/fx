@@ -349,6 +349,28 @@ interface PromptSpec {
   text: string;
 }
 
+// fx keeps its resume notice as a steering item, and an old log keeps it as a user turn.
+const resumeNoticeText = "Resuming from unexpected session interruption.";
+const oldResumeNote = "<session_resumed>";
+
+function isResumeNotice(line: any): boolean {
+  return line.kind === "item" && line.type === "steering" && line.data?.text === resumeNoticeText;
+}
+
+// A continued turn repeats its prompt as a user item after its turn_continued marker.
+function countHostResumeItems(lines: any[]): number {
+  let continued = false;
+  let count = 0;
+  for (const line of lines) {
+    if (line.kind === "turn_started") continued = false;
+    else if (line.kind === "item" && line.type === "turn_continued") continued = true;
+    else if (line.kind === "item" && line.type === "user") {
+      if (continued || JSON.stringify(line.data ?? "").includes(oldResumeNote)) count += 1;
+    }
+  }
+  return count;
+}
+
 function readLogSnapshot(home: string, sessionId: string) {
   const lines = logLines(home, sessionId) as any[];
   const rawToModelId = new Map<number, number>();
@@ -374,10 +396,9 @@ function readLogSnapshot(home: string, sessionId: string) {
   ];
   const deliveredIds = mapIds("input_delivered");
   const withdrawnIds = mapIds("input_withdrawn");
-  const userLines = lines.filter((l) => l.kind === "item" && l.type === "user");
-  const userItems = userLines.length;
-  const recoveryTurns = userLines.filter((l) => JSON.stringify(l.data ?? "").includes("<session_resumed>")).length;
-  const steeringItems = lines.filter((l) => l.kind === "item" && l.type === "steering").length;
+  const userItems = lines.filter((l) => l.kind === "item" && l.type === "user").length;
+  const recoveryTurns = countHostResumeItems(lines);
+  const steeringItems = lines.filter((l) => l.kind === "item" && l.type === "steering" && !isResumeNotice(l)).length;
   const starts = lines.filter((l) => l.kind === "turn_started").length;
   const ends = lines.filter((l) => l.kind === "turn_committed" || l.kind === "turn_interrupted").length;
   return {

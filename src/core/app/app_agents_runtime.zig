@@ -3671,7 +3671,7 @@ pub fn Runtime(comptime App: type) type {
                 debug_trace.eventf("host", "child_continue_failed", .{}, "agent={s} work_id={s} reason=continue_failed", .{ child.id, work_id });
                 return error.YieldedTurnMissing;
             }
-            SessionRuntime.continueYieldedTurn(app, agent, resumed.?) catch |err| {
+            SessionRuntime.continueStoppedTurn(app, agent, resumed.?, .yielded) catch |err| {
                 debug_trace.eventf("host", "child_continue_failed", .{}, "agent={s} work_id={s} reason=continue_failed err={s}", .{ child.id, work_id, @errorName(err) });
                 return err;
             };

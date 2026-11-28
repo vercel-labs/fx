@@ -35,12 +35,13 @@
 (*   FailedCommits a commit fails and the host goes on to its next turn,   *)
 (*                which marks the open turn stale (D98): the next write    *)
 (*                closes it as superseded and writes the turn afresh       *)
-(*   Continues    a Ctrl+G yield stops the open turn; the turn that continues  *)
-(*                it writes only the pieces past the yielded ones, or a full  *)
-(*                copy when those pieces no longer stand (`Continue`)         *)
-(*                                                                         *)
-(* A new prompt after a yield, which the product shows as a stopped turn, is *)
-(* outside this model, because it models one turn.                          *)
+(*   Continues    a Ctrl+G yield, a crash, or a closed window stops the open  *)
+(*                turn; the turn that continues it writes only the pieces    *)
+(*                past the stopped ones, or a full copy when those pieces no *)
+(*                longer stand (`Continue`)                                  *)
+(*                                                                           *)
+(* A new prompt after a stop, which the product shows as a stopped turn, is  *)
+(* outside this model, because it models one turn.                           *)
 (*                                                                         *)
 (* Mutant selects the design. "none" is fx as it is; "restamp" is fx       *)
 (* before results kept their stamps; "cut_view" is fx before the log saved *)
@@ -56,7 +57,8 @@ CONSTANTS Calls, MaxBuilds, MissedPaths, Compactions, Recovery, Faults,
 
 Mutants == {"none", "restamp", "cut_view", "copy_whole", "lose_on_recover", "share_stamp",
             "bytes_only", "loose_compare", "mix_on_mismatch", "prefix_only",
-            "continue_stale", "continue_copies", "reader_drops_yielded"}
+            "continue_stale", "continue_copies", "reader_drops_yielded",
+            "reader_drops_crashed"}
 
 ASSUME Mutant \in Mutants
 ASSUME MaxBuilds \in Nat
@@ -85,8 +87,8 @@ VARIABLES
   last,       \* what the last stream or commit decided
   stale,      \* the open turn is one a failed commit left behind (D98)
   failedAt,   \* the log's length when a failed commit left its turn, or 0
-  base,       \* the yielded turn's pieces, as its stream held them at the yield
-  yielded,    \* the log ends with a yield, and no turn has continued it yet
+  base,       \* the stopped turn's pieces, as its stream held them when it stopped
+  yielded,    \* the log ends with a stop (a yield, a crash, or a close), and no turn has continued it yet
   copyView    \* the open or committed turn is a copy written after a supersede
               \* once a compaction cut it (`open_cut_copy`)
 
@@ -200,14 +202,19 @@ CopyAfter(b) ==
   ELSE IF ~open \/ Supersedes(b) THEN FALSE
   ELSE copyView
 
-(* A line that ends a turn, unless the next line is an extends marker. The  *)
-(* planted `reader_drops_yielded` reader ends the turn at every interruption. *)
+(* A line that ends a turn, unless the next line is an extends marker. The   *)
+(* planted `reader_drops_yielded` reader ends the turn at every              *)
+(* interruption; `reader_drops_crashed` (`src/core/session/`                 *)
+(* `session_adapter.zig` `replay`) ends it at an interruption with no yield  *)
+(* marker right before it, even when an extends marker follows.              *)
 Ends(i) ==
   /\ log[i].kind \in {"superseded", "interrupted"}
-  /\ (Mutant = "reader_drops_yielded" \/
-      IF i = Len(log) THEN TRUE ELSE log[i + 1].kind # "extends")
+  /\ (Mutant = "reader_drops_yielded"
+      \/ (Mutant = "reader_drops_crashed" /\ log[i].kind = "interrupted"
+          /\ (i = 1 \/ log[i - 1].kind # "yielded"))
+      \/ IF i = Len(log) THEN TRUE ELSE log[i + 1].kind # "extends")
 
-(* The rebuild b still starts with the yielded pieces, compared as           *)
+(* The rebuild b still starts with the stopped pieces, compared as           *)
 (* `streamedPrefix` compares them. *)
 Extends(b) ==
   /\ Len(base) <= Len(b)
@@ -411,10 +418,28 @@ Yield ==
                  stampedAt, recovered, supersedes, unexplained, reparsed,
                  anyParsed, last, stale, failedAt>>
 
-(* The continuing turn opens with one rebuild. When the yielded pieces still  *)
+(* fx dies or its window closes at a boundary (`src/core/session_manager/`   *)
+(* ends the open turn `crash` or `closed`): its log gets only an             *)
+(* interruption, with no yield marker, and nothing more is streamed.         *)
+Crash ==
+  /\ Continues
+  /\ open
+  /\ ~stale
+  /\ ~committed
+  /\ log' = log \o <<Interrupted>>
+  /\ base' = streamed
+  /\ yielded' = TRUE
+  /\ open' = FALSE
+  /\ streamed' = <<>>
+  /\ copyView' = FALSE
+  /\ UNCHANGED <<done, cut, changed, dropped, builds, committed, final, birthOf,
+                 stampedAt, recovered, supersedes, unexplained, reparsed,
+                 anyParsed, last, stale, failedAt>>
+
+(* The continuing turn opens with one rebuild. When the stopped pieces still  *)
 (* stand as its prefix, the log gets an extends marker and only the pieces    *)
 (* past them, and the open turn holds all of them. Otherwise the log gets a   *)
-(* plain marker and a full copy, and the reader drops the yielded copy.       *)
+(* plain marker and a full copy, and the reader drops the stopped copy.       *)
 Continue ==
   /\ Continues
   /\ yielded
@@ -449,6 +474,7 @@ Next ==
   \/ Commit
   \/ FailCommit
   \/ Yield
+  \/ Crash
   \/ Continue
 
 Spec == Init /\ [][Next]_vars

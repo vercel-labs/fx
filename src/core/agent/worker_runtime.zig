@@ -15,6 +15,7 @@ const permissions = @import("../permissions/permissions.zig");
 const notification_contract = @import("../notifications/notification_contract.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
+const continuation = @import("../continuation/continuation.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const compactor = @import("../compactor/compactor.zig");
@@ -187,11 +188,11 @@ pub const QueuedPrompt = struct {
     /// The request a previous fx process left unfinished, which this turn's
     /// first model request resumes.
     recovery_resume: ?types.RecoveryResume = null,
-    /// Continues a turn that yielded for an upgrade's restart, from
-    /// `recovery_checkpoint`. `recovery_resume` still decides whether the
-    /// first request goes at once or asks first; this keeps the user's own
-    /// message and the turn's pieces, with no resume note.
-    continues_yielded_turn: bool = false,
+    /// Continues a turn a previous fx process stopped, from
+    /// `recovery_checkpoint`, as the same turn: the user's own message and the
+    /// turn's pieces, never a note in place of the user's message. `recovery_resume`
+    /// still decides whether the first request goes at once.
+    continuation: ?continuation.Stop = null,
     /// True when this output surface already contains the checkpoint's
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.
@@ -2877,7 +2878,7 @@ pub const WorkerRuntime = struct {
         errdefer if (!transfer_history) {
             types.freeHistoryTurnSlice(alloc, job_history);
         };
-        if (queued.continues_yielded_turn) {
+        if (queued.continuation == .yielded) {
             try self.worker_events.append(alloc, .{
                 .begin_continued_prompt = queued.turn_id,
             });
@@ -6455,7 +6456,7 @@ test "a turn that continues a yielded one begins as continued, not resumed" {
     var prompt = try makePrompt(alloc, "ok", "model");
     prompt.turn_id = 42;
     prompt.recovery_resume = .{};
-    prompt.continues_yielded_turn = true;
+    prompt.continuation = .yielded;
     try runtime.enqueuePrompt(alloc, prompt);
     const next = (try runtime.tryTakeNextPrompt(alloc)).?;
     defer freeQueuedPrompt(alloc, next);

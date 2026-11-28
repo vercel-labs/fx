@@ -2692,7 +2692,7 @@ await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } 
         let resumedSent = false;
         const respond = (body: string): Response => {
           const latest = userTexts(body).at(-1) ?? "";
-          if (latest.includes("<session_resumed>")) {
+          if (latest.includes("Resuming from unexpected session interruption.")) {
             resumedSent = true;
             return text("inst_new", newReply);
           }
