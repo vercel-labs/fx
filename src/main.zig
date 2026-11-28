@@ -5808,6 +5808,7 @@ test {
     _ = @import("core/mcp_host/login_words.zig");
     _ = @import("core/mcp/tool_lookup.zig");
     _ = @import("core/recovery/recovery.zig");
+    _ = @import("core/flight_recorder/flight_recorder.zig");
     _ = @import("core/workspace_trust/workspace_trust.zig");
     _ = @import("core/app/app_trust_runtime.zig");
     _ = @import("core/app/personal_shortcut_runtime.zig");

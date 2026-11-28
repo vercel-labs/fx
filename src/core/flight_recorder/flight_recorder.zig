@@ -1,0 +1,1148 @@
+//! Front door for the flight recorder. Outside code imports only this file.
+
+const std = @import("std");
+const testing = std.testing;
+
+pub const format = @import("format.zig");
+pub const reader = @import("reader.zig");
+const segment = @import("segment.zig");
+const writer = @import("writer.zig");
+
+pub const Result = reader.Result;
+pub const read = reader.read;
+/// The gap reason of an evicted segment whose counts are unknown. Gap readers must not count it as zero loss.
+pub const gap_reason_unreadable = writer.gap_reason_unreadable;
+
+pub const Options = struct {
+    folder: std.Io.Dir,
+    io: std.Io,
+    instance: u64,
+    segment_bytes: usize = writer.segment_bytes,
+    max_session_bytes: u64 = writer.max_session_bytes,
+    sync_interval_ms: u32 = writer.sync_interval_ms,
+    fail_prealloc_for_test: bool = false,
+    fail_seal_for_test: bool = false,
+    fault_once_for_test: ?writer.FaultSite = null,
+    on_gap_written_for_test: ?writer.GapHook = null,
+    on_switch_gap_for_test: ?writer.SwitchGapHook = null,
+    on_seal_scan_for_test: ?writer.SealScanHook = null,
+    on_sync_for_test: ?writer.SyncHook = null,
+    test_ctx: ?*anyopaque = null,
+};
+
+/// Failures the recorder thread counted and recovered from. Each counts one failed step.
+/// `prealloc_failures` counts each segment the recorder could not create or track.
+/// `startup_dropped` counts events emitted before segment 0 existed that did not fit the startup buffer.
+pub const Stats = struct {
+    sync_failures: u64,
+    evict_failures: u64,
+    seal_failures: u64,
+    prealloc_failures: u64,
+    startup_dropped: u64,
+};
+
+pub const Recorder = struct {
+    inner: writer.Writer,
+
+    pub fn start(gpa: std.mem.Allocator, options: Options) !*Recorder {
+        const self = try gpa.create(Recorder);
+        errdefer gpa.destroy(self);
+        try self.inner.start(gpa, .{
+            .folder = options.folder,
+            .io = options.io,
+            .instance = options.instance,
+            .segment_bytes = options.segment_bytes,
+            .max_session_bytes = options.max_session_bytes,
+            .sync_interval_ms = options.sync_interval_ms,
+            .fail_prealloc_from_index = if (options.fail_prealloc_for_test) 1 else null,
+            .fail_seal_for_test = options.fail_seal_for_test,
+            .fault_once_for_test = options.fault_once_for_test,
+            .on_gap_written_for_test = options.on_gap_written_for_test,
+            .on_switch_gap_for_test = options.on_switch_gap_for_test,
+            .on_seal_scan_for_test = options.on_seal_scan_for_test,
+            .on_sync_for_test = options.on_sync_for_test,
+            .test_ctx = options.test_ctx,
+        });
+        return self;
+    }
+
+    pub fn emit(self: *Recorder, kind: u16, thread: u32, payload: []const u8) void {
+        self.inner.emit(kind, thread, payload);
+    }
+
+    pub fn stats(self: *const Recorder) Stats {
+        return .{
+            .sync_failures = self.inner.sync_failures.load(.monotonic),
+            .evict_failures = self.inner.evict_failures.load(.monotonic),
+            .seal_failures = self.inner.seal_failures.load(.monotonic),
+            .prealloc_failures = self.inner.prealloc_failures.load(.monotonic),
+            .startup_dropped = self.inner.startup_dropped.load(.monotonic),
+        };
+    }
+
+    pub fn stop(self: *Recorder) void {
+        const gpa = self.inner.gpa;
+        self.inner.stop();
+        gpa.destroy(self);
+    }
+};
+
+fn readFileBytes(gpa: std.mem.Allocator, dir: std.Io.Dir, io: std.Io, name: []const u8) ![]u8 {
+    var file = try dir.openFile(io, name, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    const buf = try gpa.alloc(u8, @intCast(stat.size));
+    errdefer gpa.free(buf);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = try file.readPositionalAll(io, buf[total..], total);
+        if (n == 0) break;
+        total += n;
+    }
+    return buf[0..total];
+}
+
+test "emit then stop reads frames in order and splits 3x max_payload_bytes" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x1234,
+        .segment_bytes = 512 * 1024,
+    });
+
+    rec.emit(1, 10, "alpha");
+    rec.emit(2, 10, "beta");
+
+    const big_len = 3 * format.max_payload_bytes;
+    const big = try testing.allocator.alloc(u8, big_len);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i);
+    rec.emit(3, 10, big);
+
+    rec.stop();
+
+    var seg_names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (seg_names.items) |name| testing.allocator.free(name);
+        seg_names.deinit(testing.allocator);
+    }
+    var it = tmp.dir.iterate();
+    while (try it.next(testing.io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".seg")) {
+            try seg_names.append(testing.allocator, try testing.allocator.dupe(u8, entry.name));
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), seg_names.items.len);
+
+    const bytes = try readFileBytes(testing.allocator, tmp.dir, testing.io, seg_names.items[0]);
+    defer testing.allocator.free(bytes);
+    var res = try read(testing.allocator, bytes);
+    defer res.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 5), res.frames.items.len);
+    try testing.expectEqualStrings("alpha", res.frames.items[0].payload);
+    try testing.expectEqualStrings("beta", res.frames.items[1].payload);
+    try testing.expectEqual(@as(u16, format.flag_continues), res.frames.items[2].flags);
+    try testing.expectEqual(@as(u16, format.flag_continues), res.frames.items[3].flags);
+    try testing.expectEqual(@as(u16, 0), res.frames.items[4].flags);
+    try testing.expectEqualSlices(u8, big[0..format.max_payload_bytes], res.frames.items[2].payload);
+    try testing.expectEqualSlices(u8, big[format.max_payload_bytes .. 2 * format.max_payload_bytes], res.frames.items[3].payload);
+    try testing.expectEqualSlices(u8, big[2 * format.max_payload_bytes .. 3 * format.max_payload_bytes], res.frames.items[4].payload);
+}
+
+fn expectContiguousSegmentIndices(indices: []u64) !void {
+    std.mem.sort(u64, indices, {}, std.sort.asc(u64));
+    for (indices, 0..) |index, expected| {
+        try testing.expectEqual(@as(u64, @intCast(expected)), index);
+    }
+}
+
+/// Half of the fewest segments that `events` frames of `payload_len` bytes can fill. The half
+/// leaves slack for the segments the recorder does not fill to the brim.
+fn minSealedSegments(events: usize, payload_len: usize, segment_bytes: usize) usize {
+    const frame_bytes = format.frameBytes(payload_len);
+    const usable_bytes = segment_bytes - format.segment_header_bytes;
+    return @divCeil(events * frame_bytes, usable_bytes) / 2;
+}
+
+const max_next_segment_yields: usize = 10_000_000;
+
+/// `next` is ready when it is set and is not `current`: during a switch, `next == current` until the winner clears it.
+fn nextSegmentReady(rec: *Recorder) bool {
+    const next = rec.inner.next.load(.acquire) orelse return false;
+    return next != rec.inner.current.load(.acquire);
+}
+
+/// Called by a producer before each emit. It yields while the recorder has no next segment ready,
+/// so no producer fills a segment before the recorder can switch to the next one. The yield count
+/// is bounded: a recorder that never prepares one lets the test return and fail on its drop count.
+fn yieldUntilNextSegmentReady(rec: *Recorder) void {
+    var yields: usize = 0;
+    while (!nextSegmentReady(rec) and yields < max_next_segment_yields) : (yields += 1) {
+        // A failed yield only skips a scheduling hint, so the producer does not depend on it.
+        std.Thread.yield() catch {};
+    }
+}
+
+test "two threads emit 10000 events each across small segments without loss" {
+    const events_per_thread: usize = 10_000;
+    const payload_len: usize = 16;
+    const segment_bytes: usize = 64 * 1024;
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5678,
+        .segment_bytes = segment_bytes,
+        .max_session_bytes = 64 * 1024 * 1024,
+        .sync_interval_ms = 20,
+    });
+    // Wait until seg0 is active so startup buffer does not drop small-segment overflows.
+    while (rec.inner.current.load(.acquire) == null) {
+        try std.Thread.yield();
+    }
+
+    const Worker = struct {
+        fn run(r: *Recorder, tid: u32) void {
+            var buf: [payload_len]u8 = undefined;
+            for (0..events_per_thread) |i| {
+                std.mem.writeInt(u32, buf[0..4], tid, .little);
+                std.mem.writeInt(u64, buf[4..12], @intCast(i), .little);
+                std.mem.writeInt(u32, buf[12..16], 0, .little);
+                yieldUntilNextSegmentReady(r);
+                r.emit(7, tid, &buf);
+                if (i % 500 == 0) {
+                    // A failed yield only skips a scheduling hint, so the producers do not depend on it.
+                    std.Thread.yield() catch {};
+                }
+            }
+        }
+    };
+
+    const t1 = try std.Thread.spawn(.{}, Worker.run, .{ rec, 1 });
+    const t2 = try std.Thread.spawn(.{}, Worker.run, .{ rec, 2 });
+    t1.join();
+    t2.join();
+    rec.stop();
+
+    var seen_1 = try testing.allocator.alloc(bool, events_per_thread);
+    defer testing.allocator.free(seen_1);
+    @memset(seen_1, false);
+    var seen_2 = try testing.allocator.alloc(bool, events_per_thread);
+    defer testing.allocator.free(seen_2);
+    @memset(seen_2, false);
+
+    var seg_indices: std.ArrayList(u64) = .empty;
+    defer seg_indices.deinit(testing.allocator);
+
+    var total_frames: u64 = 0;
+    var total_dropped: u64 = 0;
+    var total_overflowed: u64 = 0;
+    var open_count: usize = 0;
+
+    var it = tmp.dir.iterate();
+    while (try it.next(testing.io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".open")) {
+            open_count += 1;
+            continue;
+        }
+        if (!std.mem.endsWith(u8, entry.name, ".seg")) continue;
+        const parsed = segment.parseSealedName(entry.name) orelse return error.InvalidSegmentName;
+        try seg_indices.append(testing.allocator, parsed.index);
+
+        const bytes = try readFileBytes(testing.allocator, tmp.dir, testing.io, entry.name);
+        defer testing.allocator.free(bytes);
+        var res = try read(testing.allocator, bytes);
+        defer res.deinit(testing.allocator);
+        try testing.expectEqual(@as(u64, 0), res.missing);
+        total_dropped += res.dropped;
+        total_overflowed += res.overflowed;
+
+        for (res.frames.items) |frame| {
+            total_frames += 1;
+            const tid = std.mem.readInt(u32, frame.payload[0..4], .little);
+            const idx = std.mem.readInt(u64, frame.payload[4..12], .little);
+            if (tid == 1) {
+                try testing.expect(!seen_1[idx]);
+                seen_1[idx] = true;
+            } else if (tid == 2) {
+                try testing.expect(!seen_2[idx]);
+                seen_2[idx] = true;
+            } else {
+                return error.UnexpectedThread;
+            }
+        }
+    }
+
+    try expectContiguousSegmentIndices(seg_indices.items);
+    try testing.expect(seg_indices.items.len >= minSealedSegments(2 * events_per_thread, payload_len, segment_bytes));
+    try testing.expectEqual(@as(usize, 0), open_count);
+    try testing.expect(total_overflowed > 0);
+    try testing.expectEqual(@as(u64, 0), total_dropped);
+    try testing.expectEqual(@as(u64, 2 * events_per_thread), total_frames);
+}
+
+test "no next segment ready counts dropped in mapped header without waiting" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x9ABC,
+        .segment_bytes = 4096,
+        .fail_prealloc_for_test = true,
+    });
+    while (rec.inner.current.load(.acquire) == null) {
+        try std.Thread.yield();
+    }
+
+    for (0..200) |_| {
+        rec.emit(1, 1, "payload-data-that-fills-a-small-segment");
+    }
+    rec.stop();
+
+    var seg_count: usize = 0;
+    var open_count: usize = 0;
+    var total_dropped: u64 = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(testing.io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".open")) open_count += 1;
+        if (!std.mem.endsWith(u8, entry.name, ".seg")) continue;
+        seg_count += 1;
+        const bytes = try readFileBytes(testing.allocator, tmp.dir, testing.io, entry.name);
+        defer testing.allocator.free(bytes);
+        var res = try read(testing.allocator, bytes);
+        defer res.deinit(testing.allocator);
+        total_dropped += res.dropped;
+    }
+
+    try testing.expectEqual(@as(usize, 1), seg_count);
+    try testing.expectEqual(@as(usize, 0), open_count);
+    try testing.expect(total_dropped > 0);
+}
+
+test "cap writes gap record before unlinking oldest sealed segment and never removes open" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const Probe = struct {
+        dir: std.Io.Dir,
+        io: std.Io,
+        checked: bool = false,
+        saw_seg_while_gap_present: bool = false,
+        saw_open_present: bool = false,
+
+        fn onGap(ctx: ?*anyopaque, gap_name: []const u8, seg_name: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.checked = true;
+            _ = self.dir.statFile(self.io, gap_name, .{}) catch return;
+            _ = self.dir.statFile(self.io, seg_name, .{}) catch return;
+            self.saw_seg_while_gap_present = true;
+
+            var it = self.dir.iterate();
+            while (it.next(self.io) catch null) |entry| {
+                if (std.mem.endsWith(u8, entry.name, ".open")) {
+                    self.saw_open_present = true;
+                    break;
+                }
+            }
+        }
+    };
+    var probe: Probe = .{ .dir = tmp.dir, .io = testing.io };
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0xDEF0,
+        .segment_bytes = 4096,
+        .max_session_bytes = 3 * 4096,
+        .sync_interval_ms = 10,
+        .on_gap_written_for_test = Probe.onGap,
+        .test_ctx = &probe,
+    });
+    while (rec.inner.current.load(.acquire) == null) {
+        try std.Thread.yield();
+    }
+
+    for (0..400) |i| {
+        rec.emit(1, 1, "0123456789abcdef0123456789abcdef");
+        if (i % 50 == 0) {
+            const ticks = rec.inner.tick_count.load(.acquire);
+            rec.inner.wake();
+            while (rec.inner.tick_count.load(.acquire) == ticks) {
+                try std.Thread.yield();
+            }
+        }
+    }
+    rec.stop();
+
+    try testing.expect(probe.checked);
+    try testing.expect(probe.saw_seg_while_gap_present);
+    try testing.expect(probe.saw_open_present);
+
+    var gap_names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (gap_names.items) |n| testing.allocator.free(n);
+        gap_names.deinit(testing.allocator);
+    }
+    var seg_indices: std.ArrayList(u64) = .empty;
+    defer seg_indices.deinit(testing.allocator);
+
+    var it = tmp.dir.iterate();
+    while (try it.next(testing.io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "gap-") and std.mem.endsWith(u8, entry.name, ".json")) {
+            try gap_names.append(testing.allocator, try testing.allocator.dupe(u8, entry.name));
+        } else if (std.mem.endsWith(u8, entry.name, ".seg")) {
+            const parsed = segment.parseSealedName(entry.name) orelse return error.InvalidSegmentName;
+            try seg_indices.append(testing.allocator, parsed.index);
+        }
+    }
+
+    try testing.expect(gap_names.items.len > 0);
+    try testing.expect(seg_indices.items.len >= 1);
+
+    // Gap record for segment 0 exists, names it, and segment 0 itself was unlinked.
+    const first_gap = try readFileBytes(testing.allocator, tmp.dir, testing.io, "gap-000000000000def0-00000000.json");
+    defer testing.allocator.free(first_gap);
+    try testing.expect(std.mem.find(u8, first_gap, "000000000000def0-00000000.seg") != null);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "000000000000def0-00000000.seg", .{}));
+}
+
+test "segment with nonzero in-flight count is not sealed until count is zero" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const seg = try segment.Segment.create(testing.allocator, tmp.dir, testing.io, 0x1111, 0, 4096, 1000, false);
+    _ = seg.in_flight.fetchAdd(1, .acq_rel);
+    try testing.expect(!seg.canSeal());
+    _ = seg.in_flight.fetchSub(1, .release);
+    try testing.expect(seg.canSeal());
+    try seg.seal(testing.allocator);
+}
+
+test "four producers stress tiny segments and fast sealing" {
+    const payload_len: usize = 12;
+    const segment_bytes: usize = 8192;
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0xCAFE,
+        .segment_bytes = segment_bytes,
+        .max_session_bytes = 128 * 1024 * 1024,
+        .sync_interval_ms = 1,
+    });
+    while (rec.inner.current.load(.acquire) == null) {
+        try std.Thread.yield();
+    }
+
+    const thread_count = 4;
+    const emits_per_thread = 50_000;
+
+    const Worker = struct {
+        fn run(r: *Recorder, tid: u32) void {
+            var buf: [payload_len]u8 = undefined;
+            for (0..emits_per_thread) |i| {
+                std.mem.writeInt(u32, buf[0..4], tid, .little);
+                std.mem.writeInt(u64, buf[4..12], @intCast(i), .little);
+                yieldUntilNextSegmentReady(r);
+                r.emit(9, tid, &buf);
+            }
+        }
+    };
+
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads, 0..) |*t, idx| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ rec, @as(u32, @intCast(idx)) });
+    }
+    for (&threads) |*t| t.join();
+    rec.stop();
+
+    var seen: [thread_count][]bool = undefined;
+    for (&seen) |*s| {
+        s.* = try testing.allocator.alloc(bool, emits_per_thread);
+        @memset(s.*, false);
+    }
+    defer for (&seen) |s| testing.allocator.free(s);
+
+    var total_frames: u64 = 0;
+    var total_dropped: u64 = 0;
+    var total_overflowed: u64 = 0;
+    var seg_indices: std.ArrayList(u64) = .empty;
+    defer seg_indices.deinit(testing.allocator);
+    var open_count: usize = 0;
+
+    var it = tmp.dir.iterate();
+    while (try it.next(testing.io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".open")) {
+            open_count += 1;
+            continue;
+        }
+        if (!std.mem.endsWith(u8, entry.name, ".seg")) continue;
+        const parsed = segment.parseSealedName(entry.name) orelse return error.InvalidSegmentName;
+        try seg_indices.append(testing.allocator, parsed.index);
+
+        const bytes = try readFileBytes(testing.allocator, tmp.dir, testing.io, entry.name);
+        defer testing.allocator.free(bytes);
+        var res = try read(testing.allocator, bytes);
+        defer res.deinit(testing.allocator);
+        try testing.expectEqual(@as(u64, 0), res.missing);
+        total_dropped += res.dropped;
+        total_overflowed += res.overflowed;
+
+        for (res.frames.items) |frame| {
+            total_frames += 1;
+            const tid = std.mem.readInt(u32, frame.payload[0..4], .little);
+            const idx = std.mem.readInt(u64, frame.payload[4..12], .little);
+            try testing.expect(tid < thread_count);
+            try testing.expect(!seen[tid][idx]);
+            seen[tid][idx] = true;
+        }
+    }
+
+    try expectContiguousSegmentIndices(seg_indices.items);
+    try testing.expect(seg_indices.items.len >= minSealedSegments(thread_count * emits_per_thread, payload_len, segment_bytes));
+    try testing.expectEqual(@as(usize, 0), open_count);
+    try testing.expect(total_overflowed > 0);
+    try testing.expectEqual(@as(u64, 0), total_dropped);
+    try testing.expectEqual(@as(u64, thread_count * emits_per_thread), total_frames);
+}
+
+const seal_test_events: u64 = 300;
+const seal_test_tick_every: usize = 50;
+const seal_test_max_extra_ticks: usize = 100;
+
+fn waitForTicks(rec: *Recorder, ticks: u64) !void {
+    while (rec.inner.tick_count.load(.acquire) < ticks) {
+        try std.Thread.yield();
+    }
+}
+
+fn tickAndWait(rec: *Recorder) !void {
+    const before = rec.inner.tick_count.load(.acquire);
+    rec.inner.wake();
+    try waitForTicks(rec, before + 1);
+}
+
+const SegmentTotals = struct {
+    frames: u64,
+    dropped: u64,
+    missing: u64,
+    open_files: u64,
+};
+
+fn totalSegments(dir: std.Io.Dir) !SegmentTotals {
+    var totals: SegmentTotals = .{ .frames = 0, .dropped = 0, .missing = 0, .open_files = 0 };
+    var it = dir.iterate();
+    while (try it.next(testing.io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".open")) totals.open_files += 1;
+        const is_segment = std.mem.endsWith(u8, entry.name, ".seg") or std.mem.endsWith(u8, entry.name, ".open");
+        if (!is_segment) continue;
+        const bytes = try readFileBytes(testing.allocator, dir, testing.io, entry.name);
+        defer testing.allocator.free(bytes);
+        var res = try read(testing.allocator, bytes);
+        defer res.deinit(testing.allocator);
+        totals.frames += res.frames.items.len;
+        totals.dropped += res.dropped;
+        totals.missing += res.missing;
+    }
+    return totals;
+}
+
+test "a failed sync is counted once and later emits still land" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5101,
+        .segment_bytes = 64 * 1024,
+        .fault_once_for_test = .sync,
+    });
+    try waitForTicks(rec, 1);
+    rec.emit(1, 1, "after-failed-sync");
+    rec.emit(1, 1, "after-failed-sync");
+    const stats = rec.stats();
+    rec.stop();
+
+    try testing.expectEqual(@as(u64, 1), stats.sync_failures);
+    try testing.expectEqual(@as(u64, 0), stats.evict_failures);
+    try testing.expectEqual(@as(u64, 0), stats.seal_failures);
+    const totals = try totalSegments(tmp.dir);
+    try testing.expectEqual(@as(u64, 2), totals.frames);
+    try testing.expectEqual(@as(u64, 0), totals.open_files);
+}
+
+test "a failed eviction is counted once and later emits still land" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5102,
+        .segment_bytes = 64 * 1024,
+        .fault_once_for_test = .evict,
+    });
+    try waitForTicks(rec, 1);
+    rec.emit(1, 1, "after-failed-evict");
+    rec.emit(1, 1, "after-failed-evict");
+    const stats = rec.stats();
+    rec.stop();
+
+    try testing.expectEqual(@as(u64, 1), stats.evict_failures);
+    try testing.expectEqual(@as(u64, 0), stats.sync_failures);
+    try testing.expectEqual(@as(u64, 0), stats.seal_failures);
+    const totals = try totalSegments(tmp.dir);
+    try testing.expectEqual(@as(u64, 2), totals.frames);
+    try testing.expectEqual(@as(u64, 0), totals.open_files);
+}
+
+test "a failed seal is counted once, the segment seals later, and no event is lost" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5103,
+        .segment_bytes = 4096,
+        .max_session_bytes = 64 * 1024 * 1024,
+        .fault_once_for_test = .seal,
+    });
+    try waitForTicks(rec, 1);
+    for (0..seal_test_events) |i| {
+        rec.emit(1, 1, "0123456789abcdef0123456789abcdef");
+        if (i % seal_test_tick_every == 0) try tickAndWait(rec);
+    }
+    var extra_ticks: usize = 0;
+    while (rec.stats().seal_failures == 0 and extra_ticks < seal_test_max_extra_ticks) : (extra_ticks += 1) {
+        try tickAndWait(rec);
+    }
+    const stats = rec.stats();
+    rec.stop();
+
+    try testing.expectEqual(@as(u64, 1), stats.seal_failures);
+    try testing.expectEqual(@as(u64, 0), stats.sync_failures);
+    try testing.expectEqual(@as(u64, 0), stats.evict_failures);
+    const totals = try totalSegments(tmp.dir);
+    try testing.expectEqual(seal_test_events, totals.frames + totals.dropped);
+    try testing.expectEqual(@as(u64, 0), totals.open_files);
+}
+
+const prealloc_test_events: u64 = 200;
+
+test "a failed preallocation is counted and the events it cannot hold are counted as dropped" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5104,
+        .segment_bytes = 4096,
+        .fail_prealloc_for_test = true,
+    });
+    try waitForTicks(rec, 1);
+    for (0..prealloc_test_events) |_| {
+        rec.emit(1, 1, "0123456789abcdef0123456789abcdef");
+    }
+    const stats = rec.stats();
+    rec.stop();
+
+    try testing.expect(stats.prealloc_failures >= 1);
+    try testing.expectEqual(@as(u64, 0), stats.sync_failures);
+    try testing.expectEqual(@as(u64, 0), stats.seal_failures);
+    const totals = try totalSegments(tmp.dir);
+    try testing.expect(totals.frames > 0);
+    try testing.expect(totals.dropped > 0);
+    try testing.expectEqual(prealloc_test_events, totals.frames + totals.dropped);
+}
+
+const cap_test_segment_bytes: usize = 4096;
+const cap_test_max_segments: u64 = 3;
+const cap_test_events: usize = 2000;
+
+test "failed seals do not grow the folder past max_session_bytes" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5107,
+        .segment_bytes = cap_test_segment_bytes,
+        .max_session_bytes = cap_test_max_segments * cap_test_segment_bytes,
+        .sync_interval_ms = 5000,
+        .fail_seal_for_test = true,
+    });
+    try waitForTicks(rec, 1);
+    for (0..cap_test_events) |i| {
+        rec.emit(1, 1, "0123456789abcdef0123456789abcdef");
+        if (i % seal_test_tick_every == 0) try tickAndWait(rec);
+    }
+    rec.stop();
+
+    const totals = try totalSegments(tmp.dir);
+    try testing.expect(totals.open_files <= cap_test_max_segments + 2);
+    try testing.expectEqual(@as(u64, cap_test_events), totals.frames + totals.dropped);
+}
+
+const GapTotals = struct {
+    records: u64 = 0,
+    frames: u64 = 0,
+    dropped: u64 = 0,
+    missing: u64 = 0,
+};
+
+fn sumGapRecords(dir: std.Io.Dir) !GapTotals {
+    const GapCounts = struct {
+        frames: u64 = 0,
+        dropped: u64 = 0,
+        missing: u64 = 0,
+    };
+    var totals: GapTotals = .{};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var it = dir.iterate();
+    while (try it.next(testing.io)) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "gap-") or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const bytes = try readFileBytes(arena.allocator(), dir, testing.io, entry.name);
+        const gap = try std.json.parseFromSliceLeaky(GapCounts, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
+        totals.records += 1;
+        totals.frames += gap.frames;
+        totals.dropped += gap.dropped;
+        totals.missing += gap.missing;
+    }
+    return totals;
+}
+
+test "eviction after drops names the dropped count in the gap record" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const payload = "0123456789abcdef0123456789abcdef";
+
+    // Instance A: segment 0 holds 45 frames and drops the other 15, because no next segment is ever prepared.
+    const first = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5201,
+        .segment_bytes = switch_pause_segment_bytes,
+        .fail_prealloc_for_test = true,
+    });
+    while (first.inner.current.load(.acquire) == null) try std.Thread.yield();
+    for (0..60) |_| first.emit(1, 1, payload);
+    first.stop();
+
+    // Instance B: the cap of three segments makes eviction remove A's segment 0, which holds the drops.
+    const second = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5202,
+        .segment_bytes = switch_pause_segment_bytes,
+        .max_session_bytes = 3 * switch_pause_segment_bytes,
+        .sync_interval_ms = 5000,
+    });
+    while (second.inner.next.load(.acquire) == null) try std.Thread.yield();
+    try waitForTicks(second, 1);
+    for (0..50) |_| second.emit(1, 2, payload);
+    try tickAndWait(second);
+    second.stop();
+
+    const segments = try totalSegments(tmp.dir);
+    const gaps = try sumGapRecords(tmp.dir);
+    try testing.expect(gaps.records >= 1);
+    const accounted = segments.frames + segments.dropped + segments.missing +
+        gaps.frames + gaps.dropped + gaps.missing;
+    try testing.expectEqual(@as(u64, 110), accounted);
+}
+
+const SyncCounter = struct {
+    count: std.atomic.Value(u64) = .init(0),
+
+    fn onSync(ctx: ?*anyopaque) void {
+        const self: *SyncCounter = @ptrCast(@alignCast(ctx.?));
+        _ = self.count.fetchAdd(1, .monotonic);
+    }
+};
+
+const sync_burst_wakes: usize = 10;
+
+test "a burst of wakes syncs the current segment at most once per sync interval" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var syncs: SyncCounter = .{};
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5203,
+        .segment_bytes = 64 * 1024,
+        .sync_interval_ms = 60_000,
+        .on_sync_for_test = SyncCounter.onSync,
+        .test_ctx = &syncs,
+    });
+    try waitForTicks(rec, 1);
+    for (0..sync_burst_wakes) |_| try tickAndWait(rec);
+    const sync_count = syncs.count.load(.monotonic);
+    rec.stop();
+
+    try testing.expectEqual(@as(u64, 1), sync_count);
+}
+
+test "a sealed segment the reader cannot parse is evicted with an unreadable gap record" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const payload = "0123456789abcdef0123456789abcdef";
+
+    // A sealed segment whose bytes are not a segment. It is created first, so eviction reaches it first.
+    const corrupt_instance: u64 = 0x5301;
+    var corrupt_name_buf: [segment.name_buf_bytes]u8 = undefined;
+    const corrupt_name = segment.sealedFileName(&corrupt_name_buf, corrupt_instance, 0);
+    var garbage: [switch_pause_segment_bytes]u8 = @splat(0xAB);
+    {
+        var file = try tmp.dir.createFile(testing.io, corrupt_name, .{
+            .read = false,
+            .truncate = true,
+            .exclusive = false,
+            .permissions = .fromMode(0o600),
+        });
+        defer file.close(testing.io);
+        try file.writeStreamingAll(testing.io, &garbage);
+    }
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5302,
+        .segment_bytes = switch_pause_segment_bytes,
+        .max_session_bytes = 3 * switch_pause_segment_bytes,
+        .sync_interval_ms = 5000,
+    });
+    while (rec.inner.next.load(.acquire) == null) try std.Thread.yield();
+    try waitForTicks(rec, 1);
+    for (0..50) |_| rec.emit(1, 2, payload);
+    try tickAndWait(rec);
+    rec.stop();
+
+    try testing.expect(!fileExists(tmp.dir, corrupt_name));
+
+    var gap_name_buf: [segment.name_buf_bytes]u8 = undefined;
+    const gap_name = segment.gapFileName(&gap_name_buf, corrupt_instance, 0);
+    const GapView = struct {
+        reason: []const u8 = "",
+        events: u64 = 0,
+        frames: u64 = 0,
+        dropped: u64 = 0,
+        missing: u64 = 0,
+        bytes: u64 = 0,
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const bytes = try readFileBytes(arena.allocator(), tmp.dir, testing.io, gap_name);
+    const gap = try std.json.parseFromSliceLeaky(GapView, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
+
+    try testing.expectEqualStrings("cap_unreadable", gap.reason);
+    try testing.expectEqual(@as(u64, 0), gap.events);
+    try testing.expectEqual(@as(u64, 0), gap.frames);
+    try testing.expectEqual(@as(u64, 0), gap.dropped);
+    try testing.expectEqual(@as(u64, 0), gap.missing);
+    try testing.expectEqual(@as(u64, switch_pause_segment_bytes), gap.bytes);
+}
+
+test "a session cap below three segments is refused at start" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try testing.expectError(error.SessionCapTooSmall, Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5109,
+        .segment_bytes = 4096,
+        .max_session_bytes = 3 * 4096 - 1,
+    }));
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x510A,
+        .segment_bytes = 4096,
+        .max_session_bytes = 3 * 4096,
+    });
+    rec.stop();
+}
+
+const switch_pause_segment_bytes: usize = 4096;
+/// Frames of a 32-byte payload that fit in a 4096-byte segment: (4096 - 64) / 88 rounded down.
+const switch_pause_frames_per_segment: usize = 45;
+const switch_pause_events: usize = 60;
+const switch_pause_main_events: usize = 5;
+
+/// Holds the first switch winner between its two stores until the test releases it.
+const SwitchPause = struct {
+    consumed: std.atomic.Value(bool) = .init(false),
+    paused: std.atomic.Value(bool) = .init(false),
+    released: std.atomic.Value(bool) = .init(false),
+
+    fn holdFirstSwitch(ctx: ?*anyopaque) void {
+        const self: *SwitchPause = @ptrCast(@alignCast(ctx.?));
+        if (self.consumed.swap(true, .acq_rel)) return;
+        self.paused.store(true, .release);
+        while (!self.released.load(.acquire)) {
+            // A failed yield only skips a scheduling hint, so the pause does not depend on it.
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+const EmitWorker = struct {
+    fn run(rec: *Recorder, count: usize) void {
+        for (0..count) |_| rec.emit(1, 1, "0123456789abcdef0123456789abcdef");
+    }
+};
+
+fn stopWriter(w: *writer.Writer) void {
+    w.stop();
+}
+
+fn waitForFlag(flag: *const std.atomic.Value(bool)) !void {
+    while (!flag.load(.acquire)) try std.Thread.yield();
+}
+
+test "a switch paused before its next store still lets the recorder prepare the successor" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var pause: SwitchPause = .{};
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x510B,
+        .segment_bytes = switch_pause_segment_bytes,
+        .sync_interval_ms = 5000,
+        .on_switch_gap_for_test = SwitchPause.holdFirstSwitch,
+        .test_ctx = &pause,
+    });
+    while (rec.inner.next.load(.acquire) == null) try std.Thread.yield();
+    // The first tick may still be finishing its seal and sync steps, so wait for it to end before the paused tick.
+    try waitForTicks(rec, 1);
+
+    const worker = try std.Thread.spawn(.{}, EmitWorker.run, .{ rec, switch_pause_events });
+    errdefer {
+        pause.released.store(true, .release);
+        worker.join();
+        rec.stop();
+    }
+    try waitForFlag(&pause.paused);
+    try tickAndWait(rec);
+
+    const current = rec.inner.current.load(.acquire) orelse return error.NoCurrentSegment;
+    const next = rec.inner.next.load(.acquire) orelse return error.NoNextSegment;
+    try testing.expect(next != current);
+
+    pause.released.store(true, .release);
+    worker.join();
+    const stats = rec.stats();
+    rec.stop();
+
+    const totals = try totalSegments(tmp.dir);
+    try testing.expectEqual(@as(u64, switch_pause_events), totals.frames + totals.dropped + stats.startup_dropped);
+}
+
+test "stopping while a switch is paused before its next store keeps the current segment's frames" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var pause: SwitchPause = .{};
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x510C,
+        .segment_bytes = switch_pause_segment_bytes,
+        .sync_interval_ms = 5000,
+        .on_switch_gap_for_test = SwitchPause.holdFirstSwitch,
+        .test_ctx = &pause,
+    });
+    while (rec.inner.next.load(.acquire) == null) try std.Thread.yield();
+
+    const worker = try std.Thread.spawn(.{}, EmitWorker.run, .{ rec, switch_pause_events });
+    try waitForFlag(&pause.paused);
+    for (0..switch_pause_main_events) |_| {
+        rec.emit(1, 2, "0123456789abcdef0123456789abcdef");
+    }
+
+    // The stop takes `next` out, then waits for the paused switch to finish with its segment.
+    const stopper = try std.Thread.spawn(.{}, stopWriter, .{&rec.inner});
+    while (rec.inner.next.load(.acquire) != null) try std.Thread.yield();
+    pause.released.store(true, .release);
+    worker.join();
+    stopper.join();
+
+    const stats = rec.stats();
+    testing.allocator.destroy(rec);
+
+    const totals = try totalSegments(tmp.dir);
+    try testing.expectEqual(
+        @as(u64, switch_pause_events + switch_pause_main_events),
+        totals.frames + totals.dropped + stats.startup_dropped,
+    );
+}
+
+/// Holds the recorder inside `sealReadySegments`, between its two loads, once the test arms it.
+const ScanPause = struct {
+    armed: std.atomic.Value(bool) = .init(false),
+    paused: std.atomic.Value(bool) = .init(false),
+    released: std.atomic.Value(bool) = .init(false),
+
+    fn holdArmedScan(ctx: ?*anyopaque) void {
+        const self: *ScanPause = @ptrCast(@alignCast(ctx.?));
+        if (!self.armed.load(.acquire)) return;
+        if (self.paused.swap(true, .acq_rel)) return;
+        while (!self.released.load(.acquire)) {
+            // A failed yield only skips a scheduling hint, so the pause does not depend on it.
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+fn fileExists(dir: std.Io.Dir, name: []const u8) bool {
+    _ = dir.statFile(testing.io, name, .{}) catch return false;
+    return true;
+}
+
+test "a seal scan never seals the segment a switch made current between its two loads" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const instance: u64 = 0x510D;
+    var pause: ScanPause = .{};
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = instance,
+        .segment_bytes = switch_pause_segment_bytes,
+        .sync_interval_ms = 5000,
+        .on_seal_scan_for_test = ScanPause.holdArmedScan,
+        .test_ctx = &pause,
+    });
+    while (rec.inner.next.load(.acquire) == null) try std.Thread.yield();
+    try waitForTicks(rec, 1);
+
+    const ticks_before_scan = rec.inner.tick_count.load(.acquire);
+    pause.armed.store(true, .release);
+    rec.inner.wake();
+    try waitForFlag(&pause.paused);
+
+    // This thread's emits fill segment 0 and switch to the prepared segment 1 while the recorder is held.
+    for (0..switch_pause_frames_per_segment + 1) |_| {
+        rec.emit(1, 1, "0123456789abcdef0123456789abcdef");
+    }
+    pause.released.store(true, .release);
+    try waitForTicks(rec, ticks_before_scan + 1);
+
+    var open_name_buf: [segment.name_buf_bytes]u8 = undefined;
+    const current_open_name = segment.openFileName(&open_name_buf, instance, 1);
+    if (!fileExists(tmp.dir, current_open_name)) {
+        // Stop before any emit: the segment is already sealed and unmapped, so writing to it would crash.
+        rec.stop();
+        return error.CurrentSegmentSealed;
+    }
+
+    for (0..switch_pause_main_events) |_| {
+        rec.emit(1, 2, "0123456789abcdef0123456789abcdef");
+    }
+    const stats = rec.stats();
+    rec.stop();
+
+    const totals = try totalSegments(tmp.dir);
+    try testing.expectEqual(
+        @as(u64, switch_pause_frames_per_segment + 1 + switch_pause_main_events),
+        totals.frames + totals.dropped + stats.startup_dropped,
+    );
+}
+
+test "a recorder whose io cannot run concurrent tasks fails to start and frees its buffers" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    try testing.expectError(error.ConcurrencyUnavailable, Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = threaded.io(),
+        .instance = 0x5108,
+    }));
+}
+
+test "events emitted before segment 0 exists are counted in stats once the startup buffer is full" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var rec: Recorder = undefined;
+    try rec.inner.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5106,
+        .segment_bytes = 4096,
+        .fail_prealloc_from_index = 0,
+    });
+    const emitted: u64 = 200;
+    for (0..emitted) |_| {
+        rec.emit(1, 1, "0123456789abcdef0123456789abcdef");
+    }
+    rec.inner.stop();
+
+    const stats = rec.stats();
+    const buffered: u64 = rec.inner.startup_count;
+    try testing.expect(stats.startup_dropped > 0);
+    try testing.expectEqual(emitted, buffered + stats.startup_dropped);
+}
+
+test "a failed seal at stop is counted, and its events stay readable in the open file" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5105,
+        .segment_bytes = 64 * 1024,
+        .fault_once_for_test = .seal,
+    });
+    try waitForTicks(rec, 1);
+    rec.emit(1, 1, "stop-time-seal");
+    rec.emit(1, 1, "stop-time-seal");
+
+    // Stop the writer directly so the stats are read after the stop-time seal and before the recorder is freed.
+    rec.inner.stop();
+    const stats = rec.stats();
+    testing.allocator.destroy(rec);
+
+    try testing.expectEqual(@as(u64, 1), stats.seal_failures);
+    try testing.expectEqual(@as(u64, 0), stats.sync_failures);
+    const totals = try totalSegments(tmp.dir);
+    try testing.expectEqual(@as(u64, 1), totals.open_files);
+
+    const bytes = try readFileBytes(testing.allocator, tmp.dir, testing.io, "0000000000005105-00000000.open");
+    defer testing.allocator.free(bytes);
+    var res = try read(testing.allocator, bytes);
+    defer res.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), res.frames.items.len);
+}
+
+test {
+    _ = @import("format.zig");
+    _ = @import("reader.zig");
+    _ = @import("segment.zig");
+    _ = @import("writer.zig");
+}
