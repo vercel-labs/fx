@@ -515,7 +515,7 @@ test "compact status line menu anchors options and prioritizes the selected tiny
     defer wide.deinit(std.testing.allocator);
     const medium_option = std.mem.find(u8, medium.items, "off") orelse return error.TestExpectedOption;
     const wide_option = std.mem.find(u8, wide.items, "off") orelse return error.TestExpectedOption;
-    const expected_column = 2 + display_width.visibleWidth("Workspace") + 4;
+    const expected_column = 2 + display_width.visibleWidth("Session usage") + 4;
     try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(medium.items[0..medium_option]));
     try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(wide.items[0..wide_option]));
 }

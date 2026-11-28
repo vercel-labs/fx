@@ -862,6 +862,7 @@ pub fn Runtime(comptime App: type) type {
             agent.total_input_tokens = 0;
             agent.total_output_tokens = 0;
             agent.total_web_search_requests = 0;
+            agents.restoreSessionUsage(agent, .{});
             if (comptime runtime_profile.allows(App, .js_host_sessions)) {
                 try beginFreshJsHostSession(app, agent, carried);
             }
@@ -2411,6 +2412,7 @@ pub fn Runtime(comptime App: type) type {
             agents.storeTotal(&agent.total_input_tokens, state.total_input_tokens);
             agents.storeTotal(&agent.total_output_tokens, state.total_output_tokens);
             agents.storeTotal(&agent.total_web_search_requests, 0);
+            agents.restoreSessionUsage(agent, state.session_usage);
         }
 
         fn hydrateResumedSession(
@@ -2442,6 +2444,7 @@ pub fn Runtime(comptime App: type) type {
             agents.storeTotal(&agent.total_input_tokens, state.total_input_tokens);
             agents.storeTotal(&agent.total_output_tokens, state.total_output_tokens);
             agents.storeTotal(&agent.total_web_search_requests, 0);
+            agents.restoreSessionUsage(agent, state.session_usage);
 
             var historical_labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer historical_labels.deinit(app.alloc);
@@ -3169,11 +3172,11 @@ pub fn Runtime(comptime App: type) type {
 
         /// `AgentRuntimeDeps.record_usage` on v2: each reply's usage
         /// reaches the log as it arrives (D92).
-        pub fn recordUsage(agent: *AppAgent, usage: types.Usage) !void {
+        pub fn recordUsage(agent: *AppAgent, step: types.StepUsage) !void {
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = agent.session_persistence.v2 orelse return;
-            try v2.recordUsage(usage);
+            try v2.recordUsage(step);
         }
 
         /// What a workspace capture of `agent`'s session needs, or null when

@@ -143,6 +143,7 @@ const Writable = enum {
     @"sound.turn_end",
     @"status_line.context",
     @"status_line.session",
+    @"status_line.session_usage",
     @"status_line.workspace",
     theme,
     ultrafast_mode,
@@ -246,6 +247,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .@"sound.turn_end" => patch.notification_turn_end = enabled,
         .@"status_line.context" => patch.statusline_item = .{ .item = .context, .enabled = enabled },
         .@"status_line.session" => patch.statusline_item = .{ .item = .session, .enabled = enabled },
+        .@"status_line.session_usage" => patch.statusline_item = .{ .item = .session_usage, .enabled = enabled },
         .@"status_line.workspace" => patch.statusline_item = .{ .item = .workspace, .enabled = enabled },
         .ultrafast_mode => patch.ultrafast_mode = enabled,
         .effort, .update_channel, .theme, .max_agent_steps, .max_tool_result_bytes, .auto_compact_percent => unreachable,
@@ -376,7 +378,7 @@ fn ownerHint(key: []const u8) []const u8 {
         .{ .keys = &.{"context_limits"}, .hint = profile_paths.displayText("use --context-limit for one run, or edit ~/.fx/settings.json") },
         .{ .keys = &.{"provider_order"}, .hint = profile_paths.displayText("use --provider-order for one run, or edit ~/.fx/settings.json") },
         .{ .keys = &.{ "yolo_acknowledged", "fast_mode_model_bound", "skill_match_fuzzy" }, .hint = "fx manages it" },
-        .{ .keys = &.{"status_line"}, .hint = "set status_line.context, status_line.session, or status_line.workspace" },
+        .{ .keys = &.{"status_line"}, .hint = "set status_line.context, status_line.session, status_line.session_usage, or status_line.workspace" },
         .{ .keys = &.{"sound"}, .hint = "set sound.turn_end, sound.attention_required, or sound.max" },
         .{ .keys = &.{"prompt_history"}, .hint = "set prompt_history.enabled" },
         .{ .keys = &.{"tool_placement"}, .hint = "set tool_placement.<tool> to toolbox or direct, for one of " ++ config_runtime.tool_placement.movable_list },
@@ -565,8 +567,8 @@ pub const resolved_keys = [_][]const u8{
     "provider_order",                 "provider_strict",                "review_model",
     "session_titles",                 "slash_menu_categories",          "sound.attention_required",
     "sound.max",                      "sound.turn_end",                 "status_line.context",
-    "status_line.session",            "status_line.workspace",          "theme",
-    "ultrafast_mode",                 "update_channel",
+    "status_line.session",            "status_line.session_usage",      "status_line.workspace",
+    "theme",                          "ultrafast_mode",                 "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -621,6 +623,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "sound.turn_end")) return boolean(state.notification_turn_end);
     if (eql(u8, key, "status_line.context")) return boolean(state.statusline_context);
     if (eql(u8, key, "status_line.session")) return boolean(state.statusline_session);
+    if (eql(u8, key, "status_line.session_usage")) return boolean(state.statusline_session_usage);
     if (eql(u8, key, "status_line.workspace")) return boolean(state.statusline_workspace);
     if (eql(u8, key, "theme")) {
         if (app_lifecycle.themeEnvOverride()) |value| return string(value);
