@@ -61,6 +61,7 @@ const session_display_metadata = @import("session_display_metadata.zig");
 const session_store = @import("session_store.zig");
 const session_summary_codec = @import("session_summary_codec.zig");
 const v1_conversion = @import("v1_conversion.zig");
+const session_catalog_cache = @import("session_catalog_cache.zig");
 const child_state = @import("../subagent/child_state.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const artifact_digest = @import("artifact_digest.zig");
@@ -616,6 +617,37 @@ pub fn listPage(
     continuation: ?session_store.ResumableSessionContinuation,
     limit: usize,
 ) !session_store.SessionListPage {
+    var v1_roots = try readV1Roots(store, alloc);
+    defer v1_roots.deinit(alloc);
+    return listPageWithV1Roots(store, alloc, &v1_roots, workspace, continuation, limit);
+}
+
+/// v1's roots not converted yet (D59), newest first. One read serves every
+/// page of a listing. Free with `deinit`.
+pub const V1Roots = struct {
+    catalog: session_catalog_cache.ActionableSessionCatalog,
+
+    pub fn deinit(roots: *V1Roots, alloc: Allocator) void {
+        roots.catalog.deinit(alloc);
+    }
+};
+
+/// Reads v1's roots, sorted newest first. Caller owns the result.
+pub fn readV1Roots(store: *Store, alloc: Allocator) !V1Roots {
+    const catalog = try v1_conversion.listRoots(alloc, store.home, null);
+    session_summary_codec.sortSummariesNewestFirst(catalog.summaries.items);
+    return .{ .catalog = catalog };
+}
+
+/// `listPage` on roots read before, so the pages of one listing share one read of v1's folder.
+pub fn listPageWithV1Roots(
+    store: *Store,
+    alloc: Allocator,
+    v1_roots: *const V1Roots,
+    workspace: ?[]const u8,
+    continuation: ?session_store.ResumableSessionContinuation,
+    limit: usize,
+) !session_store.SessionListPage {
     if (limit == 0 or limit > session_store.session_list_max_limit) return error.InvalidSessionListLimit;
     var candidates: std.ArrayList(session_store.SessionSummary) = .empty;
     defer {
@@ -626,11 +658,8 @@ pub fn listPage(
     session_summary_codec.sortSummariesNewestFirst(candidates.items);
     const v2_count = candidates.items.len;
 
-    var v1_roots = try v1_conversion.listRoots(alloc, store.home, null);
-    defer v1_roots.deinit(alloc);
-    session_summary_codec.sortSummariesNewestFirst(v1_roots.summaries.items);
     var added: usize = 0;
-    for (v1_roots.summaries.items) |summary| {
+    for (v1_roots.catalog.summaries.items) |summary| {
         if (workspace) |root| if (!std.mem.eql(u8, summary.workspace_root orelse continue, root)) continue;
         if (continuation) |position| if (!session_summary_codec.summaryFollowsContinuation(summary, position)) continue;
         // After `limit` newer ones, this one and every later one is off the page.
@@ -646,7 +675,7 @@ pub fn listPage(
     // workspace is unknown, and counts them as v1 did; the profile-wide
     // listing shows them instead (D61).
     if (workspace != null and continuation == null) {
-        for (v1_roots.summaries.items) |summary| {
+        for (v1_roots.catalog.summaries.items) |summary| {
             if (summary.workspace_root == null) page.skipped_invalid += 1;
         }
     }
