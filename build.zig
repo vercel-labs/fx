@@ -610,7 +610,7 @@ fn readGoogleOAuthClientSecret(b: *std.Build) []const u8 {
     const value = b.option(
         []const u8,
         "google-oauth-client-secret",
-        "fx's Google Desktop OAuth client secret, for Google AI Ultra plan sign-in",
+        "fx's Google Desktop OAuth client secret, for Google AI Pro or Ultra plan sign-in",
     ) orelse b.graph.environ_map.get("FX_GOOGLE_OAUTH_CLIENT_SECRET") orelse readGoogleOAuthClientSecretFile(b);
     return std.mem.trim(u8, value, " \t\r\n");
 }

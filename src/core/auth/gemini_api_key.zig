@@ -67,12 +67,15 @@ pub fn load(alloc: Allocator) host.SecretStoreLoadError!?[]u8 {
 
 pub fn save(alloc: Allocator, value: []const u8) host.SecretStoreWriteError!void {
     if (comptime host_target.is_wasm) return error.StoredKeyWriteFailed;
-    if (value.len == 0 or value.len > max_key_file_bytes) return error.StoredKeyWriteFailed;
+    // A pasted key often carries a newline or spaces; loads trim the same way,
+    // so a key that is only whitespace would save but never load.
+    const key = std.mem.trim(u8, value, " \t\r\n");
+    if (key.len == 0 or key.len > max_key_file_bytes) return error.StoredKeyWriteFailed;
     if (usesKeychain()) {
-        native_keychain.storeGeminiApiKey(value) catch |err| return writeFailed("keychain", err);
+        native_keychain.storeGeminiApiKey(key) catch |err| return writeFailed("keychain", err);
         return;
     }
-    return storeInProfile(alloc, value);
+    return storeInProfile(alloc, key);
 }
 
 pub fn delete(alloc: Allocator) host.SecretStoreWriteError!bool {
@@ -328,7 +331,7 @@ test "gemini key file refusal stays distinguishable from absence" {
     try std.testing.expect((try load(alloc)) == null);
 }
 
-test "gemini key file tolerates a trailing newline and rejects an empty value" {
+test "gemini key save trims the key and refuses an empty or whitespace-only value" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -337,15 +340,19 @@ test "gemini key file tolerates a trailing newline and rejects an empty value" {
     const env = try TestEnv.install(alloc, home);
     defer env.deinit();
 
-    try save(alloc, "hand-edited-gemini-key\n");
+    try save(alloc, "  hand-edited-gemini-key\n");
+    const file_bytes = try tmp.dir.readFileAlloc(std.testing.io, ".fx/" ++ profile_paths.gemini_api_key_file_name, alloc, .limited(256));
+    defer alloc.free(file_bytes);
+    try std.testing.expectEqualStrings("hand-edited-gemini-key", file_bytes);
+
+    try std.testing.expectError(error.StoredKeyWriteFailed, save(alloc, ""));
+    try std.testing.expectError(error.StoredKeyWriteFailed, save(alloc, "   "));
+    try std.testing.expectError(error.StoredKeyWriteFailed, save(alloc, "\n\n"));
+
+    // A refused paste keeps the key that was already saved.
     const read_back = (try load(alloc)) orelse return error.TestUnexpectedMissingGeminiKey;
     defer secret.zeroAndFree(alloc, read_back);
     try std.testing.expectEqualStrings("hand-edited-gemini-key", read_back);
-
-    try save(alloc, "\n\n");
-    try std.testing.expect((try load(alloc)) == null);
-
-    try std.testing.expectError(error.StoredKeyWriteFailed, save(alloc, ""));
 }
 
 test "gemini key backend selection uses keychain on macos only when enabled" {
@@ -374,8 +381,9 @@ test "gemini key presence treats whitespace-only and newline-only files as missi
     const env = try TestEnv.install(alloc, home);
     defer env.deinit();
 
+    // `save` refuses these values, so write the file as a hand edit would.
     for ([_][]const u8{ "\n\n", "  \t \r\n " }) |blank| {
-        try save(alloc, blank);
+        try storeInProfile(alloc, blank);
         try std.testing.expectEqual(host.SecretStorePresence.missing, presence());
         try std.testing.expect((try load(alloc)) == null);
     }
