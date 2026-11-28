@@ -12,7 +12,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
+import {
+  cleanupIsolatedTestHome,
+  createIsolatedTestHome,
+  FX_BIN,
+  HAS_API_KEY,
+} from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -26,6 +31,7 @@ import { ignoresFileModes } from "./file-modes";
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
 const TIMEOUT = 30_000;
+const MODERN_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
 
 /// Whether `chflags` can make a file immutable here, as macOS can and Linux
 /// cannot without root.
@@ -66,7 +72,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 40", 5_000);
+      const pane = await session.waitForText("Commands 41", 5_000);
       expect(pane).toContain("[All]");
       expect(pane).toContain("tab category");
       expect(pane).toContain("enter open");
@@ -1528,6 +1534,336 @@ describe.skipIf(SKIP_TMUX)("tui: theme notifications", () => {
           session = null;
         }
         rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+describe.skipIf(!tmuxAvailable())("tui: a new folder opens straight to the composer", () => {
+  let gatewayToStop: { stop: () => void } | null = null;
+
+  afterEach(() => {
+    gatewayToStop?.stop();
+    gatewayToStop = null;
+  });
+
+  test(
+    "a new repository sends the launch prompt and starts profile MCP servers at once, and holds an unapproved project server",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-folder-prompt-")));
+      const home = realpathSync(createIsolatedTestHome());
+      const repo = join(root, "repo");
+      const stderrPath = join(root, "stderr.log");
+      const profilePidPath = join(repo, "profile-mcp.pid");
+      const profileWireLogPath = join(repo, "profile-mcp-wire.jsonl");
+      const projectPidPath = join(repo, "project-mcp.pid");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(repo, ".fx", "skills", "hello"), { recursive: true });
+      execFileSync("git", ["init"], { cwd: repo, stdio: "pipe" });
+      writeFileSync(join(repo, "AGENTS.md"), "# Project instructions\n");
+      writeFileSync(
+        join(repo, ".fx", "skills", "hello", "SKILL.md"),
+        "---\nname: hello\ndescription: Says hello\n---\nSay hello.\n",
+      );
+      writeFileSync(
+        join(home, ".fx", "mcp.json"),
+        `${JSON.stringify({
+          mcp: {
+            profile: {
+              type: "local",
+              command: [process.execPath, MODERN_FIXTURE],
+              enabled: true,
+              environment: {
+                FX_MCP_WIRE_LOG: profileWireLogPath,
+                FX_MCP_PID_PATH: profilePidPath,
+                FX_MCP_MODE: "normal",
+              },
+            },
+          },
+        })}\n`,
+      );
+      writeFileSync(
+        join(repo, ".mcp.json"),
+        `${JSON.stringify({
+          mcpServers: {
+            project: {
+              command: process.execPath,
+              args: [MODERN_FIXTURE],
+              env: { FX_MCP_PID_PATH: projectPidPath, FX_MCP_MODE: "normal" },
+            },
+          },
+        })}\n`,
+      );
+      writeFileSync(stderrPath, "");
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("NEW_FOLDER_OK"));
+      gatewayToStop = gateway;
+      const quotedFx = `'${FX_BIN.replaceAll("'", "'\\''")}'`;
+
+      try {
+        session = await TmuxSession.create({
+          cmd: `${quotedFx} "say hi"`,
+          cwd: repo,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "new-folder-fixture-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+
+        await session.waitForText("NEW_FOLDER_OK", 15_000);
+        expect(gateway.requestCount()).toBe(1);
+        expect(gateway.requests[0]!.body).toContain("say hi");
+        const grid = await session.capturePaneGrid();
+        expect(grid.join("\n")).not.toContain("Folder access");
+
+        await session.waitForPane(
+          () =>
+            existsSync(profilePidPath) &&
+            existsSync(profileWireLogPath) &&
+            readFileSync(profileWireLogPath, "utf8").includes("\"tools/list\""),
+          10_000,
+        );
+        expect(existsSync(projectPidPath)).toBe(false);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the home folder opens straight to the composer",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-folder-home-")));
+      const home = realpathSync(createIsolatedTestHome());
+      const stderrPath = join(root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: home,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+          },
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+
+        await session.waitForComposer(15_000);
+        const grid = await session.capturePaneGrid();
+        expect(grid.join("\n")).not.toContain("Folder access");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  const TRUST_LINE =
+    "This repo contains .mcp.json – it's ignored until you trust this folder. Run /trust.";
+
+  function writeTrustRepo(repo: string, pidPath: string, wireLogPath: string): void {
+    mkdirSync(repo);
+    execFileSync("git", ["init"], { cwd: repo, stdio: "pipe" });
+    writeFileSync(
+      join(repo, ".mcp.json"),
+      `${JSON.stringify({
+        mcpServers: {
+          project: {
+            command: process.execPath,
+            args: [MODERN_FIXTURE],
+            env: {
+              FX_MCP_PID_PATH: pidPath,
+              FX_MCP_WIRE_LOG: wireLogPath,
+              FX_MCP_MODE: "normal",
+            },
+          },
+        },
+      })}\n`,
+    );
+  }
+
+  function startTrustSession(repo: string, home: string, stderrPath: string): Promise<TmuxSession> {
+    return TmuxSession.create({
+      cwd: repo,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
+      },
+      stderrPath,
+      width: 120,
+      height: 30,
+    });
+  }
+
+  function projectServerStarted(pidPath: string, wireLogPath: string): boolean {
+    return existsSync(pidPath) &&
+      existsSync(wireLogPath) &&
+      readFileSync(wireLogPath, "utf8").includes("\"tools/list\"");
+  }
+
+  function trustSaved(settingsPath: string, repoKey: string): boolean {
+    if (!existsSync(settingsPath)) return false;
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    return settings.workspaces?.[repoKey]?.enableAllProjectMcpServers === true;
+  }
+
+  test(
+    "a repo's .mcp.json waits for /trust, which starts it and is remembered",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-trust-remember-")));
+      const home = realpathSync(createIsolatedTestHome());
+      const repo = join(root, "repo");
+      const stderrPath = join(root, "stderr.log");
+      const restartStderrPath = join(root, "restart-stderr.log");
+      const pidPath = join(repo, "project-mcp.pid");
+      const wireLogPath = join(repo, "project-mcp-wire.jsonl");
+      const settingsPath = join(home, ".fx", "settings.json");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      writeTrustRepo(repo, pidPath, wireLogPath);
+      const repoKey = realpathSync(repo);
+      writeFileSync(stderrPath, "");
+      writeFileSync(restartStderrPath, "");
+
+      try {
+        session = await startTrustSession(repo, home, stderrPath);
+        await session.waitForComposer(15_000);
+        const pane = await session.waitForText(TRUST_LINE, 15_000);
+        expect(hasEmptyComposer(pane)).toBe(true);
+        const grid = await session.capturePaneGrid();
+        expect(grid.filter((line) => line.includes(TRUST_LINE))).toHaveLength(1);
+        expect(existsSync(pidPath)).toBe(false);
+
+        await session.sendText("/trust");
+        await session.waitForPane(
+          () => trustSaved(settingsPath, repoKey) && projectServerStarted(pidPath, wireLogPath),
+          15_000,
+        );
+        const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+        expect(settings.workspaces[repoKey].enableAllProjectMcpServers).toBe(true);
+        await session.kill();
+        session = null;
+        rmSync(pidPath, { force: true });
+        rmSync(wireLogPath, { force: true });
+
+        session = await startTrustSession(repo, home, restartStderrPath);
+        await session.waitForComposer(15_000);
+        await session.waitForPane(() => projectServerStarted(pidPath, wireLogPath), 15_000);
+        const restartGrid = await session.capturePaneGrid();
+        expect(restartGrid.join("\n")).not.toContain("This repo contains .mcp.json");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(readFileSync(restartStderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/trust in a folder without .mcp.json servers saves nothing",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-trust-no-servers-")));
+      const home = realpathSync(createIsolatedTestHome());
+      const repo = join(root, "repo");
+      const stderrPath = join(root, "stderr.log");
+      const settingsPath = join(home, ".fx", "settings.json");
+      mkdirSync(repo);
+      execFileSync("git", ["init"], { cwd: repo, stdio: "pipe" });
+      const repoKey = realpathSync(repo);
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await startTrustSession(repo, home, stderrPath);
+        await session.waitForComposer(15_000);
+        const grid = await session.capturePaneGrid();
+        expect(grid.join("\n")).not.toContain("This repo contains .mcp.json");
+
+        await session.sendText("/trust");
+        await session.waitForText("This folder's .mcp.json has no servers to trust.", 15_000);
+        expect(trustSaved(settingsPath, repoKey)).toBe(false);
+        if (existsSync(settingsPath)) {
+          const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+          expect(settings.workspaces?.[repoKey]?.enableAllProjectMcpServers).toBeUndefined();
+        }
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Ctrl+C exits at startup",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-trust-ctrl-c-")));
+      const home = realpathSync(createIsolatedTestHome());
+      const repo = join(root, "repo");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      writeTrustRepo(repo, join(repo, "project-mcp.pid"), join(repo, "project-mcp-wire.jsonl"));
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await startTrustSession(repo, home, stderrPath);
+        await session.waitForComposer(15_000);
+        await session.sendKeys("C-c");
+        await session.waitForText("press ctrl+c again to exit", 5_000);
+        await session.sendKeys("C-c");
+        expect(await session.waitForSessionEnd(10_000)).toBe(true);
+        expect(session.recordedExitStatus()).toBe(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+        cleanupIsolatedTestHome(home);
       }
     },
     TIMEOUT,

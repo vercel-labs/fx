@@ -9,6 +9,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const workspace_config = @import("../mcp/workspace_config.zig");
 const mcp_host = @import("../mcp_host/host.zig");
+const mcp_config = @import("../mcp_host/config.zig");
 const catalog_state = @import("../mcp/catalog_state.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_menu = @import("../mcp_host/menu.zig");
@@ -145,7 +146,8 @@ pub const State = struct {
     /// Set by process-exit teardown before it joins a pending reload, so the
     /// reload discards its candidate runtime without grace or session DELETEs.
     process_exiting: std.atomic.Value(bool) = .init(false),
-    held_for_trust: bool = false,
+    /// Whether the startup notice for held project MCP servers has been checked.
+    trust_line_checked: bool = false,
 
     /// Loads the host at startup with `load`, which reloads use too. The host's
     /// lifecycle is modeled in `tests/tla/mcp_host/HostLifecycle.tla`.
@@ -285,21 +287,10 @@ pub const State = struct {
         self.host_status_at_ms = 0;
     }
 
-    pub fn holdForTrust(self: *State) void {
-        self.held_for_trust = true;
-    }
-
-    pub fn releaseTrustHold(self: *State) void {
-        self.held_for_trust = false;
-        self.startHostServers();
-    }
-
     /// Starts every server in the background, so each is ready before it's
     /// needed. Nothing waits: the host's own thread connects them, and quitting
     /// still signals them all at once.
     pub fn startHostServers(self: *State) void {
-        // Servers wait for the folder access answer (`tests/tla/workspace_trust/WorkspaceTrust.tla` ConsentBeforeSession).
-        if (self.held_for_trust) return;
         const lease = self.leaseHost() orelse return;
         defer lease.deinit();
         self.host_started_ms = io_mod.milliTimestamp();
@@ -1171,7 +1162,168 @@ pub const State = struct {
         self.destroyHost();
         self.* = .{};
     }
+
+    /// Returns the one-time startup notice when the first loaded config holds
+    /// at least one project server for approval in a trustable folder; null on
+    /// every later check or in a special folder.
+    pub fn takeStartupTrustNotice(self: *State, alloc: Allocator, workspace_root: []const u8) Allocator.Error!?[]const u8 {
+        if (self.trust_line_checked) return null;
+        const lease = self.leaseHost() orelse {
+            if (self.host_load != null) self.trust_line_checked = true;
+            return null;
+        };
+        defer lease.deinit();
+        self.trust_line_checked = true;
+        const servers = lease.host.runtime.servers();
+        if (!needsTrustLine(servers)) return null;
+        var paths = try resolveTrustPaths(alloc);
+        defer paths.deinit(alloc);
+        if (trustRefusal(workspace_root, paths.home, paths.profile_root, servers) != null) return null;
+        return startup_trust_notice;
+    }
 };
+
+pub const startup_trust_notice = "This repo contains .mcp.json – it's ignored until you trust this folder. Run /trust.";
+
+pub const TrustRefusal = enum { special_folder, no_servers };
+
+pub fn trustRefusal(
+    workspace_root: []const u8,
+    home: ?[]const u8,
+    profile_root: ?[]const u8,
+    servers: []const mcp_config.Server,
+) ?TrustRefusal {
+    const ws = trimTrailingSlashes(workspace_root);
+    if (std.mem.eql(u8, ws, "/")) return .special_folder;
+    if (home) |h| {
+        if (isStrictParent(ws, trimTrailingSlashes(h))) return .special_folder;
+    }
+    if (profile_root) |p| {
+        if (isSameOrInside(trimTrailingSlashes(p), ws)) return .special_folder;
+    }
+    for (servers) |s| {
+        if (s.source == .workspace) return null;
+    }
+    return .no_servers;
+}
+
+fn trimTrailingSlashes(path: []const u8) []const u8 {
+    if (path.len == 0) return "";
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    return if (trimmed.len == 0) "/" else trimmed;
+}
+
+fn isSameOrInside(root: []const u8, candidate: []const u8) bool {
+    if (root.len == 0 or candidate.len == 0) return false;
+    if (std.mem.eql(u8, root, "/")) return candidate[0] == '/';
+    if (std.mem.eql(u8, root, candidate)) return true;
+    return candidate.len > root.len and
+        std.mem.startsWith(u8, candidate, root) and
+        candidate[root.len] == '/';
+}
+
+fn isStrictParent(parent: []const u8, child: []const u8) bool {
+    if (std.mem.eql(u8, parent, child)) return false;
+    return isSameOrInside(parent, child);
+}
+
+const TrustPaths = struct {
+    home: ?[]u8 = null,
+    profile_root: ?[]u8 = null,
+
+    fn deinit(self: TrustPaths, alloc: Allocator) void {
+        if (self.home) |h| alloc.free(h);
+        if (self.profile_root) |p| alloc.free(p);
+    }
+};
+
+fn realpathOrFallback(alloc: Allocator, path: []const u8) Allocator.Error![]u8 {
+    return io_mod.realpathAlloc(alloc, path) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => alloc.dupe(u8, path),
+    };
+}
+
+fn resolveTrustPaths(alloc: Allocator) Allocator.Error!TrustPaths {
+    const home = if (io_mod.homeDir()) |h| try realpathOrFallback(alloc, h) else null;
+    errdefer if (home) |h| alloc.free(h);
+
+    const raw_profile = (try profile_paths.activeRoot(alloc, home)) orelse {
+        return .{ .home = home, .profile_root = null };
+    };
+    defer alloc.free(raw_profile);
+
+    const profile_root = io_mod.realpathAlloc(alloc, raw_profile) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => blk: {
+            const real_parent = try realpathOrFallback(alloc, profile_paths.rootParent(home orelse ""));
+            defer alloc.free(real_parent);
+            break :blk try std.Io.Dir.path.join(alloc, &.{ real_parent, profile_paths.rootName() });
+        },
+    };
+    return .{ .home = home, .profile_root = profile_root };
+}
+
+pub fn needsTrustLine(servers: []const mcp_config.Server) bool {
+    for (servers) |s| {
+        if (s.source == .workspace and s.held == .waiting_for_approval) return true;
+    }
+    return false;
+}
+
+pub fn trustFolder(app: anytype) !void {
+    const refusal = blk: {
+        const lease = app.mcp.leaseHost();
+        defer if (lease) |l| l.deinit();
+        const servers: []const mcp_config.Server = if (lease) |l| l.host.runtime.servers() else &.{};
+        var paths = try resolveTrustPaths(app.alloc);
+        defer paths.deinit(app.alloc);
+        break :blk trustRefusal(app.workspace_root, paths.home, paths.profile_root, servers);
+    };
+    if (refusal) |r| {
+        try writeTrustRefusal(app, r);
+        return;
+    }
+    try trustFolderWithAttempt(app, config_runtime.attemptProjectMcpMutation(app.alloc, app.workspace_root, .approve_all));
+}
+
+pub fn writeTrustRefusal(app: anytype, refusal: TrustRefusal) !void {
+    try app.writeDomainNotice(.{
+        .topic = "mcp",
+        .tone = .neutral,
+        .body = switch (refusal) {
+            .special_folder => "fx doesn't trust this folder as a whole. Approve one server with /mcp approve NAME.",
+            .no_servers => "This folder's .mcp.json has no servers to trust.",
+        },
+    }, true);
+}
+
+pub fn trustFolderWithAttempt(app: anytype, attempt_value: config_runtime.CommitAttempt) !void {
+    var attempt = attempt_value;
+    defer attempt.deinit(app.alloc);
+    switch (attempt) {
+        .failure => |f| {
+            debug_trace.logf("mcp", "MCP trust folder failed reason={s}", .{@errorName(f.err)});
+            const message = try app.alloc.print(
+                "Couldn't trust this folder: {s}. Check that {s} is writable, then run /trust again.",
+                .{ mcp_verbs.describe(f.err), profile_paths.displayText("~/.fx/settings.json") },
+            );
+            defer app.alloc.free(message);
+            try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = message }, true);
+            return;
+        },
+        .outcome => {},
+    }
+    app.mcp.host_reload_requested.store(true, .release);
+    if (comptime @hasDecl(@TypeOf(app.*), "applyMcpHostReload")) {
+        app.applyMcpHostReload(app.screenAgent());
+    }
+    try app.writeDomainNotice(.{
+        .topic = "mcp",
+        .tone = .neutral,
+        .body = "Trusted this folder. fx starts the servers in its .mcp.json now, and servers added later when fx next starts.",
+    }, true);
+}
 
 test "the /mcp completions describe an idle server with a saved login as the menu does: not started" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);

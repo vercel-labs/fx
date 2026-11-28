@@ -10,7 +10,6 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const personal_shortcut_runtime = @import("personal_shortcut_runtime.zig");
 const shortcut_rules = @import("../shortcuts/shortcuts.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
-const app_trust_runtime = @import("app_trust_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const project_config = @import("../mcp/project_config.zig");
@@ -664,9 +663,6 @@ pub fn Runtime(comptime App: type) type {
             max_prompt_history: usize,
         ) !?u8 {
             if (!ingress.has_routing_work()) return null;
-            if (comptime @hasField(App, "trust")) {
-                if (try app_trust_runtime.Runtime(App).routeIngress(app, ingress)) return null;
-            }
             if (terminalIngressCancelsPendingFullTranscriptOpen(ingress)) {
                 _ = full_transcript_rt.cancelPendingOpenForInput(app);
             }

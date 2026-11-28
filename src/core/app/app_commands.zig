@@ -4,7 +4,6 @@ const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
-const app_trust_runtime = @import("app_trust_runtime.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -47,6 +46,22 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const test_builtin_skills = if (@import("builtin").is_test)
     @import("../../builtins/skills.zig")
+else
+    struct {};
+const test_mcp_contract = if (@import("builtin").is_test)
+    @import("../mcp/mcp_contract.zig")
+else
+    struct {};
+const test_mcp_config = if (@import("builtin").is_test)
+    @import("../mcp_host/config.zig")
+else
+    struct {};
+const test_mcp_host = if (@import("builtin").is_test)
+    @import("../mcp_host/host.zig")
+else
+    struct {};
+const test_tool_dispatch = if (@import("builtin").is_test)
+    @import("../tooling/tool_dispatch.zig")
 else
     struct {};
 
@@ -315,6 +330,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_usage = commandShowUsage,
                 .undo_last = commandUndoLast,
                 .handle_mcp = commandHandleMcp,
+                .trust = commandTrustFolder,
                 .handle_skills = commandHandleSkills,
                 .copy_last = commandCopyLast,
                 .submit_feedback = commandSubmitFeedback,
@@ -355,6 +371,11 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasDecl(App, "takeMcpHostNotices")) return;
             // A reload that fails leaves its warning among the notices.
             app.applyMcpHostReload(agent);
+            if (comptime runtime_profile.allows(App, .mcp) and @hasDecl(App, "takeStartupTrustNotice")) {
+                if (try app.takeStartupTrustNotice()) |notice| {
+                    try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = notice }, true);
+                }
+            }
             const notices = app.takeMcpHostNotices();
             defer {
                 for (notices) |n| std.heap.c_allocator.free(n.text);
@@ -983,6 +1004,20 @@ pub fn Handlers(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
+        fn commandTrustFolder(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !runtime_profile.allows(App, .mcp)) {
+                try app.writeDomainNotice(.{
+                    .topic = "mcp",
+                    .tone = .warning,
+                    .body = "MCP servers are unavailable in this host; the embedding app provides MCP tools.",
+                }, true);
+                return;
+            }
+            if (comptime !@hasField(App, "mcp")) return;
+            try app_mcp_runtime.trustFolder(app);
+        }
+
         noinline fn commandHandleSkills(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !runtime_profile.allows(App, .skills)) {
@@ -1032,9 +1067,6 @@ pub fn Handlers(comptime App: type) type {
                         "Skills could not be refreshed. The previous catalog was not shown as current.",
                 }, true);
                 return;
-            }
-            if (comptime @hasField(App, "trust")) {
-                try app_trust_runtime.Runtime(App).refreshFacts(app);
             }
             switch (ready.action) {
                 .startup_notice => try app_bootstrap_runtime.Runtime(App).writeSkillDiagnosticsNotice(app, agent),
@@ -2881,4 +2913,309 @@ test "/version command writes dev build label and omits unresolved revision" {
     try expectVersionCommandBody(.dev, "f1862c5061f5", "0.0.17-f1862c5 (dev)");
     try expectVersionCommandBody(.dev, "unknown", "0.0.17 (dev)");
     try expectVersionCommandBody(.dev, "", "0.0.17 (dev)");
+}
+
+test "/trust writes unavailable warning notice when MCP capability is disabled" {
+    const WasmTrustApp = struct {
+        pub const host_profile = runtime_profile.wasm;
+
+        alloc: std.mem.Allocator,
+        notice_topic: ?[]const u8 = null,
+        notice_tone: ?types.NoticeTone = null,
+        notice_body: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.notice_body.deinit(self.alloc);
+        }
+
+        fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            self.notice_topic = notice.topic;
+            self.notice_tone = notice.tone;
+            try self.notice_body.appendSlice(self.alloc, notice.body);
+        }
+    };
+
+    var app = WasmTrustApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(WasmTrustApp).commandTrustFolder(@ptrCast(&app));
+
+    try std.testing.expectEqualStrings("mcp", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.warning, app.notice_tone.?);
+    try std.testing.expectEqualStrings(
+        "MCP servers are unavailable in this host; the embedding app provides MCP tools.",
+        app.notice_body.items,
+    );
+}
+
+test "collectMcpHostFacts emits startup trust notice once with empty topic when MCP is allowed" {
+    const FakeApp = struct {
+        alloc: std.mem.Allocator,
+        main_agent: struct {} = .{},
+        pending_trust: ?[]const u8 = app_mcp_runtime.startup_trust_notice,
+        notices_written: usize = 0,
+        last_topic: ?[]const u8 = null,
+        last_tone: ?types.NoticeTone = null,
+        last_body: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.last_body.deinit(self.alloc);
+        }
+
+        pub fn takeMcpHostNotices(_: *@This()) []app_mcp_runtime.State.HostNotice {
+            return &.{};
+        }
+
+        pub fn applyMcpHostReload(_: *@This(), _: anytype) void {}
+
+        pub fn takeStartupTrustNotice(self: *@This()) std.mem.Allocator.Error!?[]const u8 {
+            const out = self.pending_trust;
+            self.pending_trust = null;
+            return out;
+        }
+
+        pub fn refreshMcpCompletion(_: *@This()) void {}
+        pub fn refreshMcpHostMenu(_: *@This()) void {}
+        pub fn refreshMcpHostStatus(_: *@This()) void {}
+
+        pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            self.notices_written += 1;
+            self.last_topic = notice.topic;
+            self.last_tone = notice.tone;
+            self.last_body.clearRetainingCapacity();
+            try self.last_body.appendSlice(self.alloc, notice.body);
+        }
+    };
+
+    var app = FakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(FakeApp).collectMcpHostFacts(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 1), app.notices_written);
+    try std.testing.expectEqualStrings("", app.last_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+    try std.testing.expectEqualStrings(
+        "This repo contains .mcp.json – it's ignored until you trust this folder. Run /trust.",
+        app.last_body.items,
+    );
+
+    try Handlers(FakeApp).collectMcpHostFacts(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 1), app.notices_written);
+}
+
+test "trustFolder reloads host and writes neutral notice on success, and warning notice on failure" {
+    const FakeApp = struct {
+        alloc: std.mem.Allocator,
+        workspace_root: []const u8 = "/tmp/workspace",
+        mcp: app_mcp_runtime.State = .{},
+        reloaded: usize = 0,
+        notice_topic: ?[]const u8 = null,
+        notice_tone: ?types.NoticeTone = null,
+        notice_body: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.mcp.deinit();
+            self.notice_body.deinit(self.alloc);
+        }
+
+        pub fn screenAgent(self: *@This()) *@This() {
+            return self;
+        }
+
+        pub fn applyMcpHostReload(self: *@This(), _: *@This()) void {
+            if (self.mcp.takeHostReload()) self.reloaded += 1;
+        }
+
+        pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            self.notice_topic = notice.topic;
+            self.notice_tone = notice.tone;
+            self.notice_body.clearRetainingCapacity();
+            try self.notice_body.appendSlice(self.alloc, notice.body);
+        }
+    };
+
+    var app = FakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try app_mcp_runtime.trustFolderWithAttempt(&app, .{ .outcome = .unchanged });
+    try std.testing.expectEqual(@as(usize, 1), app.reloaded);
+    try std.testing.expectEqualStrings("mcp", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
+    try std.testing.expectEqualStrings(
+        "Trusted this folder. fx starts the servers in its .mcp.json now, and servers added later when fx next starts.",
+        app.notice_body.items,
+    );
+
+    try app_mcp_runtime.trustFolderWithAttempt(&app, .{ .failure = .{ .err = error.AccessDenied } });
+    try std.testing.expectEqual(@as(usize, 1), app.reloaded);
+    try std.testing.expectEqualStrings("mcp", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.warning, app.notice_tone.?);
+    try std.testing.expectEqualStrings(
+        "Couldn't trust this folder: permission denied. Check that ~/.fx/settings.json is writable, then run /trust again.",
+        app.notice_body.items,
+    );
+
+    try app_mcp_runtime.writeTrustRefusal(&app, .special_folder);
+    try std.testing.expectEqual(@as(usize, 1), app.reloaded);
+    try std.testing.expectEqualStrings("mcp", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
+    try std.testing.expectEqualStrings(
+        "fx doesn't trust this folder as a whole. Approve one server with /mcp approve NAME.",
+        app.notice_body.items,
+    );
+
+    try app_mcp_runtime.writeTrustRefusal(&app, .no_servers);
+    try std.testing.expectEqual(@as(usize, 1), app.reloaded);
+    try std.testing.expectEqualStrings("mcp", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
+    try std.testing.expectEqualStrings(
+        "This folder's .mcp.json has no servers to trust.",
+        app.notice_body.items,
+    );
+}
+
+test "trustRefusal blocks root, home parents, and profile folders, and requires a workspace server" {
+    const ws_only = [_]test_mcp_config.Server{testServer(.workspace, .waiting_for_approval)};
+    const profile_only = [_]test_mcp_config.Server{testServer(.profile, null)};
+    const home = "/Users/example";
+    const profile = "/Users/example/.fx";
+
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("/", home, profile, &ws_only).?);
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("///", home, profile, &ws_only).?);
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("/Users", home, profile, &ws_only).?);
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("/Users/", "/Users/example/", profile, &ws_only).?);
+    try std.testing.expectEqual(@as(?app_mcp_runtime.TrustRefusal, null), app_mcp_runtime.trustRefusal("/Users/example", home, profile, &ws_only));
+    try std.testing.expectEqual(@as(?app_mcp_runtime.TrustRefusal, null), app_mcp_runtime.trustRefusal("/Users/example/", home, profile, &ws_only));
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("/Users/example/.fx", home, profile, &ws_only).?);
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.special_folder, app_mcp_runtime.trustRefusal("/Users/example/.fx/x", home, profile, &ws_only).?);
+    try std.testing.expectEqual(@as(?app_mcp_runtime.TrustRefusal, null), app_mcp_runtime.trustRefusal("/Users/example2", home, profile, &ws_only));
+    try std.testing.expectEqual(app_mcp_runtime.TrustRefusal.no_servers, app_mcp_runtime.trustRefusal("/Users/example/repo", home, profile, &profile_only).?);
+    try std.testing.expectEqual(@as(?app_mcp_runtime.TrustRefusal, null), app_mcp_runtime.trustRefusal("/Users/example/repo", home, profile, &ws_only));
+}
+
+fn testServer(source: test_mcp_contract.ConfigSource, held: ?test_mcp_config.Held) test_mcp_config.Server {
+    return .{
+        .name = "s",
+        .source = source,
+        .scope = if (source == .workspace) .workspace else .profile,
+        .transport = .stdio,
+        .url = null,
+        .command = "node",
+        .callback_port = null,
+        .held = held,
+    };
+}
+
+test "needsTrustLine returns true only when a workspace server is waiting for approval" {
+    const empty: []const test_mcp_config.Server = &.{};
+    try std.testing.expect(!app_mcp_runtime.needsTrustLine(empty));
+
+    const only_profile = [_]test_mcp_config.Server{
+        testServer(.profile, null),
+        testServer(.profile, .waiting_for_approval),
+    };
+    try std.testing.expect(!app_mcp_runtime.needsTrustLine(&only_profile));
+
+    const approved_and_rejected = [_]test_mcp_config.Server{
+        testServer(.workspace, null),
+        testServer(.workspace, .rejected),
+        testServer(.workspace, .disabled),
+    };
+    try std.testing.expect(!app_mcp_runtime.needsTrustLine(&approved_and_rejected));
+
+    const one_pending = [_]test_mcp_config.Server{
+        testServer(.profile, null),
+        testServer(.workspace, .rejected),
+        testServer(.workspace, .waiting_for_approval),
+    };
+    try std.testing.expect(app_mcp_runtime.needsTrustLine(&one_pending));
+}
+
+test "takeStartupTrustNotice emits once on first load and never repeats on reloads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    const Loader = struct {
+        fn load(a: std.mem.Allocator, ws: []const u8, builtins: test_tool_dispatch.Registry, extras: test_mcp_host.Extras) anyerror!?*test_mcp_host.Host {
+            _ = extras;
+            var env = std.process.Environ.Map.init(a);
+            defer env.deinit();
+            const configs = [_]test_mcp_contract.McpServerConfig{.{
+                .name = "project",
+                .source = .workspace,
+                .scope = .workspace,
+                .transport = .stdio,
+                .command = "node",
+                .workspace_admission = .pending,
+            }};
+            return try test_mcp_host.Host.create(a, io_mod.getIo(), &configs, &env, .{
+                .client_version = "test",
+                .credentials = .{ .detect = ws },
+                .workspace_root = ws,
+            }, builtins);
+        }
+    };
+
+    const registry: test_tool_dispatch.Registry = .{ .tools = &.{} };
+    var state: app_mcp_runtime.State = .{};
+    defer state.deinit();
+
+    try state.loadHost(Loader.load, alloc, home, root, registry, .{});
+    const first = (try state.takeStartupTrustNotice(alloc, root)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(
+        "This repo contains .mcp.json – it's ignored until you trust this folder. Run /trust.",
+        first,
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), try state.takeStartupTrustNotice(alloc, root));
+
+    state.host_reload_requested.store(true, .release);
+    try std.testing.expect(state.refreshHost(alloc, home, root, registry, .requested));
+    try std.testing.expectEqual(@as(?[]const u8, null), try state.takeStartupTrustNotice(alloc, root));
+}
+
+test "takeStartupTrustNotice stays silent in a special folder" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    const Loader = struct {
+        fn load(a: std.mem.Allocator, ws: []const u8, builtins: test_tool_dispatch.Registry, extras: test_mcp_host.Extras) anyerror!?*test_mcp_host.Host {
+            _ = extras;
+            var env = std.process.Environ.Map.init(a);
+            defer env.deinit();
+            const configs = [_]test_mcp_contract.McpServerConfig{.{
+                .name = "project",
+                .source = .workspace,
+                .scope = .workspace,
+                .transport = .stdio,
+                .command = "node",
+                .workspace_admission = .pending,
+            }};
+            return try test_mcp_host.Host.create(a, io_mod.getIo(), &configs, &env, .{
+                .client_version = "test",
+                .credentials = .{ .detect = ws },
+                .workspace_root = ws,
+            }, builtins);
+        }
+    };
+
+    const registry: test_tool_dispatch.Registry = .{ .tools = &.{} };
+    var state: app_mcp_runtime.State = .{};
+    defer state.deinit();
+
+    try state.loadHost(Loader.load, alloc, home, root, registry, .{});
+    try std.testing.expectEqual(@as(?[]const u8, null), try state.takeStartupTrustNotice(alloc, "/"));
 }

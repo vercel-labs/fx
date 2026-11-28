@@ -76,7 +76,6 @@
   { "file": "tui-terminal-tool.test.ts", "weight": 177 },
   { "file": "tui-tool-story.test.ts", "weight": 40 },
   { "file": "tui-transcript-window.test.ts", "weight": 42 },
-  { "file": "tui-workspace-trust.test.ts", "weight": 3 },
   { "file": "ultrafast-fake-gateway.test.ts", "weight": 8 },
   { "file": "vision-route-fake-gateway.test.ts", "weight": 20 },
   { "file": "web-fetch-fake-network.test.ts", "weight": 3 },
