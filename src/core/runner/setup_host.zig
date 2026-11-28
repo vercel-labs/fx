@@ -1,20 +1,18 @@
 //! The effects of one remote setup, for one call (spec U1 to U12, R5). The pure
 //! step in `setup.zig` decides; this file runs what it asks for: the login
-//! check, REST steps, prompts, the locked write and the single flight.
-//! `ensureReady` returns ready, canceled, or a refusal with its exact E text.
+//! check, destination discovery, the copy question, the locked write, and the
+//! consent record. `ensureReady` returns ready, canceled, or a refusal text.
 //!
-//! The slot's mutex is never held across a REST call, a prompt or the write.
-//! Those run between `Slot.begin` and `Slot.end`, which only the flight's owner
-//! calls. Each slot call takes the mutex only to read or change its state.
+//! The slot's mutex is never held across a REST call, a prompt, or a write.
 
 const std = @import("std");
 const vercel = @import("vercel/vercel.zig");
 const setup = @import("setup.zig");
+const consent = @import("consent.zig");
 const remote_slot = @import("remote_slot.zig");
 const config = @import("config.zig");
 const config_write = @import("config_write.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
-const elicitation = @import("../mcp/elicitation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -24,32 +22,29 @@ const test_server = @import("vercel/test_server.zig");
 
 const TokenHash = remote_slot.TokenHash;
 
-/// A host prompt is not an MCP request, so it names no server and no tool.
-const host_wire: elicitation.Wire = .modern_mcp;
-const host_operation: elicitation.Operation = .{ .tools_call = "" };
+const host_wire: @import("../mcp/elicitation.zig").Wire = .modern_mcp;
+const host_operation: @import("../mcp/elicitation.zig").Operation = .{ .tools_call = "" };
 
-const user_step = "user";
-const team_key = "team";
-const project_key = "project";
-const prompt_team_message = "Which Vercel team should remote commands use?";
-const create_choice = "__create__";
-const other_choice = "__other__";
-const create_title = "Create a new project named fx-sandbox";
-const other_title = "Another project (type its name below)";
+pub const team_setting_key = "sandbox_team";
+pub const project_setting_key = "sandbox_project";
+
+const copy_key = "copy";
+const choice_yes = "Yes";
+const choice_no = "No";
 
 const e4_prefix = "fx did not run this command: ";
 const e4_suffix = " Fix ~/.fx/sandbox/config.json, or turn off experimental.sandbox_execution.";
-pub const e5_text = "fx did not run this command: no Vercel login. Run `vercel login`, then try again.";
-pub const e6_text = "fx did not run this command: the Vercel login has expired or was rejected. Run `vercel whoami` to refresh it, or `vercel login`, then try again.";
-const e7_text = "fx did not run this command: remote is not set up, and fx cannot ask the user here. Ask again in an interactive fx session.";
-const e8_text = "fx did not run this command: the user did not set up remote.";
+pub const e5_text = "fx did not run this command: no Vercel login. Ask the person to run `vercel login` or set VERCEL_TOKEN.";
+pub const e6_text = "fx did not run this command: the Vercel login has expired or was rejected. Ask the person to run `vercel whoami` to refresh it, or run `vercel login`.";
+pub const e7_text = "fx did not run this command: this repository needs remote consent, and fx cannot ask here. Run the first remote command in the fx TUI or `fx ask` in a terminal.";
+pub const e8_text = "fx did not run this command: the person declined copying this repository to Vercel. Do not retry in this turn.";
 const e9_prefix = "fx did not run this command: remote setup failed: ";
-const e10_text = "fx did not run this command: remote is not set up. Set it up from the main conversation first.";
+pub const e10_text = "fx did not run this command: this repository is not set up for remote commands. Set it up from the main conversation first.";
 const e14_text = "fx did not run this command: ~/.fx/sandbox/config.json changed since fx started. Restart fx to use it.";
-const e15_text = "fx did not run this command: the remote setup question was not answered in 15 minutes.";
+pub const e15_text = "fx did not run this command: the remote copy question was not answered in 15 minutes. Do not retry in this turn.";
 
-/// The clock, injected so tests control it. `awake_ms` is the clock the
-/// responder compares prompt deadlines with (U7); `unix_s` sets `confirmed_at`.
+pub const SetupIntent = setup.Intent;
+
 pub const Clock = struct {
     context: ?*anyopaque = null,
     awake_ms: *const fn (context: ?*anyopaque) i64 = realAwakeMs,
@@ -74,7 +69,6 @@ fn realUnixS(context: ?*anyopaque) i64 {
     return @divFloor(io_mod.milliTimestamp(), 1000);
 }
 
-/// Trace lines go to the debug trace. A line names the step and the outcome only (U12).
 pub const debug_trace_sink: vercel.Trace = .{ .context = null, .line = debugLine };
 
 fn debugLine(context: ?*anyopaque, text: []const u8) void {
@@ -82,20 +76,15 @@ fn debugLine(context: ?*anyopaque, text: []const u8) void {
     debug_trace.logf("remote setup", "{s}", .{text});
 }
 
-/// The user check (R5) keeps the login it passed in the remote slot (R145), never the token.
-/// This view is the `user_check.store` call that the shell tests seed, so they keep their shape.
 pub const UserCheck = struct {
     slot: *remote_slot.Slot,
 
-    /// Keeps `user_id` as the checked user of `hash`. `alloc` is unused: the slot owns its copies.
     pub fn store(self: *UserCheck, alloc: std.mem.Allocator, hash: TokenHash, user_id: []const u8) std.mem.Allocator.Error!void {
         _ = alloc;
         return self.slot.storeChecked(hash, user_id);
     }
 };
 
-/// What is per process: the slot, the login sources, the API base, the trace
-/// sink, the clock and the config fingerprint that load computed (U9).
 pub const Host = struct {
     alloc: std.mem.Allocator,
     slot: *remote_slot.Slot,
@@ -111,25 +100,21 @@ pub const Host = struct {
     user_check: UserCheck,
 };
 
-/// One call that may need setup. The shell tool builds it from the tool context.
 pub const Call = struct {
-    /// Owns this call's text and its destination. The caller frees it after the result.
     arena: std.mem.Allocator,
-    /// The session the decline mark belongs to. Null: the call never reads or writes a mark (U4).
+    workspace_root: []const u8,
+    intent: SetupIntent = .{},
     session_key: ?[]const u8,
-    /// The worker's active turn id (U4). Zero means no active turn.
     turn_id: u64,
-    /// False for a sub-agent call (U2), which is refused with E10.
     setup_allowed: bool,
-    /// The host prompt responder. Setup needs one with form capability (U1).
     responder: ?tool_mcp_runtime.InputResponder,
     cancel: *std.atomic.Value(bool),
 };
 
-/// The call for one tool call. A call from a sub-agent (`remote_setup_allowed`
-/// false, U2) has no session key, so it reads and writes no decline mark (U4).
 pub fn callFor(
     arena: std.mem.Allocator,
+    workspace_root: []const u8,
+    intent: SetupIntent,
     remote_setup_allowed: bool,
     session_key: ?[]const u8,
     turn_id: u64,
@@ -138,6 +123,8 @@ pub fn callFor(
 ) Call {
     return .{
         .arena = arena,
+        .workspace_root = workspace_root,
+        .intent = intent,
         .session_key = if (remote_setup_allowed) session_key else null,
         .turn_id = turn_id,
         .setup_allowed = remote_setup_allowed,
@@ -146,31 +133,31 @@ pub fn callFor(
     };
 }
 
-/// The outcome of `ensureReady`. A refusal carries its exact E text in the call's arena.
 pub const Result = union(enum) {
     ready: remote_slot.Destination,
     canceled,
     refused: []const u8,
 };
 
-/// The login as this process reads it without the network (R2, R3): its state
-/// for the step, and the token that REST calls use.
+const user_step = "user";
+
 const HostLogin = struct {
     state: setup.Login,
     token: vercel.Token,
 };
 
-/// The login's user, read through the cache or one `GET /v2/user` (R5). `done`
-/// is a failed or canceled read.
 const Resolved = union(enum) {
     login: setup.Login,
     done: Result,
 };
 
-/// One arrival. When the step needs the login's user, that is read and the
-/// arrival is sent again.
 const Arrived = union(enum) {
     transition: setup.Transition,
+    done: Result,
+};
+
+const ConfigRead = union(enum) {
+    config: setup.Config,
     done: Result,
 };
 
@@ -186,9 +173,6 @@ const Parsed = union(enum) {
     invalid,
 };
 
-/// Runs one call's part of remote setup. It returns when the destination is
-/// ready, the call is canceled, or it is refused. A call that must wait for
-/// another setup waits, then checks again (U3).
 pub fn ensureReady(host: *Host, call: Call) std.mem.Allocator.Error!Result {
     while (true) {
         var login = try localLogin(host, call);
@@ -204,7 +188,6 @@ pub fn ensureReady(host: *Host, call: Call) std.mem.Allocator.Error!Result {
             },
             .owner => {
                 defer host.slot.end();
-                // Config may have changed between the first arrival and the flight.
                 const again = switch (try arriveResolved(host, call, &login)) {
                     .transition => |found| found,
                     .done => |result| return result,
@@ -218,12 +201,11 @@ pub fn ensureReady(host: *Host, call: Call) std.mem.Allocator.Error!Result {
 
 fn needsFlight(decision: setup.Decision) bool {
     return switch (decision) {
-        .rest, .ask_team, .ask_project, .write => true,
+        .discover, .ask_copy, .create_project, .write => true,
         .none, .wait, .ready, .need_user, .refuse, .canceled => false,
     };
 }
 
-/// The login as this process reads it, with no network call (R2, R3).
 fn localLogin(host: *Host, call: Call) std.mem.Allocator.Error!HostLogin {
     const auth = try vercel.load(call.arena, host.env, host.os, host.files, host.trace, host.clock.unixS());
     return switch (auth) {
@@ -233,8 +215,6 @@ fn localLogin(host: *Host, call: Call) std.mem.Allocator.Error!HostLogin {
     };
 }
 
-/// The login's user (R5): the cached id for this token, else one `GET /v2/user`.
-/// The read runs at most once per process per token. A rejected login is `rejected`.
 fn resolveUser(host: *Host, call: Call, token: vercel.Token) std.mem.Allocator.Error!Resolved {
     const hash = tokenHash(token);
     if (try host.slot.checkedUser(hash, call.arena)) |user_id| {
@@ -243,7 +223,7 @@ fn resolveUser(host: *Host, call: Call, token: vercel.Token) std.mem.Allocator.E
     const outcome = try vercel.getUser(call.arena, linkFor(host, call, token));
     switch (outcome) {
         .ok => |user| {
-            try host.slot.storeChecked(hash, user.id);
+            try host.slot.storeCheckedUser(hash, user.id, user.default_team_id);
             return .{ .login = .{ .user = user.id } };
         },
         .rejected => return .{ .login = .rejected },
@@ -253,16 +233,17 @@ fn resolveUser(host: *Host, call: Call, token: vercel.Token) std.mem.Allocator.E
     }
 }
 
-/// One arrival. When the step needs the login's user, that is read, the login
-/// is updated, and the arrival is sent again.
 fn arriveResolved(host: *Host, call: Call, login: *HostLogin) std.mem.Allocator.Error!Arrived {
-    const first = try arrive(host, call, login.state);
+    const first = switch (try arrive(host, call, login.state)) {
+        .transition => |found| found,
+        .done => |result| return .{ .done = result },
+    };
     if (std.meta.activeTag(first.decision) != .need_user) return .{ .transition = first };
     switch (try resolveUser(host, call, login.token)) {
         .login => |state| login.state = state,
         .done => |result| return .{ .done = result },
     }
-    return .{ .transition = try arrive(host, call, login.state) };
+    return arrive(host, call, login.state);
 }
 
 const unused_token: vercel.Token = .{ .value = "" };
@@ -277,21 +258,50 @@ fn linkFor(host: *const Host, call: Call, token: vercel.Token) vercel.Link {
     return .{ .base = host.base, .token = token, .cancel_flag = call.cancel, .trace = host.trace };
 }
 
-/// One arrival: the step's first event for this call, read against the slot now.
-fn arrive(host: *Host, call: Call, login: setup.Login) std.mem.Allocator.Error!setup.Transition {
-    const config_state = try configOf(host, call.arena);
+fn arrive(host: *Host, call: Call, login: setup.Login) std.mem.Allocator.Error!Arrived {
+    const cfg = switch (try configOf(host, call, login)) {
+        .config => |value| value,
+        .done => |result| return .{ .done = result },
+    };
     const mark = host.slot.markFor(call.session_key, call.turn_id);
-    return setup.step(.{ .idle = mark }, .{ .arrival = .{
+    return .{ .transition = setup.step(.{ .idle = mark }, .{ .arrival = .{
         .caller = if (call.setup_allowed) .main else .sub_agent,
         .channel = channelOf(call),
         .login = login,
-        .config = config_state,
-    } });
+        .config = cfg,
+    } }) };
 }
 
-fn configOf(host: *Host, arena: std.mem.Allocator) std.mem.Allocator.Error!setup.Config {
-    const destination = (try host.slot.currentDestination(arena)) orelse return .absent;
-    return .{ .remote = destination.user_id };
+fn configOf(host: *Host, call: Call, login: setup.Login) std.mem.Allocator.Error!ConfigRead {
+    const destination = (try host.slot.currentDestination(call.arena)) orelse return .{ .config = .absent };
+    const matches_intent = intentMatches(destination, call.intent);
+    const consent_state: setup.Consent = switch (login) {
+        .user => |user_id| blk: {
+            if (!std.mem.eql(u8, destination.user_id, user_id) or !matches_intent) break :blk .missing;
+            const root = io_mod.realpathAlloc(call.arena, call.workspace_root) catch |err| {
+                return .{ .done = .{ .refused = try workspaceRefusalText(call.arena, call.workspace_root, err) } };
+            };
+            const key = try consent.repoKey(call.arena, user_id, root);
+            const ok = try consent.hasForDestination(call.arena, host.fx_home, key, destination.team_id, destination.project_id);
+            break :blk if (ok) .matches else .missing;
+        },
+        else => .missing,
+    };
+    return .{ .config = .{ .remote = .{
+        .user_id = destination.user_id,
+        .matches_intent = matches_intent,
+        .consent = consent_state,
+    } } };
+}
+
+fn intentMatches(destination: remote_slot.Destination, intent: SetupIntent) bool {
+    if (intent.team) |team_slug| {
+        if (!std.mem.eql(u8, destination.team_slug, team_slug)) return false;
+    }
+    if (intent.project) |project_name| {
+        if (!std.mem.eql(u8, destination.project_name, project_name)) return false;
+    }
+    return true;
 }
 
 fn channelOf(call: Call) setup.Channel {
@@ -299,26 +309,25 @@ fn channelOf(call: Call) setup.Channel {
     return if (responder.capabilities.form) .form else .none;
 }
 
-/// The flight's owner runs the effects, one event at a time, until the step ends the call.
 fn runOwner(host: *Host, call: Call, token: vercel.Token, first: setup.Transition) std.mem.Allocator.Error!Result {
     var transition = first;
     while (true) {
         trace(host, "setup decision={s}", .{@tagName(transition.decision)});
         switch (transition.decision) {
             .none, .wait, .ready, .need_user, .refuse, .canceled => return finish(host, call, transition),
+            .discover => |owner| {
+                const event = if (cancelled(call)) setup.Event.owner_canceled else try discoverEvent(host, call, token, owner);
+                transition = setup.step(transition.state, event);
+            },
+            .ask_copy => |ask| {
+                const event = if (cancelled(call)) setup.Event.owner_canceled else try askCopy(call, transition.state, ask);
+                transition = setup.step(transition.state, event);
+            },
+            .create_project => |team| {
+                const event = if (cancelled(call)) setup.Event.owner_canceled else try createProjectEvent(host, call, token, team);
+                transition = setup.step(transition.state, event);
+            },
             .write => |destination| transition = try writeTransition(host, call, transition.state, destination),
-            .rest => |rest| {
-                const event = if (cancelled(call)) setup.Event.owner_canceled else try restEvent(host, call, token, rest);
-                transition = setup.step(transition.state, event);
-            },
-            .ask_team => |choices| {
-                const event = if (cancelled(call)) setup.Event.owner_canceled else try askTeam(call, transition.state, choices);
-                transition = setup.step(transition.state, event);
-            },
-            .ask_project => |ask| {
-                const event = if (cancelled(call)) setup.Event.owner_canceled else try askProject(call, transition.state, ask);
-                transition = setup.step(transition.state, event);
-            },
         }
     }
 }
@@ -327,21 +336,16 @@ fn cancelled(call: Call) bool {
     return call.cancel.load(.acquire);
 }
 
-/// Ends a call that does not need the flight, or that the flight has finished.
-/// The mark the step left is kept first, so every waiter sees it.
 fn finish(host: *Host, call: Call, transition: setup.Transition) std.mem.Allocator.Error!Result {
     try recordMark(host, call, transition.state);
     return switch (transition.decision) {
-        // A ready decision means config has a remote, and the slot holds it.
         .ready => .{ .ready = (try host.slot.currentDestination(call.arena)) orelse unreachable },
         .refuse => |refusal| .{ .refused = try refusalText(call.arena, refusal) },
         .canceled => .canceled,
-        // Only the flight's loop reaches these decisions, and it never finishes with them.
-        .none, .wait, .need_user, .rest, .ask_team, .ask_project, .write => unreachable,
+        .none, .wait, .need_user, .discover, .ask_copy, .create_project, .write => unreachable,
     };
 }
 
-/// Keeps the mark that the step left in the idle state, for this session and turn (U4).
 fn recordMark(host: *Host, call: Call, state: setup.State) std.mem.Allocator.Error!void {
     const mark = switch (state) {
         .idle => |kept| kept,
@@ -350,13 +354,119 @@ fn recordMark(host: *Host, call: Call, state: setup.State) std.mem.Allocator.Err
     if (mark == .none) return;
     host.slot.recordMark(call.session_key, call.turn_id, mark) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        // A turn with no id cannot hold a mark. The refusal still stands.
         error.NoActiveTurn => trace(host, "setup mark not kept: no active turn", .{}),
     };
 }
 
-/// The locked write (U9). The write is not interrupted by a cancel. A cancel
-/// that arrives meanwhile ends the call canceled after it (U7).
+fn discoverEvent(host: *Host, call: Call, token: vercel.Token, owner: setup.Owner) std.mem.Allocator.Error!setup.Event {
+    const link = linkFor(host, call, token);
+    _ = io_mod.realpathAlloc(call.arena, call.workspace_root) catch |err| {
+        const message = try workspaceRefusalText(call.arena, call.workspace_root, err);
+        return .{ .discover_refused = .{ .workspace_unresolved = message } };
+    };
+
+    const existing = try host.slot.currentDestination(call.arena);
+    if (existing) |dest| {
+        if (std.mem.eql(u8, dest.user_id, owner.user_id) and intentMatches(dest, call.intent)) {
+            return discoverExistingDestination(host, call, link, dest);
+        }
+    }
+    return discoverFreshDestination(host, call, token, link);
+}
+
+fn discoverExistingDestination(
+    host: *Host,
+    call: Call,
+    link: vercel.Link,
+    dest: remote_slot.Destination,
+) std.mem.Allocator.Error!setup.Event {
+    const team = switch (try vercel.getTeam(call.arena, link, dest.team_id)) {
+        .ok => |found| found,
+        .not_found => return refuseTeamMissing(call.arena, link, call.intent.team),
+        .rejected => return .rest_rejected,
+        .canceled => return .owner_canceled,
+        .failed => |failure| return .{ .rest_failed = failure },
+    };
+    const project = switch (try vercel.getProjectByName(call.arena, link, team.id, dest.project_name)) {
+        .ok => |found| found,
+        .not_found => if (call.intent.project == null and std.mem.eql(u8, dest.project_name, vercel.sandbox_project_name))
+            null
+        else
+            return .{ .discover_refused = .{ .project_not_found = .{ .team = team, .name = dest.project_name } } },
+        .rejected => return .rest_rejected,
+        .canceled => return .owner_canceled,
+        .failed => |failure| return .{ .rest_failed = failure },
+    };
+    return .{ .discovered = .{ .team = team, .project = project, .now_ms = host.clock.awakeMs() } };
+}
+
+fn discoverFreshDestination(
+    host: *Host,
+    call: Call,
+    token: vercel.Token,
+    link: vercel.Link,
+) std.mem.Allocator.Error!setup.Event {
+    const team_ref = if (call.intent.team) |slug|
+        slug
+    else if (try vercel.loadCliTeamId(call.arena, host.env, host.os, host.files, host.trace)) |cli_id|
+        cli_id
+    else
+        try host.slot.checkedDefaultTeam(tokenHash(token), call.arena);
+
+    const lookup = team_ref orelse return refuseTeamMissing(call.arena, link, null);
+    const team = switch (try vercel.getTeam(call.arena, link, lookup)) {
+        .ok => |found| found,
+        .not_found => return refuseTeamMissing(call.arena, link, call.intent.team),
+        .rejected => return .rest_rejected,
+        .canceled => return .owner_canceled,
+        .failed => |failure| return .{ .rest_failed = failure },
+    };
+
+    const project_name = call.intent.project orelse vercel.sandbox_project_name;
+    const project: ?vercel.Project = switch (try vercel.getProjectByName(call.arena, link, team.id, project_name)) {
+        .ok => |found| found,
+        .not_found => if (call.intent.project != null)
+            return .{ .discover_refused = .{ .project_not_found = .{ .team = team, .name = project_name } } }
+        else
+            null,
+        .rejected => return .rest_rejected,
+        .canceled => return .owner_canceled,
+        .failed => |failure| return .{ .rest_failed = failure },
+    };
+    return .{ .discovered = .{ .team = team, .project = project, .now_ms = host.clock.awakeMs() } };
+}
+
+fn refuseTeamMissing(
+    arena: std.mem.Allocator,
+    link: vercel.Link,
+    setting_slug: ?[]const u8,
+) std.mem.Allocator.Error!setup.Event {
+    const available: []const vercel.Team = switch (try vercel.listTeamsFirstPage(arena, link)) {
+        .ok => |teams| teams,
+        .not_found => &.{},
+        .rejected => return .rest_rejected,
+        .canceled => return .owner_canceled,
+        .failed => |failure| return .{ .rest_failed = failure },
+    };
+    return .{ .discover_refused = .{ .no_team = .{ .setting_slug = setting_slug, .available = available } } };
+}
+
+fn createProjectEvent(
+    host: *Host,
+    call: Call,
+    token: vercel.Token,
+    team: vercel.Team,
+) std.mem.Allocator.Error!setup.Event {
+    const link = linkFor(host, call, token);
+    return switch (try vercel.createProject(call.arena, link, team.id)) {
+        .ok => |project| .{ .project_created = project },
+        .rejected => .rest_rejected,
+        .not_found => .{ .rest_failed = .{ .step = vercel.sandbox_project_name, .reason = .{ .status = 404 } } },
+        .canceled => .owner_canceled,
+        .failed => |failure| .{ .rest_failed = failure },
+    };
+}
+
 fn writeTransition(host: *Host, call: Call, state: setup.State, destination: setup.Destination) std.mem.Allocator.Error!setup.Transition {
     const result = try lockedWrite(host, call, destination);
     var current = state;
@@ -365,6 +475,7 @@ fn writeTransition(host: *Host, call: Call, state: setup.State, destination: set
 }
 
 fn lockedWrite(host: *Host, call: Call, destination: setup.Destination) std.mem.Allocator.Error!setup.WriteResult {
+    const now_s = host.clock.unixS();
     const loaded_remote = try host.slot.currentDestination(call.arena);
     const result = config_write.writeRemote(
         call.arena,
@@ -373,132 +484,48 @@ fn lockedWrite(host: *Host, call: Call, destination: setup.Destination) std.mem.
         loaded_remote,
         destination,
         call.cancel,
-        host.clock.unixS(),
+        now_s,
     );
     switch (result) {
-        .written, .kept => try host.slot.setDestination(.{
-            .team_id = destination.team.id,
-            .team_slug = destination.team.slug,
-            .project_id = destination.project.id,
-            .project_name = destination.project.name,
-            .user_id = destination.user_id,
-        }),
+        .written, .kept => {
+            try host.slot.setDestination(.{
+                .team_id = destination.team.id,
+                .team_slug = destination.team.slug,
+                .project_id = destination.project.id,
+                .project_name = destination.project.name,
+                .user_id = destination.user_id,
+            });
+            const root = io_mod.realpathAlloc(call.arena, call.workspace_root) catch return .{ .failed = .write_failed };
+            const key = try consent.repoKey(call.arena, destination.user_id, root);
+            consent.write(call.arena, host.fx_home, key, destination.team.id, destination.project.id, now_s) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.WriteFailed => return .{ .failed = .write_failed },
+            };
+        },
         .config_changed, .invalid, .failed, .canceled => {},
     }
     return result;
 }
 
-/// U6: the first page holds only the newest projects, so an `fx-sandbox` past it is found by
-/// name. A 200 lists it as existing, a 404 leaves the list as it is, and any other failure is
-/// the list step's failure (E9).
-fn withSandboxProject(
-    arena: std.mem.Allocator,
-    link: vercel.Link,
-    team_id: []const u8,
-    listed: []const vercel.Project,
-) std.mem.Allocator.Error!vercel.Outcome([]const vercel.Project) {
-    if (setup.hasProjectNamed(listed, vercel.sandbox_project_name)) return .{ .ok = listed };
-    return switch (try vercel.getProjectByName(arena, link, team_id, vercel.sandbox_project_name)) {
-        .ok => |project| {
-            const all = try arena.alloc(vercel.Project, listed.len + 1);
-            @memcpy(all[0..listed.len], listed);
-            all[listed.len] = project;
-            return .{ .ok = all };
-        },
-        .rejected => .rejected,
-        .not_found => .{ .ok = listed },
-        .canceled => .canceled,
-        .failed => |failure| .{ .failed = failure },
-    };
-}
-
-fn restEvent(host: *Host, call: Call, token: vercel.Token, rest: setup.Rest) std.mem.Allocator.Error!setup.Event {
-    const link = linkFor(host, call, token);
-    const now_ms = host.clock.awakeMs();
-    switch (rest) {
-        .list_teams => return switch (try vercel.listTeams(call.arena, link)) {
-            .ok => |teams| .{ .teams_listed = .{ .teams = teams, .now_ms = now_ms } },
-            .rejected => .rest_rejected,
-            .not_found => .{ .rest_not_found = setup.step_teams },
-            .canceled => .owner_canceled,
-            .failed => |failure| .{ .rest_failed = failure },
-        },
-        .team_by_slug => |slug| return switch (try vercel.getTeamBySlug(call.arena, link, slug)) {
-            .ok => |team| .{ .team_resolved = team },
-            .rejected => .rest_rejected,
-            .not_found => .{ .rest_not_found = setup.step_team },
-            .canceled => .owner_canceled,
-            .failed => |failure| .{ .rest_failed = failure },
-        },
-        .list_projects => |team| return switch (try vercel.listProjects(call.arena, link, team.id)) {
-            .ok => |projects| switch (try withSandboxProject(call.arena, link, team.id, projects)) {
-                .ok => |listed| .{ .projects_listed = .{ .projects = listed, .now_ms = now_ms } },
-                .rejected => .rest_rejected,
-                .not_found => .{ .rest_not_found = setup.step_project },
-                .canceled => .owner_canceled,
-                .failed => |failure| .{ .rest_failed = failure },
-            },
-            .rejected => .rest_rejected,
-            .not_found => .{ .rest_not_found = setup.step_project },
-            .canceled => .owner_canceled,
-            .failed => |failure| .{ .rest_failed = failure },
-        },
-        .create_project => |team| return switch (try vercel.createProject(call.arena, link, team.id)) {
-            .ok => |project| .{ .project_resolved = project },
-            .rejected => .rest_rejected,
-            .not_found => .{ .rest_not_found = setup.step_project },
-            .canceled => .owner_canceled,
-            .failed => |failure| .{ .rest_failed = failure },
-        },
-        .project_by_name => |lookup| return switch (try vercel.getProjectByName(call.arena, link, lookup.team.id, lookup.name)) {
-            .ok => |project| .{ .project_resolved = project },
-            .rejected => .rest_rejected,
-            .not_found => .{ .rest_not_found = setup.step_project },
-            .canceled => .owner_canceled,
-            .failed => |failure| .{ .rest_failed = failure },
-        },
-    }
-}
-
-/// P1 (U5): a team chosen from the list, or a team slug typed in.
-fn askTeam(call: Call, state: setup.State, choices: setup.TeamChoices) std.mem.Allocator.Error!setup.Event {
+fn askCopy(call: Call, state: setup.State, ask: setup.CopyAsk) std.mem.Allocator.Error!setup.Event {
     const asked_at_ms = switch (state) {
-        .team_prompt => |open| open.asked_at_ms,
+        .copy_prompt => |open| open.asked_at_ms,
         else => return .prompt_failed,
     };
-    const schema = try teamSchema(call.arena, choices);
-    const reply = try prompt(call, team_key, prompt_team_message, schema, asked_at_ms);
-    return promptEvent(call, reply, asked_at_ms, teamAnswer);
-}
-
-/// P2 (U6): a project, a new fx-sandbox project, or another name typed in.
-fn askProject(call: Call, state: setup.State, ask: setup.ProjectAsk) std.mem.Allocator.Error!setup.Event {
-    const asked_at_ms = switch (state) {
-        .project_prompt => |open| open.asked_at_ms,
-        else => return .prompt_failed,
-    };
-    const message = try call.arena.print("Pick a project in {f}. fx will copy this repository's files to a sandbox in the project you pick, for remote commands.", .{text_utils.terminalSafe(ask.team.slug)});
-    const schema = try projectSchema(call.arena, ask.projects, ask.offer_create);
-    const reply = try prompt(call, project_key, message, schema, asked_at_ms);
-    return promptEvent(call, reply, asked_at_ms, projectAnswer);
-}
-
-fn promptEvent(
-    call: Call,
-    reply: Reply,
-    asked_at_ms: i64,
-    comptime answerOf: fn (Parsed) setup.Answer,
-) std.mem.Allocator.Error!setup.Event {
+    const message = try call.arena.print(
+        "Copy this repository to Vercel team {f}, project {f}? fx copies its tracked and unignored files to a sandbox there for remote commands.",
+        .{ text_utils.terminalSafe(ask.team.name), text_utils.terminalSafe(ask.project_name) },
+    );
+    const schema = try copySchema(call.arena);
+    const reply = try prompt(call, copy_key, message, schema, asked_at_ms);
     if (cancelled(call)) return .owner_canceled;
     return switch (reply) {
-        .answered => |bytes| .{ .answered = answerOf(try parseReply(call.arena, bytes)) },
+        .answered => |bytes| .{ .answered = copyAnswer(try parseReply(call.arena, bytes)) },
         .timed_out => .{ .tick = asked_at_ms + setup.question_limit_ms },
         .failed => .prompt_failed,
     };
 }
 
-/// Opens one host prompt through the responder (U11). The origin is host-kind,
-/// and its deadline is the step's limit on the awake clock.
 fn prompt(call: Call, key: []const u8, message: []const u8, schema: std.json.Value, asked_at_ms: i64) std.mem.Allocator.Error!Reply {
     const responder = call.responder orelse return .failed;
     const params = try objectOf(call.arena, &.{
@@ -531,31 +558,26 @@ fn prompt(call: Call, key: []const u8, message: []const u8, schema: std.json.Val
     return .{ .answered = try entryFor(call.arena, key, answer) };
 }
 
-/// The responder answers with one object keyed by the request key, the shape
-/// the TUI, `fx ask` and ACP all write. This returns the entry for `key`, or
-/// `{}` when there is none, which `parseReply` refuses.
 fn entryFor(arena: std.mem.Allocator, key: []const u8, answer: []const u8) std.mem.Allocator.Error![]const u8 {
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena, answer, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return "{}",
     };
     const object = switch (root) {
-        .object => |object| object,
+        .object => |obj| obj,
         else => return "{}",
     };
     const entry = object.get(key) orelse return "{}";
     return std.json.Stringify.valueAlloc(arena, entry, .{}) catch return error.OutOfMemory;
 }
 
-/// A reply is `accept` with its content, `decline`, or `cancel` (MCP elicitation).
-/// Anything else is an invalid answer, which the step refuses.
 fn parseReply(arena: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!Parsed {
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .invalid,
     };
     const fields = switch (root) {
-        .object => |object| object,
+        .object => |obj| obj,
         else => return .invalid,
     };
     const action = switch (fields.get("action") orelse return .invalid) {
@@ -565,54 +587,26 @@ fn parseReply(arena: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Err
     if (std.mem.eql(u8, action, "decline") or std.mem.eql(u8, action, "cancel")) return .dismissed;
     if (!std.mem.eql(u8, action, "accept")) return .invalid;
     const content = switch (fields.get("content") orelse return .invalid) {
-        .object => |object| object,
+        .object => |obj| obj,
         else => return .invalid,
     };
     return .{ .accept = content };
 }
 
-fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn teamAnswer(parsed: Parsed) setup.Answer {
+fn copyAnswer(parsed: Parsed) setup.Answer {
     const object = switch (parsed) {
         .dismissed => return .dismissed,
-        .invalid => return .{ .team_choice = "" },
+        .invalid => return .invalid,
         .accept => |found| found,
     };
-    if (stringField(object, "team")) |id| return .{ .team_choice = id };
-    if (stringField(object, "team_slug")) |slug| return .{ .team_slug = slug };
-    return .{ .team_choice = "" };
-}
-
-fn projectAnswer(parsed: Parsed) setup.Answer {
-    const object = switch (parsed) {
-        .dismissed => return .dismissed,
-        .invalid => return .{ .project_choice = "" },
-        .accept => |found| found,
+    const value = object.get(copy_key) orelse return .invalid;
+    const text = switch (value) {
+        .string => |s| s,
+        else => return .invalid,
     };
-    const id = stringField(object, "project") orelse return .{ .project_choice = "" };
-    if (std.mem.eql(u8, id, create_choice)) {
-        traceDroppedOtherName(object, "the create choice was picked");
-        return .project_create;
-    }
-    if (std.mem.eql(u8, id, other_choice)) return .{ .project_other = stringField(object, "other_project") orelse "" };
-    traceDroppedOtherName(object, "a listed project was picked");
-    return .{ .project_choice = id };
-}
-
-/// A typed name that comes with a listed project or the create choice is dropped: the
-/// form asks the name only for another project, and an ACP editor may still send it.
-/// The trace names the size and the reason, never the text.
-fn traceDroppedOtherName(object: std.json.ObjectMap, reason: []const u8) void {
-    const typed = stringField(object, "other_project") orelse return;
-    if (typed.len == 0) return;
-    debug_trace.logf("remote setup", "dropped a typed other project name of {d} bytes: {s}", .{ typed.len, reason });
+    if (std.mem.eql(u8, text, choice_yes)) return .yes;
+    if (std.mem.eql(u8, text, choice_no)) return .no;
+    return .invalid;
 }
 
 const Field = struct {
@@ -636,75 +630,20 @@ fn arrayOf(arena: std.mem.Allocator, items: []const std.json.Value) std.mem.Allo
     return .{ .array = array };
 }
 
-fn choice(arena: std.mem.Allocator, value: []const u8, title: []const u8) std.mem.Allocator.Error!std.json.Value {
-    return objectOf(arena, &.{
-        .{ .key = "const", .value = str(value) },
-        .{ .key = "title", .value = str(title) },
-    });
-}
-
-fn teamSchema(arena: std.mem.Allocator, choices: setup.TeamChoices) std.mem.Allocator.Error!std.json.Value {
-    switch (choices) {
-        .slug => return objectOf(arena, &.{
-            .{ .key = "type", .value = str("object") },
-            .{ .key = "required", .value = try arrayOf(arena, &.{str("team_slug")}) },
-            .{ .key = "properties", .value = try objectOf(arena, &.{.{
-                .key = "team_slug",
-                .value = try objectOf(arena, &.{
-                    .{ .key = "type", .value = str("string") },
-                    .{ .key = "title", .value = str("Team slug") },
-                }),
-            }}) },
-        }),
-        .choose => |teams| {
-            var options = std.json.Array.init(arena);
-            for (teams) |team| {
-                const title = try arena.print("{f} ({f})", .{ text_utils.terminalSafe(team.name), text_utils.terminalSafe(team.slug) });
-                try options.append(try choice(arena, team.id, title));
-            }
-            return objectOf(arena, &.{
-                .{ .key = "type", .value = str("object") },
-                .{ .key = "required", .value = try arrayOf(arena, &.{str("team")}) },
-                .{ .key = "properties", .value = try objectOf(arena, &.{.{
-                    .key = "team",
-                    .value = try objectOf(arena, &.{
-                        .{ .key = "type", .value = str("string") },
-                        .{ .key = "oneOf", .value = .{ .array = options } },
-                    }),
-                }}) },
-            });
-        },
-    }
-}
-
-fn projectSchema(arena: std.mem.Allocator, projects: []const vercel.Project, offer_create: bool) std.mem.Allocator.Error!std.json.Value {
-    var options = std.json.Array.init(arena);
-    for (projects) |project| {
-        const title = try arena.print("{f}", .{text_utils.terminalSafe(project.name)});
-        try options.append(try choice(arena, project.id, title));
-    }
-    if (offer_create) try options.append(try choice(arena, create_choice, create_title));
-    try options.append(try choice(arena, other_choice, other_title));
+fn copySchema(arena: std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
     return objectOf(arena, &.{
         .{ .key = "type", .value = str("object") },
-        .{ .key = "required", .value = try arrayOf(arena, &.{str("project")}) },
-        .{ .key = "properties", .value = try objectOf(arena, &.{
-            .{ .key = "project", .value = try objectOf(arena, &.{
+        .{ .key = "required", .value = try arrayOf(arena, &.{str(copy_key)}) },
+        .{ .key = "properties", .value = try objectOf(arena, &.{.{
+            .key = copy_key,
+            .value = try objectOf(arena, &.{
                 .{ .key = "type", .value = str("string") },
-                .{ .key = "oneOf", .value = .{ .array = options } },
-            }) },
-            .{ .key = "other_project", .value = try objectOf(arena, &.{
-                .{ .key = "type", .value = str("string") },
-                .{ .key = "title", .value = str("Project name, for Another project") },
-                .{ .key = elicitation.shown_when_key, .value = try objectOf(arena, &.{
-                    .{ .key = "project", .value = str(other_choice) },
-                }) },
-            }) },
-        }) },
+                .{ .key = "enum", .value = try arrayOf(arena, &.{ str(choice_yes), str(choice_no) }) },
+            }),
+        }}) },
     });
 }
 
-/// The E text for a refusal, in `arena`. E4 wraps the text the config write gave.
 fn refusalText(arena: std.mem.Allocator, refusal: setup.Refusal) std.mem.Allocator.Error![]const u8 {
     return switch (refusal) {
         .no_login => e5_text,
@@ -715,17 +654,72 @@ fn refusalText(arena: std.mem.Allocator, refusal: setup.Refusal) std.mem.Allocat
         .no_answer => e15_text,
         .config_changed => e14_text,
         .config_invalid => |text| arena.print("{s}{s}{s}", .{ e4_prefix, text, e4_suffix }),
+        .workspace_unresolved => |text| text,
+        .no_team => |missing| noTeamText(arena, missing),
+        .project_not_found => |missing| arena.print(
+            "fx did not run this command: Vercel project `{f}` (from `{s}`) was not found on team `{f}`. Ask the person for a project name and run `fx config set {s} <name>`.",
+            .{ text_utils.terminalSafe(missing.name), project_setting_key, text_utils.terminalSafe(missing.team.slug), project_setting_key },
+        ),
+        .project_create_failed => |failure| projectCreateFailedText(arena, failure),
         .setup_failed => |failure| failureText(arena, failure),
     };
 }
 
-/// E9: `remote setup failed: {step}: {reason}`. An API failure uses `api.describe`.
+fn noTeamText(arena: std.mem.Allocator, missing: setup.TeamMissing) std.mem.Allocator.Error![]const u8 {
+    var slugs: std.Io.Writer.Allocating = .init(arena);
+    const limit = @min(missing.available.len, vercel.max_team_hints);
+    for (missing.available[0..limit], 0..) |team, index| {
+        if (index > 0) slugs.writer.writeAll(", ") catch return error.OutOfMemory;
+        slugs.writer.print("{f}", .{text_utils.terminalSafe(team.slug)}) catch return error.OutOfMemory;
+    }
+    if (missing.setting_slug) |slug| {
+        if (limit > 0) {
+            return arena.print(
+                "fx did not run this command: Vercel team `{f}` (from `{s}`) was not found. Available teams: {s}. Ask the person which one to use and run `fx config set {s} <slug>`.",
+                .{ text_utils.terminalSafe(slug), team_setting_key, slugs.written(), team_setting_key },
+            );
+        }
+        return arena.print(
+            "fx did not run this command: Vercel team `{f}` (from `{s}`) was not found, and no teams were listed for this login. Ask the person which team slug to use and run `fx config set {s} <slug>`.",
+            .{ text_utils.terminalSafe(slug), team_setting_key, team_setting_key },
+        );
+    }
+    if (limit > 0) {
+        return arena.print(
+            "fx did not run this command: no Vercel team is selected. Available teams: {s}. Ask the person which one to use and run `fx config set {s} <slug>`.",
+            .{ slugs.written(), team_setting_key },
+        );
+    }
+    return arena.print(
+        "fx did not run this command: no Vercel team was found for this login. Ask the person which team slug to use and run `fx config set {s} <slug>`.",
+        .{team_setting_key},
+    );
+}
+
+fn projectCreateFailedText(arena: std.mem.Allocator, failure: vercel.Failure) std.mem.Allocator.Error![]const u8 {
+    var buffer: [256]u8 = undefined;
+    const detail: []const u8 = switch (failure.reason) {
+        .status => |code| std.mem.print(&buffer, "HTTP {d}", .{code}) catch "HTTP error",
+        else => vercel.describe(&buffer, failure),
+    };
+    return arena.print(
+        "fx did not run this command: could not create project `{s}` ({s}). Ask the person for a project name and run `fx config set {s} <name>`.",
+        .{ vercel.sandbox_project_name, detail, project_setting_key },
+    );
+}
+
+fn workspaceRefusalText(arena: std.mem.Allocator, workspace_root: []const u8, err: anyerror) std.mem.Allocator.Error![]const u8 {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    return arena.print(
+        "fx did not run this command: the workspace folder {f} could not be resolved: {s}",
+        .{ text_utils.terminalSafe(workspace_root), @errorName(err) },
+    );
+}
+
 fn failureText(arena: std.mem.Allocator, failure: setup.StepFailure) std.mem.Allocator.Error![]const u8 {
     var buffer: [256]u8 = undefined;
     const detail: []const u8 = switch (failure.reason) {
         .api => |reason| vercel.describe(&buffer, .{ .step = failure.step, .reason = reason }),
-        .not_found => try arena.print("{s}: not found", .{failure.step}),
-        .no_team => try arena.print("{s}: the login has no team", .{failure.step}),
         .bad_answer => try arena.print("{s}: the answer did not fit the question", .{failure.step}),
         .write_failed => try arena.print("{s}: the config could not be written", .{failure.step}),
         .write_lock_busy => try arena.print("{s}: config lock busy", .{failure.step}),
@@ -734,12 +728,8 @@ fn failureText(arena: std.mem.Allocator, failure: setup.StepFailure) std.mem.All
     return arena.print("{s}{s}", .{ e9_prefix, detail });
 }
 
-fn failedResult(arena: std.mem.Allocator, failure: setup.StepFailure) std.mem.Allocator.Error!Result {
-    return .{ .refused = try refusalText(arena, .{ .setup_failed = failure }) };
-}
-
 fn apiFailure(arena: std.mem.Allocator, failure: vercel.Failure) std.mem.Allocator.Error!Result {
-    return failedResult(arena, .{ .step = failure.step, .reason = .{ .api = failure.reason } });
+    return .{ .refused = try refusalText(arena, .{ .setup_failed = .{ .step = failure.step, .reason = .{ .api = failure.reason } } }) };
 }
 
 fn trace(host: *const Host, comptime format: []const u8, args: anytype) void {
@@ -748,21 +738,18 @@ fn trace(host: *const Host, comptime format: []const u8, args: anytype) void {
     host.trace.write(line);
 }
 
-// Tests. Each runs `ensureReady` against fake replies, a scripted responder,
-// and a temp home for the config file.
+// --- Tests -----------------------------------------------------------------
 
 const test_token = "fx-test-token";
 const test_home = "/home/fx-test";
 const test_unix_s: i64 = 1_800_000_000;
 const test_awake_ms: i64 = 1_000_000;
 
-fn fakeAwake(context: ?*anyopaque) i64 {
-    _ = context;
+fn fakeAwake(_: ?*anyopaque) i64 {
     return test_awake_ms;
 }
 
-fn fakeUnix(context: ?*anyopaque) i64 {
-    _ = context;
+fn fakeUnix(_: ?*anyopaque) i64 {
     return test_unix_s;
 }
 
@@ -770,38 +757,33 @@ const fake_clock: Clock = .{ .awake_ms = fakeAwake, .unix_s = fakeUnix };
 
 const rule_config = "{\"rules\": [{\"command\": \"zig build*\", \"runner\": \"remote\"}]}";
 
-const user_reply: test_server.Reply = .{ .body = "{\"user\":{\"id\":\"usr_1\"}}" };
-const teams_one_reply: test_server.Reply = .{
-    .body = "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"acme\",\"name\":\"Acme\"}],\"pagination\":{\"next\":null}}",
+const user_plain_reply: test_server.Reply = .{ .body = "{\"user\":{\"id\":\"usr_1\"}}" };
+const user_default_team_reply: test_server.Reply = .{ .body = "{\"user\":{\"id\":\"usr_1\",\"defaultTeamId\":\"team_def\"}}" };
+const team_acme_reply: test_server.Reply = .{ .body = "{\"id\":\"team_1\",\"slug\":\"acme\",\"name\":\"Acme\"}" };
+const team_def_reply: test_server.Reply = .{ .body = "{\"id\":\"team_def\",\"slug\":\"def-slug\",\"name\":\"Default Team\"}" };
+const team_explicit_reply: test_server.Reply = .{ .body = "{\"id\":\"team_exp\",\"slug\":\"explicit-slug\",\"name\":\"Explicit Team\"}" };
+const team_evil_reply: test_server.Reply = .{ .body = "{\"id\":\"team_1\",\"slug\":\"acme\",\"name\":\"evil\\u001b[2Jteam\"}" };
+const teams_list_reply: test_server.Reply = .{
+    .body = "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"acme\",\"name\":\"Acme\"},{\"id\":\"team_2\",\"slug\":\"beta\",\"name\":\"Beta\"}],\"pagination\":{\"next\":null}}",
 };
-const teams_two_reply: test_server.Reply = .{
-    .body = "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"acme\",\"name\":\"Acme\"},{\"id\":\"team_2\",\"slug\":\"other\",\"name\":\"Other\"}],\"pagination\":{\"next\":null}}",
-};
-const teams_evil_reply: test_server.Reply = .{
-    .body = "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"acme\",\"name\":\"evil\\u001b[2Jteam\"},{\"id\":\"team_2\",\"slug\":\"other\",\"name\":\"Other\"}],\"pagination\":{\"next\":null}}",
-};
-const projects_one_reply: test_server.Reply = .{ .body = "{\"projects\":[{\"id\":\"prj_1\",\"name\":\"repo\"}]}" };
-const projects_evil_reply: test_server.Reply = .{ .body = "{\"projects\":[{\"id\":\"prj_1\",\"name\":\"re\\u001b[2Jpo\"}]}" };
+const project_sandbox_reply: test_server.Reply = .{ .body = "{\"id\":\"prj_sandbox\",\"name\":\"fx-sandbox\"}" };
+const project_custom_reply: test_server.Reply = .{ .body = "{\"id\":\"prj_custom\",\"name\":\"my-proj\"}" };
+const project_evil_reply: test_server.Reply = .{ .body = "{\"id\":\"prj_1\",\"name\":\"re\\u001b[2Jpo\"}" };
+const not_found_reply: test_server.Reply = .{ .status = "404 Not Found", .body = "{}" };
 const status_500: test_server.Reply = .{ .status = "500 Internal Server Error", .body = "" };
 const status_401: test_server.Reply = .{ .status = "401 Unauthorized", .body = "{}" };
 
-const accept_project = "{\"action\":\"accept\",\"content\":{\"project\":\"prj_1\"}}";
-const accept_team_one = "{\"action\":\"accept\",\"content\":{\"team\":\"team_1\"}}";
+const accept_yes = "{\"action\":\"accept\",\"content\":{\"copy\":\"Yes\"}}";
+const accept_no = "{\"action\":\"accept\",\"content\":{\"copy\":\"No\"}}";
 const decline_reply = "{\"action\":\"decline\"}";
-const cancel_reply = "{\"action\":\"cancel\"}";
 
 const Step = struct {
     answer: Answer,
-    /// Sets the call's cancel flag before the answer goes back.
     cancel_first: bool = false,
-    /// Waits for this event before the answer goes back.
     gate: ?*std.Io.Event = null,
 
     const Answer = union(enum) {
-        /// This prompt's answer. The responder keys it as the real ones do.
         json: []const u8,
-        /// The exact bytes a responder writes, keyed by the request.
-        keyed: []const u8,
         timed_out,
         broken,
     };
@@ -832,17 +814,16 @@ const Scripted = struct {
     cancel: *std.atomic.Value(bool),
     tmp_dir: std.Io.Dir,
     token: []const u8 = test_token,
-    /// Runs once the prompt is open, before its answer goes back.
     before: ?*const fn (*Scripted) anyerror!void = null,
-    /// Set when the first prompt opens.
     asked: ?*std.Io.Event = null,
     next: usize = 0,
     prompts: usize = 0,
     saw_token: bool = false,
-    saw_header: bool = false,
     saw_escape: bool = false,
     saw_evil: bool = false,
     wrong_origin: bool = false,
+    last_message: [512]u8 = undefined,
+    last_message_len: usize = 0,
 
     fn respond(context: *anyopaque, alloc: std.mem.Allocator, origin: tool_mcp_runtime.InputOrigin, required: tool_mcp_runtime.InputRequired) anyerror![]const u8 {
         const self: *Scripted = @ptrCast(@alignCast(context));
@@ -850,10 +831,19 @@ const Scripted = struct {
         const json = required.input_requests_json;
         if (origin.kind != .host) self.wrong_origin = true;
         if (std.mem.find(u8, json, self.token) != null) self.saw_token = true;
-        if (std.mem.find(u8, json, "fx asks") != null) self.saw_header = true;
-        // A JSON string writes an ESC byte as \u001b, so this finds a raw escape.
         if (std.mem.find(u8, json, "\\u001b") != null) self.saw_escape = true;
         if (std.mem.find(u8, json, "evil") != null) self.saw_evil = true;
+        if (std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{})) |root| {
+            if (root.object.get(copy_key)) |req| {
+                if (req.object.get("params")) |params| {
+                    if (params.object.get("message")) |msg| {
+                        const copy_len = @min(self.last_message.len, msg.string.len);
+                        @memcpy(self.last_message[0..copy_len], msg.string[0..copy_len]);
+                        self.last_message_len = copy_len;
+                    }
+                }
+            }
+        } else |_| {}
         if (self.asked) |event| event.set(io_mod.getIo());
         const step = self.steps[@min(self.next, self.steps.len - 1)];
         self.next += 1;
@@ -862,15 +852,16 @@ const Scripted = struct {
         if (self.before) |hook| try hook(self);
         return switch (step.answer) {
             .json => |bytes| try keyedFor(alloc, json, bytes),
-            .keyed => |bytes| try alloc.dupe(u8, bytes),
             .timed_out => error.McpInputTimedOut,
             .broken => error.QuestionFailed,
         };
     }
+
+    fn lastMessage(self: *const Scripted) []const u8 {
+        return self.last_message[0..self.last_message_len];
+    }
 };
 
-/// Writes `bare` as the answer to the request in `input_json`, keyed by that
-/// request, as the TUI, `fx ask` and ACP responders do.
 fn keyedFor(alloc: std.mem.Allocator, input_json: []const u8, bare: []const u8) ![]const u8 {
     const root = try std.json.parseFromSliceLeaky(std.json.Value, alloc, input_json, .{});
     const key = root.object.keys()[0];
@@ -886,6 +877,8 @@ const TestEnv = struct {
     tmp: testing.TmpDir,
     home_path: []u8,
     fx_home: []u8,
+    repo_a: []u8,
+    repo_b: []u8,
     origin: []u8,
     slot: *remote_slot.Slot,
     server: test_server.Server,
@@ -902,10 +895,16 @@ const TestEnv = struct {
         self.tmp = testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
         try self.tmp.dir.createDirPath(testing.io, "fxhome/sandbox");
+        try self.tmp.dir.createDirPath(testing.io, "repo-a");
+        try self.tmp.dir.createDirPath(testing.io, "repo-b");
         self.fx_home = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, "fxhome");
         errdefer alloc.free(self.fx_home);
         self.home_path = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, ".");
         errdefer alloc.free(self.home_path);
+        self.repo_a = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, "repo-a");
+        errdefer alloc.free(self.repo_a);
+        self.repo_b = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, "repo-b");
+        errdefer alloc.free(self.repo_b);
         self.slot = try remote_slot.Slot.create(alloc);
         errdefer self.slot.destroy();
         self.server = .{ .replies = replies };
@@ -943,26 +942,51 @@ const TestEnv = struct {
         self.slot.destroy();
         self.tmp.cleanup();
         self.alloc.free(self.origin);
+        self.alloc.free(self.repo_b);
+        self.alloc.free(self.repo_a);
         self.alloc.free(self.home_path);
         self.alloc.free(self.fx_home);
         self.alloc.destroy(self);
     }
 
-    fn call(self: *TestEnv, arena: std.mem.Allocator, key: ?[]const u8, turn: u64, allowed: bool, form: bool) Call {
-        return callFor(arena, allowed, key, turn, if (form) self.responder else null, &self.cancel);
+    fn writeCliLogin(self: *TestEnv, current_team: ?[]const u8) !void {
+        try self.tmp.dir.createDirPath(testing.io, ".local/share/com.vercel.cli");
+        try self.tmp.dir.writeFile(testing.io, .{
+            .sub_path = ".local/share/com.vercel.cli/auth.json",
+            .data = "{\"token\":\"" ++ test_token ++ "\"}",
+        });
+        if (current_team) |team| {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const body = try arena.allocator().print("{{\"currentTeam\":\"{s}\"}}", .{team});
+            try self.tmp.dir.writeFile(testing.io, .{
+                .sub_path = ".local/share/com.vercel.cli/config.json",
+                .data = body,
+            });
+        }
+        self.host.env = .{ .home = self.home_path };
     }
 
-    fn run(self: *TestEnv, arena: std.mem.Allocator, key: ?[]const u8, turn: u64) !Result {
-        return ensureReady(&self.host, self.call(arena, key, turn, true, true));
+    fn call(self: *TestEnv, arena: std.mem.Allocator, repo: []const u8, intent: SetupIntent, key: ?[]const u8, turn: u64, allowed: bool, form: bool) Call {
+        return callFor(arena, repo, intent, allowed, key, turn, if (form) self.responder else null, &self.cancel);
     }
 
-    fn primeUser(self: *TestEnv) !void {
-        try self.host.user_check.store(self.alloc, tokenHash(.{ .value = test_token }), "usr_1");
+    fn run(self: *TestEnv, arena: std.mem.Allocator, repo: []const u8, key: ?[]const u8, turn: u64) !Result {
+        return ensureReady(&self.host, self.call(arena, repo, .{}, key, turn, true, true));
+    }
+
+    fn runWithIntent(self: *TestEnv, arena: std.mem.Allocator, repo: []const u8, intent: SetupIntent, key: ?[]const u8, turn: u64) !Result {
+        return ensureReady(&self.host, self.call(arena, repo, intent, key, turn, true, true));
     }
 };
 
 fn readConfig(arena: std.mem.Allocator, dir: std.Io.Dir) ![]u8 {
     return dir.readFileAlloc(testing.io, "fxhome/sandbox/config.json", arena, .limited(64 * 1024));
+}
+
+fn consentExists(arena: std.mem.Allocator, env: *TestEnv, user_id: []const u8, repo: []const u8, team_id: []const u8, project_id: []const u8) !bool {
+    const key = try consent.repoKey(arena, user_id, repo);
+    return consent.hasForDestination(arena, env.fx_home, key, team_id, project_id);
 }
 
 const Runner = struct {
@@ -996,425 +1020,315 @@ fn expectReady(result: Result, team_id: []const u8, project_id: []const u8) !voi
     }
 }
 
-test "AC-19: one team, two calls at once: the project is asked once, and both calls get the same destination" {
+test "team from CLI config resolves team and fx-sandbox, asks copy question once, writes config and consent" {
+    const alloc = testing.allocator;
+    const steps = [_]Step{.{ .answer = .{ .json = accept_yes } }};
+    const env = try TestEnv.create(alloc, &.{ user_plain_reply, team_acme_reply, project_sandbox_reply }, &steps);
+    defer env.destroy();
+    try env.writeCliLogin("team_1");
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try expectReady(try env.run(a, env.repo_a, "session-a", 5), "team_1", "prj_sandbox");
+    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
+    try testing.expect(std.mem.find(u8, env.scripted.lastMessage(), "Vercel team Acme, project fx-sandbox?") != null);
+    try testing.expect(try consentExists(a, env, "usr_1", env.repo_a, "team_1", "prj_sandbox"));
+    const cfg = try readConfig(a, env.tmp.dir);
+    try testing.expect(std.mem.find(u8, cfg, "\"team_id\": \"team_1\"") != null);
+    try testing.expectEqualStrings("GET /v2/teams/team_1 HTTP/1.1", env.server.line(1));
+}
+
+test "team from user defaultTeamId resolves when CLI config is absent" {
+    const alloc = testing.allocator;
+    const steps = [_]Step{.{ .answer = .{ .json = accept_yes } }};
+    const env = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, project_sandbox_reply }, &steps);
+    defer env.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try expectReady(try env.run(arena.allocator(), env.repo_a, "session-a", 5), "team_def", "prj_sandbox");
+    try testing.expectEqualStrings("GET /v2/teams/team_def HTTP/1.1", env.server.line(1));
+}
+
+test "team from explicit slug overrides CLI config and defaultTeamId" {
+    const alloc = testing.allocator;
+    const steps = [_]Step{.{ .answer = .{ .json = accept_yes } }};
+    const env = try TestEnv.create(alloc, &.{ user_default_team_reply, team_explicit_reply, project_sandbox_reply }, &steps);
+    defer env.destroy();
+    try env.writeCliLogin("team_1");
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const res = try env.runWithIntent(arena.allocator(), env.repo_a, .{ .team = "explicit-slug" }, "session-a", 5);
+    try expectReady(res, "team_exp", "prj_sandbox");
+    try testing.expectEqualStrings("GET /v2/teams/explicit-slug HTTP/1.1", env.server.line(1));
+}
+
+test "no team found refuses with up to 10 team slugs and fx config set fix" {
+    const alloc = testing.allocator;
+    const env = try TestEnv.create(alloc, &.{ user_plain_reply, teams_list_reply }, &.{});
+    defer env.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const res = try env.run(arena.allocator(), env.repo_a, "session-a", 5);
+    switch (res) {
+        .refused => |text| {
+            try testing.expect(std.mem.find(u8, text, "acme") != null);
+            try testing.expect(std.mem.find(u8, text, "beta") != null);
+            try testing.expect(std.mem.find(u8, text, "fx config set " ++ team_setting_key ++ " <slug>") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 0), env.scripted.prompts);
+}
+
+test "explicit project exists uses it; missing explicit project refuses with project fix" {
+    const alloc = testing.allocator;
+    const steps = [_]Step{.{ .answer = .{ .json = accept_yes } }};
+    const env = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, project_custom_reply }, &steps);
+    defer env.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const ok = try env.runWithIntent(arena.allocator(), env.repo_a, .{ .project = "my-proj" }, "session-a", 5);
+    try expectReady(ok, "team_def", "prj_custom");
+
+    const env_missing = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, not_found_reply }, &.{});
+    defer env_missing.destroy();
+    const missing = try env_missing.runWithIntent(arena.allocator(), env_missing.repo_a, .{ .project = "missing-proj" }, "session-a", 5);
+    switch (missing) {
+        .refused => |text| {
+            try testing.expect(std.mem.find(u8, text, "missing-proj") != null);
+            try testing.expect(std.mem.find(u8, text, "fx config set " ++ project_setting_key ++ " <name>") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 0), env_missing.scripted.prompts);
+}
+
+test "fx-sandbox missing asks copy question first, then creates after yes" {
+    const alloc = testing.allocator;
+    const steps = [_]Step{.{ .answer = .{ .json = accept_yes } }};
+    const env = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, not_found_reply, project_sandbox_reply }, &steps);
+    defer env.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const res = try env.run(arena.allocator(), env.repo_a, "session-a", 5);
+    try expectReady(res, "team_def", "prj_sandbox");
+    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
+    try testing.expectEqualStrings("POST /v11/projects?teamId=team_def HTTP/1.1", env.server.line(3));
+}
+
+test "fx-sandbox create failure refuses with HTTP status and project fix, writes nothing" {
+    const alloc = testing.allocator;
+    const steps = [_]Step{.{ .answer = .{ .json = accept_yes } }};
+    const env = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, not_found_reply, status_500 }, &steps);
+    defer env.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const res = try env.run(arena.allocator(), env.repo_a, "session-a", 5);
+    switch (res) {
+        .refused => |text| {
+            try testing.expect(std.mem.find(u8, text, "HTTP 500") != null);
+            try testing.expect(std.mem.find(u8, text, "fx config set " ++ project_setting_key ++ " <name>") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(!try consentExists(arena.allocator(), env, "usr_1", env.repo_a, "team_def", "prj_sandbox"));
+    try testing.expectError(error.FileNotFound, readConfig(arena.allocator(), env.tmp.dir));
+}
+
+test "decline creates nothing, writes no config or consent, and sets per-turn mark" {
+    const alloc = testing.allocator;
+    const steps = [_]Step{.{ .answer = .{ .json = accept_no } }};
+    const env = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, not_found_reply }, &steps);
+    defer env.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try expectRefused(try env.run(a, env.repo_a, "session-a", 5), e8_text);
+    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
+    try testing.expectEqual(setup.Mark.declined, env.slot.markFor("session-a", 5));
+    try testing.expectError(error.FileNotFound, readConfig(a, env.tmp.dir));
+    try testing.expect(!try consentExists(a, env, "usr_1", env.repo_a, "team_def", "prj_sandbox"));
+
+    try expectRefused(try env.run(a, env.repo_a, "session-a", 5), e8_text);
+    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
+    try testing.expectEqual(@as(usize, 3), env.server.servedCount());
+}
+
+test "consent in repo A asks again in repo B, asks once for same repo and destination, and asks again on destination change" {
+    const alloc = testing.allocator;
+    const steps = [_]Step{
+        .{ .answer = .{ .json = accept_yes } },
+        .{ .answer = .{ .json = accept_yes } },
+        .{ .answer = .{ .json = accept_yes } },
+    };
+    const env = try TestEnv.create(alloc, &.{
+        user_default_team_reply,
+        team_def_reply,
+        project_sandbox_reply,
+        // Repo B discovery:
+        team_def_reply,
+        project_sandbox_reply,
+        // Destination change in Repo A:
+        team_explicit_reply,
+        project_sandbox_reply,
+    }, &steps);
+    defer env.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // First run in Repo A: asks once.
+    try expectReady(try env.run(a, env.repo_a, "session-a", 5), "team_def", "prj_sandbox");
+    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
+
+    // Repeat in Repo A: no prompt.
+    try expectReady(try env.run(a, env.repo_a, "session-a", 6), "team_def", "prj_sandbox");
+    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
+
+    // First run in Repo B: asks again.
+    try expectReady(try env.run(a, env.repo_b, "session-a", 7), "team_def", "prj_sandbox");
+    try testing.expectEqual(@as(usize, 2), env.scripted.prompts);
+
+    // Destination change in Repo A: asks again.
+    try expectReady(try env.runWithIntent(a, env.repo_a, .{ .team = "explicit-slug" }, "session-a", 8), "team_exp", "prj_sandbox");
+    try testing.expectEqual(@as(usize, 3), env.scripted.prompts);
+}
+
+test "concurrent calls in the same repo ask once" {
     const alloc = testing.allocator;
     var asked: std.Io.Event = .unset;
     var gate: std.Io.Event = .unset;
-    const steps = [_]Step{.{ .answer = .{ .json = accept_project }, .gate = &gate }};
-    const env = try TestEnv.create(alloc, &.{ teams_one_reply, projects_one_reply, sandbox_missing_reply }, &steps);
+    const steps = [_]Step{.{ .answer = .{ .json = accept_yes }, .gate = &gate }};
+    const env = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, project_sandbox_reply }, &steps);
     defer env.destroy();
     env.scripted.asked = &asked;
-    try env.primeUser();
 
     var arena_a = std.heap.ArenaAllocator.init(alloc);
     defer arena_a.deinit();
     var arena_b = std.heap.ArenaAllocator.init(alloc);
     defer arena_b.deinit();
 
-    var first: Runner = .{ .host = &env.host, .call = env.call(arena_a.allocator(), "session-a", 5, true, true) };
+    var first: Runner = .{ .host = &env.host, .call = env.call(arena_a.allocator(), env.repo_a, .{}, "session-a", 5, true, true) };
     const thread_a = try std.Thread.spawn(.{}, Runner.run, .{&first});
     try asked.waitTimeout(io_mod.getIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
 
-    var second: Runner = .{ .host = &env.host, .call = env.call(arena_b.allocator(), "session-b", 5, true, true) };
+    var second: Runner = .{ .host = &env.host, .call = env.call(arena_b.allocator(), env.repo_a, .{}, "session-b", 5, true, true) };
     const thread_b = try std.Thread.spawn(.{}, Runner.run, .{&second});
     gate.set(io_mod.getIo());
     thread_a.join();
     thread_b.join();
 
     try testing.expect(!first.failed and !second.failed);
-    try expectReady(first.result orelse return error.TestUnexpectedResult, "team_1", "prj_1");
-    try expectReady(second.result orelse return error.TestUnexpectedResult, "team_1", "prj_1");
-    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
-    try testing.expect(!env.scripted.wrong_origin);
-}
-
-test "AC-29: a rule added before the project accept gives E14, and the file keeps the rule with no remote" {
-    const alloc = testing.allocator;
-    const steps = [_]Step{.{ .answer = .{ .json = accept_project } }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_one_reply, projects_one_reply, sandbox_missing_reply }, &steps);
-    defer env.destroy();
-    env.scripted.before = addRule;
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = try env.run(arena.allocator(), "session-a", 5);
-    try expectRefused(result, e14_text);
-
-    const text = try readConfig(arena.allocator(), env.tmp.dir);
-    try testing.expect(std.mem.find(u8, text, "\"rules\"") != null);
-    try testing.expect(std.mem.find(u8, text, "\"remote\":") == null);
-    try testing.expect((try env.slot.currentDestination(arena.allocator())) == null);
-}
-
-test "the host prompt text has no fx asks header, so the ACP formatter adds exactly one" {
-    const alloc = testing.allocator;
-    const steps = [_]Step{.{ .answer = .{ .json = accept_project } }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_one_reply, projects_one_reply, sandbox_missing_reply }, &steps);
-    defer env.destroy();
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = try env.run(arena.allocator(), "session-a", 5);
-    try expectReady(result, "team_1", "prj_1");
-    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
-    try testing.expect(!env.scripted.saw_header);
-}
-
-const sandbox_found_reply: test_server.Reply = .{ .body = "{\"id\":\"prj_9\",\"name\":\"fx-sandbox\"}" };
-const sandbox_missing_reply: test_server.Reply = .{ .status = "404 Not Found", .body = "{}" };
-
-test "U6: an fx-sandbox the first page does not hold is listed as existing when its lookup answers 200" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const env = try TestEnv.create(testing.allocator, &.{ projects_one_reply, sandbox_found_reply }, &.{});
-    defer env.destroy();
-    const team: vercel.Team = .{ .id = "team_1", .slug = "acme", .name = "Acme" };
-    const event = try restEvent(&env.host, env.call(arena_state.allocator(), null, 1, true, false), .{ .value = test_token }, .{ .list_projects = team });
-    switch (event) {
-        .projects_listed => |listed| {
-            try testing.expectEqual(@as(usize, 2), listed.projects.len);
-            try testing.expectEqualStrings("fx-sandbox", listed.projects[1].name);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "U6: a 404 on the fx-sandbox lookup leaves the listed projects as they are" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const env = try TestEnv.create(testing.allocator, &.{ projects_one_reply, sandbox_missing_reply }, &.{});
-    defer env.destroy();
-    const team: vercel.Team = .{ .id = "team_1", .slug = "acme", .name = "Acme" };
-    const event = try restEvent(&env.host, env.call(arena_state.allocator(), null, 1, true, false), .{ .value = test_token }, .{ .list_projects = team });
-    switch (event) {
-        .projects_listed => |listed| try testing.expectEqual(@as(usize, 1), listed.projects.len),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "U6: a failed fx-sandbox lookup is the list step's failure, with its status (E9)" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const env = try TestEnv.create(testing.allocator, &.{ projects_one_reply, status_500 }, &.{});
-    defer env.destroy();
-    const team: vercel.Team = .{ .id = "team_1", .slug = "acme", .name = "Acme" };
-    const event = try restEvent(&env.host, env.call(arena_state.allocator(), null, 1, true, false), .{ .value = test_token }, .{ .list_projects = team });
-    switch (event) {
-        .rest_failed => |failure| {
-            try testing.expectEqualStrings("project", failure.step);
-            switch (failure.reason) {
-                .status => |code| try testing.expectEqual(@as(u16, 500), code),
-                else => return error.TestUnexpectedResult,
-            }
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "E5: no login is refused, and no prompt or REST runs" {
-    const alloc = testing.allocator;
-    const env = try TestEnv.create(alloc, &.{user_reply}, &.{});
-    defer env.destroy();
-    env.host.env = .{ .home = env.home_path };
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    try expectRefused(try env.run(arena.allocator(), "session-a", 5), e5_text);
-    try testing.expectEqual(@as(usize, 0), env.scripted.prompts);
-    try testing.expectEqual(@as(setup.Mark, .none), env.slot.markFor("session-a", 5));
-}
-
-test "E6: an expired login is refused with no REST" {
-    const alloc = testing.allocator;
-    const env = try TestEnv.create(alloc, &.{user_reply}, &.{});
-    defer env.destroy();
-    env.host.env = .{ .home = env.home_path };
-    try env.tmp.dir.createDirPath(testing.io, ".local/share/com.vercel.cli");
-    try env.tmp.dir.writeFile(testing.io, .{
-        .sub_path = ".local/share/com.vercel.cli/auth.json",
-        .data = "{\"token\":\"fx-expired-token\",\"expiresAt\":1700000000}",
-    });
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    try expectRefused(try env.run(arena.allocator(), "session-a", 5), e6_text);
-    try testing.expectEqual(@as(usize, 0), env.scripted.prompts);
-}
-
-test "E6: a 401 from the user check is refused as a rejected login" {
-    const alloc = testing.allocator;
-    const env = try TestEnv.create(alloc, &.{status_401}, &.{});
-    defer env.destroy();
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    try expectRefused(try env.run(arena.allocator(), "session-a", 5), e6_text);
-    try testing.expectEqual(@as(usize, 0), env.scripted.prompts);
-}
-
-test "E7: no prompt channel is refused with no prompt" {
-    const alloc = testing.allocator;
-    const env = try TestEnv.create(alloc, &.{user_reply}, &.{});
-    defer env.destroy();
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = try ensureReady(&env.host, env.call(arena.allocator(), "session-a", 5, true, false));
-    try expectRefused(result, e7_text);
-    try testing.expectEqual(@as(usize, 0), env.scripted.prompts);
-}
-
-test "E8: a decline on P1 sets the mark, which refuses the same turn without a prompt" {
-    const alloc = testing.allocator;
-    const steps = [_]Step{.{ .answer = .{ .json = decline_reply } }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_two_reply, teams_two_reply }, &steps);
-    defer env.destroy();
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    try expectRefused(try env.run(arena.allocator(), "session-a", 5), e8_text);
-    try testing.expectEqual(setup.Mark.declined, env.slot.markFor("session-a", 5));
-    try expectRefused(try env.run(arena.allocator(), "session-a", 5), e8_text);
-    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
-
-    try expectRefused(try env.run(arena.allocator(), "session-a", 6), e8_text);
-    try testing.expectEqual(@as(usize, 2), env.scripted.prompts);
-}
-
-test "E8: a decline on P2 sets the mark, which refuses the same turn without a prompt" {
-    const alloc = testing.allocator;
-    const steps = [_]Step{.{ .answer = .{ .json = decline_reply } }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_one_reply, projects_one_reply, sandbox_missing_reply }, &steps);
-    defer env.destroy();
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    try expectRefused(try env.run(arena.allocator(), "session-a", 5), e8_text);
-    try expectRefused(try env.run(arena.allocator(), "session-a", 5), e8_text);
+    try expectReady(first.result orelse return error.TestUnexpectedResult, "team_def", "prj_sandbox");
+    try expectReady(second.result orelse return error.TestUnexpectedResult, "team_def", "prj_sandbox");
     try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
 }
 
-test "E9: a failed REST step is refused with its step and status, and sets no mark" {
+test "no channel refuses without prompt when no consent, and succeeds once consented" {
     const alloc = testing.allocator;
-    const env = try TestEnv.create(alloc, &.{ user_reply, status_500 }, &.{});
+    const steps = [_]Step{.{ .answer = .{ .json = accept_yes } }};
+    const env = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, project_sandbox_reply }, &steps);
     defer env.destroy();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const result = try env.run(arena.allocator(), "session-a", 5);
-    switch (result) {
-        .refused => |text| {
-            try testing.expect(std.mem.startsWith(u8, text, e9_prefix));
-            try testing.expect(std.mem.find(u8, text, "HTTP 500") != null);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-    try testing.expectEqual(setup.Mark.none, env.slot.markFor("session-a", 5));
-}
+    const a = arena.allocator();
 
-test "E9: a failed user check names the user step" {
-    const alloc = testing.allocator;
-    const env = try TestEnv.create(alloc, &.{status_500}, &.{});
-    defer env.destroy();
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = try env.run(arena.allocator(), "session-a", 5);
-    switch (result) {
-        .refused => |text| try testing.expectEqualStrings(e9_prefix ++ "user: HTTP 500", text),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "E9: a prompt that cannot be answered is refused, sets no mark, and writes nothing" {
-    const alloc = testing.allocator;
-    const steps = [_]Step{.{ .answer = .broken }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_one_reply, projects_one_reply, sandbox_missing_reply }, &steps);
-    defer env.destroy();
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = try env.run(arena.allocator(), "session-a", 5);
-    try expectRefused(result, e9_prefix ++ "project: the question could not be shown or answered");
-    try testing.expectEqual(setup.Mark.none, env.slot.markFor("session-a", 5));
-    try testing.expectError(error.FileNotFound, readConfig(arena.allocator(), env.tmp.dir));
-}
-
-test "E10: a sub-agent call is refused, and it never reads or writes the mark" {
-    const alloc = testing.allocator;
-    const env = try TestEnv.create(alloc, &.{user_reply}, &.{});
-    defer env.destroy();
-    try env.slot.recordMark("session-a", 5, .declined);
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = try ensureReady(&env.host, env.call(arena.allocator(), null, 5, false, true));
-    try expectRefused(result, e10_text);
+    const headless_before = try ensureReady(&env.host, env.call(a, env.repo_a, .{}, "session-a", 5, true, false));
+    try expectRefused(headless_before, e7_text);
     try testing.expectEqual(@as(usize, 0), env.scripted.prompts);
-    try testing.expectEqual(setup.Mark.declined, env.slot.markFor("session-a", 5));
+
+    try expectReady(try env.run(a, env.repo_a, "session-a", 5), "team_def", "prj_sandbox");
+    const headless_after = try ensureReady(&env.host, env.call(a, env.repo_a, .{}, "session-a", 6, true, false));
+    try expectReady(headless_after, "team_def", "prj_sandbox");
 }
 
-test "E15: an unanswered prompt is refused after the limit, and the same turn stays refused" {
+test "sub-agent refuses E10 without prompt when no consent, and succeeds once consented" {
     const alloc = testing.allocator;
-    const steps = [_]Step{.{ .answer = .timed_out }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_one_reply, projects_one_reply, sandbox_missing_reply }, &steps);
+    const steps = [_]Step{.{ .answer = .{ .json = accept_yes } }};
+    const env = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, project_sandbox_reply }, &steps);
     defer env.destroy();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    try expectRefused(try env.run(arena.allocator(), "session-a", 5), e15_text);
-    try testing.expectEqual(setup.Mark.no_answer, env.slot.markFor("session-a", 5));
-    try expectRefused(try env.run(arena.allocator(), "session-a", 5), e15_text);
-    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
-}
+    const a = arena.allocator();
 
-test "cancel before the call ends canceled with no prompt and no mark" {
-    const alloc = testing.allocator;
-    const env = try TestEnv.create(alloc, &.{user_reply}, &.{});
-    defer env.destroy();
-    env.cancel.store(true, .release);
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = try env.run(arena.allocator(), "session-a", 5);
-    try testing.expect(result == .canceled);
+    const sub_before = try ensureReady(&env.host, env.call(a, env.repo_a, .{}, "session-a", 5, false, true));
+    try expectRefused(sub_before, e10_text);
     try testing.expectEqual(@as(usize, 0), env.scripted.prompts);
-    try testing.expectEqual(setup.Mark.none, env.slot.markFor("session-a", 5));
+
+    try expectReady(try env.run(a, env.repo_a, "session-a", 5), "team_def", "prj_sandbox");
+    const sub_after = try ensureReady(&env.host, env.call(a, env.repo_a, .{}, "session-a", 6, false, true));
+    try expectReady(sub_after, "team_def", "prj_sandbox");
 }
 
-test "cancel during a prompt ends canceled with no mark" {
+test "cancel during the copy question writes nothing and sets no mark" {
     const alloc = testing.allocator;
     const steps = [_]Step{.{ .answer = .{ .json = decline_reply }, .cancel_first = true }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_one_reply, projects_one_reply, sandbox_missing_reply }, &steps);
+    const env = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, project_sandbox_reply }, &steps);
     defer env.destroy();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const result = try env.run(arena.allocator(), "session-a", 5);
+    const a = arena.allocator();
+    const result = try env.run(a, env.repo_a, "session-a", 5);
     try testing.expect(result == .canceled);
     try testing.expectEqual(setup.Mark.none, env.slot.markFor("session-a", 5));
+    try testing.expectError(error.FileNotFound, readConfig(a, env.tmp.dir));
+    try testing.expect(!try consentExists(a, env, "usr_1", env.repo_a, "team_def", "prj_sandbox"));
 }
 
-test "cancel after an accept ends canceled, and nothing is written" {
+test "E5, E6, E14, E15, and terminal-safe outside text hold" {
     const alloc = testing.allocator;
-    const steps = [_]Step{.{ .answer = .{ .json = accept_project }, .cancel_first = true }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_one_reply, projects_one_reply, sandbox_missing_reply }, &steps);
-    defer env.destroy();
-
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const result = try env.run(arena.allocator(), "session-a", 5);
-    try testing.expect(result == .canceled);
-    try testing.expectError(error.FileNotFound, readConfig(arena.allocator(), env.tmp.dir));
-}
+    const a = arena.allocator();
 
-test "R5: the user check runs once per process per token, and later calls read the cache" {
-    const alloc = testing.allocator;
-    const steps = [_]Step{.{ .answer = .{ .json = accept_project } }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_one_reply, projects_one_reply, sandbox_missing_reply }, &steps);
-    defer env.destroy();
+    // E5
+    const env_no_login = try TestEnv.create(alloc, &.{}, &.{});
+    defer env_no_login.destroy();
+    env_no_login.host.env = .{ .home = env_no_login.home_path };
+    try expectRefused(try env_no_login.run(a, env_no_login.repo_a, "session-a", 5), e5_text);
 
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    try expectReady(try env.run(arena.allocator(), "session-a", 5), "team_1", "prj_1");
-    try expectReady(try env.run(arena.allocator(), "session-a", 6), "team_1", "prj_1");
-    env.server.close();
-    // The user, the teams, the projects, and the fx-sandbox lookup (U6); the second run asks nothing.
-    try testing.expectEqual(@as(usize, 4), env.server.servedCount());
-    try testing.expect(std.mem.startsWith(u8, env.server.head(0), "GET /v2/user"));
-}
+    // E6
+    const env_rejected = try TestEnv.create(alloc, &.{status_401}, &.{});
+    defer env_rejected.destroy();
+    try expectRefused(try env_rejected.run(a, env_rejected.repo_a, "session-a", 5), e6_text);
 
-test "a token that is held by the host never reaches a prompt, a trace line or a refusal" {
-    const alloc = testing.allocator;
+    // E15
+    const timeout_steps = [_]Step{.{ .answer = .timed_out }};
+    const env_timeout = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, project_sandbox_reply }, &timeout_steps);
+    defer env_timeout.destroy();
+    try expectRefused(try env_timeout.run(a, env_timeout.repo_a, "session-a", 5), e15_text);
+    try testing.expectEqual(setup.Mark.no_answer, env_timeout.slot.markFor("session-a", 5));
+
+    // E14
+    const rule_steps = [_]Step{.{ .answer = .{ .json = accept_yes } }};
+    const env_rule = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, project_sandbox_reply }, &rule_steps);
+    defer env_rule.destroy();
+    env_rule.scripted.before = addRule;
+    try expectRefused(try env_rule.run(a, env_rule.repo_a, "session-a", 5), e14_text);
+    try testing.expect(!try consentExists(a, env_rule, "usr_1", env_rule.repo_a, "team_def", "prj_sandbox"));
+
+    // Terminal-safe + token leak check
     const leak_token = "fx-leak-token-7f3a91";
-    const steps = [_]Step{.{ .answer = .{ .json = accept_project } }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_one_reply, projects_one_reply, sandbox_missing_reply }, &steps);
-    defer env.destroy();
-    env.host.env = .{ .vercel_token = leak_token, .home = env.home_path };
-    env.scripted.token = leak_token;
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    try expectReady(try env.run(arena.allocator(), "session-a", 5), "team_1", "prj_1");
-    try testing.expect(!env.scripted.saw_token);
-    try testing.expect(std.mem.find(u8, env.capture.captured(), leak_token) == null);
-}
-
-const keyed_accept_team_one = "{\"team\":{\"action\":\"accept\",\"content\":{\"team\":\"team_1\"}}}";
-const keyed_accept_project = "{\"project\":{\"action\":\"accept\",\"content\":{\"project\":\"prj_1\"}}}";
-
-test "an answer keyed exactly as ACP writes it is read as this prompt's answer" {
-    const alloc = testing.allocator;
-    const steps = [_]Step{ .{ .answer = .{ .keyed = keyed_accept_team_one } }, .{ .answer = .{ .keyed = keyed_accept_project } } };
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_two_reply, projects_one_reply, sandbox_missing_reply }, &steps);
-    defer env.destroy();
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    try expectReady(try env.run(arena.allocator(), "session-a", 5), "team_1", "prj_1");
-    try testing.expectEqual(@as(usize, 2), env.scripted.prompts);
-}
-
-test "an answer keyed by another request is refused, and the setup fails without asking again" {
-    const alloc = testing.allocator;
-    const steps = [_]Step{.{ .answer = .{ .keyed = keyed_accept_project } }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_two_reply, projects_one_reply, sandbox_missing_reply }, &steps);
-    defer env.destroy();
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = try env.run(arena.allocator(), "session-a", 5);
-    try testing.expect(std.meta.activeTag(result) == .refused);
-    try testing.expect(std.mem.find(u8, result.refused, "did not fit the question") != null);
-    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
-}
-
-test "a team name with an escape sequence shows cleaned in the title, and the step gets the team's id unchanged" {
-    const alloc = testing.allocator;
-    const steps = [_]Step{ .{ .answer = .{ .json = accept_team_one } }, .{ .answer = .{ .json = accept_project } } };
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_evil_reply, projects_one_reply, sandbox_missing_reply }, &steps);
-    defer env.destroy();
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    try expectReady(try env.run(arena.allocator(), "session-a", 5), "team_1", "prj_1");
-    try testing.expectEqual(@as(usize, 2), env.scripted.prompts);
-    try testing.expect(env.scripted.saw_evil);
-    try testing.expect(!env.scripted.saw_escape);
-}
-
-test "a project name with an escape sequence shows cleaned in the choice" {
-    const alloc = testing.allocator;
-    const steps = [_]Step{.{ .answer = .{ .json = accept_project } }};
-    const env = try TestEnv.create(alloc, &.{ user_reply, teams_one_reply, projects_evil_reply, sandbox_missing_reply }, &steps);
-    defer env.destroy();
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    try expectReady(try env.run(arena.allocator(), "session-a", 5), "team_1", "prj_1");
-    try testing.expect(!env.scripted.saw_escape);
-}
-
-test "E10: a sub-agent call with no remote is refused with no request, and reads no mark" {
-    const alloc = testing.allocator;
-    const env = try TestEnv.create(alloc, &.{user_reply}, &.{});
-    defer env.destroy();
-    try env.slot.recordMark("session-a", 5, .declined);
-
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const result = try ensureReady(&env.host, env.call(arena.allocator(), "session-a", 5, false, true));
-    try expectRefused(result, e10_text);
-    try testing.expectEqual(@as(usize, 0), env.scripted.prompts);
-    env.server.close();
-    try testing.expectEqual(@as(usize, 0), env.server.servedCount());
-    try testing.expectEqual(setup.Mark.declined, env.slot.markFor("session-a", 5));
-}
-
-test "callFor gives a sub-agent call no session key, so it cannot read a mark" {
-    var cancel: std.atomic.Value(bool) = .init(false);
-    const main_call = callFor(testing.allocator, true, "session-a", 5, null, &cancel);
-    try testing.expectEqualStrings("session-a", main_call.session_key.?);
-    const sub_call = callFor(testing.allocator, false, "session-a", 5, null, &cancel);
-    try testing.expect(sub_call.session_key == null);
+    const evil_steps = [_]Step{.{ .answer = .{ .json = accept_yes } }};
+    const env_evil = try TestEnv.create(alloc, &.{ user_default_team_reply, team_evil_reply, project_evil_reply }, &evil_steps);
+    defer env_evil.destroy();
+    env_evil.host.env = .{ .vercel_token = leak_token, .home = env_evil.home_path };
+    env_evil.scripted.token = leak_token;
+    try expectReady(try env_evil.run(a, env_evil.repo_a, "session-a", 5), "team_1", "prj_1");
+    try testing.expect(!env_evil.scripted.saw_escape);
+    try testing.expect(env_evil.scripted.saw_evil);
+    try testing.expect(!env_evil.scripted.saw_token);
+    try testing.expect(std.mem.find(u8, env_evil.capture.captured(), leak_token) == null);
 }

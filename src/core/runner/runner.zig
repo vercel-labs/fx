@@ -38,13 +38,24 @@ const setup_host = @import("setup_host.zig");
 pub const RemoteHost = setup_host.Host;
 pub const RemoteCall = setup_host.Call;
 pub const RemoteResult = setup_host.Result;
+pub const SetupIntent = setup_host.SetupIntent;
+pub const team_setting_key = setup_host.team_setting_key;
+pub const project_setting_key = setup_host.project_setting_key;
 /// The refusal text for a missing login (E5): the same text remote setup gives,
 /// so placement and setup say the same thing.
 pub const login_missing_text = setup_host.e5_text;
+pub const login_expired_text = setup_host.e6_text;
+pub const no_channel_text = setup_host.e7_text;
+pub const declined_text = setup_host.e8_text;
+pub const sub_agent_text = setup_host.e10_text;
+pub const repoKey = policy.repoKey;
 pub const RemoteClock = setup_host.Clock;
 pub const ensureRemoteReady = setup_host.ensureReady;
 pub const remote_trace = setup_host.debug_trace_sink;
 pub const remoteCall = setup_host.callFor;
+
+const consent = @import("consent.zig");
+pub const writeConsentForTest = consent.write;
 
 test {
     _ = @import("vercel/vercel.zig");
@@ -53,5 +64,6 @@ test {
     _ = @import("setup.zig");
     _ = @import("config_write.zig");
     _ = @import("remote_slot.zig");
+    _ = @import("consent.zig");
     _ = @import("setup_host.zig");
 }

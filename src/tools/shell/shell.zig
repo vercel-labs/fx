@@ -1776,6 +1776,8 @@ fn remoteSetupRefusal(
     var no_cancel = std.atomic.Value(bool).init(false);
     const setup_call = sandbox_runner.remoteCall(
         arena,
+        ctx.workspace_root,
+        .{},
         ctx.remote_setup.allowed,
         ctx.remote_setup.session_key,
         ctx.remote_setup.turn_id,
@@ -3270,11 +3272,11 @@ fn decodeFailureText(alloc: Allocator, ctx: tool_dispatch.DispatchContext, args:
 const remote_test_token = "fx-shell-token";
 const remote_rule_config = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"remote\"}]}";
 const remote_ready_config = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"remote\"}],\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"repo\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
-const remote_e5_text = "fx did not run this command: no Vercel login. Run `vercel login`, then try again.";
-const remote_e6_text = "fx did not run this command: the Vercel login has expired or was rejected. Run `vercel whoami` to refresh it, or `vercel login`, then try again.";
-const remote_e7_text = "fx did not run this command: remote is not set up, and fx cannot ask the user here. Ask again in an interactive fx session.";
-const remote_e8_text = "fx did not run this command: the user did not set up remote.";
-const remote_e10_text = "fx did not run this command: remote is not set up. Set it up from the main conversation first.";
+const remote_e5_text = sandbox_runner.login_missing_text;
+const remote_e6_text = sandbox_runner.login_expired_text;
+const remote_e7_text = sandbox_runner.no_channel_text;
+const remote_e8_text = sandbox_runner.declined_text;
+const remote_e10_text = sandbox_runner.sub_agent_text;
 
 var remote_prompt_context: u8 = 0;
 
@@ -3469,6 +3471,8 @@ test "a ready remote setup lets the run go on, and the run is placed with its la
     // The workspace must exist: a built-in run keys its state folder by the canonical path (spec L5).
     try tmp.dir.createDirPath(io_mod.getIo(), "work");
     const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "work");
+    const key = try sandbox_runner.repoKey(arena, "usr_1", workspace);
+    try sandbox_runner.writeConsentForTest(arena, policy.fx_home, key, "team_1", "prj_1", 1_800_000_000);
     const ctx: tool_dispatch.DispatchContext = .{
         .allocator = std.testing.allocator,
         .sandbox_policy = policy,
@@ -3526,7 +3530,10 @@ test "a run whose provider failed to prepare is refused, and starts nothing" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "/Users/example/work";
+    try tmp.dir.createDirPath(io_mod.getIo(), "work");
+    const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, "work");
+    const key = try sandbox_runner.repoKey(arena, "usr_1", root);
+    try sandbox_runner.writeConsentForTest(arena, policy.fx_home, key, "team_1", "prj_1", 1_800_000_000);
     const command_ctx: command_admission.CommandContext = .{
         .command = "zig build test",
         .resolved_cwd = root,
@@ -3546,6 +3553,49 @@ test "a run whose provider failed to prepare is refused, and starts nothing" {
         .refused => |result| {
             try std.testing.expect(std.mem.startsWith(u8, result.failure, tool_admission.refusal_prefix ++ "the sandbox provider cannot be used: "));
             try std.testing.expect(std.mem.find(u8, result.failure, "fx-test-reason") != null);
+        },
+    }
+}
+
+test "placeRunStart refuses an unconsented repo without channel and allows isolated once consented" {
+    try self_exe.requireInstalledForTest();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const isolated_ready_config = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"isolated\"}],\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"repo\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
+    const policy = try loadRemoteSetupPolicy(std.testing.allocator, tmp.dir, isolated_ready_config);
+    defer policy.destroy();
+    try primeRemoteLoginUser(policy);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "work");
+    const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, "work");
+    const command_ctx: command_admission.CommandContext = .{
+        .command = "zig build test",
+        .resolved_cwd = root,
+        .target_os = builtin.target.os.tag,
+        .placement = .isolated,
+    };
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = arena,
+        .sandbox_policy = policy,
+        .workspace_root = root,
+        .remote_setup = .{ .allowed = true, .session_key = "session-a", .turn_id = 5 },
+    };
+    const unconsented = try placeRunStart(ctx, arena, command_admission.AdmissionFingerprint.init(command_ctx), command_ctx, null);
+    switch (unconsented) {
+        .placed => return error.TestUnexpectedPlacement,
+        .refused => |result| try std.testing.expectEqualStrings(remote_e7_text, result.failure),
+    }
+
+    const key = try sandbox_runner.repoKey(arena, "usr_1", root);
+    try sandbox_runner.writeConsentForTest(arena, policy.fx_home, key, "team_1", "prj_1", 1_800_000_000);
+    const consented = try placeRunStart(ctx, arena, command_admission.AdmissionFingerprint.init(command_ctx), command_ctx, null);
+    switch (consented) {
+        .refused => return error.TestUnexpectedPlacement,
+        .placed => |approved| {
+            try std.testing.expectEqual(command_environment.Placement.isolated, approved.ctx.placement);
+            try std.testing.expect(approved.ctx.sandbox != null);
         },
     }
 }

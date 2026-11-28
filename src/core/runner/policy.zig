@@ -7,6 +7,7 @@ const std = @import("std");
 const command_environment = @import("../execution/command_environment.zig");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const consent = @import("consent.zig");
 const decide = @import("decide.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
@@ -59,9 +60,6 @@ pub const Placed = struct {
     profile: ?[]const u8 = null,
     launch: ?*const launch.Launch = null,
     reason: ?decide.Reason = null,
-    /// A built-in remote run whose provider remote setup has not prepared yet.
-    /// It has no launch, so a run starts only after setup (`ensureRemote`).
-    needs_setup: bool = false,
 };
 
 const Loaded = union(enum) {
@@ -183,7 +181,6 @@ pub const Policy = struct {
                     .placement = target.placement,
                     .profile = target.profile,
                     .reason = reason,
-                    .needs_setup = true,
                 };
                 return error.SandboxProviderUnavailable;
             },
@@ -208,7 +205,6 @@ pub const Policy = struct {
                     .placement = target.placement,
                     .profile = target.profile,
                     .reason = reason,
-                    .needs_setup = true,
                 },
             }
         }
@@ -541,9 +537,8 @@ fn setRefusal(refusal: ?*Refusal, value: Refusal) void {
 
 /// The keyed folder name (spec L5): the first 16 hex digits of the SHA-256 of the
 /// user id, a newline, and the canonical workspace root.
-fn repoKey(arena: Allocator, user_id: []const u8, root: []const u8) Allocator.Error![]const u8 {
-    const digest = sha256.hexDigest(try arena.print("{s}\n{s}", .{ user_id, root }));
-    return arena.dupe(u8, digest[0..16]);
+pub fn repoKey(arena: Allocator, user_id: []const u8, root: []const u8) Allocator.Error![]const u8 {
+    return consent.repoKey(arena, user_id, root);
 }
 
 /// Null when `program` names a runnable file. Otherwise, the reason it does
@@ -871,7 +866,6 @@ test "a built-in remote run with no config needs setup, and places no launch" {
     defer policy.destroy();
     const placed = try policy.place(arena_state.allocator(), "/Users/example/work", "zig build test", .remote, null);
     try testing.expectEqual(command_environment.Placement.remote, placed.placement);
-    try testing.expect(placed.needs_setup);
     try testing.expect(placed.launch == null);
 }
 
@@ -888,7 +882,7 @@ test "a local run with no config places locally, and needs no setup" {
     defer policy.destroy();
     const placed = try policy.place(arena_state.allocator(), "/Users/example/work", "ls", .local, null);
     try testing.expectEqual(command_environment.Placement.local, placed.placement);
-    try testing.expect(!placed.needs_setup);
+    try testing.expect(placed.launch == null);
 }
 
 test "remote setup prepares the built-in provider once the config exists, and placement then launches the runner" {
@@ -926,7 +920,6 @@ test "remote setup prepares the built-in provider once the config exists, and pl
     try policy.remote_host.user_check.store(alloc, checked, "usr_1");
 
     const placed = try policy.place(arena, repo, "zig build test", .remote, null);
-    try testing.expect(!placed.needs_setup);
     const run = placed.launch orelse return error.TestExpectedLaunch;
     try testing.expectEqualStrings(runner_main.subcommand, run.provider[1]);
     const built = run.builtin orelse return error.TestExpectedBuiltinRun;
@@ -969,7 +962,6 @@ test "a built-in run with no checked login needs setup and places no launch" {
     // destination, so the run needs setup and places no launch. Remote setup then finds no login (E5).
     policy.remote_host.env = .{ .home = policy.remote_host.home };
     const placed = try policy.place(arena_state.allocator(), repo, "zig build test", .remote, null);
-    try testing.expect(placed.needs_setup);
     try testing.expect(placed.launch == null);
 }
 
@@ -1187,12 +1179,58 @@ test "ensureRemote is ready from the config's remote with no request, and then p
     std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
     try policy.remote_host.user_check.store(alloc, digest, "usr_1");
 
-    var cancel = std.atomic.Value(bool).init(false);
-    const result = try policy.ensureRemote(setup_host.callFor(arena, true, "session-a", 5, null, &cancel));
-    try testing.expectEqual(std.meta.Tag(setup_host.Result).ready, std.meta.activeTag(result));
-    try testing.expectEqual(Provider.State.ready, policy.provider.state);
     const repo = try makeRepo(alloc, tmp.dir);
     defer alloc.free(repo);
+    const key = try repoKey(arena, "usr_1", repo);
+    try consent.write(arena, fx_home, key, "team_1", "prj_1", 1_800_000_000);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const result = try policy.ensureRemote(setup_host.callFor(arena, repo, .{}, true, "session-a", 5, null, &cancel));
+    try testing.expectEqual(std.meta.Tag(setup_host.Result).ready, std.meta.activeTag(result));
+    try testing.expectEqual(Provider.State.ready, policy.provider.state);
     const placed = try policy.place(arena, repo, "zig build test", .remote, null);
     try testing.expect(placed.launch != null);
+}
+
+test "ensureRemote refuses headless without consent, and accepts isolated once repo is consented" {
+    try self_exe.requireInstalledForTest();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = testing.allocator;
+    const fx_home = try makeFxHome(alloc, tmp.dir);
+    defer alloc.free(fx_home);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const policy = try load(alloc, fx_home, "/Users/example", "/usr/bin:/bin");
+    defer policy.destroy();
+    try writeConfigFile(tmp.dir, remote_config_text);
+    try policy.remote.setDestination(.{
+        .team_id = "team_1",
+        .team_slug = "acme",
+        .project_id = "prj_1",
+        .project_name = "repo",
+        .user_id = "usr_1",
+    });
+    const token = "fx-policy-token";
+    policy.remote_host.env = .{ .vercel_token = token, .home = policy.remote_host.home };
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
+    try policy.remote_host.user_check.store(alloc, digest, "usr_1");
+
+    const repo = try makeRepo(alloc, tmp.dir);
+    defer alloc.free(repo);
+    var cancel = std.atomic.Value(bool).init(false);
+    const without_consent = try policy.ensureRemote(setup_host.callFor(arena, repo, .{}, true, "session-a", 5, null, &cancel));
+    try testing.expectEqual(std.meta.Tag(setup_host.Result).refused, std.meta.activeTag(without_consent));
+    try testing.expectEqualStrings(setup_host.e7_text, without_consent.refused);
+
+    const key = try repoKey(arena, "usr_1", repo);
+    try consent.write(arena, fx_home, key, "team_1", "prj_1", 1_800_000_000);
+    const with_consent = try policy.ensureRemote(setup_host.callFor(arena, repo, .{}, true, "session-a", 5, null, &cancel));
+    try testing.expectEqual(std.meta.Tag(setup_host.Result).ready, std.meta.activeTag(with_consent));
+    const isolated = try policy.place(arena, repo, "zig build test", .isolated, null);
+    try testing.expectEqual(command_environment.Placement.isolated, isolated.placement);
+    try testing.expect(isolated.launch != null);
 }
