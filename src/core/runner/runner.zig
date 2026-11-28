@@ -1,8 +1,10 @@
 //! Places a shell command in a sandbox through a provider program. Outside code imports only this file.
 
+const std = @import("std");
 const policy = @import("policy.zig");
 const launch = @import("launch.zig");
 const runner_main = @import("runner_main.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 /// The word after the binary name that starts the built-in runner (spec L4).
 pub const subcommand = runner_main.subcommand;
@@ -11,16 +13,63 @@ pub const runBuiltin = runner_main.runBuiltin;
 /// The exit code of a run that did not start (spec L6).
 pub const exit_did_not_run = runner_main.exit_did_not_run;
 
-/// The message `/sandbox setup` sends as the user's turn. The agent runs its
-/// steps, and fx sends it unchanged.
-pub const setup_prompt =
-    \\Help me choose where fx runs remote shell commands: the Vercel team and project of fx's remote runner.
-    \\1. Show my current choice: run `fx config get sandbox_team` and `fx config get sandbox_project`. When a value is empty, fx uses the Vercel CLI's current team (or my account's default team) and the project fx-sandbox.
-    \\2. If the Vercel CLI is installed, list my choices: `vercel teams ls`, then `vercel project ls --scope <team>`.
-    \\3. Ask me with the ask tool which team and project to use, with keeping the defaults as one option.
-    \\4. Save my answer with `fx config set sandbox_team <slug>` and `fx config set sandbox_project <name>`, or go back to the defaults with `fx config unset sandbox_team` and `fx config unset sandbox_project`.
-    \\fx asks me again before it first copies a repository to a team or project I have not used.
-;
+pub const LastRemote = policy.LastRemote;
+pub const readLastRemote = policy.readLastRemote;
+
+pub const SetupPromptContext = struct {
+    fx_bin: []const u8,
+    sandbox_team: ?[]const u8 = null,
+    sandbox_project: ?[]const u8 = null,
+    last_destination: ?LastRemote = null,
+};
+
+/// Builds the `/sandbox setup` prompt as the user's turn from the current settings,
+/// the last saved destination, and the running fx binary path. Pure (no I/O).
+pub fn setupPrompt(alloc: std.mem.Allocator, ctx: SetupPromptContext) std.mem.Allocator.Error![]u8 {
+    const bin = text_utils.terminalSafe(if (ctx.fx_bin.len > 0) ctx.fx_bin else "fx");
+    const team_value = text_utils.terminalSafe(ctx.sandbox_team orelse "not set");
+    const project_value = text_utils.terminalSafe(ctx.sandbox_project orelse "not set");
+    var last_buf: [512]u8 = undefined;
+    const last_text: []const u8 = if (ctx.last_destination) |dest|
+        std.mem.print(&last_buf, "{f} / {f}", .{
+            text_utils.terminalSafe(dest.team_slug),
+            text_utils.terminalSafe(dest.project_name),
+        }) catch "none yet"
+    else
+        "none yet";
+
+    return alloc.print(
+        \\Help me choose where fx runs remote shell commands: the Vercel team and project of fx's remote runner.
+        \\Current settings:
+        \\- {s}: {f}
+        \\- {s}: {f}
+        \\- Last destination used: {s}
+        \\When {s} is not set, fx finds the team itself (from the Vercel CLI's current team or the account's default team) and uses project fx-sandbox when {s} is not set; do not guess the CLI's current team or inspect Vercel CLI files yourself.
+        \\1. Show my current choice from the facts above.
+        \\2. If the Vercel CLI is installed, list my choices: `vercel teams ls`, then `vercel project ls --scope <team>`.
+        \\3. Ask me with the ask tool which team and project to use, with keeping the current choice as one option.
+        \\4. Save my answer with `{f} config set {s} <slug>` and `{f} config set {s} <name>`, or go back to the defaults with `{f} config unset {s}` and `{f} config unset {s}`.
+        \\fx asks me again before it first copies a repository to a team or project I have not used.
+    ,
+        .{
+            team_setting_key,
+            team_value,
+            project_setting_key,
+            project_value,
+            last_text,
+            team_setting_key,
+            project_setting_key,
+            bin,
+            team_setting_key,
+            bin,
+            project_setting_key,
+            bin,
+            team_setting_key,
+            bin,
+            project_setting_key,
+        },
+    );
+}
 
 pub const Policy = policy.Policy;
 pub const PlaceError = policy.PlaceError;
@@ -79,4 +128,27 @@ test {
     _ = @import("remote_slot.zig");
     _ = @import("consent.zig");
     _ = @import("setup_host.zig");
+}
+
+test "setupPrompt includes fx path, settings, last destination, and no-guess rule" {
+    const alloc = std.testing.allocator;
+    const defaults = try setupPrompt(alloc, .{ .fx_bin = "/opt/fx/bin/fx" });
+    defer alloc.free(defaults);
+    try std.testing.expect(std.mem.find(u8, defaults, "sandbox_team: not set") != null);
+    try std.testing.expect(std.mem.find(u8, defaults, "sandbox_project: not set") != null);
+    try std.testing.expect(std.mem.find(u8, defaults, "Last destination used: none yet") != null);
+    try std.testing.expect(std.mem.find(u8, defaults, "/opt/fx/bin/fx config set sandbox_team <slug>") != null);
+    try std.testing.expect(std.mem.find(u8, defaults, "/opt/fx/bin/fx config unset sandbox_team") != null);
+    try std.testing.expect(std.mem.find(u8, defaults, "do not guess") != null);
+
+    const configured = try setupPrompt(alloc, .{
+        .fx_bin = "/opt/fx/bin/fx",
+        .sandbox_team = "acme",
+        .sandbox_project = "my-proj",
+        .last_destination = .{ .team_slug = "old-team", .project_name = "fx-sandbox" },
+    });
+    defer alloc.free(configured);
+    try std.testing.expect(std.mem.find(u8, configured, "sandbox_team: acme") != null);
+    try std.testing.expect(std.mem.find(u8, configured, "sandbox_project: my-proj") != null);
+    try std.testing.expect(std.mem.find(u8, configured, "Last destination used: old-team / fx-sandbox") != null);
 }

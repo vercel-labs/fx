@@ -179,8 +179,12 @@ fn handleSandboxCommand(app: anytype, rest: []const u8) !void {
         try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /sandbox setup" }, true);
         return;
     }
+    const App = @TypeOf(app.*);
     // The profile is read now, not at startup, so `fx config set` takes effect without a restart.
-    var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch {
+    var settings = (if (comptime @hasField(App, "home_dir"))
+        config_runtime.loadMergedSettingsFromHome(app.alloc, app.home_dir, app.workspace_root)
+    else
+        config_runtime.loadMergedSettings(app.alloc, app.workspace_root)) catch {
         try app.writeDomainNotice(.{
             .topic = "sandbox",
             .tone = .@"error",
@@ -197,7 +201,28 @@ fn handleSandboxCommand(app: anytype, rest: []const u8) !void {
         }, true);
         return;
     }
-    try app.submitUserPrompt(runner.setup_prompt);
+    var arena = std.heap.ArenaAllocator.init(app.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const home = if (comptime @hasField(App, "home_dir")) app.home_dir else (io_mod.homeDir() orelse "");
+    const fx_home: ?[]const u8 = if (comptime @hasField(App, "sandbox_policy"))
+        (if (app.sandbox_policy) |p| p.fx_home else try profile_paths.activeRoot(a, if (home.len > 0) home else null))
+    else if (comptime @hasField(App, "home_dir"))
+        try std.Io.Dir.path.join(a, &.{ app.home_dir, profile_paths.root_dir_name })
+    else
+        try profile_paths.activeRoot(a, io_mod.homeDir());
+    const last_destination = if (fx_home) |dir|
+        try runner.readLastRemote(a, dir, home)
+    else
+        null;
+    const fx_bin = if (comptime @hasField(App, "fx_bin")) app.fx_bin else runner.runningBinaryPath(a);
+    const prompt = try runner.setupPrompt(a, .{
+        .fx_bin = fx_bin,
+        .sandbox_team = settings.sandbox_team,
+        .sandbox_project = settings.sandbox_project,
+        .last_destination = last_destination,
+    });
+    try app.submitUserPrompt(prompt);
 }
 
 fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
@@ -2914,4 +2939,57 @@ test "/version command writes dev build label and omits unresolved revision" {
     try expectVersionCommandBody(.dev, "f1862c5061f5", "0.0.17-f1862c5 (dev)");
     try expectVersionCommandBody(.dev, "unknown", "0.0.17 (dev)");
     try expectVersionCommandBody(.dev, "", "0.0.17 (dev)");
+}
+
+test "sandbox setup command builds prompt with live settings, last remote destination, and fx binary path" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/sandbox");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "home/.fx/settings.json",
+        .data = "{\"experimental\":{\"sandbox_execution\":true},\"sandbox_team\":\"acme\",\"sandbox_project\":\"web\"}",
+    });
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "home/.fx/sandbox/config.json",
+        .data = "{\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"old-team\",\"project_id\":\"prj_1\",\"project_name\":\"fx-sandbox\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-28T10:00:00Z\"}}",
+    });
+    const home_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_dir);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const SandboxSetupFakeApp = struct {
+        alloc: std.mem.Allocator,
+        home_dir: []const u8,
+        workspace_root: []const u8,
+        fx_bin: []const u8 = "/custom/fx",
+        submitted: ?[]u8 = null,
+
+        fn deinit(self: *@This()) void {
+            if (self.submitted) |text| self.alloc.free(text);
+        }
+
+        fn writeDomainNotice(_: *@This(), _: types.SemanticNotice, _: bool) !void {}
+
+        fn submitUserPrompt(self: *@This(), text: []const u8) !void {
+            if (self.submitted) |old| self.alloc.free(old);
+            self.submitted = try self.alloc.dupe(u8, text);
+        }
+    };
+
+    var app = SandboxSetupFakeApp{
+        .alloc = alloc,
+        .home_dir = home_dir,
+        .workspace_root = workspace_root,
+    };
+    defer app.deinit();
+
+    try handleSandboxCommand(&app, "setup");
+    const submitted = app.submitted orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.find(u8, submitted, "sandbox_team: acme") != null);
+    try std.testing.expect(std.mem.find(u8, submitted, "sandbox_project: web") != null);
+    try std.testing.expect(std.mem.find(u8, submitted, "Last destination used: old-team / fx-sandbox") != null);
+    try std.testing.expect(std.mem.find(u8, submitted, "/custom/fx config set sandbox_team <slug>") != null);
 }

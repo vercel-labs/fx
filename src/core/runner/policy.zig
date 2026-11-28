@@ -535,6 +535,48 @@ fn setRefusal(refusal: ?*Refusal, value: Refusal) void {
     if (refusal) |target| target.* = value;
 }
 
+pub const LastRemote = struct {
+    team_slug: []const u8,
+    project_name: []const u8,
+
+    pub fn deinit(self: LastRemote, alloc: Allocator) void {
+        alloc.free(self.team_slug);
+        alloc.free(self.project_name);
+    }
+};
+
+/// Reads the `remote` destination from `{fx_home}/sandbox/config.json`, or null
+/// when the file or `remote` is absent or unreadable. Caller owns returned slices.
+pub fn readLastRemote(alloc: Allocator, fx_home: []const u8, home: []const u8) Allocator.Error!?LastRemote {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const zio = io_mod.getIo();
+
+    var home_dir = io_mod.openDirAbsoluteNoFollow(fx_home, .{ .iterate = true }) catch return null;
+    defer home_dir.close(zio);
+    var home_root: io_mod.VerifiedDir = .{ .dir = home_dir };
+    var sandbox = (io_mod.openRealDirIfPresent(&home_root, "sandbox") catch return null) orelse return null;
+    defer sandbox.close();
+
+    var file = io_mod.openExistingReadOnlyRegularFile(sandbox.dir, "config.json", .follow) catch return null;
+    defer file.close(zio);
+    const text = io_mod.readFileToEnd(arena, &file, max_config_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    var diagnostic: config.Diagnostic = .{};
+    const parsed = config.parse(arena, text, home, &diagnostic) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const remote = parsed.remote orelse return null;
+    const slug = try alloc.dupe(u8, remote.team_slug);
+    errdefer alloc.free(slug);
+    const project = try alloc.dupe(u8, remote.project_name);
+    return .{ .team_slug = slug, .project_name = project };
+}
+
 /// The keyed folder name (spec L5): the first 16 hex digits of the SHA-256 of the
 /// user id, a newline, and the canonical workspace root.
 pub fn repoKey(arena: Allocator, user_id: []const u8, root: []const u8) Allocator.Error![]const u8 {

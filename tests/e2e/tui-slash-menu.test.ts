@@ -318,18 +318,40 @@ function gatewayPromptText(body: string): string {
   return request.prompt.map((message) => nestedText(message.content)).join("\n");
 }
 
-const SANDBOX_SETUP_PROMPT = [
-  "Help me choose where fx runs remote shell commands: the Vercel team and project of fx's remote runner.",
-  "1. Show my current choice: run `fx config get sandbox_team` and `fx config get sandbox_project`. When a value is empty, fx uses the Vercel CLI's current team (or my account's default team) and the project fx-sandbox.",
-  "2. If the Vercel CLI is installed, list my choices: `vercel teams ls`, then `vercel project ls --scope <team>`.",
-  "3. Ask me with the ask tool which team and project to use, with keeping the defaults as one option.",
-  "4. Save my answer with `fx config set sandbox_team <slug>` and `fx config set sandbox_project <name>`, or go back to the defaults with `fx config unset sandbox_team` and `fx config unset sandbox_project`.",
-  "fx asks me again before it first copies a repository to a team or project I have not used.",
-].join("\n");
+function sandboxSetupPrompt(options: {
+  fxBin: string;
+  sandboxTeam?: string;
+  sandboxProject?: string;
+  lastDestination?: { teamSlug: string; projectName: string };
+}): string {
+  const last = options.lastDestination
+    ? `${options.lastDestination.teamSlug} / ${options.lastDestination.projectName}`
+    : "none yet";
+  return [
+    "Help me choose where fx runs remote shell commands: the Vercel team and project of fx's remote runner.",
+    "Current settings:",
+    `- sandbox_team: ${options.sandboxTeam ?? "not set"}`,
+    `- sandbox_project: ${options.sandboxProject ?? "not set"}`,
+    `- Last destination used: ${last}`,
+    "When sandbox_team is not set, fx finds the team itself (from the Vercel CLI's current team or the account's default team) and uses project fx-sandbox when sandbox_project is not set; do not guess the CLI's current team or inspect Vercel CLI files yourself.",
+    "1. Show my current choice from the facts above.",
+    "2. If the Vercel CLI is installed, list my choices: `vercel teams ls`, then `vercel project ls --scope <team>`.",
+    "3. Ask me with the ask tool which team and project to use, with keeping the current choice as one option.",
+    `4. Save my answer with \`${options.fxBin} config set sandbox_team <slug>\` and \`${options.fxBin} config set sandbox_project <name>\`, or go back to the defaults with \`${options.fxBin} config unset sandbox_team\` and \`${options.fxBin} config unset sandbox_project\`.`,
+    "fx asks me again before it first copies a repository to a team or project I have not used.",
+  ].join("\n");
+}
 
 // Starts fx in a fresh profile whose settings set experimental.sandbox_execution
 // to `sandboxExecution`, and points it at the module's `gateway`.
-async function launchSandboxSession(sandboxExecution: boolean): Promise<string> {
+async function launchSandboxSession(
+  sandboxExecution: boolean,
+  extras: {
+    sandboxTeam?: string;
+    sandboxProject?: string;
+    lastDestination?: { teamSlug: string; projectName: string };
+  } = {},
+): Promise<string> {
   const root = mkdtempSync(join(tmpdir(), "fx-sandbox-setup-"));
   workDirs.push(root);
   const home = join(root, "home");
@@ -339,8 +361,29 @@ async function launchSandboxSession(sandboxExecution: boolean): Promise<string> 
   mkdirSync(workspace);
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ experimental: { sandbox_execution: sandboxExecution } }),
+    JSON.stringify({
+      experimental: { sandbox_execution: sandboxExecution },
+      ...(extras.sandboxTeam ? { sandbox_team: extras.sandboxTeam } : {}),
+      ...(extras.sandboxProject ? { sandbox_project: extras.sandboxProject } : {}),
+    }),
   );
+  if (extras.lastDestination) {
+    mkdirSync(join(home, ".fx", "sandbox"), { recursive: true });
+    writeFileSync(
+      join(home, ".fx", "sandbox", "config.json"),
+      JSON.stringify({
+        remote: {
+          backend: "vercel",
+          team_id: "team_1",
+          team_slug: extras.lastDestination.teamSlug,
+          project_id: "prj_1",
+          project_name: extras.lastDestination.projectName,
+          user_id: "usr_1",
+          confirmed_at: "2026-11-28T10:00:00Z",
+        },
+      }),
+    );
+  }
   session = await TmuxSession.create({
     cwd: workspace,
     env: {
@@ -1035,8 +1078,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "sandbox setup sends the setup prompt as the user's message",
+    "sandbox setup sends the setup prompt with running fx path, settings, and last destination",
     async () => {
+      const fxBin = realpathSync(FX_BIN);
       gateway = startFakeGateway([fakeGatewayFinalText("SANDBOX_SETUP_SENT")]);
       const stderrPath = await launchSandboxSession(true);
 
@@ -1044,8 +1088,34 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session!.waitForReplyAndTurnEnd("SANDBOX_SETUP_SENT", 10_000);
 
       expect(gateway.requests).toHaveLength(1);
-      expect(gatewayPromptText(gateway.requests[0]!.body)).toContain(SANDBOX_SETUP_PROMPT);
+      expect(gatewayPromptText(gateway.requests[0]!.body)).toContain(sandboxSetupPrompt({ fxBin }));
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await session!.sendText("/quit");
+      expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+
+      gateway.stop();
+      gateway = startFakeGateway([fakeGatewayFinalText("SANDBOX_SETUP_CONFIGURED")]);
+      const stderrPath2 = await launchSandboxSession(true, {
+        sandboxTeam: "acme",
+        sandboxProject: "web",
+        lastDestination: { teamSlug: "old-team", projectName: "fx-sandbox" },
+      });
+
+      await session!.sendText("/sandbox setup");
+      await session!.waitForReplyAndTurnEnd("SANDBOX_SETUP_CONFIGURED", 10_000);
+
+      expect(gateway.requests).toHaveLength(1);
+      expect(gatewayPromptText(gateway.requests[0]!.body)).toContain(
+        sandboxSetupPrompt({
+          fxBin,
+          sandboxTeam: "acme",
+          sandboxProject: "web",
+          lastDestination: { teamSlug: "old-team", projectName: "fx-sandbox" },
+        }),
+      );
+      expect(readFileSync(stderrPath2, "utf8")).toBe("");
 
       await session!.sendText("/quit");
       expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
