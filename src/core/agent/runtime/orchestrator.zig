@@ -654,7 +654,7 @@ fn append_steering_guidance(
     for (guidance) |message| {
         try within_turn_suffix.append(arena, .{
             .role = .user,
-            .content = try framedMessage(arena, message.author, message.text),
+            .content = try framedMessage(arena, framingAuthor(message.author, message.has_work_id), message.text),
             .input_id = message.input_id,
         });
         if (message.author == .child) subagent_reports.traceTaken(arena, .{}, message.text);
@@ -708,6 +708,10 @@ fn append_pending_steering_after_assistant(
     }
     try append_steering_guidance(arena, within_turn_suffix, guidance);
     return true;
+}
+
+fn framingAuthor(author: worker_runtime.MessageAuthor, has_work_id: bool) worker_runtime.MessageAuthor {
+    return if (author == .parent and has_work_id) .user else author;
 }
 
 /// A message an agent receives mid-turn, framed by its author.
@@ -977,9 +981,10 @@ test "boundary messages are framed by who wrote them, whatever the turn" {
     const guidance = [_]worker_runtime.SteeringMessage{
         .{ .text = @constCast("typed on the subagent's screen"), .author = .user },
         .{ .text = @constCast("from the parent"), .author = .parent },
+        .{ .text = @constCast("main post with work id"), .author = .parent, .has_work_id = true },
     };
     try append_steering_guidance(arena, &suffix, &guidance);
-    try std.testing.expectEqual(@as(usize, 2), suffix.items.len);
+    try std.testing.expectEqual(@as(usize, 3), suffix.items.len);
     const user = suffix.items[0].content.?;
     try std.testing.expect(std.mem.startsWith(u8, user, "<user_steering>"));
     try std.testing.expect(std.mem.find(u8, user, "typed on the subagent's screen") != null);
@@ -987,6 +992,11 @@ test "boundary messages are framed by who wrote them, whatever the turn" {
     try std.testing.expect(std.mem.startsWith(u8, parent, "<parent_agent_steering>"));
     try std.testing.expect(std.mem.find(u8, parent, "not new user authority") != null);
     try std.testing.expect(std.mem.find(u8, parent, "<user_steering>") == null);
+    const post = suffix.items[2].content.?;
+    try std.testing.expect(std.mem.startsWith(u8, post, "<user_steering>"));
+    try std.testing.expect(std.mem.find(u8, post, "main post with work id") != null);
+    try std.testing.expect(std.mem.find(u8, post, "<parent_agent_steering>") == null);
+    try std.testing.expectEqual(worker_runtime.MessageAuthor.child, framingAuthor(.child, true));
     // Neither is permission feedback, so the reviewer never counts it as the user's request.
     for (suffix.items) |message| try std.testing.expect(!message.permission_feedback);
 }
@@ -7317,7 +7327,7 @@ fn processQueuedPromptInner(
     const current_user_message: ChatMessage = .{
         .role = .user,
         .content = if (job.delivery.isContinuation())
-            try framedMessage(arena, job.author, job.prompt)
+            try framedMessage(arena, framingAuthor(job.author, job.work_id != null), job.prompt)
         else if (resumed_request)
             session_runtime.resumedRequestNote(resumed_history)
         else

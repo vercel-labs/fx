@@ -16891,3 +16891,43 @@ test "rewrite publication keeps the frozen prefix when a finished turn holds a h
     resumed.deinit(alloc);
     try std.testing.expectEqual(misses, runtime.frozen_prefix.misses);
 }
+
+test "parent message card escapes hostile control bytes, OSC sequences, and wraps long text" {
+    const alloc = std.testing.allocator;
+    user_message_card.setStyle(false, null);
+    const long_tail = text_utils.repeat("longparentpayloadsegment", 16);
+    const hostile = "lead \x1b[31mANSI\x1b[0m\rCR\x07BEL\x1b]2;pwned\x07 " ++ long_tail;
+    const card = try user_message_card.buildTurnCardWithSkillTokensForTerminalPresentation(
+        alloc,
+        .parent,
+        hostile,
+        &.{},
+        40,
+        &.{},
+    );
+    defer alloc.free(card);
+
+    const header = shared_theme.fx_dark.statusline_style ++ "from main\x1b[0m\n";
+    try std.testing.expect(std.mem.startsWith(u8, card, header));
+    const body = card[header.len..];
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, body, '\r') == null);
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x07) == null);
+    try std.testing.expect(std.mem.find(u8, body, "┃") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\\x0dCR\\x07BEL") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\\x1b") != null);
+    try std.testing.expect(std.mem.find(u8, body, "pwned") != null);
+    try std.testing.expect(std.mem.startsWith(u8, body, "  lead\n"));
+    try std.testing.expect(std.mem.count(u8, body, "\n") >= 8);
+
+    const wide = try user_message_card.buildTurnCardWithSkillTokensForTerminalPresentation(
+        alloc,
+        .parent,
+        hostile,
+        &.{},
+        120,
+        &.{},
+    );
+    defer alloc.free(wide);
+    try std.testing.expect(std.mem.find(u8, wide[header.len..], "\\x1b]2;pwned\\x07") != null);
+}

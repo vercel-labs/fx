@@ -1083,7 +1083,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .continue_turn => |owned| blk: {
                 defer worker_runtime.freeSteeringMessages(self.alloc, owned);
                 const messages = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
-                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author, .input_id = message.input_id };
+                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author, .has_work_id = message.has_work_id, .input_id = message.input_id };
                 break :blk .{ .continue_turn = messages };
             },
             .none => .none,

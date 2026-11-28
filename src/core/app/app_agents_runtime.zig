@@ -3652,7 +3652,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 }
             }
-            if (!try app.enqueuePrompt(agent, post.message)) return error.PromptNotAdmitted;
+            if (!try app.enqueuePromptFromParent(agent, post.message)) return error.PromptNotAdmitted;
         }
 
         fn continueChildYieldedTurn(app: *App, agent: *agents.Agent, child: *ChildAgent) !void {

@@ -607,8 +607,9 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
             var steering = try agent.worker.snapshotSteeringPresentation(app.alloc);
             defer steering.deinit(app.alloc);
-            const requested_banner_rows = render_input.steeringBannerRowsForMessages(
+            const requested_banner_rows = render_input.steeringBannerRowsForMessagesWithAuthors(
                 steering.messages,
+                steering.message_authors,
                 steering.waits_for_boundary,
                 app.shell.layout.cols,
             );

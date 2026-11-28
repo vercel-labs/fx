@@ -30,6 +30,7 @@ const effort_menu = @import("../../core/input/effort_menu.zig");
 const info_panel = @import("../../core/input/info_panel.zig");
 const usage_menu = @import("../../core/session/usage_menu.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
+const profiles = @import("../../core/profiles/profiles.zig");
 const ui_render = @import("../render.zig");
 const render_engine = @import("../render_engine.zig");
 const render_request = @import("../render_request.zig");
@@ -434,6 +435,7 @@ pub const RenderContext = struct {
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,
     steering_messages: []const []const u8 = &.{},
+    steering_message_authors: []const types.MessageAuthor = &.{},
     steering_waits_for_boundary: bool = false,
     fast_indicator_active: bool = false,
     effort: types.ReasoningEffort = .auto,
@@ -570,9 +572,26 @@ fn steering_unit_width(raw: []const u8) usize {
     return width + display_width.visibleWidth(raw[safe_start..]);
 }
 
+pub const parent_steering_prefix = "from " ++ profiles.main_name ++ " · ";
+pub const parent_steering_prefix_width: u16 = @intCast(display_width.visibleWidth(parent_steering_prefix));
+
+pub fn steeringMessageAuthor(authors: []const types.MessageAuthor, index: usize) types.MessageAuthor {
+    return if (index < authors.len) authors[index] else .user;
+}
+
 /// Borrows at most two visible row slices; measurement and painting share this layout.
 pub fn steering_message_layout(
     message: []const u8,
+    width: u16,
+    waits_for_boundary: bool,
+    row_limit: u16,
+) SteeringMessageLayout {
+    return steering_message_layout_with_author(message, .user, width, waits_for_boundary, row_limit);
+}
+
+pub fn steering_message_layout_with_author(
+    message: []const u8,
+    author: types.MessageAuthor,
     width: u16,
     waits_for_boundary: bool,
     row_limit: u16,
@@ -583,6 +602,16 @@ pub fn steering_message_layout(
     const limit = @min(row_limit, max_message_layout_rows);
     var offset: usize = 0;
     while (layout.row_count < limit) {
+        if (author == .parent and layout.content_width == 0) {
+            layout.rows[layout.row_count] = "";
+            layout.row_count += 1;
+            layout.truncated = message.len > 0;
+            break;
+        }
+        const row_width: u16 = if (author == .parent and layout.row_count == 0)
+            layout.content_width -| parent_steering_prefix_width
+        else
+            layout.content_width;
         const start = offset;
         var cells: usize = 0;
         var ellipsis_end = start;
@@ -596,11 +625,11 @@ pub fn steering_message_layout(
                 unit.cell_width
             else
                 steering_unit_width(raw);
-            if (unit_width > layout.content_width - cells) break;
+            if (unit_width > row_width -| cells) break;
             if (message[offset] == ' ' or message[offset] == '\t') last_space = offset;
             cells += unit_width;
             offset += unit.byte_len;
-            if (cells < layout.content_width) ellipsis_end = offset;
+            if (cells < row_width) ellipsis_end = offset;
         }
         var end = offset;
         const soft_separator = offset < message.len and (message[offset] == ' ' or message[offset] == '\t');
@@ -623,7 +652,8 @@ pub fn steering_message_layout(
         layout.rows[layout.row_count] = message[start..end];
         layout.row_count += 1;
         if (offset == message.len) break;
-        if (layout.row_count == limit or (!hard_break and end == start)) {
+        const first_parent_row_deferred = author == .parent and layout.row_count == 1 and limit > 1 and layout.content_width > row_width;
+        if (layout.row_count == limit or (!hard_break and end == start and !first_parent_row_deferred)) {
             layout.rows[layout.row_count - 1] = message[start..@min(end, ellipsis_end)];
             layout.truncated = true;
             break;
@@ -637,17 +667,33 @@ pub fn steeringBannerRowsForMessages(
     waits_for_boundary: bool,
     width: u16,
 ) u16 {
+    return steeringBannerRowsForMessagesWithAuthors(messages, &.{}, waits_for_boundary, width);
+}
+
+pub fn steeringBannerRowsForMessagesWithAuthors(
+    messages: []const []const u8,
+    authors: []const types.MessageAuthor,
+    waits_for_boundary: bool,
+    width: u16,
+) u16 {
     if (messages.len == 0 or !waits_for_boundary) return 0;
     var rows: u16 = 0;
-    for (messages) |message| {
-        rows +|= steering_message_layout(message, width, waits_for_boundary, max_steering_message_rows).row_count;
+    for (messages, 0..) |message, index| {
+        rows +|= steering_message_layout_with_author(
+            message,
+            steeringMessageAuthor(authors, index),
+            width,
+            waits_for_boundary,
+            max_steering_message_rows,
+        ).row_count;
     }
     return rows +| steering_composer_gap_rows;
 }
 
 pub fn steeringBannerRows(ctx: RenderContext, width: u16) u16 {
-    return steeringBannerRowsForMessages(
+    return steeringBannerRowsForMessagesWithAuthors(
         ctx.steering_messages,
+        ctx.steering_message_authors,
         ctx.steering_waits_for_boundary,
         width,
     );
@@ -688,6 +734,46 @@ test "steering preview layout retains prefix slices at row boundaries" {
         try std.testing.expectEqualStrings(case.second, layout.rows[1]);
         try std.testing.expectEqual(case.truncated, layout.truncated);
     }
+}
+
+test "parent steering layout advances past narrow first row instead of dropping message" {
+    // Wide glyph does not fit in the 1 cell left after "from main · " at width 15.
+    const wide = steering_message_layout_with_author("😀hello", .parent, 15, true, 2);
+    try std.testing.expectEqual(@as(u16, 2), wide.row_count);
+    try std.testing.expectEqualStrings("", wide.rows[0]);
+    try std.testing.expectEqualStrings("😀hello", wide.rows[1]);
+    try std.testing.expect(!wide.truncated);
+
+    // Zero cells left after prefix at width 12 still carries text onto row 1.
+    const narrow = steering_message_layout_with_author("check parser", .parent, 12, true, 2);
+    try std.testing.expectEqual(@as(u16, 2), narrow.row_count);
+    try std.testing.expectEqualStrings("", narrow.rows[0]);
+    try std.testing.expectEqualStrings("check", narrow.rows[1]);
+    try std.testing.expect(narrow.truncated);
+
+    // Zero content width stops at one row instead of emitting blank rows.
+    const zero = steering_message_layout_with_author("check", .parent, 2, true, 2);
+    try std.testing.expectEqual(@as(u16, 1), zero.row_count);
+    try std.testing.expectEqualStrings("", zero.rows[0]);
+    try std.testing.expect(zero.truncated);
+}
+
+test "user steering layout keeps zero-width behavior unchanged" {
+    const word = steering_message_layout_with_author("ab", .user, 2, true, 2);
+    try std.testing.expectEqual(@as(u16, 1), word.row_count);
+    try std.testing.expectEqualStrings("", word.rows[0]);
+    try std.testing.expect(word.truncated);
+
+    const space = steering_message_layout_with_author(" ", .user, 2, true, 2);
+    try std.testing.expectEqual(@as(u16, 1), space.row_count);
+    try std.testing.expectEqualStrings("", space.rows[0]);
+    try std.testing.expect(!space.truncated);
+
+    const newline = steering_message_layout_with_author("\nab", .user, 2, true, 2);
+    try std.testing.expectEqual(@as(u16, 2), newline.row_count);
+    try std.testing.expectEqualStrings("", newline.rows[0]);
+    try std.testing.expectEqualStrings("", newline.rows[1]);
+    try std.testing.expect(newline.truncated);
 }
 
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {

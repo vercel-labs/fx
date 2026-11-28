@@ -223,6 +223,7 @@ pub fn run(
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
+        .author = .parent,
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
         .images = &.{},
         .model = arena.dupe(u8, admission.model) catch return error.OutOfMemory,

@@ -990,7 +990,7 @@ pub fn Bindings(comptime App: type) type {
             if (owned.len == 0) return &.{};
             defer worker_runtime.freeSteeringMessages(std.heap.c_allocator, owned);
             const result = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
-            for (owned, result) |message, *dest| dest.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author, .input_id = message.input_id };
+            for (owned, result) |message, *dest| dest.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author, .has_work_id = message.has_work_id, .input_id = message.input_id };
             return result;
         }
 
