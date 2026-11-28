@@ -276,6 +276,26 @@ pub const McpToolName = struct {
     tool: []const u8,
 };
 
+/// Where an admitted shell command runs: on this machine (`local`), in the
+/// kept remote sandbox (`remote`), or in a fresh isolated sandbox (`isolated`).
+/// Live lifecycle events and in-memory transcript records carry it; saved
+/// sessions never write it (R3.5).
+pub const CommandPlacement = enum {
+    local,
+    remote,
+    isolated,
+
+    /// The runner phrase placed after the row verb (`"on remote"`, `"on isolated"`),
+    /// or null for a local run whose text does not change.
+    pub fn runnerPhrase(self: CommandPlacement) ?[]const u8 {
+        return switch (self) {
+            .local => null,
+            .remote => "on remote",
+            .isolated => "on isolated",
+        };
+    }
+};
+
 pub const ToolLifecycleEvent = union(enum) {
     provisional: struct {
         id: ToolLifecycleId,
@@ -306,6 +326,9 @@ pub const ToolLifecycleEvent = union(enum) {
         resolved_display_target: ?[]const u8 = null,
         /// As `provisional.mcp_tool`.
         mcp_tool: ?McpToolName = null,
+        /// Where an admitted shell command runs, when admission placed it.
+        /// Live memory only; saved sessions never write it (R3.5).
+        command_placement: ?CommandPlacement = null,
     },
     progress: struct {
         id: ToolLifecycleId,
@@ -1106,6 +1129,9 @@ pub const ToolCall = struct {
     /// decide it as the tool it replaced. Borrowed only for this action.
     /// Copies and durable/provider encodings omit it.
     toolbox_lookup: ?ToolboxLookup = null,
+    /// Where an admitted shell command runs, when admission placed it.
+    /// Action-scoped only; copies and durable/provider encodings omit it (R3.5).
+    command_placement: ?CommandPlacement = null,
 
     /// The name the model called, which this call's result goes back under.
     pub fn calledName(self: ToolCall) []const u8 {
@@ -1474,6 +1500,9 @@ pub const ToolResultMemory = struct {
     tool_image_handle: ?[]const u8 = null,
     output_handle: ?[]const u8 = null,
     preview: ?[]const u8 = null,
+    /// The notice lines of a shell run's result, joined by newlines, without the shell snapshot
+    /// warning (`shell_result_notice.visibleNotice`). The person sees them; the model sees the result.
+    notice: ?[]const u8 = null,
     output_bytes: usize = 0,
     stored_output_bytes: usize = 0,
     truncated: bool = false,
@@ -1490,6 +1519,9 @@ pub const ToolResultMemory = struct {
     /// A `subagent` message that made a new subagent, so its row reads
     /// "Started" rather than "Messaged". The model never sees it.
     subagent_started: bool = false,
+    /// Where an admitted shell command ran, when admission placed it.
+    /// Live memory only; saved sessions never write it (R3.5).
+    command_placement: ?CommandPlacement = null,
 };
 
 /// A shell command that crossed the quiet limit during a wait: its command
@@ -1721,6 +1753,23 @@ pub const FileEvidence = struct {
     stale: bool = false,
 };
 
+/// The toolbox menu a conversation sends on every request (D103).
+pub const SavedToolboxMenu = struct {
+    /// The lead and the menu, as the requests send them.
+    text: []u8,
+    /// `toolbox.entriesHash` of what the menu lists.
+    entries_hash: u64,
+};
+
+/// What a toolbox change note told the conversation the toolbox holds (D103).
+pub const ToolboxNoted = struct {
+    /// `toolbox.entriesHash` of what the toolbox held.
+    entries_hash: u64,
+    /// How many compactions the conversation had when the note was added. A
+    /// later compaction's summary replaces the note.
+    compaction_count: usize,
+};
+
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
@@ -1734,6 +1783,11 @@ pub const ExecutionMemory = struct {
     /// that captured it saves it; later turns send the newest saved copy
     /// unchanged (D94).
     runtime_context: ?[][]u8 = null,
+    /// The toolbox menu this turn sent first for the conversation. Later
+    /// turns, resumed ones included, send these bytes unchanged (D103).
+    toolbox_menu: ?SavedToolboxMenu = null,
+    /// What this turn's toolbox change note told the conversation (D103).
+    toolbox_noted: ?ToolboxNoted = null,
     turn_summary: ?TurnSummary = null,
     /// The turn's settled model calls, in order, for Ctrl+O. Display data:
     /// never part of what the model is sent.
@@ -1849,6 +1903,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
         .subagent_started = memory.subagent_started,
+        .command_placement = memory.command_placement,
     };
 }
 
@@ -1884,6 +1939,7 @@ test "dupeToolResultMemory copies survive teardown of every source allocation" {
         .model_view_covers_full_file = false,
         .command_output_replay = .{ .available = .{ .handle = try alloc.dupe(u8, "cmd-replay-1"), .framed_bytes = 42 } },
         .command_process_presentation = .{ .exit_code = 3 },
+        .command_placement = .remote,
     };
     const copy = try dupeToolResultMemory(alloc, source);
     // Tear down every source allocation; the testing allocator scribbles
@@ -1914,6 +1970,8 @@ test "dupeToolResultMemory copies survive teardown of every source allocation" {
         .unavailable => return error.TestUnexpectedResult,
     }
     try std.testing.expect(copy.command_process_presentation.? == .exit_code);
+    try std.testing.expectEqual(?CommandPlacement, @TypeOf(copy.command_placement));
+    try std.testing.expectEqual(@as(?CommandPlacement, .remote), copy.command_placement);
 
     freeToolResultMemory(alloc, copy);
 }
@@ -3610,6 +3668,11 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     errdefer freePersistedContextNotes(alloc, context_notes);
     const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
     errdefer if (runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    const toolbox_menu: ?SavedToolboxMenu = if (memory.toolbox_menu) |menu|
+        .{ .text = try alloc.dupe(u8, menu.text), .entries_hash = menu.entries_hash }
+    else
+        null;
+    errdefer if (toolbox_menu) |menu| alloc.free(menu.text);
     const model_calls = try dupeModelCallRecords(alloc, memory.model_calls);
     errdefer freeModelCallRecords(alloc, model_calls);
     const bridge_calls = try dupeBridgeCallRecords(alloc, memory.bridge_calls);
@@ -3619,6 +3682,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        .toolbox_menu = toolbox_menu,
+        .toolbox_noted = memory.toolbox_noted,
         .turn_summary = memory.turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,
@@ -3633,6 +3698,7 @@ pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) vo
     freePersistedSteering(alloc, memory.steering);
     freePersistedContextNotes(alloc, memory.context_notes);
     if (memory.runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    if (memory.toolbox_menu) |menu| alloc.free(menu.text);
 }
 
 /// Caller owns the result; free it with `freeRuntimeContext`.
@@ -4167,11 +4233,13 @@ test "dupeToolCall drops action scoped bindings" {
         .arguments_json = "{\"open\":\"/skills/workflow\"}",
         .toolbox_lookup = .{ .permission = "skill", .target = "workflow" },
         .resolved_display_target = "more output from zig build test",
+        .command_placement = .remote,
     };
     const copy = try dupeToolCall(std.testing.allocator, source);
     defer freeToolCall(std.testing.allocator, copy);
     try std.testing.expect(copy.toolbox_lookup == null);
     try std.testing.expect(copy.resolved_display_target == null);
+    try std.testing.expect(copy.command_placement == null);
     try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }
 

@@ -87,13 +87,12 @@ fn call(
         return .{ .failure = try ctx.allocator.dupe(u8, "") };
     } orelse return unsupported(ctx);
     const status = output.status;
-    if (ctx.mcp_call_status_sink) |sink| sink.* = status;
     const images = output.takeImages();
     const body = @constCast(output.takeModelOutput(ctx.allocator));
     if (images.len > 0) return .{ .rich = .{ .text = body, .images = images, .is_error = status != .success } };
     return switch (status) {
         .success => .{ .success = body },
-        .tool_failure, .protocol_failure, .input_required => .{ .failure = body },
+        .tool_failure, .protocol_failure => .{ .failure = body },
     };
 }
 
@@ -111,7 +110,7 @@ fn resultBytes(ctx: tool_dispatch.DispatchContext) usize {
 /// name is the model's, so the result writes it as visible text.
 pub fn unsupportedOutput(alloc: Allocator, name: []const u8, carried_by: ?[]const u8) Allocator.Error![]u8 {
     if (carried_by != null) return alloc.print("{f} is no longer available. Use toolbox search to find current tools.", .{model_context_encoding.scalar(name)});
-    return alloc.print("Unsupported tool: {f}", .{model_context_encoding.scalar(name)});
+    return tool_dispatch.unsupportedToolOutput(alloc, .{}, name);
 }
 
 fn unsupported(

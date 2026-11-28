@@ -725,6 +725,7 @@ pub const FakeAgentRuntimeDeps = struct {
     capture_restored_prompts: bool = false,
     restored_prompts: std.ArrayList([]u8) = .empty,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
+    cancel_on_settled_checkpoint: ?*std.atomic.Value(bool) = null,
     route_recovery_status_error_attempt: ?usize = null,
     steering_messages: []const []const u8 = &.{},
     /// Who wrote the fake's steering messages.
@@ -962,6 +963,10 @@ pub const FakeAgentRuntimeDeps = struct {
         );
         if (checkpoint.outstanding_reservation) {
             if (self.cancel_on_recovery_reservation) |cancel_flag| {
+                cancel_flag.store(true, .seq_cst);
+            }
+        } else {
+            if (self.cancel_on_settled_checkpoint) |cancel_flag| {
                 cancel_flag.store(true, .seq_cst);
             }
         }

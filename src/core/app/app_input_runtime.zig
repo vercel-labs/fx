@@ -557,7 +557,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 .insert_newline => {
-                    if (commandSkillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(agent) or usageMenuActive(app)) return;
+                    if (commandSkillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(agent) or usageMenuActive(app) or app.input_runtime.effort_menu.active) return;
                     dismissActiveMenusThenRedraw(app, agent);
                     switch (try insertComposerSliceBounded(app, agent, "\n", max_input_len, false)) {
                         .inserted => app.shell.render_requests.request(.footer),
@@ -1043,6 +1043,7 @@ pub fn Runtime(comptime App: type) type {
                         debug_trace.logf("input", "open_agent_list refused reason={s}", .{reason});
                         return .done;
                     }
+                    _ = cancelEffortMenu(app, "agent_list_opened");
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                     // The list sets the draft aside itself, so the model
                     // picker's goes back to the composer first.
@@ -1221,6 +1222,7 @@ pub fn Runtime(comptime App: type) type {
                         runtime_profile.allows(App, .durable_sessions))
                     {
                         if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or usageMenuActive(app)) return .done;
+                        _ = cancelEffortMenu(app, "session_picker_opened");
                         if (try refuseSessionActionWithDraft(app, agents.screenAgentOf(app), "submit or clear the draft before switching sessions")) return .done;
                         dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                         try app_session_runtime.Runtime(App).openAllSessionPicker(app, agents.screenAgentOf(app));
@@ -1234,10 +1236,9 @@ pub fn Runtime(comptime App: type) type {
                     const agent = agents.screenAgentOf(app);
                     if (effortCycleShortcutBlocked(app, agent)) return .done;
                     // The `/effort` menu marks the level that was in use
-                    // when it opened.
-                    if (cancelEffortMenu(app)) {
-                        debug_trace.logf("input", "effort menu closed without applying its highlight reason=ctrl_t_cycle", .{});
-                    }
+                    // when it opened, so Ctrl+T closes it without applying
+                    // its highlight.
+                    _ = cancelEffortMenu(app, "ctrl_t_cycle");
                     try session_commands.Commands(App).cycleEffort(app, agent);
                     app.shell.render_requests.request(.footer);
                 },
@@ -1536,6 +1537,10 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (try cycleUsageMenuPeriod(app, 1)) {
                         app.shell.render_requests.request(.footer);
+                    } else if (app.input_runtime.effort_menu.active) {
+                        // The open `/effort` menu owns Tab, as the `/model`
+                        // menu does. It has no tabs, and its query is never a
+                        // command to complete.
                     } else if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try completion_rt.openCurrentModelPicker(app);
                     } else if (picker_state.isBareEffortCommandAtCursor(&app.input_runtime.edit_state)) {
@@ -1693,7 +1698,7 @@ pub fn Runtime(comptime App: type) type {
                             selection.start
                         else
                             app.input_runtime.edit_state.cursor;
-                        if (byte == '$' and !file_picker_path.contains_position(app.input_runtime.edit_state.input.items, insertion_start) and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app) and !usageMenuActive(app)) {
+                        if (byte == '$' and !file_picker_path.contains_position(app.input_runtime.edit_state.input.items, insertion_start) and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app) and !usageMenuActive(app) and !app.input_runtime.effort_menu.active) {
                             if ((try insertComposerSliceBounded(app, agent, &.{byte}, max_input_len, false)) == .limit_exceeded) {
                                 try input_limit_feedback.report(App, app, .composer, 1);
                                 return;
@@ -2367,6 +2372,7 @@ pub fn Runtime(comptime App: type) type {
         fn openModelBrowseCatalog(app: *App) !void {
             if (comptime !@hasField(App, "model_cache")) return;
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            _ = cancelEffortMenu(app, "model_menu_opened");
             try openModelMenu(app);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
@@ -2385,6 +2391,9 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (modelPickerShortcutBlocked(app, agent)) return;
+            // Before the draft is set aside: the query is the menu's, not a
+            // draft to give back.
+            _ = cancelEffortMenu(app, "model_menu_opened");
             try openModelPickerShortcut(app);
         }
 
@@ -2532,11 +2541,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App, agent: *AppAgent) bool {
-            // The fork and effort menus read no query from the composer, so an
-            // edit closes them. The agent list searches with it instead.
+            // The fork menu reads no query from the composer, so an edit
+            // closes it. The agent list and the effort menu filter with it
+            // instead.
             const fork_menu_closed = cancelForkMenu(app, agent);
-            const effort_menu_closed = cancelEffortMenu(app);
-            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed or effort_menu_closed;
+            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed;
         }
 
         fn dismissActiveMenusThenRedraw(app: *App, agent: *AppAgent) void {
@@ -3043,6 +3052,7 @@ pub fn Runtime(comptime App: type) type {
             syncSkillsMenu(app);
             syncModelMenu(app);
             syncUsageMenu(app);
+            syncEffortMenu(app);
             syncSessionMenu(app, agent);
             syncMcpHostMenu(app);
         }
@@ -3050,6 +3060,10 @@ pub fn Runtime(comptime App: type) type {
         fn syncUsageMenu(app: *App) void {
             if (!app.input_runtime.usage_menu.active) return;
             app.input_runtime.usage_menu.resetForQuery();
+        }
+
+        fn syncEffortMenu(app: *App) void {
+            app.input_runtime.effort_menu.setQuery(app.input_runtime.edit_state.input.items);
         }
 
         fn syncMcpHostMenu(app: *App) void {
@@ -3306,7 +3320,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelUsageMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelUsageMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app, "escape")) {
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
@@ -3360,7 +3374,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelUsageMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelUsageMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app, "escape")) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -3482,17 +3496,22 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        fn cancelEffortMenu(app: *App) bool {
-            if (!app.input_runtime.effort_menu.active) return false;
-            app.input_runtime.effort_menu.close(app.alloc);
-            return true;
+        fn cancelEffortMenu(app: *App, reason: []const u8) bool {
+            return app.input_runtime.cancelEffortMenu(app.alloc, reason);
         }
 
         /// Applies the level highlighted in the `/effort` menu and closes it.
+        /// With no level matching the query, Enter keeps the menu open and
+        /// never sends the query as a prompt.
         fn submitEffortMenuSelection(app: *App, agent: *AppAgent) !bool {
             const menu = &app.input_runtime.effort_menu;
-            const effort = menu.selectedEffort() orelse return false;
-            menu.close(app.alloc);
+            if (!menu.active) return false;
+            const effort = menu.selectedEffort() orelse {
+                debug_trace.logf("input", "effort menu enter ignored reason=no_matching_level", .{});
+                app.shell.render_requests.request(.footer);
+                return true;
+            };
+            _ = cancelEffortMenu(app, "applied");
             try session_commands.Commands(App).selectEffort(app, agent, effort);
             app.shell.render_requests.request(.footer);
             return true;
@@ -4094,6 +4113,7 @@ const RoutingFakeApp = struct {
     upgrade_denied_count: usize = 0,
     suspend_count: usize = 0,
     workspace_access: app_workspace_runtime.Access = .{},
+    clipboard_image_reads: usize = 0,
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -4101,6 +4121,11 @@ const RoutingFakeApp = struct {
 
     pub fn urlOpener(_: *const RoutingFakeApp) host.UrlOpener {
         return .{ .open_fn = routingOpenUrl };
+    }
+
+    pub fn loadClipboardImageAttachment(self: *RoutingFakeApp) !image_attachments.ClipboardImageAttachment {
+        self.clipboard_image_reads += 1;
+        return error.NoClipboardImage;
     }
 
     fn init(alloc: std.mem.Allocator) !RoutingFakeApp {
@@ -9669,6 +9694,32 @@ test "app_input_runtime ctrl+t closes the open effort menu and cycles from the l
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
 }
 
+test "app_input_runtime typing over the open effort menu filters it, and Enter with no match sends nothing" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+    try app.input_runtime.effort_menu.open(alloc, "test/model", app.resolvedModelCapabilities("test/model"), .auto);
+
+    try feedRoutingBytes(&app, "zz");
+    try std.testing.expect(app.input_runtime.effort_menu.active);
+    try std.testing.expectEqualStrings("zz", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.effort_menu.levels().len);
+    try feedRoutingBytes(&app, "\r");
+    try std.testing.expect(app.input_runtime.effort_menu.active);
+    try std.testing.expectEqualStrings("zz", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+
+    try feedRoutingBytes(&app, "\x7f\x7fh");
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.effort_menu.levels().len);
+    try std.testing.expect(app.input_runtime.effort_menu.levels()[0].eql(routing_cycle_efforts[2]));
+    try feedRoutingBytes(&app, "\r");
+    try std.testing.expect(!app.input_runtime.effort_menu.active);
+    try std.testing.expectEqual(routing_cycle_efforts[2], app.agent().effort);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+}
+
 test "app_input_runtime ctrl+c while the picker borrows the composer keeps the stashed draft and its image" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
@@ -10373,6 +10424,17 @@ test "app_input_runtime decision prompt owns and discards bracketed paste" {
 
 test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "same-epoch-paste-suffix.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "keep");
@@ -10384,8 +10446,16 @@ test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
 
     try std.testing.expectEqualStrings("keep", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
-    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+    // One notice for the clipboard check the empty paste starts, one for the ignored suffix.
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
+    try std.testing.expectEqual(@as(usize, 2), app.notice_write_count);
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+
+    debug_trace.shutdown();
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "paste suffix dropped owner=composer bytes=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "reason=same_delivery_as_end_marker") != null);
 
     try feedRoutingBytes(&app, "\r");
     try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
@@ -10582,6 +10652,83 @@ test "app_input_runtime zero-content decision paste logs once" {
     const trace = try readTraceFileForTest(alloc, trace_path);
     defer alloc.free(trace);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "decision prompt paste dropped bytes=0 reason=decision_prompt_active"));
+}
+
+test "app_input_runtime empty composer paste checks the clipboard for an image" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "empty-composer-paste.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    const notices_before = app.notice_write_count;
+    // xterm.js terminals (VS Code, VSCodium, Cursor) send this for Cmd+V
+    // when the clipboard holds only an image.
+    try feedRoutingBytes(&app, "\x1b[200~\x1b[201~");
+    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
+    try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+    try std.testing.expectEqualStrings("no image found on clipboard", app.notice_body.items);
+    debug_trace.shutdown();
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "composer paste empty action=clipboard_image"));
+}
+
+test "app_input_runtime empty composer paste skips the clipboard while the model picker borrows the composer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "empty-paste-model-picker.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try enterRoutingShortcutEffortStage(&app, "draft", "draft".len);
+
+    try feedRoutingBytes(&app, "\x1b[200~\x1b[201~");
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
+    debug_trace.shutdown();
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "composer paste empty action=none reason=model_picker_borrows_composer"));
+}
+
+test "app_input_runtime text composer paste does not read the clipboard" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    try feedRoutingBytes(&app, "\x1b[200~hello\x1b[201~");
+    try std.testing.expectEqualStrings("hello", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
+}
+
+test "app_input_runtime ctrl+v reads the clipboard through the app's reader" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
 }
 
 test "app_input_runtime decision paste start clears pending ctrl-c and esc gestures" {

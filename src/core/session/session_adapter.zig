@@ -98,6 +98,9 @@ fn openHome(home: []const u8) !io_mod.VerifiedDir {
 
 /// Pieces larger than this go to a blob; the line keeps a reference.
 const max_inline_piece_bytes: usize = 256 * 1024;
+/// The most bytes of a child line's data the session keeps; a spawn line
+/// that is longer is refused (`sm.max_child_data_bytes`).
+pub const max_child_data_bytes = sm.max_child_data_bytes;
 /// A workspace capture always fits inline: one held for a turn not on disk
 /// yet could not go to a blob, which needs the turn on disk (D44, D98).
 const max_workspace_capture_bytes = max_inline_piece_bytes;
@@ -451,6 +454,33 @@ pub const Store = struct {
         var sink: Sink = .{ .alloc = alloc, .history = &history };
         try replay(.{ .store = store, .id = child_id }, alloc, alloc, .start, null, ReplaySink.init(&sink));
         return history.toOwnedSlice(alloc);
+    }
+
+    /// Whether a child's newest turn ends in the yield marker, with nothing
+    /// after it, read without its lock. False for a child with no log.
+    pub fn childTurnYielded(store: *Store, alloc: Allocator, child_id: []const u8) !bool {
+        var scan: YieldScan = .{};
+        var from: sm.From = .end;
+        while (true) {
+            var page = store.manager.read(alloc, child_id, from, .backward, replay_page_lines) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .turn_started => return scan.yielded(),
+                    .item => |piece| {
+                        scan.item(piece.type);
+                        if (scan.done()) return scan.yielded();
+                    },
+                    else => {},
+                }
+            }
+            from = .{ .at = page.next orelse break };
+        }
+        return scan.yielded();
     }
 
     /// A child's newest preferences, read without its lock. Caller owns.
@@ -3561,7 +3591,7 @@ pub const Session = struct {
         var found: InterruptedRequest = .{ .record = null, .saved_ms = 0 };
         var record_seen = false;
         var has_prompt = false;
-        var newest_item = true;
+        var yield_scan: YieldScan = .{};
         var from: sm.From = .end;
         scan: while (true) {
             var page = try self.source().readTo(self.alloc, from, .backward, replay_page_lines);
@@ -3571,12 +3601,7 @@ pub const Session = struct {
                 switch (body) {
                     .turn_started => |started| if (started.turn == ended.turn) break :scan,
                     .item => |piece| {
-                        // A request's recovery status says nothing of how the
-                        // turn ended, so a yield marker before one still counts.
-                        if (newest_item and !std.mem.eql(u8, piece.type, model_recovery_type)) {
-                            newest_item = false;
-                            found.yielded = std.mem.eql(u8, piece.type, yielded_type);
-                        }
+                        yield_scan.item(piece.type);
                         if (found.saved_ms == 0) found.saved_ms = entry.ts_ms;
                         if (std.mem.eql(u8, piece.type, itemType(.turn_completed).?)) return null;
                         if (std.mem.eql(u8, piece.type, itemType(.user).?)) has_prompt = true;
@@ -3590,6 +3615,7 @@ pub const Session = struct {
             }
             from = .{ .at = page.next orelse break };
         }
+        found.yielded = yield_scan.yielded();
         return if (has_prompt) found else null;
     }
 
@@ -6601,6 +6627,13 @@ fn mergeContinued(alloc: Allocator, earlier: types.HistoryTurn, later: types.His
     if (tail.runtime_context) |texts| {
         if (runtime_context == null) runtime_context = texts else types.freeRuntimeContext(alloc, texts);
     }
+    // So does the toolbox menu of the turn that kept it, and the newer note
+    // wins (D103).
+    var toolbox_menu = head.execution.toolbox_menu;
+    if (tail.toolbox_menu) |menu| {
+        if (toolbox_menu == null) toolbox_menu = menu else alloc.free(menu.text);
+    }
+    const toolbox_noted = tail.toolbox_noted orelse head.execution.toolbox_noted;
     const turn_summary = tail.turn_summary orelse head.execution.turn_summary;
     const execution: types.ExecutionMemory = .{
         .tool_steps = tool_steps,
@@ -6608,12 +6641,25 @@ fn mergeContinued(alloc: Allocator, earlier: types.HistoryTurn, later: types.His
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        .toolbox_menu = toolbox_menu,
+        .toolbox_noted = toolbox_noted,
         .turn_summary = turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,
     };
 
-    const user = head.user;
+    var user = head.user;
+    const later_user: *types.UserTurn = switch (second) {
+        .assistant => |*value| &value.user,
+        .interrupted => |*value| &value.user,
+        .compacted_summary => unreachable,
+    };
+    // A continued child work carries a new work id that replaces the yielded one.
+    if (later_user.work_id) |work_id| {
+        if (user.work_id) |old| alloc.free(old);
+        user.work_id = work_id;
+        later_user.work_id = null;
+    }
     if (head.assistant) |text| alloc.free(text);
     if (head.tool_call) |call| types.freeToolCall(alloc, call);
     types.freeCompletedToolNames(alloc, head.completed_tool_names);
@@ -6835,6 +6881,8 @@ noinline fn replay(
                         .steering => |value| try builder.appendSteering(value.text),
                         .context_note => |value| try builder.appendContextNote(value.text, value.sources),
                         .runtime_context => |value| try builder.setRuntimeContext(value.messages),
+                        .toolbox_menu => |value| try builder.setToolboxMenu(value.text, value.entries_hash),
+                        .toolbox_noted => |value| try builder.setToolboxNoted(value),
                         .turn_completed => |value| {
                             const finished = try presentStoredResults(src, alloc, try builder.finishAssistant(value));
                             // Numbered as its chain's first turn when it continues one (RULES R1.8).
@@ -7204,6 +7252,26 @@ const yielded_type = "turn_yielded";
 /// drops the yielded turn, whose pieces this turn repeats.
 const continued_type = "turn_continued";
 const continued_extends_data = "{\"extends\":true}";
+
+/// Whether a turn ends in the yield marker. Feed its log entries newest
+/// first: the newest item decides, except a model-recovery status, which says
+/// nothing of how the turn ended. A turn with no such item did not yield.
+const YieldScan = struct {
+    verdict: ?bool = null,
+
+    fn item(self: *YieldScan, item_type: []const u8) void {
+        if (self.verdict != null or std.mem.eql(u8, item_type, model_recovery_type)) return;
+        self.verdict = std.mem.eql(u8, item_type, yielded_type);
+    }
+
+    fn done(self: YieldScan) bool {
+        return self.verdict != null;
+    }
+
+    fn yielded(self: YieldScan) bool {
+        return self.verdict orelse false;
+    }
+};
 
 /// `execution` without its display-only records: the model and bridge calls, which a continuation's rebuild never carries and the yielded turn keeps in its own log turn.
 fn withoutDisplayRecords(execution: types.ExecutionMemory) types.ExecutionMemory {
@@ -7733,9 +7801,12 @@ fn itemType(kind: PieceKind) ?[]const u8 {
         .turn_completed => "turn_end",
         .interrupted => "interruption",
         .context_checkpoint => null,
-        // An older fx leaves out an item type it does not know (D17, D93, D94).
+        // An older fx leaves out an item type it does not know (D17, D93, D94,
+        // D103).
         .context_note => "context_note",
         .runtime_context => "runtime_context",
+        .toolbox_menu => "toolbox_menu",
+        .toolbox_noted => "toolbox_noted",
         .model_call => "model_call",
     };
 }
@@ -8829,6 +8900,94 @@ test "a yielded turn is found as yielded, and a later piece clears it" {
     try testing.expect(!(try r2.interruptedRequest()).?.yielded);
 }
 
+/// Closes `s` and returns its id, which the caller frees.
+fn closeForId(s: *Session) ![]u8 {
+    const id = try testing.allocator.dupe(u8, s.id());
+    s.close();
+    return id;
+}
+
+test "a child whose newest turn ends in the yield marker reads as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try testing.expect(try s.markYielded());
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+    try testing.expect(try t.store.childTurnYielded(testing.allocator, id));
+}
+
+test "a child's yield marker followed by a model recovery status still reads as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try testing.expect(try s.markYielded());
+    try s.saveModelRecovery(.{ .kind = .recovered, .attempt = 2, .failure = .rate_limited });
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+    try testing.expect(try t.store.childTurnYielded(testing.allocator, id));
+}
+
+test "a child's yield marker followed by a tool call does not read as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    try s.appendProgress(user, .{}, .{});
+    try testing.expect(try s.markYielded());
+    const call: types.ToolCall = .{ .id = "call_1", .name = "bash", .arguments_json = "{}" };
+    try s.appendProgress(user, .{}, .{ .calls = &.{call} });
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+    try testing.expect(!try t.store.childTurnYielded(testing.allocator, id));
+}
+
+test "a child's yield marker followed by a turn end does not read as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    try s.appendProgress(user, .{}, .{});
+    try testing.expect(try s.markYielded());
+    try s.commitTurn(assistantTurn("work", "done"), types.ConversationLanguage.default());
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+    try testing.expect(!try t.store.childTurnYielded(testing.allocator, id));
+}
+
+test "a child's turn that began after a yielded one does not read as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    try s.appendProgress(user, .{}, .{});
+    try testing.expect(try s.markYielded());
+    try s.commitTurn(assistantTurn("work", "done"), types.ConversationLanguage.default());
+    try s.appendProgress(.{ .text = @constCast("next") }, .{}, .{});
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+    try testing.expect(!try t.store.childTurnYielded(testing.allocator, id));
+}
+
+test "a child with no log does not read as yielded" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    try testing.expect(!try t.store.childTurnYielded(testing.allocator, "1786460757753-none"));
+}
+
 test "a continuing turn starts with its marker, once" {
     var t: TestHome = undefined;
     try t.init();
@@ -9300,6 +9459,38 @@ fn restoredJson(t: *TestHome, a: Allocator, id: []const u8) ![]u8 {
     var restored = try r.restore(testing.allocator);
     defer restored.deinit(testing.allocator);
     return historyJson(a, restored.history);
+}
+
+test "a continued turn keeps the continuation work id when merged with its yielded turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const old_user: types.UserTurn = .{ .text = @constCast("work"), .work_id = @constCast("work-old") };
+    try s.appendProgress(old_user, .{ .tool_steps = try stepsUpTo(a, 1) }, .{});
+    try testing.expect(try s.markYielded());
+    const id = try closeForId(s);
+    defer testing.allocator.free(id);
+
+    const c = try resumeContinuing(&t, id);
+    defer c.close();
+    const new_user: types.UserTurn = .{ .text = @constCast("work"), .work_id = @constCast("work-new") };
+    try c.commitTurn(.{ .assistant = .{
+        .user = new_user,
+        .assistant = @constCast("SOLO_DONE"),
+        .execution = .{ .tool_steps = try stepsUpTo(a, 2) },
+    } }, types.ConversationLanguage.default());
+    try expectExtendsMarker(&t, id);
+
+    const history = try t.store.childHistory(testing.allocator, id);
+    defer types.freeHistoryTurnSlice(testing.allocator, history);
+    try testing.expectEqual(@as(usize, 1), history.len);
+    try testing.expectEqualStrings("work-new", history[0].assistant.user.work_id.?);
+    try testing.expectEqualStrings("SOLO_DONE", history[0].assistant.assistant);
 }
 
 /// Asserts that the newest continuation in session `id` is in the `extends` format.
@@ -12383,6 +12574,113 @@ test "a turn's runtime context comes back on resume, saved once right after its 
     for (captured, execution.runtime_context.?) |want, got| try testing.expectEqualStrings(want, got);
     // A later turn that used the saved copy saves none.
     try testing.expect(restored.history[1].assistant.execution.runtime_context == null);
+}
+
+test "a turn's toolbox menu and noted hash come back on resume and in a fork, saved right after its user message (D103)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var captured = [_][]u8{@constCast("Runtime context: permission mode is ask.")};
+    const menu: types.SavedToolboxMenu = .{ .text = @constCast("TOOLBOX_MENU_BYTES"), .entries_hash = std.math.maxInt(u64) };
+    const noted: types.ToolboxNoted = .{ .entries_hash = 9, .compaction_count = 1 };
+    const lang = types.ConversationLanguage.default();
+    const user: types.UserTurn = .{ .text = @constCast("first turn") };
+    // The menu is kept before the first step, and every save of the turn
+    // carries it, so the streamed pieces stay a prefix of the committed turn.
+    try s.appendProgress(user, .{ .toolbox_menu = menu }, .{});
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..1], .runtime_context = &captured, .toolbox_menu = menu }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .runtime_context = &captured, .toolbox_menu = menu },
+    } }, lang);
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("noted turn") },
+        .assistant = @constCast("noted"),
+        .execution = .{ .toolbox_noted = noted },
+    } }, lang);
+    try s.commitTurn(assistantTurn("plain", "turn"), lang);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "TOOLBOX_MENU_BYTES"));
+    const user_at = std.mem.find(u8, bytes, "first turn").?;
+    const menu_at = std.mem.find(u8, bytes, "\"type\":\"toolbox_menu\"").?;
+    const runtime_at = std.mem.find(u8, bytes, "\"type\":\"runtime_context\"").?;
+    try testing.expect(user_at < menu_at and menu_at < runtime_at);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes[user_at..menu_at], "\n"));
+    try testing.expect(std.mem.find(u8, bytes, "\"type\":\"toolbox_noted\",\"data\":{\"entries_hash\":9,\"compaction_count\":1}") != null);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    {
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 3), restored.history.len);
+        const first = restored.history[0].assistant.execution;
+        try testing.expectEqual(@as(usize, 2), first.tool_steps.len);
+        try testing.expectEqualStrings(menu.text, first.toolbox_menu.?.text);
+        try testing.expectEqual(menu.entries_hash, first.toolbox_menu.?.entries_hash);
+        try testing.expect(first.toolbox_noted == null);
+        try testing.expect(restored.history[1].assistant.execution.toolbox_menu == null);
+        try testing.expectEqual(@as(?types.ToolboxNoted, noted), restored.history[1].assistant.execution.toolbox_noted);
+        try testing.expect(restored.history[2].assistant.execution.toolbox_menu == null);
+        try testing.expect(restored.history[2].assistant.execution.toolbox_noted == null);
+    }
+
+    // A fork copies the turns before its point with their items.
+    const points = try r.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, points);
+    const copy = try r.fork(testing.allocator, .{ .before_turn = points[2].turn, .workspace = "/w", .host = .app });
+    defer copy.close();
+    var forked = try copy.restore(testing.allocator);
+    defer forked.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), forked.history.len);
+    try testing.expectEqualStrings(menu.text, forked.history[0].assistant.execution.toolbox_menu.?.text);
+    try testing.expectEqual(@as(?types.ToolboxNoted, noted), forked.history[1].assistant.execution.toolbox_noted);
+}
+
+test "a turn stopped right after fx's summary cut it comes back with its runtime context, and the summary with the copy it saved (D94)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    try s.commitTurn(assistantTurn("one", "1"), types.ConversationLanguage.default());
+    var captured = [_][]u8{@constCast("<fx-turn-context>\nmodel: anthropic/claude-fable-5.2\n</fx-turn-context>")};
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    // The turn's first save carries its copy, before its first request.
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..2], .runtime_context = &captured }, .{});
+    // The summary inside the turn is one write, with the copy it saved; the
+    // process stops before the turn's next save.
+    var summary = "fx-compactor-v1\n{\"earlier\":\"e\",\"runtime_context\":[\"<fx-turn-context>\\nmodel: anthropic/claude-fable-5.2\\n</fx-turn-context>\"]}".*;
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, true, .{ .turns = 1, .tool_steps = 1 });
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings(&summary, restored.history[0].compacted_summary.summary);
+    const execution = restored.history[1].interrupted.execution;
+    try testing.expectEqual(@as(usize, 1), execution.runtime_context.?.len);
+    try testing.expectEqualStrings(captured[0], execution.runtime_context.?[0]);
 }
 
 test "a turn's model call records come back on resume at their steps, each saved once" {
