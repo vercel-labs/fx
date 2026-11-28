@@ -9,6 +9,7 @@ import {
   callFailure,
   extractToolCalls,
   isRemoteCommand,
+  MONITOR_PROBES,
   numberIn,
   parseStreamUsage,
   rescoreResults,
@@ -246,5 +247,31 @@ describe("tool schema A/B helpers", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("monitor probes", () => {
+  const probe = (id: string) => MONITOR_PROBES.find((candidate) => candidate.id === id)!;
+  test("an adopt probe passes only for a valid monitor start", () => {
+    const check = probe("adopt-ci").check;
+    expect(check([{ name: "monitor", input: { action: "start", command: "gh pr checks 2431 --watch", label: "ci" } }]).pass).toBe(true);
+    expect(check([{ name: "shell", input: { action: "run", command: "gh pr checks 2431 --watch" } }]).pass).toBe(false);
+    expect(check([{ name: "monitor", input: { action: "start" } }]).pass).toBe(false);
+    expect(check([{ name: "monitor", input: { action: "start", command: "  " } }]).pass).toBe(false);
+    expect(check([{ name: "monitor", input: { action: "start", command: "tail -f x", interval: 10 } }]).pass).toBe(false);
+    expect(check([{ name: "monitor", input: { action: "list" } }]).pass).toBe(false);
+    expect(check([]).pass).toBe(false);
+  });
+  test("a route probe fails for any monitor call and passes for the shell tool", () => {
+    const check = probe("route-build").check;
+    expect(check([{ name: "shell", input: { action: "run", command: "zig build" } }]).pass).toBe(true);
+    expect(check([]).pass).toBe(true);
+    expect(check([{ name: "monitor", input: { action: "start", command: "zig build" } }]).pass).toBe(false);
+  });
+  test("every probe has an id once", () => {
+    const ids = MONITOR_PROBES.map((candidate) => candidate.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.filter((id) => id.startsWith("adopt-")).length).toBe(3);
+    expect(ids.filter((id) => id.startsWith("route-")).length).toBe(4);
   });
 });
