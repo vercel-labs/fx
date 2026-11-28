@@ -1288,13 +1288,12 @@ def apply_profile(
     return paths.profile_use_bitcode
 
 
-def _outline_without_folded_constants(
+def _rewrite_outliner_input(
     toolchain: Toolchain,
     paths: PipelinePaths,
     source: pathlib.Path,
-    output: pathlib.Path,
     name: str,
-) -> None:
+) -> pathlib.Path:
     expanded = source.with_name(source.name + ".expanded.bc")
     run_checked(
         ir_size_argv(toolchain, "expand-constant-exprs", source, expanded),
@@ -1325,7 +1324,17 @@ def _outline_without_folded_constants(
         require_empty_stderr=True,
     )
     _require_bitcode_header(widened)
-    _outline_excluding_dropped_outputs(toolchain, paths, widened, output, name)
+    return widened
+
+
+def _outline_and_check(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+    source: pathlib.Path,
+    output: pathlib.Path,
+    name: str,
+) -> None:
+    _outline_excluding_dropped_outputs(toolchain, paths, source, output, name)
     run_checked(
         ir_size_argv(toolchain, "check-outlined", output, None),
         cwd=paths.root,
@@ -1334,6 +1343,17 @@ def _outline_without_folded_constants(
         log_path=paths.logs / f"check-outlined-{name}.json",
         require_empty_stderr=True,
     )
+
+
+def _outline_without_folded_constants(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+    source: pathlib.Path,
+    output: pathlib.Path,
+    name: str,
+) -> None:
+    widened = _rewrite_outliner_input(toolchain, paths, source, name)
+    _outline_and_check(toolchain, paths, widened, output, name)
 
 
 def _outline_excluding_dropped_outputs(

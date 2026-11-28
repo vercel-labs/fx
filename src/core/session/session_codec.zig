@@ -597,13 +597,13 @@ pub fn namesImages(user: session.UserTurn, stored: ?*const StoredImages) bool {
     return false;
 }
 
-/// Whether `execution` is written as schema 11 or 12, with context notes
-/// (D93) or a saved runtime context (D94), which an fx from before them
-/// rejects. A journal event, checkpoint, or snapshot that holds one says so
+/// Whether `execution` is written as schema 11, 12 or 13, with context notes
+/// (D93), a saved runtime context (D94) or a toolbox record (D103), which an
+/// fx from before them rejects. A journal event, checkpoint, or snapshot that holds one says so
 /// in its own version, so an older reader reports a newer format instead of
 /// a corrupt one. Matches the choice in `writeExecutionMemoryJsonFrom`.
 pub fn executionUsesNotesSchema(execution: session.ExecutionMemory) bool {
-    return execution.runtime_context != null or execution.context_notes.len > 0;
+    return execution.runtime_context != null or execution.context_notes.len > 0 or executionHasToolbox(execution);
 }
 
 pub fn turnUsesNotesSchema(turn: session.HistoryTurn) bool {
@@ -1870,12 +1870,17 @@ fn writeExecutionMemoryJsonFrom(
     image_mode: anytype,
 ) !void {
     std.debug.assert(from.tool_steps <= execution.tool_steps.len and from.files <= execution.files.len and from.steering <= execution.steering.len);
-    // Version 11 adds `context_notes` (D93) and version 12 `runtime_context`
-    // (D94). Only an execution that has them uses them, so one without keeps
-    // version 10 and its exact bytes; an older fx rejects either version as it
-    // rejects every newer version.
-    const with_runtime_context = format == .durable and execution.runtime_context != null;
-    try writer.writeAll(if (with_runtime_context)
+    // Version 11 adds `context_notes` (D93), version 12 `runtime_context`
+    // (D94) and version 13 `toolbox_menu` and `toolbox_noted` (D103). Only an
+    // execution that has them uses them, so one without keeps version 10 and
+    // its exact bytes; an older fx rejects each version as it rejects every
+    // newer version.
+    const with_toolbox = format == .durable and executionHasToolbox(execution);
+    // Whether the `runtime_context` key is written: version 13 names it too.
+    const with_runtime_context = format == .durable and (execution.runtime_context != null or with_toolbox);
+    try writer.writeAll(if (with_toolbox)
+        "{\"schema_version\":13,\"tool_steps\":["
+    else if (with_runtime_context)
         "{\"schema_version\":12,\"tool_steps\":["
     else if (format == .durable and execution.context_notes.len > 0)
         "{\"schema_version\":11,\"tool_steps\":["
@@ -1913,15 +1918,17 @@ fn writeExecutionMemoryJsonFrom(
         }
     }
     if (with_runtime_context) {
+        // Whole in every delta too, like the notes above. Version 13 always
+        // names it, null when the turn captured none.
+        try writer.writeByte(']');
+        try writeOptionalRuntimeContext(writer, execution.runtime_context, format);
+    }
+    if (with_toolbox) {
         // Whole in every delta too, like the notes above.
-        try writer.writeAll("],\"runtime_context\":[");
-        for (execution.runtime_context.?, 0..) |text, i| {
-            if (i > 0) try writer.writeByte(',');
-            try writeExecutionBytes(writer, text, format);
-        }
+        try writeToolboxRecords(writer, execution, format);
     }
     if (format == .durable) {
-        try writer.writeAll("],\"turn_summary\":");
+        try writer.writeAll(if (with_runtime_context) ",\"turn_summary\":" else "],\"turn_summary\":");
         if (execution.turn_summary) |summary| {
             try writeTurnSummary(writer, summary);
         } else {
@@ -1931,6 +1938,40 @@ fn writeExecutionMemoryJsonFrom(
         try writer.writeByte(']');
     }
     try writer.writeByte('}');
+}
+
+/// Whether `execution` holds a toolbox record, which needs schema version 13
+/// (D103).
+fn executionHasToolbox(execution: session.ExecutionMemory) bool {
+    return execution.toolbox_menu != null or execution.toolbox_noted != null;
+}
+
+fn writeOptionalRuntimeContext(writer: *std.Io.Writer, texts: ?[]const []u8, format: ExecutionMemoryJsonFormat) !void {
+    try writer.writeAll(",\"runtime_context\":");
+    const captured = texts orelse return writer.writeAll("null");
+    try writer.writeByte('[');
+    for (captured, 0..) |text, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeExecutionBytes(writer, text, format);
+    }
+    try writer.writeByte(']');
+}
+
+fn writeToolboxRecords(writer: *std.Io.Writer, execution: session.ExecutionMemory, format: ExecutionMemoryJsonFormat) !void {
+    try writer.writeAll(",\"toolbox_menu\":");
+    if (execution.toolbox_menu) |menu| {
+        try writer.writeAll("{\"text\":");
+        try writeExecutionBytes(writer, menu.text, format);
+        try writer.print(",\"entries_hash\":{d}}}", .{menu.entries_hash});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"toolbox_noted\":");
+    if (execution.toolbox_noted) |noted| {
+        try writer.print("{{\"entries_hash\":{d},\"compaction_count\":{d}}}", .{ noted.entries_hash, noted.compaction_count });
+    } else {
+        try writer.writeAll("null");
+    }
 }
 
 fn writeExecutionToolStep(writer: *std.Io.Writer, step: session.ToolExecutionStep, format: ExecutionMemoryJsonFormat, image_mode: anytype) !void {
@@ -2044,7 +2085,7 @@ pub fn executionHashes(alloc: Allocator, checkpoint: RecoveryCheckpoint) !Execut
 }
 
 fn hasDurableExecutionMemory(execution: session.ExecutionMemory) bool {
-    return !execution.isEmpty() or execution.turn_summary != null or execution.runtime_context != null;
+    return !execution.isEmpty() or execution.turn_summary != null or execution.runtime_context != null or executionHasToolbox(execution);
 }
 
 fn writeTurnSummary(writer: *std.Io.Writer, summary: types.TurnSummary) !void {
@@ -2579,6 +2620,7 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         7...10 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         11 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "turn_summary" }),
         12 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "runtime_context", "turn_summary" }),
+        13 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "context_notes", "runtime_context", "toolbox_menu", "toolbox_noted", "turn_summary" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -2606,10 +2648,13 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         &.{};
     errdefer types.freePersistedContextNotes(alloc, context_notes);
     const runtime_context: ?[][]u8 = if (object.get("runtime_context")) |texts|
-        try parseRuntimeContext(alloc, texts)
+        if (schema_version >= 13 and texts == .null) null else try parseRuntimeContext(alloc, texts)
     else
         null;
     errdefer if (runtime_context) |texts| types.freeRuntimeContext(alloc, texts);
+    const toolbox_menu = if (object.get("toolbox_menu")) |menu| try parseToolboxMenu(alloc, menu) else null;
+    errdefer if (toolbox_menu) |menu| alloc.free(menu.text);
+    const toolbox_noted = if (object.get("toolbox_noted")) |noted| try parseToolboxNoted(noted) else null;
     const turn_summary = if (schema_version >= 5)
         try parseOptionalTurnSummary(object.get("turn_summary").?)
     else
@@ -2620,8 +2665,25 @@ fn parseExecutionMemoryWith(alloc: Allocator, value: std.json.Value, sources: Im
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        .toolbox_menu = toolbox_menu,
+        .toolbox_noted = toolbox_noted,
         .turn_summary = turn_summary,
     };
+}
+
+/// Caller owns the text. Null when the turn kept no menu (D103).
+fn parseToolboxMenu(alloc: Allocator, value: std.json.Value) !?types.SavedToolboxMenu {
+    if (value == .null) return null;
+    const object = try exactObject(value, &.{ "text", "entries_hash" });
+    const entries_hash = try requireU64(object, "entries_hash");
+    return .{ .text = try parseRequiredDurableBytes(alloc, object, "text"), .entries_hash = entries_hash };
+}
+
+/// Null when the turn added no toolbox change note (D103).
+fn parseToolboxNoted(value: std.json.Value) !?types.ToolboxNoted {
+    if (value == .null) return null;
+    const object = try exactObject(value, &.{ "entries_hash", "compaction_count" });
+    return .{ .entries_hash = try requireU64(object, "entries_hash"), .compaction_count = try requireUsize(object, "compaction_count") };
 }
 
 /// Caller owns the result. Boundaries never decrease and never pass the
@@ -3046,8 +3108,9 @@ fn parseToolResultWith(
             try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
         else
             try exactObject(value, v4_keys), .extended = true },
-        // Versions 11 (D93) and 12 (D94) changed only the execution's keys.
-        10, 11, 12 => blk: {
+        // Versions 11 (D93), 12 (D94) and 13 (D103) changed only the
+        // execution's keys.
+        10, 11, 12, 13 => blk: {
             const keys = v4_keys.* ++ [_][]const u8{"review_feedback"};
             break :blk .{ .object = if (value == .object and value.object.contains("tool_images"))
                 try exactObject(value, &(keys ++ [_][]const u8{"tool_images"}))
@@ -5053,6 +5116,107 @@ test "execution memory codec writes the runtime context only for the turn that c
         defer session.freeExecutionMemory(alloc, execution);
         try std.testing.expectEqual(@as(usize, 2), execution.runtime_context.?.len);
         try std.testing.expectEqualStrings("b", execution.runtime_context.?[1]);
+    }
+}
+
+test "execution memory codec writes the toolbox menu and noted hash only for a turn that has them (D103)" {
+    const alloc = std.testing.allocator;
+    var calls = [_]session.ToolCall{.{ .id = "call_menu", .name = "read_file", .arguments_json = "{}" }};
+    var results = [_]session.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_menu"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("ok"),
+        .output_bytes = 2,
+        .stored_output_bytes = 2,
+    }};
+    var steps = [_]session.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+    var captured = [_][]u8{@constCast("Runtime context: permission mode is ask.")};
+    var notes = [_]types.PersistedContextNote{.{ .text = @constCast("toolbox change"), .after_tool_step_count = 0 }};
+    // A hash past an i64, which JSON readers keep only as digits.
+    const menu: types.SavedToolboxMenu = .{ .text = @constCast("lead\n- review\n- fixture"), .entries_hash = std.math.maxInt(u64) };
+    const noted: types.ToolboxNoted = .{ .entries_hash = 7, .compaction_count = 2 };
+    const Case = struct { menu: bool, noted: bool, runtime: bool, notes: bool, version: []const u8 };
+    for ([_]Case{
+        .{ .menu = false, .noted = false, .runtime = false, .notes = false, .version = "\"schema_version\":10" },
+        .{ .menu = false, .noted = false, .runtime = true, .notes = true, .version = "\"schema_version\":12" },
+        .{ .menu = true, .noted = false, .runtime = false, .notes = false, .version = "\"schema_version\":13" },
+        .{ .menu = false, .noted = true, .runtime = false, .notes = true, .version = "\"schema_version\":13" },
+        .{ .menu = true, .noted = true, .runtime = true, .notes = true, .version = "\"schema_version\":13" },
+    }) |case| {
+        const turn: session.HistoryTurn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast("done"),
+            .execution = .{
+                .tool_steps = steps[0..],
+                .context_notes = if (case.notes) notes[0..] else &.{},
+                .runtime_context = if (case.runtime) captured[0..] else null,
+                .toolbox_menu = if (case.menu) menu else null,
+                .toolbox_noted = if (case.noted) noted else null,
+            },
+        } };
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+        if (std.mem.find(u8, encoded.written(), case.version) == null) {
+            std.debug.print("expected {s} in {s}\n", .{ case.version, encoded.written() });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(case.menu or case.noted, std.mem.find(u8, encoded.written(), "\"toolbox_menu\"") != null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = parseHistoryTurn(alloc, parsed.value) catch |err| {
+            std.debug.print("case did not parse ({s}): {s}\n", .{ @errorName(err), encoded.written() });
+            return err;
+        };
+        defer session.freeHistoryTurn(alloc, decoded);
+        const execution = decoded.assistant.execution;
+        try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+        try std.testing.expectEqual(@as(usize, @intFromBool(case.notes)), execution.context_notes.len);
+        try std.testing.expectEqual(case.runtime, execution.runtime_context != null);
+        if (case.menu) {
+            try std.testing.expectEqualStrings(menu.text, execution.toolbox_menu.?.text);
+            try std.testing.expectEqual(menu.entries_hash, execution.toolbox_menu.?.entries_hash);
+        } else {
+            try std.testing.expect(execution.toolbox_menu == null);
+        }
+        try std.testing.expectEqual(if (case.noted) noted else null, execution.toolbox_noted);
+        // fx's own state for the model, never shown.
+        var shown: std.Io.Writer.Allocating = .init(alloc);
+        defer shown.deinit();
+        try writeExecutionMemoryJson(&shown.writer, turn.assistant.execution, .presentation);
+        try std.testing.expect(std.mem.find(u8, shown.written(), "toolbox") == null);
+    }
+
+    // Only version 13 names them, always both, each whole; older versions
+    // still read.
+    for ([_]struct { json: []const u8, rejected: ?anyerror = null }{
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"toolbox_menu\":{\"text\":\"m\",\"entries_hash\":5},\"toolbox_noted\":null,\"turn_summary\":null}" },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\"],\"toolbox_menu\":null,\"toolbox_noted\":{\"entries_hash\":5,\"compaction_count\":0},\"turn_summary\":null}" },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"toolbox_menu\":{\"text\":\"m\",\"entries_hash\":5},\"turn_summary\":null}", .rejected = error.InvalidSessionFormat },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"toolbox_menu\":{\"text\":\"m\"},\"toolbox_noted\":null,\"turn_summary\":null}", .rejected = error.InvalidSessionFormat },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"toolbox_menu\":{\"text\":1,\"entries_hash\":5},\"toolbox_noted\":null,\"turn_summary\":null}", .rejected = error.InvalidDurableBytes },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":null,\"toolbox_menu\":null,\"toolbox_noted\":{\"entries_hash\":-1,\"compaction_count\":0},\"turn_summary\":null}", .rejected = error.InvalidSessionFormat },
+        .{ .json = "{\"schema_version\":13,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[],\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_summary\":null}", .rejected = error.InvalidSessionFormat },
+        .{ .json = "{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\"],\"toolbox_menu\":null,\"toolbox_noted\":null,\"turn_summary\":null}", .rejected = error.InvalidSessionFormat },
+        .{ .json = "{\"schema_version\":12,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"runtime_context\":[\"a\"],\"turn_summary\":null}" },
+        .{ .json = "{\"schema_version\":11,\"tool_steps\":[],\"files\":[],\"steering\":[],\"context_notes\":[],\"turn_summary\":null}" },
+        .{ .json = "{\"schema_version\":10,\"tool_steps\":[],\"files\":[],\"steering\":[],\"turn_summary\":null}" },
+    }) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        if (case.rejected) |expected| {
+            try std.testing.expectError(expected, parseExecutionMemory(alloc, parsed.value));
+            continue;
+        }
+        const execution = parseExecutionMemory(alloc, parsed.value) catch |err| {
+            std.debug.print("case did not parse ({s}): {s}\n", .{ @errorName(err), case.json });
+            return err;
+        };
+        defer session.freeExecutionMemory(alloc, execution);
+        const names_menu = std.mem.find(u8, case.json, "\"toolbox_menu\":{") != null;
+        try std.testing.expectEqual(names_menu, execution.toolbox_menu != null);
+        if (names_menu) try std.testing.expectEqualStrings("m", execution.toolbox_menu.?.text);
     }
 }
 
