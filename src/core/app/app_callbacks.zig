@@ -368,6 +368,10 @@ pub fn Bindings(comptime App: type) type {
                     agentResolveToolActionDisplayTarget
                 else
                     null,
+                .resolve_command_placement = if (comptime @hasDecl(App, "resolveCommandPlacement"))
+                    agentResolveCommandPlacement
+                else
+                    null,
                 .describe_tool_action = agentDescribeToolAction,
                 .describe_tool_action_completed = agentDescribeToolActionCompleted,
                 .describe_tool_action_denied = agentDescribeToolActionDenied,
@@ -1158,6 +1162,12 @@ pub fn Bindings(comptime App: type) type {
             return app.resolveToolActionDisplayTarget(agent, arena, call);
         }
 
+        fn agentResolveCommandPlacement(ctx: *anyopaque, arena: Allocator, call: ToolCall) !?types.CommandPlacement {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            return app.resolveCommandPlacement(agent, arena, call);
+        }
+
         fn agentDescribeToolAction(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
@@ -1825,7 +1835,12 @@ pub fn Bindings(comptime App: type) type {
                 }
                 // The picker borrows the composer as its query box; the
                 // person's draft goes back when the pick or the close is done.
-                if (comptime @hasField(App, "input_runtime")) app.input_runtime.stashModelPickerDraft();
+                // An open `/effort` menu closes first, so its query is not
+                // kept as the draft.
+                if (comptime @hasField(App, "input_runtime")) {
+                    if (comptime @hasDecl(InputRuntime, "cancelEffortMenu")) _ = app.input_runtime.cancelEffortMenu(app.alloc, "worker_model_picker");
+                    app.input_runtime.stashModelPickerDraft();
+                }
                 try input_completion_runtime.CompletionRuntime(App).openCurrentModelPicker(app);
             }
         }

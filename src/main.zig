@@ -47,6 +47,7 @@ const input_full_transcript_runtime = @import("core/app/input_full_transcript_ru
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
+const sandbox_policy = @import("core/runner/runner.zig");
 const app_trust_runtime = @import("core/app/app_trust_runtime.zig");
 const workspace_trust = @import("core/workspace_trust/workspace_trust.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
@@ -140,6 +141,7 @@ const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
 const session_log = @import("core/session/session_log.zig");
 const builtin_tools = @import("builtins/tools.zig");
+const shell_projection = @import("builtins/shell_projection.zig");
 const browser_workspace_tools = @import("builtins/browser_workspace_tools.zig");
 const browser_capabilities = @import("core/hosts/browser_capabilities.zig");
 const tool_admission = @import("core/tooling/tool_admission.zig");
@@ -635,6 +637,10 @@ const App = struct {
     /// started, each marked by its role. Owned by
     /// `app_agents_runtime`.
     child_agents: std.ArrayList(*app_agents_runtime.ChildAgent) = .empty,
+    /// The `screen_id` the next agent in `child_agents` gets; 0 is the
+    /// first instance's. Owned by `app_agents_runtime`; main loop only, like
+    /// the writes to `child_agents`.
+    next_screen_id: u64 = 1,
     /// What every instance starts from, and how many startup opens. Owned
     /// by `app_instances_runtime`.
     instances: app_instances_runtime.State = .{},
@@ -665,6 +671,10 @@ const App = struct {
     /// `app_agents_runtime`.
     child_handoffs: app_agents_runtime.Handoffs = .{},
     shell: TranscriptRuntime = .{},
+    /// The sandbox policy for shell commands, loaded at startup when
+    /// `experimental.sandbox_execution` is on. Null when it is off, or when the
+    /// load ran out of memory. Destroyed at teardown, after the agents.
+    sandbox_policy: ?*sandbox_policy.Policy = null,
     pacer: assistant_pacer.AssistantPacer = .{},
 
     terminal_client: terminal_client_runtime.Runtime = .{},
@@ -1216,6 +1226,9 @@ const App = struct {
         self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         AgentsAppRuntime.deinitChildren(self);
+        // Every agent and worker that could place a command has ended, so the policy can go.
+        if (self.sandbox_policy) |loaded| loaded.destroy();
+        self.sandbox_policy = null;
         self.instances.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         main_agent.session_title.deinit(self.alloc);
@@ -2258,13 +2271,13 @@ const App = struct {
             const roots = try profiles.Roots.init(profile_arena.allocator(), io_mod.homeDir(), workspace_root);
             break :listed try profiles.list(profile_arena.allocator(), roots);
         } else &.{};
-        return tool_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(agent), .{
+        return shell_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(agent), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = subagent_available,
             .subagent_profiles = subagent_profiles,
             .behind_toolbox = self.toolbox_behind.slice(),
-        });
+        }, .{ .runner = self.sandbox_policy != null });
     }
 
     pub fn subagentToolContextForAdmission(
@@ -2477,6 +2490,10 @@ const App = struct {
 
     pub fn resolveToolActionDisplayTarget(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall) !?[]const u8 {
         return AgentAppRuntime.resolveToolActionDisplayTarget(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    }
+
+    pub fn resolveCommandPlacement(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall) !?types.CommandPlacement {
+        return AgentAppRuntime.resolveCommandPlacement(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn describeToolActionWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -3877,6 +3894,12 @@ const App = struct {
         return .{ .worker = &child.agent.worker, .id = child.id };
     }
 
+    /// The worker that owns the approval on screen: the subagent's while its
+    /// request is lent to that screen, else the screen agent's own.
+    pub fn approvalWorker(self: *App, agent: *agents.Agent) *WorkerRuntime {
+        return AgentsAppRuntime.approvalWorker(self, agent);
+    }
+
     /// Runs a cancel of the approval on main's screen in the context of the
     /// subagent it came from. False for main's own approval.
     pub fn answerLentApproval(self: *App, agent: *agents.Agent, comptime body: fn (*App, *agents.Agent) anyerror!void) !bool {
@@ -4180,6 +4203,8 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     if (c_argc > 0) ui_program_resume.rememberProgramName(c_argv[0]);
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
+    // The built-in remote runner comes first (spec L4): no settings, update check, sessions, MCP or terminal setup.
+    if (isBuiltinRunnerInvocation(raw_args)) runBuiltinRunner(raw_args, raw_env);
     // Before any mode runs, since terminal helpers write under fx's folder too.
     try useFxHomeFromEnv(raw_env);
 
@@ -4328,6 +4353,24 @@ fn writeTopLevelHelpFast(raw_env: RawEnviron) !void {
         style,
     );
     try writeStdoutFast(text);
+}
+
+fn isBuiltinRunnerInvocation(raw_args: []const [*:0]const u8) bool {
+    return raw_args.len >= 2 and std.mem.eql(u8, std.mem.span(raw_args[1]), sandbox_policy.subcommand);
+}
+
+fn runBuiltinRunner(raw_args: []const [*:0]const u8, raw_env: RawEnviron) noreturn {
+    io_mod.setRawEnviron(raw_env);
+    const alloc = processAllocator();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    const words = arena.allocator().alloc([]const u8, raw_args.len) catch exitFast(sandbox_policy.exit_did_not_run);
+    for (raw_args, words) |raw, *word| word.* = std.mem.span(raw);
+    var threaded = std.Io.Threaded.init(alloc, processIoOptions(argsFromRaw(raw_args), environBlockFromRaw(raw_env)));
+    io_mod.setIo(threaded.io());
+    const code = sandbox_policy.runBuiltin(arena.allocator(), words);
+    threaded.deinit();
+    arena.deinit();
+    exitFast(code);
 }
 
 fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_args: []const [:0]const u8) !void {
@@ -5868,6 +5911,7 @@ test {
     _ = @import("builtins/gateway.zig");
     _ = @import("builtins/gateway/typesafe_permission_reviewer.zig");
     _ = @import("builtins/hooks.zig");
+    _ = @import("core/shared/child_wait.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/output/full_transcript_metadata.zig");
@@ -5938,6 +5982,7 @@ test {
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/shell_command/safe_git.zig");
     _ = @import("core/execution/router.zig");
+    _ = @import("core/runner/runner.zig");
     _ = @import("core/execution/command_runner.zig");
     _ = @import("core/permissions/direct_command.zig");
     _ = @import("core/permissions/auto_classifier.zig");
@@ -5998,6 +6043,7 @@ test {
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/shared/text_utils.zig");
+    _ = @import("core/shared/wildcard.zig");
     _ = @import("core/shared/testing_listener.zig");
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");
@@ -6008,6 +6054,7 @@ test {
     _ = @import("core/hosts/browser_capabilities.zig");
     _ = @import("core/tooling/tool_args.zig");
     _ = @import("core/tooling/tool_result_errors.zig");
+    _ = @import("core/tooling/shell_result_notice.zig");
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("core/tooling/tool_specs.zig");
     _ = @import("core/tooling/toolbox.zig");

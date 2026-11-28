@@ -32,6 +32,11 @@ const unannounced_approval_feedback = "fx could not tell your parent about this 
 /// What a child reads when fx could not hold the request for an answer.
 const unheld_approval_feedback = "fx could not hold this request for your parent's answer, so it was refused.";
 
+/// What a child reads when the approval screen for its request could not
+/// open, so fx denied the request without asking (`failApprovalScreen` in
+/// `src/core/app/app_render_runtime.zig`).
+pub const unshown_approval_feedback = "fx could not show this request, so it was refused.";
+
 /// Decides one tool call against a subagent's live authority, resolved fresh
 /// from `resolver` for `child_id`. The child engine and child agents both use
 /// it, so a subagent is held to its admission's tools and integrations

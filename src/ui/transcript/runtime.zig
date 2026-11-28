@@ -4942,6 +4942,7 @@ const PendingToolDetailStart = struct {
     /// Set for a provisional start, whose arguments still stream in. Every
     /// other start clears it.
     streaming: bool = false,
+    command_placement: ?types.CommandPlacement = null,
 
     fn deinit(self: *PendingToolDetailStart, alloc: Allocator) void {
         const tool_name = self.tool_name;
@@ -4956,6 +4957,7 @@ const PendingToolDetailStart = struct {
 
 const PendingToolDetailTerminal = struct {
     result: ?[]u8 = null,
+    notice: ?[]u8 = null,
     result_handle: ?[]u8 = null,
     command_artifact_handle: ?[]u8 = null,
     command_output_replay: ?types.CommandOutputReplay = null,
@@ -4963,9 +4965,11 @@ const PendingToolDetailTerminal = struct {
     command_output_entry_id: ?u32 = null,
     command_process_entry: ?PendingCommandProcessEntry = null,
     subagent_started: bool = false,
+    command_placement: ?types.CommandPlacement = null,
 
     fn deinit(self: *PendingToolDetailTerminal, alloc: Allocator) void {
         if (self.result) |value| alloc.free(value);
+        if (self.notice) |value| alloc.free(value);
         if (self.result_handle) |value| alloc.free(value);
         if (self.command_artifact_handle) |value| alloc.free(value);
         if (self.command_output_replay) |replay| {
@@ -6016,6 +6020,7 @@ pub const TranscriptRuntime = struct {
                 started.activity_kind,
                 started.arguments_json,
                 started.place_after_current_transcript,
+                started.command_placement,
             ),
             .progress => |progress| self.applyProgressLifecycle(
                 alloc,
@@ -6545,6 +6550,7 @@ pub const TranscriptRuntime = struct {
         activity_kind: types.ToolActivityKind,
         arguments_json: ?[]const u8,
         place_after_current_transcript: bool,
+        command_placement: ?types.CommandPlacement,
     ) !?types.ToolActivityKind {
         if (!admitLifecycleStart(&self.notebook.lifecycle_state, id)) return null;
 
@@ -6584,6 +6590,7 @@ pub const TranscriptRuntime = struct {
                     arguments_json,
                 );
                 defer detail_start.deinit(alloc);
+                detail_start.command_placement = command_placement;
                 try self.notebook.lifecycle_state.ensureRecordCapacity(alloc);
                 const owned_call_id = try alloc.dupe(u8, id.call_id);
                 errdefer alloc.free(owned_call_id);
@@ -6629,6 +6636,7 @@ pub const TranscriptRuntime = struct {
                 arguments_json,
             );
             defer detail_start.deinit(alloc);
+            detail_start.command_placement = command_placement;
             const owned_tool_name = try alloc.dupe(u8, tool_name);
             errdefer alloc.free(owned_tool_name);
             const line = try lifecycleStartLine(alloc, tool_name);
@@ -6667,6 +6675,7 @@ pub const TranscriptRuntime = struct {
             arguments_json,
         );
         defer detail_start.deinit(alloc);
+        detail_start.command_placement = command_placement;
         const entry_id = try self.createToolActivity(
             alloc,
             id,
@@ -7403,6 +7412,7 @@ pub const TranscriptRuntime = struct {
             pending.tool_name = null;
             if (pending.captured_command) |value| detail.captured_command = value;
             if (pending.activity_kind) |kind| detail.activity_kind = kind;
+            if (pending.command_placement) |placement| detail.command_placement = placement;
             detail.streaming = pending.streaming;
             if (pending.arguments_json) |arguments_json| {
                 if (detail.arguments_json) |old| alloc.free(old);
@@ -7426,6 +7436,7 @@ pub const TranscriptRuntime = struct {
             .arguments_json = pending.arguments_json,
             .lifecycle_id = pending.lifecycle_id,
             .streaming = pending.streaming,
+            .command_placement = pending.command_placement,
         };
         if (search.index == self.notebook.tool_details.items.len) {
             self.notebook.tool_details.appendAssumeCapacity(detail);
@@ -7537,6 +7548,9 @@ pub const TranscriptRuntime = struct {
         var pending: PendingToolDetailTerminal = .{};
         errdefer pending.deinit(alloc);
         if (result) |value| pending.result = try alloc.dupe(u8, value);
+        if (result_memory) |memory| {
+            if (memory.notice) |text| pending.notice = try alloc.dupe(u8, text);
+        }
         const result_handle = if (result_memory) |memory| memory.output_handle else null;
         if (result_handle) |handle| pending.result_handle = try alloc.dupe(u8, handle);
         if (command_artifact_handle) |handle| {
@@ -7552,6 +7566,7 @@ pub const TranscriptRuntime = struct {
         else
             null;
         pending.subagent_started = if (result_memory) |memory| memory.subagent_started else false;
+        pending.command_placement = if (result_memory) |memory| memory.command_placement else null;
         pending.command_output_entry_id = if (activity_kind == .command)
             command_output_entry_id_override orelse
                 self.commandOutputEntryIdForLifecycle(lifecycle_id)
@@ -7591,6 +7606,11 @@ pub const TranscriptRuntime = struct {
             detail.result = owned;
             pending.result = null;
         }
+        if (pending.notice) |owned| {
+            if (detail.notice) |old| alloc.free(old);
+            detail.notice = owned;
+            pending.notice = null;
+        }
         if (pending.result_handle) |owned| {
             if (detail.result_handle) |old| alloc.free(old);
             detail.result_handle = owned;
@@ -7610,6 +7630,7 @@ pub const TranscriptRuntime = struct {
         }
         detail.command_process_presentation = pending.command_process_presentation;
         detail.subagent_started = pending.subagent_started;
+        if (pending.command_placement) |placement| detail.command_placement = placement;
         if (activity_kind == .command) {
             detail.command_output_entry_id = pending.command_output_entry_id;
         }
