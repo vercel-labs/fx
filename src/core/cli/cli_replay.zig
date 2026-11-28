@@ -10,6 +10,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const record_tape = @import("../workspace/record_tape.zig");
+const ui_terminal = @import("../../ui/terminal/terminal.zig");
 const vt_emulator = @import("../terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
@@ -414,7 +415,11 @@ fn replyError(
     message: []const u8,
 ) !u8 {
     if (!json) {
-        output.writeStderr(message) catch {};
+        output.writeStderr(message) catch |err| {
+            if (err == error.TerminalHungUp or err == error.TerminalInputClosed or err == error.OutputReaderGone) {
+                return err;
+            }
+        };
         return 1;
     }
     const rendered = try (output_contracts.CommandFailureSnapshot{
@@ -423,8 +428,18 @@ fn replyError(
         .code = code,
     }).renderJson(alloc);
     defer alloc.free(rendered);
-    output.writeStdout(rendered) catch {};
-    output.writeStdout("\n") catch {};
+    output.writeStdout(rendered) catch |err| {
+        if (err == error.TerminalHungUp or err == error.TerminalInputClosed or err == error.OutputReaderGone) {
+            return err;
+        }
+        return 1;
+    };
+    output.writeStdout("\n") catch |err| {
+        if (err == error.TerminalHungUp or err == error.TerminalInputClosed or err == error.OutputReaderGone) {
+            return err;
+        }
+        return 1;
+    };
     return 1;
 }
 
@@ -454,12 +469,22 @@ fn argsContainJson(args: []const [:0]const u8) bool {
 }
 
 const ProcessOutput = struct {
+    fn classifyWriteError(fd: std.posix.fd_t, err: anyerror) anyerror {
+        if (err == error.BrokenPipe) return error.OutputReaderGone;
+        if (ui_terminal.terminalGone(fd, err)) return error.TerminalHungUp;
+        return err;
+    }
+
     fn writeStdout(_: *@This(), text: []const u8) !void {
-        try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+        std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text) catch |err| {
+            return classifyWriteError(std.posix.STDOUT_FILENO, err);
+        };
     }
 
     fn writeStderr(_: *@This(), text: []const u8) !void {
-        try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+        std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text) catch |err| {
+            return classifyWriteError(std.posix.STDERR_FILENO, err);
+        };
     }
 };
 
@@ -937,4 +962,25 @@ test "run malformed tape returns bad tape stderr" {
     const exit_code = try runCaptured(alloc, &.{tape_arg}, &capture);
     try testing.expectEqual(@as(u8, 1), exit_code);
     try testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx replay: bad tape"));
+}
+
+test "ProcessOutput classifies BrokenPipe and closed-pty EIO while preserving real file errors" {
+    const shell_runtime = @import("../../ui/shell_runtime.zig");
+    try testing.expectEqual(@as(anyerror, error.OutputReaderGone), ProcessOutput.classifyWriteError(-1, error.BrokenPipe));
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(testing.io, "out.txt", .{ .read = true });
+    defer file.close(io_mod.getIo());
+    try testing.expectEqual(@as(anyerror, error.InputOutput), ProcessOutput.classifyWriteError(file.handle, error.InputOutput));
+
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |f| f.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+    master.?.close(io_mod.getIo());
+    master = null;
+    try testing.expectEqual(@as(anyerror, error.TerminalHungUp), ProcessOutput.classifyWriteError(slave.handle, error.InputOutput));
 }

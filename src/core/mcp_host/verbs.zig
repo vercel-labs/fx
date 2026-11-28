@@ -21,6 +21,7 @@ const pending_revocation = @import("../auth/pending_revocation.zig");
 const slack = @import("slack.zig");
 const login_words = @import("login_words.zig");
 const runtime_mod = @import("runtime.zig");
+const mcp = @import("../../mcp/mcp.zig");
 const mcp_call_client = @import("mcp_call_client.zig");
 const Host = @import("host.zig").Host;
 
@@ -638,9 +639,9 @@ pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
             .ready => if (s.tools_error == null)
                 try arena.print("ready, {d} tool{s}", .{ s.tools, if (s.tools == 1) "" else "s" })
             else if (s.tools == 0)
-                "ready, " ++ tool_list_refused
+                try arena.print("ready, {s}", .{faultText(s, .tool_list, .whole)})
             else
-                try arena.print("ready, {d} tool{s}, " ++ newer_list_refused, .{ s.tools, if (s.tools == 1) "" else "s" }),
+                try arena.print("ready, {d} tool{s}, {s}", .{ s.tools, if (s.tools == 1) "" else "s", faultText(s, .newer_list, .whole) }),
             .connecting => "connecting",
             .retrying => "retrying",
             .failed => "failed",
@@ -658,14 +659,49 @@ pub fn runStatusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
     return statusText(arena, running);
 }
 
-/// What a server's status says when fx refused its tool list and has none, and when it refused its newest one
-/// and still serves an older one it accepted.
-const tool_list_refused = "tool list refused";
-const newer_list_refused = "newer list refused";
+/// What a refused tool list is called, by the kind of answer, behind `subject`: "refused", or, for a status that says
+/// the server can't answer now (`mcp.tools.temporary_statuses`), "unavailable (HTTP n)", or in fewer words
+/// "unavailable (n)" and "unavailable". The words of every place that says a list's refusal come from here, spelled
+/// out at compile time.
+fn faultText(s: Status, comptime subject: enum { none, tool_list, newer_list }, comptime form: enum { whole, number, bare }) []const u8 {
+    const lead = switch (subject) {
+        .none => "",
+        .tool_list => "tool list ",
+        .newer_list => "newer list ",
+    };
+    if (s.tools_unavailable == 0) return lead ++ "refused";
+    inline for (mcp.tools.temporary_statuses) |status| {
+        if (s.tools_unavailable == status) return lead ++ switch (form) {
+            .whole => std.fmt.comptimePrint("unavailable (HTTP {d})", .{status}),
+            .number => std.fmt.comptimePrint("unavailable ({d})", .{status}),
+            .bare => "unavailable",
+        };
+    }
+    return lead ++ "unavailable";
+}
 
-/// The same two facts without the rest of the status, for a place too narrow for it.
-pub fn refusedShort(s: Status) []const u8 {
-    return if (s.tools == 0) tool_list_refused else newer_list_refused;
+/// The status of a refused-list row for a place `width` columns wide: all of it, else the longest of the same facts
+/// in fewer words that fits (`tool list refused`, `list refused`, `refused`; `unavailable (HTTP 503)`, `unavailable`),
+/// so a cut never takes the word that says it. The shortest is returned when none fits.
+pub fn statusThatFits(arena: Allocator, s: Status, width: usize) Allocator.Error![]const u8 {
+    const whole = try runStatusText(arena, s);
+    if (s.tools_error == null or whole.len <= width) return whole;
+    var forms: [4][]const u8 = undefined;
+    var n: usize = 0;
+    forms[n] = if (s.tools == 0) faultText(s, .tool_list, .whole) else faultText(s, .newer_list, .whole);
+    n += 1;
+    if (s.tools_unavailable == 0) {
+        forms[n] = "list refused";
+        forms[n + 1] = "refused";
+        n += 2;
+    } else {
+        forms[n] = faultText(s, .none, .whole);
+        forms[n + 1] = faultText(s, .none, .number);
+        forms[n + 2] = faultText(s, .none, .bare);
+        n += 3;
+    }
+    for (forms[0..n]) |form| if (form.len <= width) return form;
+    return forms[n - 1];
 }
 
 /// Why fx left tools out of a server's list, in words: the one reason they share, or that there is more than one.
@@ -686,8 +722,9 @@ pub fn droppedText(arena: Allocator, s: Status) Allocator.Error!?[]const u8 {
 /// an older accepted list is still served, that it is. Nothing for a list fx accepted.
 fn writeListRefusal(w: *Writer, s: Status) !void {
     const why = s.tools_error orelse return;
-    if (s.tools == 0) return w.print("  tool list  refused: {s}\n", .{why});
-    try w.print("  tool list  " ++ newer_list_refused ++ ": {s}. fx still uses the older list of {d} tool{s}.\n", .{ why, s.tools, if (s.tools == 1) "" else "s" });
+    const kind = if (s.tools_unavailable == 0) "refused" else "unavailable";
+    if (s.tools == 0) return w.print("  tool list  {s}: {s}\n", .{ kind, why });
+    try w.print("  tool list  newer list {s}: {s}. fx still uses the older list of {d} tool{s}.\n", .{ kind, why, s.tools, if (s.tools == 1) "" else "s" });
 }
 
 fn statusToken(s: Status) []const u8 {
@@ -1614,6 +1651,52 @@ test "a refused tool list shows in the status, the JSON and a line of show, and 
         \\  tool list  newer list refused: "tools" is not a list. fx still uses the older list of 3 tools.
         \\
     , lines.written());
+}
+
+test "a tool list answered with a temporary status is unavailable, in the status, the show line and every narrower form" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const words = "the server answered the list with HTTP 503, which is temporary";
+    const none: Status = .{ .name = "web", .source = .profile, .transport = .http, .state = .ready, .tools_error = words, .tools_unavailable = 503 };
+    var older = none;
+    older.tools = 3;
+    var refused = none;
+    refused.tools_error = "the server answered the list with HTTP 403";
+    refused.tools_unavailable = 0;
+    var older_refused = refused;
+    older_refused.tools = 3;
+
+    try testing.expectEqualStrings("ready, tool list unavailable (HTTP 503)", try statusText(a, none));
+    try testing.expectEqualStrings("ready, 3 tools, newer list unavailable (HTTP 503)", try statusText(a, older));
+    try testing.expectEqualStrings("ready, tool list refused", try statusText(a, refused));
+    try testing.expectEqualStrings("ready", statusToken(none));
+
+    var lines: Writer.Allocating = .init(a);
+    for ([_]Status{ none, older, refused }) |s| try writeListRefusal(&lines.writer, s);
+    try testing.expectEqualStrings(
+        \\  tool list  unavailable: the server answered the list with HTTP 503, which is temporary
+        \\  tool list  newer list unavailable: the server answered the list with HTTP 503, which is temporary. fx still uses the older list of 3 tools.
+        \\  tool list  refused: the server answered the list with HTTP 403
+        \\
+    , lines.written());
+
+    // The status in a place `width` columns wide: all of it, else the longest fewer words that fit.
+    const cases = [_]struct { s: Status, width: usize, want: []const u8 }{
+        .{ .s = none, .width = 80, .want = "ready, tool list unavailable (HTTP 503)" },
+        .{ .s = none, .width = 38, .want = "tool list unavailable (HTTP 503)" },
+        .{ .s = none, .width = 31, .want = "unavailable (HTTP 503)" },
+        .{ .s = none, .width = 21, .want = "unavailable (503)" },
+        .{ .s = none, .width = 16, .want = "unavailable" },
+        .{ .s = none, .width = 5, .want = "unavailable" },
+        .{ .s = older, .width = 40, .want = "newer list unavailable (HTTP 503)" },
+        .{ .s = refused, .width = 24, .want = "ready, tool list refused" },
+        .{ .s = refused, .width = 23, .want = "tool list refused" },
+        .{ .s = refused, .width = 16, .want = "list refused" },
+        .{ .s = refused, .width = 11, .want = "refused" },
+        .{ .s = older_refused, .width = 20, .want = "newer list refused" },
+    };
+    for (cases) |case| try testing.expectEqualStrings(case.want, try statusThatFits(a, case.s, case.width));
 }
 
 test "a name that only a misspelled key holds gets a line with the key and the fix, and no other name does" {

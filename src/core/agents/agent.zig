@@ -9,6 +9,7 @@ const context_contract = @import("../workspace/context_contract.zig");
 const diff = @import("../output/diff.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
+const wait_card = @import("../agent/wait_card.zig");
 const submission_state = @import("../app/submission_state.zig");
 const session_runtime = @import("../session/session.zig");
 const session_persistence = @import("../app/session_persistence.zig");
@@ -36,6 +37,9 @@ pub const Agent = struct {
     stream: types.StreamState = .{},
     approval_prompt: approval_prompt.ApprovalPrompt = .{},
     question_prompt: question_prompt.QuestionPrompt = .{},
+    /// The card a view shows for a wait only the person can continue, while
+    /// the view holds it; empty on the subagent that waits.
+    wait_card_prompt: wait_card.WaitCardPrompt = .{},
     /// The work id the next prompt queued for this agent carries: main's
     /// message to a subagent, so its saved turn can be found. Set only
     /// while that prompt is queued. Borrowed.
@@ -71,6 +75,11 @@ pub const Agent = struct {
     total_web_search_requests: u64 = 0,
     /// A top-level instance, every one alike, or a subagent.
     role: Role = .instance,
+    /// Names this agent's screen for the app's whole run. Unlike the agent's
+    /// address, which an agent created after this one closes can take, no
+    /// later agent gets it again. 0 for the first instance; the app gives
+    /// every other agent the next number when it creates it.
+    screen_id: u64 = 0,
     /// Whether one of its turns was going when the host last looked, so the
     /// host can tell when one ends. Main loop only.
     was_working: bool = false,

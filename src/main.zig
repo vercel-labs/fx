@@ -3,6 +3,7 @@ const agents = @import("core/agents/agents.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const self_exe = @import("core/shared/self_exe.zig");
 const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
@@ -30,6 +31,7 @@ const js_host_clipboard = @import("core/hosts/js_host_clipboard.zig");
 const credentials = @import("core/auth/credentials.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
+const personal_shortcut_runtime = @import("core/app/personal_shortcut_runtime.zig");
 const usage = @import("usage/usage.zig");
 const usage_host = @import("core/app/usage_host.zig");
 const credits_lookup = @import("core/app/credits_lookup.zig");
@@ -45,6 +47,9 @@ const input_full_transcript_runtime = @import("core/app/input_full_transcript_ru
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
+const sandbox_policy = @import("core/runner/runner.zig");
+const app_trust_runtime = @import("core/app/app_trust_runtime.zig");
+const workspace_trust = @import("core/workspace_trust/workspace_trust.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
 const app_permission_runtime = @import("core/app/app_permission_runtime.zig");
 const app_process_runtime = @import("core/app/app_process_runtime.zig");
@@ -115,6 +120,7 @@ const subagent_tool_host = @import("core/subagent/tool_host.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
+const shell_snapshot = @import("core/terminal/shell_snapshot.zig");
 const command_runner = @import("core/execution/command_runner.zig");
 const command_admission = @import("core/permissions/command_admission.zig");
 const permission_auto_classifier = @import("core/permissions/auto_classifier.zig");
@@ -136,6 +142,7 @@ const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
 const session_log = @import("core/session/session_log.zig");
 const builtin_tools = @import("builtins/tools.zig");
+const shell_projection = @import("builtins/shell_projection.zig");
 const browser_workspace_tools = @import("builtins/browser_workspace_tools.zig");
 const browser_capabilities = @import("core/hosts/browser_capabilities.zig");
 const tool_admission = @import("core/tooling/tool_admission.zig");
@@ -149,11 +156,14 @@ const web_fetch_runtime = @import("core/tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("core/tooling/web_search_runtime.zig");
 const worker_runtime = @import("core/agent/worker_runtime.zig");
 const question_prompt = @import("core/agent/question_prompt.zig");
+const wait_card = @import("core/agent/wait_card.zig");
+const input_completion_runtime = @import("core/app/input_completion_runtime.zig");
 const gateway_client = @import("gateway/client.zig");
 const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const url_opener = @import("core/hosts/url_opener.zig");
 const event_loop = @import("ui/event_loop.zig");
+const loop_timeout = @import("ui/loop_timeout.zig");
 const footer_runtime = @import("ui/footer/runtime.zig");
 const question_ui = @import("ui/footer/question_ui.zig");
 const ui_input = @import("ui/input/runtime.zig");
@@ -165,6 +175,7 @@ const shell_runtime = @import("ui/shell_runtime.zig");
 const ui_terminal = @import("ui/terminal/terminal.zig");
 const cursor_probe = @import("ui/terminal/cursor_probe.zig");
 const ui_program_status = @import("ui/terminal/program_status.zig");
+const ui_program_resume = @import("ui/terminal/program_resume.zig");
 const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
@@ -199,9 +210,6 @@ const ResumeProjection = resume_projection.ResumeProjection;
 const RawEnviron = io_mod.RawEnviron;
 
 const footer_rows: u16 = 4;
-const active_poll_timeout_ms: i32 = 8;
-const focused_ui_worker_poll_timeout_ms: i32 = 1;
-const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
 const default_max_agent_steps: usize = agent_steps.default_max_agent_steps;
@@ -213,32 +221,6 @@ const max_read_file_lines: usize = 400;
 const max_read_file_line_len: usize = 2000;
 const max_command_output_bytes: usize = 64 * 1024;
 const input_escape_timeout_ms: i64 = 30;
-
-/// The first frame counts as focused work: an idle wait before it would only
-/// delay the launch.
-fn nativeLoopPollTimeoutMs(
-    default_timeout_ms: i32,
-    first_frame_pending: bool,
-    auth_refresh_active: bool,
-    skills_refresh_active: bool,
-    transcript_page_work_active: bool,
-    file_listing_hold_pending: bool,
-    pending_input_restore_active: bool,
-    /// A time-bounded drain put events back: run the next iteration without
-    /// waiting for input.
-    next_iteration_due: bool,
-) i32 {
-    if (next_iteration_due) return 0;
-    return if (first_frame_pending or
-        auth_refresh_active or
-        skills_refresh_active or
-        transcript_page_work_active or
-        file_listing_hold_pending or
-        pending_input_restore_active)
-        @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms)
-    else
-        default_timeout_ms;
-}
 
 const max_prompt_history: usize = 100;
 
@@ -422,6 +404,7 @@ fn currentBuild() update_target.CurrentBuild {
         .channel = compiled_update_channel,
         .version = version,
         .revision = build_options.git_commit,
+        .build = build_options.build_number,
     };
 }
 
@@ -566,8 +549,36 @@ const App = struct {
         return ui_render.terminalTitleFor(&self.shell.stdout_file);
     }
 
+    pub fn hasProgramResumeToken() bool {
+        return ui_program_resume.keptToken() != null;
+    }
+
+    pub fn putProgramResumeToken(environ: *std.process.Environ.Map) !bool {
+        return ui_program_resume.putToken(environ);
+    }
+
+    pub fn programResumeToken() ?[]const u8 {
+        return ui_program_resume.keptToken();
+    }
+
+    /// The name the terminal runs to resume: the bare name fx was started with,
+    /// else the path of this binary written into `buffer`.
+    pub fn programResumeExecutable(buffer: []u8) ?[]const u8 {
+        if (ui_program_resume.programName()) |name| return name;
+        var fixed = std.heap.FixedBufferAllocator.init(buffer);
+        return self_exe.pathForPeerReexec(fixed.allocator()) catch null;
+    }
+
     pub fn writeProgramStatus(self: *Self, report: []const u8) void {
         self.shell.writeProgramStatus(&self.metrics, report);
+    }
+
+    pub fn writeProgramResume(self: *Self, report: []const u8) void {
+        self.shell.writeProgramResume(&self.metrics, report);
+    }
+
+    pub fn clearProgramResume(self: *Self) void {
+        SessionAppRuntime.clearProgramResume(self);
     }
 
     alloc: Allocator,
@@ -578,8 +589,12 @@ const App = struct {
         app_oauth_transport,
         app_secret_store,
     ),
+    /// Folder access gate state; `Gate` owns its state and `app_trust_runtime` owns the app glue.
+    trust: workspace_trust.gate.Gate = .{},
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
+    /// Personal keyboard shortcuts from the profile, reloaded at turn ends.
+    personal_shortcuts: personal_shortcut_runtime.State = .{},
     /// Replaced in `init` with the real home directory.
     usage_dashboard: usage.Dashboard = usage.Dashboard.init(std.heap.c_allocator, usage_host.unset),
     /// The `/credits` lookup in flight, if any.
@@ -603,6 +618,7 @@ const App = struct {
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
+    program_resume: ui_program_resume.Reporter = .{},
 
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
@@ -623,6 +639,10 @@ const App = struct {
     /// started, each marked by its role. Owned by
     /// `app_agents_runtime`.
     child_agents: std.ArrayList(*app_agents_runtime.ChildAgent) = .empty,
+    /// The `screen_id` the next agent in `child_agents` gets; 0 is the
+    /// first instance's. Owned by `app_agents_runtime`; main loop only, like
+    /// the writes to `child_agents`.
+    next_screen_id: u64 = 1,
     /// What every instance starts from, and how many startup opens. Owned
     /// by `app_instances_runtime`.
     instances: app_instances_runtime.State = .{},
@@ -637,6 +657,15 @@ const App = struct {
     /// The subagent whose approval main's prompt holds, while main is on
     /// screen. Owned by `app_agents_runtime.zig`.
     approval_lender: ?*app_agents_runtime.ChildAgent = null,
+    /// The subagent whose wait only the person can continue, while a view
+    /// shows it as a card. Owned by `app_agents_runtime.zig`.
+    wait_card_lender: ?*app_agents_runtime.ChildAgent = null,
+    /// The Enter that answers a card is followed by one more, which must not
+    /// submit the draft the card hid. Owned by `app_input_runtime.zig`.
+    wait_card_enter_guard: wait_card.EnterGuard = .{},
+    /// The agent the open model picker changes, while a view opened it for a
+    /// subagent's wait. Owned by `app_agents_runtime.zig`.
+    model_choice_target: ?*agents.Agent = null,
     /// How many subagent prompts have been asked, which orders them for the
     /// instance's screen. Owned by `app_agents_runtime.zig`.
     prompt_order: u64 = 0,
@@ -644,6 +673,10 @@ const App = struct {
     /// `app_agents_runtime`.
     child_handoffs: app_agents_runtime.Handoffs = .{},
     shell: TranscriptRuntime = .{},
+    /// The sandbox policy for shell commands, loaded at startup when
+    /// `experimental.sandbox_execution` is on. Null when it is off, or when the
+    /// load ran out of memory. Destroyed at teardown, after the agents.
+    sandbox_policy: ?*sandbox_policy.Policy = null,
     pacer: assistant_pacer.AssistantPacer = .{},
 
     terminal_client: terminal_client_runtime.Runtime = .{},
@@ -960,13 +993,24 @@ const App = struct {
         AgentsAppRuntime.requestYields(self);
     }
 
+    /// Lets the turns held for an upgrade's restart return.
+    pub fn releaseTurnYields(self: *App) void {
+        AgentsAppRuntime.releaseYields(self);
+    }
+
+    /// Takes back `requestTurnYields` when the upgrade's restart is cancelled.
+    pub fn cancelTurnYields(self: *App) void {
+        AgentsAppRuntime.cancelYields(self);
+    }
+
+    /// Whether a turn runs that the restart has not already held at its step boundary.
+    pub fn anyTurnUnheld(self: *App) bool {
+        return AgentsAppRuntime.anyTurnUnheld(self);
+    }
+
     /// Whether any agent's turn still runs, which an upgrade's restart waits for.
     pub fn anyTurnRunning(self: *App) bool {
         return AgentsAppRuntime.anyTurnRunning(self);
-    }
-
-    pub fn anySubagentWorking(self: *App) bool {
-        return AgentsAppRuntime.anySubagentWorking(self);
     }
 
     pub fn screenSubagentsWorking(self: *App) bool {
@@ -1019,6 +1063,10 @@ const App = struct {
         SessionAppRuntime.requestUpgradeResumeHandoff(agent);
     }
 
+    pub fn cancelResumeHandoffForUpgrade(_: *App, agent: *agents.Agent) void {
+        SessionAppRuntime.cancelUpgradeResumeHandoff(agent);
+    }
+
     pub fn takeUpgradeRelaunchRequest(
         self: *App,
     ) ?auto_upgrade.RelaunchRequest {
@@ -1040,8 +1088,10 @@ const App = struct {
         var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
         // Failed startups (no TTY, too small) never earn a shutdown report.
         const was_interactive = self.terminal.raw_enabled or self.terminal.signal_handler_installed;
-        // Hand the terminal back first; nothing below renders.
-        self.releaseTerminal();
+        // Hand the terminal back first; nothing below renders. Keep close
+        // handlers installed until persistence finishes (`TuiClose.tla` CloseSavesRequest).
+        self.releaseTerminalForProcessExit();
+        defer app_lifecycle.uninstallAbnormalExitHandlers();
         shutdown_trace.mark("terminal_released");
 
         // Exit never waits, not even for a sign-in refresh, which is never cut
@@ -1103,6 +1153,7 @@ const App = struct {
 
         // Waits for an in-flight API key or credential save to land.
         self.auth.deinit(self.alloc);
+        self.trust.deinit(self.alloc);
         shutdown_trace.mark("credentials_saved");
         self.mcp.deinitForProcessExit();
         shutdown_trace.mark("mcp_children_terminated");
@@ -1177,6 +1228,9 @@ const App = struct {
         self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         AgentsAppRuntime.deinitChildren(self);
+        // Every agent and worker that could place a command has ended, so the policy can go.
+        if (self.sandbox_policy) |loaded| loaded.destroy();
+        self.sandbox_policy = null;
         self.instances.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         main_agent.session_title.deinit(self.alloc);
@@ -1205,6 +1259,7 @@ const App = struct {
         self.lifecycle_runtime.deinit();
 
         self.auth.deinit(self.alloc);
+        self.trust.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
@@ -1222,6 +1277,16 @@ const App = struct {
     pub fn releaseTerminal(self: *App) void {
         if (!self.terminal.raw_enabled and !self.terminal.signal_handler_installed) return;
         app_lifecycle.shutdownInteractiveShell(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+            self.terminalTitle(),
+        );
+    }
+
+    pub fn releaseTerminalForProcessExit(self: *App) void {
+        if (!self.terminal.raw_enabled and !self.terminal.signal_handler_installed) return;
+        app_lifecycle.shutdownInteractiveShellForProcessExit(
             &self.terminal,
             &self.shell,
             &self.metrics,
@@ -1325,7 +1390,7 @@ const App = struct {
             const exit_cause = try event_loop.run(
                 self.terminal,
                 &self.should_exit,
-                active_poll_timeout_ms,
+                loop_timeout.active_ms,
                 callbacks,
             );
             switch (exit_cause) {
@@ -1338,18 +1403,65 @@ const App = struct {
     pub fn loopPollTimeoutMs(ctx: *anyopaque, default_timeout_ms: i32) i32 {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (comptime !host_target.is_wasm) {
-            return nativeLoopPollTimeoutMs(
-                default_timeout_ms,
-                self.shell.render_requests.hasReason(.first_frame),
-                self.auth.sourceInventoryRefreshActive(),
-                self.skills.refreshActive(),
-                self.fullTranscriptFocusedWorkActive(),
-                InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
-                self.pendingInputRestoreActive(),
-                self.takeDrainContinuationDue(),
-            );
+            return loop_timeout.timeoutMs(self.loopTimeoutFacts());
         }
-        return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
+        return if (self.pacer.hasPending()) default_timeout_ms else loop_timeout.idle_wasm_ms;
+    }
+
+    fn loopTimeoutFacts(self: *App) loop_timeout.Facts {
+        return .{
+            .next_iteration_due = self.takeDrainContinuationDue(),
+            .first_frame_pending = self.shell.render_requests.hasReason(.first_frame),
+            .auth_refresh_active = self.auth.sourceInventoryRefreshActive(),
+            .skills_refresh_active = self.skills.refreshActive(),
+            .transcript_page_work_active = self.fullTranscriptFocusedWorkActive(),
+            .file_listing_hold_pending = InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
+            .pending_input_restore_active = self.pendingInputRestoreActive(),
+            .render_pending = self.shell.render_requests.hasPending(),
+            .animation_visible = self.shell.render_requests.animation_visible,
+            .pacer_pending = self.pacer.hasPending(),
+            .agent_active = self.anyAgentLoopActive(),
+            .input_pending = self.terminal_input_runtime.hasPendingTerminalInput() or
+                self.terminal_input_runtime.native_clear_probe.active() or
+                InputAppRuntime.terminalPasteActive(self),
+            .gesture_armed = self.anyInputGestureArmed(),
+            .resize_pending = resize_interlock.resizePending() or !shell_runtime.resizeLifecycleIdle(&self.shell),
+            .open_ui_waiting = self.openUiWaitingForBackground(),
+        };
+    }
+
+    fn anyAgentLoopActive(self: *App) bool {
+        if (AgentsAppRuntime.firstOpen(self) and agentLoopActive(&self.main_agent)) return true;
+        for (self.child_agents.items) |child| {
+            if (agentLoopActive(&child.agent)) return true;
+        }
+        return false;
+    }
+
+    fn agentLoopActive(agent: *agents.Agent) bool {
+        return agent.stream.active or agent.worker.isProcessing() or agent.worker.hasPendingEvents();
+    }
+
+    fn anyInputGestureArmed(self: *const App) bool {
+        const gestures = self.input_runtime.gestures;
+        return gestures.ctrlCExitArmed() or
+            gestures.escapeClearArmed() or
+            gestures.escapeInterruptArmed();
+    }
+
+    fn openUiWaitingForBackground(self: *App) bool {
+        const picker = &self.input_runtime.picker.file_completion;
+        const file_listing_in_flight = picker.active and !picker.indexed and picker.directory_request != null;
+        const model_loading = self.model_cache.menu.active and self.model_cache.isLoading();
+        const mcp_loading = self.mcp.host_menu.active and self.mcp.host_menu_tools == .loading;
+        const session_picker = &self.screenAgent().session_persistence.session_picker;
+        const session_loading = session_picker.isLoading() or
+            (session_picker.active and session_picker.loading_more);
+        return self.input_runtime.usage_menu.active or
+            file_listing_in_flight or
+            model_loading or
+            mcp_loading or
+            session_loading;
     }
 
     /// Whether any agent's budgeted drain put events back for the loop's next
@@ -2088,46 +2200,17 @@ const App = struct {
         return browser_workspace_tools.selectToolSet(false, self.workspaceHostInfo() != null);
     }
 
-    pub fn hasMcpTool(self: *App, name: []const u8, access: tool_mcp_runtime.Access) bool {
-        return self.mcp.hasTool(name, access);
-    }
-
-    pub fn validateMcpTool(
-        self: *App,
-        arena: Allocator,
-        name: []const u8,
-        arguments_json: []const u8,
-        access: tool_mcp_runtime.Access,
-    ) !tool_mcp_runtime.ValidationResult {
-        return self.mcp.validateTool(arena, name, arguments_json, access);
-    }
-
-    pub fn callMcpTool(
-        self: *App,
-        arena: Allocator,
-        name: []const u8,
-        arguments_json: []const u8,
-        max_tool_result_bytes: usize,
-        options: tool_mcp_runtime.CallOptions,
-    ) !?tool_mcp_runtime.CallResult {
-        return self.mcp.callTool(arena, name, arguments_json, max_tool_result_bytes, options);
-    }
-
-    pub fn searchMcpTools(self: *App, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !tool_mcp_runtime.SearchResult {
-        return self.mcp.searchTools(arena, request, permission_rules, self.context_limits, access, cancel_flag);
-    }
-
-    pub fn mcpToolSchemaJson(self: *App, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !?tool_mcp_runtime.ToolSchemaResult {
-        return self.mcp.toolSchema(arena, name, permission_rules, self.context_limits, access, cancel_flag);
+    pub fn wireMcp(self: *App, tc: *tool_runtime.Context) void {
+        self.mcp.wire(tc);
     }
 
     pub fn addMcpSlack(self: *App) !void {
         return app_commands.Handlers(App).addSlack(self);
     }
 
-    /// `mode` is the mode of the agent that refreshes the tool: its rules are none in full access.
-    pub fn snapshotMcpDefinition(self: *App, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, mode: types.PermissionMode) !tool_mcp_runtime.DefinitionSnapshot {
-        return self.mcp.snapshotToolDefinition(alloc, name, known, permissions.mcpRules(mode, self.permission_engine.rules), self.context_limits, .unrestricted);
+    /// The refresh of `agent`'s selected tool, under the agent's own mode and MCP view.
+    pub fn snapshotMcpDefinition(self: *App, agent: *agents.Agent, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+        return AgentAppRuntime.snapshotMcpDefinition(self, agent, alloc, name, known, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
@@ -2190,13 +2273,13 @@ const App = struct {
             const roots = try profiles.Roots.init(profile_arena.allocator(), io_mod.homeDir(), workspace_root);
             break :listed try profiles.list(profile_arena.allocator(), roots);
         } else &.{};
-        return tool_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(agent), .{
+        return shell_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(agent), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = subagent_available,
             .subagent_profiles = subagent_profiles,
             .behind_toolbox = self.toolbox_behind.slice(),
-        });
+        }, .{ .runner = self.sandbox_policy != null });
     }
 
     pub fn subagentToolContextForAdmission(
@@ -2213,6 +2296,11 @@ const App = struct {
         cancel: *std.atomic.Value(bool),
     ) subagent_execution.ServiceError!void {
         return AgentAppRuntime.bindSubagentWorker(raw, turn, cancel);
+    }
+
+    pub fn subagentRestarting(raw: ?*anyopaque, child_id: []const u8) bool {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        return AgentsAppRuntime.childRestarting(self, child_id);
     }
 
     pub fn runSubagentChild(
@@ -2350,8 +2438,8 @@ const App = struct {
     }
 
     /// Records an "always" approval from `agent`'s turn on its instance.
-    pub fn allowToolForSession(self: *App, agent: *agents.Agent, tool_name: []const u8, target_path: []const u8) !void {
-        try app_permission_runtime.Runtime(App).allowForSession(self, agent, tool_name, target_path);
+    pub fn allowToolForSession(self: *App, agent: *agents.Agent, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
+        try app_permission_runtime.Runtime(App).allowForSession(self, agent, tool_name, target_path, shell_epoch);
     }
 
     pub fn permissionReviewerProvider(self: *const App) ?permission_auto_classifier.Provider {
@@ -2404,6 +2492,10 @@ const App = struct {
 
     pub fn resolveToolActionDisplayTarget(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall) !?[]const u8 {
         return AgentAppRuntime.resolveToolActionDisplayTarget(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    }
+
+    pub fn resolveCommandPlacement(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall) !?types.CommandPlacement {
+        return AgentAppRuntime.resolveCommandPlacement(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn describeToolActionWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -2767,8 +2859,8 @@ const App = struct {
         return app_process_runtime.Runtime(App).formatToolExecutionError(arena, tool_name, err);
     }
 
-    pub fn appendRuntimeContextMessage(self: *App, agent: *agents.Agent, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
-        try AgentAppRuntime.appendTransientRuntimeContextMessage(self, agent, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    pub fn appendRuntimeContextMessage(self: *App, agent: *agents.Agent, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
+        try AgentAppRuntime.appendTransientRuntimeContextMessage(self, agent, arena, model, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn appendStaticContextMessage(self: *App, agent: *agents.Agent, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -3248,7 +3340,7 @@ const App = struct {
             );
             const replay = replay_byte orelse return;
             const context = try InputAppRuntime.prepareTerminalDecode(self, self.screenAgent()) orelse return;
-            ingress = self.terminal_input_runtime.decodeTerminalByte(replay, context);
+            ingress = self.terminal_input_runtime.decodeReplayedTerminalByte(replay, context);
         }
     }
 
@@ -3609,14 +3701,67 @@ const App = struct {
         self.releaseHeldNotifications();
         AgentsAppRuntime.settleChildRuns(self);
         AgentsAppRuntime.settleLentQuestion(self);
+        AgentsAppRuntime.settleModelChoiceTarget(self);
+        AgentsAppRuntime.settleLentWaitCard(self);
         AgentsAppRuntime.lendPrompt(self);
         HerdrAppRuntime.reconcile(self);
+        SessionAppRuntime.reportProgramResume(self);
     }
 
     /// Gives a subagent's question lent to main's prompt back to it, before
     /// main's own question or session change takes the prompt.
     pub fn returnLentQuestion(self: *App) void {
         _ = AgentsAppRuntime.returnQuestion(self);
+    }
+
+    /// Gives the wait card a view holds back to its subagent, before a menu,
+    /// the alternate screen or another screen takes the footer.
+    pub fn returnLentWaitCard(self: *App) void {
+        _ = AgentsAppRuntime.returnWaitCard(self);
+    }
+
+    /// Whether the view on screen shows a wait card.
+    pub fn waitCardShows(self: *const App) bool {
+        return self.wait_card_lender != null;
+    }
+
+    /// Whether `agent`'s request waits for the person right now, which is when
+    /// a picker's choice for it continues that request.
+    pub fn requestWaitsForUser(self: *App, agent: *agents.Agent) bool {
+        return AgentsAppRuntime.agentRequestWaitsForUser(self, agent);
+    }
+
+    /// Runs the choice the person pressed on the card, in the context of the
+    /// subagent that waits. False when no card shows.
+    pub fn answerWaitCard(self: *App, choice: wait_card.Choice) !bool {
+        return AgentsAppRuntime.answerWaitCard(self, choice);
+    }
+
+    /// Opens the model picker for `agent`, so a subagent's wait changes its
+    /// own model from the view the person is on.
+    pub fn openModelPickerFor(self: *App, agent: *agents.Agent) !void {
+        try input_completion_runtime.CompletionRuntime(App).openModelPickerForAgent(self, agent);
+    }
+
+    /// Tells main that a subagent's question prompt waits for the person, with
+    /// the fixed reason of its source and none of its text.
+    pub fn noteChildQuestionPrompt(self: *App, agent: *agents.Agent, source: worker_runtime.QuestionPromptSource) void {
+        AgentsAppRuntime.noteChildQuestionPrompt(self, agent, source);
+    }
+
+    /// Whether `agent`'s own wait is for a sign-in, hidden or on screen.
+    pub fn agentWaitsForSignIn(self: *App, agent: *agents.Agent) bool {
+        return AgentsAppRuntime.agentWaitsForSignIn(self, agent);
+    }
+
+    /// `agent`'s fast mode, and the setter the model picker uses so a
+    /// subagent's choice never changes the screen's mode.
+    pub fn fastModeOf(self: *App, agent: *const agents.Agent) bool {
+        return AgentsAppRuntime.fastModeOf(self, agent);
+    }
+
+    pub fn setFastModeFor(self: *App, agent: *agents.Agent, enabled: bool) void {
+        AgentsAppRuntime.setFastModeFor(self, agent, enabled);
     }
 
     /// True while main's prompt holds a subagent's question.
@@ -3731,6 +3876,13 @@ const App = struct {
         AgentsAppRuntime.notePromptAsked(self, agent, kind);
     }
 
+    /// The person answered a subagent's request on its own screen, so its
+    /// registry binding goes with it and main's later answer reads that it no
+    /// longer waits.
+    pub fn withdrawAnsweredApproval(self: *App, agent: *agents.Agent) void {
+        AgentsAppRuntime.withdrawAnsweredApproval(self, agent);
+    }
+
     /// Whether `agent` keeps its approval prompt this pass,
     /// because an approval is lent between main and a subagent.
     pub fn keepLentApproval(self: *App, agent: *agents.Agent, pending: ?permission_request.PermissionRequest) bool {
@@ -3744,6 +3896,12 @@ const App = struct {
         return .{ .worker = &child.agent.worker, .id = child.id };
     }
 
+    /// The worker that owns the approval on screen: the subagent's while its
+    /// request is lent to that screen, else the screen agent's own.
+    pub fn approvalWorker(self: *App, agent: *agents.Agent) *WorkerRuntime {
+        return AgentsAppRuntime.approvalWorker(self, agent);
+    }
+
     /// Runs a cancel of the approval on main's screen in the context of the
     /// subagent it came from. False for main's own approval.
     pub fn answerLentApproval(self: *App, agent: *agents.Agent, comptime body: fn (*App, *agents.Agent) anyerror!void) !bool {
@@ -3753,6 +3911,12 @@ const App = struct {
     pub fn subagentDisplayName(self: *App, id: []const u8) []const u8 {
         const child = AgentsAppRuntime.findChild(self, id) orelse return id;
         return child.displayName();
+    }
+
+    /// The view's name for `agent`, for a notice about a subagent's own
+    /// change made from another view.
+    pub fn agentNameOf(self: *App, agent: *const agents.Agent) []const u8 {
+        return AgentsAppRuntime.agentNameOf(self, agent);
     }
 
     /// The footer note for a hidden agent waiting on the user.
@@ -4024,8 +4188,13 @@ pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char)
 }
 
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
+    // Before any mode reads the environment or starts a program, so none inherits the terminal's token.
+    ui_program_resume.takeToken(c_envp);
+    if (c_argc > 0) ui_program_resume.rememberProgramName(c_argv[0]);
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
+    // The built-in remote runner comes first (spec L4): no settings, update check, sessions, MCP or terminal setup.
+    if (isBuiltinRunnerInvocation(raw_args)) runBuiltinRunner(raw_args, raw_env);
     // Before any mode runs, since terminal helpers write under fx's folder too.
     try useFxHomeFromEnv(raw_env);
 
@@ -4174,6 +4343,24 @@ fn writeTopLevelHelpFast(raw_env: RawEnviron) !void {
         style,
     );
     try writeStdoutFast(text);
+}
+
+fn isBuiltinRunnerInvocation(raw_args: []const [*:0]const u8) bool {
+    return raw_args.len >= 2 and std.mem.eql(u8, std.mem.span(raw_args[1]), sandbox_policy.subcommand);
+}
+
+fn runBuiltinRunner(raw_args: []const [*:0]const u8, raw_env: RawEnviron) noreturn {
+    io_mod.setRawEnviron(raw_env);
+    const alloc = processAllocator();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    const words = arena.allocator().alloc([]const u8, raw_args.len) catch exitFast(sandbox_policy.exit_did_not_run);
+    for (raw_args, words) |raw, *word| word.* = std.mem.span(raw);
+    var threaded = std.Io.Threaded.init(alloc, processIoOptions(argsFromRaw(raw_args), environBlockFromRaw(raw_env)));
+    io_mod.setIo(threaded.io());
+    const code = sandbox_policy.runBuiltin(arena.allocator(), words);
+    threaded.deinit();
+    arena.deinit();
+    exitFast(code);
 }
 
 fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_args: []const [:0]const u8) !void {
@@ -4643,19 +4830,6 @@ test "process io connects through a reachable address while fx tasks hold every 
     }
 }
 
-test "focused UI workers retain a bounded native poll timeout" {
-    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, false, true, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, false));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, true));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, true));
-}
-
 test "poll timeout is not 1 ms while only a held restore result waits" {
     const test_session_adapter = @import("core/session/session_adapter.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -4690,6 +4864,35 @@ test "poll timeout is not 1 ms while only a held restore result waits" {
     // The background task finished and is waiting for handoff (`isActive()` is still true).
     try std.testing.expect(app.main_agent.session_persistence.pending_input_restore.isActive());
     try std.testing.expect(!app.pendingInputRestoreActive());
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+}
+
+test "poll timeout stays active 8 ms while theme monitor buffers an escape byte" {
+    var app = App{ .alloc = std.testing.allocator };
+    defer app.lifecycle_runtime.deinit();
+
+    app.terminal_input_runtime.terminal_theme_monitor.start();
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+
+    try std.testing.expectEqual(.pending, app.terminal_input_runtime.terminal_theme_monitor.feed(0x1b, 1_000));
+    try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
+}
+
+test "poll timeout stays active 8 ms while session picker loads" {
+    var app = App{ .alloc = std.testing.allocator };
+    defer app.lifecycle_runtime.deinit();
+
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+
+    const picker = &app.screenAgent().session_persistence.session_picker;
+    picker.active = true;
+    picker.load_state = .loading;
+    try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
+
+    picker.load_state = .ready;
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+
+    picker.loading_more = true;
     try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
 }
 
@@ -4732,6 +4935,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -4769,6 +4973,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -4806,6 +5011,7 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .build_number = build_options.build_number,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
@@ -4845,6 +5051,7 @@ fn runAcpServer(_: ?*anyopaque, alloc: Allocator, cfg: acp_runner.Config) anyerr
 
 fn handleSigWinchNative(_: std.posix.SIG) callconv(.c) void {
     resize_interlock.noteResizeSignal();
+    shell_runtime.notifyResizeWakePipe();
 }
 
 fn handleSigWinchWeb() callconv(.c) void {
@@ -5601,10 +5808,15 @@ test {
     _ = @import("core/mcp_host/login_words.zig");
     _ = @import("core/mcp/tool_lookup.zig");
     _ = @import("core/recovery/recovery.zig");
+    _ = @import("core/workspace_trust/workspace_trust.zig");
+    _ = @import("core/app/app_trust_runtime.zig");
+    _ = @import("core/app/personal_shortcut_runtime.zig");
+    _ = @import("ui/footer/trust_prompt_ui.zig");
     _ = @import("core/quiesce/quiesce.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
+    _ = @import("core/shortcuts/shortcuts.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/function_tools.zig");
     _ = @import("core/shared/json_depth.zig");
@@ -5630,6 +5842,7 @@ test {
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/subagent_turn_metrics.zig");
+    _ = @import("core/workspace/output_limit_metrics.zig");
     _ = @import("core/workspace/workspace_access.zig");
     _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
@@ -5658,6 +5871,8 @@ test {
     _ = @import("core/app/app_upgrade_runtime.zig");
     _ = @import("core/app/app_worker_runtime.zig");
     _ = @import("ui/event_loop.zig");
+    _ = @import("ui/loop_timeout.zig");
+    _ = @import("ui/terminal/theme_detection.zig");
     _ = @import("ui/resize_tests.zig");
     _ = @import("ui/transcript/transcript_window_fuzz.zig");
     _ = @import("ui/transcript/frozen_prefix_tests.zig");
@@ -5690,6 +5905,7 @@ test {
     _ = @import("builtins/gateway.zig");
     _ = @import("builtins/gateway/typesafe_permission_reviewer.zig");
     _ = @import("builtins/hooks.zig");
+    _ = @import("core/shared/child_wait.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/output/full_transcript_metadata.zig");
@@ -5760,6 +5976,7 @@ test {
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/shell_command/safe_git.zig");
     _ = @import("core/execution/router.zig");
+    _ = @import("core/runner/runner.zig");
     _ = @import("core/execution/command_runner.zig");
     _ = @import("core/permissions/direct_command.zig");
     _ = @import("core/permissions/auto_classifier.zig");
@@ -5820,6 +6037,7 @@ test {
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/shared/text_utils.zig");
+    _ = @import("core/shared/wildcard.zig");
     _ = @import("core/shared/testing_listener.zig");
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");
@@ -5830,6 +6048,7 @@ test {
     _ = @import("core/hosts/browser_capabilities.zig");
     _ = @import("core/tooling/tool_args.zig");
     _ = @import("core/tooling/tool_result_errors.zig");
+    _ = @import("core/tooling/shell_result_notice.zig");
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("core/tooling/tool_specs.zig");
     _ = @import("core/tooling/toolbox.zig");
@@ -5949,7 +6168,7 @@ test "the screen's subagents count as working until their host is quiet" {
     try std.testing.expect(!app.screenSubagentsWorking());
 }
 
-test "an upgrade waits for agents that need the user, stops instances between steps, and lets subagents finish" {
+test "an upgrade waits for agents that need the user and stops instances and subagents between steps" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
     defer app.shell.deinit(alloc);
@@ -5972,12 +6191,31 @@ test "an upgrade waits for agents that need the user, stops instances between st
     try std.testing.expect(runtime.anyTurnRunning(&app));
     app.main_agent.worker.worker_processing = false;
     reviewer.agent.worker.worker_processing = true;
-    try std.testing.expect(runtime.anySubagentWorking(&app));
     try std.testing.expect(runtime.needsUserElsewhere(&app, &buf) == null);
     try std.testing.expect(runtime.anyTurnRunning(&app));
     reviewer.agent.worker.worker_processing = false;
-    try std.testing.expect(!runtime.anySubagentWorking(&app));
     try std.testing.expect(!runtime.anyTurnRunning(&app));
+
+    // A turn held at its step boundary for the restart counts as stopped
+    // for the release, and still runs until it returns.
+    app.main_agent.worker.worker_processing = true;
+    second.agent.worker.worker_processing = true;
+    app.main_agent.worker.yield_held = true;
+    try std.testing.expect(runtime.anyTurnUnheld(&app));
+    second.agent.worker.yield_held = true;
+    try std.testing.expect(!runtime.anyTurnUnheld(&app));
+    try std.testing.expect(runtime.anyTurnRunning(&app));
+    // A subagent that runs and is not held yet keeps the release waiting.
+    reviewer.agent.worker.worker_processing = true;
+    try std.testing.expect(runtime.anyTurnUnheld(&app));
+    reviewer.agent.worker.yield_held = true;
+    try std.testing.expect(!runtime.anyTurnUnheld(&app));
+    reviewer.agent.worker.yield_held = false;
+    reviewer.agent.worker.worker_processing = false;
+    app.main_agent.worker.yield_held = false;
+    second.agent.worker.yield_held = false;
+    app.main_agent.worker.worker_processing = false;
+    second.agent.worker.worker_processing = false;
 
     // One that waits for the user does, by name.
     try std.testing.expect(try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
@@ -6000,14 +6238,18 @@ test "an upgrade waits for agents that need the user, stops instances between st
     app.main_agent.approval_prompt.clear(alloc);
     app.agent_on_screen = null;
 
-    // A yield reaches main and the other instances, never a subagent.
+    // A yield reaches main, the other instances, and subagents.
     runtime.requestYields(&app);
     try std.testing.expect(app.main_agent.worker.yield_requested.load(.seq_cst));
     try std.testing.expect(second.agent.worker.yield_requested.load(.seq_cst));
+    try std.testing.expect(reviewer.agent.worker.yield_requested.load(.seq_cst));
+    runtime.cancelYields(&app);
+    try std.testing.expect(!app.main_agent.worker.yield_requested.load(.seq_cst));
+    try std.testing.expect(!second.agent.worker.yield_requested.load(.seq_cst));
     try std.testing.expect(!reviewer.agent.worker.yield_requested.load(.seq_cst));
 }
 
-test "an upgrade refuses for queued work of main or another instance, not of a subagent" {
+test "an upgrade refuses for queued work of main, another instance, or a subagent" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
     defer app.shell.deinit(alloc);
@@ -6022,9 +6264,9 @@ test "an upgrade refuses for queued work of main or another instance, not of a s
     second.agent.role = .instance;
     try std.testing.expect(runtime.queuedWorkElsewhere(&app, &buf) == null);
 
-    // A subagent's queue runs, and the restart waits for it.
+    // A subagent holds its queue while it yields too, so it is named.
     try queueTestPrompt(&reviewer.agent, "subagent work");
-    try std.testing.expect(runtime.queuedWorkElsewhere(&app, &buf) == null);
+    try std.testing.expectEqualStrings("reviewer", runtime.queuedWorkElsewhere(&app, &buf).?);
     reviewer.agent.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
 
     // Another instance holds its queue while it yields, so it is named.
@@ -6043,6 +6285,21 @@ test "an upgrade refuses for queued work of main or another instance, not of a s
     app.main_agent.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
 }
 
+test "a held subagent's queued report does not keep the restart from exiting" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const reviewer = try addTestChildAgent(&app, "reviewer");
+    try queueTestPrompt(&reviewer.agent, "report");
+    try std.testing.expect(!runtime.anyTurnRunning(&app));
+    reviewer.agent.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
+}
+
 /// How many session approvals `agent` has, read as a thread other than the
 /// resolver reads them: a copy taken under the authority lock.
 fn grantCount(app: *App, agent: *agents.Agent) usize {
@@ -6057,6 +6314,28 @@ fn grantAllowed(app: *App, agent: *agents.Agent, tool_name: []const u8, target_p
     const copy = app_permission_runtime.Runtime(App).copyGrants(app, agent, std.testing.allocator) catch return false;
     defer types.freePermissionGrantSlice(std.testing.allocator, copy);
     return permissions.sessionGrantAllowed(copy, tool_name, target_path);
+}
+
+/// The same child, as an instance: a view of its own with its own tree.
+fn addTestInstanceAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent {
+    const child = try addTestChildAgent(app, id);
+    child.agent.role = .instance;
+    return child;
+}
+
+fn testWaitStatus(need: @FieldType(types.RouteRecoveryStatus, "need"), comptime text: []const u8) types.RouteRecoveryStatus {
+    var status: types.RouteRecoveryStatus = .{ .kind = .need_user, .need = need };
+    @memcpy(status.text.bytes[0..text.len], text);
+    status.text.len = text.len;
+    return status;
+}
+
+/// Records `status` as `child`'s live wait: the row the card reads, the turn
+/// the wait belongs to, and the stamp that orders it.
+fn testLiveWait(app: *App, child: *app_agents_runtime.ChildAgent, status: types.RouteRecoveryStatus) void {
+    child.screen.transcript.notebook.worker_status.set_route_recovery(status);
+    child.agent.worker.worker_processing = true;
+    App.AgentsAppRuntime.noteChildWaiting(app, &child.agent, status);
 }
 
 fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent {
@@ -6137,6 +6416,219 @@ test "the per-step refresh of an MCP tool takes the rules of the mode of the age
     // Full access keeps the tool the rule names; ask drops it.
     try std.testing.expect(yolo_refresh == .current);
     try std.testing.expect(ask_refresh == .unavailable);
+}
+
+fn tuiToolContext(app: *App, agent: *agents.Agent) tool_runtime.Context {
+    return App.AgentAppRuntime.toolContext(app, agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+}
+
+/// The context ACP and `fx ask` give a run: `tui`'s, with the MCP operations
+/// of `host`'s catalog (`Catalog.wire`), or none when there is no host.
+fn catalogWiredContext(tui: tool_runtime.Context, mcp: ?*mcp_host.Host) tool_runtime.Context {
+    var ctx = tui;
+    ctx.mcp_ctx = null;
+    ctx.mcp_has_tool = null;
+    ctx.mcp_access_changed = null;
+    ctx.mcp_validate_tool = null;
+    ctx.mcp_call_tool = null;
+    ctx.mcp_search_tools = null;
+    ctx.mcp_tool_schema = null;
+    ctx.mcp_snapshot_tool = null;
+    if (mcp) |h| h.catalog.wire(&ctx);
+    return ctx;
+}
+
+fn expectSameToolbox(tui: tool_runtime.Context, wired: tool_runtime.Context, arena: Allocator, arguments_json: []const u8) ![]const u8 {
+    const call: types.ToolCall = .{ .id = "1", .name = "toolbox", .arguments_json = arguments_json };
+    const from_tui = try tool_runtime.executeToolCall(tui, arena, call);
+    const from_catalog = try tool_runtime.executeToolCall(wired, arena, call);
+    try std.testing.expectEqual(from_catalog.status, from_tui.status);
+    try std.testing.expectEqualStrings(from_catalog.model_output, from_tui.model_output);
+    return from_tui.model_output;
+}
+
+test "one catalog adapter: with no MCP host the TUI's toolbox search says what ACP and fx ask say" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+
+    const tui = tuiToolContext(&app, (&app).screenAgent());
+    const wired = catalogWiredContext(tui, null);
+    const said = try expectSameToolbox(tui, wired, arena_state.allocator(), "{\"search\":\"echo\"}");
+    try std.testing.expect(std.mem.find(u8, said, "\"mcp_state\":\"unavailable\"") != null);
+    // Nothing of MCP is wired, so a shell command gets no `fx mcp call` bridge either.
+    try std.testing.expect(tui.mcp_ctx == null);
+    try std.testing.expect(tui.mcp_call_tool == null);
+}
+
+test "one catalog adapter: a subagent whose MCP view the servers changed under hears why in the TUI too" {
+    const alloc = std.testing.allocator;
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const mcp = try mcp_host.Host.create(alloc, std.testing.io, &configs, &f.inherited, f.options(), .{});
+    defer mcp.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    app.mcp.host = mcp;
+    defer app.mcp.host = null;
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    var child_run = try testChildRun(alloc, &resolver, false, null);
+    var view = try mcp.catalog.snapshotAccessView(alloc, "child-1", "main-session");
+    view.runtime_generation +%= 1;
+    child_run.admission.mcp_view = view;
+    App.AgentsAppRuntime.installChildRun(&app, child, child_run);
+
+    const Check = struct {
+        fn run(live_host: *mcp_host.Host, a: *App, agent: *agents.Agent) anyerror!void {
+            var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_state.deinit();
+            const tui = tuiToolContext(a, agent);
+            const wired = catalogWiredContext(tui, live_host);
+            const said = try expectSameToolbox(tui, wired, arena_state.allocator(), "{\"open\":\"mcp_fake_echo\",\"kind\":\"tool\"}");
+            try std.testing.expect(std.mem.find(u8, said, "is not available to this work") != null);
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, mcp, Check.run);
+}
+
+test "one catalog adapter: a search keeps the limits its caller narrowed in the TUI too" {
+    const alloc = std.testing.allocator;
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+    const lexical_relevance = @import("core/shared/lexical_relevance.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const mcp = try mcp_host.Host.create(alloc, std.testing.io, &configs, &f.inherited, f.options(), .{});
+    defer mcp.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    app.mcp.host = mcp;
+    defer app.mcp.host = null;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tui = tuiToolContext(&app, (&app).screenAgent());
+    const wired = catalogWiredContext(tui, mcp);
+    var narrow = tui.context_limits;
+    narrow.mcp_search_result_bytes.value = .{ .bytes = 100 };
+    const query = try lexical_relevance.prepare("echo");
+    const request: tool_mcp_runtime.SearchRequest = .{ .query = &query, .kind = .mcp };
+    const from_tui = try tui.mcp_search_tools.?(tui.mcp_ctx.?, arena, request, .{}, narrow, .unrestricted, null);
+    const from_catalog = try wired.mcp_search_tools.?(wired.mcp_ctx.?, arena, request, .{}, narrow, .unrestricted, null);
+    try std.testing.expect(std.mem.find(u8, from_catalog.model_output, "context_limit") != null);
+    try std.testing.expectEqualStrings(from_catalog.model_output, from_tui.model_output);
+}
+
+test "one catalog adapter: the per-step refresh of an MCP tool keeps the servers an instance's profile names" {
+    const alloc = std.testing.allocator;
+    const Permission = app_permission_runtime.Runtime(App);
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+    const lexical_relevance = @import("core/shared/lexical_relevance.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const mcp = try mcp_host.Host.create(alloc, std.testing.io, &configs, &f.inherited, f.options(), .{});
+    defer mcp.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer Permission.deinitSessionGrants(&app, &app.main_agent);
+    const instance = try addTestChildAgent(&app, "instance-2");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    instance.agent.role = .instance;
+    Permission.initMode(&app, &instance.agent, .ask);
+    app.mcp.host = mcp;
+    defer app.mcp.host = null;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const query = try lexical_relevance.prepare("echo");
+    const found = try mcp.catalog.searchTools(arena, .{ .query = &query, .kind = .mcp }, .{}, .{}, .unrestricted, null);
+    const binding = found.selected_tools[0].mcp_binding.?;
+
+    // The instance may use only server "other", so the tool of "fake" is gone for it.
+    instance.agent.profile.profile.mcp_servers = &[_][]const u8{"other"};
+    const deps = app_callbacks.Bindings(App).agentRuntimeDeps(&app, &instance.agent);
+    const tui = tuiToolContext(&app, &instance.agent);
+    const wired = catalogWiredContext(tui, mcp);
+    const from_catalog = try tool_runtime.snapshotMcpDefinition(wired, arena, "mcp_fake_echo", binding);
+    const from_tui = try deps.snapshot_mcp_definition.?(deps.ctx, arena, "mcp_fake_echo", binding);
+    try std.testing.expect(from_catalog == .unavailable);
+    try std.testing.expect(from_tui == .unavailable);
+}
+
+test "one catalog adapter: a context asks the host there is when an operation runs, and gives it back" {
+    const alloc = std.testing.allocator;
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+    const lexical_relevance = @import("core/shared/lexical_relevance.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const first_configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const second_configs = [_]mcp_contract.McpServerConfig{.{ .name = "other", .command = f.server }};
+    const first = try mcp_host.Host.create(alloc, std.testing.io, &first_configs, &f.inherited, f.options(), .{});
+    defer first.destroy();
+    const second = try mcp_host.Host.create(alloc, std.testing.io, &second_configs, &f.inherited, f.options(), .{});
+    defer second.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.mcp.host = null;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    app.mcp.host = first;
+    const ctx = tuiToolContext(&app, (&app).screenAgent());
+    try std.testing.expect(ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_fake_echo", .unrestricted));
+
+    // A reload that brought a new host: the context made before it sees the new one.
+    app.mcp.host = second;
+    try std.testing.expect(!ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_fake_echo", .unrestricted));
+    try std.testing.expect(ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_other_echo", .unrestricted));
+
+    // The last server went: the context says MCP is unavailable and breaks nothing.
+    app.mcp.host = null;
+    try std.testing.expect(!ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_other_echo", .unrestricted));
+    try std.testing.expect(try ctx.mcp_call_tool.?(ctx.mcp_ctx.?, arena, "mcp_other_echo", "{}", 4096, .{}) == null);
+    const query = try lexical_relevance.prepare("echo");
+    const found = try ctx.mcp_search_tools.?(ctx.mcp_ctx.?, arena, .{ .query = &query, .kind = .mcp }, .{}, ctx.context_limits, .unrestricted, null);
+    try std.testing.expectEqualStrings(tool_mcp_runtime.unavailable_search_output, found.model_output);
+
+    // Every operation gave its host back.
+    try std.testing.expectEqual(@as(usize, 0), first.leases);
+    try std.testing.expectEqual(@as(usize, 0), second.leases);
 }
 
 test "visiting a child agent puts its context, transcript, and pacer on the screen until it returns" {
@@ -8452,6 +8944,39 @@ test "a subagent's run ends only once the turn carrying its work id is saved" {
     try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);
 }
 
+test "a subagent turn a cut reply failed tells its parent output_limit, and a provider's own error stays first" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    var completion: agents.ChildRunCompletion = .{};
+    var child_run = try testChildRun(alloc, &resolver, false, null);
+    child_run.work_id = try alloc.dupe(u8, "work-1");
+    child_run.completion = &completion;
+    App.AgentsAppRuntime.installChildRun(&app, child, child_run);
+
+    const Check = struct {
+        fn run(_: *agents.ChildRunCompletion, a: *App, agent: *agents.Agent) anyerror!void {
+            // A failure with no reason the parent could use says nothing more.
+            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = 1, .outcome = .failed });
+            try std.testing.expect(agent.child_run.?.failure == null);
+            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = 2, .outcome = .failed, .disposition = .length_limited });
+            try std.testing.expectEqualStrings(
+                "output_limit: the reply was cut off at its output-token limit",
+                agent.child_run.?.failure.?.view(),
+            );
+            agent.child_run.?.failure = types.ModelFailureDiagnostic.init("provider_http_error: HTTP 500");
+            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = 3, .outcome = .failed, .disposition = .length_limited });
+            try std.testing.expectEqualStrings("provider_http_error: HTTP 500", agent.child_run.?.failure.?.view());
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);
+}
+
 test "a turn's end gives a subagent's row and its parent's work one outcome, for every end and hand-off" {
     const alloc = std.testing.allocator;
     var fixture: EndsFixture = undefined;
@@ -8606,13 +9131,13 @@ test "each instance keeps its own permission mode and session approvals" {
     try std.testing.expectEqual(types.PermissionMode.yolo, Permission.livePermissionSnapshot(&app, &second.agent).mode);
 
     // An approval belongs to the instance whose turn asked for it.
-    try Permission.allowForSession(&app, &second.agent, "run_command", "/tmp/workspace::zig build");
+    try Permission.allowForSession(&app, &second.agent, "run_command", "/tmp/workspace::zig build", shell_snapshot.processOwner().approvalEpoch());
     const second_count = grantCount(&app, &second.agent);
     try std.testing.expect(second_count > 0);
     try std.testing.expectEqual(@as(usize, 0), grantCount(&app, &app.main_agent));
 
     // A subagent's still go to the first instance, as before instances.
-    try Permission.allowForSession(&app, &child.agent, "run_command", "/tmp/workspace::zig fmt");
+    try Permission.allowForSession(&app, &child.agent, "run_command", "/tmp/workspace::zig fmt", shell_snapshot.processOwner().approvalEpoch());
     try std.testing.expect(grantCount(&app, &app.main_agent) > 0);
     try std.testing.expect(Permission.grantsLocked(&app, &child.agent).ptr == Permission.grantsLocked(&app, &app.main_agent).ptr);
     try std.testing.expectEqual(second_count, grantCount(&app, &second.agent));
@@ -8661,12 +9186,12 @@ test "a subagent's always approval reaches its instance's list at once, for main
     const arena = arena_state.allocator();
 
     // The grants a file change's approval offers: the workspace tree.
-    const file_grants = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent);
+    const file_grants = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent, shell_snapshot.processOwner().approvalEpoch());
     try std.testing.expect(file_grants.len > 0);
 
     // They are in the list when the call returns, before the event that
     // carries them reaches the main loop.
-    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
+    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path, grant.shell_epoch);
     for ([_]*agents.Agent{ &app.main_agent, &child.agent, &sibling.agent }) |agent| {
         try std.testing.expect(grantAllowed(app, agent, "write_file", "/tmp/workspace/other/file.txt"));
     }
@@ -8674,14 +9199,14 @@ test "a subagent's always approval reaches its instance's list at once, for main
     const stored = grantCount(app, &app.main_agent);
 
     // The same approval again leaves the list as it was.
-    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
+    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path, grant.shell_epoch);
     try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
 
     // A second instance is another session: it keeps its own list, and its
     // subagent's approval stays there.
     try std.testing.expectEqual(@as(usize, 0), grantCount(app, &second.agent));
     try std.testing.expect(!grantAllowed(app, &other.agent, "write_file", "/tmp/workspace/other/file.txt"));
-    try Worker.propagateGrant(app, &other.agent, "skill", "demo");
+    try Worker.propagateGrant(app, &other.agent, "skill", "demo", 0);
     try std.testing.expect(grantAllowed(app, &second.agent, "skill", "demo"));
     try std.testing.expect(!grantAllowed(app, &app.main_agent, "skill", "demo"));
     try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
@@ -8689,10 +9214,10 @@ test "a subagent's always approval reaches its instance's list at once, for main
     // Main's own answer is written at once too, so a subagent that is running
     // reads it at its next call. The main loop's event for the same answer
     // then adds no second row.
-    try Worker.propagateGrant(app, &app.main_agent, "skill", "main-only");
+    try Worker.propagateGrant(app, &app.main_agent, "skill", "main-only", 0);
     try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
     try std.testing.expect(grantAllowed(app, &child.agent, "skill", "main-only"));
-    try Permission.allowForSession(app, &app.main_agent, "skill", "main-only");
+    try Permission.allowForSession(app, &app.main_agent, "skill", "main-only", 0);
     try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
 }
 
@@ -8712,9 +9237,9 @@ test "main's check reads the approvals its instance holds when it checks, and no
 
     // The turn began, or the prompt was queued, before the approval, so its own
     // list has none of it.
-    const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own") }};
+    const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own"), .shell_epoch = 0 }};
     try std.testing.expect(!permissions.sessionGrantAllowed(Merge.mergeLiveGrants(app, &app.main_agent, arena, &own), "skill", "granted"));
-    try Worker.propagateGrant(app, &child.agent, "skill", "granted");
+    try Worker.propagateGrant(app, &child.agent, "skill", "granted", 0);
 
     // Main's check now reads it, and still reads the turn's own approval.
     const main_grants = Merge.mergeLiveGrants(app, &app.main_agent, arena, &own);
@@ -8728,6 +9253,31 @@ test "main's check reads the approvals its instance holds when it checks, and no
     const second_grants = Merge.mergeLiveGrants(app, &second.agent, arena, &own);
     try std.testing.expectEqual(own.len, second_grants.len);
     try std.testing.expect(!permissions.sessionGrantAllowed(second_grants, "skill", "granted"));
+}
+
+test "a subagent's shell grant made after a shell refresh stays live in main's check" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    const Worker = app_worker_runtime.Runtime(App);
+    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const child = try addTestChildAgent(app, "child-1");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Merge = App.AgentAppRuntime;
+
+    const owner = shell_snapshot.processOwner();
+    owner.markDirty(.user_reload);
+    const epoch = owner.approvalEpoch();
+    try std.testing.expectEqual(@as(u64, 1), epoch);
+    try Worker.propagateGrant(app, &child.agent, "bash", "echo x", epoch);
+
+    const own: []const types.PermissionGrant = &.{};
+    const main_grants = Merge.mergeLiveGrants(app, &app.main_agent, arena, own);
+    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "run_command", "echo x"));
 }
 
 test "subagents' workers and main's worker add approvals while main's worker and main's thread read them" {
@@ -8763,7 +9313,7 @@ test "subagents' workers and main's worker add approvals while main's worker and
                     _ = self.torn.fetchAdd(1, .monotonic);
                     return;
                 };
-                Worker.propagateGrant(self.app, child, "skill", target) catch {
+                Worker.propagateGrant(self.app, child, "skill", target, 0) catch {
                     _ = self.torn.fetchAdd(1, .monotonic);
                     return;
                 };
@@ -8791,7 +9341,7 @@ test "subagents' workers and main's worker add approvals while main's worker and
                 _ = arena.reset(.retain_capacity);
                 const ctx = App.AgentAppRuntime.toolContext(self.app, &self.app.main_agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
                 _ = ctx;
-                const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("m-own") }};
+                const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("m-own"), .shell_epoch = 0 }};
                 self.check(App.AgentAppRuntime.mergeLiveGrants(self.app, &self.app.main_agent, arena.allocator(), &own));
             }
         }
@@ -8830,7 +9380,7 @@ test "subagents' workers and main's worker add approvals while main's worker and
     for (0..Race.approvals) |i| {
         var buf: [16]u8 = undefined;
         const target = try std.mem.print(&buf, "m-{d}", .{i});
-        try Permission.allowForSession(app, &app.main_agent, "skill", target);
+        try Permission.allowForSession(app, &app.main_agent, "skill", target, 0);
     }
     first_writer.join();
     second_writer.join();
@@ -9503,4 +10053,1014 @@ test "a theme change leaves hidden agents alone while a scrollback handoff is pe
     App.AgentsAppRuntime.retintHiddenScreens(&app, dark, light);
 
     try std.testing.expect(std.mem.find(u8, child.screen.transcript.notebook.transcript.items, "\x1b[38;2;136;192;208mshown") != null);
+}
+
+test "wait card: a hidden subagent's wait is lent to the view that owns it, and no other tree's view shows it" {
+    const alloc = std.testing.allocator;
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    const instance = try addTestInstanceAgent(&app, "instance-id");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent, &instance.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, writer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // Main's screen owns the subagent, so it shows the wait under its name,
+    // and the card keeps the reason without the keys.
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+    try std.testing.expect(app.main_agent.wait_card_prompt.isActive());
+    try std.testing.expectEqualStrings("writer", app.main_agent.wait_card_prompt.nameText());
+    try std.testing.expectEqualStrings("The provider rejected this request", app.main_agent.wait_card_prompt.reasonText());
+    // The card takes the keys, so the subagent's own prompt stays empty.
+    try std.testing.expect(!writer.agent.question_prompt.isActive());
+
+    // The footer does not name it, and the row does not ask the busy state.
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqual(app_agents_runtime.Busiest.working, App.AgentsAppRuntime.busiest(&app));
+
+    // An instance's view holds its own tree, so the switch gives the card
+    // back and that view shows nothing of it. The footer names it there.
+    try App.AgentsAppRuntime.show(&app, instance);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!instance.agent.wait_card_prompt.isActive());
+    try std.testing.expectEqualStrings("writer needs you", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqual(app_agents_runtime.Busiest.needs_you, App.AgentsAppRuntime.busiest(&app));
+
+    // Back on main's screen the same wait is lent again.
+    try App.AgentsAppRuntime.show(&app, null);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+}
+
+test "wait card: a newer wait, or a wait that ended, returns the copy" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, writer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+
+    // The subagent raises a newer wait before the view lets the old one go.
+    // The copy no longer matches its stamp, so it goes back, and the next
+    // lend shows the newer wait.
+    testLiveWait(&app, writer, testWaitStatus(.content_filter, "Blocked by the content filter \u{b7} press Esc and rephrase"));
+    try std.testing.expectEqual(@as(u64, 2), writer.wait_asked);
+    App.AgentsAppRuntime.settleLentWaitCard(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+    try std.testing.expectEqual(@as(u64, 2), app.main_agent.wait_card_prompt.asked);
+    try std.testing.expectEqualStrings("Blocked by the content filter", app.main_agent.wait_card_prompt.reasonText());
+
+    // The wait ends by itself: the row clears and the card follows it.
+    _ = writer.screen.transcript.notebook.worker_status.clear();
+    App.AgentsAppRuntime.settleLentWaitCard(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+}
+
+test "wait card: the view's own prompt and the alternate screen return the copy" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, writer, testWaitStatus(.sign_in, "Sign-in expired \u{b7} waiting 12s \u{b7} next try in 8s"));
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+
+    // The view gets a question of its own: the card yields the footer first.
+    const options = [_]types.QuestionOption{.{ .label = "Alpha", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Pick one?", .options = &options }};
+    try app.main_agent.question_prompt.syncFrom(alloc, &entries);
+    App.AgentsAppRuntime.settleLentWaitCard(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+    try std.testing.expect(app.main_agent.question_prompt.isActive());
+    // Nothing is lent over the view's own prompt.
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    app.main_agent.question_prompt.discard(alloc, "test");
+
+    // The alternate screen takes the terminal: the card goes back, and
+    // nothing is lent until it closes.
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+    app.terminal.alternate_screen_owner = .full_transcript;
+    defer app.terminal.alternate_screen_owner = .none;
+    App.AgentsAppRuntime.settleLentWaitCard(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+
+    // When it closes, the same wait is lent again with its countdown.
+    app.terminal.alternate_screen_owner = .none;
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+    try std.testing.expectEqualStrings("waiting 12s \u{b7} next try in 8s", app.main_agent.wait_card_prompt.detailText());
+}
+
+test "wait card: a row left by a finished turn never shows, and a live one does" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, writer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+
+    // The turn ends and leaves its row behind: the card goes with the turn,
+    // so a cancelled request never keeps a card in the view.
+    writer.agent.worker.worker_processing = false;
+    App.AgentsAppRuntime.settleLentWaitCard(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+
+    // A turn that waits again is live again, so the card returns.
+    writer.agent.worker.worker_processing = true;
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+}
+
+test "wait card: the view holds only what it was lent, and the footer asks for the rest" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    const reader = try addTestChildAgent(&app, "reader-id");
+    reader.name = try alloc.dupe(u8, "reader");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent, &reader.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, writer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    testLiveWait(&app, reader, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // One item at a time: the older wait is shown, and the other is still
+    // the footer's to name.
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+    try std.testing.expect(App.AgentsAppRuntime.viewShows(&app, writer));
+    try std.testing.expect(!App.AgentsAppRuntime.viewShows(&app, reader));
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("reader needs you", app.hiddenAgentWaitingNote(&buf));
+
+    // A lent approval and a lent question are what the view holds too.
+    _ = App.AgentsAppRuntime.returnWaitCard(&app);
+    try std.testing.expect(!App.AgentsAppRuntime.viewShows(&app, writer));
+    _ = try writer.agent.approval_prompt.syncRequest(alloc, .{ .id = 7, .label = "shell ls", .origin = .{ .subagent = "writer" } });
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.approval_lender == writer);
+    try std.testing.expect(App.AgentsAppRuntime.viewShows(&app, writer));
+    _ = App.AgentsAppRuntime.returnApproval(&app);
+    // The returned approval is live in writer's own prompt again, so it must
+    // go before the question can be the oldest item of the tree.
+    writer.agent.approval_prompt.clear(alloc);
+    const options = [_]types.QuestionOption{.{ .label = "Alpha", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Pick one?", .options = &options }};
+    try reader.agent.question_prompt.syncFrom(alloc, &entries);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.question_lender == reader);
+    try std.testing.expect(App.AgentsAppRuntime.viewShows(&app, reader));
+    _ = App.AgentsAppRuntime.returnQuestion(&app);
+    reader.agent.question_prompt.discard(alloc, "test");
+
+    // Nothing lent means the view holds nothing of either child.
+    try std.testing.expect(!App.AgentsAppRuntime.viewShows(&app, writer));
+    try std.testing.expect(!App.AgentsAppRuntime.viewShows(&app, reader));
+    try std.testing.expect(app.hiddenAgentWaitingNote(&buf).len > 0);
+}
+
+test "wait card: deinit gives the card back before a child's screen is freed" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    testLiveWait(&app, writer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+    try std.testing.expectEqualStrings("writer", app.main_agent.wait_card_prompt.nameText());
+
+    // The view's copy points at the child that is about to be freed, so the
+    // deinit gives it back first.
+    for ([_]*agents.Agent{ &app.main_agent, &writer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    }
+    App.AgentsAppRuntime.deinitChildren(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+    try std.testing.expectEqualStrings("", app.main_agent.wait_card_prompt.nameText());
+}
+
+test "wait card: each choice reaches the subagent that waits" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, writer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+
+    // Retry asks that subagent's worker for another send, and no other.
+    try std.testing.expect(try App.AgentsAppRuntime.answerWaitCard(&app, .retry));
+    try std.testing.expect(writer.agent.worker.recovery_continue_requested.load(.seq_cst));
+    try std.testing.expect(!app.main_agent.worker.recovery_continue_requested.load(.seq_cst));
+    try std.testing.expect(app.wait_card_lender == null);
+    // The answer arms the Enter guard, so the draft the card hid is safe.
+    try std.testing.expect(app.wait_card_enter_guard.armed);
+
+    // Cancel ends that subagent's turn, and nothing of the screen's work.
+    app.wait_card_enter_guard = .{};
+    testLiveWait(&app, writer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+    try std.testing.expect(try App.AgentsAppRuntime.answerWaitCard(&app, .cancel));
+    try std.testing.expect(writer.agent.worker.worker_cancel_requested.load(.seq_cst));
+    try std.testing.expect(!app.main_agent.worker.worker_cancel_requested.load(.seq_cst));
+
+    // Open puts that subagent's own screen on, as its row would.
+    testLiveWait(&app, writer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(try App.AgentsAppRuntime.answerWaitCard(&app, .open_screen));
+    try std.testing.expect(app.agent_on_screen == writer);
+    try App.AgentsAppRuntime.show(&app, null);
+
+    // Stop goes through the close path. This app has no host, so the close is
+    // dropped with a trace; the card is gone either way, and the real close
+    // is what S5 exercises.
+    testLiveWait(&app, writer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(try App.AgentsAppRuntime.answerWaitCard(&app, .stop));
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+}
+
+test "wait card: the Enter after an answer reaches a picker that opened meanwhile" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    const input = @import("core/app/app_input_runtime.zig").Runtime(App);
+
+    // Nothing holds the keys: the Enter beside the card's answer is dropped.
+    app.wait_card_enter_guard.arm();
+    try std.testing.expect(input.dropEnterAfterCardAnswer(&app, &app.main_agent, '\r'));
+    // And only that one: the next Enter is the person's own.
+    try std.testing.expect(!input.dropEnterAfterCardAnswer(&app, &app.main_agent, '\r'));
+
+    // A question prompt opens in between: that Enter is its own, so it goes
+    // through whole, and the guard is spent either way.
+    app.wait_card_enter_guard.arm();
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    try app.main_agent.question_prompt.syncFrom(alloc, &entries);
+    try std.testing.expect(app.main_agent.question_prompt.isActive());
+    try std.testing.expect(!input.dropEnterAfterCardAnswer(&app, &app.main_agent, '\r'));
+    try std.testing.expect(!app.wait_card_enter_guard.armed);
+
+    // With the prompt gone, a fresh answer's Enter is dropped again: the
+    // prompt spent the guard, not the rule.
+    app.main_agent.question_prompt.discard(alloc, "test");
+    app.wait_card_enter_guard.arm();
+    try std.testing.expect(input.dropEnterAfterCardAnswer(&app, &app.main_agent, '\r'));
+}
+
+test "wait card: the sign-in wait is read for the subagent, not the screen" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const signer = try addTestChildAgent(&app, "signer-id");
+    signer.name = try alloc.dupe(u8, "signer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &signer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+
+    // The child waits for a sign-in; the screen waits for nothing.
+    signer.agent.worker.worker_processing = true;
+    signer.screen.transcript.notebook.worker_status.set_route_recovery(.{ .kind = .need_user, .need = .sign_in });
+    try std.testing.expect(App.AgentsAppRuntime.agentWaitsForSignIn(&app, &signer.agent));
+    try std.testing.expect(!App.AgentsAppRuntime.agentWaitsForSignIn(&app, &app.main_agent));
+
+    // And the other way: the screen's sign-in wait is not the child's.
+    _ = signer.screen.transcript.notebook.worker_status.clear();
+    app.shell.worker_status_state().set_route_recovery(.{ .kind = .need_user, .need = .sign_in });
+    defer _ = app.shell.worker_status_state().clear();
+    try std.testing.expect(!App.AgentsAppRuntime.agentWaitsForSignIn(&app, &signer.agent));
+    try std.testing.expect(App.AgentsAppRuntime.agentWaitsForSignIn(&app, &app.main_agent));
+}
+
+test "wait card: a model change from the card targets the subagent and keeps the screen's mode" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, writer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == writer);
+
+    // The picker opens for that subagent, and the composer holds its command.
+    try std.testing.expect(try App.AgentsAppRuntime.answerWaitCard(&app, .change_model));
+    try std.testing.expect(app.model_choice_target == &writer.agent);
+    try std.testing.expect(std.mem.startsWith(u8, app.input_runtime.edit_state.input.items, "/model "));
+
+    // The fast mode belongs to the agent the picker changes: a hidden
+    // subagent's keeps to its slot, and the screen's stays as it was.
+    app.fast_mode = false;
+    writer.screen.fast_mode = true;
+    try std.testing.expect(App.AgentsAppRuntime.fastModeOf(&app, &writer.agent));
+    App.AgentsAppRuntime.setFastModeFor(&app, &writer.agent, false);
+    try std.testing.expect(!writer.screen.fast_mode);
+    try std.testing.expect(!app.fast_mode);
+    App.AgentsAppRuntime.setFastModeFor(&app, &app.main_agent, true);
+    try std.testing.expect(app.fast_mode);
+    try std.testing.expect(!App.AgentsAppRuntime.fastModeOf(&app, &writer.agent));
+}
+
+test "wait card: the picker opened for the subagent's wait keeps the card out of the view" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.quota, "Out of credits \u{b7} press Esc to end this turn"));
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == payer);
+
+    // The picker opens for that subagent: it stands where the card would,
+    // so the card yields the footer and is not lent over it.
+    try app.openModelPickerFor(&payer.agent);
+    try std.testing.expect(app.model_choice_target == &payer.agent);
+    App.AgentsAppRuntime.settleLentWaitCard(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+}
+
+test "wait card: the card comes back with its choices once the picker closes without a choice" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.quota, "Out of credits \u{b7} press Esc to end this turn"));
+    try app.openModelPickerFor(&payer.agent);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+
+    // The picker still holds the composer, so its target stays.
+    App.AgentsAppRuntime.settleModelChoiceTarget(&app);
+    try std.testing.expect(app.model_choice_target == &payer.agent);
+
+    // The person leaves the picker without a choice: Esc dismisses it this
+    // way, and the card returns with the choices its own screen offers.
+    app.input_runtime.picker.dismissInlinePicker(.model);
+    App.AgentsAppRuntime.settleModelChoiceTarget(&app);
+    try std.testing.expect(app.model_choice_target == null);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == payer);
+    try std.testing.expect(app.main_agent.wait_card_prompt.isActive());
+    try std.testing.expectEqualStrings("payer", app.main_agent.wait_card_prompt.nameText());
+}
+
+test "wait card: the Enter after Change model reaches the /model picker the card opened" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const refuser = try addTestChildAgent(&app, "refuser-id");
+    refuser.name = try alloc.dupe(u8, "refuser");
+    defer for ([_]*agents.Agent{ &app.main_agent, &refuser.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, refuser, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // The card's "Change model" opened the picker: the Enter that picks a row
+    // there is the picker's, not the draft's the card hid.
+    try app.openModelPickerFor(&refuser.agent);
+    try std.testing.expect(app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) != null);
+    app.wait_card_enter_guard.arm();
+    const with_picker = App.InputAppRuntime.dropEnterAfterCardAnswer(&app, &app.main_agent, '\r');
+    try std.testing.expectEqual(false, with_picker);
+
+    // With no picker open, the same Enter is the draft's, and stays dropped.
+    try app.input_runtime.textReplacementState().replace(alloc, "keep me");
+    try std.testing.expect(app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) == null);
+    app.wait_card_enter_guard.arm();
+    const without_picker = App.InputAppRuntime.dropEnterAfterCardAnswer(&app, &app.main_agent, '\r');
+    try std.testing.expectEqual(true, without_picker);
+}
+
+test "wait card: a draft survives the Change model picker, through the pick and through a close" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const refuser = try addTestChildAgent(&app, "refuser-id");
+    refuser.name = try alloc.dupe(u8, "refuser");
+    try giveTestPreferences(alloc, refuser, "openai/gpt-5");
+    defer for ([_]*agents.Agent{ &app.main_agent, &refuser.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+        if (agent.session_persistence.session_preferences) |*preferences| preferences.deinit(alloc);
+    };
+    testLiveWait(&app, refuser, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // The person typed a draft, with the cursor partway through it.
+    const draft = "keep my draft";
+    try app.input_runtime.textReplacementState().replace(alloc, draft);
+    app.input_runtime.edit_state.cursor = 5;
+
+    // The card's "Change model": the picker borrows the composer as its query
+    // box. The Enter that picks ends the picker first, then the choice applies
+    // and gives the draft back exactly.
+    try app.openModelPickerFor(&refuser.agent);
+    try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
+    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+    try @import("core/session/session_commands.zig").Commands(App).selectModelFromPicker(
+        &app,
+        &app.main_agent,
+        "openai/gpt-5-mini",
+        .auto,
+        false,
+        false,
+    );
+    try std.testing.expectEqualStrings(draft, app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 5), app.input_runtime.edit_state.cursor);
+
+    // And the same when the person leaves the picker without a choice.
+    try app.openModelPickerFor(&refuser.agent);
+    app.input_runtime.picker.dismissInlinePicker(.model);
+    App.AgentsAppRuntime.settleModelChoiceTarget(&app);
+    try std.testing.expectEqualStrings(draft, app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 5), app.input_runtime.edit_state.cursor);
+}
+
+test "wait card: a closed subagent takes the view's model target with it" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const refuser = try addTestChildAgent(&app, "refuser-id");
+    refuser.name = try alloc.dupe(u8, "refuser");
+    // The close below frees the child, prompts included.
+    defer app.main_agent.approval_prompt.deinit(alloc);
+    defer app.main_agent.question_prompt.deinit(alloc);
+    testLiveWait(&app, refuser, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // The person has a draft, and the card's Change model opened the picker
+    // for the subagent.
+    try app.input_runtime.textReplacementState().replace(alloc, "keep me");
+    app.input_runtime.edit_state.cursor = 4;
+    try app.openModelPickerFor(&refuser.agent);
+    try std.testing.expect(app.model_choice_target == &refuser.agent);
+
+    // The parent closes the subagent while its picker is still open.
+    _ = try App.AgentsAppRuntime.stopSubagentsForSwitch(&app, &app.main_agent);
+
+    // No picker target points at the freed child, and the draft is back.
+    try std.testing.expect(app.model_choice_target == null);
+    try std.testing.expectEqualStrings("keep me", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 4), app.input_runtime.edit_state.cursor);
+}
+
+test "wait card: the picker the out-of-credits answer opens keeps the view's draft" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.quota, "Out of credits \u{b7} press Esc to end this turn"));
+
+    // The person has a draft, and the subagent's out-of-credits answer opens
+    // the picker through its worker's event.
+    try app.input_runtime.textReplacementState().replace(alloc, "keep me");
+    app.input_runtime.edit_state.cursor = 4;
+    var handlers = app_callbacks.Bindings(App).workerEventHandlers(&payer.agent);
+    try handlers.open_model_picker(handlers.ctx);
+    try std.testing.expect(app.model_choice_target == &payer.agent);
+    try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
+
+    // Closing the picker without a choice gives the draft back exactly.
+    app.input_runtime.picker.dismissInlinePicker(.model);
+    App.AgentsAppRuntime.settleModelChoiceTarget(&app);
+    try std.testing.expectEqualStrings("keep me", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 4), app.input_runtime.edit_state.cursor);
+}
+
+test "wait card: the view holds the subagent's item while its picker is open" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.quota, "Out of credits \u{b7} press Esc to end this turn"));
+    try app.openModelPickerFor(&payer.agent);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+
+    // The picker is the view's own: the footer does not ask the person to go
+    // to it, and the row says waiting, exactly as the card would.
+    try std.testing.expect(App.AgentsAppRuntime.viewShows(&app, payer));
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("", app.hiddenAgentWaitingNote(&buf));
+}
+
+test "wait card: the picker the subagent's own answer opened keeps the card back before it shows" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.quota, "Out of credits \u{b7} press Esc to end this turn"));
+
+    // "Switch to another model" queued the picker, and its event waits for
+    // the main loop: the card is not lent in the pass before it opens, so it
+    // never flashes under the picker.
+    try payer.agent.worker.pushEvent(std.heap.c_allocator, .open_model_picker);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+}
+
+test "wait card: a view's picker for one subagent lends no other item" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    const later = try addTestChildAgent(&app, "later-id");
+    later.name = try alloc.dupe(u8, "later");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent, &later.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.quota, "Out of credits \u{b7} press Esc to end this turn"));
+    testLiveWait(&app, later, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // The view's picker for the older item is its one modal: the newer item's
+    // card is not lent beside it (`tests/tla/subagent/ViewWaits.tla`
+    // OneAtATime).
+    try app.openModelPickerFor(&payer.agent);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+}
+
+test "wait card: the view lends the oldest item again once the picker closes" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    const later = try addTestChildAgent(&app, "later-id");
+    later.name = try alloc.dupe(u8, "later");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent, &later.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.quota, "Out of credits \u{b7} press Esc to end this turn"));
+    testLiveWait(&app, later, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // The older item's card is the view's one item.
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == payer);
+
+    // A picker opens for the newer item: the card the view holds goes back,
+    // because the picker is its one modal.
+    try app.openModelPickerFor(&later.agent);
+    App.AgentsAppRuntime.settleLentWaitCard(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+
+    // Closed without a choice: the oldest item is lent again.
+    app.input_runtime.picker.dismissInlinePicker(.model);
+    App.AgentsAppRuntime.settleModelChoiceTarget(&app);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == payer);
+    try std.testing.expectEqualStrings("payer", app.main_agent.wait_card_prompt.nameText());
+}
+
+test "wait card: a finished turn's row shows no card, and the footer names it" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    // The turn ends and leaves the recovery's row behind. The live-wait guard
+    // keeps the card away, and the footer still names the subagent, so the
+    // person is never told nothing.
+    payer.agent.worker.worker_processing = false;
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("payer needs you", app.hiddenAgentWaitingNote(&buf));
+}
+
+test "wait card: the alternate screen holds the card back until it closes" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, writer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(App.AgentsAppRuntime.waitCardFor(&app, &app.main_agent) != null);
+
+    // The full transcript takes the terminal: the card is not drawn over it.
+    app.terminal.alternate_screen_owner = .full_transcript;
+    defer app.terminal.alternate_screen_owner = .none;
+    try std.testing.expect(App.AgentsAppRuntime.waitCardFor(&app, &app.main_agent) == null);
+}
+
+/// Points fx's own files at a temporary `home` for one test, as
+/// `src/core/app/app_session_runtime.zig` does, and keeps sound off.
+const TestHome = struct {
+    alloc: Allocator,
+    map: std.process.Environ.Map,
+
+    fn install(alloc: Allocator, home: []const u8) !*TestHome {
+        const self = try alloc.create(TestHome);
+        errdefer alloc.destroy(self);
+        self.* = .{ .alloc = alloc, .map = std.process.Environ.Map.init(alloc) };
+        errdefer self.map.deinit();
+        try self.map.put("HOME", home);
+        try self.map.put("FX_SOUND", "0");
+        io_mod.setEnvironMap(&self.map);
+        return self;
+    }
+
+    fn deinit(self: *TestHome) void {
+        io_mod.resetEnvironForTest();
+        self.map.deinit();
+        const alloc = self.alloc;
+        alloc.destroy(self);
+    }
+};
+
+/// The person's global settings saved under `home`, or null when nothing
+/// wrote them. Caller owns the text.
+fn readUserSettings(alloc: Allocator, home: []const u8) !?[]u8 {
+    const path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "settings.json" });
+    defer alloc.free(path);
+    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close(io_mod.getIo());
+    return try io_mod.readFileToEnd(alloc, &file, 1 << 20);
+}
+
+/// A subagent that keeps its own preferences, as an attached child does.
+fn giveTestPreferences(alloc: Allocator, child: *app_agents_runtime.ChildAgent, model: []const u8) !void {
+    child.agent.session_persistence.session_preferences = .{
+        .provider = .gateway,
+        .model = try alloc.dupe(u8, model),
+        .effort = .auto,
+        .fast_mode = false,
+    };
+}
+
+test "wait card: a model chosen for a subagent in the view is kept in its session, never the user settings" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    try giveTestPreferences(alloc, payer, "openai/gpt-5");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+        if (agent.session_persistence.session_preferences) |*preferences| preferences.deinit(alloc);
+    };
+
+    // The view picked this model for the subagent that waits.
+    app.model_choice_target = &payer.agent;
+    try @import("core/session/session_commands.zig").Commands(App).selectModelFromPicker(
+        &app,
+        &app.main_agent,
+        "openai/gpt-5-mini",
+        .auto,
+        false,
+        false,
+    );
+
+    // The subagent's own session keeps it, and the person's settings are
+    // never written at all.
+    try std.testing.expectEqualStrings("openai/gpt-5-mini", payer.agent.session_persistence.session_preferences.?.model);
+    const settings = try readUserSettings(alloc, home);
+    defer if (settings) |text| alloc.free(text);
+    try std.testing.expect(settings == null);
+}
+
+test "wait card: a subagent's own model choice on its screen is kept in its session too" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    try giveTestPreferences(alloc, payer, "openai/gpt-5");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+        if (agent.session_persistence.session_preferences) |*preferences| preferences.deinit(alloc);
+    };
+
+    // The subagent is on its own screen and no view's picker targets it, as
+    // after `/model` there: the same commit (`handleModel` reaches
+    // `setResolvedModel`, then `persistPreferenceTargets` for that agent).
+    try std.testing.expect(app.model_choice_target == null);
+    try @import("core/session/session_commands.zig").Commands(App).selectModelFromPicker(
+        &app,
+        &payer.agent,
+        "openai/gpt-5-mini",
+        .auto,
+        false,
+        false,
+    );
+
+    try std.testing.expectEqualStrings("openai/gpt-5-mini", payer.agent.session_persistence.session_preferences.?.model);
+    const settings = try readUserSettings(alloc, home);
+    defer if (settings) |text| alloc.free(text);
+    try std.testing.expect(settings == null);
+}
+
+test "wait card: the screen's own model choice still writes the user settings" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer for ([_]*agents.Agent{&app.main_agent}) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+        if (agent.session_persistence.session_preferences) |*preferences| preferences.deinit(alloc);
+    };
+
+    // Main's own choice, with no subagent involved.
+    try @import("core/session/session_commands.zig").Commands(App).selectModelFromPicker(
+        &app,
+        &app.main_agent,
+        "openai/gpt-5-mini",
+        .auto,
+        false,
+        false,
+    );
+
+    const settings = try readUserSettings(alloc, home);
+    defer if (settings) |text| alloc.free(text);
+    const text = settings orelse return error.UserSettingsMissing;
+    try std.testing.expect(std.mem.find(u8, text, "openai/gpt-5-mini") != null);
+}
+
+test "an approval in one instance does not revive another instance's older bash grant" {
+    const alloc = std.testing.allocator;
+    const Permission = app_permission_runtime.Runtime(App);
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer Permission.deinitSessionGrants(&app, &app.main_agent);
+    const second = try addTestChildAgent(&app, "instance-2");
+    second.agent.role = .instance;
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+
+    try Permission.allowForSession(&app, &second.agent, "run_command", "echo x", shell_snapshot.processOwner().approvalEpoch());
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    try Permission.allowForSession(&app, &app.main_agent, "run_command", "echo x", shell_snapshot.processOwner().approvalEpoch());
+
+    const second_grants = try Permission.copyGrants(&app, &second.agent, alloc);
+    defer types.freePermissionGrantSlice(alloc, second_grants);
+    try std.testing.expect(!permissions.sessionGrantAllowed(second_grants, "run_command", "echo x"));
+
+    const main_grants = try Permission.copyGrants(&app, &app.main_agent, alloc);
+    defer types.freePermissionGrantSlice(alloc, main_grants);
+    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "run_command", "echo x"));
 }

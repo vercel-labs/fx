@@ -14,10 +14,12 @@
 //! and the `stop` flag end it the same way, and the engine's deinit stops
 //! every server it still runs.
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mcp = @import("../../mcp/mcp.zig");
 const core = @import("owner_core.zig");
+const owner_test_controls = @import("owner_test_controls.zig");
 const wire = @import("owner_wire.zig");
 const idle_control = @import("idle_control.zig");
 
@@ -74,7 +76,7 @@ pub fn run(alloc: Allocator, fx_home: []const u8, client_version: []const u8) !v
     _ = std.c.chdir("/");
     installSignals();
     var stop = std.atomic.Value(bool).init(false);
-    serve(io_mod.getIo(), alloc, fx_home, &stop, client_version) catch |err| switch (err) {
+    serveInternal(io_mod.getIo(), alloc, fx_home, &stop, client_version, true) catch |err| switch (err) {
         // Another owner is alive, or still exiting and holding the lock.
         error.LockBusy => return,
         else => return err,
@@ -754,9 +756,79 @@ fn forgetConfig(owner: *Owner, key: core.Key) void {
     stored.deinit(owner.gpa);
 }
 
+const ready_byte = [_]u8{1};
+
+/// Writes one ready byte to `fd` only when `fd` is a FIFO, then points `fd`
+/// at `/dev/null` so the client's pipe closes cleanly.
+fn signalReadyOnFd(io: std.Io, fd: std.posix.fd_t) void {
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(io) catch |err| {
+        debug_trace.logf("mcp-owner", "event=owner_ready_skipped reason=stat err={s}", .{@errorName(err)});
+        return;
+    };
+    if (stat.kind != .named_pipe) return;
+    // Ignore SIGPIPE only around this single ready write, before any server
+    // thread or child starts, so an abandoned read end yields EPIPE without
+    // letting MCP server subprocesses inherit SIG_IGN across exec.
+    var saved_pipe: std.posix.Sigaction = undefined;
+    const ignore_pipe: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.PIPE, &ignore_pipe, &saved_pipe);
+    {
+        defer std.posix.sigaction(std.posix.SIG.PIPE, &saved_pipe, null);
+        while (true) {
+            const rc = std.c.write(fd, &ready_byte, 1);
+            if (rc == 1) break;
+            const err = std.c.errno(rc);
+            if (rc < 0 and err == .INTR) continue;
+            if (rc < 0 and err == .PIPE) {
+                debug_trace.logf("mcp-owner", "event=owner_ready_dropped reason=reader gone", .{});
+            } else {
+                debug_trace.logf(
+                    "mcp-owner",
+                    "event=owner_ready_signal_failed reason=write errno={d}",
+                    .{if (rc < 0) @backingInt(err) else 0},
+                );
+            }
+            break;
+        }
+    }
+    const dev_null = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+    if (dev_null < 0) {
+        debug_trace.logf("mcp-owner", "event=owner_stdout_redirect_failed reason=open errno={d}", .{@backingInt(std.c.errno(dev_null))});
+        return;
+    }
+    defer if (dev_null != fd) {
+        _ = std.c.close(dev_null);
+    };
+    if (dev_null != fd) {
+        while (true) {
+            const rc = std.c.dup2(dev_null, fd);
+            if (rc >= 0) break;
+            if (std.c.errno(rc) == .INTR) continue;
+            debug_trace.logf("mcp-owner", "event=owner_stdout_redirect_failed reason=dup2 errno={d}", .{@backingInt(std.c.errno(rc))});
+            return;
+        }
+    }
+}
+
 /// Serves until the last client has been gone for `exit_grace_ms` or `stop`
 /// is set. `error.LockBusy` means another owner holds the lock.
 pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.Value(bool), client_version: []const u8) !void {
+    return serveInternal(io, gpa, fx_home, stop, client_version, false);
+}
+
+fn serveInternal(
+    io: std.Io,
+    gpa: Allocator,
+    fx_home: []const u8,
+    stop: *std.atomic.Value(bool),
+    client_version: []const u8,
+    signal_stdout: bool,
+) !void {
     const run_dir = try std.Io.Dir.path.join(gpa, &.{ fx_home, run_dir_name });
     defer gpa.free(run_dir);
     std.Io.Dir.cwd().createDir(io, run_dir, .fromMode(0o700)) catch |err| switch (err) {
@@ -785,6 +857,10 @@ pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.
     std.Io.Dir.cwd().setFilePermissions(io, socket_path, .fromMode(0o600), .{ .follow_symlinks = false }) catch |err| {
         debug_trace.logf("mcp-owner", "owner socket not private reason=set mode err={s}", .{@errorName(err)});
     };
+    if (comptime builtin.is_test) {
+        if (owner_test_controls.on_listening_hook) |hook| hook(io);
+    }
+    if (signal_stdout) signalReadyOnFd(io, std.posix.STDOUT_FILENO);
 
     var owner: Owner = .{ .io = io, .gpa = gpa, .stop = stop, .client_version = client_version };
     owner.last_open_ms = owner.now();
@@ -2420,4 +2496,184 @@ test "a failing server's status reaches a client before the phase frame that end
         }
     }
     return error.NoFailedPhaseFrame;
+}
+
+test "a spawned owner writes the ready byte when stdout is a FIFO, then points stdout at /dev/null" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    const exe = try @import("../shared/self_exe.zig").pathForPeerReexec(alloc);
+    defer alloc.free(exe);
+
+    var argv = [_][]const u8{ exe, mode, home };
+    const child = try std.process.spawn(testing.io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    defer {
+        if (child.id) |pid| {
+            _ = std.c.kill(@intCast(pid), std.posix.SIG.TERM);
+            _ = std.c.waitpid(@intCast(pid), null, 0);
+        }
+    }
+    const out = child.stdout orelse return error.MissingStdoutPipe;
+    defer out.close(testing.io);
+
+    // The owner writes 1 ready byte while still serving, then redirects stdout
+    // to /dev/null so the pipe sees EOF immediately after that byte.
+    var fds = [_]std.posix.pollfd{.{ .fd = out.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = try std.posix.poll(&fds, 1_500);
+    try testing.expect(ready > 0);
+    var byte: [1]u8 = undefined;
+    try testing.expectEqual(@as(isize, 1), std.c.read(out.handle, &byte, 1));
+    var eof_fds = [_]std.posix.pollfd{.{ .fd = out.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    try testing.expect((try std.posix.poll(&eof_fds, 500)) > 0);
+    try testing.expectEqual(@as(isize, 0), std.c.read(out.handle, &byte, 1));
+}
+
+test "signalReadyOnFd skips a regular file and redirects a FIFO to /dev/null" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const regular = try tmp.dir.createFile(testing.io, "regular.txt", .{ .read = true });
+    defer regular.close(testing.io);
+    signalReadyOnFd(testing.io, regular.handle);
+    const written = try tmp.dir.readFileAlloc(testing.io, "regular.txt", alloc, .limited(64));
+    defer alloc.free(written);
+    try testing.expectEqual(@as(usize, 0), written.len);
+
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    signalReadyOnFd(testing.io, fds[1]);
+
+    var byte: [1]u8 = undefined;
+    try testing.expectEqual(@as(isize, 1), std.c.read(fds[0], &byte, 1));
+    try testing.expectEqual(@as(isize, 0), std.c.read(fds[0], &byte, 1));
+    const redirected: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    const stat = try redirected.stat(testing.io);
+    try testing.expect(stat.kind != .named_pipe);
+}
+
+test "signalReadyOnFd restores SIGPIPE disposition and returns cleanly when the pipe reader already closed" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(tmp_path);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ tmp_path, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "mcp-owner");
+    defer debug_trace.resetForTest();
+    defer debug_trace.shutdown();
+
+    var before: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.PIPE, null, &before);
+
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    signalReadyOnFd(testing.io, fds[1]);
+
+    var after: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.PIPE, null, &after);
+    try testing.expectEqual(before.handler.handler, after.handler.handler);
+
+    const redirected: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    const stat = try redirected.stat(testing.io);
+    try testing.expect(stat.kind != .named_pipe);
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(testing.io, trace_path, .{});
+    defer trace_file.close(testing.io);
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 16 * 1024);
+    defer alloc.free(trace);
+    try testing.expect(std.mem.find(u8, trace, "event=owner_ready_dropped reason=reader gone") != null);
+}
+
+test "a server process spawned by the owner starts with the default SIGPIPE disposition" {
+    if (comptime @import("builtin").target.os.tag != .linux) return;
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    const sig_path = try std.Io.Dir.path.join(alloc, &.{ home, "sigign.txt" });
+    defer alloc.free(sig_path);
+
+    const exe = try @import("../shared/self_exe.zig").pathForPeerReexec(alloc);
+    defer alloc.free(exe);
+    var argv = [_][]const u8{ exe, mode, home };
+    const child = try std.process.spawn(testing.io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    defer {
+        if (child.id) |pid| {
+            _ = std.c.kill(@intCast(pid), std.posix.SIG.TERM);
+            _ = std.c.waitpid(@intCast(pid), null, 0);
+        }
+    }
+    const out = child.stdout orelse return error.MissingStdoutPipe;
+    defer out.close(testing.io);
+
+    var fds = [_]std.posix.pollfd{.{ .fd = out.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    try testing.expect((try std.posix.poll(&fds, 2_000)) > 0);
+    var byte: [1]u8 = undefined;
+    try testing.expectEqual(@as(isize, 1), std.c.read(out.handle, &byte, 1));
+
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    var client = try TestClient.connect(path);
+    defer client.close();
+    try client.send(.{ .hello = .{ .pid = 1 } });
+    try client.send(.{
+        .register = .{
+            .key = test_key,
+            .config = .{
+                .argv = &.{ "sh", "-c", "grep '^SigIgn:' /proc/self/status > \"$1\"; exit 7", "sh", sig_path },
+                .timeouts = .{ .start_ms = 15_000 },
+            },
+            .ask_form = false,
+            .ask_url = false,
+        },
+    });
+    try client.send(.{ .need = .{ .key = test_key } });
+
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 10_000;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        const message = client.receive(arena.allocator(), 500) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        switch (message) {
+            .owner => |owner_msg| switch (owner_msg) {
+                .phase => |phase| {
+                    if (phase.phase == .backoff or phase.phase == .failed) break;
+                },
+                else => {},
+            },
+            .client => {},
+        }
+    }
+
+    var sig_file = try std.Io.Dir.openFileAbsolute(testing.io, sig_path, .{});
+    defer sig_file.close(testing.io);
+    const sig_text = try io_mod.readFileToEnd(alloc, &sig_file, 1024);
+    defer alloc.free(sig_text);
+    const trimmed = std.mem.trim(u8, sig_text, " \t\r\n");
+    const colon = std.mem.findScalar(u8, trimmed, ':') orelse return error.MissingSigIgnField;
+    const hex = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
+    const mask = try std.fmt.parseInt(u64, hex, 16);
+    // SIGPIPE is signal 13 (bit 12 in Linux /proc/<pid>/status SigIgn).
+    try testing.expectEqual(@as(u64, 0), mask & (@as(u64, 1) << (13 - 1)));
 }

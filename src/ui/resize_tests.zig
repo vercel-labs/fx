@@ -5,6 +5,7 @@ const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 
 const question_prompt = @import("../core/agent/question_prompt.zig");
+const wait_card = @import("../core/agent/wait_card.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const diff_mod = @import("../core/output/diff.zig");
@@ -76,6 +77,7 @@ pub const Harness = struct {
     shell: TranscriptRuntime,
     metrics: Metrics = .{},
     frame_redraw: bool = false,
+    footer_surface_opening: bool = false,
     last_frame: TestFrameObservation = .{},
 
     pub fn init(alloc: Allocator, cols: u16, rows: u16, footer_rows: u16) !Harness {
@@ -475,6 +477,8 @@ fn solveTestFrame(
     replay_displaced_footer_history: bool,
     attempt_invalidations: render_engine.paint_plan.FrameInvalidationSet,
 ) !render_engine.frame_fixed_point.FramePlan {
+    const footer_surface_opening = h.footer_surface_opening;
+    h.footer_surface_opening = false;
     var ctx = TestFrameSolveContext{
         .h = h,
         .source = source,
@@ -486,7 +490,8 @@ fn solveTestFrame(
         .replay_displaced_footer_history = replay_displaced_footer_history,
         .attempt_invalidations = attempt_invalidations,
     };
-    return render_engine.frame_fixed_point.solve(
+    return h.shell.solveFrameWithFooterCloseReset(
+        &h.metrics,
         TestFrameSolveContext,
         &ctx,
         .{
@@ -499,6 +504,8 @@ fn solveTestFrame(
         },
         TestFrameSolveContext.prepareCandidate,
         TestFrameSolveContext.resolveCandidate,
+        footer_surface_opening,
+        prepared,
     );
 }
 
@@ -1354,7 +1361,8 @@ fn expectActiveInputSurvivesResize(
 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
-    try expectGridContains(&h, "test-mod");
+    // "test-model" is two columns wider than the row, so its cut ends in "…".
+    try expectGridContains(&h, "test-mo…");
 }
 
 test "active hard-newline footer survives every valid tiny height" {
@@ -4283,11 +4291,18 @@ test "settled cancel projection keeps the retained transcript aligned with the f
         "cancelled\n",
         .question_resolution,
     );
+    const close_offset = try h.file.length(io_mod.getIo());
     input.picker.dismissInlinePicker(.slash);
     input.inputResetState().clearCurrent(h.alloc);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
+
+    const close_bytes = try readEmittedSince(&h, close_offset);
+    defer h.alloc.free(close_bytes);
+    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") != null);
+    try expectFooterBottomRow(&h, 37);
+    try expectGridRowCount(&h, "cancelled", 1);
 
     const cancel_row = try findRowContaining(&h, "cancelled");
     const initial_footer_row = try findFirstDividerRowAfter(&h, cancel_row);
@@ -4298,7 +4313,7 @@ test "settled cancel projection keeps the retained transcript aligned with the f
     try h.flush();
 
     const settled_footer_row = try findFirstDividerRowAfter(&h, cancel_row);
-    try std.testing.expectEqual(TestBodyDisposition.retain, h.last_frame.body_disposition);
+    try std.testing.expectEqual(TestBodyDisposition.paint, h.last_frame.body_disposition);
     try std.testing.expectEqual(initial_footer_row, settled_footer_row);
     try expectExactlyOneBlankRowBetween(&h, cancel_row, settled_footer_row);
 }
@@ -4404,6 +4419,85 @@ test "question modal replays displaced transcript rows into history" {
     );
     try expectGridContains(&h, "question context 24");
     try expectGridContains(&h, "How should the inspection proceed?");
+}
+
+/// The wait a subagent's failed request leaves, as the view's card copies it.
+fn testWaitCardStatus(need: @FieldType(types.RouteRecoveryStatus, "need"), comptime text: []const u8) types.RouteRecoveryStatus {
+    var status: types.RouteRecoveryStatus = .{ .kind = .need_user, .need = need };
+    @memcpy(status.text.bytes[0..text.len], text);
+    status.text.len = text.len;
+    return status;
+}
+
+// A card lent while main's turn is still writing takes the footer block the
+// question panel takes, and main's next report rows must not push it out of
+// the pane: the person answers it from the view they are on.
+test "a lent wait card stays in the visible pane while main's turn streams" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 120, 40, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    var card: wait_card.WaitCardPrompt = .{};
+
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    var ctx = defaultFooterContext(&input);
+    ctx.stream = .{ .active = true, .turn_started_ms = 1 };
+
+    // Main's turn has filled the pane with its report.
+    _ = try h.shell.streamAssistantChunk(
+        alloc,
+        &h.metrics,
+        "report context 01\nreport context 02\nreport context 03\n" ++
+            "report context 04\nreport context 05\nreport context 06\n" ++
+            "report context 07\nreport context 08\nreport context 09\n" ++
+            "report context 10\nreport context 11\nreport context 12\n" ++
+            "report context 13\nreport context 14\nreport context 15\n" ++
+            "report context 16\nreport context 17\nreport context 18\n" ++
+            "report context 19\nreport context 20\nreport context 21\n" ++
+            "report context 22\nreport context 23\nreport context 24\n" ++
+            "report context 25\nreport context 26\nreport context 27\n" ++
+            "report context 28\nreport context 29\nreport context 30\n",
+    );
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+
+    // ship's request was rejected, so the card is lent mid-turn.
+    _ = card.sync(
+        1,
+        testWaitCardStatus(.rejected, "The provider rejected this request \u{b7} press Esc"),
+        "ship",
+    );
+    ctx.wait_card = &card;
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+    try expectGridContains(&h, "Open ship's screen");
+
+    // Main's turn keeps taking in its reports under the card.
+    _ = try h.shell.streamAssistantChunk(
+        alloc,
+        &h.metrics,
+        "report noted 1\nship failure noted\ncards done\nreport tail 04\n" ++
+            "report tail 05\nreport tail 06\nreport tail 07\n" ++
+            "report tail 08\nreport tail 09\nreport tail 10\n" ++
+            "report tail 11\nreport tail 12\n",
+    );
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+
+    try expectGridContains(&h, "The provider rejected this request");
+    try expectGridContains(&h, "Open ship's screen");
+    try expectGridContains(&h, "\u{2191}\u{2193} choose");
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
 }
 
 test "resized question cancellation keeps the footer in place through a repaint and the first edit" {
@@ -4596,23 +4690,28 @@ fn checkQuestionCancelKeepsTranscriptInPlace(resize: QuestionCancelResize) !void
         "\x1b[2m▪ Cancelled\x1b[0m\n",
         .question_resolution,
     );
+    const close_offset = try h.file.length(io_mod.getIo());
     question.discard(alloc, "test_cleanup");
     ctx.question = null;
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
+    const close_bytes = try readEmittedSince(&h, close_offset);
+    defer alloc.free(close_bytes);
+    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") != null);
+
     const expected_screen =
-        "LATER_03\nLATER_04\nLATER_05\nLATER_06\nLATER_07\nLATER_08\nLATER_09\n" ++
-        "LATER_10\nLATER_11\nLATER_12\nLATER_13\nLATER_14\nLATER_15\nLATER_16\n" ++
-        "LATER_17\nLATER_18\nLATER_19\nLATER_20\n" ++
+        "EARLY_18\nEARLY_19\nEARLY_20\n\n" ++
+        "LATER_01\nLATER_02\nLATER_03\nLATER_04\nLATER_05\nLATER_06\nLATER_07\n" ++
+        "LATER_08\nLATER_09\nLATER_10\nLATER_11\nLATER_12\nLATER_13\nLATER_14\n" ++
+        "LATER_15\nLATER_16\nLATER_17\nLATER_18\nLATER_19\nLATER_20\n" ++
         "\n" ++
         "▪ Cancelled\n" ++
         "\n" ++
         "┃\n" ++
         "\n" ++
-        "ask · test-model\n" ++
-        "\n\n\n\n\n\n";
+        "ask · test-model\n";
     const cancelled_screen = try captureTrimmedGrid(&h, alloc);
     defer alloc.free(cancelled_screen);
     try std.testing.expectEqualStrings(expected_screen, cancelled_screen);
@@ -4638,9 +4737,9 @@ fn checkQuestionCancelKeepsTranscriptInPlace(resize: QuestionCancelResize) !void
     try h.flush();
 
     try std.testing.expectEqual(footer_after_cancel, h.shell.committed_frame_layout.footer_area);
-    try std.testing.expectEqual(@as(u16, 1), try findRowContaining(&h, "LATER_03"));
-    try std.testing.expectEqual(@as(u16, 20), try findRowContaining(&h, "▪ Cancelled"));
-    try std.testing.expectEqual(@as(u16, 22), try findRowContaining(&h, "┃ x"));
+    try std.testing.expectEqual(@as(u16, 7), try findRowContaining(&h, "LATER_03"));
+    try std.testing.expectEqual(@as(u16, 26), try findRowContaining(&h, "▪ Cancelled"));
+    try std.testing.expectEqual(@as(u16, 28), try findRowContaining(&h, "┃ x"));
 }
 
 test "question cancellation keeps the transcript in place through a repaint" {
@@ -6800,6 +6899,188 @@ test "slash picker dismissal releases reserved picker rows" {
     try std.testing.expectEqual(@as(u16, 16), tall.shell.committed_frame_layout.footer_area.top);
 }
 
+fn dumpGridRows(h: *Harness) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    var r: u16 = 1;
+    while (r <= h.vt.rows) : (r += 1) {
+        buf.clearRetainingCapacity();
+        try h.vt.rowTextTrimmed(r, &buf);
+        std.debug.print("row {d}: '{s}'\n", .{ r, buf.items });
+    }
+}
+
+fn expectGridRowCount(h: *Harness, needle: []const u8, expected: usize) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    var count: usize = 0;
+    var r: u16 = 1;
+    while (r <= h.vt.rows) : (r += 1) {
+        buf.clearRetainingCapacity();
+        try h.vt.rowText(r, &buf);
+        count += @intFromBool(std.mem.find(u8, buf.items, needle) != null);
+    }
+    if (count == expected) return;
+    std.debug.print("expected {d} grid rows containing '{s}', found {d}\n", .{ expected, needle, count });
+    try dumpGridRows(h);
+    return error.TestUnexpectedGridRowCount;
+}
+
+fn expectFooterBottomRow(h: *Harness, bottom_row: u16) !void {
+    const bottom = h.shell.committed_frame_layout.footer_area.bottom;
+    if (bottom == bottom_row) return;
+    std.debug.print("expected footer bottom row {d}, found {d}\n", .{ bottom_row, bottom });
+    try dumpGridRows(h);
+    return error.TestUnexpectedFooterBottom;
+}
+
+test "a footer surface closed after transcript growth leaves the composer on the bottom row" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 100, 20, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(
+        alloc,
+        &h.metrics,
+        "line 01\nline 02\nline 03\nline 04\nline 05\nline 06\nline 07\nline 08\n" ++
+            "line 09\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\n",
+        true,
+    );
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try input.edit_state.input.appendSlice(alloc, "/");
+    input.edit_state.cursor = input.edit_state.input.items.len;
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try h.shell.writeTranscript(
+        alloc,
+        &h.metrics,
+        "line 16\nline 17\nline 18\nline 19\nline 20\nline 21\nline 22\nline 23\nline 24\n",
+        true,
+    );
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const close_offset = try h.file.length(io_mod.getIo());
+    try std.testing.expect(input.deletionState(null).delete(alloc, .character_left, .clear));
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const close_bytes = try readEmittedSince(&h, close_offset);
+    defer alloc.free(close_bytes);
+    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") != null);
+    try expectFooterBottomRow(&h, 20);
+    const footer_top = h.shell.committed_frame_layout.footer_area.top;
+    try std.testing.expectEqual(h.shell.last_visible_transcript_last_row + 1, footer_top);
+    try expectRowPrefix(&h, footer_top - 1, "line 24");
+    for ([_][]const u8{ "line 17", "line 18", "line 19", "line 20", "line 21", "line 22", "line 23", "line 24" }) |needle| {
+        try expectGridRowCount(&h, needle, 1);
+    }
+}
+
+test "a slash picker replaced by a smaller footer surface writes no scrollback clear" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 100, 20, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(
+        alloc,
+        &h.metrics,
+        "line 01\nline 02\nline 03\nline 04\nline 05\nline 06\nline 07\nline 08\n" ++
+            "line 09\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\n" ++
+            "line 17\nline 18\nline 19\nline 20\nline 21\nline 22\nline 23\nline 24\n",
+        true,
+    );
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try input.edit_state.input.appendSlice(alloc, "/");
+    input.edit_state.cursor = input.edit_state.input.items.len;
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    const picker_height = h.shell.committed_frame_layout.footer_area.height();
+
+    const replace_offset = try h.file.length(io_mod.getIo());
+    try std.testing.expect(try approval.syncRequest(alloc, .{
+        .label = "shell.run printf approval-replaces-picker",
+        .command = "printf approval-replaces-picker",
+    }));
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expect(h.shell.committed_frame_layout.footer_area.height() < picker_height);
+    const replace_bytes = try readEmittedSince(&h, replace_offset);
+    defer alloc.free(replace_bytes);
+    try std.testing.expect(std.mem.find(u8, replace_bytes, "\x1b[3J") == null);
+}
+
+test "a reprint skipped for an opening surface is paid by the first plain composer frame" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 100, 20, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(
+        alloc,
+        &h.metrics,
+        "line 01\nline 02\nline 03\nline 04\nline 05\nline 06\nline 07\nline 08\n" ++
+            "line 09\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\n" ++
+            "line 17\nline 18\nline 19\nline 20\nline 21\nline 22\nline 23\nline 24\n",
+        true,
+    );
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try input.edit_state.input.appendSlice(alloc, "/");
+    input.edit_state.cursor = input.edit_state.input.items.len;
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expect(input.deletionState(null).delete(alloc, .character_left, .clear));
+    const opening_offset = try h.file.length(io_mod.getIo());
+    h.footer_surface_opening = true;
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    const opening_bytes = try readEmittedSince(&h, opening_offset);
+    defer alloc.free(opening_bytes);
+    try std.testing.expect(std.mem.find(u8, opening_bytes, "\x1b[3J") == null);
+
+    const settled_offset = try h.file.length(io_mod.getIo());
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    const settled_bytes = try readEmittedSince(&h, settled_offset);
+    defer alloc.free(settled_bytes);
+    try std.testing.expect(std.mem.find(u8, settled_bytes, "\x1b[3J") != null);
+    try expectFooterBottomRow(&h, 20);
+}
+
 test "slash picker dismissal resolves transcript extent before layout convergence" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 124, 75, 3);
@@ -6841,16 +7122,20 @@ test "slash picker dismissal resolves transcript extent before layout convergenc
     try std.testing.expectEqual(@as(u16, 62), h.shell.last_visible_transcript_last_row);
     try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "┃ /"));
 
+    const close_offset = try h.file.length(io_mod.getIo());
     input.picker.dismissInlinePicker(.slash);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
+    const close_bytes = try readEmittedSince(&h, close_offset);
+    defer alloc.free(close_bytes);
+    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") != null);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 62), h.shell.last_visible_transcript_last_row);
-    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "┃ /"));
-    try std.testing.expectEqual(@as(u16, 64), h.shell.committed_frame_layout.footer_area.top);
-    try std.testing.expectEqual(@as(u16, 66), h.shell.committed_frame_layout.footer_area.bottom);
+    try std.testing.expectEqual(@as(u16, 71), h.shell.last_visible_transcript_last_row);
+    try std.testing.expectEqual(@as(u16, 73), try findRowContaining(&h, "┃ /"));
+    try std.testing.expectEqual(@as(u16, 73), h.shell.committed_frame_layout.footer_area.top);
+    try expectFooterBottomRow(&h, 75);
     try std.testing.expectEqual(
         @as(usize, 1),
         try countGridOccurrences(&h, "ATOMIC_RENDER_LINE_080"),
@@ -6865,10 +7150,10 @@ test "slash picker dismissal resolves transcript extent before layout convergenc
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expectEqual(@as(u16, 62), h.shell.last_visible_transcript_last_row);
-    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "┃ /x"));
-    try std.testing.expectEqual(@as(u16, 64), h.shell.committed_frame_layout.footer_area.top);
-    try std.testing.expectEqual(@as(u16, 66), h.shell.committed_frame_layout.footer_area.bottom);
+    try std.testing.expectEqual(@as(u16, 71), h.shell.last_visible_transcript_last_row);
+    try std.testing.expectEqual(@as(u16, 73), try findRowContaining(&h, "┃ /x"));
+    try std.testing.expectEqual(@as(u16, 73), h.shell.committed_frame_layout.footer_area.top);
+    try expectFooterBottomRow(&h, 75);
     try std.testing.expectEqual(
         @as(usize, 1),
         try countGridOccurrences(&h, "ATOMIC_RENDER_LINE_080"),
@@ -7108,14 +7393,17 @@ test "short notice after picker selection keeps footer compact" {
         },
         true,
     );
+    const close_offset = try h.file.length(io_mod.getIo());
     input.inputResetState().clearCurrent(alloc);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
+    const close_bytes = try readEmittedSince(&h, close_offset);
+    defer alloc.free(close_bytes);
+    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") != null);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    try expectFooterBottomRow(&h, 37);
     try std.testing.expectEqual(
         h.shell.last_visible_transcript_last_row + 2,
         h.shell.committed_frame_layout.footer_area.top,
@@ -7166,6 +7454,7 @@ test "long transcript picker filtering keeps footer anchored and close releases 
     try std.testing.expectEqual(open_footer_top, h.shell.committed_frame_layout.footer_area.top);
 
     input.inputResetState().clearCurrent(alloc);
+    const close_offset = try h.file.length(io_mod.getIo());
     try h.shell.writeTranscript(
         alloc,
         &h.metrics,
@@ -7176,12 +7465,15 @@ test "long transcript picker filtering keeps footer anchored and close releases 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    const close_bytes = try readEmittedSince(&h, close_offset);
+    defer alloc.free(close_bytes);
+    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") != null);
+    try expectFooterBottomRow(&h, 24);
     try std.testing.expectEqual(
         h.shell.last_visible_transcript_last_row + 2,
         h.shell.committed_frame_layout.footer_area.top,
     );
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.bottom < h.shell.layout.rows);
+    try expectGridRowCount(&h, "┃ /login", 1);
 
     h.shell.terminal_reset_pending = true;
     try h.shell.writeNotice(
@@ -7258,24 +7550,22 @@ test "picker growth advances history while shrink and dismissal do not" {
     );
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
 
+    const dismiss_offset = try h.file.length(io_mod.getIo());
     input.picker.dismissInlinePicker(.model);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
-    const dismissed_anchor = h.shell.stableTranscriptProjectionForFlow(
-        h.shell.notebook.transcript.items,
-    ) orelse return error.TestExpectedStableTranscript;
-    try std.testing.expect(
-        dismissed_anchor.history_visual_offset >= slash_anchor.history_visual_offset,
-    );
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    const dismiss_bytes = try readEmittedSince(&h, dismiss_offset);
+    defer alloc.free(dismiss_bytes);
+    try std.testing.expect(std.mem.find(u8, dismiss_bytes, "\x1b[3J") != null);
+    try expectFooterBottomRow(&h, 37);
     try std.testing.expectEqual(
         h.shell.last_visible_transcript_last_row + 1,
         h.shell.committed_frame_layout.footer_area.top,
     );
+    try expectGridRowCount(&h, "70.", 1);
 }
 
 test "slash main page renders header categories selection range and contextual controls" {
@@ -7682,14 +7972,22 @@ test "inline approval footer reflow replays displaced transcript history" {
         h.last_frame.document_append_clear_rows,
     );
 
+    const close_offset = try h.file.length(io_mod.getIo());
     approval.clear(alloc);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
+    const close_bytes = try readEmittedSince(&h, close_offset);
+    defer alloc.free(close_bytes);
+    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") != null);
     try std.testing.expectEqualStrings(transcript_before, h.shell.notebook.transcript.items);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+    try expectFooterBottomRow(&h, 36);
+    try std.testing.expectEqual(
+        h.shell.last_visible_transcript_last_row + 1,
+        h.shell.committed_frame_layout.footer_area.top,
+    );
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
     try std.testing.expectEqual(
         render_engine.terminal_diff.ShadowCommitState.committed,
@@ -7884,20 +8182,23 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
 
+    const close_offset = try h.file.length(io_mod.getIo());
     approval.clear(alloc);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
+    const close_bytes = try readEmittedSince(&h, close_offset);
+    defer alloc.free(close_bytes);
+    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") != null);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
     try std.testing.expectEqual(
         render_engine.terminal_diff.ShadowCommitState.committed,
         h.last_frame.shadow_state,
     );
     try std.testing.expect(h.last_frame.transcript_history_floor_respected);
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    try expectFooterBottomRow(&h, 20);
     try std.testing.expectEqual(
         h.shell.last_visible_transcript_last_row + 2,
         h.shell.committed_frame_layout.footer_area.top,
@@ -7932,10 +8233,6 @@ test "slash picker release keeps concurrent transcript progress single-painted" 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
     try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
-    const picker_anchor = h.shell.stableTranscriptProjectionForFlow(
-        h.shell.notebook.transcript.items,
-    ) orelse return error.TestExpectedStableTranscript;
-
     const append_one = "SLASH_RELEASE_APPEND_01";
     const append_two = "SLASH_RELEASE_APPEND_02";
     _ = try h.shell.streamAssistantChunk(
@@ -7943,22 +8240,19 @@ test "slash picker release keeps concurrent transcript progress single-painted" 
         &h.metrics,
         append_one ++ "\n" ++ append_two ++ "\n",
     );
+    const close_offset = try h.file.length(io_mod.getIo());
     input.inputResetState().clearCurrent(alloc);
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
+    const close_bytes = try readEmittedSince(&h, close_offset);
+    defer alloc.free(close_bytes);
+    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") != null);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-    try std.testing.expectEqual(@as(usize, 0), h.last_frame.document_append_bytes);
-    const dismissed_anchor = h.shell.stableTranscriptProjectionForFlow(
-        h.shell.notebook.transcript.items,
-    ) orelse return error.TestExpectedStableTranscript;
-    try std.testing.expect(
-        dismissed_anchor.history_visual_offset >= picker_anchor.history_visual_offset,
-    );
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    try std.testing.expect(h.last_frame.document_append_bytes > 0);
+    try expectFooterBottomRow(&h, 36);
     try std.testing.expectEqual(
         h.shell.last_visible_transcript_last_row + 2,
         h.shell.committed_frame_layout.footer_area.top,

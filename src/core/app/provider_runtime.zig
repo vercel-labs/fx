@@ -165,6 +165,42 @@ pub fn providerOf(app: anytype, agent: anytype) model_provider.ProviderId {
     @compileError("app must own provider_selection");
 }
 
+/// `agent`'s model: its own session's preference when it keeps one, else the
+/// app's selection. A view changes a waiting subagent's model with this, so
+/// the choice never reaches the agent on screen (`R6.5`). An agent that keeps
+/// its own choice but has none yet changes nothing.
+pub fn replaceModelFor(app: anytype, agent: anytype, value: []const u8) !void {
+    const App = @TypeOf(app.*);
+    if (comptime tracksSubagentPreferences(App) and @hasField(App, "main_agent")) {
+        if (agent != &app.main_agent) {
+            const preferences = subagentPreferencesMut(app, agent) orelse return;
+            const owned = try app.alloc.dupe(u8, value);
+            app.alloc.free(preferences.model);
+            preferences.model = owned;
+            return;
+        }
+    }
+    return replaceModel(app, value);
+}
+
+pub fn replaceSelectionFor(
+    app: anytype,
+    agent: anytype,
+    selected_provider: model_provider.ProviderId,
+    value: []const u8,
+) !void {
+    const App = @TypeOf(app.*);
+    if (comptime tracksSubagentPreferences(App) and @hasField(App, "main_agent")) {
+        if (agent != &app.main_agent) {
+            const preferences = subagentPreferencesMut(app, agent) orelse return;
+            try replaceModelFor(app, agent, value);
+            preferences.provider = selected_provider;
+            return;
+        }
+    }
+    return replaceSelection(app, selected_provider, value);
+}
+
 pub fn replaceModel(app: anytype, value: []const u8) !void {
     const App = @TypeOf(app.*);
     if (subagentPreferencesMut(app, screenAgentIfTracked(app))) |preferences| {
@@ -248,4 +284,47 @@ test "provider runtime adopts an owned selection without a fallible publication"
     try std.testing.expectEqual(@as(usize, 0), codex_model.len);
     try std.testing.expectEqual(model_provider.ProviderId.codex, runtime.selection().provider);
     try std.testing.expectEqualStrings("gpt-model", runtime.selection().model);
+}
+
+/// A model selection per agent: the app's for the agent on screen, and the
+/// agent's own preferences for a subagent.
+const ModelForTestApp = struct {
+    alloc: std.mem.Allocator,
+    main_agent: agents.Agent = .{},
+    screen_owner: ?*agents.Agent = null,
+    selected_model: std.ArrayList(u8) = .empty,
+    selected_provider: model_provider.ProviderId = .gateway,
+};
+
+fn testPreferences(alloc: std.mem.Allocator, model_id: []const u8) !session_codec.DurableSessionPreferences {
+    return .{
+        .provider = .gateway,
+        .model = try alloc.dupe(u8, model_id),
+        .effort = .auto,
+        .fast_mode = false,
+    };
+}
+
+test "wait card: a model change for a subagent keeps to that subagent" {
+    const alloc = std.testing.allocator;
+    var app = ModelForTestApp{ .alloc = alloc };
+    defer app.selected_model.deinit(alloc);
+    try app.selected_model.appendSlice(alloc, "main/model");
+    var child: agents.Agent = .{};
+    child.session_persistence.session_preferences = try testPreferences(alloc, "child/model");
+    defer alloc.free(child.session_persistence.session_preferences.?.model);
+
+    // The child's own choice moves; the screen's does not.
+    try replaceModelFor(&app, &child, "child/next");
+    try std.testing.expectEqualStrings("child/next", child.session_persistence.session_preferences.?.model);
+    try std.testing.expectEqualStrings("main/model", app.selected_model.items);
+    try replaceSelectionFor(&app, &child, .grok, "child/other");
+    try std.testing.expectEqualStrings("child/other", child.session_persistence.session_preferences.?.model);
+    try std.testing.expect(child.session_persistence.session_preferences.?.provider.eql(.grok));
+    try std.testing.expectEqualStrings("main/model", app.selected_model.items);
+    try std.testing.expect(app.selected_provider.eql(.gateway));
+
+    // The agent on screen keeps the app's selection.
+    try replaceModelFor(&app, &app.main_agent, "main/next");
+    try std.testing.expectEqualStrings("main/next", app.selected_model.items);
 }

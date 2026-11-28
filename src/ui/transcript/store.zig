@@ -952,6 +952,7 @@ fn appendSemanticNoticeEntry(
         .body = owned.body,
         .visibility = owned.visibility,
         .detail = owned.detail,
+        .detail_visibility = owned.detail_visibility,
         .pending_replacement = pending_replacement,
     } });
     self.notebook.next_entry_id +%= 1;
@@ -1054,6 +1055,7 @@ pub fn replaceSemanticNoticeAtomic(
         .body = owned.body,
         .visibility = owned.visibility,
         .detail = owned.detail,
+        .detail_visibility = owned.detail_visibility,
     } };
     handed_off = true;
     previous.deinit(alloc);
@@ -1874,6 +1876,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
                 .body = notice.body,
                 .visibility = notice.visibility,
                 .detail = notice.detail,
+                .detail_visibility = notice.detail_visibility,
             });
             break :blk .{ .semantic_notice = .{
                 .id = notice.id,
@@ -1884,6 +1887,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
                 .body = owned.body,
                 .visibility = owned.visibility,
                 .detail = owned.detail,
+                .detail_visibility = owned.detail_visibility,
                 .pending_replacement = notice.pending_replacement,
             } };
         },
@@ -1971,6 +1975,11 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
     else
         null;
     errdefer if (result) |value| alloc.free(value);
+    const notice = if (source.notice) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (notice) |value| alloc.free(value);
     const result_handle = if (source.result_handle) |value|
         try alloc.dupe(u8, value)
     else
@@ -2010,6 +2019,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .command_display = command_display,
         .command_action_label = command_action_label,
         .result = result,
+        .notice = notice,
         .result_handle = result_handle,
         .command_artifact_handle = command_artifact_handle,
         .command_output_replay = command_output_replay,
@@ -2025,6 +2035,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .check_found_command_ended = source.check_found_command_ended,
         .resolved_path = resolved_path,
         .subagent_started = source.subagent_started,
+        .command_placement = source.command_placement,
         .mcp_server = mcp_server,
         .mcp_tool = mcp_tool,
     };
@@ -2055,9 +2066,11 @@ test "a snapshot copy of a shell check keeps whether it found its command ended"
             .arguments_json = @constCast("{\"action\":\"interact\",\"session_id\":\"shell-1\"}"),
             .outcome = .completed,
             .check_found_command_ended = ended,
+            .command_placement = if (ended) .remote else null,
         });
         defer copy.deinit(alloc);
         try std.testing.expectEqual(ended, copy.check_found_command_ended);
+        try std.testing.expectEqual(if (ended) @as(?types.CommandPlacement, .remote) else null, copy.command_placement);
     }
 }
 

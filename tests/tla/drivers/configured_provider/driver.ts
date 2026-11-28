@@ -325,9 +325,9 @@ async function requestPart(out: string): Promise<number> {
   const rejected = sessions.filter((s) => s.loaded === "rejected").length;
   const noticed = sessions.filter((s) => s.notices > 0).length;
   const efforts = sessions.filter((s) => s.sent.some((r) => r.effort !== "none")).length;
-  const resends = sessions.filter((s) => s.sent.some((r) => r.resend)).length;
+  const notes = sessions.filter((s) => s.sent.some((r) => r.resend)).length;
   console.log(`request: ${sessions.length} sessions of ${binary} in ${seconds}s, ${requests} requests; ` +
-    `${rejected} settings refused, ${efforts} sent a level, ${noticed} printed a notice, ${resends} resent`);
+    `${rejected} settings refused, ${efforts} sent a level, ${noticed} printed a notice, ${notes} sent a note after a cut`);
   if (options.stress > 0) {
     const stress = sessions.at(-1)!;
     console.log(`stress: ${options.stress} tool steps, ${stress.sent.length} requests, ` +

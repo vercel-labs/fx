@@ -364,6 +364,10 @@ pub fn Bindings(comptime App: type) type {
                     agentResolveToolActionDisplayTarget
                 else
                     null,
+                .resolve_command_placement = if (comptime @hasDecl(App, "resolveCommandPlacement"))
+                    agentResolveCommandPlacement
+                else
+                    null,
                 .describe_tool_action = agentDescribeToolAction,
                 .describe_tool_action_completed = agentDescribeToolActionCompleted,
                 .describe_tool_action_denied = agentDescribeToolActionDenied,
@@ -413,6 +417,11 @@ pub fn Bindings(comptime App: type) type {
                     if (agent.session_persistence.v2 != null) agentMarkTurnYielded else null
                 else
                     null,
+                // Only a host that upgrades itself restarts, so only it holds a turn.
+                .hold_for_restart = if (comptime agents.hasAgentField(App, "session_persistence") and runtime_profile.allows(App, .auto_upgrade))
+                    if (agent.session_persistence.v2 != null) agentHoldForRestart else null
+                else
+                    null,
                 .propagate_grant = agentPropagateGrant,
                 .push_event = agentPushEvent,
                 .push_text = agentPushText,
@@ -439,6 +448,7 @@ pub fn Bindings(comptime App: type) type {
                     agentAskOutOfCredits
                 else
                     null,
+                .continue_selection = if (comptime provider_runtime.supported(App)) agentContinueSelection else null,
                 .stored_sign_in_resumed = if (comptime @hasDecl(@TypeOf(agent.worker), "markBeganWork"))
                     agentStoredSignInResumed
                 else
@@ -912,10 +922,10 @@ pub fn Bindings(comptime App: type) type {
             agentReportInnerToolUsage(ctx, tool_name, usage);
         }
 
-        fn agentAppendRuntimeContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+        fn agentAppendRuntimeContext(ctx: *anyopaque, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            try app.appendRuntimeContextMessage(agent, arena, messages);
+            try app.appendRuntimeContextMessage(agent, arena, model, messages);
         }
 
         fn cooperativeTransportPulse(ctx: *anyopaque) !void {
@@ -924,11 +934,12 @@ pub fn Bindings(comptime App: type) type {
             try app.cooperativeTransportPulse(agent);
         }
 
-        fn agentFinalizeTurn(ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, _: ?types.ProviderCompletionDisposition) !void {
+        fn agentFinalizeTurn(ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             try agent.worker.pushTurnFinished(std.heap.c_allocator, .{
                 .turn_id = turn_id,
                 .outcome = outcome,
+                .disposition = disposition,
             });
         }
 
@@ -1054,6 +1065,16 @@ pub fn Bindings(comptime App: type) type {
             return model_capabilities.capabilitiesForModel(model);
         }
 
+        /// The provider and model a continuing request uses, taken from the
+        /// worker's own copy once (`ViewWaits.tla` PickForItsWaitOnly).
+        fn agentContinueSelection(ctx: *anyopaque, alloc: std.mem.Allocator) anyerror!?agent_runtime.CurrentSelection {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            // A test fake may keep no worker copy: it has none to take.
+            if (comptime !@hasDecl(@TypeOf(agent.worker), "takeContinueSelection")) return null;
+            const selection = agent.worker.takeContinueSelection() orelse return null;
+            return .{ .provider = selection.provider, .model = try alloc.dupe(u8, selection.modelText()) };
+        }
+
         fn agentAvailableModelCapabilities(ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
@@ -1091,7 +1112,7 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             if (comptime @hasDecl(App, "snapshotMcpDefinition")) {
-                return app.snapshotMcpDefinition(arena, name, known, app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent).mode);
+                return app.snapshotMcpDefinition(agent, arena, name, known);
             }
             return .unavailable;
         }
@@ -1118,6 +1139,12 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             return app.resolveToolActionDisplayTarget(agent, arena, call);
+        }
+
+        fn agentResolveCommandPlacement(ctx: *anyopaque, arena: Allocator, call: ToolCall) !?types.CommandPlacement {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            return app.resolveCommandPlacement(agent, arena, call);
         }
 
         fn agentDescribeToolAction(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -1381,6 +1408,11 @@ pub fn Bindings(comptime App: type) type {
             try app_session_runtime.Runtime(App).markTurnYielded(agent);
         }
 
+        fn agentHoldForRestart(ctx: *anyopaque) agent_runtime.AgentRuntimeDeps.RestartHoldEnd {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            return agent.worker.holdForRestart();
+        }
+
         fn agentRecordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).recordUsage(agent, usage);
@@ -1401,10 +1433,10 @@ pub fn Bindings(comptime App: type) type {
             app_session_runtime.Runtime(App).reachWorkspace(appOf(agent), agent, dir, tool_name);
         }
 
-        fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
+        fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            try app_worker_runtime.Runtime(App).propagateGrant(app, agent, tool_name, target_path);
+            try app_worker_runtime.Runtime(App).propagateGrant(app, agent, tool_name, target_path, shell_epoch);
         }
 
         fn agentPushEvent(ctx: *anyopaque, event: WorkerEvent) !void {
@@ -1503,7 +1535,7 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             try app_worker_runtime.Runtime(App).pushSemanticNotice(app, agent, .{
-                .topic = "system",
+                .topic = "",
                 .tone = .neutral,
                 .body = text,
             });
@@ -1766,6 +1798,21 @@ pub fn Bindings(comptime App: type) type {
                 if (comptime @hasField(InputRuntime, "model_picker_draft")) {
                     if (app.input_runtime.model_picker_draft != null) return;
                 }
+                // A picker this agent's own worker opened changes that agent's
+                // model, so the choice reaches the subagent that waits, not
+                // the one on screen (`tests/tla/subagent/ViewWaits.tla`
+                // ActionReachesOwner).
+                if (comptime @hasField(App, "model_choice_target")) {
+                    if (agent.role == .subagent) app.model_choice_target = agent;
+                }
+                // The picker borrows the composer as its query box; the
+                // person's draft goes back when the pick or the close is done.
+                // An open `/effort` menu closes first, so its query is not
+                // kept as the draft.
+                if (comptime @hasField(App, "input_runtime")) {
+                    if (comptime @hasDecl(InputRuntime, "cancelEffortMenu")) _ = app.input_runtime.cancelEffortMenu(app.alloc, "worker_model_picker");
+                    app.input_runtime.stashModelPickerDraft();
+                }
                 try input_completion_runtime.CompletionRuntime(App).openCurrentModelPicker(app);
             }
         }
@@ -1838,7 +1885,7 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeSessionGrant(ctx: *anyopaque, grant: types.PermissionGrant) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            try app.allowToolForSession(agent, grant.tool_name, grant.target_path);
+            try app.allowToolForSession(agent, grant.tool_name, grant.target_path, grant.shell_epoch);
         }
 
         fn workerBridgeErrorText(ctx: *anyopaque, notice: types.SemanticNotice) !void {
@@ -1926,7 +1973,7 @@ const FakeWorker = struct {
         self.propagated_history_turns += 1;
     }
 
-    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
+    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8, _: u64) !void {
         _ = alloc;
         _ = tool_name;
         _ = target_path;
@@ -2191,7 +2238,7 @@ const FakeApp = struct {
         }
     }
 
-    fn appendRuntimeContextMessage(self: *FakeApp, _: anytype, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+    fn appendRuntimeContextMessage(self: *FakeApp, _: anytype, arena: Allocator, _: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
         _ = self;
         try messages.append(arena, .{ .role = .system, .content = "runtime" });
     }
@@ -2336,7 +2383,7 @@ const FakeApp = struct {
         }
     }
 
-    fn allowToolForSession(self: *FakeApp, _: anytype, tool_name: []const u8, target_path: []const u8) !void {
+    fn allowToolForSession(self: *FakeApp, _: anytype, tool_name: []const u8, target_path: []const u8, _: u64) !void {
         _ = tool_name;
         _ = target_path;
         self.grant_count += 1;
@@ -2441,7 +2488,7 @@ const NoOverridePersistentApp = struct {
         _ = record;
     }
 
-    fn allowToolForSession(self: *NoOverridePersistentApp, _: anytype, tool_name: []const u8, target_path: []const u8) !void {
+    fn allowToolForSession(self: *NoOverridePersistentApp, _: anytype, tool_name: []const u8, target_path: []const u8, _: u64) !void {
         _ = self;
         _ = tool_name;
         _ = target_path;
@@ -2543,7 +2590,7 @@ test "agent deps forward app callbacks through core types" {
         .removed_turn_count = 1,
         .compaction_count = 1,
     } });
-    try deps.propagate_grant(deps.ctx, "read_file", "/tmp/a");
+    try deps.propagate_grant(deps.ctx, "read_file", "/tmp/a", 0);
     const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{ .turn = .{
         .compacted_summary = .{
             .summary = @constCast("finished"),
@@ -3048,7 +3095,7 @@ test "agent context and system notices share semantic transport with distinct fi
     try std.testing.expectEqual(types.NoticeVisibility.full_only, context.visibility);
     try std.testing.expect(app.agent().worker.events.items[1] == .semantic_notice);
     const ordinary = app.agent().worker.events.items[1].semantic_notice;
-    try std.testing.expectEqualStrings("system", ordinary.topic);
+    try std.testing.expectEqualStrings("", ordinary.topic);
     try std.testing.expectEqual(types.NoticeTone.neutral, ordinary.tone);
     try std.testing.expectEqualStrings("ordinary-system", ordinary.body);
     try std.testing.expectEqual(types.NoticeVisibility.compact_and_full, ordinary.visibility);
@@ -3121,7 +3168,7 @@ test "worker bridge deps forward UI operations" {
         .turn_duration_ms = 130_000,
         .token_progress = .{ .input_tokens = 10_000, .output_tokens = 5_000 },
     } });
-    try deps.session_grant(deps.ctx, .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a") });
+    try deps.session_grant(deps.ctx, .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a"), .shell_epoch = 0 });
     try deps.error_text(deps.ctx, .{
         .topic = "system",
         .tone = .@"error",
@@ -3289,7 +3336,7 @@ test "eb03: buildWorkerDeps wires withdraw_accepted_input only when v2 session i
         pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
             return &self.main_agent;
         }
-        fn appendRuntimeContextMessage(_: *@This(), _: anytype, _: Allocator, _: *std.ArrayList(ChatMessage)) !void {}
+        fn appendRuntimeContextMessage(_: *@This(), _: anytype, _: Allocator, _: []const u8, _: *std.ArrayList(ChatMessage)) !void {}
         fn validateToolCall(_: *@This(), _: anytype, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
             return .{ .failure = try arena.print("invalid {s}", .{call.name}) };
         }

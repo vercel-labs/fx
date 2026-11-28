@@ -4851,6 +4851,7 @@ const PendingToolDetailStart = struct {
     /// Set for a provisional start, whose arguments still stream in. Every
     /// other start clears it.
     streaming: bool = false,
+    command_placement: ?types.CommandPlacement = null,
 
     fn deinit(self: *PendingToolDetailStart, alloc: Allocator) void {
         const tool_name = self.tool_name;
@@ -4865,6 +4866,7 @@ const PendingToolDetailStart = struct {
 
 const PendingToolDetailTerminal = struct {
     result: ?[]u8 = null,
+    notice: ?[]u8 = null,
     result_handle: ?[]u8 = null,
     command_artifact_handle: ?[]u8 = null,
     command_output_replay: ?types.CommandOutputReplay = null,
@@ -4872,9 +4874,11 @@ const PendingToolDetailTerminal = struct {
     command_output_entry_id: ?u32 = null,
     command_process_entry: ?PendingCommandProcessEntry = null,
     subagent_started: bool = false,
+    command_placement: ?types.CommandPlacement = null,
 
     fn deinit(self: *PendingToolDetailTerminal, alloc: Allocator) void {
         if (self.result) |value| alloc.free(value);
+        if (self.notice) |value| alloc.free(value);
         if (self.result_handle) |value| alloc.free(value);
         if (self.command_artifact_handle) |value| alloc.free(value);
         if (self.command_output_replay) |replay| {
@@ -5142,6 +5146,7 @@ const transcript_screen_fields = [_][:0]const u8{
     "render_requests",
     "has_committed_frame",
     "committed_frame_layout",
+    "footer_close_reset_owed",
     "pending_session_scrollback_handoff",
     "terminal_dimensions_invalid",
     "full_transcript",
@@ -5281,6 +5286,8 @@ pub const TranscriptRuntime = struct {
     /// still use the startup error path.
     has_committed_frame: bool = false,
     committed_frame_layout: render_engine.frame_layout.CommittedLayoutSnapshot = .{},
+    /// A reprint skipped while a surface opens is owed to the next plain composer frame.
+    footer_close_reset_owed: bool = false,
     transcript_commit_state: TranscriptCommitState = .invalid,
     /// A partial scroll may have moved rows into terminal history already.
     /// No ordinary repaint may run until the remaining rows are committed.
@@ -5825,6 +5832,7 @@ pub const TranscriptRuntime = struct {
                 started.activity_kind,
                 started.arguments_json,
                 started.place_after_current_transcript,
+                started.command_placement,
             ),
             .progress => |progress| self.applyProgressLifecycle(
                 alloc,
@@ -6354,6 +6362,7 @@ pub const TranscriptRuntime = struct {
         activity_kind: types.ToolActivityKind,
         arguments_json: ?[]const u8,
         place_after_current_transcript: bool,
+        command_placement: ?types.CommandPlacement,
     ) !?types.ToolActivityKind {
         if (!admitLifecycleStart(&self.notebook.lifecycle_state, id)) return null;
 
@@ -6393,6 +6402,7 @@ pub const TranscriptRuntime = struct {
                     arguments_json,
                 );
                 defer detail_start.deinit(alloc);
+                detail_start.command_placement = command_placement;
                 try self.notebook.lifecycle_state.ensureRecordCapacity(alloc);
                 const owned_call_id = try alloc.dupe(u8, id.call_id);
                 errdefer alloc.free(owned_call_id);
@@ -6438,6 +6448,7 @@ pub const TranscriptRuntime = struct {
                 arguments_json,
             );
             defer detail_start.deinit(alloc);
+            detail_start.command_placement = command_placement;
             const owned_tool_name = try alloc.dupe(u8, tool_name);
             errdefer alloc.free(owned_tool_name);
             const line = try lifecycleStartLine(alloc, tool_name);
@@ -6476,6 +6487,7 @@ pub const TranscriptRuntime = struct {
             arguments_json,
         );
         defer detail_start.deinit(alloc);
+        detail_start.command_placement = command_placement;
         const entry_id = try self.createToolActivity(
             alloc,
             id,
@@ -7210,6 +7222,7 @@ pub const TranscriptRuntime = struct {
             pending.tool_name = null;
             if (pending.captured_command) |value| detail.captured_command = value;
             if (pending.activity_kind) |kind| detail.activity_kind = kind;
+            if (pending.command_placement) |placement| detail.command_placement = placement;
             detail.streaming = pending.streaming;
             if (pending.arguments_json) |arguments_json| {
                 if (detail.arguments_json) |old| alloc.free(old);
@@ -7233,6 +7246,7 @@ pub const TranscriptRuntime = struct {
             .arguments_json = pending.arguments_json,
             .lifecycle_id = pending.lifecycle_id,
             .streaming = pending.streaming,
+            .command_placement = pending.command_placement,
         };
         if (search.index == self.notebook.tool_details.items.len) {
             self.notebook.tool_details.appendAssumeCapacity(detail);
@@ -7344,6 +7358,9 @@ pub const TranscriptRuntime = struct {
         var pending: PendingToolDetailTerminal = .{};
         errdefer pending.deinit(alloc);
         if (result) |value| pending.result = try alloc.dupe(u8, value);
+        if (result_memory) |memory| {
+            if (memory.notice) |text| pending.notice = try alloc.dupe(u8, text);
+        }
         const result_handle = if (result_memory) |memory| memory.output_handle else null;
         if (result_handle) |handle| pending.result_handle = try alloc.dupe(u8, handle);
         if (command_artifact_handle) |handle| {
@@ -7359,6 +7376,7 @@ pub const TranscriptRuntime = struct {
         else
             null;
         pending.subagent_started = if (result_memory) |memory| memory.subagent_started else false;
+        pending.command_placement = if (result_memory) |memory| memory.command_placement else null;
         pending.command_output_entry_id = if (activity_kind == .command)
             command_output_entry_id_override orelse
                 self.commandOutputEntryIdForLifecycle(lifecycle_id)
@@ -7398,6 +7416,11 @@ pub const TranscriptRuntime = struct {
             detail.result = owned;
             pending.result = null;
         }
+        if (pending.notice) |owned| {
+            if (detail.notice) |old| alloc.free(old);
+            detail.notice = owned;
+            pending.notice = null;
+        }
         if (pending.result_handle) |owned| {
             if (detail.result_handle) |old| alloc.free(old);
             detail.result_handle = owned;
@@ -7417,6 +7440,7 @@ pub const TranscriptRuntime = struct {
         }
         detail.command_process_presentation = pending.command_process_presentation;
         detail.subagent_started = pending.subagent_started;
+        if (pending.command_placement) |placement| detail.command_placement = placement;
         if (activity_kind == .command) {
             detail.command_output_entry_id = pending.command_output_entry_id;
         }
@@ -8772,6 +8796,171 @@ pub const TranscriptRuntime = struct {
         try self.initViewportWithReservedRows(metrics, 1, min_body_rows);
     }
 
+    fn footerCloseStrandsTranscript(
+        self: *const TranscriptRuntime,
+        footer_shrank: bool,
+        footer: render_engine.frame_layout.FooterMeasurement,
+        footer_area: render_engine.frame_layout.FrameRect,
+        selection: ?ViewportSelection,
+        source_visual_rows: u32,
+    ) bool {
+        const shown = selection orelse return false;
+        const rows_above_viewport = shown.start_line > 0 or shown.partial_skip_rows > 0;
+        const rows_above_footer = @as(u32, self.layout.rows) -| @as(u32, footer_area.height());
+        const plain_composer = footer.picker_rows == 0 and footer.banner_rows == 0;
+        return footer_shrank and
+            plain_composer and
+            self.has_committed_frame and
+            self.committed_frame_layout.terminal_cols == self.layout.cols and
+            self.resize_history_row_delta == null and
+            self.pending_resize_observation == null and
+            footer_area.bottom < self.layout.rows and
+            rows_above_viewport and
+            source_visual_rows >= rows_above_footer;
+    }
+
+    fn footerShrank(self: *const TranscriptRuntime, footer_area: render_engine.frame_layout.FrameRect) bool {
+        return footer_area.height() < self.committed_frame_layout.footer_area.height();
+    }
+
+    fn footerCloseResetDecision(
+        self: *TranscriptRuntime,
+        footer: render_engine.frame_layout.FooterMeasurement,
+        footer_area: render_engine.frame_layout.FrameRect,
+        footer_surface_opening: bool,
+        selection: ?ViewportSelection,
+        source_visual_rows: u32,
+    ) bool {
+        const footer_settled = footer.picker_rows > 0 or footer.banner_rows > 0 or footer_area.bottom >= self.layout.rows;
+        if (footer_settled) self.footer_close_reset_owed = false;
+        const shrink_due = self.footerShrank(footer_area) or self.footer_close_reset_owed;
+        if (!self.footerCloseStrandsTranscript(shrink_due, footer, footer_area, selection, source_visual_rows)) return false;
+        if (footer_surface_opening) {
+            self.footer_close_reset_owed = true;
+            return false;
+        }
+        self.footer_close_reset_owed = false;
+        return true;
+    }
+
+    pub fn solveFrameWithFooterCloseReset(
+        self: *TranscriptRuntime,
+        metrics: *Metrics,
+        comptime Context: type,
+        ctx: *Context,
+        input: render_engine.frame_layout.SolveInput,
+        prepare_candidate: *const fn (*Context, render_engine.frame_layout.FrameLayout) anyerror!render_engine.frame_fixed_point.CandidatePreparation,
+        resolve_candidate: *const fn (*Context, render_engine.frame_layout.FrameLayout, render_engine.frame_scroll_plan.FrameScrollPlan) anyerror!render_engine.frame_fixed_point.CandidateResolution,
+        footer_surface_opening: bool,
+        prepared: *const ?transcript_painter.PreparedTranscriptSurfacePaint,
+    ) !render_engine.frame_fixed_point.FramePlan {
+        const plan = try render_engine.frame_fixed_point.solve(Context, ctx, input, prepare_candidate, resolve_candidate);
+        const selection = if (prepared.*) |*paint| paint.selection else null;
+        const source_rows = if (prepared.*) |*paint| paint.sourceTotalVisualRows() else 0;
+        if (!self.footerCloseResetDecision(input.footer, plan.layout.footer_area, footer_surface_opening, selection, source_rows)) return plan;
+        debug_trace.logf("scroll", "footer_close_reset footer_bottom={d} terminal_rows={d} source_visual_rows={d} committed_footer_rows={d} footer_picker_rows={d} footer_banner_rows={d} footer_surface_opening={any}", .{ plan.layout.footer_area.bottom, self.layout.rows, source_rows, self.committed_frame_layout.footer_area.height(), input.footer.picker_rows, input.footer.banner_rows, footer_surface_opening });
+        // Pinned by resize_tests.zig "a footer surface closed after transcript growth leaves the composer on the bottom row".
+        try self.requestTerminalReset(metrics);
+        var reset_input = input;
+        reset_input.owned_top = self.owned_top_row;
+        return render_engine.frame_fixed_point.solve(Context, ctx, reset_input, prepare_candidate, resolve_candidate);
+    }
+
+    test "a footer close strands the transcript only when every condition holds" {
+        const above: ViewportSelection = .{
+            .top_row = 1,
+            .bottom_row = 8,
+            .start_line = 16,
+            .partial_skip_rows = 0,
+            .line_count = 8,
+        };
+        const footer: render_engine.frame_layout.FrameRect = .{ .top = 9, .bottom = 11 };
+        const bottom_footer: render_engine.frame_layout.FrameRect = .{ .top = 18, .bottom = 20 };
+        const fills_gap: u32 = 24;
+        const plain: render_engine.frame_layout.FooterMeasurement = .{ .natural_rows = 3, .min_rows = 1, .max_rows = 3 };
+        const picker: render_engine.frame_layout.FooterMeasurement = .{ .natural_rows = 12, .min_rows = 1, .max_rows = 12, .picker_rows = 8 };
+        const notice: render_engine.frame_layout.FooterMeasurement = .{ .natural_rows = 4, .min_rows = 1, .max_rows = 4, .banner_rows = 1 };
+        var shell = TranscriptRuntime{
+            .layout = .{
+                .rows = 20,
+                .cols = 100,
+                .content_bottom = 16,
+                .divider_top_row = 17,
+                .input_row = 18,
+                .divider_bottom_row = 19,
+                .hint_row = 20,
+            },
+            .has_committed_frame = true,
+            .committed_frame_layout = .{ .terminal_cols = 100 },
+        };
+        try std.testing.expect(shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(false, plain, footer, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, null, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, bottom_footer, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, picker, footer, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, notice, footer, above, fills_gap));
+        var at_top = above;
+        at_top.start_line = 0;
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, at_top, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, 10));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, 16));
+        try std.testing.expect(shell.footerCloseStrandsTranscript(true, plain, footer, above, 17));
+
+        shell.has_committed_frame = false;
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+        shell.has_committed_frame = true;
+
+        shell.committed_frame_layout.terminal_cols = 80;
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+        shell.committed_frame_layout.terminal_cols = 100;
+
+        shell.resize_history_row_delta = 3;
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+        shell.resize_history_row_delta = null;
+
+        shell.pending_resize_observation = .{
+            .layout = shell.layout,
+            .apply_after_ms = 0,
+            .expected_row = null,
+            .result = .unavailable,
+            .phase = .live,
+        };
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+        shell.pending_resize_observation = null;
+
+        const grown: render_engine.frame_layout.FrameRect = .{ .top = 7, .bottom = 11 };
+        shell.committed_frame_layout.footer_area = footer;
+        try std.testing.expect(!shell.footerShrank(grown));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(shell.footerShrank(grown), plain, grown, above, fills_gap));
+        shell.committed_frame_layout.footer_area = grown;
+        try std.testing.expect(shell.footerShrank(footer));
+
+        try std.testing.expect(shell.footerCloseStrandsTranscript(true, plain, footer, above, fills_gap));
+
+        shell.committed_frame_layout.footer_area = .{ .top = 9, .bottom = 20 };
+        try std.testing.expect(!shell.footerCloseResetDecision(plain, footer, true, above, fills_gap));
+        try std.testing.expect(shell.footer_close_reset_owed);
+        shell.committed_frame_layout.footer_area = footer;
+        try std.testing.expect(shell.footerCloseResetDecision(plain, footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footer_close_reset_owed);
+        shell.footer_close_reset_owed = true;
+        try std.testing.expect(!shell.footerCloseResetDecision(picker, footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footer_close_reset_owed);
+
+        shell.footer_close_reset_owed = true;
+        try std.testing.expect(shell.footerCloseResetDecision(plain, footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footer_close_reset_owed);
+
+        shell.footer_close_reset_owed = true;
+        try std.testing.expect(!shell.footerCloseResetDecision(notice, footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footer_close_reset_owed);
+
+        shell.footer_close_reset_owed = true;
+        try std.testing.expect(!shell.footerCloseResetDecision(plain, bottom_footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footer_close_reset_owed);
+    }
+
     pub fn requestTerminalResetAfterResize(
         self: *TranscriptRuntime,
         metrics: *Metrics,
@@ -9701,7 +9890,14 @@ pub const TranscriptRuntime = struct {
             target_total_visual_rows > anchor.total_visual_rows;
         const width_stable = self.committed_frame_layout.terminal_cols == 0 or
             self.committed_frame_layout.terminal_cols == self.layout.cols;
-        const geometry_rebase = footer_reservation_changed and
+        // A pending resume can change the transcript area without changing the
+        // footer, so its own area change also rebases the geometry.
+        const pending_resume_geometry_rebase = self.notebook.pending_resume_source != null and
+            !std.meta.eql(
+                self.committed_frame_layout.transcript_area,
+                prepared.projectionArea(),
+            );
+        const geometry_rebase = (footer_reservation_changed or pending_resume_geometry_rebase) and
             width_stable and
             self.resize_history_row_delta == null;
         const displaced_history_replay = if (geometry_rebase and
@@ -12376,6 +12572,22 @@ pub const TranscriptRuntime = struct {
         }
     }
 
+    /// Writes an OSC 7577 report between frames, like the notification bell.
+    pub fn writeProgramResume(
+        self: *TranscriptRuntime,
+        metrics: *Metrics,
+        report: []const u8,
+    ) void {
+        switch (transcript_io.writeFrameBytes(self, metrics, report)) {
+            .complete => {},
+            .partial => |partial| debug_trace.logf(
+                "program_resume",
+                "report write failed accepted_bytes={d} err={s}",
+                .{ partial.accepted_bytes, @errorName(partial.err) },
+            ),
+        }
+    }
+
     fn writeFrameSink(ctx: *anyopaque, metrics: *Metrics, bytes: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
         const self: *TranscriptRuntime = @ptrCast(@alignCast(ctx));
         return transcript_io.writeFrameBytes(self, metrics, bytes);
@@ -14827,6 +15039,165 @@ test "stable resume publication starts a fresh retained source epoch" {
     try std.testing.expect(facts.recovery_rebase);
 }
 
+const ResumeHandoffPlan = struct {
+    start_line: usize,
+    line_count: usize,
+    facts: TranscriptScrollFacts,
+};
+
+fn resumeHandoffTestRuntime(
+    alloc: Allocator,
+    pending_flow: []const u8,
+    transcript: []const u8,
+) !TranscriptRuntime {
+    const layout: Layout = .{
+        .rows = 8,
+        .cols = 40,
+        .content_bottom = 4,
+        .divider_top_row = 5,
+        .input_row = 6,
+        .divider_bottom_row = 7,
+        .hint_row = 8,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+    };
+    errdefer runtime.deinit(alloc);
+    try runtime.enableShadowVt(alloc);
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, pending_flow),
+    );
+    try runtime.notebook.transcript.appendSlice(alloc, transcript);
+    return runtime;
+}
+
+fn commitResumeHandoff(
+    alloc: Allocator,
+    runtime: *TranscriptRuntime,
+    start_line: usize,
+    line_count: usize,
+    visual_offset: u32,
+    cursor_col: u16,
+) void {
+    var transition = TranscriptTransition{
+        .scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(
+            runtime.layout.rows,
+            runtime.owned_top_row,
+        ),
+        .document_append = .{},
+        .materialized_without_append = .{},
+        .target_flow = runtime.notebook.pending_resume_source.?.bytes,
+        .target_flow_owned = false,
+        .target_cache = .empty,
+        .target_cache_unchanged = true,
+        .folded_summary_indices = &.{},
+        .target_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 4,
+            .start_line = start_line,
+            .partial_skip_rows = 0,
+            .line_count = line_count,
+            .last_visible_row = 4,
+        },
+        .visual_offset = visual_offset,
+        .history_visual_offset = visual_offset,
+        .total_visual_rows = @intCast(line_count),
+        .cursor_row = 4,
+        .cursor_col = cursor_col,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 4,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 4,
+    };
+    defer transition.deinit(alloc);
+    runtime.consumeTranscriptTransition(
+        alloc,
+        &transition,
+        testFrameCommitResult(0, .committed),
+    );
+}
+
+fn planAfterResumeHandoff(
+    alloc: Allocator,
+    runtime: *TranscriptRuntime,
+) !ResumeHandoffPlan {
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer prepared.deinit(alloc);
+    return .{
+        .start_line = prepared.selection.start_line,
+        .line_count = prepared.selection.line_count,
+        .facts = runtime.planTranscriptScroll(&prepared),
+    };
+}
+
+test "a resume that grows before its repaint scrolls the rows it pushes off" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "line-1\n" ++
+        "line-2\n" ++
+        "line-3\n" ++
+        "line-4\n" ++
+        "line-5\n" ++
+        "line-6";
+    var runtime = try resumeHandoffTestRuntime(alloc, flow, flow);
+    defer runtime.deinit(alloc);
+
+    commitResumeHandoff(alloc, &runtime, 2, 6, 2, 7);
+    try runtime.notebook.transcript.appendSlice(alloc, "\nline-7\nline-8\nline-9\nline-10");
+
+    const result = try planAfterResumeHandoff(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 6), result.start_line);
+    try std.testing.expectEqual(@as(usize, 10), result.line_count);
+    try std.testing.expectEqual(@as(u32, 6), result.facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 4), result.facts.planned_rows);
+}
+
+test "a resume that grew before its handoff commits scrolls the rows it pushes off" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "line-1\n" ++
+        "line-2\n" ++
+        "line-3\n" ++
+        "line-4\n" ++
+        "line-5\n" ++
+        "line-6";
+    var runtime = try resumeHandoffTestRuntime(alloc, flow, flow);
+    defer runtime.deinit(alloc);
+
+    try runtime.notebook.transcript.appendSlice(alloc, "\nline-7\nline-8\nline-9\nline-10");
+    commitResumeHandoff(alloc, &runtime, 2, 6, 2, 7);
+
+    const result = try planAfterResumeHandoff(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 6), result.start_line);
+    try std.testing.expectEqual(@as(usize, 10), result.line_count);
+    try std.testing.expectEqual(@as(u32, 6), result.facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 4), result.facts.planned_rows);
+}
+
 test "oversized resume publication starts without a prior committed frame" {
     const alloc = std.testing.allocator;
     const layout = invalidationTestLayout();
@@ -15252,6 +15623,116 @@ test "a line fx wrote marks the text entry that shows it, and nothing else" {
     var copy = try transcript_store.cloneEntryForSnapshot(alloc, runtime.notebook.entries.items[1]);
     defer copy.deinit(alloc);
     try std.testing.expect(copy.assistant_turn.operational);
+}
+
+test "pending resume publication rebases when the candidate gains one transcript row" {
+    const alloc = std.testing.allocator;
+    const layout: Layout = .{
+        .rows = 73,
+        .cols = 80,
+        .content_bottom = 69,
+        .divider_top_row = 70,
+        .input_row = 71,
+        .divider_bottom_row = 72,
+        .hint_row = 73,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .has_painted_transcript = true,
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 73 },
+            .body_area = .{ .top = 1, .bottom = 68 },
+            .transcript_area = .{ .top = 1, .bottom = 68 },
+            .footer_area = .{ .top = 69, .bottom = 73 },
+            .solved_frame_height = 73,
+            .terminal_rows = 73,
+            .terminal_cols = 80,
+        },
+    };
+    defer runtime.deinit(alloc);
+
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+    for (0..980) |_| try flow.appendSlice(alloc, "row\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try flow.toOwnedSlice(alloc),
+    );
+    const source = &runtime.notebook.pending_resume_source.?;
+
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        source,
+        .{ .top = 1, .bottom = 69 },
+    );
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 980), prepared.sourceTotalVisualRows());
+    try std.testing.expectEqual(@as(u32, 911), prepared.sourceVisualOffset());
+
+    runtime.transcript_commit_state = .{ .stable = .{
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 68,
+            .start_line = 912,
+            .partial_skip_rows = 0,
+            .line_count = 980,
+            .last_visible_row = 68,
+        },
+        .visual_offset = 912,
+        .history_visual_offset = 0,
+        .total_visual_rows = 980,
+        .flow = try alloc.dupe(u8, source.bytes),
+        .cursor_row = 68,
+        .cursor_col = 1,
+        .occupied_last_row = 68,
+        .occupied_last_row_blank = false,
+        .layout_id = 17,
+    } };
+
+    const facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        source,
+        &prepared,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(@as(u32, 911), facts.target_visual_offset);
+
+    const target_layout: render_engine.frame_layout.CommittedLayoutSnapshot = .{
+        .layout_id = 18,
+        .owned_top = 1,
+        .owned_band = .{ .top = 1, .bottom = 73 },
+        .body_area = .{ .top = 1, .bottom = 69 },
+        .transcript_area = .{ .top = 1, .bottom = 69 },
+        .footer_area = .{ .top = 70, .bottom = 73 },
+        .solved_frame_height = 73,
+        .terminal_rows = 73,
+        .terminal_cols = 80,
+    };
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    _ = try runtime.resolveTranscriptTransitionTargetForFrame(
+        alloc,
+        source,
+        &prepared,
+        target_layout,
+        scroll_plan,
+        facts,
+        false,
+        false,
+    );
+    try std.testing.expect(facts.geometry_rebase);
 }
 
 test "pending resume publication yields after a bounded row batch" {

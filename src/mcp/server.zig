@@ -368,6 +368,8 @@ pub const Server = struct {
     /// something only while `catalog.refused` holds.
     list_refusal_buf: [tools.text_max]u8 = undefined,
     list_refusal_len: u8 = 0,
+    /// The HTTP status of a refusal that says the server is temporarily unavailable, 0 for any other (`refuse`).
+    list_unavailable: u16 = 0,
 
     // A 2025 session.
     legacy: ?http_legacy.Session = null,
@@ -484,12 +486,19 @@ pub const Server = struct {
         return if (r.catalog.refused and r.list_refusal_len > 0) r.list_refusal_buf[0..r.list_refusal_len] else null;
     }
 
-    /// Records why fx refuses a page, in the words of `tools.Refusal`: `status` goes into `http_status`'s words.
+    /// The HTTP status of the last refused list when it says the server is temporarily unavailable (429 or 503), 0
+    /// when the list was refused for another reason or not refused. `fx mcp show` says "unavailable" for it.
+    pub fn listUnavailable(r: *const Server) u16 {
+        return if (r.catalog.refused) r.list_unavailable else 0;
+    }
+
+    /// Records why fx refuses a page, in the words of `tools.Refusal`: `status` goes into the HTTP refusals' words.
     fn refuse(r: *Server, why: tools.Refusal, status: u16) void {
         var words_buf: [tools.text_max]u8 = undefined;
         const words = why.text(status, &words_buf);
         @memcpy(r.list_refusal_buf[0..words.len], words);
         r.list_refusal_len = @intCast(words.len);
+        r.list_unavailable = if (why == .http_unavailable) status else 0;
     }
 
     /// Starts era detection. Over HTTP the endpoint is the "process".
@@ -1406,7 +1415,7 @@ pub const Server = struct {
     fn httpListRefusal(how: http.Ending, status: u16, in_session: bool) ?tools.Refusal {
         return switch (how) {
             .rejected => null,
-            .http_failure => if (status == 0 or (status == 404 and in_session)) null else if (status / 100 == 2) .not_json else .http_status,
+            .http_failure => if (status == 0 or (status == 404 and in_session)) null else if (status / 100 == 2) .not_json else tools.Refusal.ofStatus(status),
             .unreadable => .unreadable,
             .complete, .accepted, .broken, .too_large => null,
         };
@@ -2859,8 +2868,13 @@ test "a later listing's first invalid cursor only restarts it, and leaves the wo
 
 test "an HTTP ending refuses a tool list, unless another flow reads it" {
     // A status that nothing else reads, with no message in the body, is an answer that refuses the list. The number is the status.
-    for ([_]u16{ 400, 403, 404, 405, 408, 410, 429, 500, 502, 503, 504, 301 }) |status| {
+    for ([_]u16{ 400, 403, 404, 405, 408, 410, 500, 502, 504, 301 }) |status| {
         try std.testing.expectEqual(@as(?tools.Refusal, .http_status), Server.httpListRefusal(.http_failure, status, false));
+    }
+    // 429 and 503 are refusals too, and say the server is temporarily unavailable.
+    for ([_]u16{ 429, 503 }) |status| {
+        try std.testing.expectEqual(@as(?tools.Refusal, .http_unavailable), Server.httpListRefusal(.http_failure, status, false));
+        try std.testing.expectEqual(@as(?tools.Refusal, .http_unavailable), Server.httpListRefusal(.http_failure, status, true));
     }
     // A 2xx answer that is no JSON, and a 2xx body that is no message.
     try std.testing.expectEqual(@as(?tools.Refusal, .not_json), Server.httpListRefusal(.http_failure, 200, false));
@@ -2910,6 +2924,27 @@ test "a tool list that ends with an HTTP answer is refused with the status in it
         l.list_status = 200;
         try r.listFailed(l);
         try std.testing.expectEqualStrings("the list is not valid JSON", (r.listRefusal() orelse return error.TestExpectedRefusal));
+    }
+    // A 429 or a 503 is the same refusal, with its status told apart; a later refusal of another kind and a published
+    // list take it back.
+    {
+        var r: Server = undefined;
+        try pageTestServer(&r);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(u16, 0), r.listUnavailable());
+        const l = try listLogical(&r);
+        l.list_why = Server.httpListRefusal(.http_failure, 503, false);
+        l.list_status = 503;
+        try r.listFailed(l);
+        try std.testing.expect(r.catalog.refused);
+        try std.testing.expectEqualStrings("the server answered the list with HTTP 503, which is temporary", (r.listRefusal() orelse return error.TestExpectedRefusal));
+        try std.testing.expectEqual(@as(u16, 503), r.listUnavailable());
+        const next = try listLogical(&r);
+        next.list_why = Server.httpListRefusal(.http_failure, 403, false);
+        next.list_status = 403;
+        try r.listFailed(next);
+        try std.testing.expectEqualStrings("the server answered the list with HTTP 403", (r.listRefusal() orelse return error.TestExpectedRefusal));
+        try std.testing.expectEqual(@as(u16, 0), r.listUnavailable());
     }
     // A request that waits for a sign-in, and one that had no answer, refuse nothing.
     {

@@ -8,7 +8,7 @@ export type { Durability } from "./libfx.cjs";
 export interface LocalOptions {
   /** Where the sessions live. */
   dir?: string;
-  /** Each delivery runs as if its function stopped after this long, as on Vercel. No limit by default. */
+  /** Each delivery runs as if its function stopped after this long, as on Vercel, at most 2147483647. No limit by default. */
   maxDurationMs?: number;
   /** How long before the deadline each delivery stops. Default 30000. */
   reserveMs?: number;

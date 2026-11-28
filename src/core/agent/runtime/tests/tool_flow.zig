@@ -35,12 +35,14 @@ const runtime_tool_presentation = @import("../tool_presentation.zig");
 const runtime_telemetry = @import("../telemetry.zig");
 const recovery = @import("../../../recovery/recovery.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
+const shell_snapshot = @import("../../../terminal/shell_snapshot.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const auto_classifier_context = @import("../../../permissions/auto_classifier_context.zig");
 
 const test_support = @import("support.zig");
 const text_utils = @import("../../../shared/text_utils.zig");
+const compactor = @import("../../../compactor/compactor.zig");
 
 const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
@@ -790,6 +792,91 @@ test "a turn asked to yield stops at its next step boundary after the first requ
     try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
 }
 
+test "a turn held for a cancelled restart sends its request in the same turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    // Set before the turn starts: the first request still goes out.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+    hooks.restart_hold_end = .go_on;
+    hooks.restart_yield_flag = &yield_flag;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
+    try std.testing.expectEqual(@as(usize, 1), hooks.restart_holds);
+    try std.testing.expect(!yield_flag.load(.seq_cst));
+    // The reopen saved the send's record again, after the clean one.
+    try std.testing.expect(hooks.recovery_record_writes > hooks.recovery_record_writes_at_hold);
+}
+
+test "a held turn whose restart goes ahead returns TurnYielded" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    // Set before the turn starts: the first request still goes out.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+    hooks.restart_hold_end = .stop;
+
+    try std.testing.expectError(error.TurnYielded, runFakePrompt(&gateway, &hooks, config, fixture.job()));
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
+    try std.testing.expectEqual(@as(usize, 1), hooks.restart_holds);
+}
+
+test "a held turn that is cancelled ends cancelled without its next request" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    // Set before the turn starts: the first request still goes out.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+    hooks.restart_hold_end = .cancelled;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.restart_holds);
+}
+
 test "a yielded turn is traced as yielded, not as an HTTP error" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -827,6 +914,56 @@ test "a yielded turn is traced as yielded, not as an HTTP error" {
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "outcome_kind=yielded") != null);
     try std.testing.expect(std.mem.find(u8, trace, "outcome_kind=http_error") == null);
+}
+
+const YieldPostTurnEndCapture = struct {
+    calls: usize = 0,
+
+    fn run(raw: *anyopaque, _: lifecycle_hooks.PostTurnEndInput) lifecycle_hooks.HandlerError!void {
+        const self: *YieldPostTurnEndCapture = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+    }
+};
+
+test "a yielded turn stays open: no host hears it finished and no post-turn hook runs" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+    var post_turn_end = YieldPostTurnEndCapture{};
+    var hook_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer hook_runtime.deinit();
+    try hook_runtime.registerPostTurnEnd(.{
+        .name = "capture",
+        .ctx = &post_turn_end,
+        .run = YieldPostTurnEndCapture.run,
+    });
+
+    try std.testing.expectError(error.TurnYielded, runFakePromptWithLifecycle(
+        &gateway,
+        &hooks,
+        config,
+        fixture.job(),
+        testLifecycleContext(hook_runtime.freeze(), alloc, fixture.workspace_root),
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
+    // The host resumes the same turn, and that run reports how it ends.
+    try std.testing.expectEqual(@as(?types.TurnPresentationOutcome, null), hooks.finalized_outcome);
+    try std.testing.expectEqual(@as(usize, 0), hooks.finalization_count);
+    try std.testing.expectEqual(@as(usize, 0), post_turn_end.calls);
 }
 
 test "a turn on a session fx does not save goes on to its end when asked to yield" {
@@ -1642,7 +1779,7 @@ test "shell lifecycle resolves one display target before execution" {
             return .{
                 .decision = .once,
                 .execution_authority = .ordinary,
-                .human_approval = .once,
+                .human_approval = .{ .kind = .once, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() },
             };
         }
     };
@@ -2366,17 +2503,19 @@ fn expectSingleTerminalOutcome(
     }
     try std.testing.expectEqual(@as(usize, 1), matches);
 }
-test "processQueuedPrompt length-limited calls bypass malformed local tool identity admission" {
+test "processQueuedPrompt runs no call of a cut reply whose calls fail identity admission and asks again" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
         toolCall("", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}"),
     };
-    const completions = [_]FakeCompletion{.{
-        .content = "Partial answer",
-        .tool_calls = &calls,
-        .finish_reason = .length,
-    }};
+    // A later call started after both, so both are whole, and only the
+    // identity checks keep them from running.
+    const starts = calls ++ [_]ToolCall{toolCall("call_cut", "edit_file", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .content = "Partial answer", .tool_calls = &calls, .streamed_tool_starts = &starts, .finish_reason = .length },
+        .{ .content = "Done after the note" },
+    };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -2385,13 +2524,15 @@ test "processQueuedPrompt length-limited calls bypass malformed local tool ident
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
+    // A call with no id fails the checks a finished reply's calls pass, so
+    // its sibling does not run either.
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "Partial answer") != null);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not run them") != null);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 1, "so fx did not run it.");
+    try expectBodyNotContains(&gateway, 1, "call_read");
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Done after the note", hooks.finish_assistant_text.?);
 }
 
 test "local tool emits authoritative progress and terminal lifecycle by default" {
@@ -3646,6 +3787,102 @@ test "a session keeps its first runtime context ahead of the history and notes a
     try std.testing.expectEqual(@as(usize, 0), third_saved.context_notes.len);
 }
 
+fn countInstruction(instructions: []const []const u8, text: []const u8) usize {
+    var count: usize = 0;
+    for (instructions) |instruction| {
+        if (std.mem.eql(u8, instruction, text)) count += 1;
+    }
+    return count;
+}
+
+test "fx's own summary in a turn that sent an earlier turn's runtime context captures the current one for the rest of the session (D94)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const before = "<fx-turn-context>\nmodel: openai/gpt-6.1-sol\n</fx-turn-context>";
+    const after = "<fx-turn-context>\nmodel: anthropic/claude-fable-5.2\n</fx-turn-context>";
+    const answer = [_]FakeCompletion{.{ .content = "Final" }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The first turn captures the runtime context with model A and saves it.
+    var first_gateway = FakeGateway.init(alloc, &answer);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.runtime_context_text = before;
+    var first = fixture.job();
+    first.prompt = @constCast("First.");
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first);
+    try std.testing.expectEqualStrings(before, first_hooks.history_turns.items[0].assistant.execution.runtime_context.?[0]);
+
+    // The second turn runs on model B. It sends the first turn's copy, then a
+    // large tool result makes fx write its own summary in the turn.
+    var second_gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{toolCall("large-read", "read_file", "{\"path\":\"large.txt\"}")} },
+        .{ .content = "Turn in progress\nIn between: The read completed." },
+        .{ .content = "Completed after the summary." },
+    });
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.runtime_context_text = after;
+    const small_model = "provider/small-window";
+    const capabilities = [_]test_support.ModelCapabilityOverride{.{ .model = small_model, .capabilities = .{ .context_window = 3_000 } }};
+    second_hooks.available_capability_overrides = &capabilities;
+    second_hooks.permission_decisions = &.{.once};
+    second_hooks.exec_plans = &.{.{ .result = .{ .model_output = "LARGE\n" ++ text_utils.repeat("r", 10_000) } }};
+    var second = fixture.job();
+    second.model = @constCast(small_model);
+    second.prompt = @constCast("Second.");
+    second.history = first_hooks.history_turns.items[0..1];
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), second);
+    try std.testing.expectEqual(@as(usize, 3), second_gateway.request_bodies.items.len);
+    try expectBodyContains(&second_gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&second_gateway, 2, "compacted_conversation");
+    const before_summary = try leadingSystemContents(arena, second_gateway.request_bodies.items[0]);
+    try std.testing.expect(countInstruction(before_summary.items, before) == 1);
+
+    // The summary starts a new prefix: the rest of the turn sends model B,
+    // with no update note for a change it already shows.
+    const after_summary_body = second_gateway.request_bodies.items[2];
+    const after_summary = try leadingSystemContents(arena, after_summary_body);
+    try std.testing.expectEqual(@as(usize, 1), countInstruction(after_summary.items, after));
+    try std.testing.expectEqual(@as(usize, 0), countInstruction(after_summary.items, before));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, after_summary_body, "fx-context-update>"));
+    for ((try userMessageTexts(arena, after_summary_body)).items) |text| try std.testing.expect(!std.mem.eql(u8, text, "First."));
+
+    // The summary saves the copy sent after it, and the turn adds none, so
+    // nothing the turn saved before the summary is written again (D87).
+    const turns = second_hooks.history_turns.items;
+    try std.testing.expectEqual(@as(usize, 2), turns.len);
+    const kept = try compactor.savedRuntimeContext(arena, turns[0].compacted_summary.summary);
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqualStrings(after, kept[0]);
+    try std.testing.expect(turns[1].assistant.execution.runtime_context == null);
+
+    // The next turn restores the saved history, as a resume does, and sends
+    // that copy unchanged with no update.
+    var third_gateway = FakeGateway.init(alloc, &answer);
+    defer third_gateway.deinit();
+    var third_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer third_hooks.deinit();
+    third_hooks.runtime_context_text = after;
+    var third = fixture.job();
+    third.prompt = @constCast("Third.");
+    third.history = turns;
+    try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), third);
+    const third_body = third_gateway.request_bodies.items[0];
+    try expectSameInstructions(alloc, after_summary_body, third_body);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, third_body, "fx-context-update>"));
+    try std.testing.expect(third_hooks.history_turns.items[0].assistant.execution.runtime_context == null);
+}
+
 test "a named skill's text rides on its turn's message and the turn saves it as sent (D95)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4356,6 +4593,131 @@ test "modern mixed batch materializes unsupported terminal before admission" {
     try std.testing.expectEqual(types.PersistedToolStatus.success, results[0].status);
     try std.testing.expectEqualStrings("Unsupported tool: missing_tool", results[1].output);
     try std.testing.expectEqual(types.PersistedToolStatus.failure, results[1].status);
+}
+
+test "unsupported bash call hints the registered shell tool when no bash tool is registered" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var renamed_shell = builtin_tools.shell;
+    renamed_shell.name = "terminal";
+    renamed_shell.model_schema.name = "terminal";
+    const renamed_tools = [_]tool_dispatch.Tool{ builtin_tools.read_file, renamed_shell };
+    const no_shell_tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
+
+    const cases = [_]struct {
+        tools: ?[]const tool_dispatch.Tool,
+        expected: []const u8,
+    }{
+        .{ .tools = null, .expected = "Unsupported tool: bash. Use shell instead." },
+        .{ .tools = &renamed_tools, .expected = "Unsupported tool: bash. Use terminal instead." },
+        .{ .tools = &no_shell_tools, .expected = "Unsupported tool: bash" },
+    };
+
+    for (cases) |case| {
+        const calls = [_]ToolCall{toolCall("bash_1", "bash", "{\"command\":\"true\"}")};
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &calls },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.context_enabled = true;
+        hooks.context_registry = EmptyApplicableContext.registry;
+        hooks.validation_not_registered_names = &.{"bash"};
+        if (case.tools) |tools| hooks.tool_registry = .{ .tools = tools };
+        var fixture = PromptFixture{ .workspace_root = workspace };
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+        const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings(case.expected, results[0].output);
+        try std.testing.expectEqual(types.PersistedToolStatus.failure, results[0].status);
+    }
+}
+
+test "unsupported bash_placeholder keeps the generic message" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    for ([_][]const u8{ "bash_placeholder", "bash_tool_placeholder" }) |name| {
+        const calls = [_]ToolCall{toolCall("bad_1", name, "{}")};
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &calls },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.context_enabled = true;
+        hooks.context_registry = EmptyApplicableContext.registry;
+        hooks.validation_not_registered_names = &.{name};
+        var fixture = PromptFixture{ .workspace_root = workspace };
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        const expected = try alloc.print("Unsupported tool: {s}", .{name});
+        defer alloc.free(expected);
+        const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings(expected, results[0].output);
+        try std.testing.expectEqual(types.PersistedToolStatus.failure, results[0].status);
+    }
+}
+
+test "registered bash tool dispatches directly without unsupported hint" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var bash_tool = builtin_tools.read_file;
+    bash_tool.name = "bash";
+    bash_tool.model_schema.name = "bash";
+    const tools = [_]tool_dispatch.Tool{ builtin_tools.shell, bash_tool };
+
+    const calls = [_]ToolCall{toolCall("bash_1", "bash", "{\"path\":\"notes.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.context_registry = EmptyApplicableContext.registry;
+    hooks.tool_registry = .{ .tools = &tools };
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "bash tool ran" } }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("bash", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
+    const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("bash tool ran", results[0].output);
+    try std.testing.expectEqual(types.PersistedToolStatus.success, results[0].status);
 }
 
 test "modern cancellation during later context selection stops before context or tool history commit" {
@@ -5416,7 +5778,7 @@ test "committed file result is appended before degraded secondary publication" {
     try std.testing.expect(publish_index < status_index);
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expectEqualStrings(
-        "File change committed, but some secondary reporting failed.",
+        "fx saved the file change, but could not report all of it.",
         hooks.system_notices.items[0],
     );
     try expectBodyContainsInOrder(&gateway, 1, &.{
@@ -6261,6 +6623,7 @@ test "initial session grants follow active registry metadata" {
         "/tmp/workspace",
         .{ .id = "provider-glob", .name = "provider_glob", .arguments_json = "{\"pattern\":\"*\"}" },
         "/tmp/workspace/src",
+        shell_snapshot.processOwner().approvalEpoch(),
     );
 
     try std.testing.expectEqual(@as(usize, 4), local_grants.items.len);
@@ -7852,6 +8215,54 @@ test "a question's result is the user's answer, also when toolbox ran it" {
     }
 }
 
+test "a question's answers stored behind a preview are marked for the review only when they are answers" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var batch = runtime_tool_batch.StepBatchState{};
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const direct: ToolCall = .{ .id = "direct", .name = "ask_user_question", .arguments_json = "{}" };
+    const carried: ToolCall = .{ .id = "carried", .name = "ask_user_question", .arguments_json = "{}", .carried_by = "toolbox" };
+    const read: ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{}" };
+    const preview = "[{\"question\":\"Batch decision 01?\",\"answer\":\"Yes\"}";
+    const answered = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    const invalid = "(ask_user_question: invalid arguments; provide {questions})";
+    const stored: types.ToolResultMemory = .{
+        .output_handle = "answers-1",
+        .output_bytes = result_store.large_result_threshold_bytes + 128,
+        .stored_output_bytes = result_store.large_result_threshold_bytes + 128,
+        .truncated = true,
+    };
+    // Fx keeps a short result whole but still saves it with a handle.
+    const kept_whole: types.ToolResultMemory = .{
+        .output_handle = "answers-2",
+        .output_bytes = answered.len,
+        .stored_output_bytes = answered.len,
+    };
+    const cases = [_]struct {
+        call: ToolCall,
+        output: []const u8,
+        memory: ?types.ToolResultMemory = null,
+        status: ?types.PersistedToolStatus = null,
+        stored_answer: bool,
+    }{
+        .{ .call = direct, .output = preview, .memory = stored, .stored_answer = true },
+        .{ .call = carried, .output = preview, .memory = stored, .stored_answer = true },
+        .{ .call = direct, .output = preview, .memory = stored, .status = .failure, .stored_answer = false },
+        .{ .call = read, .output = preview, .memory = stored, .stored_answer = false },
+        .{ .call = direct, .output = answered, .memory = kept_whole, .stored_answer = false },
+        .{ .call = direct, .output = answered, .stored_answer = false },
+        .{ .call = direct, .output = ask_user_question.cancel_sentinel, .stored_answer = false },
+        .{ .call = carried, .output = invalid, .stored_answer = false },
+    };
+    for (cases) |case| {
+        try runtime_tool_batch.appendToolResultContent(arena, &suffix, &completed_tool_names, &batch, case.call, case.output, case.memory, .{ .status = case.status });
+        const message = suffix.items[suffix.items.len - 1];
+        try std.testing.expectEqual(case.stored_answer, message.stored_user_answer);
+    }
+}
+
 test "child live authority refresh denies the next tool action before execution" {
     const alloc = std.testing.allocator;
     const first_calls = [_]ToolCall{
@@ -7874,6 +8285,7 @@ test "child live authority refresh denies the next tool action before execution"
         const allowed_tools = [_][]const u8{"read_file"};
         const integrations = [_][]const u8{"mcp_fixture"};
         var grants = [_]PermissionGrant{.{
+            .shell_epoch = 0,
             .tool_name = @constCast("read_file"),
             .target_path = @constCast("/tmp/workspace/first"),
         }};
@@ -8122,7 +8534,7 @@ test "child live authority allow to ask requires current approval before effect"
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     hooks.permission_decisions = &.{ .once, .once };
-    hooks.permission_human_approvals = &.{ .none, .once };
+    hooks.permission_human_approvals = &.{ command_admission.no_human_approval, .{ .kind = .once, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() } };
     hooks.permission_wait_index = 1;
     hooks.exec_plans = &.{.{ .result = .{ .model_output = "approved result" } }};
 
@@ -8318,6 +8730,34 @@ test "a subagent's always approval of a file change stores the session grant" {
 
 test "a subagent's always approval of a command stores the session grant" {
     try expectChildAlwaysStoresGrant(.command);
+}
+
+test "an always answer to a shell command stores the epoch it was answered in when a refresh lands first" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_always", "shell", "{\"command\":\"zig fmt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.always};
+    hooks.refresh_before_record = true;
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.propagated_grants.items.len);
+    const stored = hooks.propagated_grants.items[0];
+    try std.testing.expectEqual(@as(u64, 0), stored.shell_epoch);
+    try std.testing.expect(!permissions.sessionGrantAllowed(hooks.propagated_grants.items, "run_command", stored.target_path));
 }
 
 /// What a subagent's approval of a call that reads an image kept, as the turn

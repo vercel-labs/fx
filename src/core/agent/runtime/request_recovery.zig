@@ -27,9 +27,12 @@
 //! from the main thread. One fx process runs main, its subagents and other
 //! instances, and each can have a request in flight.
 //!
-//! The module retries every transient failure for as long as it lasts, and fx
-//! adds no limit of its own: only Esc ends a request whose failures keep
-//! coming.
+//! Without a retry budget (`retry_budget_ms == null`), the module retries every
+//! transient failure for as long as it lasts, except for unreadable replies and
+//! OS errors that Zig has no name for: only Esc ends a request whose other
+//! failures keep coming. `fx ask` sets `retry_budget_ms` (5 minutes from the
+//! request's first failure), after which transient failures end the request on
+//! its error.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -78,6 +81,12 @@ pub fn failureKind(cause: types.ModelRecoveryCause) ?Failure.Kind {
 /// that sends one every time is broken, not having a bad moment.
 const max_unreadable_replies = 3;
 
+/// The OS errors that Zig has no name for one request takes before its turn
+/// ends. Their cause is not known, so one that comes back every time is taken
+/// as a defect, not a bad moment on the network. Other network failures in
+/// between do not count.
+const max_unnamed_os_errors = 3;
+
 /// Whether the store now holds a login the waiting request can send, other
 /// than the one the provider refused, as another fx process that signs in
 /// saves.
@@ -94,6 +103,9 @@ pub const RequestRecovery = struct {
     /// for example with Enter. Null on hosts that cannot ask the user, which
     /// end the turn instead (`canAskUser`).
     continue_flag: ?*std.atomic.Value(bool) = null,
+    /// Optional retry budget in milliseconds from a request's first failure.
+    /// Only `fx ask` sets this; null keeps retrying without a time cap.
+    retry_budget_ms: ?u64 = null,
     /// Set by the same host when the sign-in it opened for this request
     /// closes without a new login (`recovery.Event.sign_in_closed`).
     sign_in_closed_flag: ?*std.atomic.Value(bool) = null,
@@ -105,6 +117,9 @@ pub const RequestRecovery = struct {
     /// Replies this request could not read. Touched only by the request's
     /// own thread.
     unreadable_replies: u8 = 0,
+    /// Sends that failed with an OS error Zig has no name for. Touched only
+    /// by the request's own thread.
+    unnamed_os_errors: u8 = 0,
     /// Links the request into `registry` while it is registered. Guarded by
     /// `registry_mutex`, not `mutex`.
     registry_node: std.DoublyLinkedList.Node = .{},
@@ -142,6 +157,11 @@ pub const RequestRecovery = struct {
     /// `closeActive` saved the record marked clean: fx is exiting, and
     /// nothing after that may replace it.
     closed: bool = false,
+    /// What `closeForYield` replaced, so a cancelled restart can put the
+    /// request back (`reopenAfterYield`).
+    before_yield: ?BeforeYield = null,
+    /// The module ended this request because its `retry_budget_ms` passed.
+    budget_exhausted: bool = false,
     next_beat_ms: u64 = 0,
     /// Tests run on this virtual boot clock, so a 30-second wait takes no
     /// real time.
@@ -169,6 +189,8 @@ pub const RequestRecovery = struct {
 
     pub const Resume = types.RecoveryResume;
 
+    const BeforeYield = struct { state: recovery.State, record: ?recovery.Record };
+
     /// A new request, or one resumed. `fast` is the request's Fast
     /// selection, which makes "retrying without Fast" a real option.
     /// Returns the first send, or null when the module asks the user first;
@@ -186,7 +208,13 @@ pub const RequestRecovery = struct {
             debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event=sign_in_closed origin=start reason=nothing_waits_for_it", .{});
         };
         const from = resumed orelse Resume{};
-        return self.event(.{ .start = .{ .fast = fast, .resume_from = from.record, .stale = from.stale, .continues = from.continues } });
+        return self.event(.{ .start = .{
+            .fast = fast,
+            .resume_from = from.record,
+            .stale = from.stale,
+            .continues = from.continues,
+            .retry_budget_ms = self.retry_budget_ms,
+        } });
     }
 
     /// The record for the write just before a send: the module's save for
@@ -270,8 +298,9 @@ pub const RequestRecovery = struct {
     /// The turn stops before this request's send, between steps, for an
     /// upgrade's restart: saves the clean record `closing` returns, as
     /// SIGTERM does, so the next launch continues the request without
-    /// counting a death (`tests/tla/recovery/Resume.tla` Relaunch,
-    /// NoFalseCrashQuestion). Nothing replaces that record afterwards.
+    /// counting a death (`tests/tla/recovery/Resume.tla` Hold,
+    /// NoFalseCrashQuestion). Only a cancelled restart replaces that record
+    /// afterwards (`reopenAfterYield`).
     /// When the clean record does not land, the request stays as it was,
     /// open and with its send's record, so the turn goes on and its next
     /// boundary asks again (`Resume.tla` YieldSaveFails). Returns whether
@@ -299,9 +328,38 @@ pub const RequestRecovery = struct {
             debug_trace.eventf("recovery", "yield_close_failed", self.trace_ctx, "reason=clean_record_not_saved", .{});
             return false;
         }
+        self.before_yield = .{ .state = state_before, .record = record_before };
         self.closed = true;
         debug_trace.eventf("recovery", "closed", self.trace_ctx, "record_written=true", .{});
         return true;
+    }
+
+    pub const ReopenError = error{ NotYielded, RecordNotSaved };
+
+    /// The restart this request's turn stopped for was cancelled: the request
+    /// goes back to how it was before `closeForYield`, and its send's record
+    /// is saved again before the send, so a death during that send counts
+    /// (`tests/tla/recovery/Resume.tla` CancelRestart, CrashLoopAsks). When
+    /// the record does not land, the request stays closed with its clean
+    /// record and this fails, so no send goes out without its record.
+    /// Called on the request's own thread.
+    pub fn reopenAfterYield(self: *RequestRecovery) ReopenError!void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const before = self.before_yield orelse return error.NotYielded;
+        self.before_yield = null;
+        self.state = before.state;
+        self.record = before.record;
+        self.record_written = false;
+        self.closed = false;
+        self.writeRecordLocked();
+        if (!self.record_written) {
+            self.closed = true;
+            debug_trace.eventf("recovery", "yield_reopen_failed", self.trace_ctx, "reason=send_record_not_saved", .{});
+            return error.RecordNotSaved;
+        }
+        debug_trace.eventf("recovery", "reopened", self.trace_ctx, "reason=restart_cancelled", .{});
     }
 
     /// Whether this request's record is in the session log, so a turn
@@ -348,16 +406,26 @@ pub const RequestRecovery = struct {
         return self.deliverAnswer(.user_continue, "host");
     }
 
+    /// Whether the request ended because its `retry_budget_ms` passed.
+    pub fn budgetExhausted(self: *RequestRecovery) bool {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.budget_exhausted;
+    }
+
     /// Waits for the module's next send, delivering `tick` every
     /// `wait_tick_ms`, `user_continue` when the continue flag is set or
     /// `sign_in_renewed` finds a new login, and `sign_in_closed` when the
-    /// sign-in closed flag is set. Returns null when the cancel flag is set;
-    /// the caller then runs its cancel path, which calls `cancel`.
+    /// sign-in closed flag is set. Returns null when the cancel flag is set
+    /// or the retry budget already ended the request; the caller checks
+    /// `budgetExhausted` before running its cancel path.
     pub fn waitForSend(self: *RequestRecovery) !?Send {
         var next_tick_ms = self.nowMs() +| wait_tick_ms;
         var next_sign_in_check_ms = self.nowMs() +| sign_in_check_ms;
         while (true) {
             if (self.cancel_flag.load(.seq_cst)) return null;
+            if (self.budgetExhausted()) return null;
             if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
                 if (try self.deliverAnswer(.user_continue, "wait")) |send| return send;
             };
@@ -490,6 +558,14 @@ pub const RequestRecovery = struct {
         return self.unreadable_replies >= max_unreadable_replies;
     }
 
+    /// Counts a send that failed with an OS error Zig has no name for, and
+    /// says whether it is the last one: at `max_unnamed_os_errors` the turn
+    /// ends with the error instead of another resend.
+    pub fn unnamedOsErrorEndsRequest(self: *RequestRecovery) bool {
+        self.unnamed_os_errors +|= 1;
+        return self.unnamed_os_errors >= max_unnamed_os_errors;
+    }
+
     pub fn attempt(self: *RequestRecovery) u16 {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
@@ -620,6 +696,7 @@ pub const RequestRecovery = struct {
     /// the plan's send, which the caller carries out.
     fn stepLocked(self: *RequestRecovery, value: recovery.Event) !?Send {
         switch (value) {
+            .start => self.budget_exhausted = false,
             .failed => |failure| self.last_failure = failure.kind,
             else => {},
         }
@@ -657,6 +734,25 @@ pub const RequestRecovery = struct {
             },
             // The turn ends cancelled, which ends its record too.
             .cancelled => self.recovery_shown = false,
+            // The retry budget passed (`fx ask`): drop any saved record and
+            // keep `recovery_shown` set so `endWithError` emits `failed` even
+            // when the first failure exceeded the budget.
+            .failed => {
+                if (self.record_live) {
+                    debug_trace.eventf("recovery", "record_dropped", self.trace_ctx, "reason=retry_budget_exhausted cause={s} attempt={d}", .{
+                        if (self.last_failure) |cause| @tagName(cause) else "none",
+                        self.attempts,
+                    });
+                    _ = self.saveLocked(.clear);
+                }
+                self.recovery_shown = true;
+                self.budget_exhausted = true;
+                debug_trace.eventf("recovery", "retry_budget_exhausted", self.trace_ctx, "cause={s} attempt={d} budget_ms={d}", .{
+                    if (self.last_failure) |cause| @tagName(cause) else "none",
+                    self.attempts,
+                    self.retry_budget_ms orelse 0,
+                });
+            },
         };
         return plan.send;
     }
@@ -1452,6 +1548,61 @@ test "a yield whose clean record does not land leaves the request open with its 
     try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
 }
 
+test "a cancelled restart reopens the request and saves its send's record again" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = (try request.start(false, null)).?;
+    const send_write = request.sendRecord();
+    try std.testing.expect(send_write == .save);
+    const sent = send_write.save;
+    fake.recovery_record = sent;
+    try std.testing.expect(request.closeForYield());
+    const clean = fake.recovery_record.?;
+
+    try request.reopenAfterYield();
+    try std.testing.expect(!std.mem.eql(u8, &clean, &fake.recovery_record.?));
+    try std.testing.expectEqual(sent, fake.recovery_record.?);
+    try std.testing.expect(request.recordSaved());
+}
+
+test "a reopen whose send record does not land fails and keeps the request closed" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = (try request.start(false, null)).?;
+    const send_write = request.sendRecord();
+    try std.testing.expect(send_write == .save);
+    fake.recovery_record = send_write.save;
+    try std.testing.expect(request.closeForYield());
+    const clean = fake.recovery_record.?;
+
+    fake.recovery_record_save_failures = 1;
+    try std.testing.expectError(error.RecordNotSaved, request.reopenAfterYield());
+    try std.testing.expect(!request.recordSaved());
+    try std.testing.expectEqual(clean, fake.recovery_record.?);
+}
+
+test "a request that never yielded cannot be reopened" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = (try request.start(false, null)).?;
+    try std.testing.expectError(error.NotYielded, request.reopenAfterYield());
+}
+
 test "closing saves a clean record for every request in flight" {
     var main_fake = recordingFake();
     defer main_fake.deinit();
@@ -1653,4 +1804,39 @@ test "ten thousand failures in a row keep every wait within its cap and never st
     }
     try std.testing.expect(longest >= 24_000);
     _ = try request.cancel();
+}
+
+test "a retry budget ends transient retries and emits failed status even on the first failure" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.retry_budget_ms = 1_500;
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    _ = try request.failed(.{ .kind = .server });
+    try std.testing.expect(!request.budgetExhausted());
+    _ = (try request.waitForSend()) orelse return error.TestExpectedSend;
+    _ = try request.failed(.{ .kind = .server });
+    try std.testing.expect(request.budgetExhausted());
+    try std.testing.expectEqual(@as(?Send, null), try request.waitForSend());
+    request.endWithError();
+    const last = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.failed, last.kind);
+    try std.testing.expectEqual(@as(?Failure.Kind, .server), last.failure);
+
+    // An oversized Retry-After on attempt 1 ends at once with cause rate_limited.
+    var immediate = RequestRecovery.init(&deps, &cancel_flag, .{});
+    immediate.retry_budget_ms = 300_000;
+    defer immediate.deinit();
+    _ = try immediate.start(false, null);
+    _ = try immediate.failed(.{ .kind = .rate_limited, .retry_after_ms = 300_001 });
+    try std.testing.expect(immediate.budgetExhausted());
+    immediate.endWithError();
+    const ended = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.failed, ended.kind);
+    try std.testing.expectEqual(@as(?Failure.Kind, .rate_limited), ended.failure);
+    try std.testing.expectEqual(@as(usize, 1), ended.attempt);
 }

@@ -19,7 +19,7 @@ const AuthoritySource = enum {
     legacy_migration,
 };
 
-const AuthorityMarker = struct {
+pub const AuthorityMarker = struct {
     session_id: []u8,
     authority_id: session_event.Identifier,
     source: AuthoritySource,
@@ -30,24 +30,6 @@ const AuthorityMarker = struct {
     }
 };
 
-fn classifyMarker(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-) !?AuthorityClassification {
-    try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
-    const marker = try loadAuthorityMarkerOptional(alloc, session_dir);
-    if (marker) |marker_value| {
-        var owned = marker_value;
-        defer owned.deinit(alloc);
-        if (!std.mem.eql(u8, owned.session_id, session_id)) {
-            return error.InvalidSessionFormat;
-        }
-        return .schema_v3;
-    }
-    return null;
-}
-
 /// Classifies a session as schema-v3 or legacy. A directory with no marker but
 /// a complete prepared schema-v3 manifest is a creation orphan and reported as
 /// `error.SessionNotFound` (it must not be read as legacy).
@@ -56,13 +38,30 @@ pub fn classifyAuthority(
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
 ) !AuthorityClassification {
-    if (try classifyMarker(alloc, session_dir, session_id)) |classification| {
-        return classification;
+    var marker = (try loadClassifiedAuthorityMarker(alloc, session_dir, session_id)) orelse return .legacy;
+    marker.deinit(alloc);
+    return .schema_v3;
+}
+
+/// `classifyAuthority` that keeps the schema-v3 marker it read, so the caller
+/// need not read `authority.json` again; null for a legacy session. Caller
+/// owns the returned marker.
+pub fn loadClassifiedAuthorityMarker(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+) !?AuthorityMarker {
+    try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
+    if (try loadAuthorityMarkerOptional(alloc, session_dir)) |marker| {
+        var owned = marker;
+        errdefer owned.deinit(alloc);
+        if (!std.mem.eql(u8, owned.session_id, session_id)) return error.InvalidSessionFormat;
+        return owned;
     }
     if (try isPreparedCreationOrphan(alloc, session_dir, session_id)) {
         return error.SessionNotFound;
     }
-    return .legacy;
+    return null;
 }
 
 fn isPreparedCreationOrphan(

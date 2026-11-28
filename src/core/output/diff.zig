@@ -392,6 +392,175 @@ pub const FileReview = struct {
     }
 };
 
+/// A review that owns the text it reads, so a screen can keep it after the tool
+/// call that built it has ended (`approval_prompt.zig` keeps one). `review`'s
+/// own arrays are freed by its `deinit`; `owned` holds the text those arrays
+/// point into.
+pub const OwnedReview = struct {
+    review: FileReview,
+    owned: union(enum) {
+        /// Every row's text, in row order, which each row points into.
+        computed: []u8,
+        /// The two file texts the fallback mode reads its rows from.
+        fallback: struct { old: []u8, new: []u8 },
+    },
+
+    pub fn init(alloc: Allocator, source: *const FileReview) Allocator.Error!OwnedReview {
+        switch (source.mode) {
+            .computed => |lines| {
+                var text_bytes: usize = 0;
+                for (lines) |line| text_bytes += line.text.len;
+                const text = try alloc.alloc(u8, text_bytes);
+                errdefer alloc.free(text);
+                const copy = try alloc.alloc(DiffLine, lines.len);
+                errdefer alloc.free(copy);
+                var at: usize = 0;
+                for (lines, 0..) |line, index| {
+                    const owned = text[at..][0..line.text.len];
+                    @memcpy(owned, line.text);
+                    at += line.text.len;
+                    copy[index] = line;
+                    copy[index].text = owned;
+                }
+                return .{
+                    .review = .{
+                        .mode = .{ .computed = copy },
+                        .additions = source.additions,
+                        .deletions = source.deletions,
+                    },
+                    .owned = .{ .computed = text },
+                };
+            },
+            .fallback => |fallback| {
+                const old_text = try alloc.dupe(u8, fallback.old_text);
+                errdefer alloc.free(old_text);
+                const new_text = try alloc.dupe(u8, fallback.new_text);
+                errdefer alloc.free(new_text);
+                const old_starts = try alloc.alloc(usize, fallback.old_line_starts.len);
+                errdefer alloc.free(old_starts);
+                @memcpy(old_starts, fallback.old_line_starts);
+                const new_starts = try alloc.alloc(usize, fallback.new_line_starts.len);
+                errdefer alloc.free(new_starts);
+                @memcpy(new_starts, fallback.new_line_starts);
+                var copied = fallback;
+                copied.old_text = old_text;
+                copied.new_text = new_text;
+                copied.old_line_starts = old_starts;
+                copied.new_line_starts = new_starts;
+                return .{
+                    .review = .{
+                        .mode = .{ .fallback = copied },
+                        .additions = source.additions,
+                        .deletions = source.deletions,
+                    },
+                    .owned = .{ .fallback = .{ .old = old_text, .new = new_text } },
+                };
+            },
+        }
+    }
+
+    pub fn deinit(self: *OwnedReview, alloc: Allocator) void {
+        self.review.deinit(alloc);
+        switch (self.owned) {
+            .computed => |text| alloc.free(text),
+            .fallback => |text| {
+                alloc.free(text.old);
+                alloc.free(text.new);
+            },
+        }
+        self.* = undefined;
+    }
+
+    pub fn view(self: *const OwnedReview) *const FileReview {
+        return &self.review;
+    }
+};
+
+fn captureRowTexts(alloc: Allocator, review: *const FileReview, limit: usize) ![][]u8 {
+    const viewport = try review.viewport(alloc, 0, limit);
+    defer alloc.free(viewport.lines);
+    const texts = try alloc.alloc([]u8, viewport.lines.len);
+    var filled: usize = 0;
+    errdefer {
+        for (texts[0..filled]) |text| alloc.free(text);
+        alloc.free(texts);
+    }
+    for (viewport.lines, 0..) |line, index| {
+        texts[index] = try alloc.dupe(u8, line.text);
+        filled = index + 1;
+    }
+    return texts;
+}
+
+fn freeRowTexts(alloc: Allocator, texts: [][]u8) void {
+    for (texts) |text| alloc.free(text);
+    alloc.free(texts);
+}
+
+fn expectSameRowTexts(alloc: Allocator, review: *const FileReview, expected: [][]u8) !void {
+    const actual = try captureRowTexts(alloc, review, expected.len);
+    defer freeRowTexts(alloc, actual);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "an owned review keeps its rows after the review it copied is freed" {
+    const alloc = std.testing.allocator;
+    var source = try FileReview.init(alloc, "one\ntwo\n", "one\nTWO\n");
+    var owned = try OwnedReview.init(alloc, &source);
+    defer owned.deinit(alloc);
+
+    const rows = source.rowCount();
+    try std.testing.expectEqual(rows, owned.view().rowCount());
+    const expected = try captureRowTexts(alloc, &source, rows);
+    defer freeRowTexts(alloc, expected);
+
+    source.deinit(alloc);
+    try expectSameRowTexts(alloc, owned.view(), expected);
+}
+
+test "an owned review keeps a fallback review's rows after the source is freed" {
+    const alloc = std.testing.allocator;
+    const line_count = canonical_max_indexed_lines + 1;
+    const text = try alloc.alloc(u8, line_count * 2);
+    defer alloc.free(text);
+    for (0..line_count) |index| text[index * 2 ..][0..2].* = "x\n".*;
+
+    var source = try FileReview.init(alloc, "", text);
+    try std.testing.expectEqual(std.meta.Tag(@TypeOf(source.mode)).fallback, std.meta.activeTag(source.mode));
+    var owned = try OwnedReview.init(alloc, &source);
+    defer owned.deinit(alloc);
+
+    try std.testing.expectEqual(source.rowCount(), owned.view().rowCount());
+    const expected = try captureRowTexts(alloc, &source, max_preview_lines);
+    defer freeRowTexts(alloc, expected);
+
+    source.deinit(alloc);
+    try expectSameRowTexts(alloc, owned.view(), expected);
+}
+
+test "an owned review copies a review at the fallback limit with the same rows" {
+    const alloc = std.testing.allocator;
+    const Case = struct { lines: usize, mode: std.meta.Tag(@TypeOf(@as(FileReview, undefined).mode)) };
+    const cases = [_]Case{
+        .{ .lines = canonical_max_indexed_lines, .mode = .computed },
+        .{ .lines = canonical_max_indexed_lines + 1, .mode = .fallback },
+    };
+    for (cases) |case| {
+        const text = try alloc.alloc(u8, case.lines * 2);
+        defer alloc.free(text);
+        for (0..case.lines) |index| text[index * 2 ..][0..2].* = "y\n".*;
+        var source = try FileReview.init(alloc, "", text);
+        defer source.deinit(alloc);
+        try std.testing.expectEqual(case.mode, std.meta.activeTag(source.mode));
+        var owned = try OwnedReview.init(alloc, &source);
+        defer owned.deinit(alloc);
+        try std.testing.expectEqual(case.mode, std.meta.activeTag(owned.view().mode));
+        try std.testing.expectEqual(source.rowCount(), owned.view().rowCount());
+        try std.testing.expectEqual(source.additions, owned.view().additions);
+    }
+}
+
 pub const FileReviewError = error{
     OutOfMemory,
     ArithmeticOverflow,
