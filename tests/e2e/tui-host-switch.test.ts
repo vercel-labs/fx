@@ -4884,10 +4884,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   // test decides: `again` holds main's, `typed` fails the user's. `run` starts
   // once `broken` and `fine` have ended and `cut` still works.
   async function withEndedSubagents(
-    run: (session: TmuxSession, context: Run, gates: { cut: ReturnType<typeof held>; again: ReturnType<typeof held> }, reports: () => ReportSeen[], trace: () => string) => Promise<void>,
+    run: (session: TmuxSession, context: Run, gates: { cut: ReturnType<typeof held>; again: ReturnType<typeof held>; againSteps: () => number }, reports: () => ReportSeen[], trace: () => string) => Promise<void>,
     options: { trace?: boolean } = {},
   ) {
-    const gates = { cut: held(), again: held() };
+    let againSteps = 0;
+    let unexpectedMainReplies = 0;
+    const gates = { cut: held(), again: held(), againSteps: () => againSteps };
     // With `trace`, fx writes its trace log, which `run` reads as its last argument.
     let tracePath = "";
     const env: Record<string, string> = {};
@@ -4927,12 +4929,6 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         if (body.includes('"ended_again_broken"') && !body.includes("ENDED_MAIN_AGAIN")) {
           return text("main_again", "ENDED_MAIN_AGAIN");
         }
-        if (latestUserText(body).includes("ENDED_AGAIN")) {
-          return messageSteps([
-            { id: "ended_again_broken", agent: "broken", message: "ENDED_AGAIN try once more" },
-            { id: "ended_again_cut", agent: "cut", message: "ENDED_AGAIN start over" },
-          ]);
-        }
         if (!body.includes('"ended_broken"')) {
           return messageSteps([
             { id: "ended_broken", agent: "broken", message: "ENDED_BROKEN run the bench" },
@@ -4942,9 +4938,19 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         }
         // Main's second request (the tool-result turn after starting the three)
         // must still answer ENDED_MAIN_WAITING even if a child report already
-        // joined at the boundary before it was sent.
+        // joined at the boundary before it was sent; and report turns checked
+        // before ENDED_AGAIN ensure a child's ENDED_AGAIN_DONE report never
+        // re-triggers the again steps.
         if (!body.includes("ENDED_MAIN_WAITING")) return text("main_wait", "ENDED_MAIN_WAITING");
         if (latestUserText(body).includes('"child_id"')) return text(`main_saw_${reported.size}`, "ENDED_MAIN_SAW");
+        if (latestUserText(body).includes("ENDED_AGAIN")) {
+          againSteps += 1;
+          return messageSteps([
+            { id: "ended_again_broken", agent: "broken", message: "ENDED_AGAIN try once more" },
+            { id: "ended_again_cut", agent: "cut", message: "ENDED_AGAIN start over" },
+          ]);
+        }
+        unexpectedMainReplies += 1;
         return text("main_unexpected", "ENDED_MAIN_UNEXPECTED");
       }, async (session, context) => {
         await session.sendText("SWITCH_USER start the team");
@@ -4958,6 +4964,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         }
         await session.waitForComposer(30_000);
         await run(session, context, gates, () => [...reported.values()], trace);
+        expect(unexpectedMainReplies).toBe(0);
       }, (home) => {
         if (!options.trace) return;
         tracePath = join(home, "fx-trace.log");
@@ -5113,7 +5120,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   test(
     "a subagent's next turn says working, and a later turn that completes clears its failed or stopped state",
     async () => {
-      await withEndedSubagents(async (session, _context, gates) => {
+      await withEndedSubagents(async (session, _context, gates, reports) => {
         await stopCut(session);
         // They start out as the last turn left them.
         await session.sendKeys("C-x");
@@ -5144,6 +5151,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           expect(cleared).not.toMatch(subagentRow(name, "failed"));
           expect(cleared).not.toMatch(subagentRow(name, "stopped"));
         }
+        await until("both again reports reach main", () =>
+          reports().filter((report) => report.outcome === "completed").length >= 3, 15_000);
+        expect(gates.againSteps()).toBe(1);
       });
     },
     TIMEOUT,
