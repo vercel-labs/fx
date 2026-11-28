@@ -3,8 +3,9 @@
 //! `~/.fx/monitors/<session-id>/`, one `<monitor-id>.log` for each monitor. A
 //! file that reaches `max_file_bytes` becomes `<monitor-id>.log.1`, replacing
 //! the one before it, so a monitor keeps its newest output in at most twice
-//! that size. A normal quit, a new conversation, and the restart note remove
-//! the session's folder.
+//! that size. A normal quit and a new conversation remove the session's
+//! folder. A crash or a Ctrl+G restart leaves it, so the resumed session can
+//! still read what the monitors printed; its next normal quit removes it.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
