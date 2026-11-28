@@ -2308,6 +2308,10 @@ fn promptPermissionOutcome(
         if (response.decision == .always) .interactive_always else .interactive_once,
         shell_epoch,
     );
+    // A reload call starts its own startup files, so no earlier epoch binds it.
+    if (!shellCallRequestsReload(arena, call)) {
+        outcome = withShellGrantEpoch(outcome, shell_epoch);
+    }
     outcome.auto_review_result = auto_review_result;
     return outcome;
 }
