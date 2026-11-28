@@ -1,0 +1,553 @@
+{
+  "english": [
+    "Fix the failing test.",
+    "Why does zig build fail here?",
+    {
+      "text": "Don't touch lockfile parsing.",
+      "word": false
+    },
+    "Please add a unit test for the parser.",
+    "The build is broken on main again.",
+    "Can you explain what this function does?",
+    "Rename the flag to --no-save and update the docs.",
+    "Why is the TUI flickering after a resize?",
+    "Run the tests and tell me what failed.",
+    "What does this error mean: FileNotFound?",
+    "I think the retry logic is wrong. Can you check it?",
+    "Add a changelog entry for this fix.",
+    "Where is the session file written?",
+    "Remove the dead code in the gateway client.",
+    "Make the fake gateway return a 429 once, then succeed.",
+    "Please review my diff before I push.",
+    "Why are there two copies of this helper?",
+    "The CI job fails with a timeout. What should I check?",
+    "Summarize what changed in the last three commits.",
+    "Could you split this function into smaller ones?",
+    {
+      "text": "It crashes on startup when HOME is unset.",
+      "word": false
+    },
+    "How do I run only one test in this file?",
+    "Update the README so it matches the new flag names.",
+    "Let's fix the flaky resize test first.",
+    {
+      "text": "We can't reproduce it on Linux.",
+      "word": false
+    },
+    "I haven't touched the parser since Monday.",
+    "That test should not depend on the clock.",
+    "Check whether the cache is cleared when the profile changes.",
+    "Why does it hang when stdin is closed?",
+    "Show me where the permission check happens.",
+    "Fix typo in the help text.",
+    "Revert the last commit but keep the tests.",
+    "Please don't change the public API.",
+    "What would break if we removed this field?",
+    "This is slower than before. Can you profile it?",
+    "Which tests cover the permission prompt?",
+    "Add a --json flag to the status command.",
+    "Is the cache shared between sessions?",
+    "Why did you delete that file?",
+    "Tell me how the retry loop decides to stop.",
+    "Fix the failing test and explain why it failed.",
+    "Write a test that fails without this change.",
+    "I need the exit code to be 2 on usage errors.",
+    "These logs are too noisy. Reduce them.",
+    "Those two branches look identical to me.",
+    "What happens if the server closes the connection mid-stream?",
+    "Could you check why memory grows during a long turn?",
+    "Should I squash these commits before merging?",
+    "Would it be safe to bump the timeout?",
+    "You changed the wrong file. Undo it please.",
+    "Fix the lint errors in src/core.",
+    "Please explain this stack trace.",
+    "The tests pass locally but fail in CI. Why?",
+    "Move the helper into the shared folder.",
+    "Give me a short summary of this PR.",
+    "How long does the startup take now?",
+    "Look at the diff and tell me if anything looks risky.",
+    "Search the repo for uses of the old name.",
+    "The cursor jumps when I paste text.",
+    "Why is this test skipped on macOS?",
+    "That fix is not enough. The bug is still there.",
+    "Add retries to the upload, but only for 5xx errors.",
+    "Please keep the change small.",
+    "Don't run the full suite. Just the focused tests.",
+    "Rebuild and rerun the tests.",
+    "Who calls this function, and why?",
+    "Open the file and show me line 40.",
+    "Then check what the logs say.",
+    "Is it okay to delete the old fixtures?",
+    {
+      "text": "fix flaky test",
+      "word": false,
+      "bare": true
+    },
+    {
+      "text": "run zig build",
+      "word": false,
+      "bare": true
+    },
+    {
+      "text": "Fix lockfile parsing.",
+      "word": false,
+      "bare": true
+    },
+    {
+      "text": "Run zig build. Then tell me why the lockfile is broken.",
+      "bare": true
+    },
+    {
+      "text": "Translate the error message into Korean.",
+      "switch": true
+    },
+    "Ask José to review the lockfile.",
+    {
+      "text": "Ask José to review the lockfile.",
+      "form": "decomposed"
+    },
+    "Please check the lockfile\rWhy does it break again?",
+    "Why does the parser fail\u2028Please read the log.",
+    "Please check the lockfile\fWhy does it break again?"
+  ],
+  "other": [
+    {
+      "lang": "nl",
+      "text": "Kunnen we dit vandaag nog oplossen? The lockfile is broken again.",
+      "shared": "we"
+    },
+    {
+      "lang": "nl",
+      "text": "Is dit een bug of een feature? Error: the build failed after this change.",
+      "shared": "of"
+    },
+    {
+      "lang": "nl",
+      "text": "Praat even over de nieuwe build. Here is the log: the parser crashed on this input.",
+      "shared": "over"
+    },
+    {
+      "lang": "nl",
+      "text": "Let goed op de volgorde van de tests. What does this stack trace mean?",
+      "shared": "let"
+    },
+    {
+      "lang": "nl",
+      "text": "Hij had de test nooit gedraaid. Please check why the test fails.",
+      "shared": "had"
+    },
+    {
+      "lang": "nl",
+      "text": "Vertaal dit naar het Koreaans of Japans. The cache is not cleared when you switch the profile.",
+      "shared": "of"
+    },
+    {
+      "lang": "nl",
+      "text": "Ik heb het been gebroken tijdens het testen. The lockfile is broken again.",
+      "shared": "been"
+    },
+    {
+      "lang": "nl",
+      "text": "Ons team won de benchmark. Error: the build failed after this change.",
+      "shared": "won"
+    },
+    {
+      "lang": "nl",
+      "text": "Open de haven voor de nieuwe service. Here is the log: the parser crashed on this input.",
+      "shared": "haven"
+    },
+    {
+      "lang": "nl",
+      "text": "Waarom faalt de build op CI? What does this stack trace mean?"
+    },
+    {
+      "lang": "nl",
+      "text": "Controleer of de cache wordt geleegd. Please check why the test fails.",
+      "shared": "of"
+    },
+    {
+      "lang": "de",
+      "text": "Ich will das Problem verstehen. The cache is not cleared when you switch the profile.",
+      "shared": "will"
+    },
+    {
+      "lang": "de",
+      "text": "Also gut, dann pruefen wir das. The lockfile is broken again.",
+      "shared": "also"
+    },
+    {
+      "lang": "de",
+      "text": "All diese Tests laufen zu langsam. Error: the build failed after this change.",
+      "shared": "all"
+    },
+    {
+      "lang": "de",
+      "text": "Such den Fehler in der Datei. Here is the log: the parser crashed on this input.",
+      "shared": "such"
+    },
+    {
+      "lang": "de",
+      "text": "Her damit, ich schaue es mir an. What does this stack trace mean?",
+      "shared": "her"
+    },
+    {
+      "lang": "de",
+      "text": "Warum schlaegt der Build fehl? Please check why the test fails."
+    },
+    {
+      "lang": "de",
+      "text": "Kannst du bitte den Test reparieren? The cache is not cleared when you switch the profile."
+    },
+    {
+      "lang": "tr",
+      "text": "Her gun yeni bir hata cikiyor. The lockfile is broken again.",
+      "shared": "her"
+    },
+    {
+      "lang": "tr",
+      "text": "Can bey bu dosyayi inceledi mi? Error: the build failed after this change.",
+      "shared": "can"
+    },
+    {
+      "lang": "tr",
+      "text": "Bu not defterine yazilmali. Here is the log: the parser crashed on this input.",
+      "shared": "not"
+    },
+    {
+      "lang": "tr",
+      "text": "Bu his cok garip. What does this stack trace mean?",
+      "shared": "his"
+    },
+    {
+      "lang": "tr",
+      "text": "Bu testi neden calistiramiyorum? Please check why the test fails."
+    },
+    {
+      "lang": "tr",
+      "text": "Lutfen bu hatayi duzeltir misin? The cache is not cleared when you switch the profile."
+    },
+    {
+      "lang": "cs",
+      "text": "Mohl by to nekdo zkontrolovat? The lockfile is broken again.",
+      "shared": "by to"
+    },
+    {
+      "lang": "cs",
+      "text": "Pred par let to fungovalo. Error: the build failed after this change.",
+      "shared": "let to"
+    },
+    {
+      "lang": "cs",
+      "text": "My to opravime zitra. Here is the log: the parser crashed on this input.",
+      "shared": "my to"
+    },
+    {
+      "lang": "cs",
+      "text": "Proc test selhava na CI? What does this stack trace mean?"
+    },
+    {
+      "lang": "cs",
+      "text": "Prosim zkontroluj tento build. Please check why the test fails."
+    },
+    {
+      "lang": "pl",
+      "text": "Sprawdz to w pliku konfiguracyjnym. The cache is not cleared when you switch the profile.",
+      "shared": "to"
+    },
+    {
+      "lang": "pl",
+      "text": "My musimy to jeszcze sprawdzic. The lockfile is broken again.",
+      "shared": "my to"
+    },
+    {
+      "lang": "pl",
+      "text": "Same testy nic nie sprawdzaja. Error: the build failed after this change.",
+      "shared": "same"
+    },
+    {
+      "lang": "pl",
+      "text": "Powiedz my jak to dziala w korejskim. Here is the log: the parser crashed on this input.",
+      "shared": "my to"
+    },
+    {
+      "lang": "pl",
+      "text": "Dlaczego ten test nie przechodzi? What does this stack trace mean?"
+    },
+    {
+      "lang": "pl",
+      "text": "Mozesz poprawic ten blad w parserze? Please check why the test fails."
+    },
+    {
+      "lang": "es",
+      "text": "Tu has cambiado el archivo de configuracion. The cache is not cleared when you switch the profile.",
+      "shared": "has"
+    },
+    {
+      "lang": "es",
+      "text": "Don Pablo revisa el codigo hoy. The lockfile is broken again.",
+      "shared": "don"
+    },
+    {
+      "lang": "es",
+      "text": "Traduce esto al coreano. Error: the build failed after this change."
+    },
+    {
+      "lang": "es",
+      "text": "Por que falla la compilacion en CI? Here is the log: the parser crashed on this input."
+    },
+    {
+      "lang": "es",
+      "text": "Puedes revisar este cambio antes de subirlo? What does this stack trace mean?"
+    },
+    {
+      "lang": "pt",
+      "text": "Se for preciso, reinicie o servidor. Please check why the test fails.",
+      "shared": "for"
+    },
+    {
+      "lang": "pt",
+      "text": "Por que o teste falha no CI? The cache is not cleared when you switch the profile."
+    },
+    {
+      "lang": "pt",
+      "text": "Voce pode corrigir esse bug amanha? The lockfile is broken again."
+    },
+    {
+      "lang": "fr",
+      "text": "Or, le test echoue toujours. Error: the build failed after this change.",
+      "shared": "or"
+    },
+    {
+      "lang": "fr",
+      "text": "Le but est de corriger ce test. Here is the log: the parser crashed on this input.",
+      "shared": "but"
+    },
+    {
+      "lang": "fr",
+      "text": "Pourquoi le build echoue-t-il sur CI? What does this stack trace mean?"
+    },
+    {
+      "lang": "fr",
+      "text": "Peux-tu relire ce correctif avant la fusion? Please check why the test fails."
+    },
+    {
+      "lang": "fr",
+      "text": "Je ne sais pas pourquoi ca marche. The cache is not cleared when you switch the profile."
+    },
+    {
+      "lang": "it",
+      "text": "Traduci i file in coreano. The lockfile is broken again."
+    },
+    {
+      "lang": "it",
+      "text": "All'inizio il test passava ancora. Error: the build failed after this change.",
+      "shared": "all"
+    },
+    {
+      "lang": "it",
+      "text": "Perche il test fallisce su CI? Here is the log: the parser crashed on this input."
+    },
+    {
+      "lang": "it",
+      "text": "Puoi controllare questo errore adesso? What does this stack trace mean?"
+    },
+    {
+      "lang": "id",
+      "text": "Terjemahkan ke bahasa Korea. Please check why the test fails."
+    },
+    {
+      "lang": "id",
+      "text": "Tolong periksa file ini sekarang. The cache is not cleared when you switch the profile."
+    },
+    {
+      "lang": "id",
+      "text": "Kenapa build gagal di CI? The lockfile is broken again."
+    },
+    {
+      "lang": "id",
+      "text": "Bisa kamu tambahkan test untuk ini? Error: the build failed after this change."
+    },
+    {
+      "lang": "vi",
+      "text": "Ban can sua loi nay ngay. Here is the log: the parser crashed on this input.",
+      "shared": "can"
+    },
+    {
+      "lang": "vi",
+      "text": "Giao dien than thien voi nguoi dung. What does this stack trace mean?",
+      "shared": "than"
+    },
+    {
+      "lang": "vi",
+      "text": "Hay them mot dong vao file nay. Please check why the test fails.",
+      "shared": "them"
+    },
+    {
+      "lang": "vi",
+      "text": "Chi con it viec de lam. The cache is not cleared when you switch the profile.",
+      "shared": "it"
+    },
+    {
+      "lang": "vi",
+      "text": "Tai sao build bi loi tren CI? The lockfile is broken again."
+    },
+    {
+      "lang": "da",
+      "text": "Det er for langsomt i dag. Error: the build failed after this change.",
+      "shared": "for"
+    },
+    {
+      "lang": "da",
+      "text": "Vi skal have den nye version ud. Here is the log: the parser crashed on this input.",
+      "shared": "have"
+    },
+    {
+      "lang": "sv",
+      "text": "Det kraschar under installationen. What does this stack trace mean?",
+      "shared": "under"
+    },
+    {
+      "lang": "sv",
+      "text": "Det var just det jag menade. Please check why the test fails.",
+      "shared": "just"
+    },
+    {
+      "lang": "sv",
+      "text": "Kan du fixa testet i dag? The cache is not cleared when you switch the profile."
+    },
+    {
+      "lang": "ca",
+      "text": "Us enviare el resum de la prova. The lockfile is broken again.",
+      "shared": "us"
+    },
+    {
+      "lang": "ca",
+      "text": "Be, ara ho revisem tot junts. Error: the build failed after this change.",
+      "shared": "be"
+    },
+    {
+      "lang": "ca",
+      "text": "Aquest any no hi ha errors. Here is the log: the parser crashed on this input.",
+      "shared": "any"
+    },
+    {
+      "lang": "ro",
+      "text": "Aplicatia are o eroare noua. What does this stack trace mean?",
+      "shared": "are"
+    },
+    {
+      "lang": "sl",
+      "text": "Ali more koda delovati brez tega? Please check why the test fails.",
+      "shared": "more"
+    },
+    {
+      "lang": "vi",
+      "text": "Dịch giúp tôi nội dung này. The cache is not cleared when you switch the profile."
+    },
+    {
+      "lang": "fr",
+      "text": "Réponds vite, s'il te plaît. The lockfile is broken again."
+    },
+    {
+      "lang": "pl",
+      "text": "Zrób to dla mnie. Error: the build failed after this change.",
+      "shared": "to"
+    },
+    {
+      "lang": "de",
+      "text": "Prüfe bitte diese Datei. Here is the log: the parser crashed on this input."
+    },
+    {
+      "lang": "tr",
+      "text": "Bu hatayı düzeltir misin? What does this stack trace mean?"
+    },
+    {
+      "lang": "cs",
+      "text": "Zkontrolujte prosím tento soubor. Please check why the test fails."
+    },
+    {
+      "lang": "vi",
+      "text": "Dịch giúp tôi nội dung này. The cache is not cleared when you switch the profile.",
+      "form": "decomposed"
+    },
+    {
+      "lang": "fr",
+      "text": "Réponds vite, s'il te plaît. The lockfile is broken again.",
+      "form": "decomposed"
+    },
+    {
+      "lang": "pl",
+      "text": "Zrób to dla mnie. Error: the build failed after this change.",
+      "shared": "to",
+      "form": "decomposed"
+    },
+    {
+      "lang": "de",
+      "text": "Prüfe bitte diese Datei. Here is the log: the parser crashed on this input.",
+      "form": "decomposed"
+    },
+    {
+      "lang": "tr",
+      "text": "Bunu Can'a Korece yaz. The lockfile is broken again.",
+      "stem": "can"
+    },
+    {
+      "lang": "tr",
+      "text": "Bunu Can’a Korece yaz. Error: the build failed after this change.",
+      "stem": "can"
+    },
+    {
+      "lang": "tr",
+      "text": "Bunu Can'a ve Ali'ye Korece anlat. Please check why the test fails.",
+      "stem": "can"
+    },
+    {
+      "lang": "id",
+      "text": "Terjemahkan\u00a0ke\u00a0bahasa\u00a0Korea. The lockfile is broken again."
+    },
+    {
+      "lang": "id",
+      "text": "Terjemahkan\u202fke\u202fbahasa\u202fKorea. Here is the log: the parser crashed on this input."
+    },
+    {
+      "lang": "id",
+      "text": "Tolong\u3000terjemahkan\u3000teks\u3000ini. What does this stack trace mean?"
+    },
+    {
+      "lang": "id",
+      "text": "Terjemahkan ke\u00a0Korea. The lockfile is broken again."
+    },
+    {
+      "lang": "ms",
+      "text": "Sila\u2003terjemahkan\u2003ayat\u2003ini. The cache is not cleared when you switch the profile."
+    },
+    {
+      "lang": "id",
+      "text": "Terjemahkan ke bahasa Korea\rThe lockfile is broken again."
+    },
+    {
+      "lang": "id",
+      "text": "Terjemahkan ke bahasa Korea\u2028Why is the lockfile broken again?"
+    },
+    {
+      "lang": "ms",
+      "text": "Sila terjemahkan ayat ini\u2029Please check why the test fails."
+    },
+    {
+      "lang": "tl",
+      "text": "Isalin mo ito sa Hapon\rThe cache is not cleared when you switch the profile."
+    },
+    {
+      "lang": "es",
+      "text": "Traduce esto al coreano\u0085Please check the lockfile again."
+    },
+    {
+      "lang": "nl",
+      "text": "Vertaal dit naar het Koreaans\u000bHere is the log: the parser crashed on this input."
+    },
+    {
+      "lang": "pt",
+      "text": "Traduza isto para o coreano\fWhat does this stack trace mean?"
+    }
+  ]
+}

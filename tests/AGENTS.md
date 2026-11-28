@@ -33,6 +33,8 @@ tests/
 │   └── render-lab/        rendering evidence tool
 ├── evals/                 model-backed evals, run only on request
 ├── fixtures/
+│   ├── response-language/ requests.json: the English and other-language requests that the
+│   │                      response language driver runs through fx ask
 │   └── v1-sessions/       sessions the v0.0.14 release saved, which the converter's tests copy;
 │                          generate.ts rebuilds them and manifest.json lists them
 ├── fuzz/
