@@ -305,6 +305,10 @@ pub const Context = struct {
             .context_limits = self.context_limits,
             .auto_classifier = self.admissionAutoClassifier(),
             .terminal_review_context = self.terminalReviewContext(),
+            .review_result_store = .{
+                .capability = self.session_child_capability,
+                .result_dir = self.tool_result_dir,
+            },
             .host_sandbox_default = self.host_sandbox_default,
         };
         if (self.permission_state_override != null) {
@@ -922,7 +926,6 @@ fn executeRegisteredTool(
         .authorized_image_catalog = authorized_image_catalog,
     };
     var mcp_progress_bridge = McpProgressBridge{ .ctx = ctx };
-    var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
     var dispatch_metadata: DispatchMetadata = .{};
     var subagent_provider = SubagentProviderState{
@@ -950,7 +953,6 @@ fn executeRegisteredTool(
         .input_responder = ctx.mcp_input_responder,
         .access = ctx.mcp_access,
     };
-    dispatch_ctx.mcp_call_status_sink = &mcp_call_status;
     if (ctx.mcp_ctx != null and ctx.mcp_call_tool != null) {
         dispatch_ctx.mcp_call_capability = mcp_call_bridge.capability();
     }
@@ -1005,10 +1007,6 @@ fn executeRegisteredTool(
     else
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (mcp_call_status == .input_required) {
-        execution.finish_turn = true;
-        execution.status_detail = "McpInputRequired";
-    }
     execution.context_notices = context_notice_sink.notices.items;
     execution.result_commit = result_commit_token;
     if (dispatch_ctx.cancel_flag) |cancel_flag| {
@@ -1354,7 +1352,6 @@ fn callBridgeTool(
         .success => .{ .status = .ok, .bytes = try bridgeResultData(arena, result.model_output) },
         .tool_failure => .{ .status = .tool_error, .bytes = try bridgeResultData(arena, result.model_output) },
         .protocol_failure => .{ .status = .failed, .bytes = result.model_output },
-        .input_required => .{ .status = .failed, .bytes = "This tool asked for input that fx mcp call cannot give. Call the tool directly instead." },
     };
 }
 
@@ -2999,6 +2996,48 @@ fn subagentProviderRefusal(
     return .{ .status = .failure, .body = try why.body(alloc) };
 }
 
+/// Checks a subagent's waiting call as main's own, for `answerApproval`
+/// (`Runtime.ApprovalCheck`). It borrows the caller's tool context, which
+/// this provider call keeps alive while `executeManaged` runs.
+const SubagentApprovalCheck = struct {
+    runtime: Context,
+    /// The subagent whose request this check answers, for the card ACP shows
+    /// in main's session. Empty when the answer is not for a named subagent.
+    agent: []const u8 = "",
+
+    fn check(raw: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 {
+        const self: *SubagentApprovalCheck = @ptrCast(@alignCast(raw));
+        const ctx = self.runtime;
+        // A name this context cannot resolve is refused, not allowed:
+        // `requestPermissionOutcome` allows a name it has no contract for as
+        // its not-registered default, and the child's own admission runs the
+        // action, so allowing it would grant what main never saw (RULES.md
+        // R4.3). An MCP tool main does not advertise is such a name, since
+        // the child's profile may select servers main never did.
+        if (ctx.tool_registry.lookup(call.name) == null and
+            !containsName(ctx.advertised_dynamic_tool_names, call.name))
+        {
+            return try arena.dupe(u8, "your parent's permissions cannot check this action");
+        }
+        // The check answers another agent's call, not one of main's, so its
+        // card gets an id of its own: main's session must not reuse a card of
+        // its own with the child's id, and ACP names the agent on the card
+        // from this prefix (`subagentCardAgent`).
+        const check_call = types.ToolCall{
+            .id = try arena.print("subagent:{s}:{s}", .{ self.agent, call.id }),
+            .name = call.name,
+            .arguments_json = call.arguments_json,
+        };
+        // No selected MCP view is passed: a dynamic tool is checked as an
+        // advertised name of main's, and one it does not advertise is refused
+        // above, so nothing is checked through a view this path cannot supply.
+        return switch (try checkNestedCall(ctx, arena, check_call, null)) {
+            .allow => null,
+            .deny => |message| message,
+        };
+    }
+};
+
 fn executeSubagentProvider(
     raw_context: ?*anyopaque,
     arena: Allocator,
@@ -3013,6 +3052,15 @@ fn executeSubagentProvider(
         return subagentProviderRefusal(arena, .{ .caller_unavailable = .unidentified });
     const identity_epoch = host.issueOperationIdentity(invocation_id);
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
+    // The parent's answer checks the subagent's waiting call as main's own,
+    // with the permission context this call runs under.
+    var approval_check = SubagentApprovalCheck{
+        .runtime = ctx,
+        .agent = switch (request.*) {
+            .approve => |value| value.agent,
+            else => "",
+        },
+    };
     const output = host.executeManaged(arena, request, .{
         .observer = ctx.observer,
         .caller_id = caller_id,
@@ -3035,6 +3083,7 @@ fn executeSubagentProvider(
         .cancel_flag = runtimeCancelFlag(ctx),
         .caller_worker = ctx.worker,
         .turn_messages = ctx.current_turn_messages,
+        .approval_check = .{ .context = &approval_check, .check_fn = SubagentApprovalCheck.check },
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
         .model_capability_resolver = ctx.model_capability_resolver,
         .model_override_resolver = ctx.model_override_resolver,
@@ -9240,4 +9289,19 @@ test "in auto mode a command's fx mcp call skips the safety check for the approv
     try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
     try std.testing.expect(try nestedBridgeStatus(&rt, &.{}, "mcp_fixture_echo") != .denied);
     try std.testing.expectEqual(@as(usize, 2), reviewer.calls);
+}
+
+test "the approve check refuses a name main cannot resolve" {
+    var rt = TestRuntime{ .interactive = false };
+    defer rt.deinit(std.testing.allocator);
+    var check = SubagentApprovalCheck{ .runtime = rt.context() };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const refused = try SubagentApprovalCheck.check(
+        &check,
+        arena.allocator(),
+        .{ .id = "call-1", .name = "not_a_main_tool", .arguments_json = "{}" },
+    );
+    try std.testing.expect(refused != null);
+    try expectContains(refused.?, "your parent's permissions cannot check this action");
 }

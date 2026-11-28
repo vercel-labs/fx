@@ -952,6 +952,7 @@ fn appendSemanticNoticeEntry(
         .body = owned.body,
         .visibility = owned.visibility,
         .detail = owned.detail,
+        .detail_visibility = owned.detail_visibility,
         .pending_replacement = pending_replacement,
     } });
     self.notebook.next_entry_id +%= 1;
@@ -1054,6 +1055,7 @@ pub fn replaceSemanticNoticeAtomic(
         .body = owned.body,
         .visibility = owned.visibility,
         .detail = owned.detail,
+        .detail_visibility = owned.detail_visibility,
     } };
     handed_off = true;
     previous.deinit(alloc);
@@ -1874,6 +1876,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
                 .body = notice.body,
                 .visibility = notice.visibility,
                 .detail = notice.detail,
+                .detail_visibility = notice.detail_visibility,
             });
             break :blk .{ .semantic_notice = .{
                 .id = notice.id,
@@ -1884,6 +1887,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
                 .body = owned.body,
                 .visibility = owned.visibility,
                 .detail = owned.detail,
+                .detail_visibility = owned.detail_visibility,
                 .pending_replacement = notice.pending_replacement,
             } };
         },

@@ -5,10 +5,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const tool_result_cut_marker = @import("../shared/tool_result_cut_marker.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
-const elicitation = @import("elicitation.zig");
 const server_json_depth = @import("server_json_depth.zig");
-const mcp_json = @import("mcp_json.zig");
-const mrtr = @import("mrtr.zig");
 const tools_feature = @import("features/tools.zig");
 
 const tool_content = @import("../tooling/tool_content.zig");
@@ -23,7 +20,6 @@ pub const ExtractOptions = struct {
     max_tool_result_bytes: usize,
     protocol: tools_feature.Protocol,
     output_schema_json: ?[]const u8 = null,
-    legacy_wire: ?elicitation.Wire = null,
 };
 
 /// Parses an MCP response into the bounded, sanitized model result.
@@ -81,94 +77,14 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
                 .status = if (complete.is_error) .tool_failure else .success,
             };
         },
-        .protocol_failure => |failure| blk: {
-            if (options.legacy_wire == .legacy_mcp_2025_11 and
-                failure.code == elicitation.legacy_url_required_error_code and
-                failure.data_json != null)
-            {
-                if (try legacy_url_required(
-                    alloc,
-                    options.tool_name,
-                    failure.data_json.?,
-                    options.max_tool_result_bytes,
-                )) |required_result| break :blk required_result;
-            }
-            break :blk .{
-                .model_output = try render_owned_protocol_error(
-                    alloc,
-                    options.tool_name,
-                    failure,
-                    options.max_tool_result_bytes,
-                ),
-                .status = .protocol_failure,
-            };
-        },
-        .input_required => |required| blk: {
-            const input_requests_json = try mrtr.renderRequests(alloc, required.requests);
-            errdefer mem_utils.free(alloc, input_requests_json);
-            const request_state_json = if (required.request_state_json) |state|
-                try alloc.dupe(u8, state)
-            else
-                null;
-            errdefer if (request_state_json) |state| mem_utils.free(alloc, state);
-            const raw = try render_input_required(
+        .protocol_failure => |failure| .{
+            .model_output = try render_owned_protocol_error(
                 alloc,
-                input_requests_json,
-                request_state_json,
-            );
-            defer alloc.free(raw);
-            break :blk .{
-                .model_output = try tool_result_limits.prepareModelOutput(
-                    alloc,
-                    options.tool_name,
-                    raw,
-                    options.max_tool_result_bytes,
-                ),
-                .status = .input_required,
-                .input_required = .{
-                    .input_requests_json = input_requests_json,
-                    .request_state_json = request_state_json,
-                },
-            };
-        },
-    };
-}
-
-fn legacy_url_required(
-    alloc: Allocator,
-    tool_name: []const u8,
-    data_json: []const u8,
-    max_tool_result_bytes: usize,
-) !?tool_mcp_runtime.CallResult {
-    var required = elicitation.parseLegacyUrlRequired(
-        alloc,
-        .legacy_mcp_2025_11,
-        data_json,
-        .{},
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    defer required.deinit(alloc);
-    const input_requests_json = try elicitation.renderLegacyUrlRequiredRequests(
-        alloc,
-        required,
-        .{},
-    );
-    errdefer mem_utils.free(alloc, input_requests_json);
-    const raw = try render_input_required(alloc, input_requests_json, null);
-    defer alloc.free(raw);
-    return .{
-        .model_output = try tool_result_limits.prepareModelOutput(
-            alloc,
-            tool_name,
-            raw,
-            max_tool_result_bytes,
-        ),
-        .status = .input_required,
-        .input_required = .{
-            .input_requests_json = input_requests_json,
-            .legacy_retry_without_responses = true,
+                options.tool_name,
+                failure,
+                options.max_tool_result_bytes,
+            ),
+            .status = .protocol_failure,
         },
     };
 }
@@ -424,35 +340,6 @@ fn typeWithArticle(json_type: []const u8) []const u8 {
     };
     for (names) |name| if (std.mem.eql(u8, name[0], json_type)) return name[1];
     return json_type;
-}
-
-fn render_input_required(
-    alloc: Allocator,
-    input_requests_json: []const u8,
-    request_state_json: ?[]const u8,
-) error{OutOfMemory}![]u8 {
-    return render_input_required_fallible(
-        alloc,
-        input_requests_json,
-        request_state_json,
-    ) catch error.OutOfMemory;
-}
-
-fn render_input_required_fallible(
-    alloc: Allocator,
-    input_requests_json: []const u8,
-    request_state_json: ?[]const u8,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"resultType\":\"input_required\",\"inputRequests\":");
-    try out.writer.writeAll(input_requests_json);
-    if (request_state_json) |state| {
-        try out.writer.writeAll(",\"requestState\":");
-        try mcp_json.write_compact(&out.writer, state);
-    }
-    try out.writer.writeByte('}');
-    return try out.toOwnedSlice();
 }
 
 fn serialize_capped(
@@ -736,57 +623,20 @@ test "modern tool results validate result type and retain typed error data" {
     try std.testing.expectEqual(tool_mcp_runtime.CallStatus.success, missing.status);
 }
 
-fn check_input_required_allocation_failures(alloc: Allocator) !void {
+test "a -32042 answer reaches the model as a protocol error, as the host hands it over" {
+    // The host holds the call for the user's answer to the URLs, and gives the model the error without its data
+    // (`tests/tla/mcp_host/ErrorData.tla`, `UrlRetry.tla`).
+    const alloc = std.testing.allocator;
     var result = try extract(alloc, .{
         .server_name = "server",
-        .tool_name = "mcp_server_confirm",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"input_required\",\"inputRequests\":{\"confirm\":{\"method\":\"elicitation/create\",\"params\":{\"message\":\"Continue?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"confirmed\":{\"type\":\"boolean\"}}}}}},\"requestState\":{\"opaque\":true}}}",
+        .tool_name = "mcp_server_authorize",
+        .response = "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32042,\"message\":\"URL elicitation required\"}}",
         .max_tool_result_bytes = 64 * 1024,
         .protocol = .modern,
     });
     defer result.deinit(alloc);
-    try std.testing.expectEqual(tool_mcp_runtime.CallStatus.input_required, result.status);
-}
-
-test "input-required result releases every allocation failure path" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        check_input_required_allocation_failures,
-        .{},
-    );
-}
-
-fn check_legacy_url_required_allocation_failures(alloc: Allocator) !void {
-    var result = try extract(alloc, .{
-        .server_name = "server",
-        .tool_name = "mcp_server_authorize",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32042,\"message\":\"URL elicitation required\",\"data\":{\"elicitations\":[{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"legacy-url\"}]}}}",
-        .max_tool_result_bytes = 64 * 1024,
-        .protocol = .legacy,
-        .legacy_wire = .legacy_mcp_2025_11,
-    });
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(tool_mcp_runtime.CallStatus.input_required, result.status);
-    try std.testing.expect(result.input_required.?.legacy_retry_without_responses);
-}
-
-test "2025-11 URL-required errors become retry input only on that wire" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        check_legacy_url_required_allocation_failures,
-        .{},
-    );
-
-    var old = try extract(std.testing.allocator, .{
-        .server_name = "server",
-        .tool_name = "tool",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32042,\"message\":\"URL elicitation required\",\"data\":{\"elicitations\":[{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"legacy-url\"}]}}}",
-        .max_tool_result_bytes = 64 * 1024,
-        .protocol = .legacy,
-        .legacy_wire = .legacy_mcp_2025_06,
-    });
-    defer old.deinit(std.testing.allocator);
-    try std.testing.expectEqual(tool_mcp_runtime.CallStatus.protocol_failure, old.status);
+    try std.testing.expectEqual(tool_mcp_runtime.CallStatus.protocol_failure, result.status);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "MCP protocol error -32042") != null);
 }
 
 test "invalid tool responses retain bounded protocol failures" {

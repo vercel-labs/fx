@@ -752,6 +752,10 @@ ${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
   };
 }
 
+// Sessions that have not been killed. killLiveTmuxSessions ends them when the
+// test run ends, even when a timed-out test's body is still waiting.
+const liveSessions = new Set<TmuxSession>();
+
 export class TmuxSession {
   readonly name: string;
   private readonly socketName?: string;
@@ -837,6 +841,7 @@ export class TmuxSession {
     const defaultArgs = [
       ["FX_DISABLE_KEYCHAIN", "1"],
       ["FX_TEST_SKIP_ONBOARDING", "1"],
+      ["FX_TEST_SKIP_WORKSPACE_TRUST", "1"],
       ["FX_SOUND", "0"],
       // fx panics if it makes a network request on the input loop.
       ["FX_TEST_INPUT_LOOP_NETWORK_GUARD", "1"],
@@ -999,6 +1004,7 @@ export class TmuxSession {
       throw err;
     }
     const session = new TmuxSession(name, exitStatusPath, resolvedSocketName);
+    liveSessions.add(session);
     try {
       for (const key of CREDENTIAL_ENV_KEYS) {
         try {
@@ -1529,6 +1535,14 @@ export class TmuxSession {
     );
   }
 
+  /** Waits for a reply's text and its turn's end together. The text can show before the turn ends, so a test that reads saved state or sends the next prompt waits here, not on the text alone. */
+  async waitForReplyAndTurnEnd(text: string, timeoutMs: number): Promise<string> {
+    return this.waitForPane(
+      (pane) => pane.includes(text) && turnSettled(pane),
+      timeoutMs,
+    );
+  }
+
   async waitForComposer(timeoutMs = 15_000): Promise<string> {
     return this.waitForPane(hasEmptyComposer, timeoutMs);
   }
@@ -1614,6 +1628,7 @@ export class TmuxSession {
   }
 
   async kill(): Promise<void> {
+    liveSessions.delete(this);
     if (this.killed) return;
     this.killed = true;
     try {
@@ -1639,6 +1654,12 @@ export class TmuxSession {
     rmSync(this.exitStatusPath, { force: true });
   }
 
+  /// Closes the session's pane, as a closed terminal window does: tmux hangs
+  /// up the pane's program.
+  killPane(): void {
+    execFileSync("tmux", this.tmuxArgs(["kill-pane", "-t", this.name]), { stdio: "pipe" });
+  }
+
   /// The fx process's exit status once the pane has ended, or null.
   recordedExitStatus(): number | null {
     try {
@@ -1658,6 +1679,12 @@ export class TmuxSession {
       ? `tmux -L ${shellQuote(this.socketName)}`
       : "tmux";
   }
+}
+
+/// Ends every session that is still running. The test preload calls this once
+/// per run, so a test whose body outlives its timeout cannot leave fx behind.
+export async function killLiveTmuxSessions(): Promise<void> {
+  for (const session of [...liveSessions]) await session.kill();
 }
 
 function shellQuote(value: string): string {

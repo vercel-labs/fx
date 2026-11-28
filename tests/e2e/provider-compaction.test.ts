@@ -171,6 +171,33 @@ describe("provider compaction", () => {
     }, 240_000);
   }
 
+  // The compaction saves the toolbox menu with the provider's block, so a
+  // resume after it sends the instructions the kept turns' reasoning was
+  // written after; a skill added since arrives as a change note
+  // (tests/tla/toolbox/Toolbox.tla MenuFixed and Informed).
+  test("a resume after a provider compaction sends the toolbox menu the session sent first", async () => {
+    await withSession(FAMILIES.anthropic.model, {}, async (session, { observed, counts, edits }) => {
+      const { root, home, cwd, env, sessionId, before } = session;
+      const seventh = await ask({ ...env, FX_AUTO_COMPACT_PERCENT: "10" }, cwd, root, "t7", ["--resume", sessionId], "TURN 7 Continue.");
+      expect(seventh.code).toBe(0);
+      expect({ provider: counts.provider, blocks: counts.blocks, fx: counts.fx }).toEqual({ provider: 1, blocks: 1, fx: 0 });
+      const skill = join(home, ".fx", "skills", "menu-added");
+      mkdirSync(skill, { recursive: true });
+      writeFileSync(join(skill, "SKILL.md"), "---\nname: menu-added\ndescription: The menu-added steps.\n---\n\n# menu-added\n");
+      const eighth = await ask(env, cwd, root, "t8", ["--resume", sessionId], "TURN 8 Thanks.");
+      expect(eighth.code).toBe(0);
+      expect(edits).toEqual([]);
+      const instructions = (body: Body) => body.prompt.slice(0, leadingSystem(body.prompt)).map(withoutCacheMarkers);
+      const seventhRequest = agentRequestFor(observed, before, 7)!;
+      const eighthRequest = agentRequestFor(observed, before, 8)!;
+      expect(instructions(eighthRequest)).toEqual(instructions(seventhRequest));
+      expect(JSON.stringify(seventhRequest.prompt)).not.toContain("menu-added");
+      const noted = JSON.stringify(eighthRequest.prompt.at(-1));
+      expect(noted).toContain("The toolbox now holds something other than the toolbox menu above lists.");
+      expect(noted).toContain("menu-added");
+    });
+  }, 240_000);
+
   // Every way the provider can fail to give a block, each family in turn: fx
   // writes its own summary, keeps no turn after it, and says why in its trace.
   const failures = [
@@ -289,6 +316,7 @@ describe("provider compaction", () => {
       AI_GATEWAY_API_KEY: "synthetic-provider-compaction", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
       FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: family.model, FX_TRACE_LOG: join(root, "trace.log"),
       FX_TEST_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_WORKSPACE_TRUST: "1",
       ...sanitizerOptions(),
       FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,

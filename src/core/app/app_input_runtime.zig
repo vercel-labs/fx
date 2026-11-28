@@ -3,10 +3,14 @@ const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
+const wait_card = @import("../agent/wait_card.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
+const personal_shortcut_runtime = @import("personal_shortcut_runtime.zig");
+const shortcut_rules = @import("../shortcuts/shortcuts.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_trust_runtime = @import("app_trust_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const project_config = @import("../mcp/project_config.zig");
@@ -46,6 +50,7 @@ const usage = @import("../../usage/usage.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
+const command_router = @import("../slash_commands/command_router.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
@@ -172,11 +177,43 @@ fn validateExplicitModelSelection(selection: ExplicitModelSelection, capabilitie
     return .{ .selection = selection };
 }
 
+test "chord unregistered command text is unknown and never routed" {
+    const builtin_commands = @import("../../builtins/commands.zig");
+    const parsed = command_router.parse(builtin_commands.slash_registry, "/no-such-command");
+    try std.testing.expect(parsed == .unknown);
+    const status = command_router.parse(builtin_commands.slash_registry, "/status");
+    try std.testing.expectEqual(command_router.ChordCommandRoute.run_now, command_router.chordCommandRoute(status));
+}
+
+/// What a keystroke means while the wait card holds the keys. The card's own
+/// keys arrive as question actions; every other control byte belongs to its
+/// own handler (Ctrl+O, Ctrl+P, Ctrl+X, Esc), and typed text is ignored so it
+/// never reaches the view's agent.
+pub const WaitCardKey = union(enum) {
+    choose: usize,
+    run: void,
+    cancel: void,
+    ignore: void,
+    pass_through: void,
+};
+
+pub fn waitCardKey(byte: u8, action: ?question_prompt.Action) WaitCardKey {
+    if (action) |typed| switch (typed) {
+        .cancel => return .cancel,
+        .submit => return .run,
+        .select_ordinal => |index| return .{ .choose = index },
+        else => {},
+    };
+    if (byte < 0x20) return .pass_through;
+    return .ignore;
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         const history_rt = input_history_runtime.HistoryRuntime(App);
         const completion_rt = input_completion_runtime.CompletionRuntime(App);
+        const personal_shortcut_rt = personal_shortcut_runtime.Runtime(App);
         const provider_picker_rt = provider_picker_runtime.Runtime(App);
         const paste_rt = input_paste_runtime.PasteEditRuntime(App);
         const submit_rt = input_submit_runtime.SubmitRuntime(App);
@@ -587,10 +624,37 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        /// True when no surface sits above the composer: trust, paste, approval,
+        /// question, transcript, agents, pickers, menus, and an open model
+        /// picker all keep their own keys.
+        fn composerOwnsKeyboard(app: *App, agent: *AppAgent) bool {
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                if (agent.wait_card_prompt.isActive()) return false;
+            }
+            if (comptime @hasField(App, "trust")) {
+                if (app.trust.asking()) return false;
+            }
+            if (terminalPasteActive(app)) return false;
+            if (agent.question_prompt.isActive() or approvalOwnsCurrentSurface(app, agent)) return false;
+            if (agentsMenuActive(app) or modelPickerShortcutBlocked(app, agent)) return false;
+            if (modelMenuActive(app) or app.input_runtime.model_picker_draft != null) return false;
+            if (completion_rt.hasModelQuery(app) or app.input_runtime.effort_menu.active or
+                completion_rt.slashCompletionCount(app, agent) > 0) return false;
+            return activeCompactCommandMenu(app) == null;
+        }
+
         pub fn prepareTerminalDecode(app: *App, agent: *AppAgent) !?input_action.TerminalDecodeContext {
             if (!try app_worker_runtime.Runtime(App).authorizeInteractiveAdmission(app, agent)) return null;
             const paste_active = terminalPasteActive(app);
             return terminalDecodeContext(app, agent, paste_active);
+        }
+
+        fn ingressCancelPending(ingress: input_action.TerminalInputIngress) bool {
+            const event = ingress.event orelse return false;
+            return switch (event) {
+                .action => |decoded| decoded.cancel_pending,
+                else => false,
+            };
         }
 
         pub fn handleTerminalInputIngressWithLimits(
@@ -600,6 +664,9 @@ pub fn Runtime(comptime App: type) type {
             max_prompt_history: usize,
         ) !?u8 {
             if (!ingress.has_routing_work()) return null;
+            if (comptime @hasField(App, "trust")) {
+                if (try app_trust_runtime.Runtime(App).routeIngress(app, ingress)) return null;
+            }
             if (terminalIngressCancelsPendingFullTranscriptOpen(ingress)) {
                 _ = full_transcript_rt.cancelPendingOpenForInput(app);
             }
@@ -634,6 +701,13 @@ pub fn Runtime(comptime App: type) type {
             // is a preview.
             if (ingress.event) |event| {
                 if (try routeAgentsMenuInput(app, event)) return ingress.replay_byte_after_routing;
+            }
+
+            // A chord the profile binds claims its key before the original
+            // event routes. A replayed byte arrives as its own ingress without
+            // a chord, so a byte such as 6 never reads as Ctrl+F here.
+            if (ingress.chord) |chord| {
+                if (!ingressCancelPending(ingress) and try routeBoundChord(app, agents.screenAgentOf(app), chord)) return null;
             }
 
             var replay_byte = ingress.replay_byte_after_routing;
@@ -769,7 +843,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 const replay = replay_byte orelse return;
                 context = try prepareTerminalDecode(app, agents.screenAgentOf(app)) orelse return;
-                ingress = app.terminal_input_runtime.decodeTerminalByte(replay, context);
+                ingress = app.terminal_input_runtime.decodeReplayedTerminalByte(replay, context);
             }
         }
 
@@ -869,6 +943,10 @@ pub fn Runtime(comptime App: type) type {
             const slash_menu_was_visible = slashMenuVisibleForCue(app, agent);
             defer announceSlashMenuOpened(app, agent, slash_menu_was_visible);
             if (try routeActivePasteByte(app, byte)) return;
+
+            // The Enter beside the keystroke that answered a card must not
+            // submit the draft the card hid; any other key is its own.
+            if (dropEnterAfterCardAnswer(app, agent, byte)) return;
 
             if (byte != 3 and byte != 0x1b) disarmCtrlCExit(app, "raw_input");
 
@@ -1045,6 +1123,25 @@ pub fn Runtime(comptime App: type) type {
 
             if (try full_transcript_rt.routeComposerAction(app, agents.screenAgentOf(app), resolved)) return .done;
 
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                const card = &agents.screenAgentOf(app).wait_card_prompt;
+                if (card.isActive() and !agentsMenuActive(app)) {
+                    switch (resolved) {
+                        .history_up, .cursor_up => {
+                            card.moveChoice(-1);
+                            app.shell.render_requests.request(.modal);
+                            return .done;
+                        },
+                        .history_down, .cursor_down => {
+                            card.moveChoice(1);
+                            app.shell.render_requests.request(.modal);
+                            return .done;
+                        },
+                        else => {},
+                    }
+                }
+            }
+
             if (composer_shortcut) |action| {
                 try routeComposerShortcutAction(app, agents.screenAgentOf(app), action, max_input_len);
                 return .done;
@@ -1117,20 +1214,7 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     }
                 },
-                .open_model_catalog => {
-                    if (comptime @hasField(App, "model_cache")) {
-                        // A second Ctrl+P backs out of the shortcut's flow
-                        // from the catalog or its inline effort and fast stages.
-                        if (exitModelPickerShortcutIfActive(app)) return .done;
-                        if (modelMenuActive(app)) {
-                            _ = closeModelMenu(app, true);
-                            app.shell.render_requests.request(.footer);
-                            return .done;
-                        }
-                        if (modelPickerShortcutBlocked(app, agents.screenAgentOf(app))) return .done;
-                        try openModelPickerShortcut(app);
-                    }
-                },
+                .open_model_catalog => try openModelCatalogKey(app, agents.screenAgentOf(app)),
                 .cycle_effort => {
                     // Ctrl+T sets the effort of the agent on screen, as
                     // `/effort` does.
@@ -1226,6 +1310,27 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return true;
             }
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                const card = &agent.wait_card_prompt;
+                if (card.isActive()) {
+                    switch (waitCardKey(byte, raw.question_action)) {
+                        .choose => |index| {
+                            if (card.choiceAt(index)) |choice| _ = try answerWaitCard(app, choice);
+                        },
+                        .run => {
+                            if (card.highlighted()) |choice| _ = try answerWaitCard(app, choice);
+                        },
+                        .cancel => _ = try answerWaitCard(app, .cancel),
+                        // The card keeps the keys, as a lent question does, and
+                        // says what it dropped (R3.8; the trace carries no text).
+                        .ignore => debug_trace.logf("input", "wait card dropped key reason=card_holds_keys", .{}),
+                        // Ctrl+O, Ctrl+P, Ctrl+X and the rest keep their own
+                        // meanings while the card shows.
+                        .pass_through => return false,
+                    }
+                    return true;
+                }
+            }
             if (approvalOwnsCurrentSurface(app, agent)) {
                 if (byte >= 0x80) {
                     if (agent.approval_prompt.isAmending()) {
@@ -1284,6 +1389,48 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return true;
             }
+            return false;
+        }
+
+        /// Drops the one Enter that follows a card's answer, and only while the
+        /// view's own composer would take it. A prompt, the agent list or a
+        /// picker that opened in the meantime owns that Enter: after the card's
+        /// "Sign in", for example, the person's first Enter belongs to the
+        /// sign-in picker, not to the draft the card hid. Any key spends the
+        /// guard, so a later Enter is always the person's own.
+        pub fn dropEnterAfterCardAnswer(app: *App, agent: *AppAgent, byte: u8) bool {
+            if (comptime !@hasField(App, "wait_card_enter_guard")) return false;
+            const held_enter = app.wait_card_enter_guard.dropEnter(byte);
+            if (!held_enter) return false;
+            if (!composerOwnsKeys(app, agent)) return false;
+            debug_trace.logf("input", "wait card enter dropped reason=draft_after_answer", .{});
+            return true;
+        }
+
+        /// Whether an Enter now would be the view's own: no prompt, no agent
+        /// list and no picker holds the keys. Ctrl+C is not this question: an
+        /// existing question prompt and the out-of-credits picker both cancel
+        /// on it (`src/ui/input/runtime.zig:141`), so the card cancels too.
+        fn composerOwnsKeys(app: *App, agent: *AppAgent) bool {
+            if (agent.approval_prompt.isActive() or agent.question_prompt.isActive()) return false;
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                if (agent.wait_card_prompt.isActive()) return false;
+            }
+            if (provider_picker_runtime.Runtime(App).hasQuery(app)) return false;
+            if (inlinePickerTakesEnter(app)) return false;
+            return !agentsMenuActive(app);
+        }
+
+        /// Whether an inline completion picker holds Enter: the `/model` list a
+        /// card's "Change model" opens, the `@` file list and the `/` menu each
+        /// select a row with it, so that Enter is theirs.
+        fn inlinePickerTakesEnter(app: *App) bool {
+            if (completion_rt.hasModelQuery(app) or completion_rt.hasFileQuery(app)) return true;
+            return app.input_runtime.picker.activeInlineSlashQuery(&app.input_runtime.edit_state) != null;
+        }
+
+        fn answerWaitCard(app: *App, choice: wait_card.Choice) !bool {
+            if (comptime @hasDecl(App, "answerWaitCard")) return app.answerWaitCard(choice);
             return false;
         }
 
@@ -2210,6 +2357,76 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
+        /// Ctrl+P and a personal shortcut bound to `/model` share this path.
+        fn openModelCatalogKey(app: *App, agent: *AppAgent) !void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            // A second Ctrl+P backs out of the shortcut's flow
+            // from the catalog or its inline effort and fast stages.
+            if (exitModelPickerShortcutIfActive(app)) return;
+            if (modelMenuActive(app)) {
+                _ = closeModelMenu(app, true);
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+            if (modelPickerShortcutBlocked(app, agent)) return;
+            try openModelPickerShortcut(app);
+        }
+
+        /// A personal shortcut with no binding does nothing, as an unbound
+        /// Ctrl+digit always has. A preset never runs while a picker or menu
+        /// owns the keyboard, so the preset path never borrows the composer.
+        /// Runs the profile's binding for `chord` when the composer owns the
+        /// keyboard. Returns false when nothing ran, so the original event
+        /// routes exactly as before (unbound chords, other focus, prompts).
+        fn routeBoundChord(app: *App, agent: *AppAgent, chord: shortcut_rules.Chord) !bool {
+            if (comptime !@hasField(App, "personal_shortcuts")) return false;
+            const entry = app.personal_shortcuts.map.find(chord) orelse return false;
+            if (!composerOwnsKeyboard(app, agent)) return false;
+            // fx keeps reserved keys for itself (shortcut_rules.reserved). The loader
+            // refuses them; this is the same rule at the dispatch point.
+            if (chord.reservedReason() != null) return false;
+            switch (entry.action) {
+                .select_model => |*preset| try personal_shortcut_rt.applyPreset(app, agent, preset),
+                .command => |*command| try runBoundCommand(app, agent, command.text()),
+            }
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        /// A bound command is a slash command the router recognizes, never the
+        /// shell and never prompt text. Read-only and reversible commands run
+        /// from the key and keep the draft. `/model` alone opens the native
+        /// catalog. Only commands explicitly classified for preview enter an empty
+        /// composer, and run only on Enter through the normal submit path with
+        /// its confirmations. An existing draft is never replaced.
+        fn runBoundCommand(app: *App, agent: *AppAgent, text: []const u8) !void {
+            if (comptime !@hasDecl(App, "handleCommand")) return;
+            const parsed = command_router.parse(app.slashRegistry(), text);
+            switch (command_router.chordCommandRoute(parsed)) {
+                .refuse => return refuseBoundChord(app, "this command is not available from shortcuts; nothing ran"),
+                .run_now => try app.handleCommand(text),
+                .open_catalog => try openModelCatalogKey(app, agent),
+                .preview => {
+                    if (draftHasState(app, agent)) {
+                        return refuseBoundChord(app, "clear the draft to use this shortcut's command; nothing changed");
+                    }
+                    try app.input_runtime.textReplacementState().replace(app.alloc, text);
+                    app.shell.render_requests.request(.footer);
+                },
+            }
+        }
+
+        fn writeShortcutRefusal(app: *App, body: []const u8) !void {
+            try app.writeDomainNotice(.{ .topic = "shortcut", .tone = .warning, .body = body }, true);
+        }
+
+        /// A bound key already took the key, so the refusal says why nothing ran.
+        /// The trace holds the fixed reason only, never the command text.
+        fn refuseBoundChord(app: *App, body: []const u8) !void {
+            debug_trace.logf("shortcut", "bound chord took the key, then refused: {s}", .{body});
+            return writeShortcutRefusal(app, body);
+        }
+
         /// Ctrl+P opens the same catalog `/model` opens, but the composer is
         /// only lent to the menu: the draft moves into a stash and comes back
         /// verbatim when the picker closes, whether a model was picked or not.
@@ -3049,6 +3266,16 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeInterrupt(app, "menu");
                 return;
             }
+            // Esc on the wait card ends that subagent's turn, and touches
+            // nothing of the view's own agent.
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                if (agent.wait_card_prompt.isActive()) {
+                    _ = try answerWaitCard(app, .cancel);
+                    _ = disarmEscapeClear(app);
+                    _ = disarmEscapeInterrupt(app, "wait_card");
+                    return;
+                }
+            }
             // Esc answers `/fork`'s question: fork without the subagents (D97).
             if (try answerForkQuestionOnEscape(app, agent)) {
                 _ = disarmEscapeClear(app);
@@ -3270,6 +3497,30 @@ pub fn Runtime(comptime App: type) type {
         }
     };
 }
+test "wait card: digits choose, Enter runs, Esc and Ctrl+C cancel, and control keys pass through" {
+    const Key = WaitCardKey;
+    const question = question_prompt.Action;
+    try std.testing.expectEqual(std.meta.Tag(Key).choose, std.meta.activeTag(waitCardKey('2', .{ .select_ordinal = 1 })));
+    switch (waitCardKey('2', .{ .select_ordinal = 1 })) {
+        .choose => |index| try std.testing.expectEqual(@as(usize, 1), index),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(std.meta.Tag(Key).run, std.meta.activeTag(waitCardKey('\r', question.submit)));
+    // Ctrl+C is `.cancel` for the card exactly as it is for a question prompt
+    // and the out-of-credits picker: the decoder maps byte 3 to it
+    // (`src/ui/input/runtime.zig:141`), so the card changes no meaning.
+    try std.testing.expectEqual(std.meta.Tag(Key).cancel, std.meta.activeTag(waitCardKey(3, question.cancel)));
+    // Esc is the terminal's own byte and cancels through the decoded action;
+    // every other control byte keeps its own meaning.
+    try std.testing.expectEqual(std.meta.Tag(Key).pass_through, std.meta.activeTag(waitCardKey(0x1b, null)));
+    try std.testing.expectEqual(std.meta.Tag(Key).pass_through, std.meta.activeTag(waitCardKey(0x0f, null)));
+    try std.testing.expectEqual(std.meta.Tag(Key).pass_through, std.meta.activeTag(waitCardKey(0x10, null)));
+    try std.testing.expectEqual(std.meta.Tag(Key).pass_through, std.meta.activeTag(waitCardKey(0x18, null)));
+    // Typed text never reaches the view's agent.
+    try std.testing.expectEqual(std.meta.Tag(Key).ignore, std.meta.activeTag(waitCardKey('a', null)));
+    try std.testing.expectEqual(std.meta.Tag(Key).ignore, std.meta.activeTag(waitCardKey(0xc3, null)));
+}
+
 const ApprovalCancelEvent = enum {
     request_cancel,
 };

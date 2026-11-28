@@ -57,6 +57,10 @@ pub const Runtime = struct {
     /// catalog's query box, then for its inline effort and fast stages. Holds
     /// the draft the composer is restored to when that flow ends.
     model_picker_draft: ?composer_stash.State = null,
+    /// Set while a card's "Change model" opens the model picker for a
+    /// subagent, which borrows the composer as its query box. Holds the
+    /// person's draft until the pick or the picker's close gives it back.
+    card_model_picker_draft: ?composer_stash.State = null,
 
     pub fn initInto(self: *Runtime) void {
         const runtime_info = @typeInfo(Runtime).@"struct";
@@ -80,6 +84,24 @@ pub const Runtime = struct {
         self.kill_ring.deinit(alloc);
         self.edit_history.deinit(alloc);
         if (self.model_picker_draft) |*draft| draft.deinit(alloc);
+        if (self.card_model_picker_draft) |*draft| draft.deinit(alloc);
+    }
+
+    /// Sets the person's draft aside so the model picker a card's "Change
+    /// model" opens can use the composer as its query box.
+    pub fn stashModelPickerDraft(self: *Runtime) void {
+        if (self.card_model_picker_draft != null) return;
+        self.card_model_picker_draft = composer_stash.State.capture(self.composerStashView());
+    }
+
+    /// Gives the draft set aside above back verbatim, text, cursor and
+    /// selection, and drops whatever the picker left in the composer. False
+    /// when no draft waits.
+    pub fn restoreModelPickerDraft(self: *Runtime, alloc: Allocator) bool {
+        var draft = self.card_model_picker_draft orelse return false;
+        self.card_model_picker_draft = null;
+        draft.restore(alloc, self.composerStashView());
+        return true;
     }
 
     pub fn composerStashView(self: *Runtime) composer_stash.State.ComposerView {
