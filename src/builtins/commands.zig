@@ -155,7 +155,7 @@ const tool_skill_subcommands = [_]command_specs.SubcommandDoc{
 };
 
 const tool_ask_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--option=LABEL", .description = "One answer to offer; give 2 to 6, or --option LABEL" },
+    .{ .flag = "--option <label>", .description = "One answer to offer; give 2 to 6" },
 };
 const tool_search_options = [_]command_specs.OptionDoc{
     .{ .flag = "--allow-domain <domain>", .description = "Only results from this domain; repeat for more" },
@@ -187,7 +187,7 @@ const tool_subcommands: []const command_specs.SubcommandDoc = if (tool_bridge.su
     .{ .usage = "skill <list|open>", .description = "List or read visible skills", .subcommands = &tool_skill_subcommands },
     .{ .usage = "agent <message|wait|status|stop|close>", .description = "Message, wait for, check, stop, or close subagents", .subcommands = &tool_agent_subcommands },
     .{ .usage = "view PATH", .description = "Attach an image file for the model to see" },
-    .{ .usage = "ask QUESTION --option=LABEL...", .description = "Ask the person a question and print the answer", .options = &tool_ask_options },
+    .{ .usage = "ask QUESTION --option LABEL...", .description = "Ask the person a question and print the answer", .options = &tool_ask_options },
     .{ .usage = "web URL", .description = "Fetch a web page as text" },
     .{ .usage = "search QUERY [--allow-domain D]... [--block-domain D]...", .description = "Search the web and print the results; give one kind of domain filter, not both", .options = &tool_search_options },
 } else &.{};
