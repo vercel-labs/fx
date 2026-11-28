@@ -10913,6 +10913,126 @@ test "wait card: a model chosen for a subagent in the view is kept in its sessio
     try std.testing.expect(settings == null);
 }
 
+test "wait card: a subagent's pick that a ConfigChange hook allows reaches the subagent after the picker closes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+    try test_home.map.put("PATH", "/usr/bin:/bin");
+
+    const hooks_text = "{\"hooks\":{\"ConfigChange\":[{\"hooks\":[{\"type\":\"command\",\"id\":\"gate\",\"command\":\"sleep 0.2\"}]}]}}";
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    const hooks_path = try profile_paths.rootPath(alloc, home, &.{"hooks.json"});
+    defer alloc.free(hooks_path);
+    try io_mod.writeFileAtomic(alloc, hooks_path, hooks_text);
+    try std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), hooks_path, std.Io.File.Permissions.fromMode(0o600), .{});
+    const hook_engine = @import("hooks/hooks.zig");
+    {
+        var parsed = try hook_engine.config.parse(alloc, hooks_text, .{ .layer = .profile, .workspace_root = home });
+        defer parsed.deinit(alloc);
+        var named = try hooks_host.trust.namedFiles(alloc, parsed.hooks[0].command, home, home);
+        defer named.deinit(alloc);
+        const digest = try hooks_host.trust.digest(alloc, &parsed.hooks[0], home, named.files);
+        var store = hooks_host.trust.Store{};
+        defer store.deinit(alloc);
+        try store.add(alloc, digest, "wait card gate test hook");
+        const trust_file = try hooks_host.trust.path(alloc, home);
+        defer alloc.free(trust_file);
+        try hooks_host.trust.save(alloc, trust_file, &store);
+    }
+
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer app.model_cache.deinit();
+    defer app.provider_selection.deinit();
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer {
+        app.hook_gate.deinit();
+        if (app.user_hooks) |*rt| rt.deinit();
+    }
+    app.workspace_root = try alloc.dupe(u8, home);
+    defer {
+        alloc.free(app.workspace_root);
+        app.workspace_root = "";
+    }
+    var hook_runtime = try hooks_host.Runtime.init(alloc, .{
+        .enabled = true,
+        .home = home,
+        .workspace_root = home,
+    });
+    hook_runtime.native.base_env = &test_home.map;
+    hook_runtime.refresh();
+    app.user_hooks = hook_runtime;
+
+    {
+        const cache_alloc = std.heap.c_allocator;
+        const id = try cache_alloc.dupe(u8, "openai/gpt-5-mini");
+        errdefer cache_alloc.free(id);
+        const model_type = try cache_alloc.dupe(u8, "language");
+        errdefer cache_alloc.free(model_type);
+        var efforts: std.ArrayList(types.ReasoningEffort) = .empty;
+        errdefer efforts.deinit(cache_alloc);
+        try efforts.append(cache_alloc, types.ReasoningEffort.literal("low"));
+        try efforts.append(cache_alloc, types.ReasoningEffort.literal("high"));
+        try app.model_cache.catalog.append(cache_alloc, .{
+            .id = id,
+            .model_type = model_type,
+            .has_reasoning = true,
+            .reasoning_efforts = efforts,
+        });
+        app.model_cache.state = .ready;
+    }
+
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    try giveTestPreferences(alloc, payer, "openai/gpt-5");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+        if (agent.session_persistence.session_preferences) |*preferences| preferences.deinit(alloc);
+    };
+
+    const main_model_before = try alloc.dupe(u8, provider_runtime.modelOf(&app, &app.main_agent));
+    defer alloc.free(main_model_before);
+    const main_effort_before = app.main_agent.effort;
+
+    app.model_choice_target = &payer.agent;
+    const picked_effort = types.ReasoningEffort.literal("high");
+    try @import("core/session/session_commands.zig").Commands(App).selectModelFromPicker(
+        &app,
+        &app.main_agent,
+        "openai/gpt-5-mini",
+        picked_effort,
+        false,
+        false,
+    );
+
+    try std.testing.expect(app.hook_gate.pending != null);
+
+    // Simulates the next tick after the picker closes while the hook gate still waits.
+    App.AgentsAppRuntime.settleModelChoiceTarget(&app);
+
+    const job = app.hook_gate.gate.current orelse return error.HookGateNotStarted;
+    try std.testing.expect(@import("core/shared/testing_listener.zig").waitFor(&job.done, 10_000));
+    try app_commands.Handlers(App).collectHookGateFacts(&app);
+    try std.testing.expect(app.hook_gate.pending == null);
+
+    try std.testing.expectEqualStrings("openai/gpt-5-mini", payer.agent.session_persistence.session_preferences.?.model);
+    try std.testing.expectEqualStrings("high", payer.agent.effort.label());
+    try std.testing.expectEqualStrings(main_model_before, provider_runtime.modelOf(&app, &app.main_agent));
+    try std.testing.expectEqualStrings(main_effort_before.label(), app.main_agent.effort.label());
+    const settings = try readUserSettings(alloc, home);
+    defer if (settings) |text| alloc.free(text);
+    try std.testing.expect(settings == null);
+}
+
 test "wait card: a subagent's own model choice on its screen is kept in its session too" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

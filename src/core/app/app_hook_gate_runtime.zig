@@ -219,6 +219,16 @@ pub const State = struct {
         return self.pending != null;
     }
 
+    /// A picker pick waits for its hooks, so the picker's target must stay until the pick finishes.
+    pub fn holdsPickerChoice(self: *const State) bool {
+        const pending = self.pending orelse return false;
+        return switch (pending.change) {
+            .setting => |setting| setting.picked != null,
+            .model => |model| model.picker != null,
+            .permission_mode, .model_switched => false,
+        };
+    }
+
     /// The footer's working line while a change waits, or "" when none does.
     pub fn statusText(self: *const State) []const u8 {
         const pending = self.pending orelse return "";
@@ -521,4 +531,46 @@ test "a refusing ConfigChange hook answers a waiting effort change as refused, a
     try testing.expectEqual(SettingFeedback.named, setting.feedback);
     try testing.expect(setting.picked == null);
     try testing.expectEqual(@as(usize, 5), taken.agent_key);
+}
+
+test "holdsPickerChoice reflects only pending picker changes" {
+    var hooks = try TestHooks.init(testing.allocator, configHooks("exec sleep 30"));
+    defer hooks.deinit(testing.allocator);
+    try hooks.start(testing.allocator);
+
+    var state: State = .{};
+    defer state.deinit();
+    try testing.expect(!state.holdsPickerChoice());
+
+    const lifecycle = testLifecycle(hooks.home, &hooks.runtime.?);
+
+    const with_picked: Change = .{ .setting = .{
+        .setting = .effort,
+        .source = "effort",
+        .old_value = "medium",
+        .new_value = "high",
+        .value = "high",
+        .effort = types.ReasoningEffort.literal("high"),
+        .picked = .{ .model = "openai/gpt-5-mini", .fast_mode = false, .ultrafast_mode = false },
+    } };
+    try testing.expect(try state.begin(lifecycle, with_picked, 1, null));
+    try testing.expect(state.holdsPickerChoice());
+    try testing.expect(state.cancel());
+    var picked_taken = try waitTaken(&state);
+    picked_taken.deinit();
+    try testing.expect(!state.holdsPickerChoice());
+
+    const without_picked: Change = .{ .setting = .{
+        .setting = .effort,
+        .source = "effort",
+        .old_value = "medium",
+        .new_value = "high",
+        .value = "high",
+        .effort = types.ReasoningEffort.literal("high"),
+    } };
+    try testing.expect(try state.begin(lifecycle, without_picked, 1, null));
+    try testing.expect(!state.holdsPickerChoice());
+    try testing.expect(state.cancel());
+    var plain_taken = try waitTaken(&state);
+    plain_taken.deinit();
 }

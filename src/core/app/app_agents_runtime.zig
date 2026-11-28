@@ -1473,6 +1473,9 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "model_choice_target")) return;
             if (app.model_choice_target == null) return;
             if (modelPickerHolds(app)) return;
+            if (comptime @hasField(App, "hook_gate")) {
+                if (app.hook_gate.holdsPickerChoice()) return;
+            }
             app.model_choice_target = null;
             // The person left the picker without a choice: the card comes
             // back, and so does the draft the picker borrowed the composer for.
