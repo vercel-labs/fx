@@ -77,6 +77,9 @@ jobs:
             target: aarch64-macos
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The build number counts main's history (build.zig readBuildNumber).
+          fetch-depth: 0
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -250,8 +253,11 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          jq -n --arg version "$VERSION" --arg commit "$RELEASE_SHA" \
-            '{version: $version, commit: $commit}' > /tmp/dev.json
+          # The same number the binary carries (build.zig readBuildNumber).
+          # fx installs a dev build only when this number is higher.
+          BUILD=$(git rev-list --count --first-parent "$RELEASE_SHA")
+          jq -n --arg version "$VERSION" --arg commit "$RELEASE_SHA" --argjson build "$BUILD" \
+            '{version: $version, commit: $commit, build: $build}' > /tmp/dev.json
 
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -X PUT "https://blob.vercel-storage.com/cli/dev.json" \
