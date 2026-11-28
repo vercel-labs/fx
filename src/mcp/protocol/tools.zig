@@ -121,7 +121,8 @@ pub const List = struct {
 
 pub const Added = struct {
     added: u32 = 0,
-    /// Tools without a plain, non-empty `name`, or whose `inputSchema` isn't an object.
+    /// Tools without a plain, non-empty `name`, or whose `inputSchema` isn't an object. Such a tool takes no name, so
+    /// a later tool of the same name is kept.
     invalid: u32 = 0,
     /// Tools with a field written twice, `name` included: no copy of it is trusted over the other.
     repeated_field: u32 = 0,
@@ -568,6 +569,25 @@ test "gathers valid tools, skipping malformed ones and later duplicates" {
     try testing.expectEqual(@as(?[]const u8, null), store.nextCursor());
     try testing.expectEqual(@as(usize, 2), store.current.len());
     try testing.expectError(error.NotAnArray, store.addPage(testing.allocator, .{ .tools = "{}", .next_cursor = null, .ttl_ms = 0 }));
+}
+
+test "a tool whose inputSchema is missing or no object is skipped and takes no name: a later tool of the name is kept" {
+    const skipped = [_][]const u8{
+        "{\"name\":\"a\"}",
+        "{\"name\":\"a\",\"inputSchema\":null}",
+        "{\"name\":\"a\",\"inputSchema\":[]}",
+        "{\"name\":\"a\",\"inputSchema\":\"x\"}",
+    };
+    for (skipped) |bad| {
+        var store: Store = .{};
+        defer store.deinit(testing.allocator);
+        var page: [192]u8 = undefined;
+        const text = try std.mem.print(&page, "{{\"tools\":[{s},{{\"name\":\"a\",\"description\":\"the good one\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}", .{bad});
+        const added = try store.addPage(testing.allocator, try parsePage(text));
+        try testing.expectEqual(Added{ .added = 1, .invalid = 1 }, added);
+        store.publish();
+        try testing.expect(std.mem.find(u8, store.current.find("a").?.raw, "the good one") != null);
+    }
 }
 
 test "a large list over pages: each tool is found as first listed, and a later one of the same name is skipped" {

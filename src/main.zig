@@ -31,6 +31,7 @@ const js_host_clipboard = @import("core/hosts/js_host_clipboard.zig");
 const credentials = @import("core/auth/credentials.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
+const personal_shortcut_runtime = @import("core/app/personal_shortcut_runtime.zig");
 const usage = @import("usage/usage.zig");
 const usage_host = @import("core/app/usage_host.zig");
 const credits_lookup = @import("core/app/credits_lookup.zig");
@@ -159,6 +160,7 @@ const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const url_opener = @import("core/hosts/url_opener.zig");
 const event_loop = @import("ui/event_loop.zig");
+const loop_timeout = @import("ui/loop_timeout.zig");
 const footer_runtime = @import("ui/footer/runtime.zig");
 const question_ui = @import("ui/footer/question_ui.zig");
 const ui_input = @import("ui/input/runtime.zig");
@@ -205,9 +207,6 @@ const ResumeProjection = resume_projection.ResumeProjection;
 const RawEnviron = io_mod.RawEnviron;
 
 const footer_rows: u16 = 4;
-const active_poll_timeout_ms: i32 = 8;
-const focused_ui_worker_poll_timeout_ms: i32 = 1;
-const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
 const default_max_agent_steps: usize = agent_steps.default_max_agent_steps;
@@ -219,32 +218,6 @@ const max_read_file_lines: usize = 400;
 const max_read_file_line_len: usize = 2000;
 const max_command_output_bytes: usize = 64 * 1024;
 const input_escape_timeout_ms: i64 = 30;
-
-/// The first frame counts as focused work: an idle wait before it would only
-/// delay the launch.
-fn nativeLoopPollTimeoutMs(
-    default_timeout_ms: i32,
-    first_frame_pending: bool,
-    auth_refresh_active: bool,
-    skills_refresh_active: bool,
-    transcript_page_work_active: bool,
-    file_listing_hold_pending: bool,
-    pending_input_restore_active: bool,
-    /// A time-bounded drain put events back: run the next iteration without
-    /// waiting for input.
-    next_iteration_due: bool,
-) i32 {
-    if (next_iteration_due) return 0;
-    return if (first_frame_pending or
-        auth_refresh_active or
-        skills_refresh_active or
-        transcript_page_work_active or
-        file_listing_hold_pending or
-        pending_input_restore_active)
-        @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms)
-    else
-        default_timeout_ms;
-}
 
 const max_prompt_history: usize = 100;
 
@@ -616,6 +589,8 @@ const App = struct {
     trust: workspace_trust.gate.Gate = .{},
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
+    /// Personal keyboard shortcuts from the profile, reloaded at turn ends.
+    personal_shortcuts: personal_shortcut_runtime.State = .{},
     /// Replaced in `init` with the real home directory.
     usage_dashboard: usage.Dashboard = usage.Dashboard.init(std.heap.c_allocator, usage_host.unset),
     /// The `/credits` lookup in flight, if any.
@@ -1392,7 +1367,7 @@ const App = struct {
             const exit_cause = try event_loop.run(
                 self.terminal,
                 &self.should_exit,
-                active_poll_timeout_ms,
+                loop_timeout.active_ms,
                 callbacks,
             );
             switch (exit_cause) {
@@ -1405,18 +1380,65 @@ const App = struct {
     pub fn loopPollTimeoutMs(ctx: *anyopaque, default_timeout_ms: i32) i32 {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (comptime !host_target.is_wasm) {
-            return nativeLoopPollTimeoutMs(
-                default_timeout_ms,
-                self.shell.render_requests.hasReason(.first_frame),
-                self.auth.sourceInventoryRefreshActive(),
-                self.skills.refreshActive(),
-                self.fullTranscriptFocusedWorkActive(),
-                InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
-                self.pendingInputRestoreActive(),
-                self.takeDrainContinuationDue(),
-            );
+            return loop_timeout.timeoutMs(self.loopTimeoutFacts());
         }
-        return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
+        return if (self.pacer.hasPending()) default_timeout_ms else loop_timeout.idle_wasm_ms;
+    }
+
+    fn loopTimeoutFacts(self: *App) loop_timeout.Facts {
+        return .{
+            .next_iteration_due = self.takeDrainContinuationDue(),
+            .first_frame_pending = self.shell.render_requests.hasReason(.first_frame),
+            .auth_refresh_active = self.auth.sourceInventoryRefreshActive(),
+            .skills_refresh_active = self.skills.refreshActive(),
+            .transcript_page_work_active = self.fullTranscriptFocusedWorkActive(),
+            .file_listing_hold_pending = InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
+            .pending_input_restore_active = self.pendingInputRestoreActive(),
+            .render_pending = self.shell.render_requests.hasPending(),
+            .animation_visible = self.shell.render_requests.animation_visible,
+            .pacer_pending = self.pacer.hasPending(),
+            .agent_active = self.anyAgentLoopActive(),
+            .input_pending = self.terminal_input_runtime.hasPendingTerminalInput() or
+                self.terminal_input_runtime.native_clear_probe.active() or
+                InputAppRuntime.terminalPasteActive(self),
+            .gesture_armed = self.anyInputGestureArmed(),
+            .resize_pending = resize_interlock.resizePending() or !shell_runtime.resizeLifecycleIdle(&self.shell),
+            .open_ui_waiting = self.openUiWaitingForBackground(),
+        };
+    }
+
+    fn anyAgentLoopActive(self: *App) bool {
+        if (AgentsAppRuntime.firstOpen(self) and agentLoopActive(&self.main_agent)) return true;
+        for (self.child_agents.items) |child| {
+            if (agentLoopActive(&child.agent)) return true;
+        }
+        return false;
+    }
+
+    fn agentLoopActive(agent: *agents.Agent) bool {
+        return agent.stream.active or agent.worker.isProcessing() or agent.worker.hasPendingEvents();
+    }
+
+    fn anyInputGestureArmed(self: *const App) bool {
+        const gestures = self.input_runtime.gestures;
+        return gestures.ctrlCExitArmed() or
+            gestures.escapeClearArmed() or
+            gestures.escapeInterruptArmed();
+    }
+
+    fn openUiWaitingForBackground(self: *App) bool {
+        const picker = &self.input_runtime.picker.file_completion;
+        const file_listing_in_flight = picker.active and !picker.indexed and picker.directory_request != null;
+        const model_loading = self.model_cache.menu.active and self.model_cache.isLoading();
+        const mcp_loading = self.mcp.host_menu.active and self.mcp.host_menu_tools == .loading;
+        const session_picker = &self.screenAgent().session_persistence.session_picker;
+        const session_loading = session_picker.isLoading() or
+            (session_picker.active and session_picker.loading_more);
+        return self.input_runtime.usage_menu.active or
+            file_listing_in_flight or
+            model_loading or
+            mcp_loading or
+            session_loading;
     }
 
     /// Whether any agent's budgeted drain put events back for the loop's next
@@ -2155,46 +2177,17 @@ const App = struct {
         return browser_workspace_tools.selectToolSet(false, self.workspaceHostInfo() != null);
     }
 
-    pub fn hasMcpTool(self: *App, name: []const u8, access: tool_mcp_runtime.Access) bool {
-        return self.mcp.hasTool(name, access);
-    }
-
-    pub fn validateMcpTool(
-        self: *App,
-        arena: Allocator,
-        name: []const u8,
-        arguments_json: []const u8,
-        access: tool_mcp_runtime.Access,
-    ) !tool_mcp_runtime.ValidationResult {
-        return self.mcp.validateTool(arena, name, arguments_json, access);
-    }
-
-    pub fn callMcpTool(
-        self: *App,
-        arena: Allocator,
-        name: []const u8,
-        arguments_json: []const u8,
-        max_tool_result_bytes: usize,
-        options: tool_mcp_runtime.CallOptions,
-    ) !?tool_mcp_runtime.CallResult {
-        return self.mcp.callTool(arena, name, arguments_json, max_tool_result_bytes, options);
-    }
-
-    pub fn searchMcpTools(self: *App, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !tool_mcp_runtime.SearchResult {
-        return self.mcp.searchTools(arena, request, permission_rules, self.context_limits, access, cancel_flag);
-    }
-
-    pub fn mcpToolSchemaJson(self: *App, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !?tool_mcp_runtime.ToolSchemaResult {
-        return self.mcp.toolSchema(arena, name, permission_rules, self.context_limits, access, cancel_flag);
+    pub fn wireMcp(self: *App, tc: *tool_runtime.Context) void {
+        self.mcp.wire(tc);
     }
 
     pub fn addMcpSlack(self: *App) !void {
         return app_commands.Handlers(App).addSlack(self);
     }
 
-    /// `mode` is the mode of the agent that refreshes the tool: its rules are none in full access.
-    pub fn snapshotMcpDefinition(self: *App, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, mode: types.PermissionMode) !tool_mcp_runtime.DefinitionSnapshot {
-        return self.mcp.snapshotToolDefinition(alloc, name, known, permissions.mcpRules(mode, self.permission_engine.rules), self.context_limits, .unrestricted);
+    /// The refresh of `agent`'s selected tool, under the agent's own mode and MCP view.
+    pub fn snapshotMcpDefinition(self: *App, agent: *agents.Agent, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+        return AgentAppRuntime.snapshotMcpDefinition(self, agent, alloc, name, known, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
@@ -3315,7 +3308,7 @@ const App = struct {
             );
             const replay = replay_byte orelse return;
             const context = try InputAppRuntime.prepareTerminalDecode(self, self.screenAgent()) orelse return;
-            ingress = self.terminal_input_runtime.decodeTerminalByte(replay, context);
+            ingress = self.terminal_input_runtime.decodeReplayedTerminalByte(replay, context);
         }
     }
 
@@ -4779,19 +4772,6 @@ test "process io connects through a reachable address while fx tasks hold every 
     }
 }
 
-test "focused UI workers retain a bounded native poll timeout" {
-    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, false, true, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, false));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, true));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, true));
-}
-
 test "poll timeout is not 1 ms while only a held restore result waits" {
     const test_session_adapter = @import("core/session/session_adapter.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -4826,6 +4806,35 @@ test "poll timeout is not 1 ms while only a held restore result waits" {
     // The background task finished and is waiting for handoff (`isActive()` is still true).
     try std.testing.expect(app.main_agent.session_persistence.pending_input_restore.isActive());
     try std.testing.expect(!app.pendingInputRestoreActive());
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+}
+
+test "poll timeout stays active 8 ms while theme monitor buffers an escape byte" {
+    var app = App{ .alloc = std.testing.allocator };
+    defer app.lifecycle_runtime.deinit();
+
+    app.terminal_input_runtime.terminal_theme_monitor.start();
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+
+    try std.testing.expectEqual(.pending, app.terminal_input_runtime.terminal_theme_monitor.feed(0x1b, 1_000));
+    try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
+}
+
+test "poll timeout stays active 8 ms while session picker loads" {
+    var app = App{ .alloc = std.testing.allocator };
+    defer app.lifecycle_runtime.deinit();
+
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+
+    const picker = &app.screenAgent().session_persistence.session_picker;
+    picker.active = true;
+    picker.load_state = .loading;
+    try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
+
+    picker.load_state = .ready;
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+
+    picker.loading_more = true;
     try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
 }
 
@@ -4981,6 +4990,7 @@ fn runAcpServer(_: ?*anyopaque, alloc: Allocator, cfg: acp_runner.Config) anyerr
 
 fn handleSigWinchNative(_: std.posix.SIG) callconv(.c) void {
     resize_interlock.noteResizeSignal();
+    shell_runtime.notifyResizeWakePipe();
 }
 
 fn handleSigWinchWeb() callconv(.c) void {
@@ -5739,11 +5749,13 @@ test {
     _ = @import("core/recovery/recovery.zig");
     _ = @import("core/workspace_trust/workspace_trust.zig");
     _ = @import("core/app/app_trust_runtime.zig");
+    _ = @import("core/app/personal_shortcut_runtime.zig");
     _ = @import("ui/footer/trust_prompt_ui.zig");
     _ = @import("core/quiesce/quiesce.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
+    _ = @import("core/shortcuts/shortcuts.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/function_tools.zig");
     _ = @import("core/shared/json_depth.zig");
@@ -5797,6 +5809,8 @@ test {
     _ = @import("core/app/app_upgrade_runtime.zig");
     _ = @import("core/app/app_worker_runtime.zig");
     _ = @import("ui/event_loop.zig");
+    _ = @import("ui/loop_timeout.zig");
+    _ = @import("ui/terminal/theme_detection.zig");
     _ = @import("ui/resize_tests.zig");
     _ = @import("ui/transcript/transcript_window_fuzz.zig");
     _ = @import("ui/transcript/frozen_prefix_tests.zig");
@@ -6319,6 +6333,219 @@ test "the per-step refresh of an MCP tool takes the rules of the mode of the age
     // Full access keeps the tool the rule names; ask drops it.
     try std.testing.expect(yolo_refresh == .current);
     try std.testing.expect(ask_refresh == .unavailable);
+}
+
+fn tuiToolContext(app: *App, agent: *agents.Agent) tool_runtime.Context {
+    return App.AgentAppRuntime.toolContext(app, agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+}
+
+/// The context ACP and `fx ask` give a run: `tui`'s, with the MCP operations
+/// of `host`'s catalog (`Catalog.wire`), or none when there is no host.
+fn catalogWiredContext(tui: tool_runtime.Context, mcp: ?*mcp_host.Host) tool_runtime.Context {
+    var ctx = tui;
+    ctx.mcp_ctx = null;
+    ctx.mcp_has_tool = null;
+    ctx.mcp_access_changed = null;
+    ctx.mcp_validate_tool = null;
+    ctx.mcp_call_tool = null;
+    ctx.mcp_search_tools = null;
+    ctx.mcp_tool_schema = null;
+    ctx.mcp_snapshot_tool = null;
+    if (mcp) |h| h.catalog.wire(&ctx);
+    return ctx;
+}
+
+fn expectSameToolbox(tui: tool_runtime.Context, wired: tool_runtime.Context, arena: Allocator, arguments_json: []const u8) ![]const u8 {
+    const call: types.ToolCall = .{ .id = "1", .name = "toolbox", .arguments_json = arguments_json };
+    const from_tui = try tool_runtime.executeToolCall(tui, arena, call);
+    const from_catalog = try tool_runtime.executeToolCall(wired, arena, call);
+    try std.testing.expectEqual(from_catalog.status, from_tui.status);
+    try std.testing.expectEqualStrings(from_catalog.model_output, from_tui.model_output);
+    return from_tui.model_output;
+}
+
+test "one catalog adapter: with no MCP host the TUI's toolbox search says what ACP and fx ask say" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+
+    const tui = tuiToolContext(&app, (&app).screenAgent());
+    const wired = catalogWiredContext(tui, null);
+    const said = try expectSameToolbox(tui, wired, arena_state.allocator(), "{\"search\":\"echo\"}");
+    try std.testing.expect(std.mem.find(u8, said, "\"mcp_state\":\"unavailable\"") != null);
+    // Nothing of MCP is wired, so a shell command gets no `fx mcp call` bridge either.
+    try std.testing.expect(tui.mcp_ctx == null);
+    try std.testing.expect(tui.mcp_call_tool == null);
+}
+
+test "one catalog adapter: a subagent whose MCP view the servers changed under hears why in the TUI too" {
+    const alloc = std.testing.allocator;
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const mcp = try mcp_host.Host.create(alloc, std.testing.io, &configs, &f.inherited, f.options(), .{});
+    defer mcp.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    app.mcp.host = mcp;
+    defer app.mcp.host = null;
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    var child_run = try testChildRun(alloc, &resolver, false, null);
+    var view = try mcp.catalog.snapshotAccessView(alloc, "child-1", "main-session");
+    view.runtime_generation +%= 1;
+    child_run.admission.mcp_view = view;
+    App.AgentsAppRuntime.installChildRun(&app, child, child_run);
+
+    const Check = struct {
+        fn run(live_host: *mcp_host.Host, a: *App, agent: *agents.Agent) anyerror!void {
+            var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_state.deinit();
+            const tui = tuiToolContext(a, agent);
+            const wired = catalogWiredContext(tui, live_host);
+            const said = try expectSameToolbox(tui, wired, arena_state.allocator(), "{\"open\":\"mcp_fake_echo\",\"kind\":\"tool\"}");
+            try std.testing.expect(std.mem.find(u8, said, "is not available to this work") != null);
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, mcp, Check.run);
+}
+
+test "one catalog adapter: a search keeps the limits its caller narrowed in the TUI too" {
+    const alloc = std.testing.allocator;
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+    const lexical_relevance = @import("core/shared/lexical_relevance.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const mcp = try mcp_host.Host.create(alloc, std.testing.io, &configs, &f.inherited, f.options(), .{});
+    defer mcp.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    app.mcp.host = mcp;
+    defer app.mcp.host = null;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tui = tuiToolContext(&app, (&app).screenAgent());
+    const wired = catalogWiredContext(tui, mcp);
+    var narrow = tui.context_limits;
+    narrow.mcp_search_result_bytes.value = .{ .bytes = 100 };
+    const query = try lexical_relevance.prepare("echo");
+    const request: tool_mcp_runtime.SearchRequest = .{ .query = &query, .kind = .mcp };
+    const from_tui = try tui.mcp_search_tools.?(tui.mcp_ctx.?, arena, request, .{}, narrow, .unrestricted, null);
+    const from_catalog = try wired.mcp_search_tools.?(wired.mcp_ctx.?, arena, request, .{}, narrow, .unrestricted, null);
+    try std.testing.expect(std.mem.find(u8, from_catalog.model_output, "context_limit") != null);
+    try std.testing.expectEqualStrings(from_catalog.model_output, from_tui.model_output);
+}
+
+test "one catalog adapter: the per-step refresh of an MCP tool keeps the servers an instance's profile names" {
+    const alloc = std.testing.allocator;
+    const Permission = app_permission_runtime.Runtime(App);
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+    const lexical_relevance = @import("core/shared/lexical_relevance.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const mcp = try mcp_host.Host.create(alloc, std.testing.io, &configs, &f.inherited, f.options(), .{});
+    defer mcp.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer Permission.deinitSessionGrants(&app, &app.main_agent);
+    const instance = try addTestChildAgent(&app, "instance-2");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    instance.agent.role = .instance;
+    Permission.initMode(&app, &instance.agent, .ask);
+    app.mcp.host = mcp;
+    defer app.mcp.host = null;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const query = try lexical_relevance.prepare("echo");
+    const found = try mcp.catalog.searchTools(arena, .{ .query = &query, .kind = .mcp }, .{}, .{}, .unrestricted, null);
+    const binding = found.selected_tools[0].mcp_binding.?;
+
+    // The instance may use only server "other", so the tool of "fake" is gone for it.
+    instance.agent.profile.profile.mcp_servers = &[_][]const u8{"other"};
+    const deps = app_callbacks.Bindings(App).agentRuntimeDeps(&app, &instance.agent);
+    const tui = tuiToolContext(&app, &instance.agent);
+    const wired = catalogWiredContext(tui, mcp);
+    const from_catalog = try tool_runtime.snapshotMcpDefinition(wired, arena, "mcp_fake_echo", binding);
+    const from_tui = try deps.snapshot_mcp_definition.?(deps.ctx, arena, "mcp_fake_echo", binding);
+    try std.testing.expect(from_catalog == .unavailable);
+    try std.testing.expect(from_tui == .unavailable);
+}
+
+test "one catalog adapter: a context asks the host there is when an operation runs, and gives it back" {
+    const alloc = std.testing.allocator;
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+    const lexical_relevance = @import("core/shared/lexical_relevance.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const first_configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const second_configs = [_]mcp_contract.McpServerConfig{.{ .name = "other", .command = f.server }};
+    const first = try mcp_host.Host.create(alloc, std.testing.io, &first_configs, &f.inherited, f.options(), .{});
+    defer first.destroy();
+    const second = try mcp_host.Host.create(alloc, std.testing.io, &second_configs, &f.inherited, f.options(), .{});
+    defer second.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.mcp.host = null;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    app.mcp.host = first;
+    const ctx = tuiToolContext(&app, (&app).screenAgent());
+    try std.testing.expect(ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_fake_echo", .unrestricted));
+
+    // A reload that brought a new host: the context made before it sees the new one.
+    app.mcp.host = second;
+    try std.testing.expect(!ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_fake_echo", .unrestricted));
+    try std.testing.expect(ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_other_echo", .unrestricted));
+
+    // The last server went: the context says MCP is unavailable and breaks nothing.
+    app.mcp.host = null;
+    try std.testing.expect(!ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_other_echo", .unrestricted));
+    try std.testing.expect(try ctx.mcp_call_tool.?(ctx.mcp_ctx.?, arena, "mcp_other_echo", "{}", 4096, .{}) == null);
+    const query = try lexical_relevance.prepare("echo");
+    const found = try ctx.mcp_search_tools.?(ctx.mcp_ctx.?, arena, .{ .query = &query, .kind = .mcp }, .{}, ctx.context_limits, .unrestricted, null);
+    try std.testing.expectEqualStrings(tool_mcp_runtime.unavailable_search_output, found.model_output);
+
+    // Every operation gave its host back.
+    try std.testing.expectEqual(@as(usize, 0), first.leases);
+    try std.testing.expectEqual(@as(usize, 0), second.leases);
 }
 
 test "visiting a child agent puts its context, transcript, and pacer on the screen until it returns" {

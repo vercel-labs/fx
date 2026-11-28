@@ -2778,6 +2778,9 @@ describe("effect-aware command permissions", () => {
       const networkFailures = report.all("failed_network_call");
       expect(networkFailures).toHaveLength(1);
       expect(network.kept_failures).toBe(1);
+      // An HTTP rejection is not an OS error that Zig has no name for.
+      expect(network.os_errors).toBe(0);
+      expect(report.all("os_error")).toEqual([]);
       expect(networkFailures[0]).toMatchObject({
         source: "parent",
         status: 400,

@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, test } from "bun:test";
 import { processAlive } from "./process-alive";
 import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
-import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -1208,6 +1208,61 @@ test("ACP shell completed and replayed updates show the command output", async (
     expect(shellText(client.rawLines.map(line => JSON.parse(line)))).toEqual([expected]);
     expect(client.stderr).toBe("");
   } finally {
+    await client?.close();
+    fixture.close();
+  }
+}, 45000);
+
+test("ACP shell output after a yielded call keeps the run card completed", async () => {
+  // The command blocks on this FIFO until the test writes to it, so its output
+  // arrives after `run` has yielded and completed its card.
+  const fixture = createConfiguredProviderFixture(body => {
+    const results = body.messages.filter((message: any) => message.role === "tool");
+    if (results.length === 0) return configuredToolCompletion(body.model, "shell", { request: {
+      action: "run", yield_time_ms: 1, command: `read _ < "${gate}"; printf LATE_STDOUT`,
+    } }, "call_split");
+    if (results.length === 1) {
+      const session = JSON.stringify(results[0].content).match(/shell-\d+/)?.[0];
+      if (!session) throw new Error("expected a yielded shell session");
+      release();
+      return configuredToolCompletion(body.model, "shell", { request: {
+        action: "interact", session_id: session, yield_time_ms: 5000,
+      } }, "call_collect");
+    }
+    return configuredCompletion(body.model, "done");
+  });
+  const gate = join(fixture.workspace, "release.fifo");
+  execFileSync("mkfifo", [gate]);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    nodeSpawn("/bin/sh", ["-c", "printf go > \"$1\"", "sh", gate], { stdio: "ignore" });
+  };
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    const result = await runPrompt(client, "Run the split probe.", TIMEOUT);
+    expect(result.promptResult.result.stopReason).toBe("end_turn");
+    const updates = result.messages.map((message: any) => message.params?.update).filter(Boolean);
+    const split = updates.filter((update: any) => update.toolCallId === "call_split");
+    const completedAt = split.findIndex((update: any) => update.status === "completed");
+    expect(completedAt).toBeGreaterThan(-1);
+    expect(split.filter((update: any) => update.status !== undefined).map((update: any) => update.status))
+      .toEqual(["pending", "in_progress", "completed"]);
+    const late = split.slice(completedAt + 1);
+    expect(late.some((update: any) => JSON.stringify(update.content).includes("LATE_STDOUT"))).toBe(true);
+    expect(late.every((update: any) => update.status === undefined)).toBe(true);
+    const collected = updates.find((update: any) => update.toolCallId === "call_collect" && update.status === "completed");
+    expect(collected).toBeDefined();
+    expect(JSON.stringify(collected.content)).toContain("LATE_STDOUT");
+    expect(client.stderr).toBe("");
+  } finally {
+    release();
     await client?.close();
     fixture.close();
   }
@@ -10244,6 +10299,34 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "unknown method returns error -32601",
+    async () => {
+      // Its own profile and fake gateway, as the other tests here use: the
+      // developer's profile can select a provider that refuses initialize.
+      const root = createIsolatedRoot("fx-acp-unknown-method-");
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const init = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(init.error).toBeUndefined();
+        expect(init.result.protocolVersion).toBe(1);
+        const resp = await client.request("nonexistent/method", {}, 2) as any;
+        expect(resp.error).toBeDefined();
+        expect(resp.error.code).toBe(-32601);
+        expect(resp.error.message).toContain("Method not found");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/list leaves an empty home unchanged",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-acp-no-create-"));
@@ -15022,19 +15105,6 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
       expect(resp.error).toBeDefined();
       expect(resp.error.code).toBe(-32600);
       expect(resp.error.message).toContain("Not initialized");
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "unknown method returns error -32601",
-    async () => {
-      client = await AcpClient.create();
-      await client.request("initialize", { protocolVersion: 1 }, 1);
-      const resp = await client.request("nonexistent/method", {}, 2) as any;
-      expect(resp.error).toBeDefined();
-      expect(resp.error.code).toBe(-32601);
-      expect(resp.error.message).toContain("Method not found");
     },
     TIMEOUT,
   );

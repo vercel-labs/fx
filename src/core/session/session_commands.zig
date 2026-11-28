@@ -168,6 +168,7 @@ fn postCommitResolutionError(
             .invalid_skill_symlink_authorities,
             .invalid_ultrafast_mode_override,
             => return error.InvalidSettingsFormat,
+            .invalid_shortcuts,
             .ignored_project_user_only_setting,
             .legacy_workspace_preferences,
             .manual_backup_available,

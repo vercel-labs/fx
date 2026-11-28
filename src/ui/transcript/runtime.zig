@@ -14843,6 +14843,165 @@ test "stable resume publication starts a fresh retained source epoch" {
     try std.testing.expect(facts.recovery_rebase);
 }
 
+const ResumeHandoffPlan = struct {
+    start_line: usize,
+    line_count: usize,
+    facts: TranscriptScrollFacts,
+};
+
+fn resumeHandoffTestRuntime(
+    alloc: Allocator,
+    pending_flow: []const u8,
+    transcript: []const u8,
+) !TranscriptRuntime {
+    const layout: Layout = .{
+        .rows = 8,
+        .cols = 40,
+        .content_bottom = 4,
+        .divider_top_row = 5,
+        .input_row = 6,
+        .divider_bottom_row = 7,
+        .hint_row = 8,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+    };
+    errdefer runtime.deinit(alloc);
+    try runtime.enableShadowVt(alloc);
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, pending_flow),
+    );
+    try runtime.notebook.transcript.appendSlice(alloc, transcript);
+    return runtime;
+}
+
+fn commitResumeHandoff(
+    alloc: Allocator,
+    runtime: *TranscriptRuntime,
+    start_line: usize,
+    line_count: usize,
+    visual_offset: u32,
+    cursor_col: u16,
+) void {
+    var transition = TranscriptTransition{
+        .scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(
+            runtime.layout.rows,
+            runtime.owned_top_row,
+        ),
+        .document_append = .{},
+        .materialized_without_append = .{},
+        .target_flow = runtime.notebook.pending_resume_source.?.bytes,
+        .target_flow_owned = false,
+        .target_cache = .empty,
+        .target_cache_unchanged = true,
+        .folded_summary_indices = &.{},
+        .target_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 4,
+            .start_line = start_line,
+            .partial_skip_rows = 0,
+            .line_count = line_count,
+            .last_visible_row = 4,
+        },
+        .visual_offset = visual_offset,
+        .history_visual_offset = visual_offset,
+        .total_visual_rows = @intCast(line_count),
+        .cursor_row = 4,
+        .cursor_col = cursor_col,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 4,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 4,
+    };
+    defer transition.deinit(alloc);
+    runtime.consumeTranscriptTransition(
+        alloc,
+        &transition,
+        testFrameCommitResult(0, .committed),
+    );
+}
+
+fn planAfterResumeHandoff(
+    alloc: Allocator,
+    runtime: *TranscriptRuntime,
+) !ResumeHandoffPlan {
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer prepared.deinit(alloc);
+    return .{
+        .start_line = prepared.selection.start_line,
+        .line_count = prepared.selection.line_count,
+        .facts = runtime.planTranscriptScroll(&prepared),
+    };
+}
+
+test "a resume that grows before its repaint scrolls the rows it pushes off" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "line-1\n" ++
+        "line-2\n" ++
+        "line-3\n" ++
+        "line-4\n" ++
+        "line-5\n" ++
+        "line-6";
+    var runtime = try resumeHandoffTestRuntime(alloc, flow, flow);
+    defer runtime.deinit(alloc);
+
+    commitResumeHandoff(alloc, &runtime, 2, 6, 2, 7);
+    try runtime.notebook.transcript.appendSlice(alloc, "\nline-7\nline-8\nline-9\nline-10");
+
+    const result = try planAfterResumeHandoff(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 6), result.start_line);
+    try std.testing.expectEqual(@as(usize, 10), result.line_count);
+    try std.testing.expectEqual(@as(u32, 6), result.facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 4), result.facts.planned_rows);
+}
+
+test "a resume that grew before its handoff commits scrolls the rows it pushes off" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "line-1\n" ++
+        "line-2\n" ++
+        "line-3\n" ++
+        "line-4\n" ++
+        "line-5\n" ++
+        "line-6";
+    var runtime = try resumeHandoffTestRuntime(alloc, flow, flow);
+    defer runtime.deinit(alloc);
+
+    try runtime.notebook.transcript.appendSlice(alloc, "\nline-7\nline-8\nline-9\nline-10");
+    commitResumeHandoff(alloc, &runtime, 2, 6, 2, 7);
+
+    const result = try planAfterResumeHandoff(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 6), result.start_line);
+    try std.testing.expectEqual(@as(usize, 10), result.line_count);
+    try std.testing.expectEqual(@as(u32, 6), result.facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 4), result.facts.planned_rows);
+}
+
 test "oversized resume publication starts without a prior committed frame" {
     const alloc = std.testing.allocator;
     const layout = invalidationTestLayout();

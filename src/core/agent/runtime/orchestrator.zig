@@ -9694,18 +9694,27 @@ fn processQueuedPromptLoop(
                         debug_trace.logf("recovery", "unreadable reply limit reached, ending the turn err={s}", .{@errorName(err)});
                         break :blk null;
                     }
+                    if (evidence.cause == .unnamed_os_error and request_recovery.unnamedOsErrorEndsRequest()) {
+                        debug_trace.logf("recovery", "unnamed OS error limit reached, ending the turn err={s}", .{@errorName(err)});
+                        break :blk null;
+                    }
                     break :blk evidence;
                 } else null;
                 const failure_cause: types.ModelRecoveryCause = if (network_failure) |evidence|
                     switch (evidence.cause) {
                         // Saved sessions name only causes every version reads.
-                        .transport_interrupted, .unreadable_reply => .network_interrupted,
+                        .transport_interrupted, .unreadable_reply, .unnamed_os_error => .network_interrupted,
                         .connectivity_lost => .connectivity_lost,
                         .stream_stalled => .provider_stream_timeout,
                     }
                 else
                     recovery_cause;
-                const failure_diagnostic = types.ModelFailureDiagnostic.init(@errorName(err));
+                const unnamed_os_error = if (gateway_attempt_evidence.network_failure) |evidence|
+                    evidence.cause == .unnamed_os_error
+                else
+                    false;
+                // Its name says nothing; /trace has the errno (`os_errors.zig`).
+                const failure_diagnostic = types.ModelFailureDiagnostic.init(if (unnamed_os_error) "OS error, see /trace" else @errorName(err));
                 const failure_tool_evidence = settledAttemptToolEvidence(
                     deps.tool_registry,
                     preserved_tool_evidence,
