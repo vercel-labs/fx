@@ -147,8 +147,9 @@ const LauncherControl = struct {
     command_path: ?[]const u8,
     child_pid: std.posix.pid_t,
     watchdog: *LauncherWatchdog,
-    /// Where the launcher reports to the host: its standard error.
-    report_fd: std.posix.fd_t = std.posix.STDERR_FILENO,
+    /// Where the launcher reports to the host. Null means its standard error,
+    /// which `acceptMarker` names; a test sets a pipe to read the reports.
+    report_fd: ?std.posix.fd_t = null,
     done: std.atomic.Value(bool) = .init(false),
     phase: ControlPhase = .awaiting_shell,
     failed: bool = false,
@@ -220,6 +221,7 @@ const LauncherControl = struct {
         self: *LauncherControl,
         kind: MarkerKind,
     ) !bool {
+        const report_fd = self.report_fd orelse std.posix.STDERR_FILENO;
         switch (kind) {
             .shell_ready => {
                 if (self.phase != .awaiting_shell) return false;
@@ -229,7 +231,7 @@ const LauncherControl = struct {
                     self.bootstrap_path,
                 ) catch {};
                 try writeControlFd(
-                    self.report_fd,
+                    report_fd,
                     .shell_ready,
                     @intCast(self.child_pid),
                 );
@@ -243,7 +245,7 @@ const LauncherControl = struct {
                     self.command_path.?,
                 ) catch {};
                 try writeControlFd(
-                    self.report_fd,
+                    report_fd,
                     .command_started,
                     @intCast(self.child_pid),
                 );
