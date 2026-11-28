@@ -1597,6 +1597,97 @@ test "full transcript page boundaries preserve monotonic navigation" {
     try std.testing.expect(after_page_down > before_page_down);
 }
 
+test "page down on tail full transcript keeps following tail when entries grow before rebuild" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+        .full_transcript = .{ .depth = .full, .follow_tail = true },
+    };
+    defer runtime.deinit(alloc);
+
+    for (0..5) |_| {
+        _ = try runtime.appendRawTranscriptEntryClassified(alloc, "row\n", .unknown_raw);
+    }
+
+    const visible_rows = runtime.fullTranscriptPageBottom();
+    const initial_rows: u32 = 40;
+    const initial_max = initial_rows - visible_rows;
+    const installPage = struct {
+        fn call(
+            current: *TranscriptRuntime,
+            range: full_transcript_page.SourceRange,
+            total_rows: u32,
+        ) !void {
+            const request = full_transcript_page.Request{
+                .content_revision = current.notebook.full_transcript_content_revision,
+                .cols = current.layout.cols,
+                .anchor = current.full_transcript_page_anchor,
+            };
+            if (current.full_transcript_installed_page == null) {
+                current.full_transcript_installed_page = .{
+                    .source = .{ .request = request, .range = range },
+                    .projection = .{ .styles = .{} },
+                };
+            }
+            const page = &current.full_transcript_installed_page.?;
+            page.source.request = request;
+            page.source.range = range;
+            page.projection.measured_item_rows.clearRetainingCapacity();
+            const rows_per_entry = total_rows / @as(u32, @intCast(range.len()));
+            for (range.start..range.end) |entry_index| {
+                try page.projection.measured_item_rows.append(std.heap.c_allocator, .{
+                    .entry_id = current.notebook.entries.items[entry_index].id(),
+                    .row = @as(u32, @intCast(entry_index - range.start)) * rows_per_entry,
+                });
+            }
+            page.projection.measured_total_rows = total_rows;
+        }
+    }.call;
+
+    try installPage(&runtime, .{ .start = 0, .end = 5 }, initial_rows);
+    runtime.full_transcript.scroll_rows = initial_max;
+
+    // Pacer appends entries while the older .tail snapshot (0..5) is still installed.
+    for (0..2) |_| {
+        _ = try runtime.appendRawTranscriptEntryClassified(alloc, "row\n", .unknown_raw);
+    }
+
+    for (0..5) |_| {
+        runtime.scrollFullTranscript(.down, .page);
+    }
+
+    try std.testing.expect(runtime.full_transcript_page_anchor == .tail);
+    try std.testing.expect(runtime.full_transcript.follow_tail);
+    try std.testing.expect(!runtime.full_transcript.bookmark_pending);
+
+    // A rebuild completing right after PageDown from below the bottom must also
+    // keep follow_tail instead of pinning a reading-position bookmark to the old page.
+    runtime.full_transcript.scroll_rows = initial_max -| 5;
+    runtime.full_transcript.follow_tail = false;
+    runtime.scrollFullTranscript(.down, .page);
+    try std.testing.expect(runtime.full_transcript.follow_tail);
+
+    runtime.full_transcript = runtime.presentationForRebuiltPage();
+    try installPage(&runtime, .{ .start = 0, .end = 7 }, 80);
+    const installed = &runtime.full_transcript_installed_page.?;
+    const selected = runtime.full_transcript.select_visual_offset(
+        installed.projection.measured_total_rows,
+        visible_rows,
+        installed.projection.measured_item_rows.items,
+    );
+    try std.testing.expect(selected.state.follow_tail);
+    try std.testing.expectEqual(@as(u32, 80 - visible_rows), selected.offset);
+}
+
 test "rebuilt full transcript page keeps the entry the viewer was reading" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -8483,6 +8574,7 @@ pub const TranscriptRuntime = struct {
     /// The page below the one at `anchor` over `range`: the next page of the
     /// same entries, else the next newer cycle, else the held entries.
     pub fn newerPageAnchor(self: *const TranscriptRuntime, anchor: full_transcript_page.Anchor, range: full_transcript_page.SourceRange) ?full_transcript_page.Anchor {
+        if (anchor == .tail) return null;
         const total = self.pageStoreLen(anchor) orelse return null;
         if (full_transcript_page.nextAnchor(range, total)) |next| return pageAnchorInStore(anchor, next.entry_index);
         return switch (anchor) {
@@ -8805,6 +8897,12 @@ pub const TranscriptRuntime = struct {
         };
         if (adjacent_anchor) |anchor| {
             self.moveToFullTranscriptPage(anchor, if (direction == .up) .last else .first);
+        } else if (direction == .down and
+            self.full_transcript_installed_page != null and
+            self.full_transcript.scroll_rows >= local_max_offset)
+        {
+            self.full_transcript.scroll_rows = local_max_offset;
+            self.full_transcript.follow_tail = true;
         }
         debug_trace.logf(
             "full_transcript_cache",
