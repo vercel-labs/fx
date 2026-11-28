@@ -24,6 +24,7 @@ const runtime_mod = @import("runtime.zig");
 const mcp = @import("../../mcp/mcp.zig");
 const mcp_call_client = @import("mcp_call_client.zig");
 const ui_terminal = @import("../../ui/terminal/terminal.zig");
+const output_contracts = @import("../output/output_contracts.zig");
 const Host = @import("host.zig").Host;
 
 const Allocator = std.mem.Allocator;
@@ -426,8 +427,10 @@ pub fn run(c: Context, args: []const []const u8) u8 {
     return code;
 }
 
-/// The exit code for a verb that failed, after saying why on `err_writer`.
+/// The exit code for a verb that failed, after saying why on `err_writer`. A
+/// hang-up ends quietly, as the other CLI commands do.
 fn reportFailure(err_writer: *Writer, surface: Surface, err: anyerror) u8 {
+    if (err == error.TerminalHungUp) return output_contracts.terminal_hung_up_exit_code;
     err_writer.print("{s}: {s}\n", .{ surface.prog(), describe(err) }) catch {};
     return 1;
 }

@@ -798,12 +798,6 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
 /// The status a shell reports for a process SIGPIPE ended: 128 + 13.
 const output_reader_gone_exit_code: u8 = 141;
 
-/// The status a shell reports for a process SIGHUP ended: 128 + 1.
-const terminal_hung_up_exit_code: u8 = if (host_target.is_wasm)
-    1
-else
-    128 + @as(u8, @intCast(@backingInt(std.posix.SIG.HUP)));
-
 /// How a command that ended on `err` exits. One whose output reader went
 /// away, as `head` does, ends quietly with SIGPIPE's status, as the commands
 /// that finish before fx's I/O starts do when SIGPIPE ends them. A command whose
@@ -811,7 +805,7 @@ else
 fn commandFailure(deps: RunDeps, err: anyerror) BeforeInteractiveResult {
     if (isTerminalHangUp(err)) {
         debug_trace.logf("core", "command ended after its terminal hung up err={s}", .{@errorName(err)});
-        return .{ .exit = terminal_hung_up_exit_code };
+        return .{ .exit = output_contracts.terminal_hung_up_exit_code };
     }
     if (err == error.OutputReaderGone) {
         debug_trace.logf("core", "command ended after its output reader went away", .{});
