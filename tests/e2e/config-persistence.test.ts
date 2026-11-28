@@ -79,7 +79,7 @@ async function disablePromptHistory(
   await session.waitForText("←→ change", TIMEOUT);
   await session.sendLiteral("prompt history");
   await session.waitForPane(
-    (pane) => pane.includes("Prompt history") && !pane.includes("Startup scrollback"),
+    (pane) => pane.includes("Prompt history") && !pane.includes("Status line context"),
     TIMEOUT,
   );
   await session.sendKeys("Left");
@@ -369,7 +369,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
                 permission_mode: "ask",
                 effort: "low",
                 fast_mode: false,
-                startup_scrollback: true,
                 prompt_history: { enabled: true, future: "keep-a-history" },
                 status_line: {
                   sandbox: false,
@@ -385,7 +384,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
                 permission_mode: "ask",
                 effort: "high",
                 fast_mode: false,
-                startup_scrollback: true,
                 prompt_history: { enabled: true, future: "keep-b-history" },
                 status_line: {
                   sandbox: false,
@@ -434,8 +432,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("* statusline: session:", TIMEOUT);
         await session.sendText("/statusline workspace");
         await session.waitForText("* statusline: workspace:", TIMEOUT);
-        await session.sendText("/settings startup-scrollback off");
-        await session.waitForText("startup_scrollback: off", TIMEOUT);
         await disablePromptHistory(session, join(home, ".fx", "settings.json"));
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
@@ -447,7 +443,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(stored.effort).toBe("auto");
         expect(stored.fast_mode).toBe(true);
         expect(stored.fast_mode_model_bound).toBe(true);
-        expect(stored.startup_scrollback).toBe(false);
         expect(stored.prompt_history).toMatchObject({ enabled: false });
         expect(stored.status_line).toMatchObject({
           context: true,
@@ -464,7 +459,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           expect(override).not.toHaveProperty("permission_mode");
           expect(override).not.toHaveProperty("effort");
           expect(override).not.toHaveProperty("fast_mode");
-          expect(override).not.toHaveProperty("startup_scrollback");
           expect(override.prompt_history).toEqual({ future: historyFuture });
           expect(override.status_line).toEqual({ sandbox: false, workspace: false, future: statusFuture });
           expect(override.future_workspace).toEqual({ nested: futureWorkspace });
@@ -477,7 +471,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           "permission_mode",
           "effort",
           "fast_mode",
-          "startup_scrollback",
           "prompt_history_enabled",
           "statusline_context",
           "statusline_session",
@@ -501,7 +494,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.sendText("/settings");
         const pane = await session.waitForText("←→ change", TIMEOUT);
         expect(pane).toContain("anthropic/claude-opus-4.7");
-        expect(pane).toContain("Startup scrollback");
         expect(pane).toContain("Prompt history");
         await session.sendKeys("Escape");
         await session.waitForPane(
@@ -683,7 +675,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const settingsBytes =
           JSON.stringify({
             output_level: { legacy: true },
-            startup_scrollback: true,
             workspaces: {
               [workspaceRoot]: {
                 output_level: ["quiet", 7],
@@ -714,11 +705,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         );
         await session.sendKeys("C-u");
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
-        await session.sendText("/settings startup-scrollback off");
-        await session.waitForText(
-          "startup_scrollback: off (applies on next launch)",
-          TIMEOUT,
-        );
+        await session.sendText("/statusline context");
+        await session.waitForText("* statusline: context:", TIMEOUT);
         await session.waitForStableComposer(TIMEOUT);
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
@@ -728,7 +716,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           readFileSync(join(home, ".fx", "settings.json"), "utf8"),
         );
         expect(stored.output_level).toEqual({ legacy: true });
-        expect(stored.startup_scrollback).toBe(false);
+        expect(stored.status_line).toMatchObject({ context: true });
         expect(stored.workspaces[workspaceRoot]).toEqual({
           output_level: ["quiet", 7],
           future_workspace: { keep: true },
@@ -1638,8 +1626,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           stderrPath,
         });
         await session.waitForText("Run /help", TIMEOUT);
-        await session.sendText("/settings startup-scrollback off");
-        await session.waitForText("startup_scrollback: off", TIMEOUT);
+        await session.sendText("/statusline context");
+        await session.waitForText("* statusline: context:", TIMEOUT);
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
@@ -1849,11 +1837,11 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           secondSession.waitForText("Run /help", TIMEOUT),
         ]);
         await Promise.all([
-          session.sendText("/settings startup-scrollback off"),
+          session.sendText("/statusline session"),
           secondSession.sendText("/statusline context"),
         ]);
         await Promise.all([
-          session.waitForText("startup_scrollback: off", TIMEOUT),
+          session.waitForText("* statusline: session:", TIMEOUT),
           secondSession.waitForText("* statusline: context:", TIMEOUT),
         ]);
         await Promise.all([
@@ -1871,8 +1859,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           readFileSync(join(home, ".fx", "settings.json"), "utf8"),
         );
         expect(stored.future_global).toEqual({ nested: "keep-global" });
-        expect(stored.startup_scrollback).toBe(false);
-        expect(stored.status_line).toMatchObject({ context: true });
+        expect(stored.status_line).toMatchObject({ context: true, session: true });
         expect(stored.workspaces[workspaceRoot]).toMatchObject({
           future_workspace: {
             nested: { keep: true },
