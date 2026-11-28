@@ -446,12 +446,14 @@ A rewind is the same operation as a fork before a prompt, applied to the session
 After a rewind:
 
 - fx sends `_sh.fx/session/history_replaced` with the `sessionId` to every other client that has the session open and lists `sh.fx/rewind`. The client loads the session again to get its history.
-- A position from before the rewind no longer names a turn, so a catch-up from it replays the whole session, as after a compaction.
+- fx doesn't know a position that it gave before the rewind, so a catch-up from one replays the whole session, as "Catching up" says for a position fx doesn't know.
 - The session's list changes, so fx sends the hint that "List changes" defines.
 
 While a turn runs in the session, `session/fork` and `_sh.fx/session/rewind` both get `-32600`, and the client stops the turn first.
 
 `tests/tla/acp/AcpForkRewind.tla` models these rules, and TLC checks that a fork holds exactly the source's turns before the prompt and leaves the source as it was, that a rewind leaves exactly those turns in place, and that a client of the session holds a history that was replaced only while the notice is on its way. Its `Today` configs show where fx breaks them now.
+
+The model leaves out these parts of this section: capability gating for `sh.fx/fork`, `sh.fx/rewind`, and `sh.fx/logPosition`, so every other client with the session open gets the notice; `sessionCapabilities.fork`; the `-32602` answer to a `messageId` that names no prompt, since the model names a prompt by its place; the `session/load` options of a fork, and the new session that is open on the calling connection; the list-change hint; and files, which neither a fork nor a rewind changes.
 
 ## Names in use today
 
