@@ -1,5 +1,8 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const profile_paths = @import("../shared/profile_paths.zig");
+const profiles = @import("../profiles/profiles.zig");
+const shared_theme = @import("../shared/theme.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -130,6 +133,7 @@ pub fn collect(
         snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendWorkspaceTrustCheck(&checks, alloc, snapshot.workspace_root);
         try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
+        try appendModAssetChecks(&checks, alloc, paths.home_fx_dir);
 
         snapshot.checks = try checks.toOwnedSlice(alloc);
         return snapshot;
@@ -164,6 +168,7 @@ pub fn collect(
     snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendWorkspaceTrustCheck(&checks, alloc, snapshot.workspace_root);
     try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
+    try appendModAssetChecks(&checks, alloc, paths.home_fx_dir);
 
     snapshot.checks = try checks.toOwnedSlice(alloc);
     return snapshot;
@@ -802,6 +807,64 @@ fn skillDiagnosticPlace(alloc: Allocator, diagnostic: skill_runtime.SkillDiagnos
         }
     }
     return alloc.dupe(u8, diagnostic.path);
+}
+
+/// Profile and theme names defined by two or more enabled mods.
+fn appendModAssetChecks(checks: *std.ArrayList(Check), alloc: Allocator, home_fx_dir: ?[]const u8) !void {
+    if (comptime build_options.libfx) return;
+    const fx_dir = home_fx_dir orelse return;
+    const mods_dir = try std.Io.Dir.path.join(alloc, &.{ fx_dir, "mods" });
+    defer alloc.free(mods_dir);
+    const home_agents = if (io_mod.homeDir()) |h| try profile_paths.agentsDir(alloc, h) else null;
+    defer if (home_agents) |dir| alloc.free(dir);
+    const user_themes = try std.Io.Dir.path.join(alloc, &.{ fx_dir, "themes" });
+    defer alloc.free(user_themes);
+
+    const profile_clashes = try profiles.findModClashesIn(alloc, home_agents, mods_dir);
+    defer {
+        for (profile_clashes) |*c| c.deinit(alloc);
+        alloc.free(profile_clashes);
+    }
+    for (profile_clashes) |clash| {
+        const mod_list = try joinNames(alloc, clash.mods);
+        defer alloc.free(mod_list);
+        try appendCheckOwnedFix(
+            checks,
+            alloc,
+            "profiles",
+            .warn,
+            try alloc.print("profile '{s}' is defined by multiple mods ({s}), so neither loads", .{ clash.name, mod_list }),
+            try alloc.dupe(u8, "disable or remove one of those mods, or define the profile in ~/.fx/agents"),
+        );
+    }
+
+    const theme_clashes = try shared_theme.findModClashesIn(alloc, user_themes, mods_dir);
+    defer {
+        for (theme_clashes) |*c| c.deinit(alloc);
+        alloc.free(theme_clashes);
+    }
+    for (theme_clashes) |clash| {
+        const mod_list = try joinNames(alloc, clash.mods);
+        defer alloc.free(mod_list);
+        try appendCheckOwnedFix(
+            checks,
+            alloc,
+            "themes",
+            .warn,
+            try alloc.print("theme '{s}' is defined by multiple mods ({s}), so neither loads", .{ clash.name, mod_list }),
+            try alloc.dupe(u8, "disable or remove one of those mods, or place the theme in ~/.fx/themes"),
+        );
+    }
+}
+
+fn joinNames(alloc: Allocator, items: []const []u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    for (items, 0..) |item, idx| {
+        if (idx > 0) try out.writer.writeAll(", ");
+        try out.writer.writeAll(item);
+    }
+    return try out.toOwnedSlice();
 }
 
 fn resolvePermissionMode(configured: ?types.PermissionMode) !types.PermissionMode {

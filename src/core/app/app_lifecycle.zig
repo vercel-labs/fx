@@ -269,8 +269,10 @@ pub const StartupState = struct {
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
     theme: ?[]const u8 = null,
+    theme_source: shared_theme.PinnedSource = .{},
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
+        self.theme_source.deinit(alloc);
         self.workspace_access.deinit(alloc);
         self.configured_providers.deinit(alloc);
         if (self.workspace_root.len > 0) alloc.free(self.workspace_root);
@@ -401,6 +403,13 @@ pub const StartupState = struct {
     pub fn takeReviewModel(self: *StartupState) []u8 {
         const value = self.review_model;
         self.review_model = &.{};
+        return value;
+    }
+
+    /// Moves the held custom-theme source (and any mod pin) out.
+    pub fn takeThemeSource(self: *StartupState) shared_theme.PinnedSource {
+        const value = self.theme_source;
+        self.theme_source = .{};
         return value;
     }
 };
@@ -1053,7 +1062,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
             .custom => |name| {
                 shared_theme.setSource(name, false);
                 const detected = ui_render.detectTheme(cfg.alloc, cfg.terminal);
-                const custom_theme = shared_theme.resolveNamed(cfg.alloc, name, detected.light, .{ .truecolor = truecolor }) catch |err| blk: {
+                const custom_theme = state.theme_source.resolveNamed(cfg.alloc, name, detected.light, .{ .truecolor = truecolor }) catch |err| blk: {
                     debug_trace.logf("theme", "custom_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
                     break :blk null;
                 };

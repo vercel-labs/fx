@@ -4,18 +4,21 @@
 //!
 //! A profile is a folder, `<name>/profile.json` with an optional
 //! `<name>/prompt.md`. A name resolves from the user's `~/.fx/agents/` first,
-//! then the repository's `.fx/agents/`, then fx's own `main` and `agent`.
-//! A repository's profile never sets the permission mode, so a cloned
-//! repository cannot grant itself access, and its files never resolve
-//! outside the repository, so it cannot read the user's other files.
+//! then enabled mods in name order, then the repository's `.fx/agents/`, then
+//! fx's own `main` and `agent`. A mod's or repository's profile never sets the
+//! permission mode, so it cannot grant itself access, and its files never
+//! resolve outside its own folder or repository.
 
 const std = @import("std");
+const build_options = @import("build_options");
+const debug_trace = @import("../shared/debug_trace.zig");
 const toolbox = @import("../tooling/toolbox.zig");
 const types = @import("../shared/types.zig");
 const io_mod = @import("../shared/io.zig");
 const pathing = @import("../workspace/pathing.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const mods_mod = if (build_options.libfx) struct {} else @import("../mods/mods.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -32,7 +35,7 @@ pub const agent_name = "agent";
 const subagent_tool = "subagent";
 const wildcard = "*";
 
-pub const Source = enum { home, project, builtin };
+pub const Source = enum { home, mod, project, builtin };
 /// Whether an agent is main or a subagent.
 pub const Role = enum { main, subagent };
 pub const PromptMode = enum { append, replace };
@@ -40,6 +43,7 @@ pub const PromptMode = enum { append, replace };
 pub const IgnoredReason = enum {
     unknown_key,
     project_cannot_set_permissions,
+    mod_cannot_set_permissions,
 };
 
 /// A key a profile set that fx did not apply.
@@ -53,6 +57,8 @@ pub const Profile = struct {
     name: []const u8,
     description: []const u8,
     source: Source,
+    /// Set when `source == .mod`: the name of the mod that defines it.
+    mod_name: ?[]const u8 = null,
     model: ?[]const u8 = null,
     effort: ?types.ReasoningEffort = null,
     /// Null means the agent runs under its parent's mode.
@@ -74,6 +80,8 @@ pub const Entry = struct {
     name: []const u8,
     description: []const u8,
     source: Source,
+    /// Set when `source == .mod`: the name of the mod that defines it.
+    mod_name: ?[]const u8 = null,
     /// The profile's own model, effort, and tools; null keeps the ones fx
     /// runs with.
     model: ?[]const u8 = null,
@@ -84,21 +92,51 @@ pub const Entry = struct {
 pub const ParseError = error{ OutOfMemory, InvalidProfile };
 pub const LoadError = error{ OutOfMemory, InvalidProfile, ProfileNotFound, ReadFailed };
 
-/// Where profiles are saved. Either may be absent.
+pub const ModRoot = struct {
+    mod_name: []const u8,
+    dir: []const u8,
+    /// Containing version folder for symlink containment; defaults to `dir`.
+    within: ?[]const u8 = null,
+};
+
+pub const ModClash = struct {
+    name: []u8,
+    mods: [][]u8,
+
+    pub fn deinit(self: *ModClash, alloc: Allocator) void {
+        alloc.free(self.name);
+        for (self.mods) |m| alloc.free(m);
+        alloc.free(self.mods);
+        self.* = .{ .name = &.{}, .mods = &.{} };
+    }
+};
+
+/// Where profiles are saved. Any may be absent.
 pub const Roots = struct {
     /// `~/.fx/agents`.
     home: ?[]const u8 = null,
+    /// `~/.fx/mods` (or `$FX_HOME/mods`). When set and `mod_roots` is null,
+    /// readers pin enabled mods around each scan or load.
+    mods_dir: ?[]const u8 = null,
+    /// Explicit mod agent roots (for tests or a caller that already holds pins).
+    mod_roots: ?[]const ModRoot = null,
     /// `<workspace>/.fx/agents`.
     project: ?[]const u8 = null,
     /// The workspace itself, which a repository's profile files must stay
     /// inside. Without it they must stay inside `project`.
     repository: ?[]const u8 = null,
 
-    /// Builds both roots from the fx home and the workspace. Caller owns the
+    /// Builds roots from the fx home and the workspace. Caller owns the
     /// result through `arena`.
     pub fn init(arena: Allocator, home: ?[]const u8, workspace_root: ?[]const u8) !Roots {
         return .{
             .home = if (home) |path| try profile_paths.agentsDir(arena, path) else null,
+            .mods_dir = if (comptime build_options.libfx)
+                null
+            else if (home) |path|
+                try profile_paths.modsDir(arena, path)
+            else
+                null,
             .project = if (workspace_root) |root|
                 try std.Io.Dir.path.join(arena, &.{ root, profile_paths.root_dir_name, profile_paths.agents_dir_name })
             else
@@ -108,11 +146,12 @@ pub const Roots = struct {
     }
 
     /// The folder a profile saved in `dir` must keep its files in: the
-    /// repository for a repository's profile. The user's own profiles may
-    /// link anywhere, so theirs is null.
+    /// repository for a repository's profile, or `within`/`dir` for a mod's.
+    /// The user's own profiles may link anywhere, so theirs is null.
     fn fileRoot(self: Roots, source: Source, dir: []const u8) ?[]const u8 {
         return switch (source) {
             .project => self.repository orelse dir,
+            .mod => dir,
             .home, .builtin => null,
         };
     }
@@ -226,6 +265,10 @@ pub fn parse(
                 try ignored.append(arena, .{ .key = key, .reason = .project_cannot_set_permissions });
                 continue;
             }
+            if (source == .mod) {
+                try ignored.append(arena, .{ .key = key, .reason = .mod_cannot_set_permissions });
+                continue;
+            }
             const raw = try stringField(arena, failure, name, key, value);
             profile.permission_mode = types.PermissionMode.parse(raw) orelse
                 return fail(arena, failure, "profile '{s}': unknown permission_mode '{s}'", .{ name, raw });
@@ -314,9 +357,10 @@ pub fn systemPrompt(arena: Allocator, profile: *const Profile, base: []const u8)
     };
 }
 
-/// Loads the profile named `name`: the user's own, then the repository's,
-/// then fx's. `main` is always fx's own. On failure, `failure` holds a message
-/// for the user. The result belongs to `arena`.
+/// Loads the profile named `name`: the user's own, then enabled mods in name
+/// order, then the repository's, then fx's. `main` is always fx's own. On
+/// failure, `failure` holds a message for the user. The result belongs to
+/// `arena`.
 pub fn load(arena: Allocator, roots: Roots, name: []const u8, failure: *?[]const u8) LoadError!Profile {
     if (!validName(name)) return fail(arena, failure, "profile name '{s}' must use lowercase letters, digits, '-', or '_'", .{name});
     if (std.mem.eql(u8, name, main_name)) return builtin(main_name).?;
@@ -324,6 +368,7 @@ pub fn load(arena: Allocator, roots: Roots, name: []const u8, failure: *?[]const
     // not the caller's.
     const owned = try arena.dupe(u8, name);
     if (roots.home) |dir| if (try readProfile(arena, dir, owned, .home, roots.fileRoot(.home, dir), failure)) |profile| return profile;
+    if (try loadFromConfiguredMods(arena, roots, owned, failure)) |profile| return profile;
     if (roots.project) |dir| if (try readProfile(arena, dir, owned, .project, roots.fileRoot(.project, dir), failure)) |profile| return profile;
     if (builtin(name)) |profile| return profile;
     const names = try listNames(arena, roots);
@@ -331,40 +376,300 @@ pub fn load(arena: Allocator, roots: Roots, name: []const u8, failure: *?[]const
     return error.ProfileNotFound;
 }
 
-/// Every profile main can pick, by name, with the user's own over the
-/// repository's over fx's. A profile that fails to load is left out. The
-/// result belongs to `arena` and is sorted by name.
+/// Loads `name` only from the enabled mod `mod_name` (used on child resume so
+/// another source cannot hijack or shadow the profile). Pins enabled mods
+/// while reading and releases them before returning.
+pub fn loadFromMod(
+    arena: Allocator,
+    mods_dir: ?[]const u8,
+    mod_name: []const u8,
+    name: []const u8,
+    failure: *?[]const u8,
+) LoadError!Profile {
+    if (comptime build_options.libfx) return error.ProfileNotFound;
+    if (!validName(name)) return fail(arena, failure, "profile name '{s}' must use lowercase letters, digits, '-', or '_'", .{name});
+    if (std.mem.eql(u8, name, main_name)) return builtin(main_name).?;
+    const root_path = mods_dir orelse return error.ProfileNotFound;
+    const Ctx = struct {
+        arena: Allocator,
+        mod_name: []const u8,
+        name: []const u8,
+        failure: *?[]const u8,
+    };
+    const Body = struct {
+        fn run(ctx: Ctx, pinned: *const mods_mod.ModPins) anyerror!?Profile {
+            traceModPinProblems("loadFromMod", pinned.problems);
+            for (pinned.pins) |p| {
+                if (!std.mem.eql(u8, p.name, ctx.mod_name)) continue;
+                const agents_dir = try std.Io.Dir.path.join(ctx.arena, &.{ p.path, profile_paths.agents_dir_name });
+                const owned = try ctx.arena.dupe(u8, ctx.name);
+                var loaded = (try readProfile(ctx.arena, agents_dir, owned, .mod, p.path, ctx.failure)) orelse return null;
+                loaded.mod_name = try ctx.arena.dupe(u8, p.name);
+                return loaded;
+            }
+            return null;
+        }
+    };
+    const result = mods_mod.withPinnedMods(arena, root_path, Ctx{
+        .arena = arena,
+        .mod_name = mod_name,
+        .name = name,
+        .failure = failure,
+    }, ?Profile, Body.run) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidProfile => return error.InvalidProfile,
+        error.ReadFailed => return error.ReadFailed,
+        else => {
+            debug_trace.logf("profile", "mod_pins_load_failed op=loadFromMod mod={s} err={s}", .{ mod_name, @errorName(err) });
+            return error.ProfileNotFound;
+        },
+    };
+    return result orelse error.ProfileNotFound;
+}
+
+fn loadFromConfiguredMods(arena: Allocator, roots: Roots, owned_name: []const u8, failure: *?[]const u8) LoadError!?Profile {
+    if (comptime build_options.libfx) return null;
+    if (roots.mod_roots) |mod_roots| {
+        return loadFromModRoots(arena, mod_roots, owned_name, failure);
+    }
+    const root_path = roots.mods_dir orelse return null;
+    const Ctx = struct {
+        arena: Allocator,
+        name: []const u8,
+        failure: *?[]const u8,
+    };
+    const Body = struct {
+        fn run(ctx: Ctx, pinned: *const mods_mod.ModPins) anyerror!?Profile {
+            traceModPinProblems("load", pinned.problems);
+            var mod_roots = try pinned.roots(ctx.arena, .agents);
+            defer mod_roots.deinit(ctx.arena);
+            const adapted = try modRootsFromPinned(ctx.arena, mod_roots.items);
+            return try loadFromModRoots(ctx.arena, adapted, ctx.name, ctx.failure);
+        }
+    };
+    return mods_mod.withPinnedMods(arena, root_path, Ctx{
+        .arena = arena,
+        .name = owned_name,
+        .failure = failure,
+    }, ?Profile, Body.run) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidProfile => return error.InvalidProfile,
+        error.ReadFailed => return error.ReadFailed,
+        else => {
+            debug_trace.logf("profile", "mod_pins_load_failed op=load err={s}", .{@errorName(err)});
+            return null;
+        },
+    };
+}
+
+fn modRootsFromPinned(arena: Allocator, items: []const mods_mod.ModRoot) Allocator.Error![]ModRoot {
+    const out = try arena.alloc(ModRoot, items.len);
+    for (items, out) |item, *slot| {
+        slot.* = .{
+            .mod_name = item.mod_name,
+            .dir = item.path,
+            .within = std.Io.Dir.path.dirname(item.path) orelse item.path,
+        };
+    }
+    return out;
+}
+
+fn loadFromModRoots(arena: Allocator, mod_roots: []const ModRoot, owned_name: []const u8, failure: *?[]const u8) LoadError!?Profile {
+    var matches: std.ArrayList(ModRoot) = .empty;
+    for (mod_roots) |root| {
+        if (try hasProfileSettings(arena, root.dir, owned_name)) {
+            try matches.append(arena, root);
+        }
+    }
+    if (matches.items.len == 0) return null;
+    if (matches.items.len >= 2) {
+        var mod_names: std.ArrayList(u8) = .empty;
+        for (matches.items, 0..) |m, index| {
+            if (index > 0) try mod_names.appendSlice(arena, ", ");
+            try mod_names.appendSlice(arena, m.mod_name);
+        }
+        return fail(arena, failure, "profile '{s}' is defined by multiple mods ({s}); remove or disable one", .{ owned_name, mod_names.items });
+    }
+    const matched = matches.items[0];
+    var loaded = (try readProfile(arena, matched.dir, owned_name, .mod, matched.within orelse matched.dir, failure)) orelse return null;
+    loaded.mod_name = try arena.dupe(u8, matched.mod_name);
+    return loaded;
+}
+
+fn hasProfileSettings(arena: Allocator, dir_path: []const u8, name: []const u8) Allocator.Error!bool {
+    const settings_path = try std.Io.Dir.path.join(arena, &.{ dir_path, name, settings_file_name });
+    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), settings_path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return true,
+    };
+    file.close(io_mod.getIo());
+    return true;
+}
+
+fn traceModPinProblems(op: []const u8, problems: []const []u8) void {
+    for (problems) |problem| {
+        debug_trace.logf("profile", "mod_pin_skipped op={s} problem={s}", .{ op, problem });
+    }
+}
+
+/// Every profile main can pick, by name, with the user's own over enabled
+/// mods over the repository's over fx's. A profile that fails to load, or a
+/// name defined by two or more enabled mods, is left out. The result belongs to
+/// `arena` and is sorted by name.
 pub fn list(arena: Allocator, roots: Roots) ![]Entry {
     var entries: std.ArrayList(Entry) = .empty;
-    const sources = [_]struct { dir: ?[]const u8, source: Source }{
-        .{ .dir = roots.home, .source = .home },
-        .{ .dir = roots.project, .source = .project },
+    var clashed_mod_names: std.ArrayList([]const u8) = .empty;
+    if (roots.home) |dir_path| try listDirInto(arena, &entries, &clashed_mod_names, dir_path, .home, null, roots.fileRoot(.home, dir_path));
+    try listModsInto(arena, &entries, &clashed_mod_names, roots);
+    if (roots.project) |dir_path| try listDirInto(arena, &entries, &clashed_mod_names, dir_path, .project, null, roots.fileRoot(.project, dir_path));
+    for ([_][]const u8{ main_name, agent_name }) |name| {
+        if (hasEntry(entries.items, name) or hasName(clashed_mod_names.items, name)) continue;
+        const profile = builtin(name).?;
+        try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = .builtin, .model = profile.model, .effort = profile.effort, .tools = profile.tools });
+    }
+    sort_utils.sort(Entry, entries.items, {}, entryLessThan);
+    return entries.items;
+}
+
+fn listDirInto(
+    arena: Allocator,
+    entries: *std.ArrayList(Entry),
+    clashed_mod_names: *const std.ArrayList([]const u8),
+    dir_path: []const u8,
+    source: Source,
+    mod_name: ?[]const u8,
+    within: ?[]const u8,
+) Allocator.Error!void {
+    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io_mod.getIo());
+    var it = dir.iterate();
+    while (it.next(io_mod.getIo()) catch null) |item| {
+        if (item.kind != .directory or !validName(item.name)) continue;
+        if (std.mem.eql(u8, item.name, main_name)) continue;
+        if (hasEntry(entries.items, item.name) or hasName(clashed_mod_names.items, item.name)) continue;
+        const name = try arena.dupe(u8, item.name);
+        var failure: ?[]const u8 = null;
+        const profile = (readProfile(arena, dir_path, name, source, within, &failure) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        }) orelse continue;
+        try entries.append(arena, .{
+            .name = profile.name,
+            .description = profile.description,
+            .source = profile.source,
+            .mod_name = if (mod_name) |m| try arena.dupe(u8, m) else null,
+            .model = profile.model,
+            .effort = profile.effort,
+            .tools = profile.tools,
+        });
+    }
+}
+
+fn listModsInto(
+    arena: Allocator,
+    entries: *std.ArrayList(Entry),
+    clashed_mod_names: *std.ArrayList([]const u8),
+    roots: Roots,
+) Allocator.Error!void {
+    if (comptime build_options.libfx) return;
+    if (roots.mod_roots) |mod_roots| {
+        try listModRootsInto(arena, entries, clashed_mod_names, mod_roots);
+        return;
+    }
+    const root_path = roots.mods_dir orelse return;
+    const Ctx = struct {
+        arena: Allocator,
+        entries: *std.ArrayList(Entry),
+        clashed: *std.ArrayList([]const u8),
     };
-    for (sources) |root| {
-        const dir_path = root.dir orelse continue;
-        var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), dir_path, .{ .iterate = true }) catch continue;
+    const Body = struct {
+        fn run(ctx: Ctx, pinned: *const mods_mod.ModPins) anyerror!void {
+            traceModPinProblems("list", pinned.problems);
+            var mod_roots = try pinned.roots(ctx.arena, .agents);
+            defer mod_roots.deinit(ctx.arena);
+            const adapted = try modRootsFromPinned(ctx.arena, mod_roots.items);
+            try listModRootsInto(ctx.arena, ctx.entries, ctx.clashed, adapted);
+        }
+    };
+    mods_mod.withPinnedMods(arena, root_path, Ctx{
+        .arena = arena,
+        .entries = entries,
+        .clashed = clashed_mod_names,
+    }, void, Body.run) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => debug_trace.logf("profile", "mod_pins_load_failed op=list err={s}", .{@errorName(err)}),
+    };
+}
+
+fn listModRootsInto(
+    arena: Allocator,
+    entries: *std.ArrayList(Entry),
+    clashed_mod_names: *std.ArrayList([]const u8),
+    mod_roots: []const ModRoot,
+) Allocator.Error!void {
+    const SeenMod = struct {
+        name: []const u8,
+        entry_index: ?usize,
+        clashed: bool = false,
+    };
+    var seen: std.ArrayList(SeenMod) = .empty;
+    var mod_entries: std.ArrayList(Entry) = .empty;
+
+    for (mod_roots) |mod_root| {
+        var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), mod_root.dir, .{ .iterate = true }) catch continue;
         defer dir.close(io_mod.getIo());
         var it = dir.iterate();
         while (it.next(io_mod.getIo()) catch null) |item| {
             if (item.kind != .directory or !validName(item.name)) continue;
             if (std.mem.eql(u8, item.name, main_name)) continue;
             if (hasEntry(entries.items, item.name)) continue;
+            if (!(try hasProfileSettings(arena, mod_root.dir, item.name))) continue;
+
+            var existing_idx: ?usize = null;
+            for (seen.items, 0..) |s, idx| {
+                if (std.mem.eql(u8, s.name, item.name)) {
+                    existing_idx = idx;
+                    break;
+                }
+            }
+            if (existing_idx) |idx| {
+                if (!seen.items[idx].clashed) {
+                    seen.items[idx].clashed = true;
+                    try clashed_mod_names.append(arena, seen.items[idx].name);
+                }
+                continue;
+            }
+
             const name = try arena.dupe(u8, item.name);
             var failure: ?[]const u8 = null;
-            const profile = (readProfile(arena, dir_path, name, root.source, roots.fileRoot(root.source, dir_path), &failure) catch |err| switch (err) {
+            const within = mod_root.within orelse mod_root.dir;
+            const loaded = readProfile(arena, mod_root.dir, name, .mod, within, &failure) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => continue,
-            }) orelse continue;
-            try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = profile.source, .model = profile.model, .effort = profile.effort, .tools = profile.tools });
+                else => null,
+            };
+            if (loaded) |profile| {
+                const entry_idx = mod_entries.items.len;
+                try mod_entries.append(arena, .{
+                    .name = profile.name,
+                    .description = profile.description,
+                    .source = .mod,
+                    .mod_name = try arena.dupe(u8, mod_root.mod_name),
+                    .model = profile.model,
+                    .effort = profile.effort,
+                    .tools = profile.tools,
+                });
+                try seen.append(arena, .{ .name = name, .entry_index = entry_idx });
+            } else {
+                try seen.append(arena, .{ .name = name, .entry_index = null });
+            }
         }
     }
-    for ([_][]const u8{ main_name, agent_name }) |name| {
-        if (hasEntry(entries.items, name)) continue;
-        const profile = builtin(name).?;
-        try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = .builtin, .model = profile.model, .effort = profile.effort, .tools = profile.tools });
+
+    for (seen.items) |s| {
+        if (s.clashed) continue;
+        const idx = s.entry_index orelse continue;
+        try entries.append(arena, mod_entries.items[idx]);
     }
-    sort_utils.sort(Entry, entries.items, {}, entryLessThan);
-    return entries.items;
 }
 
 fn listNames(arena: Allocator, roots: Roots) ![]const u8 {
@@ -379,6 +684,11 @@ fn listNames(arena: Allocator, roots: Roots) ![]const u8 {
 
 fn hasEntry(entries: []const Entry, name: []const u8) bool {
     for (entries) |entry| if (std.mem.eql(u8, entry.name, name)) return true;
+    return false;
+}
+
+fn hasName(names: []const []const u8, target: []const u8) bool {
+    for (names) |name| if (std.mem.eql(u8, name, target)) return true;
     return false;
 }
 
@@ -409,9 +719,10 @@ pub const CompletionList = struct {
 /// Like `list`, but bounded for completion: it reads at most
 /// `max_completion_dir_entries` folder entries and
 /// `max_completion_settings_bytes` of settings, and never reads `prompt.md`.
-/// The user's own still win over the repository's, fx's `main` and `agent`
-/// are always there, and the entries are sorted by name. Every slice of the
-/// result belongs to `alloc`.
+/// The user's own still win over enabled mods over the repository's, fx's
+/// `main` and `agent` are always there (unless shadowed by a mod clash), and
+/// the entries are sorted by name. Every slice of the result belongs to
+/// `alloc`.
 pub fn listForCompletion(alloc: Allocator, roots: Roots) Allocator.Error!CompletionList {
     const io = io_mod.getIo();
     var entries: std.ArrayList(Entry) = .empty;
@@ -419,6 +730,9 @@ pub fn listForCompletion(alloc: Allocator, roots: Roots) Allocator.Error!Complet
         freeEntries(alloc, entries.items);
         entries.deinit(alloc);
     }
+    var scan_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer scan_arena_state.deinit();
+    const scan_arena = scan_arena_state.allocator();
     // Holds one profile's paths, settings, parsed JSON, and failure message,
     // reset before the next so a scan of failing profiles stays bounded.
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
@@ -426,53 +740,273 @@ pub fn listForCompletion(alloc: Allocator, roots: Roots) Allocator.Error!Complet
     var visited: usize = 0;
     var budget: usize = max_completion_settings_bytes;
     var limited = false;
-    const sources = [_]struct { dir: ?[]const u8, source: Source }{
-        .{ .dir = roots.home, .source = .home },
-        .{ .dir = roots.project, .source = .project },
-    };
-    scan: for (sources) |root| {
-        const dir_path = root.dir orelse continue;
-        var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch continue;
-        defer dir.close(io);
-        var it = dir.iterate();
-        while (it.next(io) catch {
-            limited = true;
-            break :scan;
-        }) |item| {
-            visited += 1;
-            if (visited > max_completion_dir_entries) {
-                limited = true;
-                break :scan;
-            }
-            if (item.kind != .directory or !validName(item.name)) continue;
-            if (std.mem.eql(u8, item.name, main_name)) continue;
-            if (hasEntry(entries.items, item.name)) continue;
-            _ = scratch_state.reset(.retain_capacity);
-            const read = try readCompletionProfile(scratch_state.allocator(), dir_path, item.name, root.source, roots.fileRoot(root.source, dir_path), budget);
-            budget -= read.bytes;
-            switch (read.outcome) {
-                .missing, .invalid => {},
-                .too_large => limited = true,
-                // A profile left unread may outrank a later one of the same
-                // name, so the scan stops rather than offer the wrong one.
-                .over_budget => {
-                    limited = true;
-                    break :scan;
-                },
-                .loaded => |profile| {
-                    try entries.ensureUnusedCapacity(alloc, 1);
-                    entries.appendAssumeCapacity(try cloneEntry(alloc, profile));
-                },
-            }
+    var clashed_mod_names: std.ArrayList([]const u8) = .empty;
+
+    if (roots.home) |dir_path| {
+        try listCompletionDirInto(
+            alloc,
+            io,
+            &scratch_state,
+            &entries,
+            &clashed_mod_names,
+            dir_path,
+            .home,
+            roots.fileRoot(.home, dir_path),
+            &visited,
+            &budget,
+            &limited,
+        );
+    }
+    if (!limited) {
+        try listCompletionModsInto(
+            alloc,
+            scan_arena,
+            io,
+            &scratch_state,
+            &entries,
+            &clashed_mod_names,
+            roots,
+            &visited,
+            &budget,
+            &limited,
+        );
+    }
+    if (!limited) {
+        if (roots.project) |dir_path| {
+            try listCompletionDirInto(
+                alloc,
+                io,
+                &scratch_state,
+                &entries,
+                &clashed_mod_names,
+                dir_path,
+                .project,
+                roots.fileRoot(.project, dir_path),
+                &visited,
+                &budget,
+                &limited,
+            );
         }
     }
     for ([_][]const u8{ main_name, agent_name }) |name| {
-        if (hasEntry(entries.items, name)) continue;
+        if (hasEntry(entries.items, name) or hasName(clashed_mod_names.items, name)) continue;
         try entries.ensureUnusedCapacity(alloc, 1);
         entries.appendAssumeCapacity(try cloneEntry(alloc, builtin(name).?));
     }
     sort_utils.sort(Entry, entries.items, {}, entryLessThan);
     return .{ .entries = try entries.toOwnedSlice(alloc), .limited = limited };
+}
+
+fn listCompletionDirInto(
+    alloc: Allocator,
+    io: std.Io,
+    scratch_state: *std.heap.ArenaAllocator,
+    entries: *std.ArrayList(Entry),
+    clashed_mod_names: *const std.ArrayList([]const u8),
+    dir_path: []const u8,
+    source: Source,
+    within: ?[]const u8,
+    visited: *usize,
+    budget: *usize,
+    limited: *bool,
+) Allocator.Error!void {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch {
+        limited.* = true;
+        return;
+    }) |item| {
+        visited.* += 1;
+        if (visited.* > max_completion_dir_entries) {
+            limited.* = true;
+            return;
+        }
+        if (item.kind != .directory or !validName(item.name)) continue;
+        if (std.mem.eql(u8, item.name, main_name)) continue;
+        if (hasEntry(entries.items, item.name) or hasName(clashed_mod_names.items, item.name)) continue;
+        _ = scratch_state.reset(.retain_capacity);
+        const read = try readCompletionProfile(scratch_state.allocator(), dir_path, item.name, source, within, budget.*);
+        budget.* -= read.bytes;
+        switch (read.outcome) {
+            .missing, .invalid => {},
+            .too_large => limited.* = true,
+            // A profile left unread may outrank a later one of the same
+            // name, so the scan stops rather than offer the wrong one.
+            .over_budget => {
+                limited.* = true;
+                return;
+            },
+            .loaded => |profile| {
+                try entries.ensureUnusedCapacity(alloc, 1);
+                entries.appendAssumeCapacity(try cloneEntry(alloc, profile));
+            },
+        }
+    }
+}
+
+fn listCompletionModsInto(
+    alloc: Allocator,
+    scan_arena: Allocator,
+    io: std.Io,
+    scratch_state: *std.heap.ArenaAllocator,
+    entries: *std.ArrayList(Entry),
+    clashed_mod_names: *std.ArrayList([]const u8),
+    roots: Roots,
+    visited: *usize,
+    budget: *usize,
+    limited: *bool,
+) Allocator.Error!void {
+    if (comptime build_options.libfx) return;
+    if (roots.mod_roots) |mod_roots| {
+        try listCompletionModRootsInto(alloc, scan_arena, io, scratch_state, entries, clashed_mod_names, mod_roots, visited, budget, limited);
+        return;
+    }
+    const root_path = roots.mods_dir orelse return;
+    const Ctx = struct {
+        alloc: Allocator,
+        scan_arena: Allocator,
+        io: std.Io,
+        scratch_state: *std.heap.ArenaAllocator,
+        entries: *std.ArrayList(Entry),
+        clashed: *std.ArrayList([]const u8),
+        visited: *usize,
+        budget: *usize,
+        limited: *bool,
+    };
+    const Body = struct {
+        fn run(ctx: Ctx, pinned: *const mods_mod.ModPins) anyerror!void {
+            traceModPinProblems("listForCompletion", pinned.problems);
+            var mod_roots = try pinned.roots(ctx.scan_arena, .agents);
+            defer mod_roots.deinit(ctx.scan_arena);
+            const adapted = try modRootsFromPinned(ctx.scan_arena, mod_roots.items);
+            try listCompletionModRootsInto(
+                ctx.alloc,
+                ctx.scan_arena,
+                ctx.io,
+                ctx.scratch_state,
+                ctx.entries,
+                ctx.clashed,
+                adapted,
+                ctx.visited,
+                ctx.budget,
+                ctx.limited,
+            );
+        }
+    };
+    mods_mod.withPinnedMods(scan_arena, root_path, Ctx{
+        .alloc = alloc,
+        .scan_arena = scan_arena,
+        .io = io,
+        .scratch_state = scratch_state,
+        .entries = entries,
+        .clashed = clashed_mod_names,
+        .visited = visited,
+        .budget = budget,
+        .limited = limited,
+    }, void, Body.run) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => debug_trace.logf("profile", "mod_pins_load_failed op=listForCompletion err={s}", .{@errorName(err)}),
+    };
+}
+
+fn listCompletionModRootsInto(
+    alloc: Allocator,
+    scan_arena: Allocator,
+    io: std.Io,
+    scratch_state: *std.heap.ArenaAllocator,
+    entries: *std.ArrayList(Entry),
+    clashed_mod_names: *std.ArrayList([]const u8),
+    mod_roots: []const ModRoot,
+    visited: *usize,
+    budget: *usize,
+    limited: *bool,
+) Allocator.Error!void {
+    const SeenMod = struct {
+        name: []const u8,
+        entry_index: ?usize,
+        clashed: bool = false,
+    };
+    var seen: std.ArrayList(SeenMod) = .empty;
+    var mod_entries: std.ArrayList(Entry) = .empty;
+    errdefer {
+        freeEntries(alloc, mod_entries.items);
+        mod_entries.deinit(alloc);
+    }
+
+    scan: for (mod_roots) |mod_root| {
+        var dir = std.Io.Dir.openDirAbsolute(io, mod_root.dir, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch {
+            limited.* = true;
+            break :scan;
+        }) |item| {
+            visited.* += 1;
+            if (visited.* > max_completion_dir_entries) {
+                limited.* = true;
+                break :scan;
+            }
+            if (item.kind != .directory or !validName(item.name)) continue;
+            if (std.mem.eql(u8, item.name, main_name)) continue;
+            if (hasEntry(entries.items, item.name)) continue;
+            if (!(try hasProfileSettings(scan_arena, mod_root.dir, item.name))) continue;
+
+            var existing_idx: ?usize = null;
+            for (seen.items, 0..) |s, idx| {
+                if (std.mem.eql(u8, s.name, item.name)) {
+                    existing_idx = idx;
+                    break;
+                }
+            }
+            if (existing_idx) |idx| {
+                if (!seen.items[idx].clashed) {
+                    seen.items[idx].clashed = true;
+                    try clashed_mod_names.append(scan_arena, seen.items[idx].name);
+                }
+                continue;
+            }
+
+            const owned_name = try scan_arena.dupe(u8, item.name);
+            _ = scratch_state.reset(.retain_capacity);
+            const within = mod_root.within orelse mod_root.dir;
+            const read = try readCompletionProfile(scratch_state.allocator(), mod_root.dir, item.name, .mod, within, budget.*);
+            budget.* -= read.bytes;
+            switch (read.outcome) {
+                .missing, .invalid => {
+                    try seen.append(scan_arena, .{ .name = owned_name, .entry_index = null });
+                },
+                .too_large => {
+                    limited.* = true;
+                    try seen.append(scan_arena, .{ .name = owned_name, .entry_index = null });
+                },
+                .over_budget => {
+                    limited.* = true;
+                    break :scan;
+                },
+                .loaded => |profile| {
+                    var copy = profile;
+                    copy.mod_name = mod_root.mod_name;
+                    const cloned = try cloneEntry(alloc, copy);
+                    errdefer freeEntry(alloc, cloned);
+                    try mod_entries.append(alloc, cloned);
+                    try seen.append(scan_arena, .{ .name = owned_name, .entry_index = mod_entries.items.len - 1 });
+                },
+            }
+        }
+    }
+
+    for (mod_entries.items, 0..) |entry, idx| {
+        const keep = for (seen.items) |s| {
+            if (s.entry_index == idx) break !s.clashed;
+        } else false;
+        if (keep) {
+            try entries.append(alloc, entry);
+        } else {
+            freeEntry(alloc, entry);
+        }
+    }
+    mod_entries.deinit(alloc);
 }
 
 const CompletionRead = struct {
@@ -526,10 +1060,20 @@ fn cloneEntry(alloc: Allocator, profile: Profile) Allocator.Error!Entry {
     errdefer alloc.free(name);
     const description = try alloc.dupe(u8, profile.description);
     errdefer alloc.free(description);
+    const mod_name = if (profile.mod_name) |text| try alloc.dupe(u8, text) else null;
+    errdefer if (mod_name) |text| alloc.free(text);
     const model = if (profile.model) |text| try alloc.dupe(u8, text) else null;
     errdefer if (model) |text| alloc.free(text);
     const tools = if (profile.tools) |names| try cloneNames(alloc, names) else null;
-    return .{ .name = name, .description = description, .source = profile.source, .model = model, .effort = profile.effort, .tools = tools };
+    return .{
+        .name = name,
+        .description = description,
+        .source = profile.source,
+        .mod_name = mod_name,
+        .model = model,
+        .effort = profile.effort,
+        .tools = tools,
+    };
 }
 
 /// A copy of `names` that `alloc` owns, each name and the list itself.
@@ -547,16 +1091,125 @@ pub fn cloneNames(alloc: Allocator, names: []const []const u8) Allocator.Error![
     return out;
 }
 
-fn freeEntries(alloc: Allocator, entries: []const Entry) void {
-    for (entries) |entry| {
-        alloc.free(entry.name);
-        alloc.free(entry.description);
-        if (entry.model) |text| alloc.free(text);
-        if (entry.tools) |names| {
-            for (names) |text| alloc.free(text);
-            alloc.free(names);
-        }
+fn freeEntry(alloc: Allocator, entry: Entry) void {
+    alloc.free(entry.name);
+    alloc.free(entry.description);
+    if (entry.mod_name) |text| alloc.free(text);
+    if (entry.model) |text| alloc.free(text);
+    if (entry.tools) |names| {
+        for (names) |text| alloc.free(text);
+        alloc.free(names);
     }
+}
+
+fn freeEntries(alloc: Allocator, entries: []const Entry) void {
+    for (entries) |entry| freeEntry(alloc, entry);
+}
+
+/// Returns every profile name defined by two or more enabled mods (when not
+/// shadowed by `~/.fx/agents/`), for `fx doctor`. Caller frees each element
+/// via `ModClash.deinit` and the outer slice.
+pub fn findModClashes(alloc: Allocator, home: ?[]const u8) ![]ModClash {
+    if (comptime build_options.libfx) return &.{};
+    const root_path = if (home) |h| try profile_paths.modsDir(alloc, h) else return &.{};
+    defer alloc.free(root_path);
+    const home_agents = if (home) |h| try profile_paths.agentsDir(alloc, h) else null;
+    defer if (home_agents) |dir| alloc.free(dir);
+    return findModClashesIn(alloc, home_agents, root_path);
+}
+
+pub fn findModClashesIn(alloc: Allocator, home_agents: ?[]const u8, mods_dir: []const u8) ![]ModClash {
+    if (comptime build_options.libfx) return &.{};
+
+    const Ctx = struct {
+        alloc: Allocator,
+        home_agents: ?[]const u8,
+    };
+    const Body = struct {
+        fn run(ctx: Ctx, pinned: *const mods_mod.ModPins) anyerror![]ModClash {
+            traceModPinProblems("findModClashes", pinned.problems);
+            var scratch_state = std.heap.ArenaAllocator.init(ctx.alloc);
+            defer scratch_state.deinit();
+            const scratch = scratch_state.allocator();
+
+            var mod_roots = try pinned.roots(scratch, .agents);
+            defer mod_roots.deinit(scratch);
+
+            const Seen = struct {
+                name: []const u8,
+                mods: std.ArrayList([]const u8),
+            };
+            var seen: std.ArrayList(Seen) = .empty;
+            for (mod_roots.items) |mod_root| {
+                var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), mod_root.path, .{ .iterate = true }) catch continue;
+                defer dir.close(io_mod.getIo());
+                var it = dir.iterate();
+                while (it.next(io_mod.getIo()) catch null) |item| {
+                    if (item.kind != .directory or !validName(item.name)) continue;
+                    if (std.mem.eql(u8, item.name, main_name)) continue;
+                    if (!(try hasProfileSettings(scratch, mod_root.path, item.name))) continue;
+                    if (ctx.home_agents) |h_dir| {
+                        if (try hasProfileSettings(scratch, h_dir, item.name)) continue;
+                    }
+                    var slot: ?*Seen = null;
+                    for (seen.items) |*s| {
+                        if (std.mem.eql(u8, s.name, item.name)) {
+                            slot = s;
+                            break;
+                        }
+                    }
+                    if (slot) |s| {
+                        try s.mods.append(scratch, mod_root.mod_name);
+                    } else {
+                        var list_mods: std.ArrayList([]const u8) = .empty;
+                        try list_mods.append(scratch, mod_root.mod_name);
+                        try seen.append(scratch, .{
+                            .name = try scratch.dupe(u8, item.name),
+                            .mods = list_mods,
+                        });
+                    }
+                }
+            }
+
+            var out: std.ArrayList(ModClash) = .empty;
+            errdefer {
+                for (out.items) |*c| c.deinit(ctx.alloc);
+                out.deinit(ctx.alloc);
+            }
+            for (seen.items) |s| {
+                if (s.mods.items.len < 2) continue;
+                const name_copy = try ctx.alloc.dupe(u8, s.name);
+                errdefer ctx.alloc.free(name_copy);
+                const mods_copy = try ctx.alloc.alloc([]u8, s.mods.items.len);
+                var filled: usize = 0;
+                errdefer {
+                    for (mods_copy[0..filled]) |m| ctx.alloc.free(m);
+                    ctx.alloc.free(mods_copy);
+                }
+                for (s.mods.items, mods_copy) |m, *dst| {
+                    dst.* = try ctx.alloc.dupe(u8, m);
+                    filled += 1;
+                }
+                try out.append(ctx.alloc, .{ .name = name_copy, .mods = mods_copy });
+            }
+            sort_utils.sort(ModClash, out.items, {}, struct {
+                fn lessThan(_: void, a: ModClash, b: ModClash) bool {
+                    return std.mem.lessThan(u8, a.name, b.name);
+                }
+            }.lessThan);
+            return try out.toOwnedSlice(ctx.alloc);
+        }
+    };
+    return mods_mod.withPinnedMods(alloc, mods_dir, Ctx{
+        .alloc = alloc,
+        .home_agents = home_agents,
+    }, []ModClash, Body.run) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("profile", "mod_pins_load_failed op=findModClashes err={s}", .{@errorName(err)});
+            return &.{};
+        },
+    };
 }
 
 /// Reads `<dir>/<name>/profile.json` and its optional `prompt.md`. Returns null
@@ -1175,4 +1828,121 @@ test "completion skips a settings file over its own limit and stops at the share
     try testing.expect(listed > 0 and listed < count);
     try testing.expect(listed * big_json.len < max_completion_settings_bytes);
     try testing.expect(findEntry(result.entries, "main") != null and findEntry(result.entries, "agent") != null);
+}
+
+test "a mod profile ignores permission_mode with mod_cannot_set_permissions" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const profile = try testParse(arena_state.allocator(), .mod,
+        \\{"description": "Mod agent", "permission_mode": "yolo", "colour": "green"}
+    , "");
+    try testing.expect(profile.permission_mode == null);
+    try testing.expectEqual(types.PermissionMode.ask, permissionMode(&profile, .ask));
+    try testing.expectEqual(@as(usize, 2), profile.ignored.len);
+    try testing.expectEqualStrings("permission_mode", profile.ignored[0].key);
+    try testing.expectEqual(IgnoredReason.mod_cannot_set_permissions, profile.ignored[0].reason);
+    try testing.expectEqual(IgnoredReason.unknown_key, profile.ignored[1].reason);
+}
+
+test "profiles resolve home, then mods, then project, then builtins, and mod clashes load from neither" {
+    if (comptime build_options.libfx) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestProfile(tmp.dir, "home-agents/shared", "{\"description\": \"Home wins\"}");
+    try writeTestProfile(tmp.dir, "project-agents/shared", "{\"description\": \"Project loses\"}");
+    try writeTestProfile(tmp.dir, "project-agents/mod-wins", "{\"description\": \"Project loses to mod\"}");
+    try writeTestProfile(tmp.dir, "project-agents/clashed", "{\"description\": \"Project under clash\"}");
+
+    // Mod alpha defines shared (loses to home), mod-wins (wins over project),
+    // clashed (clashes with beta), and main (ignored: main stays builtin).
+    try writeTestFile(tmp.dir, "src-alpha/mod.json", "{\"name\":\"alpha\",\"version\":\"1.0.0\"}");
+    try writeTestProfile(tmp.dir, "src-alpha/agents/shared", "{\"description\": \"Alpha loses to home\"}");
+    try writeTestProfile(tmp.dir, "src-alpha/agents/mod-wins", "{\"description\": \"Alpha wins over project\"}");
+    try writeTestFile(tmp.dir, "src-alpha/agents/mod-wins/prompt.md", "Alpha prompt v1.");
+    try writeTestProfile(tmp.dir, "src-alpha/agents/clashed", "{\"description\": \"Alpha clash\"}");
+    try writeTestProfile(tmp.dir, "src-alpha/agents/main", "{\"description\": \"Fake main\"}");
+
+    // Mod beta also defines clashed, plus beta-only.
+    try writeTestFile(tmp.dir, "src-beta/mod.json", "{\"name\":\"beta\",\"version\":\"1.0.0\"}");
+    try writeTestProfile(tmp.dir, "src-beta/agents/clashed", "{\"description\": \"Beta clash\"}");
+    try writeTestProfile(tmp.dir, "src-beta/agents/beta-only", "{\"description\": \"Beta only\"}");
+
+    // Disabled mod gamma defines gamma-only (must stay hidden).
+    try writeTestFile(tmp.dir, "src-gamma/mod.json", "{\"name\":\"gamma\",\"version\":\"1.0.0\"}");
+    try writeTestProfile(tmp.dir, "src-gamma/agents/gamma-only", "{\"description\": \"Hidden when off\"}");
+
+    const mods_dir = try std.Io.Dir.path.join(arena, &.{ try io_mod.dirRealpathAlloc(arena, tmp.dir, "."), "mods" });
+    try tmp.dir.createDirPath(io_mod.getIo(), "mods");
+    try testing.expect((try mods_mod.add(arena, mods_dir, "alpha", try io_mod.dirRealpathAlloc(arena, tmp.dir, "src-alpha"))) == .ok);
+    try testing.expect((try mods_mod.add(arena, mods_dir, "beta", try io_mod.dirRealpathAlloc(arena, tmp.dir, "src-beta"))) == .ok);
+    try testing.expect((try mods_mod.add(arena, mods_dir, "gamma", try io_mod.dirRealpathAlloc(arena, tmp.dir, "src-gamma"))) == .ok);
+    try testing.expect((try mods_mod.setOn(arena, mods_dir, "gamma", false)) == .ok);
+
+    const roots: Roots = .{
+        .home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home-agents"),
+        .mods_dir = mods_dir,
+        .project = try io_mod.dirRealpathAlloc(arena, tmp.dir, "project-agents"),
+        .repository = try io_mod.dirRealpathAlloc(arena, tmp.dir, "project-agents"),
+    };
+
+    var failure: ?[]const u8 = null;
+    // Home beats mods and project.
+    const shared = try load(arena, roots, "shared", &failure);
+    try testing.expectEqual(Source.home, shared.source);
+    try testing.expect(shared.mod_name == null);
+
+    // Mods beat project.
+    const mod_wins = try load(arena, roots, "mod-wins", &failure);
+    try testing.expectEqual(Source.mod, mod_wins.source);
+    try testing.expectEqualStrings("alpha", mod_wins.mod_name.?);
+    try testing.expectEqualStrings("Alpha prompt v1.", mod_wins.prompt);
+
+    // `main` stays builtin even when a mod defines `main`.
+    const main_prof = try load(arena, roots, "main", &failure);
+    try testing.expectEqual(Source.builtin, main_prof.source);
+
+    // Disabled mod is not loaded.
+    try testing.expectError(error.ProfileNotFound, load(arena, roots, "gamma-only", &failure));
+
+    // Clash across two enabled mods fails naming both mods.
+    try testing.expectError(error.InvalidProfile, load(arena, roots, "clashed", &failure));
+    try testing.expect(std.mem.find(u8, failure.?, "alpha") != null);
+    try testing.expect(std.mem.find(u8, failure.?, "beta") != null);
+
+    // `list` and `listForCompletion` skip `clashed` and `gamma-only`, and mark `alpha`/`beta`.
+    const entries = try list(arena, roots);
+    try testing.expect(findEntry(entries, "clashed") == null);
+    try testing.expect(findEntry(entries, "gamma-only") == null);
+    const mw_entry = findEntry(entries, "mod-wins").?;
+    try testing.expectEqual(Source.mod, mw_entry.source);
+    try testing.expectEqualStrings("alpha", mw_entry.mod_name.?);
+
+    const comp = try listForCompletion(testing.allocator, roots);
+    defer comp.deinit(testing.allocator);
+    try testing.expect(findEntry(comp.entries, "clashed") == null);
+    try testing.expect(findEntry(comp.entries, "gamma-only") == null);
+    try testing.expectEqualStrings("alpha", findEntry(comp.entries, "mod-wins").?.mod_name.?);
+
+    // `findModClashesIn` reports `clashed` with `alpha` and `beta`, not `shared` (shadowed by home).
+    const clashes = try findModClashesIn(testing.allocator, roots.home, mods_dir);
+    defer {
+        for (clashes) |*c| c.deinit(testing.allocator);
+        testing.allocator.free(clashes);
+    }
+    try testing.expectEqual(@as(usize, 1), clashes.len);
+    try testing.expectEqualStrings("clashed", clashes[0].name);
+    try testing.expectEqual(@as(usize, 2), clashes[0].mods.len);
+    try testing.expectEqualStrings("alpha", clashes[0].mods[0]);
+    try testing.expectEqualStrings("beta", clashes[0].mods[1]);
+
+    // Live update: updating alpha applies to the next load immediately.
+    try writeTestFile(tmp.dir, "src-alpha/mod.json", "{\"name\":\"alpha\",\"version\":\"2.0.0\"}");
+    try writeTestFile(tmp.dir, "src-alpha/agents/mod-wins/prompt.md", "Alpha prompt v2.");
+    try testing.expect((try mods_mod.update(arena, mods_dir, "alpha", try io_mod.dirRealpathAlloc(arena, tmp.dir, "src-alpha"))) == .ok);
+    const updated = try load(arena, roots, "mod-wins", &failure);
+    try testing.expectEqualStrings("Alpha prompt v2.", updated.prompt);
 }

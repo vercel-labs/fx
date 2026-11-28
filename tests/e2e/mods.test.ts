@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
-import { completion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
+import { completion, createConfiguredProviderFixture as fixture, toolCompletion } from "./fixtures/chat-completions";
 import { collectFiles, runGit } from "./fixtures/shared-helpers";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
@@ -656,4 +656,103 @@ describe("mods as skill roots", () => {
       f.close();
     }
   }, 90000);
+});
+
+describe("mod profiles and themes", () => {
+  test("a mod profile sends its prompt to the gateway and ignores permission_mode", async () => {
+    const targetFile = "should-not-exist.txt";
+    let parentTurn = 0;
+    let childTurn = 0;
+    const f = fixture(body => {
+      const isChild = JSON.stringify(body.messages).includes("MOD_PROFILE_SYSTEM_MARKER");
+      if (isChild) {
+        childTurn += 1;
+        if (childTurn === 1) {
+          return toolCompletion(body.model, "write_file", { path: targetFile, content: "nope" }, "call-write");
+        }
+        return completion(body.model, "kid blocked");
+      }
+      parentTurn += 1;
+      if (parentTurn === 1) {
+        return toolCompletion(body.model, "subagent", {
+          action: "message",
+          agent: "kid",
+          profile: "mod-helper",
+          message: "create file",
+        });
+      }
+      if (parentTurn === 2) {
+        return toolCompletion(body.model, "subagent", { action: "wait" }, "call-wait");
+      }
+      return completion(body.model, "parent done");
+    });
+    try {
+      const folder = makeModFolder(
+        f,
+        "alpha",
+        { name: "alpha", version: "1.0.0", description: "Profile mod" },
+        {
+          "agents/mod-helper/profile.json": JSON.stringify({
+            description: "Mod helper",
+            permission_mode: "yolo",
+            prompt: "append",
+          }),
+          "agents/mod-helper/prompt.md": "MOD_PROFILE_SYSTEM_MARKER",
+        },
+      );
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+
+      const result = await runFx(["ask", "--json", "--provider", "local", "--model", "local-model", "run helper"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(childTurn, result.stdout + result.stderr).toBeGreaterThanOrEqual(1);
+      expect(f.requests.some(req => JSON.stringify(req.body).includes("MOD_PROFILE_SYSTEM_MARKER"))).toBe(true);
+      // `permission_mode: "yolo"` in the mod profile is ignored, so write_file
+      // never runs in ask mode.
+      expect(existsSync(join(f.workspace, targetFile))).toBe(false);
+    } finally { f.close(); }
+  }, 60000);
+
+  test.skipIf(!tmuxAvailable())("FX_THEME loads a theme from an enabled mod in fx ask presentation", async () => {
+    const f = fixture(body => completion(body.model, "themed `reply`"));
+    let session: TmuxSession | null = null;
+    try {
+      const folder = makeModFolder(
+        f,
+        "alpha",
+        { name: "alpha", version: "1.0.0", description: "Theme mod" },
+        {
+          "themes/mod-accent.json": JSON.stringify({
+            type: "dark",
+            colors: { inline_code: "#FF0000", dim: "#FF0000", hint: "#FF0000" },
+          }),
+        },
+      );
+      expect((await fxMod(f, ["add", "--yes", folder])).code).toBe(0);
+
+      session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--provider", "local", "--model", "local-model", "--no-save", "hi"]),
+        cwd: f.workspace,
+        env: {
+          ...f.env,
+          NO_COLOR: undefined,
+          FX_THEME: "mod-accent",
+          COLORFGBG: "15;0",
+          COLORTERM: undefined,
+          TERM_PROGRAM: "Apple_Terminal",
+        },
+        width: 100,
+        height: 30,
+        remainOnExit: true,
+      });
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT_MS);
+      const escapes = await session.capturePaneEscapes();
+      expect(escapes).toContain("38;2;255;0;0");
+    } finally {
+      if (session) {
+        await session.kill();
+        session = null;
+      }
+      f.close();
+    }
+  }, 60000);
 });

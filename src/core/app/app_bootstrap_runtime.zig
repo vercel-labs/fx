@@ -616,6 +616,7 @@ pub fn Runtime(comptime App: type) type {
                 if (launch_overrides.effort_from_profile) app.instances.seed.agent_effort = persisted_effort;
             }
             if (comptime @hasField(App, "review_model")) app.review_model = startup.takeReviewModel();
+            if (comptime @hasField(App, "theme_source")) app.theme_source = startup.takeThemeSource();
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),
             );

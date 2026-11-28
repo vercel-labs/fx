@@ -3,18 +3,21 @@
 //! `fx_dark` and `fx_light` retain their historical palette bytes. The ui
 //! keeps diff marker accents off until a theme is explicitly selected. Both
 //! core presentation and ui rendering resolve their themed values from here.
-//! User themes load from `~/.fx/themes/<name>.json` (selected with
-//! FX_THEME=<name>) in either the
-//! native fx slot schema or the VS Code theme schema (`colors` +
-//! `tokenColors`), so editor themes like GitHub Dark apply
-//! directly. Hex colors resolve to truecolor escapes when the terminal
-//! supports them, otherwise they quantize to the xterm-256 palette.
+//! User themes load from `~/.fx/themes/<name>.json` first, then enabled mods'
+//! `themes/<name>.json` in mod name order (selected with FX_THEME=<name>) in
+//! either the native fx slot schema or the VS Code theme schema (`colors` +
+//! `tokenColors`), so editor themes like GitHub Dark apply directly. Hex colors
+//! resolve to truecolor escapes when the terminal supports them, otherwise they
+//! quantize to the xterm-256 palette.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const debug_trace = @import("debug_trace.zig");
 const io_mod = @import("io.zig");
 const profile_paths = @import("profile_paths.zig");
+const sort_utils = @import("sort_utils.zig");
 const text_utils = @import("text_utils.zig");
+const mods_mod = if (build_options.libfx) struct {} else @import("../mods/mods.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
@@ -983,18 +986,195 @@ pub fn siblingName(alloc: std.mem.Allocator, name: []const u8, want_light: bool)
     return null;
 }
 
-/// Resolves the named theme for the terminal's detected mode: loads it, swaps
-/// to a sibling variant file (github-dark <-> github-light) when the variant
-/// mismatches, and returns null to signal the builtin variant when neither
-/// file fits. Used both at startup and on live terminal theme notifications.
-pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: bool, options: ParseOptions) LoadError!?Theme {
-    const theme = loadNamed(alloc, name, options) catch |err| {
+pub const ModClash = struct {
+    name: []u8,
+    mods: [][]u8,
+
+    pub fn deinit(self: *ModClash, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        for (self.mods) |m| alloc.free(m);
+        alloc.free(self.mods);
+        self.* = .{ .name = &.{}, .mods = &.{} };
+    }
+};
+
+/// Holds the resolved source (and mod pin, when loaded from a mod) for a
+/// custom theme across a whole session so terminal dark/light flips read the
+/// same source and mod version even after an in-place mod update.
+pub const PinnedSource = if (build_options.libfx) struct {
+    pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+
+    pub fn resolveNamed(
+        _: *@This(),
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        terminal_light: bool,
+        options: ParseOptions,
+    ) LoadError!?Theme {
+        return resolveNamedStateless(alloc, name, terminal_light, options);
+    }
+} else struct {
+    kind: enum { uninitialized, none, user, mod } = .uninitialized,
+    pin: ?mods_mod.Pin = null,
+    themes_dir: ?[]u8 = null,
+    io: std.Io = undefined,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.pin) |*p| p.release(alloc, self.io);
+        if (self.themes_dir) |dir| alloc.free(dir);
+        self.* = .{};
+    }
+
+    pub fn resolveNamed(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        terminal_light: bool,
+        options: ParseOptions,
+    ) LoadError!?Theme {
+        const home = io_mod.homeDir();
+        const user_dir = if (home) |h| try profile_paths.rootPath(alloc, h, &.{"themes"}) else null;
+        defer if (user_dir) |d| alloc.free(d);
+        const mods_dir = if (home) |h| try profile_paths.modsDir(alloc, h) else null;
+        defer if (mods_dir) |d| alloc.free(d);
+        return self.resolveNamedIn(alloc, user_dir, mods_dir, name, terminal_light, options);
+    }
+
+    pub fn resolveNamedIn(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        user_themes_dir: ?[]const u8,
+        mods_dir: ?[]const u8,
+        name: []const u8,
+        terminal_light: bool,
+        options: ParseOptions,
+    ) LoadError!?Theme {
+        if (!validThemeName(name)) {
+            debug_trace.logf("theme", "custom_theme_load_failed name={s} err=InvalidName", .{name});
+            return null;
+        }
+        switch (self.kind) {
+            .none => return null,
+            .user, .mod => {
+                const dir = self.themes_dir orelse return null;
+                return resolveNamedFromDir(alloc, dir, name, terminal_light, options);
+            },
+            .uninitialized => {},
+        }
+
+        if (user_themes_dir) |dir| {
+            if (try hasThemeFileInDir(alloc, dir, name)) {
+                self.kind = .user;
+                self.themes_dir = try alloc.dupe(u8, dir);
+                return resolveNamedFromDir(alloc, dir, name, terminal_light, options);
+            }
+        }
+
+        if (mods_dir) |m_dir| {
+            if (try self.bindModSource(alloc, m_dir, name)) {
+                const dir = self.themes_dir orelse return null;
+                return resolveNamedFromDir(alloc, dir, name, terminal_light, options);
+            }
+        }
+
+        self.kind = .none;
+        debug_trace.logf("theme", "custom_theme_load_failed name={s} err=ThemeNotFound", .{name});
+        return null;
+    }
+
+    fn bindModSource(self: *@This(), alloc: std.mem.Allocator, mods_dir: []const u8, name: []const u8) !bool {
+        const set = mods_mod.loadModPins(alloc, mods_dir) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("theme", "mod_pins_load_failed name={s} err={s}", .{ name, @errorName(err) });
+                return false;
+            },
+        };
+        var transferred_idx: ?usize = null;
+        defer {
+            for (set.pins, 0..) |*p, idx| {
+                if (transferred_idx == idx) {
+                    // Ownership of p moved to `self.pin`.
+                    continue;
+                }
+                p.release(alloc, set.io);
+            }
+            if (set.pins.len > 0) alloc.free(set.pins);
+            for (set.problems) |problem| alloc.free(problem);
+            if (set.problems.len > 0) alloc.free(set.problems);
+            if (set.resolved_root) |r| alloc.free(r);
+        }
+
+        for (set.problems) |problem| {
+            debug_trace.logf("theme", "mod_pin_skipped problem={s}", .{problem});
+        }
+
+        var matches: std.ArrayList(usize) = .empty;
+        defer matches.deinit(alloc);
+        for (set.pins, 0..) |p, idx| {
+            const themes_dir = try std.Io.Dir.path.join(alloc, &.{ p.path, "themes" });
+            defer alloc.free(themes_dir);
+            if (try hasThemeFileInDir(alloc, themes_dir, name)) {
+                try matches.append(alloc, idx);
+            }
+        }
+
+        if (matches.items.len == 0) return false;
+        if (matches.items.len >= 2) {
+            var mod_list: std.ArrayList(u8) = .empty;
+            defer mod_list.deinit(alloc);
+            for (matches.items, 0..) |idx, pos| {
+                if (pos > 0) try mod_list.appendSlice(alloc, ",");
+                try mod_list.appendSlice(alloc, set.pins[idx].name);
+            }
+            debug_trace.logf("theme", "custom_theme_mod_clash name={s} mods={s}", .{ name, mod_list.items });
+            return false;
+        }
+
+        const match_idx = matches.items[0];
+        const chosen_themes_dir = try std.Io.Dir.path.join(alloc, &.{ set.pins[match_idx].path, "themes" });
+        errdefer alloc.free(chosen_themes_dir);
+
+        self.pin = set.pins[match_idx];
+        self.io = set.io;
+        self.themes_dir = chosen_themes_dir;
+        self.kind = .mod;
+        transferred_idx = match_idx;
+        return true;
+    }
+};
+
+fn hasThemeFileInDir(alloc: std.mem.Allocator, dir_path: []const u8, name: []const u8) !bool {
+    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return false,
+    };
+    defer dir.close(io_mod.getIo());
+    const file_name = try alloc.print("{s}.json", .{name});
+    defer alloc.free(file_name);
+    var file = dir.openFile(io_mod.getIo(), file_name, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return true,
+    };
+    file.close(io_mod.getIo());
+    return true;
+}
+
+fn resolveNamedFromDir(
+    alloc: std.mem.Allocator,
+    dir_path: []const u8,
+    name: []const u8,
+    terminal_light: bool,
+    options: ParseOptions,
+) LoadError!?Theme {
+    const theme = loadNamedFromDir(alloc, dir_path, name, options) catch |err| {
         debug_trace.logf("theme", "custom_theme_load_failed name={s} err={s}", .{ name, @errorName(err) });
         return null;
     };
     if (theme.light == terminal_light) return theme;
     if (siblingName(alloc, name, terminal_light) catch null) |sibling| {
-        if (loadNamed(alloc, sibling, options)) |swapped| {
+        defer alloc.free(sibling);
+        if (loadNamedFromDir(alloc, dir_path, sibling, options)) |swapped| {
             if (swapped.light == terminal_light) {
                 debug_trace.logf("theme", "theme_variant_swapped from={s} to={s}", .{ name, sibling });
                 return swapped;
@@ -1010,9 +1190,28 @@ pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: 
     return null;
 }
 
-/// Loads `~/.fx/themes/<name>.json` and resolves it for the terminal's color
-/// capability. The returned Theme is process-lifetime state allocated from
-/// `alloc`; the caller keeps the allocation alive.
+/// Resolves the named theme for the terminal's detected mode: checks
+/// `~/.fx/themes/<name>.json` first, then enabled mods' `themes/<name>.json`
+/// in name order, swaps to a sibling variant file in the same source when the
+/// variant mismatches, and returns null to signal the builtin variant when
+/// neither file fits. Stateless convenience wrapper; long-lived sessions should
+/// keep a `PinnedSource` so live updates stay pinned to startup's mod version.
+pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: bool, options: ParseOptions) LoadError!?Theme {
+    var source: PinnedSource = .{};
+    defer source.deinit(alloc);
+    return source.resolveNamed(alloc, name, terminal_light, options);
+}
+
+fn resolveNamedStateless(alloc: std.mem.Allocator, name: []const u8, terminal_light: bool, options: ParseOptions) LoadError!?Theme {
+    const home = io_mod.homeDir() orelse {
+        debug_trace.logf("theme", "custom_theme_load_failed name={s} err=ThemeNotFound", .{name});
+        return null;
+    };
+    const dir_path = try profile_paths.rootPath(alloc, home, &.{"themes"});
+    defer alloc.free(dir_path);
+    return resolveNamedFromDir(alloc, dir_path, name, terminal_light, options);
+}
+
 /// Whether `name` can name a theme file under ~/.fx/themes: 1 to 64 letters,
 /// digits, `-`, `_`, or `.`, and not `.` or `..`.
 pub fn validThemeName(name: []const u8) bool {
@@ -1026,10 +1225,15 @@ pub fn validThemeName(name: []const u8) bool {
 
 pub fn loadNamed(alloc: std.mem.Allocator, name: []const u8, options: ParseOptions) LoadError!Theme {
     if (!validThemeName(name)) return error.InvalidName;
-
     const home = io_mod.homeDir() orelse return error.ThemeNotFound;
     const dir_path = try profile_paths.rootPath(alloc, home, &.{"themes"});
     defer alloc.free(dir_path);
+    return loadNamedFromDir(alloc, dir_path, name, options);
+}
+
+fn loadNamedFromDir(alloc: std.mem.Allocator, dir_path: []const u8, name: []const u8, options: ParseOptions) LoadError!Theme {
+    if (!validThemeName(name)) return error.InvalidName;
+
     var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), dir_path, .{}) catch return error.ThemeNotFound;
     defer dir.close(io_mod.getIo());
 
@@ -1043,6 +1247,115 @@ pub fn loadNamed(alloc: std.mem.Allocator, name: []const u8, options: ParseOptio
     defer alloc.free(bytes);
 
     return parse(alloc, bytes, options);
+}
+
+/// Returns every theme name defined by two or more enabled mods (when not
+/// shadowed by `~/.fx/themes/<name>.json`), for `fx doctor`. Caller frees each
+/// element via `ModClash.deinit` and the outer slice.
+pub fn findModClashes(alloc: std.mem.Allocator, home: ?[]const u8) ![]ModClash {
+    if (comptime build_options.libfx) return &.{};
+    const mods_dir = if (home) |h| try profile_paths.modsDir(alloc, h) else return &.{};
+    defer alloc.free(mods_dir);
+    const user_dir = if (home) |h| try profile_paths.rootPath(alloc, h, &.{"themes"}) else null;
+    defer if (user_dir) |d| alloc.free(d);
+    return findModClashesIn(alloc, user_dir, mods_dir);
+}
+
+pub fn findModClashesIn(alloc: std.mem.Allocator, user_dir: ?[]const u8, mods_dir: []const u8) ![]ModClash {
+    if (comptime build_options.libfx) return &.{};
+
+    const Ctx = struct {
+        alloc: std.mem.Allocator,
+        user_dir: ?[]const u8,
+    };
+    const Body = struct {
+        fn run(ctx: Ctx, pinned: *const mods_mod.ModPins) anyerror![]ModClash {
+            for (pinned.problems) |problem| {
+                debug_trace.logf("theme", "mod_pin_skipped op=findModClashes problem={s}", .{problem});
+            }
+            var scratch_state = std.heap.ArenaAllocator.init(ctx.alloc);
+            defer scratch_state.deinit();
+            const scratch = scratch_state.allocator();
+
+            var mod_roots = try pinned.roots(scratch, .themes);
+            defer mod_roots.deinit(scratch);
+
+            const Seen = struct {
+                name: []const u8,
+                mods: std.ArrayList([]const u8),
+            };
+            var seen: std.ArrayList(Seen) = .empty;
+            for (mod_roots.items) |mod_root| {
+                var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), mod_root.path, .{ .iterate = true }) catch continue;
+                defer dir.close(io_mod.getIo());
+                var it = dir.iterate();
+                while (it.next(io_mod.getIo()) catch null) |item| {
+                    if (item.kind != .file) continue;
+                    if (!std.mem.endsWith(u8, item.name, ".json")) continue;
+                    const stem = item.name[0 .. item.name.len - ".json".len];
+                    if (!validThemeName(stem)) continue;
+                    if (ctx.user_dir) |u_dir| {
+                        if (try hasThemeFileInDir(scratch, u_dir, stem)) continue;
+                    }
+                    var slot: ?*Seen = null;
+                    for (seen.items) |*s| {
+                        if (std.mem.eql(u8, s.name, stem)) {
+                            slot = s;
+                            break;
+                        }
+                    }
+                    if (slot) |s| {
+                        try s.mods.append(scratch, mod_root.mod_name);
+                    } else {
+                        var list_mods: std.ArrayList([]const u8) = .empty;
+                        try list_mods.append(scratch, mod_root.mod_name);
+                        try seen.append(scratch, .{
+                            .name = try scratch.dupe(u8, stem),
+                            .mods = list_mods,
+                        });
+                    }
+                }
+            }
+
+            var out: std.ArrayList(ModClash) = .empty;
+            errdefer {
+                for (out.items) |*c| c.deinit(ctx.alloc);
+                out.deinit(ctx.alloc);
+            }
+            for (seen.items) |s| {
+                if (s.mods.items.len < 2) continue;
+                const name_copy = try ctx.alloc.dupe(u8, s.name);
+                errdefer ctx.alloc.free(name_copy);
+                const mods_copy = try ctx.alloc.alloc([]u8, s.mods.items.len);
+                var filled: usize = 0;
+                errdefer {
+                    for (mods_copy[0..filled]) |m| ctx.alloc.free(m);
+                    ctx.alloc.free(mods_copy);
+                }
+                for (s.mods.items, mods_copy) |m, *dst| {
+                    dst.* = try ctx.alloc.dupe(u8, m);
+                    filled += 1;
+                }
+                try out.append(ctx.alloc, .{ .name = name_copy, .mods = mods_copy });
+            }
+            sort_utils.sort(ModClash, out.items, {}, struct {
+                fn lessThan(_: void, a: ModClash, b: ModClash) bool {
+                    return std.mem.lessThan(u8, a.name, b.name);
+                }
+            }.lessThan);
+            return try out.toOwnedSlice(ctx.alloc);
+        }
+    };
+    return mods_mod.withPinnedMods(alloc, mods_dir, Ctx{
+        .alloc = alloc,
+        .user_dir = user_dir,
+    }, []ModClash, Body.run) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("theme", "mod_pins_load_failed op=findModClashes err={s}", .{@errorName(err)});
+            return &.{};
+        },
+    };
 }
 
 test "builtin selects the variant matching the light flag" {
@@ -1536,4 +1849,109 @@ test "builtin themes pin the new slot bytes" {
     for ([_][]const u8{ fx_light.syntax.function_style, fx_light.syntax.variable_style, fx_light.syntax.operator_style }) |style| {
         try std.testing.expectEqualStrings(fx_light.syntax.keyword_style, style);
     }
+}
+
+test "themes resolve user over mods, drop mod clashes, keep sibling in same source, and hold pin across mod updates" {
+    if (comptime build_options.libfx) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = io_mod.getIo();
+    try tmp.dir.createDirPath(io, "user-themes");
+    try tmp.dir.createDirPath(io, "mods");
+
+    const writeDoc = struct {
+        fn run(dir: std.Io.Dir, rel: []const u8, content: []const u8) !void {
+            if (std.Io.Dir.path.dirname(rel)) |parent| try dir.createDirPath(io_mod.getIo(), parent);
+            try dir.writeFile(io_mod.getIo(), .{ .sub_path = rel, .data = content });
+        }
+    }.run;
+
+    // User theme `shared` (dark only) wins over mod alpha's `shared`, and its
+    // light sibling does NOT fall back to mod alpha's `shared-light`.
+    try writeDoc(tmp.dir, "user-themes/shared-dark.json", "{\"type\":\"dark\",\"colors\":{\"hint\":\"#101010\"}}");
+    try writeDoc(tmp.dir, "src-alpha/mod.json", "{\"name\":\"alpha\",\"version\":\"1.0.0\"}");
+    try writeDoc(tmp.dir, "src-alpha/themes/shared-dark.json", "{\"type\":\"dark\",\"colors\":{\"hint\":\"#202020\"}}");
+    try writeDoc(tmp.dir, "src-alpha/themes/shared-light.json", "{\"type\":\"light\",\"colors\":{\"hint\":\"#303030\"}}");
+    try writeDoc(tmp.dir, "src-alpha/themes/pair-dark.json", "{\"type\":\"dark\",\"colors\":{\"hint\":\"#112233\"}}");
+    try writeDoc(tmp.dir, "src-alpha/themes/pair-light.json", "{\"type\":\"light\",\"colors\":{\"hint\":\"#445566\"}}");
+    try writeDoc(tmp.dir, "src-alpha/themes/clash.json", "{\"type\":\"dark\",\"colors\":{\"hint\":\"#AAAAAA\"}}");
+
+    try writeDoc(tmp.dir, "src-beta/mod.json", "{\"name\":\"beta\",\"version\":\"1.0.0\"}");
+    try writeDoc(tmp.dir, "src-beta/themes/clash.json", "{\"type\":\"dark\",\"colors\":{\"hint\":\"#BBBBBB\"}}");
+    // Beta has `solo-dark` without `solo-light`, while alpha has `solo-light` — must not mix.
+    try writeDoc(tmp.dir, "src-alpha/themes/solo-light.json", "{\"type\":\"light\",\"colors\":{\"hint\":\"#778899\"}}");
+    try writeDoc(tmp.dir, "src-beta/themes/solo-dark.json", "{\"type\":\"dark\",\"colors\":{\"hint\":\"#667788\"}}");
+
+    const root_abs = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
+    const user_themes_dir = try std.Io.Dir.path.join(arena, &.{ root_abs, "user-themes" });
+    const mods_dir = try std.Io.Dir.path.join(arena, &.{ root_abs, "mods" });
+    try std.testing.expect((try mods_mod.add(arena, mods_dir, "alpha", try io_mod.dirRealpathAlloc(arena, tmp.dir, "src-alpha"))) == .ok);
+    try std.testing.expect((try mods_mod.add(arena, mods_dir, "beta", try io_mod.dirRealpathAlloc(arena, tmp.dir, "src-beta"))) == .ok);
+
+    // 1. User theme beats mod, and sibling stays in user source only.
+    {
+        var src: PinnedSource = .{};
+        defer src.deinit(arena);
+        const dark = (try src.resolveNamedIn(arena, user_themes_dir, mods_dir, "shared-dark", false, .{ .truecolor = true })).?;
+        try std.testing.expectEqualStrings("\x1b[38;2;16;16;16m", dark.hint_style);
+        try std.testing.expect((try src.resolveNamedIn(arena, user_themes_dir, mods_dir, "shared-dark", true, .{ .truecolor = true })) == null);
+    }
+
+    // 2. Clash between alpha and beta loads neither and reports in `findModClashesIn`.
+    {
+        var src: PinnedSource = .{};
+        defer src.deinit(alloc);
+        try std.testing.expect((try src.resolveNamedIn(alloc, user_themes_dir, mods_dir, "clash", false, .{ .truecolor = true })) == null);
+        const clashes = try findModClashesIn(alloc, user_themes_dir, mods_dir);
+        defer {
+            for (clashes) |*c| c.deinit(alloc);
+            alloc.free(clashes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), clashes.len);
+        try std.testing.expectEqualStrings("clash", clashes[0].name);
+        try std.testing.expectEqualStrings("alpha", clashes[0].mods[0]);
+        try std.testing.expectEqualStrings("beta", clashes[0].mods[1]);
+    }
+
+    // 3. Sibling from a different mod is never mixed.
+    {
+        var src: PinnedSource = .{};
+        defer src.deinit(arena);
+        try std.testing.expect((try src.resolveNamedIn(arena, user_themes_dir, mods_dir, "solo-dark", true, .{ .truecolor = true })) == null);
+    }
+
+    // 4. Mod theme holds its pin for the whole session across an update, so a
+    // live light/dark flip reads the startup version even after `update`.
+    var old_link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var mods_d = try std.Io.Dir.openDirAbsolute(io, mods_dir, .{});
+    defer mods_d.close(io);
+    const old_rel_len = try mods_d.readLink(io, "alpha", &old_link_buf);
+    const old_rel = try arena.dupe(u8, old_link_buf[0..old_rel_len]);
+
+    var pinned_src: PinnedSource = .{};
+    const v1_dark = (try pinned_src.resolveNamedIn(arena, user_themes_dir, mods_dir, "pair-dark", false, .{ .truecolor = true })).?;
+    try std.testing.expectEqualStrings("\x1b[38;2;17;34;51m", v1_dark.hint_style);
+
+    try writeDoc(tmp.dir, "src-alpha/mod.json", "{\"name\":\"alpha\",\"version\":\"2.0.0\"}");
+    try writeDoc(tmp.dir, "src-alpha/themes/pair-dark.json", "{\"type\":\"dark\",\"colors\":{\"hint\":\"#AABBCC\"}}");
+    try writeDoc(tmp.dir, "src-alpha/themes/pair-light.json", "{\"type\":\"light\",\"colors\":{\"hint\":\"#DDEEFF\"}}");
+    try std.testing.expect((try mods_mod.update(arena, mods_dir, "alpha", try io_mod.dirRealpathAlloc(arena, tmp.dir, "src-alpha"))) == .ok);
+
+    // v1's `.store` folder must still exist while `pinned_src` holds the pin.
+    var old_dir = try mods_d.openDir(io, old_rel, .{});
+    old_dir.close(io);
+
+    // Flipping to light still reads v1's pair-light (`#445566`), not v2's (`#DDEEFF`).
+    const v1_light = (try pinned_src.resolveNamedIn(arena, user_themes_dir, mods_dir, "pair-dark", true, .{ .truecolor = true })).?;
+    try std.testing.expectEqualStrings("\x1b[38;2;68;85;102m", v1_light.hint_style);
+
+    // Releasing the pin lets `collect` remove the old v1 store folder.
+    pinned_src.deinit(arena);
+    try std.testing.expect((try mods_mod.collect(mods_dir, "alpha")) == .ok);
+    try std.testing.expectError(error.FileNotFound, mods_d.openDir(io, old_rel, .{}));
 }

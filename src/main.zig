@@ -699,6 +699,7 @@ const App = struct {
     upgrader: auto_upgrade.AutoUpgrade = .{},
     mcp: app_mcp_runtime.State = .{},
     mods: if (build_options.libfx) struct {} else app_mods_runtime.State = .{},
+    theme_source: @import("core/shared/theme.zig").PinnedSource = .{},
     /// The profiles `/launch` completes.
     launch_completion: app_profile_runtime.LaunchCompletion = .{},
     skills: skill_runtime.Runtime = .{},
@@ -1174,7 +1175,10 @@ const App = struct {
         self.trust.deinit(self.alloc);
         shutdown_trace.mark("credentials_saved");
         self.mcp.deinitForProcessExit();
-        if (comptime !build_options.libfx) self.mods.deinit();
+        if (comptime !build_options.libfx) {
+            self.mods.deinit();
+            self.theme_source.deinit(self.alloc);
+        }
         shutdown_trace.mark("mcp_children_terminated");
         if (comptime !build_options.libfx) command_auth.shutdown();
         shutdown_trace.mark("complete");
@@ -1267,7 +1271,10 @@ const App = struct {
         for (main_agent.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
         main_agent.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit();
-        if (comptime !build_options.libfx) self.mods.deinit();
+        if (comptime !build_options.libfx) {
+            self.mods.deinit();
+            self.theme_source.deinit(self.alloc);
+        }
         shutdown_trace.mark("mcp_deinit");
         self.launch_completion.deinit();
         self.skills.deinit(std.heap.c_allocator);
