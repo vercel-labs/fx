@@ -121,7 +121,8 @@ pub const List = struct {
 
 pub const Added = struct {
     added: u32 = 0,
-    /// Tools without a plain, non-empty `name`, or whose `inputSchema` isn't an object.
+    /// Tools without a plain, non-empty `name`, or whose `inputSchema` isn't an object. Such a tool takes no name, so
+    /// a later tool of the same name is kept.
     invalid: u32 = 0,
     /// Tools with a field written twice, `name` included: no copy of it is trusted over the other.
     repeated_field: u32 = 0,
@@ -228,6 +229,9 @@ pub const Refusal = enum {
     /// An HTTP status that no other flow reads (not a sign-in, nor a session's end) and a body with no
     /// JSON-RPC message. `text` puts the status number in the words.
     http_status,
+    /// The same, for a status that says the server can't answer now: `temporaryStatus`. The list is refused
+    /// like any other, and the words say it is temporary.
+    http_unavailable,
     /// A 2xx answer sent with a content type that is not JSON.
     not_json,
 
@@ -238,18 +242,36 @@ pub const Refusal = enum {
             .repeated_field => "a field is written twice",
             .tools_not_a_list => "\"tools\" is not a list",
             .unreadable => "the answer is not a readable tool list",
-            .http_status => "the server answered the list with an HTTP error",
+            .http_status, .http_unavailable => "the server answered the list with an HTTP error",
             .not_json => "the list is not valid JSON",
         };
     }
 
-    /// The words of a refusal, with the status number for `http_status` (a number fx read, never server text).
+    /// The words of a refusal, with the status number for the HTTP ones (a number fx read, never server text).
     /// They fit `text_max` bytes.
     pub fn text(refusal: Refusal, status: u16, buf: *[text_max]u8) []const u8 {
-        if (refusal != .http_status or status == 0) return refusal.words();
-        return std.mem.print(buf, "the server answered the list with HTTP {d}", .{status}) catch refusal.words();
+        if (status == 0) return refusal.words();
+        const temporary: []const u8 = switch (refusal) {
+            .http_status => "",
+            .http_unavailable => ", which is temporary",
+            else => return refusal.words(),
+        };
+        return std.mem.print(buf, "the server answered the list with HTTP {d}{s}", .{ status, temporary }) catch refusal.words();
+    }
+
+    /// The refusal for an HTTP answer to `tools/list` that no other flow reads, by its status.
+    pub fn ofStatus(status: u16) Refusal {
+        return if (temporaryStatus(status)) .http_unavailable else .http_status;
     }
 };
+
+/// The HTTP statuses that say the server can't answer now but may later: 429 (too many requests) and 503
+/// (unavailable). `fx mcp show` names each in the words it has for them (`verbs.zig`).
+pub const temporary_statuses = [_]u16{ 429, 503 };
+
+fn temporaryStatus(status: u16) bool {
+    return std.mem.findScalar(u16, &temporary_statuses, status) != null;
+}
 
 /// The most bytes `Refusal.text` writes.
 pub const text_max = 64;
@@ -463,11 +485,23 @@ test "an HTTP status goes into the words as a number, and nothing else does" {
     // No status, no number; every other reason keeps its fixed words whatever the status.
     try testing.expectEqualStrings(Refusal.http_status.words(), Refusal.http_status.text(0, &buf));
     for (std.enums.values(Refusal)) |refusal| {
-        if (refusal == .http_status) continue;
+        if (refusal == .http_status or refusal == .http_unavailable) continue;
         try testing.expectEqualStrings(refusal.words(), refusal.text(500, &buf));
     }
     // The longest words fit the buffer, and are plain ASCII.
     const longest = Refusal.http_status.text(65535, &buf);
+    try testing.expect(longest.len <= text_max);
+    for (longest) |byte| try testing.expect(byte >= ' ' and byte < 0x7f);
+}
+
+test "429 and 503 are refused as temporary, with their number and no other words from the server" {
+    var buf: [text_max]u8 = undefined;
+    try testing.expectEqual(Refusal.http_unavailable, Refusal.ofStatus(429));
+    try testing.expectEqual(Refusal.http_unavailable, Refusal.ofStatus(503));
+    for ([_]u16{ 400, 401, 403, 404, 500, 502, 504, 301 }) |status| try testing.expectEqual(Refusal.http_status, Refusal.ofStatus(status));
+    try testing.expectEqualStrings("the server answered the list with HTTP 503, which is temporary", Refusal.http_unavailable.text(503, &buf));
+    try testing.expectEqualStrings(Refusal.http_unavailable.words(), Refusal.http_unavailable.text(0, &buf));
+    const longest = Refusal.http_unavailable.text(65535, &buf);
     try testing.expect(longest.len <= text_max);
     for (longest) |byte| try testing.expect(byte >= ' ' and byte < 0x7f);
 }
@@ -535,6 +569,25 @@ test "gathers valid tools, skipping malformed ones and later duplicates" {
     try testing.expectEqual(@as(?[]const u8, null), store.nextCursor());
     try testing.expectEqual(@as(usize, 2), store.current.len());
     try testing.expectError(error.NotAnArray, store.addPage(testing.allocator, .{ .tools = "{}", .next_cursor = null, .ttl_ms = 0 }));
+}
+
+test "a tool whose inputSchema is missing or no object is skipped and takes no name: a later tool of the name is kept" {
+    const skipped = [_][]const u8{
+        "{\"name\":\"a\"}",
+        "{\"name\":\"a\",\"inputSchema\":null}",
+        "{\"name\":\"a\",\"inputSchema\":[]}",
+        "{\"name\":\"a\",\"inputSchema\":\"x\"}",
+    };
+    for (skipped) |bad| {
+        var store: Store = .{};
+        defer store.deinit(testing.allocator);
+        var page: [192]u8 = undefined;
+        const text = try std.mem.print(&page, "{{\"tools\":[{s},{{\"name\":\"a\",\"description\":\"the good one\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}", .{bad});
+        const added = try store.addPage(testing.allocator, try parsePage(text));
+        try testing.expectEqual(Added{ .added = 1, .invalid = 1 }, added);
+        store.publish();
+        try testing.expect(std.mem.find(u8, store.current.find("a").?.raw, "the good one") != null);
+    }
 }
 
 test "a large list over pages: each tool is found as first listed, and a later one of the same name is skipped" {

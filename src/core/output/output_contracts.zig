@@ -3434,6 +3434,7 @@ const DoctorGroup = enum {
             .{ "sessions", .sessions },
             .{ "mcp", .mcp },
             .{ "git", .tools },
+            .{ "trust", .tools },
             .{ "gh", .tools },
             .{ "skills", .tools },
         };

@@ -8,6 +8,7 @@ const model_catalog = @import("../core/gateway/model_catalog.zig");
 /// An answer cut off before its end. A retry can get the whole answer.
 const cut_off_answer_errors = [_]anyerror{
     error.HttpChunkTruncated,
+    error.HttpRequestTruncated,
     error.EndOfStream,
     error.HttpBodyCutOff,
 };
@@ -17,6 +18,10 @@ const cut_off_answer_errors = [_]anyerror{
 const broken_answer_errors = [_]anyerror{
     error.HttpHeadersInvalid,
     error.HttpHeadersOversize,
+    error.HttpConnectionHeaderUnsupported,
+    error.HttpHeaderContinuationsUnsupported,
+    error.HttpTransferEncodingUnsupported,
+    error.InvalidContentLength,
     error.HttpContentEncodingUnsupported,
     error.UnsupportedCompressionMethod,
     error.HttpChunkInvalid,
@@ -94,11 +99,16 @@ test "catalog fetch failures split unreadable answers from connection failures" 
     try expectClassified(error.HttpChunkTruncated, .malformed_response, true);
     try expectClassified(error.EndOfStream, .malformed_response, true);
     try expectClassified(error.HttpBodyCutOff, .malformed_response, true);
+    try expectClassified(error.HttpRequestTruncated, .malformed_response, true);
     const broken = [_]anyerror{
         error.BadGzipHeader,
         error.WrongGzipChecksum,
         error.HttpChunkInvalid,
         error.HttpHeadersInvalid,
+        error.HttpConnectionHeaderUnsupported,
+        error.HttpHeaderContinuationsUnsupported,
+        error.HttpTransferEncodingUnsupported,
+        error.InvalidContentLength,
     };
     for (broken) |err| try expectClassified(err, .malformed_response, false);
     for (broken_answer_errors) |err| try expectClassified(err, .malformed_response, false);

@@ -15,7 +15,7 @@
 //! The module performs no I/O, reads no clock, starts no thread, keeps no
 //! global state, and never allocates, so the same events always produce the
 //! same decisions. `tests/tla/recovery/Resume.tla` models the relaunch
-//! (actions Upgrade and Relaunch).
+//! (actions Upgrade, Hold, and Relaunch).
 //!
 //! Outside code imports only this file, and this file imports only `std`.
 

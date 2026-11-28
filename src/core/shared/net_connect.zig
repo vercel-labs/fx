@@ -16,12 +16,17 @@
 //! cancelation between them, reads the result with SO_ERROR, and returns a
 //! blocking socket, as std's own connect does.
 //!
+//! A connect that fails with `error.Unexpected` notes its errno in
+//! `os_errors.zig` for `/trace`.
+//!
 //! Remove this file and its use in `io.zig` once fx builds with a Zig whose
 //! `posixConnect` no longer calls connect(2) after EINTR
-//! (https://codeberg.org/ziglang/zig/issues/31391).
+//! (https://codeberg.org/ziglang/zig/issues/31391), and let `os_errors.wrap`
+//! note failed connects instead.
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("debug_trace.zig");
+const os_errors = @import("os_errors.zig");
 
 const posix = std.posix;
 const net = std.Io.net;
@@ -59,9 +64,24 @@ fn netConnectIp(
     options: net.IpAddress.ConnectOptions,
 ) net.IpAddress.ConnectError!net.Socket {
     const inner = wrapped_inner.?;
+    const io: std.Io = .{ .userdata = userdata, .vtable = inner };
     // std doesn't implement connect timeouts yet; those stay with std.
     if (options.timeout != .none or !std.options.networking) return inner.netConnectIp(userdata, address, options);
-    return connect(.{ .userdata = userdata, .vtable = inner }, address, options);
+    unexpected_errno = 0;
+    return connect(io, address, options) catch |err| {
+        if (err == error.Unexpected) os_errors.note(io, .connect, unexpected_errno);
+        return err;
+    };
+}
+
+/// The errno behind the newest `error.Unexpected` this thread's connect
+/// returned. A failed connect's errno comes from SO_ERROR, not libc's
+/// `errno`, so the connect keeps it here for `os_errors`.
+threadlocal var unexpected_errno: u16 = 0;
+
+fn unexpected(err: posix.E) error{Unexpected} {
+    unexpected_errno = @backingInt(err);
+    return posix.unexpectedErrno(err);
 }
 
 /// Connects a new socket to `address`. Waits until the connection is made,
@@ -162,7 +182,7 @@ fn awaitConnected(io: std.Io, fd: posix.fd_t) net.IpAddress.ConnectError!void {
             .SUCCESS => if (ready > 0) return socketError(fd),
             .INTR => traceConnect(io, fd, "intr", null),
             .AGAIN, .NOMEM => return error.SystemResources,
-            else => |err| return posix.unexpectedErrno(err),
+            else => |err| return unexpected(err),
         }
         try io.checkCancel();
     }
@@ -174,7 +194,7 @@ fn socketError(fd: posix.fd_t) net.IpAddress.ConnectError!void {
     var length: posix.socklen_t = @sizeOf(c_int);
     switch (posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&value), &length))) {
         .SUCCESS => {},
-        else => |err| return posix.unexpectedErrno(err),
+        else => |err| return unexpected(err),
     }
     if (value == 0) return;
     return connectError(@fromBackingInt(@intCast(value)));
@@ -195,7 +215,7 @@ fn connectError(err: posix.E) net.IpAddress.ConnectError {
         .ACCES, .PERM => error.AccessDenied,
         .NETDOWN => error.NetworkDown,
         .NOBUFS, .NOMEM => error.SystemResources,
-        else => posix.unexpectedErrno(err),
+        else => unexpected(err),
     };
 }
 
@@ -221,7 +241,7 @@ fn openSocket(family: posix.sa_family_t, options: net.IpAddress.ConnectOptions) 
             .NOBUFS, .NOMEM => return error.SystemResources,
             .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
             .PROTOTYPE => return error.SocketModeUnsupported,
-            else => |err| return posix.unexpectedErrno(err),
+            else => |err| return unexpected(err),
         }
     }
 }
@@ -252,7 +272,7 @@ fn fcntl(fd: posix.fd_t, command: c_int, arg: usize) error{Unexpected}!usize {
         switch (posix.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
-            else => |err| return posix.unexpectedErrno(err),
+            else => |err| return unexpected(err),
         }
     }
 }
@@ -263,7 +283,7 @@ fn localAddress(fd: posix.fd_t) error{Unexpected}!net.IpAddress {
     while (true) switch (posix.errno(posix.system.getsockname(fd, &storage.any, &length))) {
         .SUCCESS => return Threaded.addressFromPosix(&storage),
         .INTR => continue,
-        else => |err| return posix.unexpectedErrno(err),
+        else => |err| return unexpected(err),
     };
 }
 
@@ -416,6 +436,12 @@ test "connect reports a port nobody listens on as refused" {
     server.deinit(io);
 
     try testing.expectError(error.ConnectionRefused, connect(io, &closed, .{ .mode = .stream }));
+}
+
+test "a connect errno that std has no name for is kept for os_errors" {
+    unexpected_errno = 0;
+    try testing.expectEqual(error.Unexpected, connectError(.HOSTDOWN));
+    try testing.expectEqual(@as(u16, @backingInt(posix.E.HOSTDOWN)), unexpected_errno);
 }
 
 test "a connect that SIGIO interrupts while it waits still connects" {

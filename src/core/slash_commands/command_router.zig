@@ -49,6 +49,68 @@ pub const ParsedCommand = union(enum) {
     unknown,
 };
 
+/// How a chord's slash command is carried out. `run_now` runs the real
+/// command at once; it only reads state or flips a reversible setting, and
+/// never touches the draft. `open_catalog` reuses the native Ctrl+P flow,
+/// which lends the composer and restores the draft. `preview` writes the
+/// exact command into an empty composer, and it runs only on Enter.
+pub const ChordCommandRoute = enum { run_now, open_catalog, preview, refuse };
+
+pub fn chordCommandRoute(parsed: ParsedCommand) ChordCommandRoute {
+    return switch (parsed) {
+        .fast, .version, .status, .stats, .usage, .help => .run_now,
+        .effort => |level| if (blankArgs(level)) .preview else .run_now,
+        .ultrafast => |rest| if (ultrafastReadOrToggle(rest)) .run_now else .preview,
+        .model => |query| if (blankArgs(query)) .open_catalog else .preview,
+        .credits, .statusline, .notifications => .preview,
+        // A profile can be written by an agent. Enter on a prepared draft
+        // is not authorization to run a privileged or unclassified command.
+        else => .refuse,
+    };
+}
+
+fn blankArgs(rest: []const u8) bool {
+    return std.mem.trim(u8, rest, " \t").len == 0;
+}
+
+/// `/ultrafast` with no argument or `status` reads state; `on` and `off` flip a
+/// reversible mode, as `/fast` does.
+fn ultrafastReadOrToggle(rest: []const u8) bool {
+    const arg = std.mem.trim(u8, rest, " \t");
+    return std.ascii.eqlIgnoreCase(arg, "") or std.ascii.eqlIgnoreCase(arg, "status") or
+        std.ascii.eqlIgnoreCase(arg, "on") or std.ascii.eqlIgnoreCase(arg, "off");
+}
+
+test "chord commands: read-only and reversible run now, the rest waits" {
+    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.status));
+    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.stats));
+    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.usage));
+    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.help));
+    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.version));
+    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.{ .fast = "" }));
+    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.{ .effort = "low" }));
+    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.{ .ultrafast = "status" }));
+    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.{ .effort = "  " }));
+    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.{ .ultrafast = "always" }));
+}
+
+test "chord /model with no argument reuses the native catalog, not a typed command" {
+    try std.testing.expectEqual(ChordCommandRoute.open_catalog, chordCommandRoute(.{ .model = "" }));
+    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.{ .model = "gpt-5" }));
+}
+
+test "sensitive and unknown commands cannot run or become a draft from a shortcut" {
+    const refused = [_]ParsedCommand{
+        .{ .permissions = "ask" }, .{ .allowlist = "view" },   .{ .settings = "" },
+        .{ .shell = "" },          .{ .launch_instance = "" }, .{ .workspace = "" },
+        .{ .mcp = "" },            .{ .skills = "" },          .login,
+        .provider,                 .quit,                      .reset_session,
+        .unknown,
+    };
+    for (refused) |parsed| try std.testing.expectEqual(ChordCommandRoute.refuse, chordCommandRoute(parsed));
+    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.credits));
+}
+
 pub const CommandHandlers = struct {
     ctx: *anyopaque,
     quit: *const fn (ctx: *anyopaque) anyerror!void,

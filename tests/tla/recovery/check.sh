@@ -45,6 +45,23 @@
 #   yield-unclean       an upgrade's restart saved as a death              NoFalseCrashQuestion
 #   yield-first         a turn stopped for a restart before it is logged   YieldContinues
 #   yield-unsaved       a stop whose save failed, left as a clean stop     NoFalseCrashQuestion
+#   cancel-strands      a cancelled restart leaves a held turn stopped     HeldOnlyWhileRestartWaits
+#   cancel-keeps-relaunch  a quit after a cancel relaunches                CancelledRestartStays
+#   cancel-unsaved      a held turn sends with its clean record            CrashLoopAsks
+#
+# RestartWait.tla models one process's main loop against the workers it
+# asks to stop for the restart, and the cancel. restart-wait.cfg is the
+# design and must pass, with its WaitEnds liveness; restart-wait-current.cfg
+# is fx before the cancel, whose turn stops for good at its boundary
+# (NoStopWhileCancellable). Each restart-wait-mutation-*.cfg plants one
+# defect:
+#
+#   hold-ignores-flag   a turn holds after a cancel cleared its request    HeldOnlyWhileRestartWaits
+#   cancel-while-releasing  a cancel after the release strands a turn   NoStopWhileCancellable
+#   release-early       the release closes the cancel while a turn runs    NoUncancellableWait
+#
+# The two restart-wait-simulate-*.cfg run random behaviors with and
+# without faults.
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -97,4 +114,14 @@ Resume resume-mutation-no-lock OneWorker
 Resume resume-mutation-yield-unclean NoFalseCrashQuestion
 Resume resume-mutation-yield-first YieldContinues
 Resume resume-mutation-yield-unsaved NoFalseCrashQuestion
+Resume resume-mutation-cancel-strands HeldOnlyWhileRestartWaits
+Resume resume-mutation-cancel-keeps-relaunch CancelledRestartStays
+Resume resume-mutation-cancel-unsaved CrashLoopAsks
+RestartWait restart-wait -
+RestartWait restart-wait-current NoStopWhileCancellable
+RestartWait restart-wait-mutation-hold-ignores-flag HeldOnlyWhileRestartWaits
+RestartWait restart-wait-mutation-cancel-while-releasing NoStopWhileCancellable
+RestartWait restart-wait-mutation-release-early NoUncancellableWait
+RestartWait restart-wait-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
+RestartWait restart-wait-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 EOF

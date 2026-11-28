@@ -10,7 +10,6 @@ const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const versions = @import("../core/gateway/provider_versions.zig");
-const version_lookup = @import("provider_versions.zig");
 const catalog_fetch_failure = @import("catalog_fetch_failure.zig");
 
 const max_catalog_models: usize = 128;
@@ -90,13 +89,7 @@ fn fetchCatalogForProvider(
         .clock = .awake,
         .raw = .fromMilliseconds(fetch_timeout_ms),
     });
-    const version = if (request_auth.include_subscription_headers)
-        version_lookup.resolve(alloc, .grok, cancel_flag, deadline) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return .{ .failure = catalogFetchFailure(err) };
-        }
-    else
-        null;
+    const version: ?[]const u8 = if (request_auth.include_subscription_headers) versions.grok_client_version else null;
     var response = fetchCatalogResponse(
         alloc,
         request_url,
@@ -195,7 +188,7 @@ const FetchOperation = struct {
     credential: ?[]const u8,
     account_id: ?[]const u8,
     include_subscription_headers: bool,
-    client_version: ?versions.Version = null,
+    client_version: ?[]const u8 = null,
 
     pub fn run(self: *@This()) !FetchResponse {
         var auth_header: ?[]u8 = null;
@@ -223,8 +216,8 @@ const FetchOperation = struct {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-userid", .value = account_id };
             extra_headers_len += 1;
         }
-        if (self.client_version) |*version| {
-            extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-version", .value = version.slice() };
+        if (self.client_version) |version| {
+            extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-version", .value = version };
             extra_headers_len += 1;
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-identifier", .value = "fx" };
             extra_headers_len += 1;
@@ -255,7 +248,7 @@ fn fetchCatalogResponse(
     credential: ?[]const u8,
     account_id: ?[]const u8,
     include_subscription_headers: bool,
-    client_version: ?versions.Version,
+    client_version: ?[]const u8,
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
 ) !FetchResponse {
@@ -848,7 +841,6 @@ const CatalogEndpointEnvironment = struct {
         errdefer self.map.deinit();
         try self.map.put(e2e_models_endpoint_env, models_url);
         try self.map.put(e2e_modalities_endpoint_env, modalities_url);
-        try self.map.put("FX_TEST_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }

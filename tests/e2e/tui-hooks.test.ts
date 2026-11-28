@@ -252,7 +252,7 @@ test.skipIf(!tmuxAvailable())(
     const { session } = current;
 
     await session.sendText("/effort high");
-    await session.waitForText(/!\s+hooks:\s+Hook cfg-fail failed: exited with code 1: oops/, TIMEOUT);
+    await session.waitForText(/⚠\s+hooks:\s+Hook cfg-fail failed: exited with code 1: oops/, TIMEOUT);
     await session.waitForText("Reasoning effort set to high for acme/thinker", TIMEOUT);
     await session.waitForComposer(TIMEOUT);
 

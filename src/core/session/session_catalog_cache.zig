@@ -24,6 +24,10 @@ const magic = "fx-resume-catalog-v6\n";
 const file_name = ".resume-catalog";
 const max_bytes = 64 * 1024 * 1024;
 const max_records = 100_000;
+/// A store with at most this many sessions is listed on the calling thread:
+/// below it, the helper threads cost more to start than they save, since each
+/// new thread zeroes its thread-local signal stack.
+const sessions_before_helper_threads = 16;
 const Fingerprint = [Sha256.digest_length]u8;
 
 const Entry = struct {
@@ -162,6 +166,10 @@ const Loaded = struct {
         const row = self.parsed.?[position];
         if (!matches(row, fingerprint_value)) return null;
         return try cloneRow(alloc, row);
+    }
+
+    fn holds(self: *const Loaded, id: []const u8) bool {
+        return self.index.contains(id);
     }
 
     fn matches(row: Row, value: Fingerprint) bool {
@@ -371,7 +379,8 @@ const CatalogWorker = struct {
         const dir = self.read.store.canonical_root.sessions orelse return;
         while (try self.read.nextId(self.alloc)) |id| {
             defer self.alloc.free(id);
-            const before = fingerprint(dir.dir, id) catch null;
+            // Only a row the index holds can be reused, so only then are its stats worth taking.
+            const before = if (self.read.cache.holds(id)) (fingerprint(dir.dir, id) catch null) else null;
             if (before) |stamp| {
                 if (try self.read.cache.reuse(self.alloc, id, stamp)) |value| {
                     var entry = value;
@@ -422,6 +431,19 @@ const CatalogWorker = struct {
     }
 };
 
+/// Whether the store holds more than `session_limit` sessions, from their
+/// folder names alone.
+fn holdsMoreSessionsThan(store: session_store.Store, alloc: Allocator, session_limit: usize) !bool {
+    var candidates = store.readOnlyCandidates();
+    var session_count: usize = 0;
+    while (try candidates.nextId(alloc, null)) |id| {
+        alloc.free(id);
+        session_count += 1;
+        if (session_count > session_limit) return true;
+    }
+    return false;
+}
+
 /// Every listable v1 session, newest first, `active_id` left out. Rows whose
 /// fingerprints still match the index are reused without opening their
 /// sessions; the rest are classified by canonical discovery. The index is
@@ -439,6 +461,7 @@ pub fn listActionableCatalog(
     var read = CatalogRead{ .store = store, .candidates = store.readOnlyCandidates(), .active_id = active_id, .cancelled = stop_requested, .cache = &cached };
     // Worker storage is independent of the caller's allocator and ends after the merge.
     const worker_alloc = std.heap.c_allocator;
+    const start_helpers = try holdsMoreSessionsThan(store, worker_alloc, sessions_before_helper_threads);
     var workers: [4]CatalogWorker = undefined;
     for (&workers) |*worker| worker.* = .{ .read = &read, .alloc = worker_alloc };
     defer for (&workers) |*worker| {
@@ -455,12 +478,14 @@ pub fn listActionableCatalog(
             handle.* = null;
         }
     }
-    for (&threads, workers[1..]) |*handle, *worker| {
-        handle.* = try std.Thread.spawn(.{}, CatalogWorker.run, .{worker});
+    if (start_helpers) {
+        for (&threads, workers[1..]) |*handle, *worker| {
+            handle.* = try std.Thread.spawn(.{}, CatalogWorker.run, .{worker});
+        }
     }
     workers[0].run();
     for (&threads) |*handle| {
-        handle.*.?.join();
+        if (handle.*) |thread| thread.join();
         handle.* = null;
     }
     for (workers) |worker| {
@@ -599,4 +624,24 @@ test "catalog fingerprint detects event appends and child directory permissions"
     try child.setPermissions(std.testing.io, .fromMode(0o755));
     const changed = (try fingerprint(tmp.dir, "session")).?;
     try std.testing.expect(!std.mem.eql(u8, &private, &changed));
+}
+
+test "a store holds more sessions than the limit only past it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx/sessions/session-0");
+    try tmp.dir.createDirPath(std.testing.io, ".fx/sessions/session-1");
+    try tmp.dir.createDirPath(std.testing.io, ".fx/sessions/session-2");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, ".fx/sessions/session-3", .{});
+        file.close(std.testing.io);
+    }
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
+    defer store.deinit(alloc);
+    try std.testing.expect(!try holdsMoreSessionsThan(store, alloc, 3));
+    try std.testing.expect(try holdsMoreSessionsThan(store, alloc, 2));
+    try std.testing.expect(!try holdsMoreSessionsThan(store, alloc, 4));
 }

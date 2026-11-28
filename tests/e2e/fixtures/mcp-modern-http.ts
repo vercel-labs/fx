@@ -38,7 +38,9 @@ export type ModernHttpMode =
   | "features_ttl_expiry"
   | "list_refused"
   | "list_http_500"
+  | "list_http_403"
   | "list_http_429"
+  | "list_http_503"
   | "list_html_200"
   | "mrtr_form"
   | "legacy_session_required"
@@ -421,8 +423,14 @@ export function startModernMcpHttpFixture(
       if (mode === "list_http_500" && message.method === "tools/list") {
         return new Response("upstream failure", { status: 500, headers: { "content-type": "text/plain" } });
       }
+      if (mode === "list_http_403" && message.method === "tools/list") {
+        return new Response("forbidden", { status: 403, headers: { "content-type": "text/plain" } });
+      }
       if (mode === "list_http_429" && message.method === "tools/list") {
         return new Response("slow down", { status: 429, headers: { "content-type": "text/plain", "retry-after": "1" } });
+      }
+      if (mode === "list_http_503" && message.method === "tools/list") {
+        return new Response("try later", { status: 503, headers: { "content-type": "text/plain" } });
       }
       if (mode === "list_html_200" && message.method === "tools/list") {
         return new Response("<html><body>Welcome to the gateway</body></html>", { headers: { "content-type": "text/html" } });

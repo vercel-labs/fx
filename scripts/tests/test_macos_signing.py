@@ -526,21 +526,37 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             "\n  build-linux-aarch64:", 1
         )[0]
         check_script = textwrap.dedent(check_job.split("        run: |\n", 1)[1])
-        for validate, tag_exists, expected_needed, expected_publish in (
-            ("true", True, "true", "false"),
-            ("true", False, "true", "false"),
-            ("false", True, "false", "false"),
-            ("false", False, "true", "true"),
+        # A push starts a release only when it changes the version; a later
+        # push under the same version skips, and a manual run still releases.
+        for event, validate, tag_exists, previous, expected_needed, expected_publish in (
+            ("workflow_dispatch", "true", True, "0.0.8", "true", "false"),
+            ("workflow_dispatch", "true", False, "0.0.8", "true", "false"),
+            ("push", "false", True, "0.0.7", "false", "false"),
+            ("push", "false", False, "0.0.7", "true", "true"),
+            ("push", "false", False, "0.0.8", "false", "false"),
+            ("push", "false", False, None, "true", "true"),
+            ("workflow_dispatch", "false", False, "0.0.8", "true", "true"),
         ):
-            with self.subTest(validate=validate, tag_exists=tag_exists):
+            with self.subTest(event=event, validate=validate, tag_exists=tag_exists, previous=previous):
                 with tempfile.TemporaryDirectory(prefix="fx-release-check-") as tmp:
                     root = pathlib.Path(tmp)
                     (root / "src").mkdir()
                     (root / "src/main.zig").write_text(
                         'pub const version = "0.0.8";\n'
                     )
+                    shown = (
+                        f"printf 'pub const version = \"{previous}\";\\n'"
+                        if previous is not None
+                        else "exit 128"
+                    )
                     git = root / "git"
-                    git.write_text(f"#!/bin/sh\nexit {0 if tag_exists else 1}\n")
+                    git.write_text(
+                        "#!/bin/sh\n"
+                        'case "$1" in\n'
+                        f"  rev-parse) exit {0 if tag_exists else 1} ;;\n"
+                        f"  show) {shown} ;;\n"
+                        "esac\n"
+                    )
                     git.chmod(0o755)
                     output = root / "outputs"
                     env = dict(
@@ -548,6 +564,8 @@ class MacosSigningWorkflowTests(unittest.TestCase):
                         PATH=f"{root}:{os.environ['PATH']}",
                         GITHUB_OUTPUT=str(output),
                         VALIDATE_ONLY=validate,
+                        EVENT_NAME=event,
+                        BEFORE_SHA="before",
                     )
                     result = subprocess.run(
                         ["bash", "-euo", "pipefail", "-c", check_script],

@@ -28,6 +28,9 @@ const { local } = durabilityKind === "memory" ? {} : await import("../durable/lo
 const { vercelStorage } = durabilityKind === "vercel" ? await import("./vercel-storage.mjs") : {};
 // "world": the app's own World through world(); see app-world.mjs.
 const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("./app-world.mjs") : {};
+// "world" also restarts an app whose World recovers its runs at startup; see
+// restarted-world.mjs.
+const { restartedWorldAt } = durabilityKind === "world" ? await import("./restarted-world.mjs") : {};
 // Vercel's World is a round trip away, so its tests wait longer for a
 // stream's next chunk, give a function more time, and run longer.
 const remote = durabilityKind === "vercel";
@@ -1355,6 +1358,41 @@ for (const tool of ["lookup", "send"]) {
   });
 }
 
+for (const tool of ["lookup", "send"]) {
+  test(`a hand-off during a ${tool} call yields the turn after the call, and another agent continues it, each step once`, async () => {
+    const durability = await durabilityFor();
+    const cutoffs = [];
+    const onEvent = (event) => { if (event.type === "session.handoff" || event.type === "session.deadline") cutoffs.push(event.type); };
+    const first = createFxAgent(agentOptions(durability, { onEvent }));
+    const second = createFxAgent(agentOptions(durability, { onEvent }));
+    const held = gate(tool);
+    const before = requests.length;
+    const runsBefore = runs.filter(([name]) => name === tool).length;
+    const session = first.session();
+    const turn = session.prompt(`use ${tool}`);
+    await held.started;
+    const handedOff = first.handOff();
+    gates.delete(tool);
+    held.open();
+    await handedOff;
+    // Another process continues the turn. On local() the queue went with the
+    // first agent's World, so a resume asks for it; elsewhere it finds the
+    // turn already going on, or ended.
+    void second.session(session.id).resume().result.catch(() => {});
+    const { result } = await collect(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(runs.filter(([name]) => name === tool).length - runsBefore, 1, "the call ran once");
+    const sent = requests.slice(before);
+    assert.equal(sent.length, 2, "each model step ran once");
+    assert.ok(sent.every((prompt) => !JSON.stringify(prompt).includes(resumeNotice)), "a yield is not an interruption");
+    const lines = await readLines(first.session(session.id).stream(0), 32);
+    assert.equal(lines.filter((line) => line.type === "turn_yield").length, 1);
+    assert.deepEqual(cutoffs, [], "nothing was cut off");
+    await first.close();
+    await second.close();
+  });
+}
+
 // A call the resume answers as possibly run ends on the session stream, once,
 // with what the model heard, so a viewer never shows it running for good.
 function assertEndedAsPossiblyRun(lines, id) {
@@ -1659,6 +1697,49 @@ if (durabilityKind !== "memory") {
     assert.equal(result.stopReason, "end_turn", "the accepted prompt was in the log");
     assert.equal(text, "echo: hello");
     await agent.close();
+  });
+}
+
+if (durabilityKind === "world") {
+  // The app shares its World with the Workflow SDK, and the World recovers
+  // its runs as the restarted app starts it: the session goes back to
+  // libfx's queue, not to the Workflow SDK's, which would fail it
+  // (`tests/tla/sdk/QueueRecovery.tla` LibfxRunsNotFailed).
+  test("a crash mid-turn, then a World that recovers its runs at startup: the session is not failed, and its turn ends", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-recovery-"));
+    dirs.push(dir);
+    const child = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), durabilityKind, engineBackend, "--child", dir, "lookup"], {
+      stdio: ["ignore", "pipe", "inherit"], env: { ...process.env },
+    });
+    const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    try {
+      await until(() => output.includes("\n"), "the child to start its tool", testTimeoutMs / 2);
+    } finally {
+      child.kill("SIGKILL");
+      await exited;
+    }
+    const { sessionId } = JSON.parse(output.trim().split("\n")[0]);
+    const restarted = await restartedWorldAt(dir);
+    try {
+      const agent = createFxAgent(agentOptions(restarted.durability));
+      // It takes the World's deliveries before the World starts.
+      await agent.newSessionId();
+      await restarted.start();
+      const ofSession = () => restarted.deliveries.filter((delivery) => delivery.runId === sessionId);
+      await until(() => ofSession().length > 0, "recovery to deliver the session's run");
+      assert.deepEqual(await restarted.run(sessionId), { status: "running", namespace: "libfx" }, "the session's run is not failed");
+      assert.deepEqual(ofSession().map(({ consumer, attempt, status }) => ({ consumer, attempt, status })), [{ consumer: "libfx", attempt: 1, status: 200 }], "libfx's route took the session's run and acked it");
+      const requestsBefore = requests.length;
+      const { result } = await collect(agent.session(sessionId).resume());
+      assert.equal(result.stopReason, "end_turn", "the turn the crash left open ends");
+      assert.ok(requests.length > requestsBefore, "the resumed turn's model requests reached the fake gateway");
+      assert.equal((await restarted.run(sessionId)).status, "running");
+      await agent.close();
+    } finally {
+      await restarted.close();
+    }
   });
 }
 

@@ -1,0 +1,27 @@
+%% RestartWait.tla as the person sees it (restart-wait.cfg, 38 states).
+%% Left out: subagents, typed text that holds the exit, /quit and signals
+%% (Resume.tla), and a turn that starts while no restart waits.
+stateDiagram-v2
+    [*] --> Working
+    Working: Turns run, no restart waits
+    Waiting: Restart waits, a turn still runs to its next step
+    AllHeld: Restart waits, every turn holds or has ended
+    Restarting: Held turns return for the restart
+    Exited: fx exits and starts the new version
+
+    Working --> Waiting: you press Ctrl+G
+    Waiting --> Waiting: a turn reaches its step and holds, or its save fails and it goes on
+    Waiting --> AllHeld: the last running turn holds or ends
+    Waiting --> Working: you press Ctrl+G again, and held turns go on
+    AllHeld --> Working: you press Ctrl+G again, and held turns go on
+    Waiting --> Waiting: you press Esc twice, and that turn ends cancelled
+    AllHeld --> Restarting: the next tick lets the held turns go
+    Restarting --> Restarting: you press Ctrl+G, and fx says it is restarting now
+    Restarting --> Exited: the held turns return
+    Exited --> [*]
+
+    %% Rule broken by fx before the cancel (restart-wait-current.cfg,
+    %% NoStopWhileCancellable): Working -> Ctrl+G -> Waiting -> a turn
+    %% reaches its step and stops for good, while Ctrl+G could still cancel.
+    StoppedForGood: A turn stopped for good while you can still cancel (fx before the cancel)
+    Waiting --> StoppedForGood: a turn reaches its step (planted stop_at_boundary)

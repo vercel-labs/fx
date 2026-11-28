@@ -3,7 +3,6 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_data = @import("../images/image_data.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const tool_result_cut_marker = @import("../shared/tool_result_cut_marker.zig");
 const types = @import("../shared/types.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_child_store = @import("session_child_store.zig");
@@ -67,86 +66,43 @@ pub const ResultReader = struct {
 
 pub fn prepare(
     alloc: Allocator,
-    result_dir: ?[]const u8,
+    result_dir: []const u8,
     tool_call_id: []const u8,
     tool_name: []const u8,
     output_bytes: usize,
     durable_output: []const u8,
     inline_cap: usize,
 ) !PreparedResult {
-    if (result_dir) |dir| {
-        if (output_bytes > large_result_threshold_bytes or
-            durable_output.len > inline_cap)
-        {
-            return prepareStoredResult(
-                alloc,
-                .{ .legacy_dir = dir },
-                tool_call_id,
-                tool_name,
-                output_bytes,
-                durable_output,
-            );
-        }
-        return prepareExternallyBackedInlineResult(
-            alloc,
-            .{ .legacy_dir = dir },
-            tool_call_id,
-            tool_name,
-            output_bytes,
-            durable_output,
-        );
-    }
-    const capped = try cappedInlineOutput(alloc, tool_name, durable_output, inline_cap);
-    return .{
-        .model_output = capped,
-        .memory = .{
-            .output_bytes = output_bytes,
-            .stored_output_bytes = durable_output.len,
-            .truncated = capped.len < durable_output.len,
-        },
-    };
+    return prepareAt(alloc, .{ .legacy_dir = result_dir }, tool_call_id, tool_name, output_bytes, durable_output, inline_cap);
 }
 
 pub fn prepareManaged(
     alloc: Allocator,
-    capability: ?*session_child_store.SessionChildCapability,
+    capability: *session_child_store.SessionChildCapability,
     tool_call_id: []const u8,
     tool_name: []const u8,
     output_bytes: usize,
     durable_output: []const u8,
     inline_cap: usize,
 ) !PreparedResult {
-    if (capability) |managed| {
-        if (output_bytes > large_result_threshold_bytes or
-            durable_output.len > inline_cap)
-        {
-            return prepareStoredResult(
-                alloc,
-                .{ .managed = managed },
-                tool_call_id,
-                tool_name,
-                output_bytes,
-                durable_output,
-            );
-        }
-        return prepareExternallyBackedInlineResult(
-            alloc,
-            .{ .managed = managed },
-            tool_call_id,
-            tool_name,
-            output_bytes,
-            durable_output,
-        );
+    return prepareAt(alloc, .{ .managed = capability }, tool_call_id, tool_name, output_bytes, durable_output, inline_cap);
+}
+
+/// A large result is stored and the model gets its preview and handle; a small one is kept inline, with the same
+/// handle beside it.
+fn prepareAt(
+    alloc: Allocator,
+    target: StorageTarget,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    output_bytes: usize,
+    durable_output: []const u8,
+    inline_cap: usize,
+) !PreparedResult {
+    if (output_bytes > large_result_threshold_bytes or durable_output.len > inline_cap) {
+        return prepareStoredResult(alloc, target, tool_call_id, tool_name, output_bytes, durable_output);
     }
-    const capped = try cappedInlineOutput(alloc, tool_name, durable_output, inline_cap);
-    return .{
-        .model_output = capped,
-        .memory = .{
-            .output_bytes = output_bytes,
-            .stored_output_bytes = durable_output.len,
-            .truncated = capped.len < durable_output.len,
-        },
-    };
+    return prepareExternallyBackedInlineResult(alloc, target, tool_call_id, tool_name, output_bytes, durable_output);
 }
 
 fn prepareExternallyBackedInlineResult(
@@ -521,6 +477,39 @@ pub fn readByRangeManaged(
     );
 }
 
+/// The whole stored text of one handle, for a review that reads it by handle.
+/// Fails with `ResultTooLarge` above `read_max_bytes`. The caller owns the text.
+pub fn readWholeManaged(
+    alloc: Allocator,
+    capability: *session_child_store.SessionChildCapability,
+    handle: []const u8,
+) ![]u8 {
+    try validateHandle(handle);
+    if (!capability.holdsBlobs()) {
+        // A file's size is checked before it is read.
+        const stat = try statManaged(capability, handle);
+        if (stat.size > read_max_bytes) return error.ResultTooLarge;
+    }
+    const text = try readStoredTextManaged(alloc, capability, handle);
+    if (text.len > read_max_bytes) {
+        alloc.free(text);
+        return error.ResultTooLarge;
+    }
+    return text;
+}
+
+/// `readWholeManaged` for a legacy tool-result folder, as `readByRange` opens one.
+pub fn readWhole(alloc: Allocator, result_dir: []const u8, handle: []const u8) ![]u8 {
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+        alloc,
+        result_dir,
+        .tool_results,
+        .read_only,
+    );
+    defer capability.deinit();
+    return readWholeManaged(alloc, &capability, handle);
+}
+
 pub fn readForReplayManaged(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
@@ -637,19 +626,6 @@ pub fn deleteManaged(
         error.FileNotFound => return error.ResultHandleNotFound,
         else => return err,
     };
-}
-
-fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8, max_bytes: usize) ![]u8 {
-    const marker = try alloc.print(
-        tool_result_cut_marker.cut_marker_format,
-        .{ tool_name, text.len, max_bytes },
-    );
-    defer alloc.free(marker);
-    if (text.len <= max_bytes) return try alloc.dupe(u8, text);
-    const prefix_cap = if (max_bytes > marker.len) max_bytes - marker.len else 0;
-    const prefix_len = text_utils.utf8BackwardBoundary(text, prefix_cap);
-    if (prefix_len == 0) return try alloc.dupe(u8, marker);
-    return try std.mem.concat(alloc, u8, &.{ text[0..prefix_len], marker });
 }
 
 pub fn previewText(alloc: Allocator, text: []const u8, max_bytes: usize) ![]u8 {
@@ -1064,29 +1040,8 @@ test "saved preparation externalizes small results" {
     try std.testing.expect(std.mem.find(u8, stored, "\ndone\n") != null);
 }
 
-test "a capped inline result ends with the cut marker written from its shared words" {
+test "a stored preview keeps complete codepoints" {
     const alloc = std.testing.allocator;
-    const text = text_utils.repeat("x", 300);
-    const capped = try cappedInlineOutput(alloc, "grep_files", text, 128);
-    defer alloc.free(capped);
-    const marker = tool_result_cut_marker.cut_marker_start ++ "grep_files: original 300 bytes; cap is 128" ++ tool_result_cut_marker.cut_marker_end;
-    try std.testing.expect(std.mem.endsWith(u8, capped, marker));
-    try std.testing.expect(capped.len <= 128);
-}
-
-test "inline cap and stored preview keep complete codepoints" {
-    const alloc = std.testing.allocator;
-
-    const inline_text = "x" ++ text_utils.repeat("\xc3\xa9", 300);
-    for ([_]usize{ 128, 129 }) |cap| {
-        const prepared = try prepare(alloc, null, "call/2", "grep_files", inline_text.len, inline_text, cap);
-        defer alloc.free(prepared.model_output);
-        const marker_start = std.mem.find(u8, prepared.model_output, "\n... [tool result truncated").?;
-        const prefix = prepared.model_output[0..marker_start];
-        try std.testing.expect(std.unicode.utf8ValidateSlice(prefix));
-        try std.testing.expect(std.mem.endsWith(u8, prefix, "\xc3\xa9"));
-    }
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -1316,6 +1271,83 @@ test "stored result reads support ranges and literal queries" {
     defer alloc.free(queried);
     try std.testing.expect(std.mem.find(u8, queried, "needle one") != null);
     try std.testing.expect(std.mem.find(u8, queried, "needle two") != null);
+}
+
+test "whole stored result reads return the stored bytes exactly, legacy and managed" {
+    const alloc = std.testing.allocator;
+    const text = "alpha\nneedle one\n\xc3\xa9 beta\x00\n";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const legacy_handle = try storeLargeResult(alloc, dir, "call", "grep_files", text);
+    defer alloc.free(legacy_handle);
+    const legacy = try readWhole(alloc, dir, legacy_handle);
+    defer alloc.free(legacy);
+    try std.testing.expectEqualSlices(u8, text, legacy);
+
+    var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    const managed_handle = try storeLargeResultManaged(alloc, &capability, "call", "grep_files", text);
+    defer alloc.free(managed_handle);
+    const managed = try readWholeManaged(alloc, &capability, managed_handle);
+    defer alloc.free(managed);
+    try std.testing.expectEqualSlices(u8, text, managed);
+}
+
+test "whole stored result over the read cap is refused, legacy and managed" {
+    const alloc = std.testing.allocator;
+    const over = try alloc.alloc(u8, read_max_bytes + 1);
+    defer alloc.free(over);
+    @memset(over, 'x');
+    const at_cap = over[0..read_max_bytes];
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const over_handle = try storeLargeResult(alloc, dir, "over", "grep_files", over);
+    defer alloc.free(over_handle);
+    try std.testing.expectError(error.ResultTooLarge, readWhole(alloc, dir, over_handle));
+    const cap_handle = try storeLargeResult(alloc, dir, "cap", "grep_files", at_cap);
+    defer alloc.free(cap_handle);
+    const whole = try readWhole(alloc, dir, cap_handle);
+    defer alloc.free(whole);
+    try std.testing.expectEqual(read_max_bytes, whole.len);
+
+    var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    const managed_handle = try storeLargeResultManaged(alloc, &capability, "over", "grep_files", over);
+    defer alloc.free(managed_handle);
+    try std.testing.expectError(error.ResultTooLarge, readWholeManaged(alloc, &capability, managed_handle));
+}
+
+test "whole stored result of an unknown handle returns ResultHandleNotFound" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    // A stored result makes the folder private, which a read requires.
+    const known = try storeLargeResult(alloc, dir, "call", "grep_files", "known");
+    defer alloc.free(known);
+    const found = try readWhole(alloc, dir, known);
+    defer alloc.free(found);
+    try std.testing.expectEqualStrings("known", found);
+    try std.testing.expectError(error.ResultHandleNotFound, readWhole(alloc, dir, "result-missing.txt"));
+
+    var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    const missing = try blobHandle(alloc, "never stored");
+    defer alloc.free(missing);
+    try std.testing.expectError(error.ResultHandleNotFound, readWholeManaged(alloc, &capability, missing));
 }
 
 test "range reads snap to utf8 rune boundaries" {

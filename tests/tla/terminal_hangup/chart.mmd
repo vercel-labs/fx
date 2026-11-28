@@ -1,0 +1,40 @@
+stateDiagram-v2
+    [*] --> StartingUp
+    StartingUp --> Idle : startup modes written
+    StartingUp --> ExitingOnError : startup write fails or terminal closes
+    Idle --> TurnRunning : user sends prompt
+    TurnRunning --> Idle : turn finishes
+    Idle --> WritingFrame : frame flush starts
+    TurnRunning --> WritingFrame : frame flush starts
+    WritingFrame --> Idle : frame written (no turn)
+    WritingFrame --> TurnRunning : frame written (turn active)
+    WritingFrame --> ExitingOnError : frame write fails
+    Idle --> ExitingOnError : input closes, EIO, or alt-screen write fails
+    TurnRunning --> ExitingOnError : input closes, EIO, or alt-screen write fails
+    Idle --> SpinningRevoked : macOS tty revoked (current / no_pollnval)
+    SpinningRevoked --> SpinningRevoked : poll ignores POLLNVAL [breaks NoSpin]
+    StartingUp --> ClosedQuietly : SIGHUP arrives
+    Idle --> ClosedQuietly : SIGHUP arrives or user quits
+    TurnRunning --> ClosedSavingTurn : SIGHUP arrives
+    ExitingOnError --> ClosedQuietly : classified as hang-up (no turn)
+    ExitingOnError --> ClosedSavingTurn : classified as hang-up (turn active)
+    ExitingOnError --> ErrorShownWrongly : terminal gone missed [breaks GoneIsQuiet]
+    ExitingOnError --> ErrorShownRightly : terminal still open and owned
+    ClosedQuietly --> [*]
+    ClosedSavingTurn --> [*]
+    ErrorShownWrongly --> [*]
+    ErrorShownRightly --> [*]
+    note right of ErrorShownWrongly
+        Shortest path (current):
+        StartingUp -> ExitingOnError (terminal closed) -> ErrorShownWrongly
+    end note
+    note right of SpinningRevoked
+        Shortest path (current):
+        StartingUp -> Idle (tty revoked) -> SpinningRevoked -> SpinningRevoked
+    end note
+    %% Omitted model-internal events:
+    %%   - TerminalCloseLateSigns / TerminalSignsArrive (merged into closing/hang-up transitions)
+    %%   - TerminalOrphanGroup (folded into input/write failure paths)
+    %%   - EnterOrLeaveAltScreen (grouped with idle/turn write failures)
+    %%   - FinishFrameWrite recovery retry details (grouped into WritingFrame -> ExitingOnError)
+    %%   - Stuttering steps (Finished /\ UNCHANGED vars)

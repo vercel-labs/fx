@@ -129,6 +129,7 @@ pub fn appendToolResultContent(
         .tool_result_created_at_ms = io_mod.milliTimestamp(),
         // `tool_call` is the call that ran, which a toolbox run carries.
         .user_answer = try types.isUserAnswer(arena, tool_call.name, result_status, content),
+        .stored_user_answer = types.isStoredUserAnswer(tool_call.name, result_status, result_memory),
     });
     if (accounting.record_completion) {
         try runtime_interruption.recordCompletedToolName(arena, completed_tool_names, tool_call.name);
@@ -536,10 +537,7 @@ pub fn processCommittedFileResult(
         }
     }
     if (reporting_degraded) {
-        hooks.push_system_notice(
-            hooks.ctx,
-            "File change committed, but some secondary reporting failed.",
-        ) catch |err| {
+        hooks.pushWarningNotice("fx saved the file change, but could not report all of it.") catch |err| {
             debug_trace.eventf(
                 "tool",
                 "committed_reporting_warning_failed",

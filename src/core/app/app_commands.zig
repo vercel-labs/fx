@@ -6,6 +6,7 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agent_runtime = @import("app_agent_runtime.zig");
 const app_hook_gate_runtime = @import("app_hook_gate_runtime.zig");
+const app_trust_runtime = @import("app_trust_runtime.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -1139,6 +1140,9 @@ pub fn Handlers(comptime App: type) type {
                         "Skills could not be refreshed. The previous catalog was not shown as current.",
                 }, true);
                 return;
+            }
+            if (comptime @hasField(App, "trust")) {
+                try app_trust_runtime.Runtime(App).refreshFacts(app);
             }
             switch (ready.action) {
                 .startup_notice => try app_bootstrap_runtime.Runtime(App).writeSkillDiagnosticsNotice(app, agent),
@@ -2277,6 +2281,7 @@ pub fn finishGatedSetting(app: anytype, taken: *app_hook_gate_runtime.Taken) !vo
     if (!app_agent_runtime.gatedTargetIsCurrent(app, taken)) {
         debug_trace.logf("hooks", "dropped the setting change: the screen or the session changed while its hook check ran", .{});
         Notices.writeChangeNotice(app, "The setting change was dropped: the session changed while its hooks ran.");
+        if (taken.change.setting.picked != null) session_commands.Commands(@TypeOf(app.*)).finishAbortedModelPick(app);
         return;
     }
     switch (taken.result.outcome) {
@@ -2285,15 +2290,19 @@ pub fn finishGatedSetting(app: anytype, taken: *app_hook_gate_runtime.Taken) !vo
         .cancelled => Notices.writeChangeNotice(app, "The setting change was cancelled. Its hooks were stopped."),
     }
     app_agent_runtime.showHookNotices(app, taken.result.notices, "ConfigChange");
-    if (taken.result.outcome != .allowed) return;
+    if (taken.result.outcome != .allowed) {
+        if (taken.change.setting.picked != null) session_commands.Commands(@TypeOf(app.*)).finishAbortedModelPick(app);
+        return;
+    }
     const change = taken.change.setting;
     if (change.picked) |pick| {
         // An effort check continues the pick to its speed check and then the model. A speed check goes straight to the model.
         const effort = change.effort orelse return error.MissingPickedEffort;
+        const target = session_commands.Commands(@TypeOf(app.*)).modelChoiceTarget(app) orelse agents.screenAgentOf(app);
         if (change.setting == .effort) {
-            return session_commands.Commands(@TypeOf(app.*)).continuePickedModel(app, agents.screenAgentOf(app), pick, effort);
+            return session_commands.Commands(@TypeOf(app.*)).continuePickedModel(app, target, pick, effort);
         }
-        return session_commands.Commands(@TypeOf(app.*)).startPickedModel(app, agents.screenAgentOf(app), pick, effort);
+        return session_commands.Commands(@TypeOf(app.*)).startPickedModel(app, target, pick, effort);
     }
     try applySettingFromGate(app, change);
 }
