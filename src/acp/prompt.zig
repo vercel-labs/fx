@@ -91,6 +91,7 @@ const tool_runtime = @import("../core/tooling/tool_runtime.zig");
 const command_output_content = @import("../core/tooling/command_output_content.zig");
 const bash_tools = @import("../builtins/bash_tools.zig");
 const builtin_tools = @import("../builtins/tools.zig");
+const tool_bridge = @import("../core/tool_bridge/tool_bridge.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
     @import("../builtins/gateway.zig")
 else
@@ -665,7 +666,7 @@ const AcpContext = struct {
             });
         }
         var tc: tool_runtime.Context = .{
-            .nested_tool_registry = builtin_tools.registry,
+            .nested_tool_registry = if (comptime tool_bridge.supported) builtin_tools.registry else null,
             .observer = self.observer,
             .workspace_root = self.state.workspace_root,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),

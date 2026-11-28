@@ -3379,6 +3379,7 @@ describe("slice 7: fx tool web and search", () => {
         command: `timeout 1 ${JSON.stringify(FX_BIN)} tool search "zig release notes"; echo "exit=$?"`,
       }),
       async () => {
+        // Pacing only: the reply comes after `timeout 1` has killed the program, so the search is still in flight.
         await Bun.sleep(3000);
         return searchWorkerReply();
       },

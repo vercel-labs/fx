@@ -175,7 +175,7 @@ fn toolSummary(comptime bridge_supported: bool) []const u8 {
 
 /// The `tool` command's usage, shared by its help entry and the top-level list.
 fn toolUsage(comptime bridge_supported: bool) []const u8 {
-    return if (bridge_supported) "tool <edit|write|skill|agent|web|search> ..." else "tool";
+    return if (bridge_supported) "tool <command> ..." else "tool";
 }
 
 const tool_subcommands: []const command_specs.SubcommandDoc = if (tool_bridge.supported) &.{

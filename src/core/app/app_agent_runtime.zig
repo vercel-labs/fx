@@ -402,7 +402,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
-                .nested_tool_registry = builtin_tools.registry,
+                .nested_tool_registry = if (comptime tool_bridge.supported) builtin_tools.registry else null,
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
                 .ignored_list_entries = ignored_list_entries,
