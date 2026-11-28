@@ -340,7 +340,7 @@ gh workflow run release.yml --ref main -f validate_only=true
 
 It takes about as long as a release build. A failure means a PGSO training, behavior, size, or performance gate failed on code that would ship. Fix what failed, run it again, and open the release pull request only after it passes.
 
-After CI passes on `main`, the dev release workflow publishes binaries for that commit. Run `fx upgrade --channel dev` to follow those builds, and `fx upgrade --channel stable` to go back to tagged releases.
+Every 30 minutes, the dev release workflow takes the newest commit on `main`, runs the build, the unit tests, the deterministic E2E shards, the MCP conformance baseline, and the SDK WASM, N-API, Node, and Browser jobs on it, and publishes binaries for that commit when they pass. It does not wait for the rest of CI, such as the durable-session model check and the TLA+ models. Run `fx upgrade --channel dev` to follow those builds, and `fx upgrade --channel stable` to go back to tagged releases.
 
 ## License
 
