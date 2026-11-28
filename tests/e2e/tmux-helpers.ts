@@ -752,6 +752,10 @@ ${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
   };
 }
 
+// Sessions that have not been killed. killLiveTmuxSessions ends them when the
+// test run ends, even when a timed-out test's body is still waiting.
+const liveSessions = new Set<TmuxSession>();
+
 export class TmuxSession {
   readonly name: string;
   private readonly socketName?: string;
@@ -999,6 +1003,7 @@ export class TmuxSession {
       throw err;
     }
     const session = new TmuxSession(name, exitStatusPath, resolvedSocketName);
+    liveSessions.add(session);
     try {
       for (const key of CREDENTIAL_ENV_KEYS) {
         try {
@@ -1614,6 +1619,7 @@ export class TmuxSession {
   }
 
   async kill(): Promise<void> {
+    liveSessions.delete(this);
     if (this.killed) return;
     this.killed = true;
     try {
@@ -1658,6 +1664,12 @@ export class TmuxSession {
       ? `tmux -L ${shellQuote(this.socketName)}`
       : "tmux";
   }
+}
+
+/// Ends every session that is still running. The test preload calls this once
+/// per run, so a test whose body outlives its timeout cannot leave fx behind.
+export async function killLiveTmuxSessions(): Promise<void> {
+  for (const session of [...liveSessions]) await session.kill();
 }
 
 function shellQuote(value: string): string {

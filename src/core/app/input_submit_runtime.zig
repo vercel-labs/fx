@@ -8,6 +8,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const sign_in_trace = @import("../auth/sign_in_trace.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -185,7 +186,21 @@ pub fn SubmitRuntime(comptime App: type) type {
                 "trigger={s}",
                 .{trigger},
             );
+            sign_in_trace.record(.prompt, false, "outcome=resumed screen={s} turn_id={d} trigger={s}", .{
+                sign_in_trace.screenName(agent),
+                pending.draft.turn_id,
+                trigger,
+            });
             return true;
+        }
+
+        /// A held prompt now waits for a sign-in: only Enter, a sign-in, or a
+        /// change of source or team sends it on.
+        fn recordPromptWaitsForSignIn(agent: *const AppAgent, turn_id: anytype) void {
+            sign_in_trace.record(.prompt, true, "outcome=waits_for_sign_in screen={s} turn_id={d}", .{
+                sign_in_trace.screenName(agent),
+                turn_id,
+            });
         }
 
         pub fn resumePromptAfterAuth(app: *App, agent: *AppAgent, max_prompt_history: usize) !void {
@@ -335,6 +350,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                                 "",
                                 .{},
                             );
+                            recordPromptWaitsForSignIn(agent, pending.draft.turn_id);
                             return;
                         },
                     }
@@ -354,6 +370,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                             "",
                             .{},
                         );
+                        recordPromptWaitsForSignIn(agent, pending.draft.turn_id);
                         return;
                     }
                 }
@@ -2610,6 +2627,25 @@ test "Ctrl+C cancels pending ownership from every pre-worker phase" {
     try std.testing.expectEqual(@as(?u64, null), queued.agent().worker.queued_turn_id);
     try std.testing.expectEqual(@as(usize, 1), queued.agent().worker.delete_count);
     try std.testing.expectEqual(@as(usize, 1), queued.agent().worker.release_count);
+}
+
+test "a prompt that waited for a sign-in records that it went on" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    sign_in_trace.reset();
+    defer sign_in_trace.reset();
+    var app = try pendingLifecycleFake(std.testing.allocator, 807);
+    defer app.deinit();
+    Runtime.noteCommittedFrame(&app, (&app).agent());
+    app.agent().submission.pending.?.phase = .awaiting_auth;
+
+    try std.testing.expect(Runtime.resumePendingPromptAfterAuth(&app, (&app).agent(), "auth_completion"));
+    try std.testing.expectEqual(PendingPhase.adopted, app.agent().submission.pending.?.phase);
+    var events: [1]sign_in_trace.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), sign_in_trace.snapshot(&events));
+    try std.testing.expectEqualStrings("prompt", events[0].name());
+    try std.testing.expect(!events[0].failed);
+    try std.testing.expectEqualStrings("outcome=resumed screen=main turn_id=807 trigger=auth_completion", events[0].detail());
+    try std.testing.expect(Runtime.cancelPendingSubmission(&app, (&app).agent()));
 }
 
 test "Ctrl+C on a queued prompt gives back the stale shell handles note it carried (D93)" {
