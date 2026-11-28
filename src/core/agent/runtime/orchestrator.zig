@@ -76,6 +76,7 @@ const execution_memory_helpers = @import("../execution_memory.zig");
 const runtime_agent = @import("agent.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
+const recovery_rules = @import("../../recovery/recovery.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
 const observation = @import("observation.zig");
@@ -4918,7 +4919,7 @@ fn canStopForRestart(
 /// record is saved: marked clean, as a closing fx saves it, so the next
 /// launch resumes it without counting a death, and the session marks the turn
 /// as yielded, so the launch continues it as the same turn
-/// (`tests/tla/recovery/Resume.tla` Hold, NoFalseCrashQuestion).
+/// (`tests/tla/recovery/Resume.tla` Hold, NoFalseCrash).
 /// Its start capture is settled first, so it never lands after the marker.
 /// Only a turn `canStopForRestart` allows gets here. When the clean record does
 /// not land, nothing is marked and it returns false: the request is still
@@ -8612,7 +8613,7 @@ fn processQueuedPromptLoop(
     // A turn that continues a yielded one sends the request the yield
     // stopped, so the recovery module shows no retry for it.
     var recovery_resume: ?types.RecoveryResume = if (job.recovery_resume) |resumed|
-        .{ .record = resumed.record, .stale = resumed.stale, .continues = job.continuation == .yielded }
+        .{ .record = resumed.record, .crashes = resumed.crashes, .continues = job.continuation == .yielded }
     else
         null;
     // Whether this prompt has sent a request yet, for a host that stops the
@@ -8838,7 +8839,25 @@ fn processQueuedPromptLoop(
         errdefer request_recovery.endWithError();
         const resumed = recovery_resume;
         recovery_resume = null;
-        if (try request_recovery.start(route_fast_mode, resumed) == null) {
+        const first_send = try request_recovery.start(route_fast_mode, resumed);
+        // A turn at the crash-loop guard sends nothing and is saved as failed
+        // before the error returns (`tests/tla/recovery/Resume.tla` CrashLoopStops).
+        if (request_recovery.stoppedByCrashLoop()) {
+            try deps.push_system_notice(deps.ctx, recovery_rules.crash_loop_notice);
+            try runtime_interruption.persistFailedTurnOnce(
+                deps,
+                finalization,
+                job,
+                "",
+                &interrupted_persisted,
+                step_ctx,
+                within_turn_suffix.items,
+                &stop_state.terminal_materializing,
+            );
+            finish_trace.finish("crash_loop");
+            return error.CrashLoop;
+        }
+        if (first_send == null) {
             // The module asks before resending a resumed request. The turn
             // reaches the log now, with the question's record, so Esc ends
             // it and a relaunch asks again

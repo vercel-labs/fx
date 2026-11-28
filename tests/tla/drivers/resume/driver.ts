@@ -9,18 +9,17 @@
 // does: launch fx (`fx`, then `fx -c`), send a message, let the response
 // finish, answer it with a tool call, cut the stream short, close the window
 // (SIGHUP), kill fx (SIGKILL), quit, press Esc or Enter, or send "continue".
-// A day passing is left out: a log line's time is under its checksum, and the
-// recovery module's own tests cover the day-old question.
 //
 // The driver covers every step from every observable class of quiet state
 // along a shortest path. It runs each walk against the built binary in tmux,
 // with a fake gateway that holds every response until the walk releases it.
 // After every step, what fx keeps in the session log, whether a request is on
-// the wire, and the question fx shows must match one of the model states that
-// step can reach. The driver then follows only those. From the log it reads
-// how the newest turn ended and that turn's newest `recovery` piece, decoded
-// as `src/core/recovery/recovery.zig` encodes it: the phase, the clean flag,
-// the abrupt-death count, and the question a waiting record asks.
+// the wire, and the guard notice when fx stops a turn must match one of the
+// model states that step can reach. The driver then
+// follows only those. From the log it reads how the newest turn ended, the
+// crash count in its `turn_continued` marker, and its newest `recovery` piece,
+// decoded as `src/core/recovery/recovery.zig` encodes it: the phase, the
+// clean flag, and the question a waiting record asks.
 //
 // Runs on request, from the repository root after `zig build`:
 //   bun tests/tla/drivers/resume/driver.ts
@@ -28,8 +27,9 @@
 //   bun tests/tla/drivers/resume/driver.ts --walks 5 --self-check
 //   bun tests/tla/drivers/resume/driver.ts --grep "kill launch kill launch"
 //
-// --self-check also reruns one walk with the expected clean flag inverted for
-// every saved record, which the driver must reject.
+// --self-check also reruns a close walk with the expected clean flag inverted
+// and a three-kill walk with the expected guard end altered, both of which the
+// driver must reject.
 //
 // Exit codes: 0 every walk matched, 1 a mismatch, 2 a toolchain or setup
 // failure.
@@ -53,7 +53,7 @@ type Obs = {
   turn: string;
   ph: string;
   clean: boolean | null;
-  deaths: number | null;
+  crashes: number;
   need: string | null;
 };
 
@@ -74,11 +74,13 @@ const maxWalks = option("--walks", Number.MAX_SAFE_INTEGER);
 const selfCheck = process.argv.includes("--self-check");
 // Only the walks whose steps contain this sequence, such as "kill launch close".
 const grep = process.argv.includes("--grep") ? process.argv[process.argv.indexOf("--grep") + 1] ?? "" : "";
-// --self-check's planted defect in the expectation.
+// --self-check's planted defects in the expectation.
 let tampered = false;
+let tamperGuard = false;
 const timeoutMs = 20_000;
 const out = outDir("resume-driver");
 const resumeNote = "Resuming from unexpected session interruption.";
+const guardNotice = "This turn crashed fx three times, so fx stopped it. Send a message to go on.";
 
 // The model.
 
@@ -125,11 +127,11 @@ function proc(s: Model, p: 1 | 2): Model {
 }
 
 const holds = (s: Model, p: number) => (Array.isArray(s.lock) ? s.lock.includes(p) : false);
-const onlyFirst = (s: Model) => proc(s, 2).pc === "off" && !holds(s, 2) && s.wall === 0;
+const onlyFirst = (s: Model) => proc(s, 2).pc === "off" && !holds(s, 2);
 const quiet = (s: Model) => ["off", "idle", "ask", "flight", "need"].includes(proc(s, 1).pc);
 
 // fx's own steps between two quiet states.
-const internal = new Set(["Save", "Finish", "ToolsDone", "Retry"]);
+const internal = new Set(["Rerun", "RerunDone", "Save", "Finish", "ToolsDone", "Retry"]);
 
 // The model actions each driver step starts with, and which of its first
 // action's targets the step means.
@@ -208,17 +210,18 @@ function stepTargets(graph: Graph, id: string, step: Step): Set<string> {
 // turn that a crash or a close left unended.
 function expected(s: Model): Obs {
   const p = proc(s, 1);
-  const turn = s.turn.req === 0 ? "none" : s.turn.st;
-  const rec = ["open", "crash"].includes(turn) ? s.turn.rec : { ph: "none" };
+  const rawTurn = s.turn.req === 0 ? "none" : s.turn.st;
+  // SIGHUP leaves the turn open in log.jsonl until the next launch repairs it.
+  const turn = tamperGuard && rawTurn === "stopped" ? "crash" : (rawTurn === "closed" ? "open" : rawTurn);
+  const rec = ["open", "crash", "closed"].includes(rawTurn) ? s.turn.rec : { ph: "none" };
   return {
     running: p.pc !== "off",
     flight: p.pc === "flight",
     question: ["ask", "need"].includes(p.pc) ? p.q : "none",
-    // The log has no end for an open turn until a launch ends it.
-    turn: turn === "crash" ? "crash" : turn,
+    turn,
     ph: rec.ph,
     clean: ["sending", "waiting"].includes(rec.ph) ? (rec.clean === true) !== tampered : null,
-    deaths: rec.ph === "none" ? null : rec.deaths,
+    crashes: rawTurn === "none" ? 0 : s.turn.crashes,
     need: rec.ph === "need" ? rec.need : null,
   };
 }
@@ -227,7 +230,7 @@ function expected(s: Model): Obs {
 // they lead: deaths seen, disruptions so far, and the turn's work.
 function stateClass(s: Model): string {
   const p = proc(s, 1);
-  return JSON.stringify([expected(s), p.pc, p.md, s.seen, s.faults, s.turn.work]);
+  return JSON.stringify([expected(s), p.pc, p.md, s.deaths, s.faults, s.turn.work]);
 }
 
 // One walk per (class, step): the shortest step path from the initial state
@@ -281,7 +284,6 @@ type Hold = {
 };
 
 const phases: Record<number, string> = { 1: "sending", 2: "waiting", 3: "need" };
-const needs: Record<number, string> = { 6: "crash", 7: "old" };
 
 class Run {
   root = realpathSync(join(out, "runs"));
@@ -359,26 +361,35 @@ class Run {
     return existsSync(path) ? path : null;
   }
 
-  // The newest turn: how it ended, and its newest `recovery` piece.
-  newestTurn(): { turn: string; record: Uint8Array | null } {
+  // The newest turn: how it ended, its continuation crash count, and its
+  // newest `recovery` piece.
+  newestTurn(): { turn: string; crashes: number; record: Uint8Array | null } {
     const path = this.logPath();
-    if (!path) return { turn: "none", record: null };
+    if (!path) return { turn: "none", crashes: 0, record: null };
     const text = readFileSync(path, "utf8");
     const lines = text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map((line) => JSON.parse(line));
     let start = -1;
     for (const [at, line] of lines.entries()) if (line.kind === "turn_started") start = at;
-    if (start < 0) return { turn: "none", record: null };
+    if (start < 0) return { turn: "none", crashes: 0, record: null };
     let turn = "open";
+    let crashes = 0;
     let record: Uint8Array | null = null;
     for (const line of lines.slice(start + 1)) {
       if (line.kind === "turn_committed") turn = "done";
-      if (line.kind === "turn_interrupted") turn = ["crash", "closed"].includes(line.reason) ? "crash" : "cancel";
+      if (line.kind === "turn_interrupted") {
+        turn = ["crash", "closed"].includes(line.reason) ? "crash"
+          : line.reason === "failed" ? "stopped"
+          : "cancel";
+      }
+      if (line.kind === "item" && line.type === "turn_continued") {
+        crashes = typeof line.data?.crashes === "number" ? line.data.crashes : 0;
+      }
       if (line.kind === "item" && line.type === "recovery") {
         const hex = line.data?.record;
         record = typeof hex === "string" ? Uint8Array.from(Buffer.from(hex, "hex")) : null;
       }
     }
-    return { turn, record };
+    return { turn, crashes, record };
   }
 
   running(): boolean {
@@ -396,6 +407,7 @@ class Run {
   async launch() {
     this.launches += 1;
     const before = this.holdsOpen.length;
+    const wasStopped = this.newestTurn().turn === "stopped";
     this.session = await this.helpers.TmuxSession.create({
       cmd: this.logPath() ? `${binary} -c` : binary,
       cwd: this.workspace,
@@ -418,20 +430,21 @@ class Run {
     });
     await this.session.waitForComposer(timeoutMs);
     // A resumed request goes out at once, so a short wait tells a resend
-    // from a question or from nothing.
+    // from the guard stop or from nothing.
     const deadline = Date.now() + 2_500;
     while (this.holdsOpen.length === before && Date.now() < deadline) {
-      if ((await this.question()) !== "none") break;
+      if (!wasStopped && this.newestTurn().turn === "stopped" && (await this.hasGuardNotice())) break;
       await Bun.sleep(25);
+    }
+    if (!wasStopped && this.newestTurn().turn === "stopped" && !(await this.hasGuardNotice())) {
+      throw new Error("fx stopped at the crash-loop guard without showing the notice");
     }
   }
 
-  async question(): Promise<string> {
-    if (!this.running()) return "none";
+  async hasGuardNotice(): Promise<boolean> {
+    if (!this.running()) return false;
     const screen = (await this.session.capturePane()).replaceAll(/\s+/g, " ");
-    if (screen.includes("crashed fx twice")) return "crash";
-    if (screen.includes("more than a day ago")) return "old";
-    return "none";
+    return screen.includes(guardNotice);
   }
 
   async send(text: string) {
@@ -472,7 +485,7 @@ class Run {
   async end(signal: "HUP" | "KILL" | null) {
     if (signal) {
       Bun.spawnSync(["kill", `-${signal}`, String(this.session.processPid())]);
-    } else if (this.openHold() || (await this.question()) !== "none") {
+    } else if (this.openHold()) {
       this.session.sendKeysImmediate(["C-c", "C-c"]);
     } else {
       await this.session.sendText("/quit");
@@ -502,18 +515,20 @@ class Run {
 
   async observe(): Promise<Obs> {
     const running = this.running();
-    const { turn, record } = this.newestTurn();
+    const { turn, crashes, record } = this.newestTurn();
     const live = record !== null && record.length === 32 && ["open", "crash"].includes(turn);
     const ph = live ? phases[record![1]!] ?? "none" : "none";
     return {
       running,
       flight: running && this.openHold() !== undefined,
-      question: await this.question(),
+      // No step of this driver reaches a question: a request that needs the
+      // user (`NeedFail` in Resume.tla) is not one of its steps.
+      question: "none",
       turn,
       ph,
       clean: ["sending", "waiting"].includes(ph) ? (record![2]! & 1) === 1 : null,
-      deaths: ph === "none" ? null : record![7]!,
-      need: ph === "need" ? needs[record![3]!] ?? "other" : null,
+      crashes,
+      need: ph === "need" ? "other" : null,
     };
   }
 
@@ -599,6 +614,19 @@ if (selfCheck) {
     console.log("  self-check: a tampered expectation was not rejected");
   } else {
     console.log(`self-check: tampered expectation rejected (${result.split(":")[0]})`);
+  }
+  const guardProbe = planned
+    .filter((steps) => steps.filter((s) => s === "kill").length >= 3 && steps.at(-1) === "launch")
+    .sort((a, b) => a.length - b.length)[0];
+  if (!guardProbe) fail(2, "self-check: no planned walk reaches the crash-loop guard");
+  tamperGuard = true;
+  const guardResult = await walk(graph, helpers, walks.length + 1, guardProbe).catch((err) => `${err}`);
+  tamperGuard = false;
+  if (!guardResult) {
+    mismatches.push("self-check: a tampered guard expectation was not rejected");
+    console.log("  self-check: a tampered guard expectation was not rejected");
+  } else {
+    console.log(`self-check: tampered guard expectation rejected (${guardResult.split(":")[0]})`);
   }
 }
 writeFileSync(join(out, "walks.json"), JSON.stringify({ walks, mismatches }, null, 2));

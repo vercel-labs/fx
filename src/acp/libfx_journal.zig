@@ -97,6 +97,12 @@ pub const Journal = struct {
     /// The pending resume is a turn that yielded: it continues without being
     /// told it was interrupted.
     pending_resume_yielded: bool = false,
+    /// The abrupt deaths the journal's events count for the pending resume's
+    /// turn (`journal.Folded.open_crashes`). Zero without a pending resume.
+    pending_resume_crashes: u8 = 0,
+    /// The abrupt deaths the open turn's events count, as the fold reads them,
+    /// so a snapshot of the turn keeps them. Zero without an open turn.
+    open_crashes: u8 = 0,
     /// The host keeps an image store: events and snapshots name the images
     /// in `stored_images` instead of holding their bytes.
     image_store: bool = false,
@@ -152,6 +158,7 @@ pub const Journal = struct {
         self.pending_resume = null;
         self.pending_resume_answered = null;
         self.pending_resume_yielded = false;
+        self.pending_resume_crashes = 0;
         types.freeToolCallSlice(alloc, self.pending_resume_ambiguous);
         self.pending_resume_ambiguous = &.{};
         if (self.pending_inputs.len > 0) {
@@ -333,6 +340,7 @@ pub const Journal = struct {
             .turn_progress => self.progress_open = true,
             .turn_committed, .turn_progress_cleared => {
                 self.progress_open = false;
+                self.open_crashes = 0;
                 self.last_turn_id = self.open_turn_id;
                 self.open_turn_id = .{};
                 // A turn's steers end with it.
@@ -344,7 +352,7 @@ pub const Journal = struct {
                 .follow_up => self.follow_ups_waiting += 1,
                 .steer => self.steers_waiting += 1,
             },
-            .tool_intent, .history_replaced, .input_withdrawn, .turn_yielded, .tool_result => {},
+            .tool_intent, .history_replaced, .input_withdrawn, .turn_yielded, .tool_result, .turn_resumed => {},
         }
     }
 
@@ -469,6 +477,13 @@ pub const Journal = struct {
     pub fn clearProgress(self: *Journal, alloc: Allocator, session_id: []const u8) !void {
         if (!self.progress_open) return;
         try self.append(alloc, session_id, .turn_progress_cleared);
+    }
+
+    /// Records that the open turn resumed after `crashes` abrupt deaths. It is
+    /// a barrier: the host stores it before fx reruns or sends anything.
+    pub fn noteResumed(self: *Journal, alloc: Allocator, session_id: []const u8, crashes: u8) !void {
+        try self.appendMarked(alloc, session_id, .{ .turn_resumed = crashes }, true);
+        self.open_crashes = crashes;
     }
 };
 
@@ -738,6 +753,7 @@ pub fn open(
         .writer = writer,
         .cursor = folded.cursor,
         .progress_open = folded.open_turn != null,
+        .open_crashes = folded.open_crashes,
         .pending_follow_ups = try dupePendingInputs(session_alloc, folded.pending_follow_ups),
         .follow_ups_waiting = folded.pending_follow_ups.len,
         .open_turn_id = TurnId.of(folded.open_turn_id),
@@ -766,6 +782,7 @@ pub fn open(
     if (folded.running_calls.len > 0) state.pending_resume_answered = answered_step;
     state.pending_resume_ambiguous = try unfinishedCalls(session_alloc, folded.running_calls, folded.finished);
     state.pending_resume_yielded = folded.yielded;
+    state.pending_resume_crashes = folded.open_crashes;
     state.pending_inputs = try dupePendingInputs(session_alloc, folded.pending_inputs);
     return .{ state, .{
         .turns = folded.history.len,
@@ -1200,6 +1217,52 @@ test "a turn resumed again keeps its one resume notice where it was" {
     try std.testing.expectEqual(@as(usize, 2), yielded.execution.steering.len);
     try std.testing.expectEqualStrings(continuation.resume_notice, yielded.execution.steering[0].text);
     try std.testing.expectEqual(@as(usize, 0), yielded.execution.steering[0].after_tool_step_count);
+}
+
+test "a journal open gives the pending resume the crash count its events fold to" {
+    const alloc = std.testing.allocator;
+    var capture: TestCapture = .{};
+    defer capture.frames.deinit(alloc);
+    var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
+    var progress = try testProgress(alloc);
+    defer progress.deinit(alloc);
+
+    var events: std.Io.Writer.Allocating = .init(alloc);
+    defer events.deinit();
+    try events.writer.writeByte('[');
+    var cursor: journal.Cursor = .{};
+    cursor = try cursor.write(&events.writer, .{ .turn_progress = .{ .checkpoint = progress } });
+    try events.writer.writeByte(',');
+    _ = try cursor.write(&events.writer, .{ .turn_resumed = 2 });
+    try events.writer.writeByte(']');
+
+    var runtime = session_runtime.SessionRuntime.init(10);
+    defer runtime.deinit(alloc);
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    var images: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer images.deinit();
+    var state, const opened = try open(alloc, alloc, &writer, &runtime, events.written(), null, false, &images, false, .{});
+    defer state.deinit(alloc);
+    try std.testing.expect(opened.resumable);
+    try std.testing.expectEqual(@as(u8, 2), state.pending_resume_crashes);
+
+    state.dropPendingResume(alloc);
+    try std.testing.expectEqual(@as(u8, 0), state.pending_resume_crashes);
+}
+
+test "a journal noteResumed appends a barrier turn_resumed event with its count" {
+    const alloc = std.testing.allocator;
+    var capture: TestCapture = .{};
+    defer capture.frames.deinit(alloc);
+    var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
+    var session: Journal = .{ .writer = &writer };
+    defer session.deinit(alloc);
+
+    try session.noteResumed(alloc, "session", 2);
+    try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"events\":[{\"v\":5,\"seq\":1,\"turn\":1,\"type\":\"turn_resumed\",\"data\":{\"crashes\":2}}]") != null);
+    try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"barrier\":true") != null);
+    try std.testing.expectEqual(@as(u64, 2), session.cursor.next_seq);
 }
 
 test "a resumed turn that stopped between steps carries no confirmed-tool prompt" {

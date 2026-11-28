@@ -2607,9 +2607,9 @@ fn handleKernelSnapshot(
     var open_turn_names_images = false;
     if (yielded) {
         if (stored) |names| {
-            open_turn_names_images = try journal_events.writeOpenTurnNamingImages(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?, names);
+            open_turn_names_images = try journal_events.writeOpenTurnNamingImages(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?, names, journal.open_crashes);
         } else {
-            try journal_events.writeOpenTurn(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?);
+            try journal_events.writeOpenTurn(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?, journal.open_crashes);
             // An image the session dropped is written by name even here.
             open_turn_names_images = session_codec.checkpointNamesImages(journal.pending_resume.?, null, null);
         }

@@ -96,6 +96,7 @@ const agent = await createFxEngine({
 const turnOptions = flag("yield") ? { yieldAt: 1 } : {};
 let stop = null;
 let error = null;
+let errorCode = null;
 try {
   const turn = prompt === undefined ? agent.resume(turnOptions) : agent.prompt(prompt, turnOptions);
   if (!turn) throw new Error("the journal holds no turn to resume");
@@ -103,10 +104,12 @@ try {
   stop = (await turn.result).stopReason;
 } catch (caught) {
   error = `${caught?.name ?? "Error"}: ${caught?.message ?? caught}`;
+  errorCode = typeof caught?.code === "string" ? caught.code : null;
 }
 try {
   await agent.close();
 } catch (caught) {
   error ??= `${caught?.name ?? "Error"}: ${caught?.message ?? caught}`;
+  errorCode ??= typeof caught?.code === "string" ? caught.code : null;
 }
-say({ done: true, stop, error, outside });
+say({ done: true, stop, error, errorCode, outside });

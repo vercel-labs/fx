@@ -29,10 +29,10 @@ import { REPO_ROOT, TLA_ROOT, outDir, runTlc } from "../lib/tlc";
 type Model = Record<string, any>;
 type Edge = { to: string; label: string };
 type Graph = { states: Map<string, Model>; next: Map<string, Edge[]>; inits: string[] };
-type Op = Record<string, unknown> & { continues?: boolean };
+type Op = Record<string, unknown> & { continues?: boolean; crashes?: number };
 type Result = {
   plan: { save: boolean; send: { compact: boolean; no_fast: boolean } | null; status: { kind: string; need: string | null } | null; finish: string | null } | null;
-  state: { phase: string; need: string | null; attempt: number; deaths: number; clean: boolean; flowing: boolean; streak: number; streak_kind: string | null };
+  state: { phase: string; need: string | null; attempt: number; clean: boolean; flowing: boolean; streak: number; streak_kind: string | null };
   disk: { ph: string; clean: boolean; deaths: number; need: string | null } | null;
   error: string | null;
 };
@@ -157,9 +157,9 @@ function opsFor(label: string, s: Model): Op[] {
     case "TimerFires": return [{ op: "wait" }];
     case "Crash": return [{ op: "exit" }];
     case "Close": return [{ op: "event", name: "closing" }, { op: "exit" }];
-    case "Relaunch": return [{ op: "start", resume: true }];
+    case "Relaunch": return [{ op: "start", resume: true, crashes: s.deaths }];
     case "Yield": return [{ op: "event", name: "closing" }, { op: "exit" }];
-    case "Continue": return [{ op: "start", resume: true, continues: true }];
+    case "Continue": return [{ op: "start", resume: true, continues: true, crashes: s.deaths }];
     case "UserCancels": return [{ op: "event", name: "user_cancel" }];
     case "UserActs": return [{ op: "event", name: "user_continue" }];
     case "NetDown": case "NetUp": case "GatewayBreak": case "GatewayHeal": case "NeedUserFault":
@@ -304,7 +304,7 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
       if (!t.alive) return;
       if (!Active.has(t.phase)) {
         // fx, not the module, ends a request nobody can answer.
-        const finish = { done_ok: "succeeded", done_cancel: "cancelled", done_failed: null }[t.phase as string];
+        const finish = { done_ok: "succeeded", done_cancel: "cancelled", done_failed: null, done_crash_loop: "crash_loop" }[t.phase as string];
         expect("finished", finish ?? null, own.find((x) => x.plan?.finish)?.plan?.finish ?? null);
         expect("phase", "idle", real.phase);
         expect("record deleted", null, last.disk);
@@ -313,15 +313,13 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
       expect("phase", t.phase, phaseOf(real.phase, tamper));
       expect("attempt", t.attempt, Math.min(real.attempt, MaxAttempt));
       expect("flowing", t.flowing, real.flowing);
-      expect("abrupt deaths", t.seenDeaths, Math.min(real.deaths, options.faults));
       // The run of blocks is the module's streak while it counts blocks;
       // the model's saturates one past the resends.
       expect("blocks in a row", t.filterRun,
         real.streak_kind === "content_filter" ? Math.min(real.streak, FilterResends + 1) : 0);
-      // A relaunch that asks first asks about the crash loop, unless the
-      // request was already waiting for the user.
-      if ((step.label === "Relaunch" || step.label === "Continue") && t.phase === "need_user" && s.phase !== "need_user") {
-        expect("need", "crash_loop", real.need);
+      // A relaunch or continuation never opens a new question.
+      if ((step.label === "Relaunch" || step.label === "Continue") && t.phase === "need_user") {
+        expect("already waiting", true, s.phase === "need_user");
       }
     });
   });
@@ -400,9 +398,9 @@ if (options.selfCheck) {
       planted: "",
     },
     {
-      name: "forgets its crashes when the user signs in",
-      target: "if (state.need == .crash_loop) state.abrupt_deaths = 0;",
-      planted: "state.abrupt_deaths = 0;",
+      name: "ignores the crash-loop guard on start",
+      target: "    if (stopsTurn(start.crashes)) {\n        state.* = .{};\n        return .{ .finish = .crash_loop };\n    }\n",
+      planted: "",
     },
     {
       name: "shows a turn it continues after a restart as a retry",

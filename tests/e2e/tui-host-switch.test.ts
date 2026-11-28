@@ -5076,7 +5076,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "closing the window while main and a subagent wait on the model resumes main without a crash question",
+    "closing the window while main and a subagent wait on the model resumes main without a crash notice",
     async () => {
       // Full access runs the subagent's command without a review.
       const env: Record<string, string> = { FX_PERMISSION_MODE: "full-access" };
@@ -5121,7 +5121,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // fx never crashed, so main's request goes out again without asking.
         const third = await context.launch(`--resume ${records.rootId}`);
         await until("main's request to resume again", () => mainSends === 3, 30_000);
-        expect(await third.capturePane()).not.toContain("crashed fx twice");
+        expect(await third.capturePane()).not.toContain("This turn crashed fx three times");
       }, (dir) => {
         home = dir;
       }, false, env);

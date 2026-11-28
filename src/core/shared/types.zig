@@ -2922,20 +2922,22 @@ pub const AssistantHistoryTurn = struct {
     saved_execution: ?ExecutionMemory = null,
 };
 
-/// What a turn write does with the recovery module's record for the model
-/// request in flight (`src/core/recovery/recovery.zig` `Record`): leave it,
-/// save these bytes, or clear it because the request's response is complete.
 /// A model request a previous fx process left unfinished, which a turn
-/// resumes: the record its turn saved last, if any, and whether it was
-/// interrupted more than a day ago.
+/// resumes: the record its turn saved last, if any, and the turn's abrupt
+/// deaths that the host counted.
 pub const RecoveryResume = struct {
     record: ?[32]u8 = null,
-    stale: bool = false,
+    /// The turn's abrupt deaths that the host counted (`recovery.zig`
+    /// `Start.crashes`).
+    crashes: u8 = 0,
     /// The request continues a turn that stopped between steps for the
     /// host's restart (`recovery.zig` `Start.continues`).
     continues: bool = false,
 };
 
+/// What a turn write does with the recovery module's record for the model
+/// request in flight (`src/core/recovery/recovery.zig` `Record`): leave it,
+/// save these bytes, or clear it because the request's response is complete.
 pub const RecoveryRecordWrite = union(enum) {
     keep,
     save: [32]u8,

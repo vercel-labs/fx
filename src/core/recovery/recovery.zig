@@ -6,14 +6,15 @@
 //! starts no thread, keeps no global state, and never allocates, so the same
 //! events at the same times always produce the same plans.
 //!
-//! Only `succeeded` finishes a request successfully, and only `user_cancel`
-//! finishes it any other way. Every failure waits instead: for time, or for
-//! the user when only they can fix it (`tests/tla/recovery/Recovery.tla`
-//! NeverGivesUp, Heals). A wait for a sign-in also resends now and then on
-//! its own, since a login can work again without the user (SignInPoll). A
-//! reply the content filter blocks is resent at once a few times before the
-//! request needs the user (FilterBounded). Comments below name the model
-//! property that pins each rule.
+//! Only `succeeded` finishes a request successfully. `user_cancel` ends it, and
+//! so does a start that counts `crash_loop_after` crashes of its turn
+//! (`tests/tla/recovery/Recovery.tla` CrashLoopStops). Every other failure
+//! waits instead: for time, or for the user when only they can fix it
+//! (`tests/tla/recovery/Recovery.tla` NeverGivesUp, Heals). A wait for a
+//! sign-in also resends now and then on its own, since a login can work again
+//! without the user (SignInPoll). A reply the content filter blocks is resent
+//! at once a few times before the request needs the user (FilterBounded).
+//! Comments below name the model property that pins each rule.
 //!
 //! Outside code imports only this file, and this file imports only `std`.
 //! `scripts/check-recovery-boundary.sh` enforces both in CI.
@@ -66,15 +67,15 @@ pub const Start = struct {
     resume_from: ?Record = null,
     /// The request uses the Fast route, so dropping Fast is a real option.
     fast: bool = false,
-    /// The request resumes from an interruption more than a day ago, or
-    /// dated in the future, with or without a record. fx reads the wall
-    /// clock, which the module never does.
-    stale: bool = false,
+    /// Abrupt deaths of the request's turn that the host counted, including
+    /// the death this start resumes from. At `crash_loop_after` the request
+    /// ends as a crash loop before anything is decoded, saved, or sent.
+    crashes: u8 = 0,
     /// The request continues a turn that fx stopped between steps for its
     /// host's restart, at the save before this send, so nothing went out for
-    /// it. The record's questions and death count still apply; then the
-    /// planned send goes out with no new attempt and nothing on the status
-    /// line (`tests/tla/recovery/Recovery.tla` NoFalseAlarm).
+    /// it. The record's questions still apply; then the planned send goes out
+    /// with no new attempt and nothing on the status line
+    /// (`tests/tla/recovery/Recovery.tla` NoFalseAlarm).
     continues: bool = false,
 };
 
@@ -128,7 +129,9 @@ pub const Send = packed struct {
     no_fast: bool = false,
 };
 
-pub const Finish = enum { succeeded, cancelled };
+/// `crash_loop`: a start found the turn at the guard. Nothing was sent or
+/// saved, and the request ends as `cancelled` does.
+pub const Finish = enum { succeeded, cancelled, crash_loop };
 
 /// Opaque saved state. fx stores the bytes and hands them back unchanged.
 pub const Record = [32]u8;
@@ -151,9 +154,6 @@ pub const Status = struct {
         content_filter,
         rejected,
         too_long,
-        crash_loop,
-        /// The request resumes from a record more than a day old.
-        stale,
     };
 };
 
@@ -184,8 +184,6 @@ pub const State = struct {
     streak_kind: ?Failure.Kind = null,
     backoff_step: u8 = 0,
     offline_step: u8 = 0,
-    /// Abrupt deaths found with a send in flight, for the crash-loop guard.
-    abrupt_deaths: u8 = 0,
     /// Jitter state, seeded from `now_ms` at `start` so replays stay exact.
     seed: u32 = 1,
     /// Request time carried over from earlier fx processes.
@@ -245,8 +243,20 @@ const handoff_ms: u64 = 2_000;
 /// host that asks a copy of `State` how it would send next can look this far
 /// ahead.
 pub const escalate_after: u8 = 3;
-/// Abrupt in-flight deaths before asking the user once.
-const crash_loop_after: u8 = 2;
+/// Abrupt deaths of one turn, at any point in it, after which fx stops the
+/// turn. A close or a yield is not one (`tests/tla/recovery/Recovery.tla`
+/// CrashLoopStops).
+pub const crash_loop_after: u8 = 3;
+/// The notice at the guard. Its "three" must stay true for `crash_loop_after`.
+pub const crash_loop_notice = "This turn crashed fx three times, so fx stopped it. Send a message to go on.";
+comptime {
+    if (crash_loop_after != 3) @compileError("crash_loop_notice says three crashes");
+}
+
+pub fn stopsTurn(crashes: u8) bool {
+    return crashes >= crash_loop_after;
+}
+
 /// Resends of a blocked reply in a row before the request needs the user
 /// (`tests/tla/recovery/Recovery.tla` FilterBounded).
 const content_filter_resends: u8 = 3;
@@ -264,8 +274,14 @@ const short_columns = 46;
 // Events.
 
 /// A new request shows nothing until something goes wrong
-/// (`tests/tla/recovery/Recovery.tla` NoFalseAlarm).
+/// (`tests/tla/recovery/Recovery.tla` NoFalseAlarm). A turn at the guard ends
+/// before anything is decoded, saved, or sent (`tests/tla/recovery/Resume.tla`
+/// CrashLoopStops).
 fn onStart(state: *State, start: Start, now_ms: u64) Plan {
+    if (stopsTurn(start.crashes)) {
+        state.* = .{};
+        return .{ .finish = .crash_loop };
+    }
     if (start.resume_from) |bytes| {
         if (decode(bytes)) |saved| return resumeFrom(state, saved, start, now_ms);
     }
@@ -276,25 +292,19 @@ fn onStart(state: *State, start: Start, now_ms: u64) Plan {
         .started_ms = now_ms,
         .fast = start.fast,
     };
-    if (start.stale) return askUser(state, .stale, now_ms);
     return .{ .save = encode(state, now_ms), .send = .{} };
 }
 
 /// A record left by SIGHUP or SIGTERM resumes without a question, and so does
 /// one left while waiting, since the downtime already served as the wait
-/// (`tests/tla/recovery/Recovery.tla` ResumesAfterClose). Only abrupt deaths
-/// with a send in flight count toward asking once (CrashLoopAsks), and a
-/// record more than a day old asks first (`tests/tla/recovery/Resume.tla`
-/// OldAsks).
+/// (`tests/tla/recovery/Recovery.tla` ResumesAfterClose). A question the record
+/// was waiting on, such as a sign-in, is asked again. Any other record resends
+/// at once (`tests/tla/recovery/Resume.tla` ResumeNeverAsks).
 fn resumeFrom(state: *State, saved: State, start: Start, now_ms: u64) Plan {
     state.* = saved;
     state.fast = start.fast;
     state.started_ms = now_ms;
-    const abrupt = saved.phase == .sending and !saved.flags.clean_exit;
     state.flags.clean_exit = false;
-    if (abrupt) state.abrupt_deaths +|= 1;
-    if (start.stale) return askUser(state, .stale, now_ms);
-    if (state.abrupt_deaths >= crash_loop_after) return askUser(state, .crash_loop, now_ms);
     if (saved.phase == .need_user) {
         // decode guarantees a need for need_user; resending is the safe fallback.
         if (saved.need) |need| return askUser(state, need, now_ms);
@@ -417,11 +427,9 @@ fn onUserContinue(state: *State, now_ms: u64) Plan {
     // (`tests/tla/recovery/Recovery.tla` AnswerGivesResends).
     if (state.streak_kind == .content_filter) state.streak = 0;
     const label: RetryLabel = if (state.need) |need| switch (need) {
-        .crash_loop, .stale => .resuming,
         .sign_in => .after_sign_in,
         .quota, .content_filter, .rejected, .too_long => .after_user,
     } else .after_user;
-    if (state.need == .crash_loop) state.abrupt_deaths = 0;
     state.need = null;
     state.retry_label = label;
     return sendNow(state, now_ms, .{});
@@ -717,16 +725,6 @@ fn needStatus(need: Status.Need) Status {
             "Still too long after compacting · press Esc and shorten your message",
             "Still too long · Esc, then shorten it",
         ),
-        .crash_loop => needOf(
-            need,
-            "This request crashed fx twice · Enter to retry, Esc to cancel",
-            "Crashed fx twice · Enter retries, Esc cancels",
-        ),
-        .stale => needOf(
-            need,
-            "Interrupted more than a day ago · Enter to resume, Esc to cancel",
-            "Over a day old · Enter resumes, Esc cancels",
-        ),
     };
 }
 
@@ -801,7 +799,7 @@ fn refresh(state: *State, status: Status) Plan {
 //  3      need (0 none)
 //  4..5   attempt, little endian
 //  6      streak
-//  7      abrupt in-flight deaths
+//  7      unused: written as 0, ignored on read
 //  8      backoff step
 //  9      cause (0 none)
 //  10     streak kind (0 none)
@@ -820,7 +818,7 @@ fn encode(state: *const State, now_ms: u64) Record {
     record[3] = if (state.need) |need| @backingInt(need) else 0;
     std.mem.writeInt(u16, record[4..6], state.attempt, .little);
     record[6] = state.streak;
-    record[7] = state.abrupt_deaths;
+    record[7] = 0;
     record[8] = state.backoff_step;
     record[9] = if (state.cause) |cause| @backingInt(cause) else 0;
     record[10] = if (state.streak_kind) |kind| @backingInt(kind) else 0;
@@ -831,6 +829,20 @@ fn encode(state: *const State, now_ms: u64) Record {
     std.mem.writeInt(u32, record[28..32], std.hash.Crc32.hash(record[0..28]), .little);
     return record;
 }
+
+/// Whether `record` was saved by a close that ended its request cleanly
+/// (`RequestRecovery.closeActive`). A close is not a death, so a launch that
+/// reads this record counts none for the turn (`tests/tla/recovery/Resume.tla`
+/// NoFalseCrash). A record this version cannot trust is not clean.
+pub fn closedCleanly(record: Record) bool {
+    const state = decode(record) orelse return false;
+    return state.flags.clean_exit;
+}
+
+/// Need bytes older fx wrote for questions this version no longer asks: 6 was
+/// the crash-loop question, 7 the day-old one. A record waiting on one of them
+/// resends at once.
+const retired_need_bytes = [_]u8{ 6, 7 };
 
 /// Returns null for a record this version can't trust: a bad checksum, an
 /// unknown version, or a value outside the format.
@@ -843,11 +855,18 @@ fn decode(record: Record) ?State {
     for (record[24..28]) |byte| {
         if (byte != 0) return null;
     }
-    const phase = std.enums.fromInt(Phase, record[1]) orelse return null;
+    var phase = std.enums.fromInt(Phase, record[1]) orelse return null;
     if (phase == .idle) return null;
     const flags: Flags = @bitCast(record[2]);
     if (flags.unused != 0) return null;
-    const need = optionalFromByte(Status.Need, record[3]) catch return null;
+    const retired = std.mem.findScalar(u8, &retired_need_bytes, record[3]) != null;
+    if (retired and phase != .need_user) return null;
+    var need: ?Status.Need = null;
+    if (retired) {
+        phase = .waiting;
+    } else {
+        need = optionalFromByte(Status.Need, record[3]) catch return null;
+    }
     if ((phase == .need_user) != (need != null)) return null;
     const cause = optionalFromByte(Failure.Kind, record[9]) catch return null;
     const streak_kind = optionalFromByte(Failure.Kind, record[10]) catch return null;
@@ -862,7 +881,6 @@ fn decode(record: Record) ?State {
         .streak_kind = streak_kind,
         .backoff_step = record[8],
         .offline_step = record[11],
-        .abrupt_deaths = record[7],
         .seed = if (seed == 0) 1 else seed,
         .carried_ms = std.mem.readInt(u32, record[12..16], .little),
     };
@@ -908,6 +926,21 @@ fn columns(text: []const u8) usize {
 
 fn startsWith(text: []const u8, prefix: []const u8) bool {
     return std.mem.startsWith(u8, text, prefix);
+}
+
+test "recovery: a record a close saved clean reads as closed, and no other record does" {
+    var clean = State{ .phase = .sending, .flags = .{ .clean_exit = true }, .attempt = 1 };
+    const saved = encode(&clean, 0);
+    try testing.expect(closedCleanly(saved));
+
+    var unclean = clean;
+    unclean.flags.clean_exit = false;
+    try testing.expect(!closedCleanly(encode(&unclean, 0)));
+
+    var torn = saved;
+    torn[1] ^= 1;
+    try testing.expect(!closedCleanly(torn));
+    try testing.expect(!closedCleanly(@splat(0)));
 }
 
 test "an unreadable reply waits and resends as a dropped connection does, under its own name" {
@@ -1401,7 +1434,6 @@ test "a closed window resumes without a question" {
         const resumed = step(&state, .{ .start = .{ .resume_from = record } }, 100);
         try testing.expect(resumed.send != null);
         try testing.expect(startsWith(resumed.status.?.text.slice(), "Resuming the interrupted request · attempt "));
-        try testing.expectEqual(@as(u8, 0), state.abrupt_deaths);
     }
 }
 
@@ -1416,7 +1448,6 @@ test "a request that continues a turn stopped for a restart shows nothing and ke
     try testing.expect(continued.send != null);
     try testing.expect(continued.status == null);
     try testing.expectEqual(@as(u8, 1), state.attempt);
-    try testing.expectEqual(@as(u8, 0), state.abrupt_deaths);
 
     // A paused retry's resend that a restart stopped keeps its attempt too.
     state = .{};
@@ -1432,68 +1463,90 @@ test "a request that continues a turn stopped for a restart shows nothing and ke
     try testing.expectEqual(attempt, state.attempt);
 }
 
-test "a continued request still asks first when its record is a day old" {
-    var state: State = .{};
-    _ = startNew(&state, 0, false);
-    const record = step(&state, .closing, 100).save.?;
-    state = .{};
-    const asked = step(&state, .{ .start = .{ .resume_from = record, .stale = true, .continues = true } }, 50);
-    try testing.expect(asked.send == null);
-    try testing.expectEqual(Status.Need.stale, asked.status.?.need.?);
+test "three crashes end a request as a crash loop, with a record, without one, and when continued" {
+    var record_state: State = .{};
+    const record = startNew(&record_state, 0, false).save.?;
+    const starts = [_]Start{
+        .{ .resume_from = record, .crashes = 3 },
+        .{ .resume_from = record, .crashes = 3, .continues = true },
+        .{ .crashes = 3 },
+    };
+    for (starts) |start| {
+        var state: State = .{};
+        const plan = step(&state, .{ .start = start }, 50);
+        try testing.expectEqual(Finish.crash_loop, plan.finish.?);
+        try testing.expect(plan.send == null);
+        try testing.expect(plan.save == null);
+        try testing.expect(plan.status == null);
+    }
 }
 
-test "a continued request keeps its death count, so the next abrupt death asks" {
-    var state: State = .{};
-    var record = startNew(&state, 0, false).save.?;
-    // One abrupt death with the send in flight.
-    state = .{};
-    const first = step(&state, .{ .start = .{ .resume_from = record } }, 50);
-    try testing.expect(first.send != null);
-    try testing.expectEqual(@as(u8, 1), state.abrupt_deaths);
-    // fx stops the resent request for a restart and continues it.
-    record = step(&state, .closing, 60).save.?;
-    state = .{};
-    const continued = step(&state, .{ .start = .{ .resume_from = record, .continues = true } }, 70);
-    try testing.expect(continued.send != null);
-    try testing.expectEqual(@as(u8, 1), state.abrupt_deaths);
-    // A second abrupt death with that send in flight asks once.
-    record = continued.save.?;
-    state = .{};
-    const asked = step(&state, .{ .start = .{ .resume_from = record } }, 80);
-    try testing.expect(asked.send == null);
-    try testing.expectEqual(Status.Need.crash_loop, asked.status.?.need.?);
-}
-
-test "a record more than a day old asks before resending" {
+test "two crashes resend at once with no question" {
     var state: State = .{};
     const record = startNew(&state, 0, false).save.?;
     state = .{};
-    const asked = step(&state, .{ .start = .{ .resume_from = record, .stale = true } }, 50);
-    try testing.expect(asked.send == null);
-    try testing.expectEqual(Status.Need.stale, asked.status.?.need.?);
-    try testing.expectEqualStrings(
-        "Interrupted more than a day ago · Enter to resume, Esc to cancel",
-        asked.status.?.text.slice(),
-    );
-
-    // The question is saved, so a relaunch the same day asks again.
-    state = .{};
-    const again = step(&state, .{ .start = .{ .resume_from = asked.save.? } }, 60);
-    try testing.expect(again.send == null);
-    try testing.expectEqual(Status.Need.stale, again.status.?.need.?);
-
-    const resumed = step(&state, .user_continue, 70);
-    try testing.expect(resumed.send != null);
-    try testing.expect(startsWith(resumed.status.?.text.slice(), "Resuming the interrupted request · attempt "));
+    const plan = step(&state, .{ .start = .{ .resume_from = record, .crashes = 2 } }, 50);
+    try testing.expectEqual(Send{}, plan.send.?);
+    try testing.expectEqual(Status.Kind.retrying, plan.status.?.kind);
+    try testing.expect(startsWith(plan.status.?.text.slice(), "Resuming the interrupted request · attempt "));
 }
 
-test "a day-old resume with no record asks too" {
+/// The record a request saved while it waited for a quota question, with its
+/// need byte replaced, as an older fx wrote it.
+fn recordWithNeedByte(need_byte: u8) Record {
     var state: State = .{};
-    const plan = step(&state, .{ .start = .{ .stale = true } }, 0);
-    try testing.expect(plan.send == null);
-    try testing.expectEqual(Status.Need.stale, plan.status.?.need.?);
-    const resumed = step(&state, .user_continue, 10);
-    try testing.expect(resumed.send != null);
+    _ = startNew(&state, 0, false);
+    const record = fail(&state, .quota, 1_000).save.?;
+    return resealed(record, 3, need_byte);
+}
+
+/// The record with one byte changed and its checksum made valid again.
+fn resealed(record: Record, index: usize, byte: u8) Record {
+    var out = record;
+    out[index] = byte;
+    std.mem.writeInt(u32, out[28..32], std.hash.Crc32.hash(out[0..28]), .little);
+    return out;
+}
+
+test "a record waiting on the old crash question resends at once" {
+    var state: State = .{};
+    const plan = step(&state, .{ .start = .{ .resume_from = recordWithNeedByte(6) } }, 50);
+    try testing.expectEqual(Send{}, plan.send.?);
+    try testing.expect(startsWith(plan.status.?.text.slice(), "Resuming the interrupted request · attempt "));
+}
+
+test "a record waiting on the old day-old question resends at once" {
+    var state: State = .{};
+    const plan = step(&state, .{ .start = .{ .resume_from = recordWithNeedByte(7) } }, 50);
+    try testing.expectEqual(Send{}, plan.send.?);
+    try testing.expect(startsWith(plan.status.?.text.slice(), "Resuming the interrupted request · attempt "));
+}
+
+test "a record an older fx saved with byte 7 set resumes and sends" {
+    var state: State = .{};
+    const record = resealed(startNew(&state, 0, false).save.?, 7, 2);
+    state = .{};
+    const plan = step(&state, .{ .start = .{ .resume_from = record } }, 50);
+    try testing.expectEqual(Send{}, plan.send.?);
+}
+
+test "a saved sign-in question is asked again on resume" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    const record = fail(&state, .sign_in, 1_000).save.?;
+    state = .{};
+    const asked = step(&state, .{ .start = .{ .resume_from = record } }, 2_000);
+    try testing.expect(asked.send == null);
+    try testing.expectEqual(Status.Need.sign_in, asked.status.?.need.?);
+}
+
+test "a continued request resends at once with two crashes counted" {
+    var state: State = .{};
+    const record = startNew(&state, 0, false).save.?;
+    state = .{};
+    const continued = step(&state, .{ .start = .{ .resume_from = record, .crashes = 2, .continues = true } }, 50);
+    try testing.expect(continued.send != null);
+    try testing.expect(continued.status == null);
 }
 
 test "a relaunch during a wait resends at once" {
@@ -1507,36 +1560,32 @@ test "a relaunch during a wait resends at once" {
     try testing.expectEqual(Send{}, resumed.send.?);
 }
 
-test "two abrupt deaths with a send in flight ask once" {
+test "two abrupt deaths with a send in flight both resend, since the host counts them" {
     var state: State = .{};
     var record = startNew(&state, 0, false).save.?;
 
     state = .{};
-    const first = step(&state, .{ .start = .{ .resume_from = record } }, 50);
+    const first = step(&state, .{ .start = .{ .resume_from = record, .crashes = 1 } }, 50);
     try testing.expect(first.send != null);
     record = first.save.?;
 
     state = .{};
-    const second = step(&state, .{ .start = .{ .resume_from = record } }, 50);
-    try testing.expect(second.send == null);
-    try testing.expectEqual(Status.Need.crash_loop, second.status.?.need.?);
-    try testing.expectEqualStrings("Crashed fx twice · Enter retries, Esc cancels", second.status.?.short.slice());
-
-    const resumed = step(&state, .user_continue, 900);
-    try testing.expect(resumed.send != null);
-    try testing.expectEqual(@as(u8, 0), state.abrupt_deaths);
+    const second = step(&state, .{ .start = .{ .resume_from = record, .crashes = 2 } }, 50);
+    try testing.expect(second.send != null);
 }
 
-test "a death while waiting is not a crash loop" {
+test "a death while waiting counts toward the guard" {
     var state: State = .{};
     _ = startNew(&state, 0, false);
-    var record = fail(&state, .dropped, 1_000).save.?;
-    for (0..3) |_| {
-        state = .{};
-        const resumed = step(&state, .{ .start = .{ .resume_from = record } }, 10);
-        try testing.expect(resumed.send != null);
-        record = fail(&state, .dropped, 20).save.?;
-    }
+    const record = fail(&state, .dropped, 1_000).save.?;
+
+    state = .{};
+    const resumed = step(&state, .{ .start = .{ .resume_from = record, .crashes = 2 } }, 10);
+    try testing.expect(resumed.send != null);
+
+    state = .{};
+    const stopped = step(&state, .{ .start = .{ .resume_from = record, .crashes = 3 } }, 10);
+    try testing.expectEqual(Finish.crash_loop, stopped.finish.?);
 }
 
 test "a request waiting for the user resumes waiting" {
@@ -1785,8 +1834,9 @@ const SimHost = struct {
     status: Status.Kind = .clear,
     need: ?Status.Need = null,
     finished: bool = false,
-    /// Abrupt deaths with a send in flight since the last crash-loop continue.
-    inflight_deaths: u8 = 0,
+    /// Abrupt deaths of this turn so far, at any point in it. A close does
+    /// not count; the host passes the count in every start.
+    crashes: u8 = 0,
     /// When the latest transient failure happened; a retry must wait after it.
     transient_failure_ms: ?u64 = null,
     /// When the latest wait for a sign-in began; its own resend waits
@@ -1818,6 +1868,7 @@ const SimHost = struct {
         if (plan.finish) |finish| switch (finish) {
             .succeeded => try testing.expect(event == .succeeded and was_outstanding),
             .cancelled => try testing.expect(event == .user_cancel),
+            .crash_loop => try testing.expect(event == .start),
         };
         if (!was_outstanding) switch (event) {
             .responding, .succeeded, .failed => try testing.expectEqual(Plan{}, plan),
@@ -1913,17 +1964,12 @@ const SimHost = struct {
         }
     }
 
-    fn userContinue(host: *SimHost) !void {
-        if (host.status == .need_user and host.need == .crash_loop) host.inflight_deaths = 0;
-        try host.deliver(.user_continue);
-    }
-
     /// The process dies, gracefully or not, and fx starts again.
     fn relaunch(host: *SimHost, graceful: bool) !void {
         if (graceful) {
             try host.deliver(.closing);
-        } else if (host.outstanding) {
-            host.inflight_deaths +|= 1;
+        } else {
+            host.crashes +|= 1;
         }
         host.state = .{};
         host.outstanding = false;
@@ -1935,9 +1981,11 @@ const SimHost = struct {
         host.sent_ms = null;
         host.now_ms += 5_000;
         const record = host.saved orelse return;
-        try host.deliver(.{ .start = .{ .resume_from = record, .fast = host.fast } });
-        const asked_crash_loop = host.status == .need_user and host.need == .crash_loop;
-        try testing.expectEqual(host.inflight_deaths >= crash_loop_after, asked_crash_loop);
+        const resumes_send = if (decode(record)) |saved| saved.phase == .sending else false;
+        try host.deliver(.{ .start = .{ .resume_from = record, .fast = host.fast, .crashes = host.crashes } });
+        try testing.expectEqual(stopsTurn(host.crashes), host.finished);
+        // A resume from a send in flight resends; it never asks the user.
+        if (resumes_send and !host.finished) try testing.expect(host.status != .need_user);
     }
 };
 
@@ -1976,7 +2024,7 @@ fn simulate(seed: u64) !void {
                 host.now_ms += 1_000;
                 try host.deliver(.tick);
             },
-            69...72 => try host.userContinue(),
+            69...72 => try host.deliver(.user_continue),
             73 => try host.deliver(.sign_in_closed),
             74...75 => try host.deliver(.user_cancel),
             76...83 => try host.relaunch(false),
@@ -2001,7 +2049,7 @@ fn simulate(seed: u64) !void {
             if (!host.flowing) try host.deliver(.responding);
             try host.deliver(.succeeded);
         } else if (host.status == .need_user) {
-            try host.userContinue();
+            try host.deliver(.user_continue);
         } else {
             host.now_ms += 1_000;
             ticks_waiting += 1;

@@ -51,6 +51,8 @@ pub const ErrorCode = struct {
     pub const invalid_request: i64 = -32600;
     pub const method_not_found: i64 = -32601;
     pub const invalid_params: i64 = -32602;
+    /// A turn stopped at the crash-loop guard (`recovery.crash_loop_notice`).
+    pub const crash_loop: i64 = -32001;
     pub const internal_error: i64 = -32603;
 };
 
@@ -76,10 +78,11 @@ pub const Message = struct {
 pub const RpcError = struct {
     code: i64,
     message: []const u8,
+    /// `code` names the error; `model` and `capability` are written only when set.
     data: ?struct {
         code: []const u8,
-        model: []const u8,
-        capability: []const u8,
+        model: ?[]const u8 = null,
+        capability: ?[]const u8 = null,
     } = null,
 };
 
@@ -198,10 +201,14 @@ pub const Writer = struct {
                     if (response.err.data) |data| {
                         try w.writeAll(",\"data\":{\"code\":");
                         try writeJsonStr(data.code, w);
-                        try w.writeAll(",\"model\":");
-                        try writeJsonStr(data.model, w);
-                        try w.writeAll(",\"capability\":");
-                        try writeJsonStr(data.capability, w);
+                        if (data.model) |model| {
+                            try w.writeAll(",\"model\":");
+                            try writeJsonStr(model, w);
+                        }
+                        if (data.capability) |capability| {
+                            try w.writeAll(",\"capability\":");
+                            try writeJsonStr(capability, w);
+                        }
                         try w.writeByte('}');
                     }
                     try w.writeAll("}}\n");
@@ -430,6 +437,11 @@ const ChunkedTestSource = struct {
     }
 };
 
+test "the crash-loop error code is an implementation-defined server error, not invalid params" {
+    try std.testing.expect(ErrorCode.crash_loop >= -32099 and ErrorCode.crash_loop <= -32000);
+    try std.testing.expect(ErrorCode.crash_loop != ErrorCode.invalid_params);
+}
+
 test "Reader accepts an exact fragmented frame" {
     const alloc = std.testing.allocator;
     var source = ChunkedTestSource{
@@ -605,6 +617,23 @@ test "Writer Frame formats protocol lines" {
         } }).write(&out.writer);
         try std.testing.expectEqualStrings(
             "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32602,\"message\":\"Unsupported fast mode\",\"data\":{\"code\":\"LIBFX_MODEL_UNSUPPORTED_FAST\",\"model\":\"provider/quoted\\\"model\",\"capability\":\"fast\"}}}\n",
+            out.writer.buffered(),
+        );
+    }
+
+    {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try (Writer.Frame{ .error_response = .{
+            .id = .{ .integer = 8 },
+            .err = .{
+                .code = ErrorCode.crash_loop,
+                .message = "This turn crashed fx three times, so fx stopped it. Send a message to go on.",
+                .data = .{ .code = "crash_loop" },
+            },
+        } }).write(&out.writer);
+        try std.testing.expectEqualStrings(
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"error\":{\"code\":-32001,\"message\":\"This turn crashed fx three times, so fx stopped it. Send a message to go on.\",\"data\":{\"code\":\"crash_loop\"}}}\n",
             out.writer.buffered(),
         );
     }

@@ -11,7 +11,7 @@
 #   stale-socket        a dead pooled connection shown as a failure        NoFalseAlarm
 #   frozen-status       a retry warning left over a streaming answer       StatusHonest
 #   no-closing          a closed window treated as a crash                 ResumesAfterClose
-#   never-ask           a request that crashes fx resumes forever          CrashLoopAsks
+#   no-guard            a request that crashes fx resumes forever          CrashLoopStops
 #   hot-retry           resending at once after a failure                  NoHotRetry
 #   send-without-save   a retry sent without saving the record first       SaveBeforeSend
 #   yield-retry-status  a continued turn shown as a retry ("attempt 2")    NoFalseAlarm
@@ -34,21 +34,24 @@
 # resume-today.cfg is fx before it, which leaves an interrupted request for
 # the user (AutoResumes). Each resume-mutation-*.cfg plants one defect:
 #
-#   no-closing          a closed window counted as a crash                 NoFalseCrashQuestion
-#   no-clear            a finished request's record left behind            NoFalseCrashQuestion
-#   send-before-save    a send on the wire before its record is saved      CrashLoopAsks
-#   reset-on-resume     a resumed request saves a fresh death count        CrashLoopAsks
+#   no-closing          a closed window counted as a crash                 NoFalseCrash
+#   no-clear            a finished request's record left behind            NoFalseCrash
+#   send-before-save    a send on the wire before its record is saved      CrashLoopStops
+#   reset-on-resume     a resumed request saves a fresh death count        CrashLoopStops
 #   resume-answered     a turn whose final answer was saved sent again     DoneNeverResent
 #   resume-cancelled    a turn the user cancelled sent again               CancelNeverResumes
-#   ignore-age          a day-old request sent again without asking        OldAsks
 #   no-lock             a second fx resuming a session another holds       OneWorker
-#   yield-unclean       an upgrade's restart saved as a death              NoFalseCrashQuestion
+#   yield-unclean       an upgrade's restart saved as a death              NoFalseCrash
 #   yield-first         a turn stopped for a restart before it is logged   YieldContinues
-#   yield-unsaved       a stop whose save failed, left as a clean stop     NoFalseCrashQuestion
+#   yield-unsaved       a stop whose save failed, left as a clean stop     NoFalseCrash
 #   note-turn           a resumed turn started as a new turn with no work  SameTurn
 #   cancel-strands      a cancelled restart leaves a held turn stopped     HeldOnlyWhileRestartWaits
 #   cancel-keeps-relaunch  a quit after a cancel relaunches                CancelledRestartStays
-#   cancel-unsaved      a held turn sends with its clean record            CrashLoopAsks
+#   cancel-unsaved      a held turn sends with its clean record            CrashLoopStops
+#   guard-asks          at the guard, the launch asks                      ResumeNeverAsks
+#   no-guard            the turn continues whatever its count              CrashLoopStops
+#   tool-death-uncounted  a death while tools run is not counted           CrashLoopStops
+#   rerun-death-uncounted  the count reaches the log only after the rerun  CrashLoopStops
 #
 # RestartWait.tla models one process's main loop against the workers it
 # asks to stop for the restart, and the cancel. restart-wait.cfg is the
@@ -85,7 +88,7 @@ Recovery recovery-mutation-stale-socket NoFalseAlarm
 Recovery recovery-mutation-yield-retry-status NoFalseAlarm
 Recovery recovery-mutation-frozen-status StatusHonest
 Recovery recovery-mutation-no-closing ResumesAfterClose
-Recovery recovery-mutation-never-ask CrashLoopAsks
+Recovery recovery-mutation-no-guard CrashLoopStops
 Recovery recovery-mutation-hot-retry NoHotRetry
 Recovery recovery-mutation-send-without-save SaveBeforeSend
 Recovery recovery-mutation-poll-reopens StatusHonest
@@ -104,21 +107,24 @@ RecoveryTimed recovery-mutation-never-poll PollBounded
 Resume resume -
 Resume resume-deep -
 Resume resume-today AutoResumes
-Resume resume-mutation-no-closing NoFalseCrashQuestion
-Resume resume-mutation-no-clear NoFalseCrashQuestion
-Resume resume-mutation-send-before-save CrashLoopAsks
-Resume resume-mutation-reset-on-resume CrashLoopAsks
+Resume resume-mutation-no-closing NoFalseCrash
+Resume resume-mutation-no-clear NoFalseCrash
+Resume resume-mutation-send-before-save CrashLoopStops
+Resume resume-mutation-reset-on-resume CrashLoopStops
 Resume resume-mutation-resume-answered DoneNeverResent
 Resume resume-mutation-resume-cancelled CancelNeverResumes
-Resume resume-mutation-ignore-age OldAsks
 Resume resume-mutation-no-lock OneWorker
-Resume resume-mutation-yield-unclean NoFalseCrashQuestion
+Resume resume-mutation-yield-unclean NoFalseCrash
 Resume resume-mutation-yield-first YieldContinues
-Resume resume-mutation-yield-unsaved NoFalseCrashQuestion
+Resume resume-mutation-yield-unsaved NoFalseCrash
 Resume resume-mutation-note-turn SameTurn
 Resume resume-mutation-cancel-strands HeldOnlyWhileRestartWaits
 Resume resume-mutation-cancel-keeps-relaunch CancelledRestartStays
-Resume resume-mutation-cancel-unsaved CrashLoopAsks
+Resume resume-mutation-cancel-unsaved CrashLoopStops
+Resume resume-mutation-guard-asks ResumeNeverAsks
+Resume resume-mutation-no-guard CrashLoopStops
+Resume resume-mutation-tool-death-uncounted CrashLoopStops
+Resume resume-mutation-rerun-death-uncounted CrashLoopStops
 RestartWait restart-wait -
 RestartWait restart-wait-current NoStopWhileCancellable
 RestartWait restart-wait-mutation-hold-ignores-flag HeldOnlyWhileRestartWaits

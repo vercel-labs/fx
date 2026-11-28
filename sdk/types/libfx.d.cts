@@ -25,7 +25,7 @@ export type FxWasmModule = typeof globalThis extends { WebAssembly: { Module: ab
 /** The `fetch` libfx calls: always with a URL string and an init object. The global `fetch` fits. */
 export type FxFetch = (input: string, init: RequestInit) => Promise<Response>;
 
-/** An error as libfx reports it in results and events. */
+/** An error as libfx reports it in results and events. Its `code` is `crash_loop` when a turn crashed fx three times and fx stopped it. */
 export interface FxErrorSummary {
   name: string;
   message: string;

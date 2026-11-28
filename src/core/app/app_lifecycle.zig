@@ -12,6 +12,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const request_recovery = @import("../agent/runtime/request_recovery.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const shared_theme = @import("../shared/theme.zig");
@@ -85,9 +86,10 @@ fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
 
 /// SIGHUP and SIGTERM close fx: a closed window, a logout, or a reboot. The
 /// handler only wakes `closerMain`, which saves the model request in flight
-/// outside signal context, marked as a clean close, so the next launch
-/// resumes it without counting a crash (`RequestRecovery.closeActive`,
-/// `tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). It then restores
+/// outside signal context, marked as a clean close, and marks every open turn
+/// as closed, so the next launch resumes them without counting a crash
+/// (`RequestRecovery.closeActive`, `session_adapter.closeOpenTurns`,
+/// `tests/tla/recovery/Resume.tla` NoFalseCrash). It then restores
 /// the terminal and re-raises as the handler did before. Without that
 /// thread, the handler restores and re-raises itself. A terminal that hangs
 /// up closes fx the same way (`closeOnHangup`).
@@ -113,7 +115,8 @@ fn closerMain() void {
     }
     const sig: std.posix.SIG = @fromBackingInt(@intCast(close_signal.load(.seq_cst)));
     const saved = request_recovery.RequestRecovery.closeActive();
-    debug_trace.logf("app", "event=closing signal={d} records_saved={d}", .{ close_signal.load(.seq_cst), saved });
+    const marked = session_adapter.closeOpenTurns();
+    debug_trace.logf("app", "event=closing signal={d} records_saved={d} turns_marked={d}", .{ close_signal.load(.seq_cst), saved, marked });
     if (closer_tmux) {
         abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
     } else {
@@ -131,7 +134,8 @@ fn closerMain() void {
 pub fn closeOnHangup(turn_running: bool) void {
     if (!turn_running) return;
     const saved = request_recovery.RequestRecovery.closeActive();
-    debug_trace.logf("app", "event=closing cause=hangup records_saved={d} turn=left_open", .{saved});
+    const marked = session_adapter.closeOpenTurns();
+    debug_trace.logf("app", "event=closing cause=hangup records_saved={d} turns_marked={d} turn=left_open", .{ saved, marked });
     if (io_mod.getenv("TMUX") != null) {
         abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, std.posix.SIG.HUP);
     } else {
