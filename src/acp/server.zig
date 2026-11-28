@@ -1691,7 +1691,7 @@ fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mes
 fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     reapActivePrompt(state, false);
     const method = AcpMethod.parse(msg.method);
-    takeTokenPassAnswer(state, method);
+    takeTokenPassAnswer(state);
 
     if (method == .initialize) {
         return handleInitialize(state, alloc, msg);
@@ -3202,8 +3202,8 @@ test "ordinary ACP ignores private libfx capabilities" {
 
 /// Asks whether the credential's team has Token Pass. A team with Token Pass
 /// starts new sessions on the Token Pass default when nothing chose the
-/// model. `initialize` never waits for the check; the requests that depend
-/// on its answer do (`tokenPassNeed`).
+/// model. `initialize` never waits for the check; a new session and a prompt
+/// do (`awaitTokenPassForNewSession`, `awaitTokenPassForPrompt`).
 fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: config_runtime.ModelSource) void {
     if (state.provider != .gateway) return;
     const source = state.credential_source orelse return;
@@ -3225,24 +3225,30 @@ fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: conf
     applyTokenPassStartModel(state);
 }
 
-/// What a request does about the Token Pass answer: take it if it has
-/// arrived, or wait for a check that has not answered.
 const TokenPassNeed = enum { take, wait };
 
 /// Clients read a new session's model from the `session/new` reply, so it
-/// waits on the reader when nothing chose the model. A prompt waits too, on
-/// its own thread (`awaitTokenPassForPrompt`), so the reader takes only what
-/// has arrived.
-fn tokenPassNeed(state: *const ServerState, method: AcpMethod) TokenPassNeed {
-    return switch (method) {
-        .session_new => if (state.token_pass_start != null) .wait else .take,
-        else => .take,
-    };
+/// waits for the answer when nothing chose the model. Not while a prompt
+/// runs: the reader would read that prompt's `session/cancel` and EOF late.
+fn newSessionTokenPassNeed(nothing_chose_model: bool, prompt_running: bool) TokenPassNeed {
+    return if (nothing_chose_model and !prompt_running) .wait else .take;
 }
 
-fn takeTokenPassAnswer(state: *ServerState, method: AcpMethod) void {
+/// For every request: takes the answer if it has arrived, and never waits.
+fn takeTokenPassAnswer(state: *ServerState) void {
+    settleTokenPassAnswer(state, .take);
+}
+
+/// Called once `session/new` is checked, so a request that fails never
+/// waits.
+pub fn awaitTokenPassForNewSession(state: *ServerState) void {
+    if (comptime host_target.is_wasm) return;
+    settleTokenPassAnswer(state, newSessionTokenPassNeed(state.token_pass_start != null, state.active_prompt != null));
+}
+
+fn settleTokenPassAnswer(state: *ServerState, need: TokenPassNeed) void {
     const check = if (state.token_pass_run) |*value| value else return;
-    switch (tokenPassNeed(state, method)) {
+    switch (need) {
         .take => check.takeAnswer(state.alloc),
         .wait => check.awaitAnswer(state.alloc, null),
     }
@@ -3366,7 +3372,7 @@ test "ACP initialize starts the Token Pass check without waiting for its answer"
     try std.testing.expectEqualStrings("example/built-in-default", state.selected_model);
 }
 
-test "ACP's reader waits for an unanswered Token Pass check only in a new session nothing chose a model for" {
+test "ACP's reader waits for an unanswered Token Pass check only in a new session nothing chose a model for, while no prompt runs" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: TokenPassFixture = undefined;
     try fixture.init(std.testing.allocator, .fake);
@@ -3374,20 +3380,20 @@ test "ACP's reader waits for an unanswered Token Pass check only in a new sessio
     const state = &fixture.state;
     startTokenPassCheck(state, state.alloc, .compiled_default);
 
-    // A prompt waits on its own thread instead (`awaitTokenPassForPrompt`).
-    for ([_]AcpMethod{ .initialize, .session_list, .session_load, .session_resume, .session_set_config_option, .session_prompt, .session_close }) |method| {
-        takeTokenPassAnswer(state, method);
-        try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
-    }
+    // Every request takes what has arrived; a prompt waits on its own
+    // thread (`awaitTokenPassForPrompt`).
+    takeTokenPassAnswer(state);
+    try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
     // A model that the profile or a flag chose does not wait on the answer.
     const start = state.token_pass_start;
     state.token_pass_start = null;
-    takeTokenPassAnswer(state, .session_new);
+    awaitTokenPassForNewSession(state);
     try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
     state.token_pass_start = start;
 
-    try std.testing.expectEqual(TokenPassNeed.wait, tokenPassNeed(state, .session_new));
-    try std.testing.expectEqual(TokenPassNeed.take, tokenPassNeed(state, .session_prompt));
+    try std.testing.expectEqual(TokenPassNeed.wait, newSessionTokenPassNeed(true, false));
+    try std.testing.expectEqual(TokenPassNeed.take, newSessionTokenPassNeed(true, true));
+    try std.testing.expectEqual(TokenPassNeed.take, newSessionTokenPassNeed(false, false));
 }
 
 test "ACP session/new waits for an unanswered Token Pass check until the wait from the check's start runs out" {
@@ -3401,7 +3407,7 @@ test "ACP session/new waits for an unanswered Token Pass check until the wait fr
     // The client lists its sessions first; on the fake clock this sleep
     // only moves the time on.
     io_mod.sleep(500 * std.time.ns_per_ms);
-    takeTokenPassAnswer(state, .session_new);
+    awaitTokenPassForNewSession(state);
 
     try std.testing.expectEqual(token_pass_check.first_prompt_wait_ms, FakeAwakeClock.elapsedMs());
     try std.testing.expect(fixture.check().lookup.task != null);
@@ -3422,7 +3428,7 @@ test "ACP session/new takes a Token Pass answer that arrived after initialize an
     startTokenPassCheck(state, state.alloc, .compiled_default);
 
     fixture.answer();
-    takeTokenPassAnswer(state, .session_new);
+    awaitTokenPassForNewSession(state);
 
     try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
     try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
@@ -3445,7 +3451,7 @@ test "ACP session/new takes the catalog's Token Pass marks without waiting for t
         .{ .id = @constCast(token_pass.default_model), .model_type = @constCast("language"), .token_pass = true },
     };
     @import("../core/gateway/token_pass_team.zig").publishCatalog(&entries);
-    takeTokenPassAnswer(state, .session_new);
+    awaitTokenPassForNewSession(state);
 
     try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
     try std.testing.expect(fixture.check().lookup.task != null);
@@ -3484,7 +3490,7 @@ test "ACP's reader moves new sessions to the Token Pass default when a prompt's 
     var not_cancelled = std.atomic.Value(bool).init(false);
     awaitTokenPassForPrompt(state, &not_cancelled);
     try std.testing.expectEqualStrings("example/built-in-default", state.selected_model);
-    takeTokenPassAnswer(state, .session_list);
+    takeTokenPassAnswer(state);
 
     try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
     try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
@@ -3509,12 +3515,12 @@ test "ACP's reader and a prompt's thread take the Token Pass answer at the same 
     const prompt = try std.Thread.spawn(.{}, Prompt.wait, .{ state, &prompt_done });
     fixture.credits.release();
     while (!prompt_done.load(.acquire) or !fixture.check().hasPass()) {
-        takeTokenPassAnswer(state, .session_list);
+        takeTokenPassAnswer(state);
         // A failed yield only spins once more.
         std.Thread.yield() catch {};
     }
     prompt.join();
-    takeTokenPassAnswer(state, .session_list);
+    takeTokenPassAnswer(state);
 
     try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
 }
@@ -3529,7 +3535,7 @@ test "ACP session/new wakes as soon as the Token Pass answer arrives, not at its
 
     // The credits reply comes 3 ms into the new session's wait.
     FakeAwakeClock.deliverAt(3, &fixture.credits.released, fixture.lookupDone());
-    takeTokenPassAnswer(state, .session_new);
+    awaitTokenPassForNewSession(state);
 
     try std.testing.expectEqual(@as(i64, 3), FakeAwakeClock.elapsedMs());
     try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
@@ -3562,7 +3568,7 @@ test "ACP session/new wakes on the Token Pass answer with the real clock" {
 
     const releaser = try std.Thread.spawn(.{}, HeldCredits.releaseOnceWaiting, .{ &fixture.credits, fixture.lookupDone(), 2 * token_pass_check.first_prompt_wait_ms });
     const started_ms = io_mod.awakeMilliTimestamp();
-    takeTokenPassAnswer(state, .session_new);
+    awaitTokenPassForNewSession(state);
     const waited_ms = io_mod.awakeMilliTimestamp() - started_ms;
     releaser.join();
 
@@ -3805,7 +3811,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         _ = try resolveSelectedModelCapabilities(state, startup_catalog);
         // The catalog just loaded; its Token Pass marks can answer for the
         // team when the credits check could not.
-        if (comptime !host_target.is_wasm) takeTokenPassAnswer(state, .initialize);
+        if (comptime !host_target.is_wasm) takeTokenPassAnswer(state);
     }
 
     if (state.cfg.effort_override) |raw| {

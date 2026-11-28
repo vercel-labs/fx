@@ -102,7 +102,7 @@ pub fn answerOf(snapshot: output_contracts.CreditsSnapshot) ?token_pass.Answer {
 }
 
 /// How often a prompt's wait looks at its cancel flag. The lookup wakes the
-/// wait at once when it finishes.
+/// wait itself when it finishes.
 const cancel_check_ms: i64 = 10;
 
 /// For `fx ask` and ACP: the answer saved for the team, refreshed by a
@@ -116,9 +116,8 @@ pub const Check = struct {
     has_pass: bool = false,
     /// Whether the credits check answered in this run.
     answered: bool = false,
-    /// Whether fx had an answer saved for the team when the check started.
     had_saved: bool = false,
-    /// When the credits check started, on the awake clock.
+    /// On the awake clock.
     started_ms: ?i64 = null,
     /// Guards the lookup and the answer after `begin`: ACP's prompt thread
     /// waits for the answer while its reader takes it for other requests.
@@ -127,9 +126,8 @@ pub const Check = struct {
     /// (`awaitFinishUnlocked`).
     waiters: u32 = 0,
 
-    /// Starts the check with the saved answer, and never waits for it.
-    /// Publishes whether the team has Token Pass to `token_pass_team`. Runs
-    /// before any other thread uses the check.
+    /// Starts from the saved answer and never waits. Runs before any other
+    /// thread uses the check.
     pub fn begin(
         self: *Check,
         alloc: Allocator,
@@ -155,10 +153,8 @@ pub const Check = struct {
         debug_trace.logf("token_pass", "check started saved={s}", .{answerLabel(saved)});
     }
 
-    /// For what depends on the answer, such as a new session's model: waits
-    /// for the check while fx knows nothing of the team, until
-    /// `first_prompt_wait_ms` after the check started (`requestWaitMs`), or
-    /// until `cancel` is set. The lookup wakes the wait when it finishes.
+    /// Waits while fx knows nothing of the team (`requestWaitMs`), or until
+    /// `cancel` is set. The lookup wakes the wait when it finishes.
     pub fn awaitAnswer(self: *Check, alloc: Allocator, cancel: ?*const std.atomic.Value(bool)) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -195,37 +191,27 @@ pub const Check = struct {
         try self.lookup.awaitFinish(wait_ms);
     }
 
-    /// Takes the answer if it has arrived, and the catalog's marks, then
-    /// returns how long a request still waits (`requestWaitMs`).
     fn takeAnswerLocked(self: *Check, alloc: Allocator) i64 {
         self.pollLocked(alloc);
         _ = self.observeCatalogLocked(alloc);
         return self.requestWaitMs(self.lookup.task != null, io_mod.awakeMilliTimestamp());
     }
 
-    /// Takes the answer if it has arrived, and the catalog's marks, without
-    /// waiting.
     pub fn takeAnswer(self: *Check, alloc: Allocator) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         _ = self.takeAnswerLocked(alloc);
     }
 
-    /// Whether the team has Token Pass, as fx knows it now.
     pub fn hasPass(self: *Check) bool {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         return self.has_pass;
     }
 
-    /// How long a request that depends on the answer still waits at
-    /// `now_ms`, or 0: it waits only while the check runs, fx knows nothing
-    /// of the team from a saved answer, this run's answer, or the catalog's
-    /// marks, and until `first_prompt_wait_ms` after the check started.
     fn requestWaitMs(self: *const Check, running: bool, now_ms: i64) i64 {
         if (!running or self.had_saved or self.answered or self.has_pass) return 0;
-        const started = self.started_ms orelse return 0;
-        return @max(0, started + first_prompt_wait_ms - now_ms);
+        return firstWaitLeftMs(self.started_ms, now_ms);
     }
 
     fn pollLocked(self: *Check, alloc: Allocator) void {
@@ -277,6 +263,13 @@ pub const Check = struct {
         self.lookup.deinit();
     }
 };
+
+/// The wait counts from the check's start, not from the request, so later
+/// requests never wait longer than the first.
+fn firstWaitLeftMs(started_ms: ?i64, now_ms: i64) i64 {
+    const started = started_ms orelse return 0;
+    return @max(0, started + first_prompt_wait_ms - now_ms);
+}
 
 fn saveAnswer(alloc: Allocator, home: []const u8, id: []const u8, answer: token_pass.Answer) void {
     token_pass_memory.save(alloc, home, id, answer) catch |err| {
@@ -340,8 +333,7 @@ pub const State = struct {
     /// Gateway, such as a catalog that marks Token Pass models.
     fn holdsFirstPrompt(self: *const State, now_ms: i64) bool {
         if (self.start_settled or self.had_saved or self.answer != null) return false;
-        const started = self.started_ms orelse return false;
-        return now_ms - started < first_prompt_wait_ms;
+        return firstWaitLeftMs(self.started_ms, now_ms) > 0;
     }
 };
 

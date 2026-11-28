@@ -487,6 +487,7 @@ fn startV2Session(
     var session_host_owned = true;
     defer if (session_host_owned) if (session_host) |h| h.destroy();
     const workspace_root = if (start.workspace) |binding| binding.root else state.workspace_root;
+    server.awaitTokenPassForNewSession(state);
     const v2 = session_adapter.Session.create(alloc, v2_store, workspace_root, .acp, .{
         .preferences = .{
             .provider = state.provider,
