@@ -110,6 +110,26 @@ pub fn toolCall(
             try out.writer.writeByte('}');
             return .{ .id = request_id, .name = "subagent", .arguments_json = out.written() };
         },
+        .web_fetch => |req| {
+            try out.writer.writeAll("{\"url\":");
+            try std.json.Stringify.value(req.url, .{}, &out.writer);
+            try out.writer.writeByte('}');
+            return .{ .id = request_id, .name = "web_fetch", .arguments_json = out.written() };
+        },
+        .web_search => |req| {
+            try out.writer.writeAll("{\"query\":");
+            try std.json.Stringify.value(req.query, .{}, &out.writer);
+            if (req.allowed_domains.len > 0) {
+                try out.writer.writeAll(",\"allowed_domains\":");
+                try std.json.Stringify.value(req.allowed_domains, .{}, &out.writer);
+            }
+            if (req.blocked_domains.len > 0) {
+                try out.writer.writeAll(",\"blocked_domains\":");
+                try std.json.Stringify.value(req.blocked_domains, .{}, &out.writer);
+            }
+            try out.writer.writeByte('}');
+            return .{ .id = request_id, .name = "web_search", .arguments_json = out.written() };
+        },
     }
 }
 
@@ -173,6 +193,24 @@ pub fn skillOpenFailureText(arena: Allocator, raw_name: []const u8, raw_resource
         error.SkillResourceChanged, error.ChangedSkillWasLoaded => arena.print("resource {s} in skill {s} changed while fx read it; open it again.", .{ shown, name }),
         else => arena.print("could not read {s} in skill {s} ({s}); open it again, and report it if this repeats.", .{ shown, name, @errorName(err) }),
     };
+}
+
+test "a web request runs as the web tool's own call, with its url, query, and domain filters" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fetched = try toolCall(arena, "req-1", .{ .web_fetch = .{ .url = "https://example.com/a?b=\"c\"" } }, "");
+    try std.testing.expectEqualStrings("web_fetch", fetched.name);
+    try std.testing.expectEqualStrings("{\"url\":\"https://example.com/a?b=\\\"c\\\"\"}", fetched.arguments_json);
+    const plain = try toolCall(arena, "req-2", .{ .web_search = .{ .query = "zig allocators" } }, "");
+    try std.testing.expectEqualStrings("web_search", plain.name);
+    try std.testing.expectEqualStrings("{\"query\":\"zig allocators\"}", plain.arguments_json);
+    const allowed = [_][]const u8{ "ziglang.org", "example.com" };
+    const filtered = try toolCall(arena, "req-3", .{ .web_search = .{ .query = "zig", .allowed_domains = &allowed } }, "");
+    try std.testing.expectEqualStrings("{\"query\":\"zig\",\"allowed_domains\":[\"ziglang.org\",\"example.com\"]}", filtered.arguments_json);
+    const blocked = [_][]const u8{"spam.example"};
+    const blocked_call = try toolCall(arena, "req-4", .{ .web_search = .{ .query = "zig", .blocked_domains = &blocked } }, "");
+    try std.testing.expectEqualStrings("{\"query\":\"zig\",\"blocked_domains\":[\"spam.example\"]}", blocked_call.arguments_json);
 }
 
 test "bridged skill open names a missing skill and the command that lists names" {

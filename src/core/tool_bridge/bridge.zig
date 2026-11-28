@@ -385,15 +385,26 @@ fn readRequestLine(arena: Allocator, fd: posix.socket_t, wake_read: posix.fd_t) 
     }
 }
 
-/// Writes one reply. Returns whether the client got all of it.
-fn writeReply(stream: std.Io.net.Stream, status: wire.Status, reason: ?wire.Reason, bytes: []const u8) bool {
+/// Writes one reply to `writer`, with the notice when there is one. Returns
+/// whether all of it was written.
+fn writeReplyTo(writer: *std.Io.Writer, arena: Allocator, status: wire.Status, reason: ?wire.Reason, bytes: []const u8, notice: ?[]const u8) bool {
+    const bounded: ?[]const u8 = if (notice) |raw| wire.boundedNotice(arena, raw) catch |err| blk: {
+        debug_trace.logf("mcp-call", "reply notice dropped err={s}", .{@errorName(err)});
+        break :blk null;
+    } else null;
+    wire.writeHeader(writer, .{ .status = status, .reason = reason, .bytes = bytes.len, .notice = bounded }) catch return false;
+    writer.writeAll(bytes) catch return false;
+    writer.flush() catch return false;
+    return true;
+}
+
+/// Writes one reply, with its notice when there is one. Returns whether the
+/// client got all of it.
+fn writeReply(stream: std.Io.net.Stream, arena: Allocator, status: wire.Status, reason: ?wire.Reason, bytes: []const u8, notice: ?[]const u8) bool {
     const io = io_mod.getIo();
     var buffer: [16 * 1024]u8 = undefined;
     var writer = stream.writer(io, &buffer);
-    wire.writeHeader(&writer.interface, .{ .status = status, .reason = reason, .bytes = bytes.len }) catch return false;
-    writer.interface.writeAll(bytes) catch return false;
-    writer.interface.flush() catch return false;
-    return true;
+    return writeReplyTo(&writer.interface, arena, status, reason, bytes, notice);
 }
 
 fn refusalMessage(reason: wire.Reason) []const u8 {
@@ -470,13 +481,13 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
 
     const line = readRequestLine(arena, stream.socket.handle, wake_read) catch |err| {
         debug_trace.logf("mcp-call", "bridge request not read err={s}", .{@errorName(err)});
-        if (err == error.TooLarge) _ = writeReply(stream, .refused, .too_large, refusalMessage(.too_large));
-        if (err == error.Silent) _ = writeReply(stream, .refused, .malformed, refusalMessage(.malformed));
+        if (err == error.TooLarge) _ = writeReply(stream, arena, .refused, .too_large, refusalMessage(.too_large), null);
+        if (err == error.Silent) _ = writeReply(stream, arena, .refused, .malformed, refusalMessage(.malformed), null);
         return;
     };
     const request = wire.parseRequest(arena, line) catch |err| {
         debug_trace.logf("mcp-call", "bridge request malformed err={s}", .{@errorName(err)});
-        _ = writeReply(stream, .refused, .malformed, refusalMessage(.malformed));
+        _ = writeReply(stream, arena, .refused, .malformed, refusalMessage(.malformed), null);
         return;
     };
 
@@ -486,7 +497,7 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
     bridge.mutex.lockUncancelable(io);
     bridge.live.ensureUnusedCapacity(gpa, 1) catch {
         bridge.mutex.unlock(io);
-        _ = writeReply(stream, .failed, null, "fx could not take this request: out of memory.");
+        _ = writeReply(stream, arena, .failed, null, "fx could not take this request: out of memory.", null);
         return;
     };
     const admitted = step(.{ .request = .{ .token = request.token orelse @splat(0), .version = request.version } });
@@ -496,7 +507,7 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
             bridge.mutex.unlock(io);
             const reason = wire.Reason.fromRefusal(refusal);
             debug_trace.logf("mcp-call", "bridge refused op={s} reason={s}", .{ @tagName(request.operation), @tagName(reason) });
-            _ = writeReply(stream, .refused, reason, refusalMessage(reason));
+            _ = writeReply(stream, arena, .refused, reason, refusalMessage(reason), null);
             return;
         },
         else => {},
@@ -552,18 +563,18 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
     // are denied as the core's deny, and the client is told why.
     const file_refused = switch (request.operation) {
         .edit, .write => registration.capability.authorize_file_fn == null,
-        .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => registration.capability.authorize_bash_tool_fn == null,
+        .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => registration.capability.authorize_bash_tool_fn == null,
         .call, .list, .search, .help => false,
     };
     const authorization: capability_mod.Authorization = if (file_refused) .{ .deny = refusalMessage(.file_tool_unavailable) } else switch (request.operation) {
-        .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => authorizeGated(io, registration, work.id, arena, request_id, request.operation),
+        .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => authorizeGated(io, registration, work.id, arena, request_id, request.operation),
         .list, .search, .help => .{ .allow = .{} },
     };
     bridge.mutex.lockUncancelable(io);
     const decided = step(.{ .authorized = .{ .id = work.id, .decision = if (authorization == .allow) .allow else .deny } });
     bridge.mutex.unlock(io);
 
-    var reply: ?struct { status: wire.Status, reason: ?wire.Reason = null, bytes: []const u8 } = null;
+    var reply: ?struct { status: wire.Status, reason: ?wire.Reason = null, bytes: []const u8, notice: ?[]const u8 = null } = null;
     for (decided.effects()) |effect| switch (effect) {
         .call => {
             const outcome = runOperation(arena, registration.capability, request_id, request.operation, authorization.allow, &live.cancel) catch |err|
@@ -581,7 +592,7 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
                     .tool_error => .tool_error,
                     .failed => .failed,
                     .denied => .denied,
-                }, .bytes = outcome.bytes },
+                }, .bytes = outcome.bytes, .notice = outcome.notice },
                 else => {},
             };
         },
@@ -595,7 +606,7 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
         else => {},
     };
     const answer = reply orelse return;
-    const delivered = writeReply(stream, answer.status, answer.reason, answer.bytes);
+    const delivered = writeReply(stream, arena, answer.status, answer.reason, answer.bytes, answer.notice);
     bridge.mutex.lockUncancelable(io);
     _ = step(.{ .reply_done = .{ .id = work.id, .delivery = if (delivered) .delivered else .lost } });
     bridge.mutex.unlock(io);
@@ -631,6 +642,8 @@ fn authorizeGated(
         .agent_status => |agent| registration.capability.authorizeBashTool(arena, request_id, .{ .agent_status = agent }),
         .agent_stop => |agent| registration.capability.authorizeBashTool(arena, request_id, .{ .agent_stop = agent }),
         .agent_close => |agent| registration.capability.authorizeBashTool(arena, request_id, .{ .agent_close = agent }),
+        .web_fetch => |value| registration.capability.authorizeBashTool(arena, request_id, .{ .web_fetch = value }),
+        .web_search => |value| registration.capability.authorizeBashTool(arena, request_id, .{ .web_search = value }),
         .list, .search, .help => unreachable, // lookups have no permission check
     };
     return checked catch |err| .{ .deny = arena.print("The permission check for {f} failed: {s}", .{ text_utils.terminalSafe(operation.subject()), @errorName(err) }) catch "The permission check failed." };
@@ -649,7 +662,7 @@ fn runOperation(
     return switch (operation) {
         .call => |value| capability.call(arena, request_id, value.tool, value.arguments_json, allowed, cancel),
         // A gated bash-tool operation's authority holds its call, so tool and arguments are empty.
-        .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => capability.call(arena, request_id, operation.subject(), "", allowed, cancel),
+        .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => capability.call(arena, request_id, operation.subject(), "", allowed, cancel),
         .list, .search, .help => unreachable, // answered by the lookup above
     };
 }
@@ -668,6 +681,8 @@ const FakeTool = struct {
     file_authorize_calls: u32 = 0,
     bash_tool_authorize_calls: u32 = 0,
     calls: std.atomic.Value(u32) = .init(0),
+    /// The notice each ordinary call's reply carries.
+    notice: ?[]const u8 = null,
     /// File changes run. The fake changes nothing.
     file_calls: std.atomic.Value(u32) = .init(0),
     /// The registration offers no file/bash-tool handler, as a shell command's does.
@@ -741,7 +756,7 @@ const FakeTool = struct {
             return .{ .status = .ok, .bytes = try arena.print("file {s}\n", .{tool}) };
         }
         _ = self.calls.fetchAdd(1, .acq_rel);
-        return .{ .status = .ok, .bytes = try arena.print("{s} {s}\n", .{ tool, arguments_json }) };
+        return .{ .status = .ok, .bytes = try arena.print("{s} {s}\n", .{ tool, arguments_json }), .notice = self.notice };
     }
 };
 
@@ -854,6 +869,55 @@ test "a command that leaves while its call waits for permission runs nothing, an
     tool.gate.store(false, .release);
     unregister(registration);
     try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+}
+
+test "a reply notice is one terminal-safe line, and its header stays under the limit" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var raw: std.Io.Writer.Allocating = .init(arena);
+    try raw.writer.writeAll("\x1b[31m\nnote ");
+    try raw.writer.splatByteAll('"', 5000);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try std.testing.expect(writeReplyTo(&out.writer, arena, .ok, null, "data\n", raw.written()));
+    const written = out.written();
+    const eol = std.mem.findScalar(u8, written, '\n') orelse return error.TestUnexpectedResult;
+    try std.testing.expect(eol < wire.max_header_bytes);
+    const header = try wire.parseHeader(arena, written[0..eol]);
+    const notice = header.notice orelse return error.TestUnexpectedResult;
+    try std.testing.expect(notice.len <= wire.max_notice_bytes);
+    try std.testing.expect(std.mem.findScalar(u8, notice, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, notice, '\n') == null);
+    try std.testing.expectEqualStrings("data\n", written[eol + 1 ..]);
+}
+
+test "a handler's notice reaches the reply header, and its data follows" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tool: FakeTool = .{ .notice = "fx could not read one line of the page." };
+    const registration = try register(tool.capability());
+    defer unregister(registration);
+    const variables = registration.environment();
+    const address = try std.Io.net.UnixAddress.init(variables[0].value);
+    const token = wire.parseToken(variables[1].value).?;
+
+    const stream = try address.connect(io);
+    defer stream.close(io);
+    var write_buffer: [512]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try wire.writeRequest(&writer.interface, token, .{ .call = .{ .tool = "mcp_s_notice", .arguments_json = "{}" } });
+    try writer.interface.flush();
+    var read_buffer: [wire.max_header_bytes]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    const line = (try reader.interface.takeDelimiter('\n')) orelse return error.TestUnexpectedResult;
+    const header = try wire.parseHeader(arena, line);
+    try std.testing.expectEqual(wire.Status.ok, header.status);
+    try std.testing.expectEqualStrings("fx could not read one line of the page.", header.notice orelse return error.TestUnexpectedResult);
+    const bytes = try reader.interface.readAllocAll(arena, @intCast(header.bytes));
+    try std.testing.expectEqualStrings("mcp_s_notice {}\n", bytes);
 }
 
 test "a request that leaves while it waits for the prompt lock opens no prompt" {
@@ -1145,6 +1209,8 @@ test "new skill and agent operations go through authorizeGated and never run whe
         .{ .agent_status = null },
         .{ .agent_stop = "worker" },
         .{ .agent_close = "worker" },
+        .{ .web_fetch = .{ .url = "https://example.com/" } },
+        .{ .web_search = .{ .query = "zig", .allowed_domains = &.{"ziglang.org"} } },
     };
 
     // Allowed: goes through authorizeBashTool (not lookup) and reaches run.

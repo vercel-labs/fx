@@ -15,7 +15,7 @@ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_name = "bash";
 
 const bash_description = std.fmt.comptimePrint(
-    "Run one bash program in the workspace. Its variables, functions, aliases, shell options, and working folder carry over to the next program. Use it for all work: read files (cat, sed -n, head), search (rg, rg --files), change files only with edit PATH (SEARCH/REPLACE blocks on stdin) and write PATH (the whole file on stdin), never with sed -i, perl -pi, or a > redirect, so fx can show and undo each change, run tests and builds, and use git. A call waits up to {d} s. When the program is still running, send {s} as the whole program to wait for it; only one program runs at a time. Reach this session's MCP tools with fx mcp call. A program can also use skills and subagents: skill list, skill open NAME, agent message NAME TEXT, agent wait, agent status, agent stop NAME. Each program's full output is saved as $FX_OUT/N.txt and listed in $FX_OUT/index.tsv; a long one comes back as a preview, so read the rest with rg, sed, or jq instead of running the program again.",
+    "Run one bash program in the workspace. Its variables, functions, aliases, shell options, and working folder carry over to the next program. Use it for all work: read files (cat, sed -n, head), search (rg, rg --files), change files only with edit PATH (SEARCH/REPLACE blocks on stdin) and write PATH (the whole file on stdin), never with sed -i, perl -pi, or a > redirect, so fx can show and undo each change, run tests and builds, and use git. A call waits up to {d} s. When the program is still running, send {s} as the whole program to wait for it; only one program runs at a time. Reach this session's MCP tools with fx mcp call. A program can also use skills, subagents, and the web: skill list, skill open NAME, agent message NAME TEXT, agent wait, agent status, agent stop NAME, web URL, search QUERY. Each program's full output is saved as $FX_OUT/N.txt and listed in $FX_OUT/index.tsv; a long one comes back as a preview, so read the rest with rg, sed, or jq instead of running the program again.",
     .{ bash_impl.program_yield_ms / 1000, bash_session.wait_word },
 );
 
@@ -33,7 +33,13 @@ test "the bash description says to change files with edit and write, not with se
 }
 
 test "the bash description tells the model about the skill and agent functions" {
-    try std.testing.expect(std.mem.find(u8, bash_description, "A program can also use skills and subagents: skill list, skill open NAME, agent message NAME TEXT, agent wait, agent status, agent stop NAME.") != null);
+    try std.testing.expect(std.mem.find(u8, bash_description, "A program can also use skills, subagents, and the web: skill list, skill open NAME, agent message NAME TEXT, agent wait, agent status, agent stop NAME, web URL, search QUERY.") != null);
+}
+
+test "the bash description names the web and search functions, within the byte limit" {
+    try std.testing.expect(std.mem.find(u8, bash_description, "web URL") != null);
+    try std.testing.expect(std.mem.find(u8, bash_description, "search QUERY") != null);
+    try std.testing.expect(bash_description.len <= model_tool_schema.description_max_bytes);
 }
 
 const bash = tool_dispatch.Tool{
@@ -157,7 +163,7 @@ test "the bash gateway schema stays byte exact" {
     std.crypto.hash.sha2.Sha256.hash(schema_json, &digest, .{});
     const actual_hex = std.fmt.bytesToHex(digest, .lower);
     try std.testing.expectEqualStrings(
-        "feab827ee35a2cdfa3508264694c6542e81c56c44b4b2b391742f43d417daf3c",
+        "0957e655028fb6b941ec9f47b810463d3e619de745a0a0752071488de9cd5067",
         &actual_hex,
     );
 }

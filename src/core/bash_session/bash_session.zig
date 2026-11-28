@@ -720,14 +720,15 @@ fn sessionEnvScript(alloc: std.mem.Allocator, dir: []const u8, fx_variables: []c
     return out.toOwnedSlice(alloc);
 }
 
-/// Appends the four functions a program calls: `edit PATH` and `write PATH`
-/// change files, and `skill` and `agent` run `fx tool skill` and `fx tool agent`.
-/// Each runs as `'<fx>' tool <verb> "$@"`, and all four are exported to child
-/// bash processes (`export -f edit write skill agent`). They come after the saved
+/// Appends the six functions a program calls: `edit PATH` and `write PATH`
+/// change files, `skill` and `agent` run `fx tool skill` and `fx tool agent`, and
+/// `web URL` and `search QUERY` run `fx tool web` and `fx tool search`.
+/// Each runs as `'<fx>' tool <verb> "$@"`, and all six are exported to child
+/// bash processes (`export -f edit write skill agent web search`). They come after the saved
 /// state loads, so they win over a saved definition with the same name, and the
 /// save skips them (`body_after_skip`), so they never reach the state.
 fn appendFxFunctions(alloc: std.mem.Allocator, out: *std.ArrayList(u8), fx_binary: []const u8) !void {
-    for ([_][]const u8{ "edit", "write", "skill", "agent" }) |verb| {
+    for ([_][]const u8{ "edit", "write", "skill", "agent", "web", "search" }) |verb| {
         try out.appendSlice(alloc, verb);
         try out.appendSlice(alloc, "() { ");
         try appendQuotedWord(alloc, out, &.{fx_binary});
@@ -735,7 +736,7 @@ fn appendFxFunctions(alloc: std.mem.Allocator, out: *std.ArrayList(u8), fx_binar
         try out.appendSlice(alloc, verb);
         try out.appendSlice(alloc, " \"$@\"; }\n");
     }
-    try out.appendSlice(alloc, "builtin export -f edit write skill agent\n");
+    try out.appendSlice(alloc, "builtin export -f edit write skill agent web search\n");
 }
 
 /// The kind of the entry `name` in `folder`, without following a link, or null
@@ -959,7 +960,7 @@ const body_after_skip =
     \\      {
     \\        for __fx_name in $(\builtin compgen -A function); do
     \\          case $__fx_name in
-    \\            __fx_*|alias|builtin|cd|command|declare|eval|exec|exit|printf|set|shopt|source|trap|unalias|unset|edit|write|skill|agent|.) builtin continue ;;
+    \\            __fx_*|alias|builtin|cd|command|declare|eval|exec|exit|printf|set|shopt|source|trap|unalias|unset|edit|write|skill|agent|web|search|.) builtin continue ;;
     \\          esac
     \\          builtin declare -f "$__fx_name"
     \\        done
@@ -1094,7 +1095,7 @@ test "the bash script keeps the reviewed bytes" {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    try std.testing.expectEqualStrings("f28eaf5bcd21ed3ba67d0b4f21c80b74665d1a39e24c295645f286dc1fcd0198", &hex);
+    try std.testing.expectEqualStrings("db5605207d99709ac6d0c51c2aaa33ab11ec4a6b395065fd85d84dc083f2b756", &hex);
 }
 
 /// Writes an executable shell script at `path` that prints its arguments, standing
@@ -1216,6 +1217,103 @@ test "exported edit and write work in a bash -c child process, and stay out of t
     try std.testing.expect(std.mem.find(u8, state, "BASH_FUNC_") == null);
     try std.testing.expect(std.mem.find(u8, state, "export -f") == null);
     try std.testing.expect(std.mem.find(u8, state, "x=\"kept\"") != null);
+}
+
+test "the session defines web and search after the state loads, with an fx path that has a space" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const fx_path = try alloc.print("{s}/fx bin", .{root});
+    defer alloc.free(fx_path);
+    try makeFakeFx(io, fx_path);
+
+    var session = Session.init(alloc);
+    defer _ = session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables, fx_path);
+
+    const result = try runProgram(alloc, io, &session, root, "t1", "web https://example.com/a; search zig release");
+    defer freeRun(alloc, result);
+    try expectExit(result, 0);
+    try std.testing.expectEqualStrings("tool web https://example.com/a\ntool search zig release\n", result.stdout);
+}
+
+test "a saved state that defines web or search does not win over the fx functions" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const fx_path = try alloc.print("{s}/fx bin", .{root});
+    defer alloc.free(fx_path);
+    try makeFakeFx(io, fx_path);
+
+    var session = Session.init(alloc);
+    defer _ = session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables, fx_path);
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+    try writePrivateFile(io, folder, state_file, "web() { echo saved; }\nsearch() { echo saved; }\n");
+
+    const result = try runProgram(alloc, io, &session, root, "t1", "web https://example.com/a; search zig");
+    defer freeRun(alloc, result);
+    try expectExit(result, 0);
+    try std.testing.expectEqualStrings("tool web https://example.com/a\ntool search zig\n", result.stdout);
+}
+
+test "the web and search functions are never saved into the state" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const fx_path = try alloc.print("{s}/fx bin", .{root});
+    defer alloc.free(fx_path);
+    try makeFakeFx(io, fx_path);
+
+    var session = Session.init(alloc);
+    defer _ = session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables, fx_path);
+    const result = try runProgram(alloc, io, &session, root, "t1", "web https://example.com/a && search zig && x=kept");
+    defer freeRun(alloc, result);
+    try expectExit(result, 0);
+
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+    const state = try folder.readFileAlloc(io, state_file, alloc, .limited(1 << 20));
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.find(u8, state, "web () ") == null);
+    try std.testing.expect(std.mem.find(u8, state, "search () ") == null);
+    try std.testing.expect(std.mem.find(u8, state, "x=\"kept\"") != null);
+}
+
+test "exported web and search work in a bash -c child process" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const fx_path = try alloc.print("{s}/fx bin", .{root});
+    defer alloc.free(fx_path);
+    try makeFakeFx(io, fx_path);
+
+    var session = Session.init(alloc);
+    defer _ = session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables, fx_path);
+
+    const result = try runProgram(alloc, io, &session, root, "t1", "bash -c 'web https://example.com/a && search zig' && x=kept");
+    defer freeRun(alloc, result);
+    try expectExit(result, 0);
+    try std.testing.expectEqualStrings("tool web https://example.com/a\ntool search zig\n", result.stdout);
 }
 
 test "the session defines skill and agent after the state loads, with an fx path that has a space" {

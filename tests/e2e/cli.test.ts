@@ -485,9 +485,17 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx tool help documents edit, write, skill, agent, and the exit codes",
+    "fx tool help documents edit, write, skill, agent, web, search, and the exit codes",
     async () => {
-      for (const args of [["tool"], ["tool", "--help"], ["tool", "edit", "--help"], ["tool", "skill", "--help"], ["tool", "agent", "--help"]]) {
+      for (const args of [
+        ["tool"],
+        ["tool", "--help"],
+        ["tool", "edit", "--help"],
+        ["tool", "skill", "--help"],
+        ["tool", "agent", "--help"],
+        ["tool", "web", "--help"],
+        ["tool", "search", "--help"],
+      ]) {
         const r = await runFx(args);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
@@ -497,6 +505,10 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.stdout).toContain("open NAME [FILE]");
         expect(r.stdout).toContain("agent");
         expect(r.stdout).toContain("message NAME TEXT");
+        expect(r.stdout).toContain("web URL");
+        expect(r.stdout).toContain("search QUERY");
+        expect(r.stdout).toContain("--allow-domain");
+        expect(r.stdout).toContain("--block-domain");
         expect(r.stdout).toContain("Exit codes:");
         expect(r.stdout).toContain("5 denied");
         expect(r.stdout).toContain("6 ");
@@ -524,6 +536,38 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.code).toBe(2);
         expect(r.stdout).toBe("");
         expect(r.stderr.length).toBeGreaterThan(0);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx tool web and search reject bad usage with exit 2, and run outside a program with exit 3",
+    async () => {
+      for (const args of [
+        ["tool", "web"],
+        ["tool", "web", ""],
+        ["tool", "web", "https://example.com", "extra"],
+        ["tool", "web", "--raw", "https://example.com"],
+        ["tool", "search"],
+        ["tool", "search", "a"],
+        ["tool", "search", ""],
+        ["tool", "search", "zig", "--allow-domain", "a.example", "--block-domain", "b.example"],
+        ["tool", "search", "zig", "--json"],
+        ["tool", "search", "zig", "--allow-domain="],
+      ]) {
+        const r = await runFx(args);
+        expect(r.code).toBe(2);
+        expect(r.stdout).toBe("");
+        expect(r.stderr.length).toBeGreaterThan(0);
+      }
+      for (const args of [
+        ["tool", "web", "https://example.com/a"],
+        ["tool", "search", "zig", "--allow-domain", "example.com"],
+      ]) {
+        const r = await runFx(args);
+        expect(r.code).toBe(3);
+        expect(r.stdout).toBe("");
       }
     },
     TIMEOUT,

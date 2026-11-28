@@ -90,6 +90,7 @@ else
     struct {};
 const builtin_tools = @import("../../builtins/tools.zig");
 const bash_tools = @import("../../builtins/bash_tools.zig");
+const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_projection_mod = @import("../tooling/tool_projection.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
@@ -1062,6 +1063,7 @@ const AskContext = struct {
             });
         }
         var tc: tool_runtime.Context = .{
+            .nested_tool_registry = if (comptime tool_bridge.supported) builtin_tools.registry else null,
             .workspace_root = self.workspace_root,
             .access_scope = self.workspace_access.scope(self.workspace_root),
             .ignored_list_entries = self.cfg.ignored_list_entries,

@@ -398,6 +398,7 @@ pub fn Bindings(comptime App: type) type {
                 .record_tool_call_failed = agentRecordToolCallFailed,
                 .report_usage = agentReportUsage,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
+                .report_bash_session_search_requests = agentReportBashSessionSearchRequests,
                 .diff_marker_styles = .{
                     .added = ui_render.diff_added_marker_style,
                     .removed = ui_render.diff_removed_marker_style,
@@ -1589,6 +1590,11 @@ pub fn Bindings(comptime App: type) type {
             agents.addTotal(&agent.total_web_search_requests, @as(u64, usage.web_search_requests));
         }
 
+        fn agentReportBashSessionSearchRequests(ctx: *anyopaque, web_search_requests: u64) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            agents.addTotal(&agent.total_web_search_requests, web_search_requests);
+        }
+
         fn workerBridgeWriteUserPrompt(ctx: *anyopaque, prompt: types.UserTurn) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
@@ -2711,6 +2717,17 @@ test "inner search tokens do not replace outer context counters" {
     try std.testing.expectEqual(@as(u64, 100), app.agent().total_input_tokens);
     try std.testing.expectEqual(@as(u64, 20), app.agent().total_output_tokens);
     try std.testing.expectEqual(@as(u64, 4), app.agent().total_web_search_requests);
+}
+
+test "a bash session's bridged searches add their requests to the agent's search total, as a direct search's do" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app, (&app).agent());
+    const report = deps.report_bash_session_search_requests orelse return error.TestExpectedEqual;
+    report(deps.ctx, 1);
+
+    try std.testing.expectEqual(@as(u64, 1), app.agent().total_web_search_requests);
 }
 
 test "agent diff block callback enqueues worker event without direct transcript mutation" {

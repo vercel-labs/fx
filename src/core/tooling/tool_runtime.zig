@@ -1,5 +1,6 @@
 const std = @import("std");
 const toolbox = @import("toolbox.zig");
+const execution_memory = @import("../agent/execution_memory.zig");
 const observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -75,6 +76,8 @@ const mcp_tool_lookup = @import("../mcp/tool_lookup.zig");
 const tool_presentation = @import("tool_presentation.zig");
 const agent_tool_presentation = @import("../agent/runtime/tool_presentation.zig");
 const shell_impl = @import("../../tools/shell/shell.zig");
+const web_fetch_impl = @import("../../tools/web/fetch.zig");
+const web_search_impl = @import("../../tools/web/search.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
 const web_search_contract = @import("web_search_contract.zig");
@@ -87,6 +90,10 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
+else
+    struct {};
+const test_bash_tools = if (builtin.is_test)
+    @import("../../builtins/bash_tools.zig")
 else
     struct {};
 const test_builtin_gateway = if (builtin.is_test)
@@ -230,6 +237,10 @@ pub const Context = struct {
     provider_strict: bool = false,
     first_call_tool_choice: types.ToolChoice = .auto,
     tool_registry: tool_dispatch.Registry = .{},
+    /// The registry a bridged call's permission contract comes from when the
+    /// session's `tool_registry` lacks the tool. Hosts set it to the built-in
+    /// registry. Null means such a call is refused, so a missed tool fails closed.
+    nested_tool_registry: ?tool_dispatch.Registry = null,
     host_tool_provider: ?tool_dispatch.HostToolProvider = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
@@ -989,6 +1000,7 @@ fn executeRegisteredTool(
     var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
     var dispatch_metadata: DispatchMetadata = .{};
+    var bridge_usage = BridgeUsage{ .total = &dispatch_metadata.inner_usage };
     var subagent_provider = SubagentProviderState{
         .runtime = ctx,
         .call = call,
@@ -1023,6 +1035,7 @@ fn executeRegisteredTool(
     const bash_program = if (registry.lookup(call.name)) |tool| tool.captured_command_host == .bash_session else false;
     if ((ctx.mcp_ctx != null and ctx.mcp_call_tool != null) or bash_program) {
         mcp_call_bridge.file_ops = bash_program;
+        mcp_call_bridge.usage = &bridge_usage;
         dispatch_ctx.mcp_call_capability = mcp_call_bridge.capability();
     }
     dispatch_ctx.toolbox_run = toolbox_run.capability();
@@ -1098,6 +1111,8 @@ const McpCallBridgeState = struct {
     runtime: Context,
     /// Whether this bridge serves file changes: only the bash tool's programs.
     file_ops: bool = false,
+    /// The bash call's usage total, set for the bash tool's bridge only.
+    usage: ?*BridgeUsage = null,
 
     fn capability(self: *McpCallBridgeState) mcp_call_capability.Capability {
         return .{
@@ -1111,6 +1126,25 @@ const McpCallBridgeState = struct {
     }
 };
 
+/// The usage a bash call's bridged searches add to. The bridge serves each request
+/// on its own thread while the bash call waits, so each add takes the lock. The
+/// bash call reads the total only after its bridge calls have finished.
+const BridgeUsage = struct {
+    lock: std.Io.Mutex = .init,
+    total: *?types.ToolUsage,
+
+    fn add(self: *BridgeUsage, spent: types.ToolUsage) void {
+        const io = io_mod.getIo();
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        var sum = self.total.* orelse types.ToolUsage{};
+        sum.input_tokens += spent.input_tokens;
+        sum.output_tokens += spent.output_tokens;
+        sum.web_search_requests += spent.web_search_requests;
+        self.total.* = sum;
+    }
+};
+
 fn authorizeBridgeBashTool(
     raw: *anyopaque,
     arena: Allocator,
@@ -1120,6 +1154,12 @@ fn authorizeBridgeBashTool(
     const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
     const ctx = state.runtime;
     const call = try bridgeBashToolCall(ctx, arena, request_id, operation);
+    // A web request this check refuses never reaches a permission prompt, as a direct web call does not.
+    if (try bridgeWebRefusal(ctx, arena, operation, call)) |text| {
+        const refused = try arena.create(BridgeAuthority);
+        refused.* = .{ .bash_tool = .{ .ctx = ctx, .operation = operation, .tool_call = call, .refusal = text } };
+        return .{ .allow = .{ .prepared = refused } };
+    }
     const checked_ctx = switch (try checkNestedCall(ctx, arena, call, null)) {
         .allow => |allowed_ctx| allowed_ctx,
         .deny => |why| return .{ .deny = why },
@@ -1129,8 +1169,47 @@ fn authorizeBridgeBashTool(
         .ctx = checked_ctx,
         .operation = operation,
         .tool_call = call,
+        .usage = state.usage,
     } };
     return .{ .allow = .{ .prepared = authority } };
+}
+
+const web_search_needs_gateway_text = "web search needs the AI Gateway provider; use web to fetch a page you know.";
+
+/// The refusal a web request gets before its permission check: what the direct
+/// web tool refuses when its decode or validation rejects the call, and a search
+/// with no backend. Null when the request may go on to its check.
+fn bridgeWebRefusal(
+    ctx: Context,
+    arena: Allocator,
+    operation: mcp_call_capability.BashToolRequest,
+    call: ToolCall,
+) !?[]const u8 {
+    const dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
+    switch (operation) {
+        .web_fetch => {
+            const decoded = try web_fetch_impl.decode(dispatch_ctx, call.arguments_json);
+            var tool_input = switch (decoded) {
+                .failure => |reason| return reason,
+                .input => |value| value,
+            };
+            defer tool_input.deinit(arena);
+            if (try web_fetch_impl.validate(dispatch_ctx, tool_input)) |reason| return reason;
+            return null;
+        },
+        .web_search => {
+            if (ctx.web_search_backend == null) return web_search_needs_gateway_text;
+            const decoded = try web_search_impl.decode(dispatch_ctx, call.arguments_json);
+            var tool_input = switch (decoded) {
+                .failure => |reason| return reason,
+                .input => |value| value,
+            };
+            defer tool_input.deinit(arena);
+            if (try web_search_impl.validate(dispatch_ctx, tool_input)) |reason| return reason;
+            return null;
+        },
+        else => return null,
+    }
 }
 
 fn bridgeBashToolCall(
@@ -1153,6 +1232,10 @@ const BridgeAuthority = union(enum) {
         ctx: Context,
         operation: mcp_call_capability.BashToolRequest,
         tool_call: ToolCall,
+        /// Why a web request is refused before its call, as its reply says. Null otherwise.
+        refusal: ?[]const u8 = null,
+        /// The bash call's usage total, which a bridged search adds to. Null for a refused call.
+        usage: ?*BridgeUsage = null,
     },
 };
 
@@ -1444,16 +1527,23 @@ fn runBridgeBashToolCall(
     request_id: []const u8,
     operation: mcp_call_capability.BashToolRequest,
     tool_call: ToolCall,
+    refusal: ?[]const u8,
+    usage: ?*BridgeUsage,
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
-    const info = try bashToolRowInfo(arena, operation);
+    const info = try bashToolRowInfo(arena, ctx.nested_tool_registry orelse ctx.tool_registry, operation);
     const row = BridgeCallRow.startAction(ctx, arena, request_id, info.tool, tool_call.arguments_json, info.action);
     if (cancel.load(.acquire)) {
         if (row) |value| value.finishAction(arena, .cancelled);
         debug_trace.logf("mcp-call", "request={s} dropped {s} before it started: canceled", .{ request_id, @tagName(operation) });
         return .{ .status = .failed, .bytes = "Cancelled before starting." };
     }
-    const outcome = executeBridgeBashToolOperation(ctx, arena, operation, tool_call, cancel) catch |err| {
+    if (refusal) |text| {
+        if (row) |value| value.finishAction(arena, .failed);
+        debug_trace.logf("mcp-call", "request={s} refused {s} before its permission check", .{ request_id, @tagName(operation) });
+        return .{ .status = .tool_error, .bytes = text };
+    }
+    const outcome = executeBridgeBashToolOperation(ctx, arena, operation, tool_call, usage, cancel) catch |err| {
         if (row) |value| value.finishAction(arena, if (err == error.Cancelled or cancel.load(.acquire)) .cancelled else .failed);
         if (err == error.Cancelled) {
             debug_trace.logf("mcp-call", "request={s} dropped {s} while it ran: canceled", .{ request_id, @tagName(operation) });
@@ -1468,7 +1558,22 @@ fn runBridgeBashToolCall(
     return outcome;
 }
 
-fn bashToolRowInfo(arena: Allocator, operation: mcp_call_capability.BashToolRequest) !struct {
+/// A bridged web call's row: the web tool's own running and done labels, from its
+/// registered spec, so it reads as a direct call's row does. Its failed label is
+/// the one every non-subagent failed call uses, so the transcript writes the verb
+/// once, as "Couldn't fetch <target>".
+fn webRowAction(arena: Allocator, specs: tool_dispatch.Registry, name: []const u8, target: []const u8) !BridgeCallRow.ActionRow {
+    const spec = specs.lookup(name);
+    return .{
+        .activity_kind = .read,
+        .running_label = if (spec) |tool| tool.action_label else "",
+        .done_label = if (spec) |tool| tool.completed_action_label else "",
+        .failed_label = try tool_presentation.subagentFailureLabel(arena, .{ .id = "", .name = name, .arguments_json = "" }, ""),
+        .target = target,
+    };
+}
+
+fn bashToolRowInfo(arena: Allocator, specs: tool_dispatch.Registry, operation: mcp_call_capability.BashToolRequest) !struct {
     tool: []const u8,
     action: BridgeCallRow.ActionRow,
 } {
@@ -1543,6 +1648,18 @@ fn bashToolRowInfo(arena: Allocator, operation: mcp_call_capability.BashToolRequ
                 .target = try rowPath(arena, agent),
             },
         },
+        .web_fetch => |req| blk: {
+            // Redact credentials and signed query values before building any row or saved summary (RULES.md R1.8, R4.8).
+            const display_url = try text_utils.redactUrlForDisplay(arena, req.url);
+            break :blk .{
+                .tool = "web_fetch",
+                .action = try webRowAction(arena, specs, "web_fetch", try rowPath(arena, display_url)),
+            };
+        },
+        .web_search => |req| .{
+            .tool = "web_search",
+            .action = try webRowAction(arena, specs, "web_search", try rowPath(arena, req.query)),
+        },
     };
 }
 
@@ -1551,12 +1668,80 @@ fn executeBridgeBashToolOperation(
     arena: Allocator,
     operation: mcp_call_capability.BashToolRequest,
     tool_call: ToolCall,
+    usage: ?*BridgeUsage,
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
     return switch (operation) {
         .skill_list => runBridgeSkillList(ctx, arena),
         .skill_open => |req| runBridgeSkillOpen(ctx, arena, req, cancel),
         .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => runBridgeAgentCall(ctx, arena, tool_call, cancel),
+        .web_fetch => runBridgeWebFetch(ctx, arena, tool_call, cancel),
+        .web_search => runBridgeWebSearch(ctx, arena, tool_call, usage, cancel),
+    };
+}
+
+/// Runs a bridged `web` request as the direct web_fetch tool runs it: the same
+/// decode, validation, and call, with the request's cancel flag.
+fn runBridgeWebFetch(
+    ctx: Context,
+    arena: Allocator,
+    tool_call: ToolCall,
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
+    var dispatch_ctx = typedDispatchContextForCall(ctx, arena, tool_call);
+    dispatch_ctx.cancel_flag = cancel;
+    const decoded = try web_fetch_impl.decode(dispatch_ctx, tool_call.arguments_json);
+    var tool_input = switch (decoded) {
+        .failure => |reason| return .{ .status = .tool_error, .bytes = reason },
+        .input => |value| value,
+    };
+    defer tool_input.deinit(arena);
+    if (try web_fetch_impl.validate(dispatch_ctx, tool_input)) |reason| return .{ .status = .tool_error, .bytes = reason };
+    var result = try web_fetch_impl.runForBridge(dispatch_ctx, tool_input.as(web_fetch_impl.Input).*);
+    defer result.deinit(dispatch_ctx.allocator);
+    return bridgeWebOutcome(arena, result);
+}
+
+/// Runs a bridged `search` request as the direct web_search tool runs it. With
+/// no search backend it answers with the next step instead.
+fn runBridgeWebSearch(
+    ctx: Context,
+    arena: Allocator,
+    tool_call: ToolCall,
+    usage: ?*BridgeUsage,
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
+    var dispatch_ctx = typedDispatchContextForCall(ctx, arena, tool_call);
+    dispatch_ctx.cancel_flag = cancel;
+    var inner_usage: ?types.ToolUsage = null;
+    dispatch_ctx.inner_usage_sink = &inner_usage;
+    const decoded = try web_search_impl.decode(dispatch_ctx, tool_call.arguments_json);
+    var tool_input = switch (decoded) {
+        .failure => |reason| return .{ .status = .tool_error, .bytes = reason },
+        .input => |value| value,
+    };
+    defer tool_input.deinit(arena);
+    if (try web_search_impl.validate(dispatch_ctx, tool_input)) |reason| return .{ .status = .tool_error, .bytes = reason };
+    var result = try web_search_impl.runForBridge(dispatch_ctx, tool_input.as(web_search_impl.Input).*);
+    defer result.deinit(dispatch_ctx.allocator);
+    if (inner_usage) |spent| {
+        if (usage) |total| total.add(spent);
+    }
+    return bridgeWebOutcome(arena, result);
+}
+
+/// Copies a web result's data and notice into the request's arena, so the caller
+/// may free the result with its own `deinit`. The notice is null when it is empty.
+fn bridgeWebOutcome(arena: Allocator, result: anytype) !mcp_call_capability.CallOutcome {
+    const bytes = try arena.dupe(u8, result.data);
+    const notice = try arena.dupe(u8, result.notice);
+    return .{
+        .status = switch (result.status) {
+            .ok => .ok,
+            .tool_error => .tool_error,
+        },
+        .bytes = bytes,
+        .notice = if (notice.len == 0) null else notice,
     };
 }
 
@@ -1767,6 +1952,24 @@ const NestedCheck = union(enum) {
 /// with its definition for the review.
 fn checkNestedCall(ctx: Context, arena: Allocator, call: ToolCall, mcp: ?tool_mcp_runtime.SelectedTool) !NestedCheck {
     var check = ctx;
+    // A built-in the session's registry lacks, such as web_fetch in a bash session, is
+    // checked with the host's built-in registry, as a direct call is. Only this copy
+    // changes; the call still runs in the session's registry.
+    if (ctx.tool_registry.lookup(call.name) == null) {
+        if (ctx.nested_tool_registry) |nested| {
+            if (nested.lookup(call.name) != null) check.tool_registry = nested;
+        }
+    }
+    // Admission lets a call with no permission contract through without reading a rule.
+    // Refuse it here instead, so a missed tool fails closed (R4.2).
+    if (mcp == null and
+        check.tool_registry.lookup(call.name) == null and
+        !types.isMcpToolName(call.name) and
+        !tool_mcp_runtime.isAdvertisedDynamicToolName(ctx.advertised_dynamic_tool_names, call.name))
+    {
+        debug_trace.logf("permission", "nested call refused: tool={s} has no permission contract", .{call.name});
+        return .{ .deny = try arena.print("{f} has no permission check in fx, so the call was refused.", .{text_utils.terminalSafe(call.name)}) };
+    }
     if (mcp) |resolved| {
         const names = try arena.alloc([]const u8, ctx.advertised_dynamic_tool_names.len + 1);
         @memcpy(names[0..ctx.advertised_dynamic_tool_names.len], ctx.advertised_dynamic_tool_names);
@@ -1777,7 +1980,10 @@ fn checkNestedCall(ctx: Context, arena: Allocator, call: ToolCall, mcp: ?tool_mc
     }
     check.permission_review_turn = try nestedReviewTurn(ctx, arena, call);
     const outcome = try tool_admission.requestPermissionOutcome(check.admissionInput(), arena, call, ctx.permission_mode, ctx.session_grants);
-    if (!outcome.decision.isDenied() and outcome.tool_failure == null) return .{ .allow = check };
+    if (!outcome.decision.isDenied() and outcome.tool_failure == null) {
+        check.tool_registry = ctx.tool_registry;
+        return .{ .allow = check };
+    }
     if (outcome.tool_failure orelse outcome.feedback) |message| return .{ .deny = message };
     // Say why, as a direct call would: a held review's reason and advice tell
     // the calling command what to change, such as an action too large to
@@ -1915,7 +2121,7 @@ fn runBridgeCall(
             const authority: *BridgeAuthority = @ptrCast(@alignCast(prepared));
             return switch (authority.*) {
                 .file => |*file_auth| runBridgeFileCall(state.runtime, arena, request_id, file_auth, cancel),
-                .bash_tool => |*tool_auth| runBridgeBashToolCall(tool_auth.ctx, arena, request_id, tool_auth.operation, tool_auth.tool_call, cancel),
+                .bash_tool => |*tool_auth| runBridgeBashToolCall(tool_auth.ctx, arena, request_id, tool_auth.operation, tool_auth.tool_call, tool_auth.refusal, tool_auth.usage, cancel),
             };
         }
     }
@@ -2049,7 +2255,7 @@ const BridgeCallRow = struct {
                 .reconciles_provisional_call_id = null,
                 .tool_name = self.tool,
                 .activity_kind = action.activity_kind,
-                .arguments_json = if (arguments_json.len <= max_argument_bytes) try text_utils.maskSecrets(arena, arguments_json) else null,
+                .arguments_json = if (arguments_json.len <= max_argument_bytes) try execution_memory.redactToolArgumentsJson(arena, self.tool, arguments_json) else null,
                 .resolved_display_target = if (action.target.len > 0) action.target else null,
             } });
             try self.publisher.push(.{ .progress = .{
@@ -3455,6 +3661,454 @@ test "bridged skill open reads whole files, enforces skill_file_bytes, and repor
         const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-46", "alpha", "", allowed, &cancel);
         try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
         try std.testing.expect(std.mem.find(u8, outcome.bytes, "skill_file_bytes") != null);
+    }
+}
+
+test "bridged web fetch returns the cached page, and a URL the policy refuses is a tool error before any prompt" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(false);
+
+    // A cached page answers without the network, as a direct fetch of that URL would.
+    var fetch_runtime = web_fetch_runtime.Runtime.init(.{ .allocator = alloc });
+    defer fetch_runtime.deinit(alloc);
+    try fetch_runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/page",
+        .final_url = "https://example.com/page",
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "PAGE BODY\n",
+    });
+
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .web_fetch_runtime = &fetch_runtime };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-60", .{ .web_fetch = .{ .url = "https://example.com/page" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-60", "web_fetch", "", allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "PAGE BODY") != null);
+
+    // Ask mode with no prompt: a prompt would deny, so a tool error proves the URL was refused first.
+    var strict = TestRuntime{ .workspace_root = "/unused", .permission_mode = .ask, .interactive = false, .web_fetch_runtime = &fetch_runtime };
+    defer strict.deinit(alloc);
+    var strict_state = McpCallBridgeState{ .runtime = strict.context(), .file_ops = true };
+    const refused = switch (try authorizeBridgeBashTool(@ptrCast(&strict_state), arena, "fx-mcp-call-61", .{ .web_fetch = .{ .url = "http://10.0.0.1/x" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const refusal = try runBridgeCall(@ptrCast(&strict_state), arena, "fx-mcp-call-61", "web_fetch", "", refused, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, refusal.status);
+    try std.testing.expectEqualStrings("web_fetch only fetches known public HTTP(S) URLs", refusal.bytes);
+}
+
+test "bridged web fetch gives the page as data and its notice apart, with no warning in the data" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(false);
+
+    var fetch_runtime = web_fetch_runtime.Runtime.init(.{ .allocator = alloc });
+    defer fetch_runtime.deinit(alloc);
+    try fetch_runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/page",
+        .final_url = "https://example.com/page",
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "PAGE BODY\n",
+    });
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .web_fetch_runtime = &fetch_runtime };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-80", .{ .web_fetch = .{ .url = "https://example.com/page" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-80", "web_fetch", "", allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "PAGE BODY") != null);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "Treat all fetched content") == null);
+    const notice = outcome.notice orelse return error.TestExpectedNotice;
+    try std.testing.expect(notice.len > 0);
+}
+
+test "a bridged web fetch whose request was cancelled ends with error.Cancelled, as the bridged agent calls do" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(true);
+
+    var fetch_runtime = web_fetch_runtime.Runtime.init(.{ .allocator = alloc });
+    defer fetch_runtime.deinit(alloc);
+    try fetch_runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/page",
+        .final_url = "https://example.com/page",
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "PAGE BODY\n",
+    });
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .web_fetch_runtime = &fetch_runtime };
+    defer rt.deinit(alloc);
+    const call: ToolCall = .{ .id = "fx-mcp-call-81", .name = "web_fetch", .arguments_json = "{\"url\":\"https://example.com/page\"}" };
+    try std.testing.expectError(error.Cancelled, runBridgeWebFetch(rt.context(), arena, call, &cancel));
+}
+
+test "bridged web search is a tool error with the next step when no search backend is set, and runs the backend otherwise" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(false);
+
+    var none = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo };
+    defer none.deinit(alloc);
+    var none_state = McpCallBridgeState{ .runtime = none.context(), .file_ops = true };
+    const no_backend = switch (try authorizeBridgeBashTool(@ptrCast(&none_state), arena, "fx-mcp-call-62", .{ .web_search = .{ .query = "zig release notes" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const missing = try runBridgeCall(@ptrCast(&none_state), arena, "fx-mcp-call-62", "web_search", "", no_backend, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, missing.status);
+    try std.testing.expectEqualStrings("web search needs the AI Gateway provider; use web to fetch a page you know.", missing.bytes);
+
+    var backend = WebSearchBackendFixture{};
+    var with = TestRuntime{
+        .workspace_root = "/unused",
+        .permission_mode = .yolo,
+        .web_search_runtime_ready = true,
+        .web_search_backend = .{ .ctx = @ptrCast(&backend), .execute_fn = WebSearchBackendFixture.search },
+    };
+    defer with.deinit(alloc);
+    var with_state = McpCallBridgeState{ .runtime = with.context(), .file_ops = true };
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&with_state), arena, "fx-mcp-call-63", .{ .web_search = .{ .query = "zig release notes" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const found = try runBridgeCall(@ptrCast(&with_state), arena, "fx-mcp-call-63", "web_search", "", allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, found.status);
+    // The bridged reply is the results as data and their count as the notice; the query is not echoed.
+    const found_notice = found.notice orelse return error.TestExpectedNotice;
+    try std.testing.expect(std.mem.find(u8, found_notice, "0 results") != null);
+    try std.testing.expectEqual(@as(usize, 1), backend.calls);
+}
+
+test "a deny rule for a web host refuses a bridged fetch at its permission check" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var deny_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("web_fetch"),
+        .pattern = @constCast("domain:example.com"),
+        .action = .deny,
+    }};
+    var rt = TestRuntime{
+        .workspace_root = "/unused",
+        .permission_mode = .ask,
+        .interactive = false,
+        .permission_rules = .{ .rules = &deny_rules },
+    };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-64", .{ .web_fetch = .{ .url = "https://example.com/page" } })) {
+        .allow => return error.TestExpectedDeny,
+        .deny => {},
+    }
+}
+
+test "bridged web rows show Fetching or Searching with the url or the query, and their failed labels" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fetch = try bashToolRowInfo(arena, test_builtin_tools.registry, .{ .web_fetch = .{ .url = "https://example.com/page" } });
+    try std.testing.expectEqualStrings("web_fetch", fetch.tool);
+    try std.testing.expect(fetch.action.activity_kind == .read);
+    try std.testing.expectEqualStrings("Fetching", fetch.action.running_label);
+    try std.testing.expectEqualStrings("Fetched", fetch.action.done_label);
+    try std.testing.expectEqualStrings("Failed", fetch.action.failed_label);
+    try std.testing.expectEqualStrings("https://example.com/page", fetch.action.target);
+    const search = try bashToolRowInfo(arena, test_builtin_tools.registry, .{ .web_search = .{ .query = "zig release notes" } });
+    try std.testing.expectEqualStrings("web_search", search.tool);
+    try std.testing.expect(search.action.activity_kind == .read);
+    try std.testing.expectEqualStrings("Searching", search.action.running_label);
+    try std.testing.expectEqualStrings("Searched", search.action.done_label);
+    try std.testing.expectEqualStrings("Failed", search.action.failed_label);
+    try std.testing.expectEqualStrings("zig release notes", search.action.target);
+}
+
+test "a failed bridged web row says Failed once with its target terminal-safe, and runs under the web tool's own labels" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .nested_tool_registry = test_builtin_tools.registry };
+    defer rt.deinit(alloc);
+    var rows = RowRecorder{ .alloc = alloc };
+    defer rows.deinit();
+    var ctx = rt.context();
+    ctx.nested_tool_lifecycle = .{ .context = @ptrCast(&rows), .push_fn = RowRecorder.push, .save_bridge_call_fn = RowRecorder.save };
+    ctx.output_chunk_lifecycle_id = .{ .turn_id = 5, .call_id = "shell-call-2" };
+    var state = McpCallBridgeState{ .runtime = ctx, .file_ops = true };
+
+    // A private address is refused before any fetch, so its row fails at once.
+    const fetch_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-90", .{ .web_fetch = .{ .url = "http://10.0.0.1/\x1b[31mX" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    _ = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-90", "web_fetch", "", fetch_allowed, &cancel);
+    // With no search backend, a search fails at once.
+    const search_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-91", .{ .web_search = .{ .query = "zig\x1b[31m release" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    _ = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-91", "web_search", "", search_allowed, &cancel);
+
+    try std.testing.expectEqual(@as(usize, 6), rows.lines.items.len);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[1], "Fetching") != null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[2], "● Failed\x1b[0m ") != null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[2], "Failed fetch") == null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[2], "\x1b[31m") == null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[4], "Searching") != null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[5], "● Failed\x1b[0m ") != null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[5], "Failed search") == null);
+    try std.testing.expect(std.mem.find(u8, rows.lines.items[5], "\x1b[31m") == null);
+}
+
+test "bridged web_fetch rows, saved summaries, and started arguments redact url userinfo and signed query values" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Recorder = struct {
+        alloc: Allocator,
+        started_args: std.ArrayList(?[]u8) = .empty,
+        started_targets: std.ArrayList(?[]u8) = .empty,
+        lines: std.ArrayList([]u8) = .empty,
+        saved_summaries: std.ArrayList(?[]u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.started_args.items) |v| if (v) |s| self.alloc.free(s);
+            self.started_args.deinit(self.alloc);
+            for (self.started_targets.items) |v| if (v) |s| self.alloc.free(s);
+            self.started_targets.deinit(self.alloc);
+            for (self.lines.items) |s| self.alloc.free(s);
+            self.lines.deinit(self.alloc);
+            for (self.saved_summaries.items) |v| if (v) |s| self.alloc.free(s);
+            self.saved_summaries.deinit(self.alloc);
+        }
+
+        fn push(raw: *anyopaque, event: types.ToolLifecycleEvent) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .authoritative_started => |started| {
+                    try self.started_args.append(
+                        self.alloc,
+                        if (started.arguments_json) |json| try self.alloc.dupe(u8, json) else null,
+                    );
+                    try self.started_targets.append(
+                        self.alloc,
+                        if (started.resolved_display_target) |target| try self.alloc.dupe(u8, target) else null,
+                    );
+                },
+                .progress => |progress| try self.lines.append(self.alloc, try self.alloc.dupe(u8, progress.text)),
+                .terminal => |terminal| try self.lines.append(self.alloc, try self.alloc.dupe(u8, terminal.outcome.summary)),
+                else => {},
+            }
+        }
+
+        fn save(raw: *anyopaque, record: types.BridgeCallRecord) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.saved_summaries.append(
+                self.alloc,
+                if (record.summary) |s| try self.alloc.dupe(u8, s) else null,
+            );
+        }
+    };
+
+    var fetch_runtime = web_fetch_runtime.Runtime.init(.{ .allocator = alloc });
+    defer fetch_runtime.deinit(alloc);
+    const ok_url = "https://example.com/p?X-Amz-Signature=SECRET_AMZ_1&token=SECRET_TOK_1";
+    const fail_url = "http://u:SECRET_PASS_2@10.0.0.1/p?X-Amz-Signature=SECRET_AMZ_2&token=SECRET_TOK_2";
+    try fetch_runtime.insert(alloc, .{
+        .submitted_url = ok_url,
+        .final_url = ok_url,
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "cached page",
+    });
+
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{
+        .workspace_root = "/unused",
+        .permission_mode = .yolo,
+        .nested_tool_registry = test_builtin_tools.registry,
+        .web_fetch_runtime = &fetch_runtime,
+    };
+    defer rt.deinit(alloc);
+
+    var rec = Recorder{ .alloc = alloc };
+    defer rec.deinit();
+    var ctx = rt.context();
+    ctx.nested_tool_lifecycle = .{ .context = @ptrCast(&rec), .push_fn = Recorder.push, .save_bridge_call_fn = Recorder.save };
+    ctx.output_chunk_lifecycle_id = .{ .turn_id = 6, .call_id = "shell-call-redact" };
+    var state = McpCallBridgeState{ .runtime = ctx, .file_ops = true };
+
+    const ok_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-100", .{ .web_fetch = .{ .url = ok_url } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const ok_outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-100", "web_fetch", "", ok_allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, ok_outcome.status);
+
+    const fail_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-101", .{ .web_fetch = .{ .url = fail_url } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const fail_outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-101", "web_fetch", "", fail_allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, fail_outcome.status);
+
+    const expected_ok = "https://example.com/p?X-Amz-Signature=[redacted]&token=[redacted]";
+    const expected_fail = "http://[redacted]@10.0.0.1/p?X-Amz-Signature=[redacted]&token=[redacted]";
+    const secrets = [_][]const u8{
+        "SECRET_AMZ_1",
+        "SECRET_TOK_1",
+        "SECRET_PASS_2",
+        "SECRET_AMZ_2",
+        "SECRET_TOK_2",
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), rec.started_args.items.len);
+    try std.testing.expectEqual(@as(usize, 4), rec.lines.items.len);
+    try std.testing.expectEqual(@as(usize, 2), rec.saved_summaries.items.len);
+
+    for (rec.started_args.items, [_][]const u8{ expected_ok, expected_fail }) |maybe_args, expected| {
+        const args = maybe_args orelse return error.TestExpectedEqual;
+        for (secrets) |secret| try std.testing.expect(std.mem.find(u8, args, secret) == null);
+        try std.testing.expect(std.mem.find(u8, args, expected) != null);
+    }
+    for (rec.started_targets.items, [_][]const u8{ expected_ok, expected_fail }) |maybe_target, expected| {
+        const target = maybe_target orelse return error.TestExpectedEqual;
+        for (secrets) |secret| try std.testing.expect(std.mem.find(u8, target, secret) == null);
+        try std.testing.expectEqualStrings(expected, target);
+    }
+    for (rec.lines.items) |line| {
+        for (secrets) |secret| try std.testing.expect(std.mem.find(u8, line, secret) == null);
+    }
+    // Running, done, and failed rows carry the redacted URL.
+    try std.testing.expect(std.mem.find(u8, rec.lines.items[0], expected_ok) != null);
+    try std.testing.expect(std.mem.find(u8, rec.lines.items[1], expected_ok) != null);
+    try std.testing.expect(std.mem.find(u8, rec.lines.items[2], expected_fail) != null);
+    try std.testing.expect(std.mem.find(u8, rec.lines.items[3], expected_fail) != null);
+    for (rec.saved_summaries.items, [_][]const u8{ expected_ok, expected_fail }) |maybe_summary, expected| {
+        const summary = maybe_summary orelse return error.TestExpectedEqual;
+        for (secrets) |secret| try std.testing.expect(std.mem.find(u8, summary, secret) == null);
+        try std.testing.expect(std.mem.find(u8, summary, expected) != null);
+    }
+}
+
+test "bridged web_fetch under a domain deny rule is refused when the bash session's registry lacks web_fetch" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The registry `fx ask` gives a bash session: the advertised tools, without web_fetch.
+    const bash_registry = test_bash_tools.select(true, test_builtin_tools.advertisement_set).registry;
+    var deny_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("web_fetch"),
+        .pattern = @constCast("domain:example.com"),
+        .action = .deny,
+    }};
+    var rt = TestRuntime{
+        .workspace_root = "/unused",
+        .permission_mode = .ask,
+        .interactive = false,
+        .permission_rules = .{ .rules = &deny_rules },
+        .tool_registry = bash_registry,
+        .nested_tool_registry = test_builtin_tools.registry,
+    };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-70", .{ .web_fetch = .{ .url = "https://example.com/page" } })) {
+        .allow => return error.TestExpectedDeny,
+        .deny => {},
+    }
+}
+
+test "bridged web_search under a deny rule is refused when the bash session's registry lacks web_search" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bash_registry = test_bash_tools.select(true, test_builtin_tools.advertisement_set).registry;
+    var backend = WebSearchBackendFixture{};
+    var deny_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("web_search"),
+        .pattern = @constCast("*"),
+        .action = .deny,
+    }};
+    var rt = TestRuntime{
+        .workspace_root = "/unused",
+        .permission_mode = .ask,
+        .interactive = false,
+        .permission_rules = .{ .rules = &deny_rules },
+        .tool_registry = bash_registry,
+        .nested_tool_registry = test_builtin_tools.registry,
+        .web_search_runtime_ready = true,
+        .web_search_backend = .{ .ctx = @ptrCast(&backend), .execute_fn = WebSearchBackendFixture.search },
+    };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-71", .{ .web_search = .{ .query = "zig release notes" } })) {
+        .allow => return error.TestExpectedDeny,
+        .deny => {},
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.calls);
+}
+
+test "a nested call of a tool with no permission contract is refused with its name, not allowed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo };
+    defer rt.deinit(alloc);
+    const call: ToolCall = .{ .id = "nested-made-up", .name = "made_up_tool", .arguments_json = "{}" };
+    switch (try checkNestedCall(rt.context(), arena, call, null)) {
+        .allow => return error.TestExpectedDeny,
+        .deny => |why| try std.testing.expect(std.mem.find(u8, why, "made_up_tool") != null),
+    }
+}
+
+test "a bridged web_fetch with no nested registry is refused, not allowed, because the built-in contract is unknown" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bash_registry = test_bash_tools.select(true, test_builtin_tools.advertisement_set).registry;
+    // Yolo with no rule: a call that reaches admission's allow branch would pass.
+    var rt = TestRuntime{
+        .workspace_root = "/unused",
+        .permission_mode = .yolo,
+        .tool_registry = bash_registry,
+        .nested_tool_registry = null,
+    };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-72", .{ .web_fetch = .{ .url = "https://example.com/page" } })) {
+        .allow => return error.TestExpectedDeny,
+        .deny => {},
     }
 }
 
@@ -5197,6 +5851,7 @@ const TestRuntime = struct {
     observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     tool_registry: tool_dispatch.Registry = test_tool_registry,
+    nested_tool_registry: ?tool_dispatch.Registry = null,
     worker: WorkerRuntime = .{},
     session: SessionRuntime = .{ .max_history_turns = 8 },
     subagent_host: ?*subagent_tool_host.Runtime = null,
@@ -5286,6 +5941,7 @@ const TestRuntime = struct {
             .session_grants = self.session_grants,
             .permission_rules = self.permission_rules,
             .tool_registry = self.tool_registry,
+            .nested_tool_registry = self.nested_tool_registry,
             .subagent_host = self.subagent_host,
             .subagent_caller_id = self.subagent_caller_id,
             .worker = &self.worker,
@@ -8361,7 +9017,6 @@ test "run_command timeout returns model-visible failure" {
 
     const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
     const runtime_config = @import("../agent/runtime/config.zig");
-    const execution_memory = @import("../agent/execution_memory.zig");
     const session_codec = @import("../session/session_codec.zig");
 
     var cancel = std.atomic.Value(bool).init(false);
