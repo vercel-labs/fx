@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../../stream_provider.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
+const shell_snapshot = @import("../../../terminal/shell_snapshot.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const types = @import("../../../shared/types.zig");
 const cache_warmer = @import("../cache_warmer.zig");
@@ -519,6 +520,10 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_permission_mode: ?PermissionMode = null,
     propagated_grants: std.ArrayList(PermissionGrant) = .empty,
     event_grants: std.ArrayList(PermissionGrant) = .empty,
+    /// Makes the shell approval epoch advance once, after the first answer and
+    /// before the grant that answer keeps is recorded.
+    refresh_before_record: bool = false,
+    refresh_count: usize = 0,
     last_execute_grants: std.ArrayList(PermissionGrant) = .empty,
     last_live_authority_generation: ?u64 = null,
     last_live_authority_tool_count: usize = 0,
@@ -1421,11 +1426,11 @@ pub const FakeAgentRuntimeDeps = struct {
             .human_approval = if (permission_index < self.permission_human_approvals.len)
                 self.permission_human_approvals[permission_index]
             else if (decision == .once)
-                .once
+                .{ .kind = .once, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() }
             else if (decision == .always)
-                .always
+                .{ .kind = .always, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() }
             else
-                .none,
+                command_admission.no_human_approval,
             .denial_reason = denial_reason,
             .feedback = if (feedback.len == 0) null else try arena.dupe(u8, feedback),
             .auto_review_result = auto_review_result,
@@ -1581,8 +1586,16 @@ pub const FakeAgentRuntimeDeps = struct {
         return arena.print("{s} {s}", .{ label, call.name });
     }
 
+    fn refreshBeforeRecord(self: *FakeAgentRuntimeDeps) void {
+        if (!self.refresh_before_record or self.permission_index == 0) return;
+        self.refresh_before_record = false;
+        shell_snapshot.processOwner().markDirty(.user_reload);
+        self.refresh_count += 1;
+    }
+
     fn permissionTarget(raw: *anyopaque, arena: Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.refreshBeforeRecord();
         if (self.resolve_permission_target) {
             return permissions.permissionTargetForCall(
                 arena,
@@ -1659,6 +1672,7 @@ pub const FakeAgentRuntimeDeps = struct {
             self.last_execute_grants.clearRetainingCapacity();
             for (request.session_grants) |grant| {
                 try self.last_execute_grants.append(self.alloc, .{
+                    .shell_epoch = grant.shell_epoch,
                     .tool_name = try self.alloc.dupe(u8, grant.tool_name),
                     .target_path = try self.alloc.dupe(u8, grant.target_path),
                 });
@@ -1850,11 +1864,12 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn propagateGrant(raw: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
+    fn propagateGrant(raw: *anyopaque, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try appendGrant(self.alloc, &self.propagated_grants, .{
             .tool_name = @constCast(tool_name),
             .target_path = @constCast(target_path),
+            .shell_epoch = shell_epoch,
         });
         try self.record("propagate_grant:{s}:{s}", .{ tool_name, target_path });
     }
@@ -2317,6 +2332,7 @@ fn freeStringList(alloc: Allocator, list: *std.ArrayList([]u8)) void {
 
 fn appendGrant(alloc: Allocator, list: *std.ArrayList(PermissionGrant), grant: PermissionGrant) !void {
     try list.append(alloc, .{
+        .shell_epoch = grant.shell_epoch,
         .tool_name = try alloc.dupe(u8, grant.tool_name),
         .target_path = try alloc.dupe(u8, grant.target_path),
     });

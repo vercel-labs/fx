@@ -5,7 +5,7 @@
 //! folder search never reuses a snapshot cut at the candidate cap. Any other
 //! search scans its root.
 //! Nothing here saves a snapshot, so searches outside the workspace leave no
-//! trace under `~/.fx/file-index/`.
+//! trace under `file-index/` under the fx profile folder.
 
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");

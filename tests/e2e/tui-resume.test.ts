@@ -111,6 +111,19 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+function manualUpgradeEnv(
+  home: string,
+  gateway: ReturnType<typeof startFakeGateway> | ReturnType<typeof startDynamicFakeGateway>,
+  release: { baseUrl: string },
+) {
+  return {
+    ...gatewayEnv(home, gateway),
+    FX_AUTO_UPGRADE: "1",
+    FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+    FX_TEST_UPGRADE_IDLE_QUIET_MS: "3600000",
+  };
+}
+
 function gatewayEnv(
   home: string,
   gateway: ReturnType<typeof startFakeGateway>,
@@ -6361,9 +6374,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: realpathSync(workspace),
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
         },
         stderrPath,
@@ -6394,6 +6405,84 @@ test.skipIf(!tmuxAvailable())(
       expect(launches).toHaveLength(1);
       expect(launches[0]![0]).toBe(installedFx);
       expect(launches[0]).toContain("--upgrade-relaunch");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      release.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a dev release with a lower build number never replaces the one installed",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-build-number-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ update_channel: "dev" }));
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+    // Build numbers far above any real count of main's commits, so the first
+    // release installs whatever number this build carries.
+    const firstRevision = "1111111111111111111111111111111111111111";
+    const staleRevision = "3333333333333333333333333333333333333333";
+    const newestRevision = "2222222222222222222222222222222222222222";
+    const installed = () => readFileSync(installedFx, "utf8");
+
+    let active: TmuxSession | null = null;
+    const gateway = startFakeGateway([]);
+    const release = startUpgradeServer(root, argvLogPath, { revision: firstRevision, build: 10_000_005 });
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      expect(installed()).toContain(`# fake fx release ${firstRevision}`);
+
+      // A stale manifest names an older build with another commit. Three more
+      // checks read it, and none installs it.
+      release.setRevision(staleRevision, 10_000_003);
+      const checked = release.devChecks() + 3;
+      for (const deadline = Date.now() + UPGRADE_TIMEOUT; release.devChecks() < checked; await Bun.sleep(50)) {
+        if (Date.now() > deadline) throw new Error("fx stopped reading dev.json");
+      }
+      expect(installed()).toContain(`# fake fx release ${firstRevision}`);
+      expect(installed()).not.toContain(staleRevision);
+
+      // A newer build replaces it.
+      release.setRevision(newestRevision, 10_000_007);
+      const deadline = Date.now() + UPGRADE_TIMEOUT;
+      while (!installed().includes(`# fake fx release ${newestRevision}`)) {
+        if (Date.now() > deadline) throw new Error(`the newer dev release was never installed:\n${installed().slice(0, 200)}`);
+        await Bun.sleep(100);
+      }
+      expect(await active.capturePane()).toContain("update ready: ctrl+g to reload");
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
       await active.kill();
@@ -6502,9 +6591,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "core,session",
         },
@@ -6662,9 +6749,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
         },
         stderrPath,
         width: 110,
@@ -6765,9 +6850,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker",
           FX_RECORD: tapeBefore,
@@ -6785,7 +6868,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Ctrl+G while the turn runs: the upgrade waits instead of refusing.
       await active.sendHexBytes(["07"]);
-      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops", TIMEOUT);
       // A draft in the composer holds the restart, so the screen before it
       // can be checked.
       await active.sendLiteralText("HOLD");
@@ -6799,13 +6882,13 @@ test.skipIf(!tmuxAvailable())(
       // With the composer empty, fx relaunches and the new build continues
       // the same turn, with one line that says so.
       await active.sendKeys("BSpace BSpace BSpace BSpace");
-      await active.waitForText("continuing the turn after the upgrade", UPGRADE_TIMEOUT);
+      await active.waitForText("continuing the turn after the update", UPGRADE_TIMEOUT);
       // While the continued request waits, its status line is the plain
       // one, never a retry's.
       await continuedAsked.fired;
       expect(gateway.requests.length).toBe(2);
       const waiting = await active.waitForPane((pane) => {
-        const at = pane.lastIndexOf("continuing the turn after the upgrade");
+        const at = pane.lastIndexOf("continuing the turn after the update");
         return at >= 0 && pane.indexOf("Thinking", at) > at;
       }, UPGRADE_TIMEOUT);
       expect(waiting).not.toContain("Resuming the interrupted request");
@@ -6814,7 +6897,7 @@ test.skipIf(!tmuxAvailable())(
       const scrollback = await active.captureFullScrollback();
       expect(scrollback).not.toContain("What can fx do differently?");
       expect(scrollback).not.toContain("Resuming the interrupted request");
-      expect(countOccurrences(scrollback, "continuing the turn after the upgrade")).toBe(1);
+      expect(countOccurrences(scrollback, "continuing the turn after the update")).toBe(1);
       const argvLines = readFileSync(argvLogPath, "utf8").trim().split("\n");
       expect(argvLines.some((line) => line.split("\t")[3] === "--upgrade-relaunch")).toBe(true);
 
@@ -6854,8 +6937,8 @@ test.skipIf(!tmuxAvailable())(
       expect(tapesShowed([tapeBefore, tapeAfter], ["What can fx do differently?", "Cancelled", "Resuming the interrupted request"], frames)).toEqual([]);
       // The tapes hold each process's output: the stop before the relaunch,
       // the continuation after it.
-      expect(tapesShowed([tapeBefore], ["stopped between steps for the upgrade"], join(frames, "before"))).toEqual(["stopped between steps for the upgrade"]);
-      expect(tapesShowed([tapeAfter], ["continuing the turn after the upgrade"], join(frames, "after"))).toEqual(["continuing the turn after the upgrade"]);
+      expect(tapesShowed([tapeBefore], ["stopped between steps for the update"], join(frames, "before"))).toEqual(["stopped between steps for the update"]);
+      expect(tapesShowed([tapeAfter], ["continuing the turn after the update"], join(frames, "after"))).toEqual(["continuing the turn after the update"]);
       // The yielded turn stays open, so the first launch never reports it to
       // the terminal as failed, only as work in progress.
       const writtenBefore = readTapeFrames(tapeBefore, { ignoreTruncatedTail: true })
@@ -6933,9 +7016,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,upgrade",
         },
@@ -6952,7 +7033,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendHexBytes(["07"]);
       await active.waitForText(
-        "upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip",
+        "update ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip",
         TIMEOUT,
       );
       await active.waitForText("restart pending · ctrl+g cancel", TIMEOUT);
@@ -6965,7 +7046,7 @@ test.skipIf(!tmuxAvailable())(
       expect(relaunched()).toBe(false);
 
       await active.sendHexBytes(["07"]);
-      await active.waitForText("restart cancelled; Ctrl+G restarts for the upgrade later", TIMEOUT);
+      await active.waitForText("restart cancelled; Ctrl+G restarts for the update later", TIMEOUT);
       await secondAsked.fired;
       expect(gateway.requests.length).toBe(2);
       expect(relaunched()).toBe(false);
@@ -7073,9 +7154,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,upgrade",
         },
@@ -7091,7 +7170,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendHexBytes(["07"]);
       await active.waitForText(
-        "upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip",
+        "update ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip",
         TIMEOUT,
       );
       await active.sendLiteralText("HOLD");
@@ -7100,7 +7179,7 @@ test.skipIf(!tmuxAvailable())(
 
       await waitForCondition(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=turn_held_for_restart"), "the turn held for the restart");
       await active.sendHexBytes(["07"]);
-      await active.waitForText("restart cancelled; Ctrl+G restarts for the upgrade later", TIMEOUT);
+      await active.waitForText("restart cancelled; Ctrl+G restarts for the update later", TIMEOUT);
       await secondAsked.fired;
 
       await active.sendKeys("BSpace BSpace BSpace BSpace");
@@ -7122,7 +7201,7 @@ test.skipIf(!tmuxAvailable())(
       expect(relaunched()).toBe(false);
 
       await active.sendKeys("BSpace BSpace BSpace BSpace");
-      await active.waitForText("continuing the turn after the upgrade", UPGRADE_TIMEOUT);
+      await active.waitForText("continuing the turn after the update", UPGRADE_TIMEOUT);
       await thirdAsked.fired;
       await active.waitForText("AFTER_CANCEL_RESTART_DONE", UPGRADE_TIMEOUT);
       expect(relaunched()).toBe(true);
@@ -7238,10 +7317,8 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
+          ...manualUpgradeEnv(home, gateway, release),
           FX_MODEL: "anthropic/claude-fable-5.2",
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "session,recovery",
         },
@@ -7258,7 +7335,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Ctrl+G while the turn runs: the upgrade waits instead of refusing.
       await active.sendHexBytes(["07"]);
-      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops", TIMEOUT);
       releaseFirst();
 
       // The tool runs, the turn stops between steps, fx relaunches with the
@@ -7375,10 +7452,8 @@ test.skipIf(!tmuxAvailable())(
     });
     const release = startUpgradeServer(root, argvLogPath);
     const upgradeEnv = {
-      ...gatewayEnv(home, gateway),
+      ...manualUpgradeEnv(home, gateway, release),
       FX_MODEL: model,
-      FX_AUTO_UPGRADE: "1",
-      FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
     };
     let active: TmuxSession | null = null;
 
@@ -7426,7 +7501,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Ctrl+G while request 6 is held: the upgrade waits for the turn to stop.
       await active.sendHexBytes(["07"]);
-      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops", TIMEOUT);
       releaseStep5();
 
       // The step ends, the turn stops between steps, fx relaunches, and the
@@ -7492,9 +7567,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
         },
         stderrPath,
         width: 110,
@@ -7654,9 +7727,7 @@ async function captureCtrlGRelaunch(options: {
       cmd: `/bin/sh -c ${shellQuote(gatedLaunch)}`,
       cwd: workspaceRoot,
       env: {
-        ...gatewayEnv(home, gateway),
-        FX_AUTO_UPGRADE: "1",
-        FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+        ...manualUpgradeEnv(home, gateway, release),
       },
       stderrPath,
       width: size.cols,
@@ -7938,6 +8009,7 @@ test.skipIf(!tmuxAvailable())(
           ...f.env,
           FX_AUTO_UPGRADE: "1",
           FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "3600000",
           FX_PERMISSION_MODE: "full-access",
           FX_RECORD: tapeBefore,
         },
@@ -7957,8 +8029,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
       // This turn's provider cannot stop between steps, so the restart waits for the subagent's turn to end.
-      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
-      await active.waitForText("upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip", TIMEOUT);
       expect(relaunched()).toBe(false);
 
       // The subagent's turn ends with its second answer. Then fx restarts on
@@ -7983,7 +8055,7 @@ test.skipIf(!tmuxAvailable())(
       expect(tapesShowed([tapeBefore, tapeAfter], ["solo was cancelled", "What can fx do differently?"], frames)).toEqual([]);
       // The tapes hold the restart's wait in the first process and main's
       // report in the second.
-      expect(tapesShowed([tapeBefore], ["upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip"], join(frames, "before"))).toEqual(["upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip"]);
+      expect(tapesShowed([tapeBefore], ["update ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip"], join(frames, "before"))).toEqual(["update ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip"]);
       expect(tapesShowed([tapeAfter], ["MAIN_SAW_REPORT"], join(frames, "after"))).toEqual(["MAIN_SAW_REPORT"]);
       await active.kill();
       active = null;
@@ -8083,10 +8155,8 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
+          ...manualUpgradeEnv(home, gateway, release),
           FX_MODEL: "anthropic/claude-fable-5.2",
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
           FX_PERMISSION_MODE: "full-access",
         },
         stderrPath,
@@ -8103,8 +8173,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
       // The subagent has one request left, so the restart waits for that request to answer.
-      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
-      await active.waitForText("upgrade ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops · ctrl+g cancel · esc esc stop turn · /quit skip", TIMEOUT);
       expect(relaunched()).toBe(false);
 
       // Its answer ends the subagent turn; then fx restarts on its own, and main
@@ -8198,9 +8268,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_PERMISSION_MODE: "full-access",
         },
         stderrPath,
@@ -8216,7 +8284,7 @@ test.skipIf(!tmuxAvailable())(
       await soloAsked.fired;
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
-      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops", TIMEOUT);
 
       // A prompt waits for the restart, but /quit still quits, with no relaunch.
       await active.sendText("/quit");
@@ -8288,9 +8356,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_PERMISSION_MODE: "full-access",
           FX_TEST_STEER_YIELD_GRACE_MS: "600000",
         },
@@ -8322,8 +8388,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Enter");
       await active.waitForPane((pane) => pane.includes("fx 1/2") && !pane.includes(LIST_HINT), TIMEOUT);
       await active.sendHexBytes(["07"]);
-      const refused = await active.waitForText("upgrade unavailable · fx 2 has queued prompts", TIMEOUT);
-      expect(refused).not.toContain("upgrade ready · restarts when the turn stops");
+      const refused = await active.waitForText("update unavailable · fx 2 has queued prompts", TIMEOUT);
+      expect(refused).not.toContain("update ready · restarts when the turn stops");
       expect(relaunched()).toBe(false);
 
       // The command ends, the turn answers, and fx 1 quits.
@@ -8409,9 +8475,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_PERMISSION_MODE: "full-access",
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "worker",
@@ -8427,7 +8491,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("UPGRADE_MAIN start solo");
       await mainAsked.fired;
       await active.sendHexBytes(["07"]);
-      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops", TIMEOUT);
 
       // Main starts the subagent, then stops before its next request. The
       // subagent keeps working, so fx waits for it.
@@ -8456,7 +8520,7 @@ test.skipIf(!tmuxAvailable())(
       expect(tapesShowed([tapeBefore, tapeAfter], ["solo was cancelled", "What can fx do differently?", "Cancelled"], frames)).toEqual([]);
       // The tapes hold main's stop in the first process and main's report in
       // the second.
-      expect(tapesShowed([tapeBefore], ["stopped between steps for the upgrade"], join(frames, "before"))).toEqual(["stopped between steps for the upgrade"]);
+      expect(tapesShowed([tapeBefore], ["stopped between steps for the update"], join(frames, "before"))).toEqual(["stopped between steps for the update"]);
       expect(tapesShowed([tapeAfter], ["MAIN_SAW_REPORT"], join(frames, "after"))).toEqual(["MAIN_SAW_REPORT"]);
       await active.kill();
       active = null;
@@ -8546,6 +8610,7 @@ test.skipIf(!tmuxAvailable())(
           ...gatewayEnv(home, gateway),
           FX_AUTO_UPGRADE: "1",
           FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "3600000",
           FX_PERMISSION_MODE: "full-access",
         },
         stderrPath,
@@ -8557,12 +8622,12 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendText("UPGRADE_MAIN start solo");
       await soloAsked.fired;
-      await active.waitForPane((pane) => pane.includes("MAIN_STARTED") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("MAIN_STARTED", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
       // Main's turn has ended, so only the subagent holds the restart. It
       // stops at its next step boundary; the restart does not wait for it.
-      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops", TIMEOUT);
       const version = (await runFx(["--version"])).stdout.trim();
       releaseSolo();
 
@@ -8652,6 +8717,7 @@ test.skipIf(!tmuxAvailable())(
           ...gatewayEnv(home, gateway),
           FX_AUTO_UPGRADE: "1",
           FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "3600000",
           FX_PERMISSION_MODE: "full-access",
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "worker",
@@ -8665,10 +8731,10 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendText("UPGRADE_MAIN start solo");
       await soloAsked.fired;
-      await active.waitForPane((pane) => pane.includes("MAIN_STARTED") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("MAIN_STARTED", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
-      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops", TIMEOUT);
       // A draft holds the release. With an empty composer, the restart would
       // relaunch as soon as the subagent yields, before Ctrl+G can cancel it.
       await active.sendLiteralText("HOLD");
@@ -8682,7 +8748,7 @@ test.skipIf(!tmuxAvailable())(
         UPGRADE_TIMEOUT,
       );
       await active.sendHexBytes(["07"]);
-      await active.waitForText("restart cancelled; Ctrl+G restarts for the upgrade later", TIMEOUT);
+      await active.waitForText("restart cancelled; Ctrl+G restarts for the update later", TIMEOUT);
       await active.waitForText("MAIN_SAW_REPORT", UPGRADE_TIMEOUT);
 
       const solo = gateway.requests.map((request) => request.body).filter(isSoloSubagentRequest);
@@ -8776,6 +8842,7 @@ test.skipIf(!tmuxAvailable())(
           ...gatewayEnv(home, gateway),
           FX_AUTO_UPGRADE: "1",
           FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "3600000",
           FX_PERMISSION_MODE: "full-access",
         },
         stderrPath,
@@ -8789,7 +8856,7 @@ test.skipIf(!tmuxAvailable())(
       await soloAsked.fired;
       await mainWaitSent.fired;
       await active.sendHexBytes(["07"]);
-      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops", TIMEOUT);
       const version = (await runFx(["--version"])).stdout.trim();
       releaseSolo();
 
@@ -8883,6 +8950,7 @@ test.skipIf(!tmuxAvailable())(
           ...gatewayEnv(home, gateway),
           FX_AUTO_UPGRADE: "1",
           FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "3600000",
           FX_PERMISSION_MODE: "full-access",
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "worker",
@@ -8896,10 +8964,10 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendText("UPGRADE_MAIN start solo");
       await soloAsked.fired;
-      await active.waitForPane((pane) => pane.includes("MAIN_STARTED") && turnSettled(pane), TIMEOUT);
+      await active.waitForReplyAndTurnEnd("MAIN_STARTED", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
-      await active.waitForText("upgrade ready · restarts when the turn stops", TIMEOUT);
+      await active.waitForText("update ready · restarts when the turn stops", TIMEOUT);
       // A draft holds the release. With an empty composer, the restart would
       // relaunch as soon as the turn holds, so the draft comes first.
       await active.sendLiteralText("draft held");
@@ -8952,6 +9020,576 @@ test.skipIf(!tmuxAvailable())(
     } finally {
       releaseSolo();
       if (active) await active.kill();
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart restarts without ctrl+g and resumes with the screen in place",
+  async () => {
+    const size = { cols: 110, rows: 32 };
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-restart-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    const capturePath = join(root, "pane-output.bin");
+    const launchGate = join(root, "launch-gate");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const prompt = "Save history before idle auto-restart.";
+    const reply = [
+      "IDLE_AUTO_FIRST_LINE",
+      ...Array.from({ length: 24 }, (_, index) => `idle auto filler paragraph ${index + 1}`),
+      "IDLE_AUTO_LAST_LINE",
+    ].join("\n\n");
+    const gateway = startFakeGateway([fakeGatewayFinalText(reply)]);
+    const release = startUpgradeServer(root, argvLogPath);
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      const gatedLaunch = `while [ ! -e ${shellQuote(launchGate)} ]; do sleep 0.02; done; exec ${shellQuote(installedFx)}`;
+      active = await TmuxSession.create({
+        cmd: `/bin/sh -c ${shellQuote(gatedLaunch)}`,
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+        },
+        stderrPath,
+        width: size.cols,
+        height: size.rows,
+        startupWaitMs: 0,
+      });
+      active.startPaneOutputCapture(capturePath);
+      writeFileSync(launchGate, "");
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText(prompt);
+      await active.waitForPane(
+        (pane) => pane.includes("IDLE_AUTO_LAST_LINE") && hasEmptyComposer(pane) && turnSettled(pane),
+        TIMEOUT,
+      );
+      const version = (await runFx(["--version"])).stdout.trim();
+      const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
+
+      // No Ctrl+G is sent; once the update is ready and the quiet window
+      // elapses while idle, fx restarts on its own.
+      await waitForScrollback(active, updatedNotice, UPGRADE_TIMEOUT * 2);
+      await active.waitForComposer(TIMEOUT);
+      const resumed = await active.waitForStableScrollback(
+        (scrollback) =>
+          scrollback.includes(updatedNotice) &&
+          scrollback.includes("IDLE_AUTO_LAST_LINE"),
+        TIMEOUT,
+        250,
+      );
+      await settledCaptureLength(capturePath);
+      expect(countOccurrences(resumed, prompt)).toBe(1);
+      expect(countOccurrences(resumed, "IDLE_AUTO_FIRST_LINE")).toBe(1);
+      expect(countOccurrences(resumed, "IDLE_AUTO_LAST_LINE")).toBe(1);
+      expect(countOccurrences(resumed, updatedNotice)).toBe(1);
+      expect(
+        readFileSync(argvLogPath, "utf8")
+          .trim()
+          .split("\n")
+          .some((line) => line.startsWith(`${installedFx}\tresume\t`) && line.includes("\t--upgrade-relaunch")),
+      ).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+
+      const bytes = readFileSync(capturePath);
+      const lastLineAt = bytes.indexOf(Buffer.from("IDLE_AUTO_LAST_LINE"));
+      expect(lastLineAt).toBeGreaterThanOrEqual(0);
+      const relaunchBytes = bytes.subarray(lastLineAt);
+      const resets = [Buffer.from("\x1b[2J"), Buffer.from("\x1bc")]
+        .map((seq) => relaunchBytes.indexOf(seq))
+        .filter((idx) => idx >= 0);
+      expect(resets.length).toBeGreaterThan(0);
+      const gapLength = lastLineAt + Math.min(...resets);
+      const gap = replayPaneBytes(root, home, "idle-auto-gap", size, bytes.subarray(0, gapLength));
+      expect(gap.join("\n")).toContain("IDLE_AUTO_LAST_LINE");
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart holds while a composer draft exists until it is cleared",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-draft-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const gateway = startFakeGateway([]);
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendLiteralText("HOLD_DRAFT");
+      await active.waitForPane((pane) => composerContains(pane, "HOLD_DRAFT"), TIMEOUT);
+
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes("update ready: ctrl+g to reload") && composerContains(scrollback, "HOLD_DRAFT"),
+        TIMEOUT,
+        250,
+      );
+      expect(relaunched()).toBe(false);
+      expect(await active.capturePane()).toContain("update ready: ctrl+g to reload");
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      await active.sendKeys(Array.from({ length: "HOLD_DRAFT".length }, () => "BSpace").join(" "));
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(true);
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart holds while a subagent works until it finishes",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-subagent-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const soloAsked = signal();
+    let releaseSolo = () => {};
+    const soloReleased = new Promise<void>((resolve) => {
+      releaseSolo = resolve;
+    });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes("SOLO_TASK") && !body.includes('"main_solo"')) {
+        soloAsked.fire();
+        await soloReleased;
+        return fakeGatewayFinalText("SOLO_DONE");
+      }
+      if (body.includes("SOLO_DONE")) return fakeGatewayFinalText("MAIN_SAW_REPORT");
+      if (!body.includes('"main_solo"')) {
+        return fakeGatewayToolCall("main_solo", "subagent", {
+          request: { action: "message", agent: "solo", message: "SOLO_TASK" },
+        });
+      }
+      return fakeGatewayFinalText("MAIN_DONE");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+          FX_PERMISSION_MODE: "full-access",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("AUTO_SUBAGENT start solo");
+      await active.waitForPane((pane) => pane.includes("MAIN_DONE") && turnSettled(pane), TIMEOUT);
+      await soloAsked.fired;
+      await active.waitForComposer(TIMEOUT);
+
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes("update ready: ctrl+g to reload"),
+        TIMEOUT,
+        250,
+      );
+      expect(relaunched()).toBe(false);
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      releaseSolo();
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(true);
+      await active.waitForText("MAIN_SAW_REPORT", TIMEOUT);
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      releaseSolo();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart holds while a background shell session runs",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-bgshell-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    const releaseFifo = join(root, "release.fifo");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    execFileSync("mkfifo", [releaseFifo]);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const gateway = startFakeGateway([
+      fakeShellRun("call_bg_shell", `cat ${shellQuote(releaseFifo)}`, { yield_time_ms: 50 }),
+      fakeGatewayFinalText("BG_SHELL_STARTED"),
+    ]);
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+          FX_PERMISSION_MODE: "full-access",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Start a background shell.");
+      await active.waitForPane((pane) => pane.includes("BG_SHELL_STARTED") && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
+
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes("update ready: ctrl+g to reload") && scrollback.includes("BG_SHELL_STARTED"),
+        TIMEOUT,
+        250,
+      );
+      expect(relaunched()).toBe(false);
+      expect(await active.capturePane()).toContain("update ready: ctrl+g to reload");
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      writeFileSync(releaseFifo, "done\n");
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(true);
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      try {
+        closeSync(openSync(releaseFifo, constants.O_WRONLY | constants.O_NONBLOCK));
+      } catch {}
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart holds while a turn runs and restarts after the turn ends",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-turn-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const turnAsked = signal();
+    let releaseTurn = () => {};
+    const turnReleased = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    const gateway = startDynamicFakeGateway(async () => {
+      turnAsked.fire();
+      await turnReleased;
+      return fakeGatewayFinalText("RUNNING_TURN_FINISHED_DONE");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Hold this running turn until the update is ready.");
+      await turnAsked.fired;
+
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes("update ready: ctrl+g to reload"),
+        TIMEOUT,
+        250,
+      );
+      expect(relaunched()).toBe(false);
+      expect(await active.capturePane()).not.toContain("fx restarts for the upgrade");
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      releaseTurn();
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(true);
+      await active.waitForText("RUNNING_TURN_FINISHED_DONE", TIMEOUT);
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      releaseTurn();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart holds while Ctrl+P model picker is open and keeps the stashed draft",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-picker-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const gateway = startFakeGateway([]);
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendLiteralText("PICKER_DRAFT");
+      await active.waitForPane((pane) => composerContains(pane, "PICKER_DRAFT"), TIMEOUT);
+      await active.sendKeys("C-p");
+      await active.waitForPane((pane) => pane.includes("Models") && !composerContains(pane, "PICKER_DRAFT"), TIMEOUT);
+
+      // Wait on a directory watch signal until auto-upgrade installs the new binary while the picker stays open.
+      if (statSync(installedFx).size >= 1024 * 1024) {
+        const installed = signal();
+        const deadline = AbortSignal.timeout(UPGRADE_TIMEOUT);
+        const onAbort = () => installed.fire();
+        deadline.addEventListener("abort", onAbort, { once: true });
+        const watcher = watch(installDir, () => {
+          if (statSync(installedFx).size < 1024 * 1024) installed.fire();
+        });
+        try {
+          if (statSync(installedFx).size < 1024 * 1024) installed.fire();
+          await installed.fired;
+        } finally {
+          deadline.removeEventListener("abort", onAbort);
+          watcher.close();
+        }
+        if (statSync(installedFx).size >= 1024 * 1024) {
+          throw new Error("Timed out waiting for background upgrade install while picker was open");
+        }
+      }
+      await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes("Models") && !composerContains(scrollback, "PICKER_DRAFT"),
+        TIMEOUT,
+        300,
+      );
+      expect(relaunched()).toBe(false);
+      expect(await active.capturePane()).toContain("Models");
+
+      // Closing the picker restores the draft to the composer, which keeps holding the restart.
+      await active.sendKeys("Escape");
+      await active.waitForPane(
+        (pane) => composerContains(pane, "PICKER_DRAFT") && pane.includes("update ready: ctrl+g to reload"),
+        TIMEOUT,
+      );
+      await active.waitForStableScrollback(
+        (scrollback) => composerContains(scrollback, "PICKER_DRAFT") && scrollback.includes("update ready: ctrl+g to reload"),
+        TIMEOUT,
+        300,
+      );
+      expect(relaunched()).toBe(false);
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      await active.sendKeys(Array.from({ length: "PICKER_DRAFT".length }, () => "BSpace").join(" "));
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(true);
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
       release.stop();
       gateway.stop();
       rmSync(root, { recursive: true, force: true });

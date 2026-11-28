@@ -67,7 +67,8 @@ ASSUME /\ MaxFaults \in Nat /\ Ladder \in 1..4 /\ Bug \in Bugs
 Min(a, b) == IF a < b THEN a ELSE b
 
 \* done_failed: fx ended the turn on its own error, because the request
-\* needs the user on a host that cannot ask.
+\* needs the user on a host that cannot ask, or a budgeted host (fx ask)
+\* ended the turn because its retry budget ran out.
 Phases   == {"working", "waiting", "need_user", "done_ok", "done_cancel",
              "done_failed", "stopped"}
 Active   == {"working", "waiting", "need_user"}

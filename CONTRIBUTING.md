@@ -232,10 +232,11 @@ CI retries a failed end-to-end file once. A file that passes only on the retry g
 
 When the detector can't read the change, the `macOS arm64` check fails instead of passing.
 
-`scripts/detect-ci-need.sh` decides whether a pull request runs CI's five model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
+`scripts/detect-ci-need.sh` decides whether a pull request runs CI's six model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
 
 - `sdk/`
 - The SDK models in `tests/tla/sdk/` or their drivers in `tests/tla/drivers/*.mjs`
+- The shared TLC code in `tests/tla/lib/`
 - The Node-API or WebAssembly core entry point
 - `src/acp/`, `src/core/hosts/`, or `src/core/session_manager/`
 
@@ -243,6 +244,7 @@ The `TLA+ MCP engine models and driver`, `TLA+ MCP host SignIn model`, `TLA+ MCP
 
 - `src/mcp/`, `src/core/mcp_host/`, or `src/core/mcp/`
 - The models in `tests/tla/mcp/` or `tests/tla/mcp_host/`, or their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, or `tests/tla/drivers/lib/`
+- The shared TLC code in `tests/tla/lib/`, which the MCP driver's bridge runs
 - The `tests/e2e/fixtures/mcp-*` servers, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`
 
 The `TLA+ transcript window model` job takes about 4 minutes and runs its checks when the change touches:
@@ -263,7 +265,13 @@ The `TLA+ shell quiet notice model` job takes about 2 minutes and runs its check
 - The model in `tests/tla/managed_execution/` or its drivers in `tests/tla/drivers/managed_execution/`
 - The shared code in `tests/tla/lib/`, `tests/tla/drivers/lib/`, and `tests/tla/drivers/graph.mjs`, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
 
-All five run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
+The `TLA+ ACP models and drivers` job takes about 5 minutes and runs its checks when the change touches:
+
+- `src/acp/`
+- The models in `tests/tla/acp/` or their drivers in `tests/tla/drivers/acp/`
+- The code those drivers share: `tests/tla/drivers/lib/` and `tests/tla/lib/`, or the helpers they load: the fake Gateway in `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
+
+All six run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
 
 Other workflows and benchmark jobs also report on pull requests, such as the `Examples` workflow when `examples/` changes and the `Shell command overhead` benchmark. Only the five checks above are required to merge, but look into any check that fails. Two of the others need more explanation:
 

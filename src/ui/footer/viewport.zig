@@ -72,6 +72,9 @@ pub const ComposedFooterFrame = struct {
     cursor: Cursor = .{ .row = 1, .col = 1 },
     cursor_visible: bool = true,
     danger_status_visible: bool = false,
+    /// A row shows `row_text.appendLoadingMarker`, which blinks only while
+    /// animation frames keep coming.
+    loading_marker_visible: bool = false,
 
     pub fn deinit(self: *ComposedFooterFrame, alloc: Allocator) void {
         for (self.rows.items) |*row| row.deinit(alloc);

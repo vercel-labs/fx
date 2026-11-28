@@ -3,6 +3,7 @@ const image_attachments = @import("../../core/images/image_attachments.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
+const render_request = @import("../render_request.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
@@ -160,10 +161,53 @@ pub fn composeTextRow(alloc: Allocator, text: []const u8, width: u16, style: []c
     return row;
 }
 
+/// The marker and the space after it.
+const loading_marker_width: usize = 2;
+
+/// Puts fx's working marker in a row that shows something loading, such as a
+/// server that connects: the `•` of `• Thinking`, blinking with it at
+/// animation phase `phase`. Its off half is blank, so the text after it stays
+/// still. Returns the columns it took, 0 when `room` is too narrow for it.
+/// A frame that shows it must keep animation frames coming, through
+/// `ComposedFooterFrame.loading_marker_visible`.
+pub fn appendLoadingMarker(alloc: Allocator, row: *std.ArrayList(u8), phase: i16, room: usize) !usize {
+    if (room < loading_marker_width) return 0;
+    if (render_request.markerBlinkVisible(phase)) {
+        try row.appendSlice(alloc, ui_render.permission_auto_style);
+        try row.appendSlice(alloc, "•");
+        try row.appendSlice(alloc, ui_render.reset_style);
+        try row.append(alloc, ' ');
+    } else {
+        try row.appendSlice(alloc, "  ");
+    }
+    return loading_marker_width;
+}
+
 pub fn appendSpacesToColumn(alloc: Allocator, out: *std.ArrayList(u8), target_col: usize) !void {
     const current = display_width.visibleWidthIgnoringAnsi(out.items);
     if (current >= target_col) return;
     try out.appendNTimes(alloc, ' ', target_col - current);
+}
+
+test "the loading marker blinks with the working marker and keeps its two columns when off" {
+    const alloc = std.testing.allocator;
+    var on: std.ArrayList(u8) = .empty;
+    defer on.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), try appendLoadingMarker(alloc, &on, 0, 10));
+    const lit = try std.mem.concat(alloc, u8, &.{ ui_render.permission_auto_style, "•", ui_render.reset_style, " " });
+    defer alloc.free(lit);
+    try std.testing.expectEqualStrings(lit, on.items);
+
+    var off: std.ArrayList(u8) = .empty;
+    defer off.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), try appendLoadingMarker(alloc, &off, render_request.blink_half_period_frames - render_request.animation_padding, 10));
+    try std.testing.expectEqualStrings("  ", off.items);
+
+    // Without room for both columns, it takes none.
+    var tight: std.ArrayList(u8) = .empty;
+    defer tight.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), try appendLoadingMarker(alloc, &tight, 0, 1));
+    try std.testing.expectEqualStrings("", tight.items);
 }
 
 test "clipped image badge closes OSC 8 before following cells" {
