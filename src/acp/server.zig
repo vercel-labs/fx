@@ -3227,23 +3227,19 @@ fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: conf
 
 const TokenPassNeed = enum { take, wait };
 
-/// Clients read a new session's model from the `session/new` reply, so it
-/// waits for the answer when nothing chose the model. Not while a prompt
-/// runs: the reader would read that prompt's `session/cancel` and EOF late.
-fn newSessionTokenPassNeed(nothing_chose_model: bool, prompt_running: bool) TokenPassNeed {
-    return if (nothing_chose_model and !prompt_running) .wait else .take;
-}
-
 /// For every request: takes the answer if it has arrived, and never waits.
 fn takeTokenPassAnswer(state: *ServerState) void {
     settleTokenPassAnswer(state, .take);
 }
 
-/// Called once `session/new` is checked, so a request that fails never
-/// waits.
+/// Clients read a new session's model from the `session/new` reply, so it
+/// waits for the answer when nothing chose the model. Called once the
+/// request is checked, so a request that fails never waits, and once the
+/// session it replaces has ended its prompt.
 pub fn awaitTokenPassForNewSession(state: *ServerState) void {
     if (comptime host_target.is_wasm) return;
-    settleTokenPassAnswer(state, newSessionTokenPassNeed(state.token_pass_start != null, state.active_prompt != null));
+    std.debug.assert(state.active_prompt == null);
+    settleTokenPassAnswer(state, if (state.token_pass_start != null) .wait else .take);
 }
 
 fn settleTokenPassAnswer(state: *ServerState, need: TokenPassNeed) void {
@@ -3366,7 +3362,7 @@ test "ACP initialize starts the Token Pass check without waiting for its answer"
     try std.testing.expectEqualStrings("example/built-in-default", state.selected_model);
 }
 
-test "ACP's reader waits for an unanswered Token Pass check only in a new session nothing chose a model for, while no prompt runs" {
+test "ACP's reader waits for an unanswered Token Pass check only in a new session nothing chose a model for" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: TokenPassFixture = undefined;
     try fixture.init(std.testing.allocator);
@@ -3384,10 +3380,6 @@ test "ACP's reader waits for an unanswered Token Pass check only in a new sessio
     awaitTokenPassForNewSession(state);
     try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
     state.token_pass_start = start;
-
-    try std.testing.expectEqual(TokenPassNeed.wait, newSessionTokenPassNeed(true, false));
-    try std.testing.expectEqual(TokenPassNeed.take, newSessionTokenPassNeed(true, true));
-    try std.testing.expectEqual(TokenPassNeed.take, newSessionTokenPassNeed(false, false));
 }
 
 test "ACP session/new waits for an unanswered Token Pass check until the wait from the check's start runs out" {

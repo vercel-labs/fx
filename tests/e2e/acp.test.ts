@@ -2030,7 +2030,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP answers session/new at once while a prompt waits for the Token Pass check, and never waits for one it rejects",
+    "ACP starts a session/new that replaces a prompt waiting for the Token Pass check on the answer, cancels that prompt at once, and never waits for a session/new it rejects",
     async () => {
       const root = createIsolatedRoot("fx-acp-token-pass-new-during-prompt-");
       const tracePath = join(root.root, "trace.log");
@@ -2057,6 +2057,8 @@ describe("acp: model-independent", () => {
         sendPrompt(client, 3, "Save this chat.");
         expect((await readResponse(client, 3)).result.stopReason).toBe("end_turn");
         await client.close();
+        // The second fx's trace starts empty, without the first's wait.
+        rmSync(tracePath, { force: true });
 
         holdCredits = true;
         client = await AcpClient.create({ cwd: root.workspace, env });
@@ -2072,13 +2074,27 @@ describe("acp: model-independent", () => {
         await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 3, 1_000);
         sendPrompt(client, 4, "Which model answers?");
         await waitForCondition("the prompt to wait for the Token Pass check", () => trace().includes("check wait started"));
+        const replies = new Map<number, { message: any; at: number }>();
+        const reply = async (id: number) => {
+          while (!replies.has(id)) {
+            const message = await client!.readLine(8_000) as any;
+            if (message.id !== undefined && (message.result !== undefined || message.error !== undefined)) {
+              replies.set(message.id, { message, at: Date.now() });
+            }
+          }
+          return replies.get(id)!;
+        };
         sentAt = Date.now();
         client.send({ jsonrpc: "2.0", id: 5, method: "session/new", params: { mcpServers: [] } });
-        const { responses } = await readUntilResponses(client, [4, 5], 8_000);
-        expect(Date.now() - sentAt).toBeLessThan(1_000);
-        expect(responses.get(5).result.sessionId).toBeDefined();
-        // The new session replaces the one whose prompt waited.
-        expect(responses.get(4).result.stopReason).toBe("cancelled");
+        // The new session replaces the one whose prompt waited, and ends that
+        // prompt before it waits for the answer itself.
+        const cancelled = await reply(4);
+        expect(cancelled.message.result.stopReason).toBe("cancelled");
+        expect(cancelled.at - sentAt).toBeLessThan(1_000);
+        releaseCredits();
+        const created = await reply(5);
+        const model = created.message.result.configOptions.find((option: any) => option.id === "model");
+        expect(model.currentValue).toBe("deepseek/deepseek-v4.1-flash");
         expect(trace()).not.toContain("check wait ended");
         expect(client.stderr).toBe("");
       } finally {
