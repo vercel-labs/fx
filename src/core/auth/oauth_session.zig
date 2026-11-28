@@ -12,6 +12,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
 const session_presence = @import("session_presence.zig");
+const sign_in_trace = @import("sign_in_trace.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -920,15 +921,26 @@ fn lockMutationWithBackend(
     var fx_dir = open_fx_dir;
     errdefer fx_dir.close();
 
+    const started = io_mod.awakeMilliTimestamp();
     const taken = leased_lock.acquire(
         &fx_dir,
         mutation_lock_file_name,
-        io_mod.awakeMilliTimestamp(),
+        started,
         wait_ms,
         ops,
         "auth",
         "fx login",
-    ) catch |err| return session_presence.storageError(auth_file_name, err);
+    ) catch |err| {
+        // A lock fx only tries (`wait_ms` 0) is not a wait, and its busy
+        // answer is expected.
+        if (wait_ms > 0) sign_in_trace.record(.lock_wait, true, "outcome={s} waited_ms={d} limit_ms={d}", .{
+            if (err == error.LockBusy) "given_up" else @errorName(err),
+            io_mod.awakeMilliTimestamp() - started,
+            wait_ms,
+        });
+        return session_presence.storageError(auth_file_name, err);
+    };
+    if (wait_ms > 0) sign_in_trace.record(.lock_wait, false, "outcome=taken waited_ms={d}", .{taken.stamp_ms - started});
     var lock = taken.lock;
     errdefer lock.release();
 
