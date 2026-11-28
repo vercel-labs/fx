@@ -111,6 +111,7 @@
     {"name": "gemini_errors_classify", "module": "fx", "test": "gemini errors classify returns for fuzzed status, body, and header bytes", "iterations": 400000},
     {"name": "google_session_parse", "module": "fx", "test": "a Google session record parses or is refused on fuzzed bytes, and what parses writes back the same", "iterations": 400000},
     {"name": "google_http_date", "module": "fx", "test": "HTTP-date parser handles fuzzed bytes and round-trips formatted dates", "iterations": 1000000},
-    {"name": "google_oauth_callback", "module": "fx", "test": "Google OAuth callback parsers handle fuzzed URLs and targets cleanly", "iterations": 1000000}
+    {"name": "google_oauth_callback", "module": "fx", "test": "Google OAuth callback parsers handle fuzzed URLs and targets cleanly", "iterations": 1000000},
+    {"name": "shortcut_map", "module": "fx", "test": "shortcut map parses or is refused on fuzzed bytes", "iterations": 400000}
   ]
 }

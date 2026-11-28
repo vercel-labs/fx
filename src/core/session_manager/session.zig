@@ -21,6 +21,7 @@ const storage = @import("storage.zig");
 const log_mod = @import("log.zig");
 const fold = @import("fold.zig");
 const diag = @import("diag.zig");
+const lock_wait = @import("lock_wait.zig");
 const trace = if (storage.hooks) @import("trace.zig") else struct {};
 
 const hooks = storage.hooks;
@@ -30,6 +31,9 @@ const Log = log_mod.Log;
 /// 256 KB and 0.4 ms at 64 KB. Smaller distances gain little and cost more
 /// log bytes when the folded state (settings, children) is large.
 pub const default_snapshot_every_bytes: u64 = 64 << 10;
+
+/// How long `openResume` sleeps between tries of a held flock.
+const session_lock_retry_ms: u64 = 10;
 
 pub const Options = struct {
     /// How long `openResume` retries a held flock before Busy.
@@ -1300,13 +1304,17 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
 
 fn acquireLock(env: *const Env, lock: storage.File, wait_ms: u64) OpenError!void {
     const io = env.s.io;
-    const step_ms: u64 = 10;
-    var waited: u64 = 0;
-    while (true) {
+    const wait: lock_wait.Wait = .{ .budget_ms = wait_ms, .retry_ms = session_lock_retry_ms };
+    const started = std.Io.Timestamp.now(io, .awake);
+    var sleeps: u64 = 0;
+    // flock has no timed wait, so the wait polls a non-blocking try between short sleeps.
+    while (true) : (sleeps += 1) {
         if (env.s.tryLock(lock) catch |io_err| return storage.ioFault(io_err)) return;
-        if (waited >= wait_ms) return error.Busy;
-        io.sleep(.fromMilliseconds(@intCast(step_ms)), .awake) catch return error.Busy;
-        waited += step_ms;
+        const elapsed_ms = lock_wait.elapsedMs(started, std.Io.Timestamp.now(io, .awake));
+        switch (lock_wait.afterFailedTry(wait, elapsed_ms, sleeps)) {
+            .give_up => return error.Busy,
+            .sleep_ms => |ms| io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch return error.Busy,
+        }
     }
 }
 

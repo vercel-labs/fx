@@ -145,6 +145,11 @@ pub const NetworkFailureCause = enum {
     /// damaged on the way. Resent a few times; a server that keeps sending
     /// one ends the turn.
     unreadable_reply,
+    /// The OS returned an error code that Zig has no name for, which it
+    /// reports as `error.Unexpected`; `/trace` names the code
+    /// (`src/core/shared/os_errors.zig`). Its cause is not known, so it is
+    /// resent a few times, and a request that keeps getting one ends the turn.
+    unnamed_os_error,
 };
 
 /// Stable native transport evidence consumed by model recovery policy.

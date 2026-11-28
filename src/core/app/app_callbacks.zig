@@ -924,10 +924,10 @@ pub fn Bindings(comptime App: type) type {
             agentReportInnerToolUsage(ctx, tool_name, usage);
         }
 
-        fn agentAppendRuntimeContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+        fn agentAppendRuntimeContext(ctx: *anyopaque, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            try app.appendRuntimeContextMessage(agent, arena, messages);
+            try app.appendRuntimeContextMessage(agent, arena, model, messages);
         }
 
         fn cooperativeTransportPulse(ctx: *anyopaque) !void {
@@ -1114,7 +1114,7 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             if (comptime @hasDecl(App, "snapshotMcpDefinition")) {
-                return app.snapshotMcpDefinition(arena, name, known, app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent).mode);
+                return app.snapshotMcpDefinition(agent, arena, name, known);
             }
             return .unavailable;
         }
@@ -2320,7 +2320,7 @@ const FakeApp = struct {
         }
     }
 
-    fn appendRuntimeContextMessage(self: *FakeApp, _: anytype, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+    fn appendRuntimeContextMessage(self: *FakeApp, _: anytype, arena: Allocator, _: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
         _ = self;
         try messages.append(arena, .{ .role = .system, .content = "runtime" });
     }
@@ -3447,7 +3447,7 @@ test "eb03: buildWorkerDeps wires withdraw_accepted_input only when v2 session i
         pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
             return &self.main_agent;
         }
-        fn appendRuntimeContextMessage(_: *@This(), _: anytype, _: Allocator, _: *std.ArrayList(ChatMessage)) !void {}
+        fn appendRuntimeContextMessage(_: *@This(), _: anytype, _: Allocator, _: []const u8, _: *std.ArrayList(ChatMessage)) !void {}
         fn validateToolCall(_: *@This(), _: anytype, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
             return .{ .failure = try arena.print("invalid {s}", .{call.name}) };
         }

@@ -836,6 +836,7 @@ test {
     _ = @import("fold.zig");
     _ = @import("session.zig");
     _ = @import("catalog.zig");
+    _ = @import("lock_wait.zig");
     // Fault injection and traces exist only with -Dhooks=true.
     if (storage.hooks) {
         _ = @import("storage_fault.zig");
@@ -2008,6 +2009,123 @@ const api_tests = struct {
         released = true;
         const reopened = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app, .lock_wait_ms = 0 });
         reopened.release();
+    }
+
+    /// `io` with sleeps that return at once and move a fake monotonic clock
+    /// `factor` times as far as they asked, as a loaded machine or a
+    /// background process stretches every sleep. It never waits in real time
+    /// (`RULES.md` R7.3). The copied vtable and the clock are process
+    /// storage, so one test uses it at a time.
+    const SlowSleeps = struct {
+        var vtable: std.Io.VTable = undefined;
+        var awake_ns: i96 = 0;
+        var factor: i96 = 1;
+        var sleeps: u64 = 0;
+        /// Past this, a sleep is canceled, so a wait that never ends fails
+        /// its test instead of hanging it.
+        const max_sleeps: u64 = 100_000;
+
+        fn wrap(sleep_factor: i96) std.Io {
+            vtable = io.vtable.*;
+            vtable.now = now;
+            vtable.sleep = fakeSleep;
+            factor = sleep_factor;
+            restart();
+            return .{ .userdata = io.userdata, .vtable = &vtable };
+        }
+
+        fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            if (clock == .awake) return .fromNanoseconds(awake_ns);
+            return io.vtable.now(userdata, clock);
+        }
+
+        fn fakeSleep(_: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            switch (timeout) {
+                .duration => |duration| {
+                    sleeps += 1;
+                    if (sleeps > max_sleeps) return error.Canceled;
+                    awake_ns += duration.raw.nanoseconds * factor;
+                },
+                // The lock waits sleep only for a duration; any other sleep is
+                // canceled, which ends the wait early and fails its test.
+                .none, .deadline => return error.Canceled,
+            }
+        }
+
+        fn restart() void {
+            awake_ns = 0;
+            sleeps = 0;
+        }
+
+        /// The fake monotonic milliseconds since `wrap` or `restart`.
+        fn elapsedMs() i96 {
+            return @divTrunc(awake_ns, std.time.ns_per_ms);
+        }
+    };
+
+    /// The wait took its whole budget and at most one stretched sleep more.
+    fn expectWaitEndsAtBudget(budget_ms: i96, longest_sleep_ms: i96) !void {
+        const waited_ms = SlowSleeps.elapsedMs();
+        if (waited_ms < budget_ms or waited_ms > budget_ms + longest_sleep_ms) {
+            std.debug.print("waited {d} ms on the monotonic clock for a budget of {d} ms\n", .{ waited_ms, budget_ms });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    test "a resume behind another writer is Busy once its wait is spent on the monotonic clock, though each sleep lasts three times as long (D38)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const held = try f.manager.openNew(.{ .workspace = "/w", .host = .app });
+        defer held.release();
+        _ = try held.append(&.{ .turn_started, piece, .turn_committed });
+
+        const contender = try api.Manager.init(gpa, SlowSleeps.wrap(3), .{ .root = f.root, .lock_wait_ms = 2000 });
+        defer contender.deinit();
+        try testing.expectError(error.Busy, contender.openResume(.{ .target = .{ .id = held.id() }, .workspace = "/w", .host = .app }));
+        // Each 10 ms retry sleep lasts 30 ms, which 2000 ms is no multiple of.
+        try expectWaitEndsAtBudget(2000, 30);
+    }
+
+    test "an index write behind another process's index lock gives up once its wait is spent on the monotonic clock, though each sleep lasts three times as long (D38)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        var recorder: Recorder = .{};
+        defer recorder.kinds.deinit(gpa);
+        const writer = try api.Manager.init(gpa, SlowSleeps.wrap(3), .{ .root = f.root, .lock_wait_ms = 2000, .diagnostics = recorder.sink() });
+        defer writer.deinit();
+        const s = try writer.openNew(.{ .workspace = "/w", .host = .app });
+        defer s.release();
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+
+        var root = try f.dir();
+        defer root.close(io);
+        const other_process = try root.openFile(io, "index.lock", .{ .mode = .read_write });
+        defer other_process.close(io);
+        try testing.expect(try other_process.tryLock(io, .exclusive));
+        defer other_process.unlock(io);
+
+        SlowSleeps.restart();
+        try s.close();
+        try testing.expectEqual(@as(usize, 1), recorder.count(.index_stale));
+        // Each 5 ms retry sleep lasts 15 ms, which 2000 ms is no multiple of.
+        try expectWaitEndsAtBudget(2000, 15);
+    }
+
+    test "a resume behind another writer still gives up when the monotonic clock never moves (D38)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const held = try f.manager.openNew(.{ .workspace = "/w", .host = .app });
+        defer held.release();
+        _ = try held.append(&.{ .turn_started, piece, .turn_committed });
+
+        const contender = try api.Manager.init(gpa, SlowSleeps.wrap(0), .{ .root = f.root, .lock_wait_ms = 2000 });
+        defer contender.deinit();
+        try testing.expectError(error.Busy, contender.openResume(.{ .target = .{ .id = held.id() }, .workspace = "/w", .host = .app }));
+        // As many 10 ms sleeps as fit in 2000 ms, as before the clock counted.
+        try testing.expectEqual(@as(u64, 200), SlowSleeps.sleeps);
     }
 
     test "a lost or damaged blob damages its session: verify counts it and a recover fork stops before it (D39)" {
