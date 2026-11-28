@@ -1108,7 +1108,7 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             if (comptime @hasDecl(App, "snapshotMcpDefinition")) {
-                return app.snapshotMcpDefinition(arena, name, known, app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent).mode);
+                return app.snapshotMcpDefinition(agent, arena, name, known);
             }
             return .unavailable;
         }

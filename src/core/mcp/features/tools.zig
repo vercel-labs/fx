@@ -2,7 +2,6 @@ const std = @import("std");
 const testing_allocator = @import("../../shared/testing_allocator.zig");
 const json_number = @import("../json_number.zig");
 const mcp_contract = @import("../mcp_contract.zig");
-const mrtr = @import("../mrtr.zig");
 const server_json_depth = @import("../server_json_depth.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 
@@ -26,8 +25,6 @@ pub const Limits = struct {
     /// result: fx stores or cuts a big result itself.
     max_content_text_bytes: usize = @import("../../images/image_data.zig").max_result_frame_bytes,
     max_image_bytes: usize = @import("../../images/image_data.zig").max_encoded_image_bytes,
-    max_input_requests: usize = 32,
-    max_request_state_bytes: usize = 64 * 1024,
     max_schema_bytes: usize = 256 * 1024,
     max_argument_bytes: usize = 1024 * 1024,
 };
@@ -53,7 +50,7 @@ pub const Error = error{
     InvalidInputRequired,
     MetadataLimitExceeded,
     NestingTooDeep,
-} || mrtr.Error || Allocator.Error || std.Io.Writer.Error;
+} || Allocator.Error || std.Io.Writer.Error;
 
 pub const Tool = struct {
     name: []u8,
@@ -90,9 +87,6 @@ pub const ProtocolError = struct {
     }
 };
 
-pub const InputRequest = mrtr.InputRequest;
-pub const InputRequired = mrtr.InputRequired;
-
 pub const CompleteResult = struct {
     result_json: []u8,
     is_error: bool,
@@ -105,13 +99,11 @@ pub const CompleteResult = struct {
 
 pub const CallOutcome = union(enum) {
     complete: CompleteResult,
-    input_required: InputRequired,
     protocol_failure: ProtocolError,
 
     pub fn deinit(self: *CallOutcome, alloc: Allocator) void {
         switch (self.*) {
             .complete => |*value| value.deinit(alloc),
-            .input_required => |*value| value.deinit(alloc),
             .protocol_failure => |*value| value.deinit(alloc),
         }
         self.* = undefined;
@@ -126,6 +118,8 @@ pub fn parseCallOutcome(
     max_result_bytes: usize,
     limits: Limits,
 ) Error!CallOutcome {
+    // The protocol once decided whether an input_required result was read; the engine reads every round now.
+    _ = protocol;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, response, .{
         .parse_numbers = false,
     }) catch |err| switch (err) {
@@ -144,14 +138,6 @@ pub fn parseCallOutcome(
     const result_type = result.object.get("resultType");
     if (result_type) |value| {
         if (value != .string) return error.InvalidCallResult;
-        if (std.mem.eql(u8, value.string, "input_required")) {
-            if (protocol != .modern) return error.UnsupportedResultType;
-            return .{ .input_required = try mrtr.parseInputRequired(
-                alloc,
-                result,
-                mrtrLimits(limits),
-            ) };
-        }
         if (!std.mem.eql(u8, value.string, "complete")) return error.UnsupportedResultType;
     }
 
@@ -451,16 +437,6 @@ fn validateContentItem(alloc: Allocator, value: std.json.Value, limits: Limits) 
     return error.InvalidContent;
 }
 
-fn mrtrLimits(limits: Limits) mrtr.Limits {
-    return .{
-        .max_requests = limits.max_input_requests,
-        .max_name_bytes = limits.max_name_bytes,
-        .max_json_bytes = limits.max_metadata_bytes,
-        .max_string_bytes = limits.max_request_state_bytes,
-        .max_collection_items = limits.max_content_items,
-    };
-}
-
 fn validateResourceLink(alloc: Allocator, object: std.json.ObjectMap, limits: Limits) Error!void {
     _ = try requireBoundedString(object, "uri", limits.max_content_field_bytes);
     _ = try requireBoundedString(object, "name", limits.max_title_bytes);
@@ -711,7 +687,7 @@ test "tool call content rejects malformed payloads and enforces item limits" {
     );
 }
 
-test "tool call outcomes distinguish protocol tool and MRTR results" {
+test "tool call outcomes distinguish protocol and tool results, and refuse an input_required one" {
     const alloc = std.testing.allocator;
     var protocol_failure = try parseCallOutcome(
         alloc,
@@ -737,7 +713,8 @@ test "tool call outcomes distinguish protocol tool and MRTR results" {
     defer tool_failure.deinit(alloc);
     try std.testing.expect(tool_failure.complete.is_error);
 
-    var input_required = try parseCallOutcome(
+    // A round is read once, by the engine (`src/mcp/protocol/mrtr.zig`); this reader never takes one.
+    try std.testing.expectError(error.UnsupportedResultType, parseCallOutcome(
         alloc,
         \\{"jsonrpc":"2.0","id":3,"result":{"resultType":"input_required","inputRequests":{"confirm":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}}}}}},"requestState":"opaque"}}
     ,
@@ -745,17 +722,7 @@ test "tool call outcomes distinguish protocol tool and MRTR results" {
         null,
         4096,
         .{},
-    );
-    defer input_required.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        "\"opaque\"",
-        input_required.input_required.request_state_json.?,
-    );
-    try std.testing.expectEqualStrings("confirm", input_required.input_required.requests[0].key);
-    try std.testing.expectEqualStrings(
-        "elicitation/create",
-        input_required.input_required.requests[0].payload.method(),
-    );
+    ));
 }
 
 test "a text item may be as large as the whole result, and other fields keep their limit" {
