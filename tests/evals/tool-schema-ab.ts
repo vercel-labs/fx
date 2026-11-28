@@ -1629,6 +1629,8 @@ export const MONITOR_PROBES: Probe[] = [
   { id: "adopt-wait", tool: "monitor", prompt: "The migration prints its progress to migrate.out. Wait for it to finish and tell me how it went.", check: startsMonitor },
   { id: "route-tests", tool: "monitor", prompt: "Run the unit tests once and show me any failures.", check: noMonitor },
   { id: "route-fetch", tool: "monitor", prompt: "Download https://example.com/data.json with curl and tell me how big it is.", check: noMonitor },
+  { id: "route-sleep", tool: "monitor", prompt: "Run sleep 8 && echo done and tell me what it printed.", check: noMonitor },
+  { id: "route-slow", tool: "monitor", prompt: "Run the full test suite, wait for it to finish, and tell me how many tests failed.", check: noMonitor },
 ];
 
 PROBES.push(...MONITOR_PROBES);
