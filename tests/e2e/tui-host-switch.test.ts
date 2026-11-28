@@ -506,6 +506,8 @@ interface Run {
   /// Every request the fake gateway answered, in order, with its headers: the
   /// model rides `ai-language-model-id`, not the body.
   requests: Array<{ body: string; headers: Headers }>;
+  /// The file the first fx writes its stderr to, when `withFx` keeps it.
+  stderrPath?: string;
 }
 
 async function withFx(
@@ -516,10 +518,12 @@ async function withFx(
   env: Record<string, string | undefined> = {},
   gatewayOptions: Parameters<typeof startDynamicFakeGateway>[1] = {},
   launchArgs = "",
+  keepStderr = false,
 ) {
   const gateway = startDynamicFakeGateway(respond, gatewayOptions);
   const home = createIsolatedTestHome();
   const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-switch-")));
+  const stderrPath = keepStderr ? join(home, "fx-stderr.log") : undefined;
   mkdirSync(join(home, ".fx"), { recursive: true });
   writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none" }));
   setupHome(home);
@@ -532,6 +536,7 @@ async function withFx(
     const session = await TmuxSession.create({
       cmd: args ? `${JSON.stringify(FX_BIN)} ${args}` : FX_BIN,
       cwd: workspace,
+      stderrPath,
       env: {
         HOME: home,
         AI_GATEWAY_API_KEY: "fake-switch-key",
@@ -557,7 +562,7 @@ async function withFx(
     return session;
   };
   try {
-    await run(await launch(launchArgs), { workspace, home, launch, tape, requests: gateway.requests });
+    await run(await launch(launchArgs), { workspace, home, launch, tape, requests: gateway.requests, stderrPath });
     return gateway.requests.map((request) => request.body);
   } finally {
     gateway.stop();
@@ -2645,10 +2650,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "/trace on a subagent's screen shows why its prompt waits for a sign-in: the failed refresh, the issuer step, and the notice it never showed",
+    "/trace on a subagent's screen shows why its prompt waits for a sign-in: the failed refresh, the issuer step, and the notice each screen showed",
     async () => {
       // The issuer cannot refresh the saved login. Main's screen shows the
-      // failure; the subagent's prompt then waits with no notice of its own.
+      // failure, and the subagent's screen shows it again for its own prompt.
       const issuer = startFakeIssuer({ refresh: () => new Response("unavailable", { status: 500 }) });
       const traceDir = mkdtempSync(join(tmpdir(), "fx-sign-in-trace-"));
       let mainCalls = 0;
@@ -2693,7 +2698,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           expect(has("issuer", true, "outcome=failed", "step=token", "login_deleted=false")).toBe(true);
           expect(has("refresh", true, "mode=if_needed", "outcome=failed", "step=issuer")).toBe(true);
           expect(has("prompt", true, "outcome=credential_failed", "screen=main", "notice=shown")).toBe(true);
-          expect(has("prompt", true, "outcome=credential_failed", "screen=subagent", "notice=not_shown")).toBe(true);
+          expect(has("prompt", true, "outcome=credential_failed", "screen=subagent", "notice=shown")).toBe(true);
           expect(has("prompt", true, "outcome=waits_for_sign_in", "screen=subagent")).toBe(true);
 
           const summary = report.one("sign_in");
@@ -2711,6 +2716,74 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       } finally {
         issuer.stop();
         rmSync(traceDir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a prompt on a subagent's screen says its sign-in refresh failed after main's screen showed the same failure, and main's screen does not say it again",
+    async () => {
+      // A failed refresh of the saved login parks the prompt until the person
+      // retries or signs in. Main's screen already told the person once; the
+      // subagent's screen must say so too, or it shows only "Thinking".
+      const issuer = startFakeIssuer({ refresh: () => new Response("unavailable", { status: 500 }) });
+      const subagentAsked: string[] = [];
+      let mainCalls = 0;
+      try {
+        await withFx((body) => {
+          if (!isMainRequest(body)) {
+            subagentAsked.push(latestUserText(body));
+            return text(`road_${subagentAsked.length}`, "SWITCH_ROAD_DONE");
+          }
+          mainCalls += 1;
+          if (mainCalls === 1) return toolCall("main_road", "subagent", { request: { action: "message", agent: "roadmap", message: "SWITCH_ROAD_TASK" } });
+          return text(`main_${mainCalls}`, `SWITCH_MAIN_${mainCalls}`);
+        }, async (session, { home }) => {
+          await session.sendText("SWITCH_USER start the roadmap");
+          await session.waitForText("roadmap finished", 30_000);
+          await session.waitForComposer(15_000);
+
+          // The saved login is now past its refresh deadline, and the issuer
+          // cannot refresh it.
+          writeFxLogin(home, issuer.issuerUrl, "seeded-token", { expiresAtMs: Date.now() - 120_000 });
+          await session.sendText("SWITCH_MAIN_AFTER_EXPIRY");
+          await session.waitForText("credential refresh failed", 30_000);
+          // Ctrl+C drops that prompt; the failure it reported stays recorded.
+          await session.sendKeys("C-c");
+          await until("main's prompt dropped", () => traceText().includes("reason=ctrl_c_pending_submission"), 15_000);
+
+          await showAgent(session, "roadmap");
+          await session.waitForPane((pane) => pane.includes("roadmap \u00b7 "), 15_000);
+          await session.sendText("SWITCH_ROAD_PROMPT after the failure");
+          const pane = await session.waitForPane(
+            (shown) => shown.includes("SWITCH_ROAD_PROMPT") && shown.includes("credential refresh failed"),
+            30_000,
+          );
+          expect(pane).toContain("press enter to retry. Your prompt is saved.");
+          expect(subagentAsked.some((asked) => asked.includes("SWITCH_ROAD_PROMPT"))).toBe(false);
+
+          // Back on main, a new prompt meets the same failure: main's screen
+          // already showed it, so it gets no second copy.
+          const dropped = () => traceText().split("reason=ctrl_c_pending_submission").length - 1;
+          const waiting = () => traceText().split("pending_prompt_awaiting_auth").length - 1;
+          const droppedBefore = dropped();
+          await session.sendKeys("C-c");
+          await until("the roadmap prompt dropped", () => dropped() > droppedBefore, 15_000);
+          await showAgent(session, "main");
+          const waitingBefore = waiting();
+          await session.sendText("SWITCH_MAIN_AGAIN");
+          await until("main's new prompt waits", () => waiting() > waitingBefore, 30_000);
+          await session.waitForPane((shown) => shown.includes("SWITCH_MAIN_AGAIN"), 15_000);
+          const mainScreen = await session.captureFullScrollback();
+          expect(mainScreen.split("credential refresh failed").length - 1).toBe(1);
+        }, (home) => writeFxLogin(home, issuer.issuerUrl, "seeded-token"), false, {
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          AI_GATEWAY_API_KEY: undefined as unknown as string,
+        });
+      } finally {
+        issuer.stop();
       }
     },
     TIMEOUT,
@@ -5806,6 +5879,180 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
         await until("the write", () => existsSync(join(workspace, "spike-e4.txt")));
         expect(mainSawNote).toBe(false);
       }, writeSpikeWriter);
+    },
+    TIMEOUT,
+  );
+
+  // The approval screen for a lent copy can fail before it opens. The deny
+  // still has to reach the subagent whose request waits, not main's worker,
+  // which usually has nothing to take it (`.no_pending`) and, with a request
+  // of its own numbered the same, would deny that one instead. The subagent's
+  // next request is then answered on main's screen normally, and a later
+  // answer from main's model finds no request for the denied one.
+  test(
+    "a failed approval screen on the lent copy denies the subagent, not main",
+    async () => {
+      const arrival = held();
+      let childCalls = 0;
+      let childSawReason = false;
+      let mainAnswer = "";
+      const bodies: string[] = [];
+      await withFx(
+        (body) => {
+          bodies.push(body);
+          if (!SPIKE_MAIN(body)) {
+            childCalls += 1;
+            if (childCalls === 1) return text("child_e6_ready", "SPIKE_E6_READY");
+            if (childCalls === 2) {
+              return arrival.promise.then(() =>
+                toolCall("child_e6_write", "write_file", { path: "spike-e6.txt", content: "SPIKE_WROTE\n" })
+              );
+            }
+            if (childCalls === 3) {
+              childSawReason = body.includes("could not show this request, so it was refused");
+              return toolCall("child_e6_write_again", "write_file", { path: "spike-e6b.txt", content: "SPIKE_WROTE\n" });
+            }
+            return text("child_e6_second", "SPIKE_E6_SECOND_DONE");
+          }
+          if (!body.includes('"main_e6_start"')) {
+            return toolCall("main_e6_start", "subagent", {
+              request: { action: "message", agent: "writer", message: "SPIKE_E6_FIRST", profile: "writer" },
+            });
+          }
+          if (body.includes('"main_e6_answer"')) {
+            mainAnswer = body.includes("has no approval request waiting") ? "no_request" : "other";
+            return text("main_e6_said", "SPIKE_E6_MAIN_ANSWERED");
+          }
+          if (!body.includes("SPIKE_USER_e6b")) return text("main_e6_tail", "SPIKE_E6_MAIN_DONE");
+          return toolCall("main_e6_answer", "subagent", { action: "approve", agent: "writer" });
+        },
+        async (session, { workspace, stderrPath }) => {
+          await session.sendText("SPIKE_USER_e6");
+          await session.waitForText("SPIKE_E6_MAIN_DONE", 30_000);
+          await showAgent(session, "writer");
+          await session.waitForPane((pane) => pane.includes("SPIKE_E6_FIRST"), 20_000);
+          // A turn the person types on the subagent's own screen. Its write
+          // arrives once the person is back on main, so the only screen that
+          // could show it is main's, holding the lent copy.
+          await session.sendText("SPIKE_E6_TYPED");
+          await session.waitForPane((pane) => pane.includes("SPIKE_E6_READY"), 20_000);
+          await showAgent(session, "main");
+          arrival.release();
+          await session.waitForText("The approval screen could not open", 30_000);
+          // The hook fails one screen, and the notice appears once.
+          const scrollback = await session.captureFullScrollback();
+          expect(scrollback.split("The approval screen could not open").length - 1).toBe(1);
+          // The subagent reads the reason and asks again. The person answers
+          // that second request with the key, and it is answered normally.
+          await session.waitForPane((pane) => pane.includes("spike-e6b.txt"), 30_000);
+          await session.sendKeys("1");
+          await until("the second write", () => existsSync(join(workspace, "spike-e6b.txt")));
+          expect(readFileSync(join(workspace, "spike-e6b.txt"), "utf8")).toBe("SPIKE_WROTE\n");
+          expect(childSawReason).toBe(true);
+          expect(existsSync(join(workspace, "spike-e6.txt"))).toBe(false);
+          // A later answer from main's model for the denied request finds
+          // nothing, so nothing reports a request it no longer waits on.
+          await session.sendText("SPIKE_USER_e6b");
+          await session.waitForText("SPIKE_E6_MAIN_ANSWERED", 30_000);
+          expect(mainAnswer).toBe("no_request");
+          for (const body of bodies) expect(body).not.toContain("is no longer waiting");
+          await showAgent(session, "writer");
+          await session.waitForText("SPIKE_E6_SECOND_DONE", 30_000);
+          await showAgent(session, "main");
+          expect(await session.capturePane()).not.toContain("needs permission");
+          expect(stderrPath).toBeDefined();
+          expect(readFileSync(stderrPath!, "utf8")).toBe("");
+        },
+        writeSpikeWriter,
+        false,
+        { FX_TEST_APPROVAL_SCREEN_FAIL: "1" },
+        {},
+        "",
+        true,
+      );
+    },
+    TIMEOUT,
+  );
+
+  // A request main's model asked for is registered, and it shows on the
+  // subagent's own screen. When that screen fails, fx denies it there and the
+  // binding goes with the answer, so main's later answer finds no request at
+  // all instead of resolving one whose worker already took the deny.
+  test(
+    "a failed approval screen on the subagent's own screen leaves main nothing to answer",
+    async () => {
+      const arrived = held();
+      const answered = held();
+      const denied = held();
+      let childCalls = 0;
+      let childSawReason = false;
+      let mainAnswer = "";
+      await withFx(
+        (body) => {
+          if (!SPIKE_MAIN(body)) {
+            childCalls += 1;
+            // The write waits for the person to be on the subagent's own
+            // screen, so the request shows there and is not lent to main.
+            if (childCalls === 1) {
+              return arrived.promise.then(() =>
+                toolCall("child_e7_write", "write_file", { path: "spike-e7.txt", content: "SPIKE_WROTE\n" })
+              );
+            }
+            childSawReason = body.includes("could not show this request, so it was refused");
+            // The subagent's turn stays open, so its worker is still attached
+            // and its binding, if nothing withdrew it, still waits for main's
+            // answer.
+            return denied.promise.then(() => text("child_e7_done", "SPIKE_E7_DENIED"));
+          }
+          if (!body.includes('"main_e7_start"')) {
+            return toolCall("main_e7_start", "subagent", {
+              request: { action: "message", agent: "writer", message: "SPIKE_E7_TASK", profile: "writer" },
+            });
+          }
+          if (body.includes('"main_e7_answer"')) {
+            // The code decides which text this is: no request at all, or one
+            // that no longer waits (`answerApproval` in
+            // `src/core/subagent/tool_host.zig`).
+            mainAnswer = body.includes("has no approval request waiting")
+              ? "has no approval request waiting"
+              : body.includes("is no longer waiting") ? "is no longer waiting" : "other";
+            return text("main_e7_said", "SPIKE_E7_MAIN_ANSWERED");
+          }
+          if (!body.includes(SPIKE_NOTE)) return text("main_e7_tail", "SPIKE_E7_MAIN_DONE");
+          // Main answers the request its note named, once the screen has
+          // already failed, so the order under test is the one that runs.
+          return answered.promise.then(() => toolCall("main_e7_answer", "subagent", { action: "approve", agent: "writer" }));
+        },
+        async (session, { workspace, stderrPath }) => {
+          await session.sendText("SPIKE_USER_e7");
+          await session.waitForText("SPIKE_E7_MAIN_DONE", 30_000);
+          await showAgent(session, "writer");
+          arrived.release();
+          // The request is main's, so the subagent's own screen shows it, and
+          // the hook fails that screen.
+          await session.waitForText("The approval screen could not open", 30_000);
+          await until("the subagent read the reason", () => childSawReason);
+          answered.release();
+          // Main answers the request its note named: with the binding gone it
+          // finds nothing, and main's screen shows no request waiting.
+          await showAgent(session, "main");
+          await session.waitForText("SPIKE_E7_MAIN_ANSWERED", 30_000);
+          expect(mainAnswer).toBe("has no approval request waiting");
+          expect(await session.capturePane()).not.toContain("needs permission");
+          denied.release();
+          await showAgent(session, "writer");
+          await session.waitForText("SPIKE_E7_DENIED", 30_000);
+          expect(existsSync(join(workspace, "spike-e7.txt"))).toBe(false);
+          expect(stderrPath).toBeDefined();
+          expect(readFileSync(stderrPath!, "utf8")).toBe("");
+        },
+        writeSpikeWriter,
+        false,
+        { FX_TEST_APPROVAL_SCREEN_FAIL: "1" },
+        {},
+        "",
+        true,
+      );
     },
     TIMEOUT,
   );

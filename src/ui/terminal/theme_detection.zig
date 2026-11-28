@@ -110,10 +110,6 @@ test "the background probe keeps reading until the fence completes" {
     try std.testing.expect(fencedBackgroundReply("") == .pending);
 }
 
-fn testThemeProbeSigWinchWake(_: std.posix.SIG) callconv(.c) void {
-    shell_runtime.notifyResizeWakePipe();
-}
-
 test "queryTerminalBackground keeps waiting across SIGWINCH until reply arrives" {
     if (comptime !shell_runtime.supports_resize_signal) return error.SkipZigTest;
 
@@ -122,7 +118,7 @@ test "queryTerminalBackground keeps waiting across SIGWINCH until reply arrives"
     defer _ = std.c.close(stdin_pipe[1]);
 
     var terminal = shell_runtime.TerminalState{ .stdin_fd = stdin_pipe[0] };
-    terminal.installResizeSignal(testThemeProbeSigWinchWake);
+    terminal.installResizeSignal(shell_runtime.test_winch.handler);
     defer {
         terminal.uninstallResizeSignal();
         for (&terminal.resize_wake_pipe) |*fd| {
@@ -134,19 +130,21 @@ test "queryTerminalBackground keeps waiting across SIGWINCH until reply arrives"
     }
 
     const Peer = struct {
-        fn run(pid: std.c.pid_t, write_fd: std.posix.fd_t) void {
-            io_mod.sleep(5 * std.time.ns_per_ms);
+        fn run(pid: std.c.pid_t, write_fd: std.posix.fd_t, wake_fd: std.posix.fd_t, seen: u32) void {
+            const winch = shell_runtime.test_winch;
             _ = std.c.kill(pid, std.posix.SIG.WINCH);
-            io_mod.sleep(20 * std.time.ns_per_ms);
+            // The reply goes only after the probe took the wake, so the wake comes first; with no wake the probe reaches its deadline and the test fails.
+            if (!winch.awaitHandled(seen, winch.peer_wait_ms)) return;
+            if (!winch.awaitWakeDrained(wake_fd, winch.peer_wait_ms)) return;
             const reply = "\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[?62;22c";
             _ = std.c.write(write_fd, reply.ptr, reply.len);
         }
     };
     const pid = std.c.getpid();
-    var thread = try std.Thread.spawn(.{}, Peer.run, .{ pid, stdin_pipe[1] });
+    var thread = try std.Thread.spawn(.{}, Peer.run, .{ pid, stdin_pipe[1], terminal.resize_wake_pipe[0], shell_runtime.test_winch.count() });
     defer thread.join();
 
-    // A deadline well past the peer's 25 ms keeps a loaded CI machine from ending the wait first; the old code still fails, because it stopped at the wake.
-    const bg = readBackgroundReplyUntilDeadline(&terminal, io_mod.milliTimestamp() + 2_000) orelse return error.TestUnexpectedResult;
+    // The old code fails, because it stopped at the wake.
+    const bg = readBackgroundReplyUntilDeadline(&terminal, io_mod.milliTimestamp() + shell_runtime.test_winch.poll_timeout_ms) orelse return error.TestUnexpectedResult;
     try std.testing.expect(bg.light);
 }
