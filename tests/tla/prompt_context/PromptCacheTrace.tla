@@ -89,6 +89,9 @@ Next ==
                                changed |-> b # 0 /\ (Ctx(o.req) # Ctx(Observed[b].req)
                                                        \/ Carried(o.req) > Carried(Observed[b].req)),
                                keep |-> IF b = 0 THEN 0 ELSE Keep(b),
+                               \* No exception for a replayed request (PromptCache
+                               \* restarted).
+                               restarted |-> FALSE,
                                repoSeen |-> \E j \in 1..i : Observed[j].repo = o.repo,
                                worktreeSeen |-> \E j \in 1..i : Observed[j].w = o.w,
                                anySeen |-> i > 0])

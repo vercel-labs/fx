@@ -122,7 +122,11 @@
 (* session's first effort and an update block, "eff", comes right before   *)
 (* that turn's message (src/gateway/vercel_protocol.zig). Mutation         *)
 (* "effort_follows_current" is fx before that: the request's own effort    *)
-(* follows the turn's.                                                     *)
+(* follows the turn's. fx's own summary restarts that first effort at the  *)
+(* running turn's (D104, src/core/agent/runtime/effort_anchor.zig          *)
+(* sessionAnchor): the request right after it may miss the stable prefix,  *)
+(* the one miss D104 accepts. Mutation "anchor_restarts_at_effort" also    *)
+(* restarts it at an "effort" turn, which no exception covers.             *)
 (*                                                                         *)
 (* Event "summary" is fx's own summary written inside a turn: it replaces  *)
 (* the history, and fx sends it as a user message. A turn that sent an     *)
@@ -162,7 +166,7 @@ ASSUME Mutation \in {"none", "mark_every_system", "fence_after_context", "no_aut
                      "note_not_saved", "contract_late", "remind_old_result",
                      "stale_in_instructions", "overlay_rebuilt", "overlay_not_saved",
                      "skill_swapped", "attach_in_instructions", "effort_follows_current",
-                     "summary_stale"}
+                     "summary_stale", "anchor_restarts_at_effort"}
 ASSUME Carrier \in {"message", "note"}
 ASSUME MaxSessions \in Nat /\ MaxSteps \in Nat /\ Limit \in Nat
 ASSUME PathScoped \in BOOLEAN
@@ -276,7 +280,7 @@ NoSession == [on |-> FALSE, w |-> "none", s |-> 0, n |-> 0, br |-> "b1", br0 |->
               skill |-> FALSE, skillText |-> 0,
               carrierAt |-> 0, remindable |-> FALSE, reminded |-> FALSE,
               resumed |-> FALSE, stale |-> FALSE, out |-> FALSE, out0 |-> FALSE,
-              attached |-> FALSE, attach |-> FALSE, effort |-> "e1", effortChanged |-> FALSE,
+              attached |-> FALSE, attach |-> FALSE, effort |-> "e1", effortChanged |-> FALSE, anchor |-> "e1",
               own |-> FALSE, pending |-> FALSE, summarized |-> FALSE]
 
 (* Whether the request's turn context and runtime block show the outside  *)
@@ -306,9 +310,10 @@ LeadBlocks(a) ==
          \o (IF a.skill THEN << Block("skill", "k") >> ELSE << >>)
          \o Overlay(a.w, LeadBranch(a))
 
-(* The effort the request itself names. With Notes it is the session's      *)
-(* first, "e1"; before that it follows the turn.                           *)
-RequestEffort(a) == IF Notes /\ Mutation # "effort_follows_current" THEN "e1" ELSE a.effort
+(* The effort the request itself names. With Notes it is the anchor: the   *)
+(* session's first, "e1", until fx's own summary restarts it; before that  *)
+(* it follows the turn.                                                    *)
+RequestEffort(a) == IF Notes /\ Mutation # "effort_follows_current" THEN a.anchor ELSE a.effort
 
 (* The first block with the request's own effort, which is part of the     *)
 (* provider's cache key.                                                    *)
@@ -335,12 +340,12 @@ Init ==
   /\ branchOf = [w \in Worktrees |-> "b1"]
 
 (* Send one request and record what the provider read.                     *)
-Send(w, s, req, first, prev, changed, keep) ==
+Send(w, s, req, first, prev, changed, keep, restarted) ==
   LET bps == Breakpoints(req)
   IN /\ cache' = cache \cup {SubSeq(req, 1, n) : n \in WritesWith(req, Manual(req))}
      /\ log' = Append(log, [w |-> w, s |-> s, first |-> first, req |-> req, bps |-> bps,
                             read |-> ReadWith(req, Manual(req), cache), prev |-> prev, changed |-> changed,
-                            keep |-> keep,
+                            keep |-> keep, restarted |-> restarted,
                             repoSeen |-> \E i \in 1..Len(log) : RepoOf[log[i].w] = RepoOf[w],
                             worktreeSeen |-> \E i \in 1..Len(log) : log[i].w = w,
                             anySeen |-> Len(log) > 0])
@@ -358,7 +363,7 @@ Start(w) ==
      /\ sessions < MaxSessions
      /\ sessions' = s
      /\ active' = [a EXCEPT !.last = req]
-     /\ Send(w, s, req, TRUE, <<>>, FALSE, 0)
+     /\ Send(w, s, req, TRUE, <<>>, FALSE, 0, FALSE)
      /\ UNCHANGED branchOf
 
 (* A message without the change it carried.                               *)
@@ -388,6 +393,8 @@ Continue(kind) ==
       \* The turn's message follows an update; the request keeps its effort.
       effortUpdate == kind = "effort" /\ Notes /\ Mutation # "effort_follows_current"
       summarizing == kind = "summary"
+      \* The effort the turn asks for.
+      turnEffort == IF kind = "effort" THEN "e2" ELSE a.effort
       carried == Notes /\ Carrier = "message"
       \* fx's summary in a turn that sent an earlier turn's copy captures the
       \* current values; with "summary_stale" the next turn does instead.
@@ -440,8 +447,10 @@ Continue(kind) ==
                         !.resumed = a.resumed \/ kind = "resume",
                         !.stale = a.stale \/ staleInLead,
                         !.out = a.out \/ kind = "outside",
-                        !.effort = IF kind = "effort" THEN "e2" ELSE a.effort,
+                        !.effort = turnEffort,
                         !.effortChanged = a.effortChanged \/ kind = "effort",
+                        !.anchor = IF summarizing \/ (kind = "effort" /\ Mutation = "anchor_restarts_at_effort")
+                                   THEN turnEffort ELSE a.anchor,
                         !.attached = a.attached \/ kind = "attach",
                         !.attach = (IF isTurn THEN kind = "attach" /\ Mutation = "attach_in_instructions"
                                     ELSE a.attach),
@@ -452,8 +461,15 @@ Continue(kind) ==
                                     ELSE a.pending \/ (summarizing /\ ~a.own /\ Mutation = "summary_stale"),
                         !.summarized = a.summarized \/ summarizing]
       req == Lead(next) \o hist
+      \* The one miss D104 accepts: fx's own summary restarts the anchor at
+      \* the running turn's effort (effort_anchor.zig sessionAnchor), so the
+      \* request right after it names another effort and reads nothing. Only
+      \* a summary whose request effort really changes counts; a summary that
+      \* keeps it, and every other request, keeps the checks below.
+      restarted == summarizing /\ RequestEffort(next) # RequestEffort(a)
       \* A summary replaces the history: only the stable instructions stay.
-      keep == IF summarizing THEN PosStable ELSE LastKept(a.last)
+      keep == IF restarted THEN 0
+              ELSE IF summarizing THEN PosStable ELSE LastKept(a.last)
   IN /\ a.on
      /\ a.n < MaxSteps
      /\ kind \in {"switch", "deliver", "skill", "remind", "resume", "outside", "attach", "effort", "summary"} => kind \in Events
@@ -467,7 +483,7 @@ Continue(kind) ==
      /\ kind = "effort" => ~a.effortChanged
      /\ kind = "summary" => ~a.summarized
      /\ active' = [next EXCEPT !.last = req]
-     /\ Send(a.w, a.s, req, FALSE, a.last, event, keep)
+     /\ Send(a.w, a.s, req, FALSE, a.last, event, keep, restarted)
      /\ branchOf' = [branchOf EXCEPT ![a.w] = br]
      /\ UNCHANGED sessions
 
@@ -523,9 +539,10 @@ SessionReuse ==
   \A i \in 1..Len(log) : ~log[i].first /\ ~log[i].changed => log[i].read >= Len(log[i].prev)
 
 (* When the turn context changes mid-session, the stable instructions are   *)
-(* still read.                                                              *)
+(* still read, except right after a summary that restarted the request's   *)
+(* effort (D104, effort_anchor.zig sessionAnchor; see restarted above).    *)
 ContextChangeKeepsStable ==
-  \A i \in 1..Len(log) : log[i].changed => log[i].read >= PosStable
+  \A i \in 1..Len(log) : log[i].changed /\ ~log[i].restarted => log[i].read >= PosStable
 
 (* When the turn context changes mid-session, the history is still read,   *)
 (* the turn after a named skill included. Only the notes design has it;    *)

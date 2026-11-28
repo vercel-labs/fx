@@ -39,6 +39,12 @@
 # turn that sent an earlier turn's turn context captures the current one there,
 # so the next turn sends the same bytes. p6-mutant-summary-stale.cfg keeps the
 # earlier copy and saves none, as fx did, which MidSessionKeepsHistory catches.
+# p6-openai-effort-summary.cfg turns on both: fx's summary restarts the request's
+# effort at the running turn's (D104), and only the request right after a
+# summary that changed it may miss the stable prefix. The two mutants above run
+# again with both events on (p6-mutant-effort-follows-current-summary.cfg,
+# p6-mutant-summary-stale-effort.cfg), and p6-mutant-anchor-restarts-at-effort.cfg
+# restarts the effort at an effort turn too, which that exception must not hide.
 #
 # p6-attach.cfg and p6-openai-attach.cfg add a user turn that attaches a file from a
 # folder with its own AGENTS.md, as an ACP client does: its rules ride on that turn's
@@ -112,4 +118,8 @@ MCPromptCache p6-mutant-effort-follows-current MidSessionKeepsHistory -deadlock
 MCPromptCache p6-summary - -deadlock
 MCPromptCache p6-openai-summary - -deadlock
 MCPromptCache p6-mutant-summary-stale MidSessionKeepsHistory -deadlock
+MCPromptCache p6-openai-effort-summary - -deadlock
+MCPromptCache p6-mutant-effort-follows-current-summary MidSessionKeepsHistory -deadlock
+MCPromptCache p6-mutant-summary-stale-effort MidSessionKeepsHistory -deadlock
+MCPromptCache p6-mutant-anchor-restarts-at-effort MidSessionKeepsHistory -deadlock
 EOT
