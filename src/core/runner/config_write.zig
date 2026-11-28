@@ -251,7 +251,7 @@ pub fn removeStaleTemps(dir: *io_mod.VerifiedDir, prefix: []const u8, now_s: i64
 
 // The other copy is `formatIso8601` in src/acp/sessions.zig; core cannot import acp.
 /// `now_s` as an ISO 8601 UTC time in whole seconds, as the driver writes it.
-fn isoTime(arena: std.mem.Allocator, now_s: i64) ![]const u8 {
+pub fn isoTime(arena: std.mem.Allocator, now_s: i64) ![]const u8 {
     const secs = std.math.cast(u64, now_s) orelse return error.InvalidClock;
     const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
     const day = epoch.getDaySeconds();

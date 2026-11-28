@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 pub const max_teams: usize = 300;
 /// The most team pages one listing reads. A page holds up to `team_page_limit` teams.
 pub const max_team_pages: usize = 16;
+pub const max_team_hints: usize = 10;
 pub const team_page_limit: usize = 100;
 pub const project_page_limit: usize = 20;
 /// The most bytes one setup reply may hold. Real list entries are large, and a page of
@@ -41,6 +42,7 @@ pub const Link = struct {
 
 pub const User = struct {
     id: []const u8,
+    default_team_id: ?[]const u8 = null,
 };
 
 pub const Team = struct {
@@ -121,6 +123,25 @@ pub fn listTeams(arena: Allocator, link: Link) Allocator.Error!Outcome([]const T
         cursor = next;
     }
     return .{ .ok = teams.items };
+}
+
+/// First page of teams for a login, capped at `max_team_hints`.
+pub fn listTeamsFirstPage(arena: Allocator, link: Link) Allocator.Error!Outcome([]const Team) {
+    const path = try arena.print("/v2/teams?limit={d}", .{max_team_hints});
+    const fetched = try fetch(arena, link, "teams", .GET, path, null);
+    const page = switch (try settle(TeamsPage, arena, "teams", fetched, parseTeamsPage)) {
+        .ok => |value| value,
+        .rejected => return .rejected,
+        .not_found => return .not_found,
+        .canceled => return .canceled,
+        .failed => |failure| return .{ .failed = failure },
+    };
+    return .{ .ok = page.teams[0..@min(page.teams.len, max_team_hints)] };
+}
+
+/// One team by its slug or id. A segment is path text, so it is escaped.
+pub fn getTeam(arena: Allocator, link: Link, slug_or_id: []const u8) Allocator.Error!Outcome(Team) {
+    return getTeamBySlug(arena, link, slug_or_id);
 }
 
 /// One team by its slug. A slug is path text, so it is escaped.
@@ -284,7 +305,10 @@ const TeamsPage = struct {
 // The fields fx reads from a setup reply. A field is an optional JSON value so `requiredText`
 // checks its type and length; a field fx does not read is not in these structs, so it is
 // skipped while parsing, never kept (U5).
-const UserEntry = struct { id: ?std.json.Value = null };
+const UserEntry = struct {
+    id: ?std.json.Value = null,
+    defaultTeamId: ?std.json.Value = null,
+};
 const UserReply = struct { user: ?UserEntry = null };
 const TeamEntry = struct {
     id: ?std.json.Value = null,
@@ -309,9 +333,21 @@ fn parseSetup(comptime T: type, arena: Allocator, bytes: []const u8) ParseError!
     };
 }
 
+fn optionalText(arena: Allocator, value: ?std.json.Value, max: usize) ParseError!?[]const u8 {
+    const found = value orelse return null;
+    return switch (found) {
+        .null => null,
+        .string => |text| if (text.len == 0) null else try requiredText(arena, found, max),
+        else => return error.BadReply,
+    };
+}
+
 fn parseUser(arena: Allocator, bytes: []const u8) ParseError!User {
     const user = (try parseSetup(UserReply, arena, bytes)).user orelse return error.BadReply;
-    return .{ .id = try requiredText(arena, user.id, max_id_bytes) };
+    return .{
+        .id = try requiredText(arena, user.id, max_id_bytes),
+        .default_team_id = try optionalText(arena, user.defaultTeamId, max_id_bytes),
+    };
 }
 
 fn teamFrom(arena: Allocator, entry: TeamEntry) ParseError!Team {
@@ -441,8 +477,55 @@ test "getUser reads the user id from the reply, and the token stays off the trac
     const user = try expectOk(User, try getUser(arena_state.allocator(), link));
     server.close();
     try std.testing.expectEqualStrings("user_fake_1", user.id);
+    try std.testing.expect(user.default_team_id == null);
     try std.testing.expectEqualStrings("GET /v2/user HTTP/1.1", server.line(0));
     try std.testing.expect(std.mem.find(u8, capture.captured(), "vca_fake_api_token") == null);
+}
+
+test "getUser decodes optional defaultTeamId when present and ignores null" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var server: test_server.Server = .{ .replies = &.{
+        .{ .status = "200 OK", .body = "{\"user\":{\"id\":\"user_fake_1\",\"defaultTeamId\":\"team_default_1\"}}" },
+        .{ .status = "200 OK", .body = "{\"user\":{\"id\":\"user_fake_2\",\"defaultTeamId\":null}}" },
+        .{ .status = "200 OK", .body = "{\"user\":{\"id\":\"user_fake_3\",\"defaultTeamId\":42}}" },
+    } };
+    try server.listen();
+    defer server.close();
+    try server.start();
+    var origin_buffer: [64]u8 = undefined;
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    const link = linkTo(try originFor(&origin_buffer, server.port()), &cancel, capture.trace());
+
+    const with_team = try expectOk(User, try getUser(arena_state.allocator(), link));
+    try std.testing.expectEqualStrings("team_default_1", with_team.default_team_id orelse return error.TestUnexpectedResult);
+
+    const with_null = try expectOk(User, try getUser(arena_state.allocator(), link));
+    try std.testing.expect(with_null.default_team_id == null);
+
+    try expectFailed(User, try getUser(arena_state.allocator(), link), "user", .bad_reply);
+}
+
+test "listTeamsFirstPage reads only the first page and caps at max_team_hints" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const page1 = try teamsPageBody(arena, 0, 12, 1000);
+    var server: test_server.Server = .{ .replies = &.{.{ .status = "200 OK", .body = page1 }} };
+    try server.listen();
+    defer server.close();
+    try server.start();
+    var origin_buffer: [64]u8 = undefined;
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    const link = linkTo(try originFor(&origin_buffer, server.port()), &cancel, capture.trace());
+    const teams = try expectOk([]const Team, try listTeamsFirstPage(arena, link));
+    server.close();
+    try std.testing.expectEqual(@as(usize, 1), server.servedCount());
+    try std.testing.expectEqual(max_team_hints, teams.len);
+    try std.testing.expectEqualStrings("fake-0", teams[0].slug);
+    try std.testing.expectEqualStrings("fake-9", teams[9].slug);
 }
 
 test "a 401 and a 403 both give rejected, and a rejected call is not retried" {
@@ -778,6 +861,7 @@ test "describe names the step and the reason" {
 
 const reply_seeds = .{
     "A{\"user\":{\"id\":\"user_fake_1\",\"username\":\"fake-user\",\"email\":\"fake@example.com\"}}",
+    "A{\"user\":{\"id\":\"user_fake_1\",\"defaultTeamId\":\"team_fake_1\"}}",
     "B{\"teams\":[{\"id\":\"team_fake_1\",\"slug\":\"fake-one\",\"name\":\"Fake One\"}],\"pagination\":{\"count\":1,\"next\":null}}",
     "B{\"teams\":[{\"id\":\"team_fake_2\",\"slug\":\"fake-two\",\"name\":\"Fake Two\"}],\"pagination\":{\"count\":1,\"next\":1700000000000}}",
     "C{\"projects\":[{\"id\":\"prj_fake_1\",\"name\":\"fake-web\",\"createdAt\":1700000000000}],\"pagination\":{\"count\":1,\"next\":null}}",
@@ -814,6 +898,7 @@ fn fuzzSetupReply(_: void, smith: *std.testing.Smith) !void {
         0 => {
             const user = parseUser(arena, body) catch |err| return refusedOnly(err);
             try expectBoundedId(user.id);
+            if (user.default_team_id) |team_id| try expectBoundedId(team_id);
         },
         1 => {
             const page = parseTeamsPage(arena, body) catch |err| return refusedOnly(err);

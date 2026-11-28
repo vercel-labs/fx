@@ -118,6 +118,7 @@
     {"name": "vercel_back_archive", "module": "fx", "test": "the bring-back archive decodes and writes only files whose names pass the path rules, on fuzzed bytes", "iterations": 100000},
     {"name": "vercel_back_text", "module": "fx", "test": "a stderr note and a deferred path parse or are ignored, a deferred path survives its escaping, and an accepted name is clean, on fuzzed bytes", "iterations": 200000},
     {"name": "vercel_config_remote", "module": "fx", "test": "a remote section parses or is refused on fuzzed bytes, and a parsed remote keeps the strings its JSON gave", "iterations": 200000},
+    {"name": "vercel_consent_record", "module": "fx", "test": "a consent record parses or is refused on fuzzed bytes, and what parses writes back the same", "iterations": 300000},
     {"name": "vercel_wait_answer", "module": "fx", "test": "a wait answer parses or is refused, and a parsed exit code holds when it is written back, on fuzzed bytes", "iterations": 200000},
     {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000},
     {"name": "file_index_snapshot", "module": "fx", "test": "a saved file-index snapshot loads or is refused on fuzzed bytes", "iterations": 3000},

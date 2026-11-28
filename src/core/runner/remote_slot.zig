@@ -28,6 +28,7 @@ pub const TokenHash = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const CheckedLogin = struct {
     token_hash: TokenHash,
     user_id: []u8,
+    default_team_id: ?[]u8 = null,
 };
 
 pub const Begin = enum { owner, wait };
@@ -63,7 +64,10 @@ pub const Slot = struct {
 
     pub fn destroy(self: *Slot) void {
         const alloc = self.alloc;
-        if (self.checked_login) |checked| alloc.free(checked.user_id);
+        if (self.checked_login) |checked| {
+            alloc.free(checked.user_id);
+            if (checked.default_team_id) |team| alloc.free(team);
+        }
         for (self.marks.keys()) |key| alloc.free(key);
         self.marks.deinit(alloc);
         if (self.destination_arena) |*arena| arena.deinit();
@@ -96,11 +100,34 @@ pub const Slot = struct {
     /// Keeps the login that passed the user check (R5): its token's hash and its user id. The copy is
     /// made before the mutex is taken, and the copy it replaces is freed under the mutex.
     pub fn storeChecked(self: *Slot, token_hash: TokenHash, user_id: []const u8) std.mem.Allocator.Error!void {
+        return self.storeCheckedUser(token_hash, user_id, null);
+    }
+
+    pub fn storeCheckedUser(
+        self: *Slot,
+        token_hash: TokenHash,
+        user_id: []const u8,
+        default_team_id: ?[]const u8,
+    ) std.mem.Allocator.Error!void {
         const copy = try self.alloc.dupe(u8, user_id);
+        errdefer self.alloc.free(copy);
+        const team_copy = if (default_team_id) |team| try self.alloc.dupe(u8, team) else null;
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        if (self.checked_login) |old| self.alloc.free(old.user_id);
-        self.checked_login = .{ .token_hash = token_hash, .user_id = copy };
+        if (self.checked_login) |old| {
+            self.alloc.free(old.user_id);
+            if (old.default_team_id) |team| self.alloc.free(team);
+        }
+        self.checked_login = .{ .token_hash = token_hash, .user_id = copy, .default_team_id = team_copy };
+    }
+
+    pub fn checkedDefaultTeam(self: *Slot, token_hash: TokenHash, arena: std.mem.Allocator) std.mem.Allocator.Error!?[]const u8 {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const checked = self.checked_login orelse return null;
+        if (!std.mem.eql(u8, &checked.token_hash, &token_hash)) return null;
+        const team = checked.default_team_id orelse return null;
+        return try arena.dupe(u8, team);
     }
 
     /// The checked user id, in `arena`, when `token_hash` is the checked login's token.
@@ -479,4 +506,21 @@ test "R1.5: the mutex is free while a setup's own work runs" {
     try reader_done;
     try testing.expectEqual(Begin.wait, reader.begin);
     try testing.expectEqual(setup.Mark.declined, reader.mark);
+}
+
+test "storeCheckedUser keeps optional default_team_id per token hash" {
+    const slot = try Slot.create(testing.allocator);
+    defer slot.destroy();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const hash_a: TokenHash = @splat(1);
+    const hash_b: TokenHash = @splat(2);
+    try slot.storeCheckedUser(hash_a, "usr_1", "team_default_1");
+    try testing.expectEqualStrings("usr_1", (try slot.checkedUser(hash_a, arena.allocator())).?);
+    try testing.expectEqualStrings("team_default_1", (try slot.checkedDefaultTeam(hash_a, arena.allocator())).?);
+    try testing.expect((try slot.checkedDefaultTeam(hash_b, arena.allocator())) == null);
+
+    try slot.storeCheckedUser(hash_a, "usr_1", null);
+    try testing.expect((try slot.checkedDefaultTeam(hash_a, arena.allocator())) == null);
 }
