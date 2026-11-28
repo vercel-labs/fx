@@ -1866,13 +1866,17 @@ pub const WorkerRuntime = struct {
         hooks.record_withdrawn(hooks.ctx, input_id);
     }
 
-    /// Whether the steering preview shows `prompt` while it waits for the
-    /// running turn. A subagent's report or message joins the turn as
-    /// steering too, but once the turn takes it the transcript shows it as
-    /// that subagent's row (`subagent/reports.zig`), so the preview never
-    /// draws it as a message the user typed.
+    /// Whether the steering preview shows `prompt` while it waits in the queue.
+    /// Every newly submitted user/parent prompt stays visible from admission
+    /// until its turn paints it: as steering while it can join the running
+    /// turn, or queued once it must wait for a turn of its own. Subagent
+    /// reports/messages (`author == .child`) and already-presented resume
+    /// prompts are omitted so they are never shown as fresh user input or
+    /// painted twice.
     fn previewsAsSteering(prompt: QueuedPrompt) bool {
-        return prompt.delivery.isSteering() and prompt.author != .child;
+        if (prompt.author == .child) return false;
+        if (prompt.user_prompt_already_presented or prompt.recovery_checkpoint != null) return false;
+        return true;
     }
 
     /// Whether steering `prompt` moves a running shell command to the
@@ -3190,6 +3194,15 @@ pub const WorkerRuntime = struct {
         return self.active_turn_id;
     }
 
+    fn pendingFeedbackText(event: WorkerEvent) ?[]const u8 {
+        return switch (event) {
+            .append_user_feedback => |text| text,
+            .begin_prompt => |turn| if (turn.author != .child) turn.text else null,
+            .begin_prompt_with_skill_bindings => |begin| if (begin.prompt.author != .child) begin.prompt.text else null,
+            else => null,
+        };
+    }
+
     /// Returns one coherent, allocator-owned steering presentation snapshot.
     /// Its messages are the steering `previewsAsSteering` shows.
     pub fn snapshotSteeringPresentation(self: *WorkerRuntime, alloc: std.mem.Allocator) !SteeringPresentationSnapshot {
@@ -3207,7 +3220,7 @@ pub const WorkerRuntime = struct {
         snapshot.pending_feedback = pending: {
             var count: usize = 0;
             for (self.worker_events.items) |event| {
-                if (event == .append_user_feedback) count += 1;
+                if (pendingFeedbackText(event) != null) count += 1;
             }
             if (count == 0) break :pending &.{};
             const feedback = try alloc.alloc([]u8, count);
@@ -3215,8 +3228,8 @@ pub const WorkerRuntime = struct {
             var written: usize = 0;
             errdefer for (feedback[0..written]) |message| alloc.free(message);
             for (self.worker_events.items) |event| {
-                if (event == .append_user_feedback) {
-                    feedback[written] = try alloc.dupe(u8, event.append_user_feedback);
+                if (pendingFeedbackText(event)) |text| {
+                    feedback[written] = try alloc.dupe(u8, text);
                     written += 1;
                 }
             }
@@ -7217,6 +7230,58 @@ test "a rich message behind waiting work keeps a turn of its own" {
     const rich = (try runtime.tryTakeNextPrompt(alloc)).?;
     defer freeQueuedPrompt(alloc, rich);
     try std.testing.expectEqualStrings("newer with image", rich.prompt);
+}
+
+test "steered prompt stays visible through finishProcessing, next-turn claim, and ordinary fallback" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try std.testing.expect(runtime.beginDirectProcessing(41));
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "follow-up", "model"));
+    runtime.finishProcessing();
+
+    // After finishProcessing demotes untaken steering to .continuation, the
+    // snapshot still lists it.
+    {
+        var snapshot = try runtime.snapshotSteeringPresentation(alloc);
+        defer snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.messages.len);
+        try std.testing.expectEqualStrings("follow-up", snapshot.messages[0]);
+        try std.testing.expect(!snapshot.waits_for_boundary);
+    }
+
+    // Once tryTakeNextPrompt moves it from queued_prompts into a pending
+    // begin_prompt worker event, the snapshot still shows it until drained.
+    const next_job = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, next_job);
+    {
+        var claimed = try runtime.snapshotSteeringPresentation(alloc);
+        defer claimed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), claimed.messages.len);
+        try std.testing.expectEqual(@as(usize, 1), claimed.pending_feedback.len);
+        try std.testing.expectEqualStrings("follow-up", claimed.pending_feedback[0]);
+    }
+
+    var events = runtime.takeEvents();
+    defer freeEventList(alloc, &events);
+    {
+        var drained = try runtime.snapshotSteeringPresentation(alloc);
+        defer drained.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), drained.pending_feedback.len);
+    }
+
+    // An ordinary user prompt queued behind an explicit cancel stays visible too.
+    runtime.requestInteractiveCancel();
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "after-cancel", "model"));
+    try std.testing.expect(runtime.queued_prompts.items[0].delivery == .ordinary);
+    {
+        var ordinary = try runtime.snapshotSteeringPresentation(alloc);
+        defer ordinary.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), ordinary.messages.len);
+        try std.testing.expectEqualStrings("after-cancel", ordinary.messages[0]);
+    }
+    runtime.finishProcessing();
 }
 
 test "a turn takes in only the messages right behind it, so none passes older work" {
