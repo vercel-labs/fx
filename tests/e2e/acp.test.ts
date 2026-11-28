@@ -3875,6 +3875,8 @@ describe("acp: model-independent", () => {
         expect(resp.result.agentCapabilities.mcpCapabilities).toEqual({ http: true, sse: false, acp: false });
         expect(resp.result.agentCapabilities.sessionCapabilities.resume).toEqual({});
         expect(resp.result.agentCapabilities.sessionCapabilities.close).toEqual({});
+        // A load can send its newest turns first, and older ones on request.
+        expect(resp.result.agentCapabilities._meta.fx.historyPages).toBe(true);
       } finally {
         await client?.close();
         rmSync(root.root, { recursive: true, force: true });
@@ -15915,3 +15917,227 @@ test(
   },
   TIMEOUT * 2,
 );
+
+// History a page at a time: with `_meta.fx.historyPages`, a load sends the newest turns first and
+// `_fx/session/history` sends the older ones, so the bottom screen comes first whatever the size
+// of the chat (tests/tla/session/HistoryLoad.tla BottomBounded, TranscriptExact).
+const HISTORY_KINDS = new Set(["user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan"]);
+
+function historyParagraphs(label: string, count: number, size: number): string {
+  return Array.from({ length: count }, (_, i) => `${label} paragraph ${i} ${"x".repeat(size)}`).join("\n\n");
+}
+
+/// A saved chat whose turns get `replies` in order, made through fx acp against the fake provider.
+async function savedHistoryChat(replies: string[], later?: (body: any) => Response | Promise<Response> | undefined) {
+  let turn = 0;
+  const fixture = createConfiguredProviderFixture(body => {
+    if (JSON.stringify(body).includes("short title")) return configuredCompletion(body.model, "History pages");
+    if (turn >= replies.length && later) return later(body) ?? configuredCompletion(body.model, "later reply");
+    return configuredCompletion(body.model, replies[Math.min(turn++, replies.length - 1)]);
+  });
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    for (let i = 0; i < replies.length; i++) {
+      const prompt = await runPrompt(client, `turn ${i}`, TIMEOUT);
+      expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+    }
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+    return { fixture, sessionId: created.result.sessionId as string };
+  } finally {
+    await client.close();
+  }
+}
+
+/// A fresh fx's `session/load` of the chat, with `meta` as its `_meta`: the reply and the
+/// `session/update` params that came before it.
+async function loadHistoryChat(fixture: ReturnType<typeof createConfiguredProviderFixture>, sessionId: string, meta?: object) {
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  await client.request("initialize", { protocolVersion: 1 }, 1);
+  const from = client.rawLines.length;
+  const loaded = await client.request("session/load", { sessionId, cwd: fixture.workspace, mcpServers: [], ...(meta ? { _meta: meta } : {}) }, 2) as any;
+  if (loaded.error) throw new Error(JSON.stringify(loaded.error));
+  const updates = client.rawLines.slice(from).map((line) => JSON.parse(line)).filter((m: any) => m.method === "session/update").map((m: any) => m.params);
+  return { client, loaded, updates };
+}
+
+/// The transcript's updates among `params`, without the message ids, which each load makes anew.
+function historyOf(params: any[]): any[] {
+  return params
+    .filter((p: any) => HISTORY_KINDS.has(p.update?.sessionUpdate))
+    .map((p: any) => JSON.parse(JSON.stringify(p.update, (key, value) => key === "messageId" ? undefined : value)));
+}
+
+function newestEnd(updates: any[]): number {
+  return updates.findIndex((p: any) => p._meta?.fx?.historyNewestEnd === true);
+}
+
+test("ACP history pages: the newest turns come first, and pages to the top give a whole load's history in order", async () => {
+  const replies = Array.from({ length: 12 }, (_, i) => historyParagraphs(`reply ${i}`, 6, 2000));
+  const { fixture, sessionId } = await savedHistoryChat(replies);
+  try {
+    // A client that doesn't ask gets today's load: no cursor and no marker.
+    const whole = await loadHistoryChat(fixture, sessionId);
+    expect(whole.loaded.result._meta?.fx?.historyCursor).toBeUndefined();
+    expect(newestEnd(whole.updates)).toBe(-1);
+    const wholeHistory = historyOf(whole.updates);
+    expect(wholeHistory.length).toBeGreaterThanOrEqual(24);
+    await whole.client.close();
+
+    const paged = await loadHistoryChat(fixture, sessionId, { fx: { historyPages: true } });
+    try {
+      const marker = newestEnd(paged.updates);
+      expect(marker).toBeGreaterThan(0);
+      const newest = historyOf(paged.updates.slice(0, marker));
+      expect(newest.length).toBeGreaterThan(0);
+      expect(JSON.stringify(newest).length).toBeLessThan(80 * 1024);
+      expect(newest).toEqual(wholeHistory.slice(wholeHistory.length - newest.length));
+      let cursor = paged.loaded.result._meta.fx.historyCursor;
+      expect(cursor).toBeDefined();
+      let shown = newest;
+      let pages = 0;
+      while (cursor) {
+        const page = await paged.client.request("_fx/session/history", { sessionId, cursor }, 100 + pages) as any;
+        if (page.error) throw new Error(JSON.stringify(page.error));
+        expect(page.result.damaged).toBe(false);
+        expect(page.result.continues).toBe(false);
+        shown = [...historyOf(page.result.updates), ...shown];
+        cursor = page.result.cursor;
+        pages += 1;
+        expect(pages).toBeLessThan(50);
+      }
+      expect(pages).toBeGreaterThan(0);
+      expect(shown).toEqual(wholeHistory);
+      expect(paged.client.stderr).toBe("");
+    } finally {
+      await paged.client.close();
+    }
+  } finally {
+    fixture.close();
+  }
+}, 180000);
+
+test("ACP history pages: a reply past the page is cut at a paragraph start, and its parts join into the reply", async () => {
+  const huge = historyParagraphs("huge", 60, 5000);
+  const { fixture, sessionId } = await savedHistoryChat(["short reply", huge]);
+  try {
+    const whole = await loadHistoryChat(fixture, sessionId);
+    const wholeHistory = historyOf(whole.updates);
+    await whole.client.close();
+    const paged = await loadHistoryChat(fixture, sessionId, { fx: { historyPages: true } });
+    try {
+      const newest = historyOf(paged.updates.slice(0, newestEnd(paged.updates)));
+      // Only the end of the reply: one message, from a paragraph start, about a page long.
+      expect(newest.map((u: any) => u.sessionUpdate)).toEqual(["agent_message_chunk"]);
+      const tail: string = newest[0].content.text;
+      expect(tail.length).toBeLessThanOrEqual(64 * 1024);
+      expect(tail.startsWith("huge paragraph ")).toBe(true);
+      expect(huge.endsWith(tail)).toBe(true);
+      let cursor = paged.loaded.result._meta.fx.historyCursor;
+      expect(cursor.part).toBeGreaterThan(0);
+      let shown: any[] = newest;
+      let pages = 0;
+      let cuts = 0;
+      while (cursor) {
+        const page = await paged.client.request("_fx/session/history", { sessionId, cursor }, 200 + pages) as any;
+        if (page.error) throw new Error(JSON.stringify(page.error));
+        const updates = historyOf(page.result.updates);
+        expect(updates.length).toBeGreaterThan(0);
+        if (page.result.continues) {
+          // The page ends inside the reply: its last message and the first one below are one.
+          const last = updates[updates.length - 1];
+          expect(last.sessionUpdate).toBe("agent_message_chunk");
+          expect(shown[0].sessionUpdate).toBe("agent_message_chunk");
+          shown = [...updates.slice(0, -1), { ...last, content: { ...last.content, text: last.content.text + shown[0].content.text } }, ...shown.slice(1)];
+          cuts += 1;
+        } else shown = [...updates, ...shown];
+        cursor = page.result.cursor;
+        pages += 1;
+        expect(pages).toBeLessThan(20);
+      }
+      expect(cuts).toBeGreaterThan(0);
+      expect(shown).toEqual(wholeHistory);
+    } finally {
+      await paged.client.close();
+    }
+  } finally {
+    fixture.close();
+  }
+}, 180000);
+
+test("ACP history pages: a page is answered while a turn runs, and an unknown cursor is refused", async () => {
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const replies = Array.from({ length: 10 }, (_, i) => historyParagraphs(`reply ${i}`, 6, 2000));
+  const { fixture, sessionId } = await savedHistoryChat(replies, (body) => held.then(() => configuredCompletion(body.model, "after the page")) as any);
+  try {
+    const paged = await loadHistoryChat(fixture, sessionId, { fx: { historyPages: true } });
+    try {
+      const cursor = paged.loaded.result._meta.fx.historyCursor;
+      expect(cursor).toBeDefined();
+      paged.client.send({ jsonrpc: "2.0", id: 300, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text: "one more" }] } });
+      const page = await paged.client.request("_fx/session/history", { sessionId, cursor }, 301) as any;
+      if (page.error) throw new Error(JSON.stringify(page.error));
+      expect(historyOf(page.result.updates).length).toBeGreaterThan(0);
+      // The turn is still waiting for its reply, so the page came first.
+      expect(paged.client.rawLines.some((line) => JSON.parse(line).id === 300)).toBe(false);
+      release();
+      const deadline = Date.now() + TIMEOUT;
+      while (!paged.client.rawLines.some((line) => JSON.parse(line).id === 300) && Date.now() < deadline) await Bun.sleep(50);
+      const done = paged.client.rawLines.map((line) => JSON.parse(line)).find((m: any) => m.id === 300);
+      expect(done?.result?.stopReason).toBe("end_turn");
+
+      const unknown = await paged.client.request("_fx/session/history", { sessionId, cursor: { offset: cursor.offset + 1, seq: cursor.seq } }, 302) as any;
+      expect(unknown.error?.code).toBe(-32602);
+      const other = await paged.client.request("_fx/session/history", { sessionId: "not-this-one", cursor }, 303) as any;
+      expect(other.error?.code).toBe(-32602);
+    } finally {
+      await paged.client.close();
+    }
+  } finally {
+    fixture.close();
+  }
+}, 180000);
+
+test("ACP history pages: a damaged line stops the pages there, and says so", async () => {
+  const replies = Array.from({ length: 12 }, (_, i) => historyParagraphs(`reply ${i}`, 6, 2000));
+  const { fixture, sessionId } = await savedHistoryChat(replies);
+  try {
+    // One character of reply 2's saved line changes, so its line's crc fails.
+    const logPath = join(sessionDir(fixture.home, sessionId), "log.jsonl");
+    const log = readFileSync(logPath, "utf8");
+    const at = log.indexOf("reply 2 paragraph 3");
+    expect(at).toBeGreaterThan(0);
+    writeFileSync(logPath, log.slice(0, at) + "reply 2 paragraph 4" + log.slice(at + "reply 2 paragraph 3".length));
+    const paged = await loadHistoryChat(fixture, sessionId, { fx: { historyPages: true } });
+    try {
+      let cursor = paged.loaded.result._meta.fx.historyCursor;
+      let shown = historyOf(paged.updates.slice(0, newestEnd(paged.updates)));
+      let damaged = paged.loaded.result._meta.fx.historyDamaged === true;
+      let pages = 0;
+      while (cursor) {
+        const page = await paged.client.request("_fx/session/history", { sessionId, cursor }, 400 + pages) as any;
+        if (page.error) throw new Error(JSON.stringify(page.error));
+        shown = [...historyOf(page.result.updates), ...shown];
+        damaged = damaged || page.result.damaged;
+        cursor = page.result.cursor;
+        pages += 1;
+        expect(pages).toBeLessThan(50);
+      }
+      expect(damaged).toBe(true);
+      // Every turn after the damaged line shows, and nothing from it or before it.
+      const texts = shown.map((u: any) => u.content?.text ?? "").join("\n");
+      expect(texts).toContain("reply 11 paragraph 0");
+      expect(texts).toContain("reply 3 paragraph 0");
+      expect(texts).not.toContain("reply 2 paragraph");
+      expect(texts).not.toContain("reply 1 paragraph");
+    } finally {
+      await paged.client.close();
+    }
+  } finally {
+    fixture.close();
+  }
+}, 180000);

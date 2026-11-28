@@ -31,17 +31,20 @@
 #
 # subagent: the TLA+ subagent and session-write models job model-checks the
 # design configs of tests/tla/subagent/ and the session-write, live sessions,
-# and accepted-input models in tests/tla/session/, and drives a built fx along
-# them, which takes a few minutes. A pull request runs it only when it touches
-# src/core/subagent/, src/core/session/, src/core/agent/worker_runtime.zig,
+# accepted-input, and history load models in tests/tla/session/, and drives a
+# built fx along them, which takes a few minutes. A pull request runs it only
+# when it touches src/core/subagent/, src/core/session/,
+# src/core/agent/worker_runtime.zig,
 # src/core/agent/runtime/parallel_execution.zig,
-# src/core/app/app_session_runtime.zig, those models, their drivers in
+# src/core/app/app_session_runtime.zig, src/acp/history_pages.zig,
+# src/acp/sessions.zig, those models, their drivers in
 # tests/tla/drivers/subagent/, tests/tla/drivers/session/write.test.ts,
-# tests/tla/drivers/session/live.test.ts, and
-# tests/tla/drivers/session/accepted-input.test.ts, the shared code in
+# tests/tla/drivers/session/live.test.ts,
+# tests/tla/drivers/session/accepted-input.test.ts, and
+# tests/tla/drivers/session/history.test.ts, the shared code in
 # tests/tla/lib/ and tests/tla/drivers/lib/, or the helpers those drivers load:
-# tests/e2e/tmux-helpers.ts, tests/e2e/saved-sessions.ts, and
-# tests/evals/eval-helpers.ts.
+# tests/e2e/tmux-helpers.ts, tests/e2e/saved-sessions.ts,
+# tests/e2e/fixtures/chat-completions.ts, and tests/evals/eval-helpers.ts.
 #
 # managed_execution: the TLA+ shell quiet notice model job model-checks the
 # design configs of tests/tla/managed_execution/ and drives quiet_notice.zig
@@ -155,8 +158,8 @@ while IFS= read -r -d '' path; do
       require_transcript_window "$path: shared driver code changed"
       require_subagent "$path: shared driver code changed"
       require_managed_execution "$path: shared driver code changed" ;;
-    tests/tla/drivers/subagent/* | tests/tla/drivers/session/write.test.ts | tests/tla/drivers/session/live.test.ts | tests/tla/drivers/session/accepted-input.test.ts)
-      require_subagent "$path: subagent, session-write, live sessions, or accepted-input driver changed" ;;
+    tests/tla/drivers/subagent/* | tests/tla/drivers/session/write.test.ts | tests/tla/drivers/session/live.test.ts | tests/tla/drivers/session/accepted-input.test.ts | tests/tla/drivers/session/history.test.ts)
+      require_subagent "$path: subagent, session-write, live sessions, accepted-input, or history load driver changed" ;;
     tests/tla/drivers/managed_execution/*)
       require_managed_execution "$path: shell quiet notice driver changed" ;;
     tests/tla/drivers/transcript_window/*)
@@ -172,6 +175,9 @@ while IFS= read -r -d '' path; do
       fi ;;
     src/napi_*.zig | src/wasm_core_main.zig)
       require_libfx "$path: libfx entry point changed" ;;
+    src/acp/history_pages.zig | src/acp/sessions.zig)
+      require_libfx "$path: code libfx owns changed"
+      require_subagent "$path: the history load changed" ;;
     src/acp/* | src/core/hosts/* | src/core/session_manager/*)
       require_libfx "$path: code libfx owns changed" ;;
     src/mcp/* | src/core/mcp_host/* | src/core/mcp/* | src/core/shared/net_connect.zig)
@@ -188,8 +194,8 @@ while IFS= read -r -d '' path; do
       require_managed_execution "$path: shell quiet notice model changed" ;;
     src/core/subagent/* | src/core/session/* | src/core/agent/worker_runtime.zig | src/core/agent/runtime/parallel_execution.zig | src/core/app/app_session_runtime.zig)
       require_subagent "$path: subagent, session, or accepted-input code changed" ;;
-    tests/tla/subagent/* | tests/tla/session/SessionWrite* | tests/tla/session/session-write* | tests/tla/session/LiveSessions* | tests/tla/session/live-* | tests/tla/session/AcceptedInput* | tests/tla/session/accepted-*)
-      require_subagent "$path: subagent, session-write, live sessions, or accepted-input model changed" ;;
+    tests/tla/subagent/* | tests/tla/session/SessionWrite* | tests/tla/session/session-write* | tests/tla/session/LiveSessions* | tests/tla/session/live-* | tests/tla/session/AcceptedInput* | tests/tla/session/accepted-* | tests/tla/session/HistoryLoad* | tests/tla/session/history-*)
+      require_subagent "$path: subagent, session-write, live sessions, accepted-input, or history load model changed" ;;
     tests/tla/lib/*)
       require_subagent "$path: shared model-check code changed"
       require_managed_execution "$path: shared model-check code changed" ;;
@@ -199,6 +205,8 @@ while IFS= read -r -d '' path; do
       require_managed_execution "$path: a file the shell quiet notice driver loads changed" ;;
     tests/e2e/saved-sessions.ts)
       require_subagent "$path: a file the accepted-input driver loads changed" ;;
+    tests/e2e/fixtures/chat-completions.ts)
+      require_subagent "$path: a file the history load driver loads changed" ;;
     tests/e2e/fixtures/mcp-* | tests/e2e/render-lab/tape.ts)
       require_mcp "$path: a file the MCP drivers load changed" ;;
   esac
