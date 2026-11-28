@@ -1873,7 +1873,9 @@ pub fn revalidateLiveActionPermissionOutcome(
             break :blk refreshed;
         },
     };
+    // A fresh answer from a question asked after a refresh keeps its own kind and epoch.
     if (human_approval.kind != .none and
+        outcome.human_approval.kind == .none and
         outcome.tool_failure == null and
         !outcome.decision.isDenied())
     {
