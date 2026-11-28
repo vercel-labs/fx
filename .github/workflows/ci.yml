@@ -13,15 +13,26 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Dev Release calls CI as the gate for a dev build. With dev_gate, only the
+  # build, the unit tests, the E2E shards, the MCP conformance baseline, and
+  # the SDK WASM, N-API, Node, and Browser jobs run.
+  workflow_call:
+    inputs:
+      dev_gate:
+        description: Run only the jobs a dev build waits for
+        type: boolean
+        default: false
 
 concurrency:
   # A manual dispatch gets its own group so it cannot cancel the push run on
   # main. A push to main runs the durable-session model check, which takes
   # about 40 minutes, so a newer push waits instead of cancelling it. Without
   # this, merges land faster than a run can finish and main never reports a
-  # result. GitHub keeps only the newest waiting run.
-  group: ci-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # result. GitHub keeps only the newest waiting run. A called workflow uses
+  # its caller's github context here, so the dev gate needs a group of its own
+  # or it would join the queue of the push runs on main.
+  group: ${{ inputs.dev_gate && format('ci-dev-gate-{0}', github.run_id) || format('ci-{0}{1}', github.event_name == 'workflow_dispatch' && 'dispatch-' || '', github.ref) }}
+  cancel-in-progress: ${{ !inputs.dev_gate && github.event_name == 'pull_request' }}
 
 jobs:
   zig_mode:
@@ -122,7 +133,7 @@ jobs:
         run: python3 -m scripts.check_cli_shape
 
       - name: Test CI and release scripts
-        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_dev_channel_forward scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape scripts.tests.test_check_provider_versions scripts.tests.test_publish_libfx
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_dev_channel_forward scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape scripts.tests.test_check_provider_versions scripts.tests.test_publish_libfx scripts.tests.test_dev_release
 
       - name: Test benchmark scripts
         run: python3 -m unittest benchmarks.shell_command_overhead_test
@@ -195,7 +206,7 @@ jobs:
   # on them instead of rerunning the package qualification before publishing.
   zig:
     name: Build & Test
-    if: ${{ always() }}
+    if: ${{ always() && !inputs.dev_gate }}
     needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp, tla-mcp-host, tla-transcript-window, tla-subagent, tla-managed-execution, tla-acp]
     runs-on: ubuntu-latest
     steps:
@@ -255,6 +266,7 @@ jobs:
   # all six, so the main run that Publish libfx waits for includes them.
   ci-need:
     name: Detect CI need
+    if: ${{ !inputs.dev_gate }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -474,6 +486,7 @@ jobs:
 
   sdk-bun:
     name: SDK (Bun + N-API/WASM)
+    if: ${{ !inputs.dev_gate }}
     needs: [ci-need, sdk-wasm, sdk-napi]
     runs-on: ubuntu-latest
     steps:
@@ -652,6 +665,7 @@ jobs:
 
   sdk-package-guards:
     name: SDK package guards
+    if: ${{ !inputs.dev_gate }}
     needs: [sdk-wasm, sdk-napi]
     runs-on: ubuntu-latest
     steps:
@@ -745,6 +759,7 @@ jobs:
   # (tests/tla/mcp/check.sh): they measure the checks, not the code.
   tla-mcp:
     name: TLA+ MCP engine models and driver
+    if: ${{ !inputs.dev_gate }}
     needs: [build, ci-need]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -797,6 +812,7 @@ jobs:
   # (tests/tla/mcp_host/check.sh).
   tla-mcp-host:
     name: TLA+ MCP host ${{ matrix.label }}
+    if: ${{ !inputs.dev_gate }}
     needs: [build, ci-need]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -878,6 +894,7 @@ jobs:
   # checks, not the code, and the second drives fx through tmux.
   tla-transcript-window:
     name: TLA+ transcript window model
+    if: ${{ !inputs.dev_gate }}
     needs: ci-need
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -917,6 +934,7 @@ jobs:
   # the code.
   tla-subagent:
     name: TLA+ subagent and session-write models
+    if: ${{ !inputs.dev_gate }}
     needs: [build, ci-need]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -972,6 +990,7 @@ jobs:
   # minutes of intentional flood and rearm waits.
   tla-managed-execution:
     name: TLA+ shell quiet notice model
+    if: ${{ !inputs.dev_gate }}
     needs: [build, ci-need]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -1029,6 +1048,7 @@ jobs:
   # the TLC configs, and with --ci the driver.ts files, but no check-spec.ts.
   tla-acp:
     name: TLA+ ACP models and drivers
+    if: ${{ !inputs.dev_gate }}
     needs: [build, ci-need]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -1248,6 +1268,7 @@ jobs:
 
   lint-scripts:
     name: Shellcheck
+    if: ${{ !inputs.dev_gate }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -1278,7 +1299,7 @@ jobs:
 
   e2e_acp_live:
     name: E2E ACP (live models)
-    if: github.event_name == 'workflow_dispatch' && inputs.acp_live
+    if: ${{ !inputs.dev_gate && github.event_name == 'workflow_dispatch' && inputs.acp_live }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
