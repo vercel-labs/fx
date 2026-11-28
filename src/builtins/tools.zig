@@ -500,7 +500,7 @@ pub fn shellProcessOnlySpec() ToolSpec {
 }
 
 const monitor_description =
-    "Start a command and get its new output as messages, instead of polling it with shell or a subagent. A message arrives at most every 10 seconds, and one more when the command ends. Use it for CI checks, logs, and slow jobs. Monitors end with fx: start them again after a restart.";
+    "Watch something that takes time. Start a command, and its new output arrives as messages: you never poll it with shell or a subagent. Start the monitor as your first step, before any check of your own: it reports errors and the end of the command too. Use it to watch CI checks, logs, deploys, and health checks, and for any request to wait for something or to tell the user when it happens. A message arrives at most every 10 seconds. Monitors end with fx: start them again after a restart.";
 
 const monitor_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "start", "list", "stop" } } },
@@ -895,9 +895,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "6f67766736dcf9c7b1ac62dbe6003095276a433843e6ca70a694b04b6aa28401"
+            "9c116347bba8dad482e8f01f46d107b3960558060c48ba0bc7a5b813547b83a9"
         else
-            "f2ef336a4544febcfde7cb25ae8aa7867bf61ad29bae3692f989c2d8cc63f84e",
+            "3cdc0f68682abb4006f90ac2f97b451a222e54b5cfd991387fff2b92e8106ce4",
         &actual_hex,
     );
 }

@@ -1623,6 +1623,12 @@ export const MONITOR_PROBES: Probe[] = [
   { id: "route-status", tool: "monitor", prompt: "Run git status and summarize it.", check: noMonitor },
   { id: "route-list", tool: "monitor", prompt: "List the files in the src directory.", check: noMonitor },
   { id: "route-wait", tool: "monitor", prompt: "Run sleep 5, then tell me what the date is.", check: noMonitor },
+  // Held out: worded after the text under test was written, and not used to tune it.
+  { id: "adopt-deploy", tool: "monitor", prompt: "Let me know when the deploy at https://staging.example.com starts serving build id abc123.", check: startsMonitor },
+  { id: "adopt-queue", tool: "monitor", prompt: "Keep an eye on queue.txt and tell me if the number in it ever goes above 100.", check: startsMonitor },
+  { id: "adopt-wait", tool: "monitor", prompt: "The migration prints its progress to migrate.out. Wait for it to finish and tell me how it went.", check: startsMonitor },
+  { id: "route-tests", tool: "monitor", prompt: "Run the unit tests once and show me any failures.", check: noMonitor },
+  { id: "route-fetch", tool: "monitor", prompt: "Download https://example.com/data.json with curl and tell me how big it is.", check: noMonitor },
 ];
 
 PROBES.push(...MONITOR_PROBES);

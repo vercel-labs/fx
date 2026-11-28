@@ -271,7 +271,7 @@ describe("monitor probes", () => {
   test("every probe has an id once", () => {
     const ids = MONITOR_PROBES.map((candidate) => candidate.id);
     expect(new Set(ids).size).toBe(ids.length);
-    expect(ids.filter((id) => id.startsWith("adopt-")).length).toBe(3);
-    expect(ids.filter((id) => id.startsWith("route-")).length).toBe(4);
+    expect(ids.filter((id) => id.startsWith("adopt-")).length).toBe(6);
+    expect(ids.filter((id) => id.startsWith("route-")).length).toBe(6);
   });
 });
