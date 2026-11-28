@@ -5788,6 +5788,7 @@ pub fn dupeToolLifecycleEvent(
                 .arguments_json = arguments_json,
                 .place_after_current_transcript = started.place_after_current_transcript,
                 .mcp_tool = try dupeMcpToolName(alloc, started.mcp_tool),
+                .command_placement = started.command_placement,
             } };
         },
         .progress => |progress| blk: {
@@ -5886,6 +5887,25 @@ fn freeMcpToolName(alloc: std.mem.Allocator, name: ?types.McpToolName) void {
     alloc.free(@constCast(value.tool));
 }
 
+test "a copied terminal event keeps the notice of its shell result, and a failed copy frees it" {
+    const alloc = std.testing.allocator;
+    const event: types.ToolLifecycleEvent = .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "shell-1" },
+        .outcome = .{ .kind = .completed, .summary = "Ran uname -s" },
+        .result = "{\"output_delta\":\"Darwin\\n\"}",
+        .result_memory = .{ .notice = "fx: ran on local because of your rule for uname -s*", .command_placement = .remote },
+    } };
+    const copy = try dupeToolLifecycleEvent(alloc, event);
+    defer freeToolLifecycleEvent(alloc, copy);
+    try std.testing.expectEqualStrings("fx: ran on local because of your rule for uname -s*", copy.terminal.result_memory.?.notice.?);
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .remote), copy.terminal.result_memory.?.command_placement);
+    try std.testing.checkAllAllocationFailures(@import("../shared/testing_allocator.zig").no_resize, struct {
+        fn run(a: std.mem.Allocator, value: types.ToolLifecycleEvent) !void {
+            freeToolLifecycleEvent(a, try dupeToolLifecycleEvent(a, value));
+        }
+    }.run, .{event});
+}
+
 test "a copied start event keeps the MCP tool core named for the call" {
     const alloc = std.testing.allocator;
     var server = "my_srv".*;
@@ -5939,6 +5959,11 @@ fn dupeToolResultMemory(
     else
         null;
     errdefer if (preview) |value| alloc.free(value);
+    const notice = if (memory.notice) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (notice) |value| alloc.free(value);
     const command_output_replay = if (memory.command_output_replay) |replay|
         try types.dupeCommandOutputReplay(alloc, replay)
     else
@@ -5951,6 +5976,7 @@ fn dupeToolResultMemory(
     return .{
         .output_handle = output_handle,
         .preview = preview,
+        .notice = notice,
         .output_bytes = memory.output_bytes,
         .stored_output_bytes = memory.stored_output_bytes,
         .truncated = memory.truncated,
@@ -5960,6 +5986,7 @@ fn dupeToolResultMemory(
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
         .subagent_started = memory.subagent_started,
+        .command_placement = memory.command_placement,
     };
 }
 
@@ -5970,6 +5997,7 @@ fn freeToolResultMemory(
     const value = memory orelse return;
     if (value.output_handle) |handle| alloc.free(@constCast(handle));
     if (value.preview) |preview| alloc.free(@constCast(preview));
+    if (value.notice) |notice| alloc.free(@constCast(notice));
     if (value.command_output_replay) |replay| {
         types.freeCommandOutputReplay(alloc, replay);
     }

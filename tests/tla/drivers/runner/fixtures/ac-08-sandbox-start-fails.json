@@ -1,0 +1,49 @@
+{
+  "covers": [
+    "AC-8"
+  ],
+  "title": "The sandbox create answers 500: exit 125, and nothing runs on this machine instead.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false
+      }
+    },
+    "teams": "one",
+    "surface": "interactive",
+    "login": "valid",
+    "configured": true,
+    "configValid": true,
+    "answers": [],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "refused"
+      ]
+    },
+    "prompts": 0,
+    "writes": 0
+  },
+  "run": {
+    "events": [
+      "push_failed",
+      "exit_125"
+    ]
+  },
+  "tamper": {
+    "setup": "outcome-as-local",
+    "run": "exit-code-lie"
+  },
+  "drive": {
+    "command": "touch local-marker",
+    "faults": {
+      "createStatus": 500
+    }
+  }
+}
