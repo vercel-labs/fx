@@ -91,7 +91,10 @@ EOT
 # code traces checked by TraceToolEdit.tla, and each planted bug in
 # mutations.json caught. The AgentWait graph is walked on the real subagent
 # wait, its traces are checked by TraceAgentWait.tla, the bridge grace is timed,
-# and each planted bug in agent-mutations.json is caught.
+# and each planted bug in agent-mutations.json is caught. The AskWait graph is
+# walked on the real bridge, runBridgeAsk, worker question slot, and managed
+# execution, its traces are checked by TraceAskWait.tla, and each planted bug
+# in ask-mutations.json is caught.
 # FX_TLA_TOOL_BRIDGE_QUICK=1 runs the quick settings.
 # FX_TLA_TOOL_BRIDGE_TLC_ONLY=1 skips the driver and keeps the TLC verdicts,
 # which every pull request checks in ci.yml.

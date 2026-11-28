@@ -1,0 +1,18 @@
+[
+  {
+    "id": "watch-off",
+    "breaks": "QuestionWatch does not call cancelPendingQuestionBatch when its request is canceled, so an open question of a gone program stays until answered (tool_runtime.zig QuestionWatch.run).",
+    "file": "src/core/tooling/tool_runtime.zig",
+    "find": "            if (self.cancel.load(.acquire) and self.worker.cancelPendingQuestionBatch()) {",
+    "replace": "            if (self.cancel.load(.acquire) and false) {",
+    "expect": "QuestionEndsWhenGone"
+  },
+  {
+    "id": "admission-lock-only",
+    "breaks": "The bridge does not hold bridge.prompt across the question, so a second ask enters the session's occupied question slot and fires the assert (bridge.zig serve).",
+    "file": "src/core/tool_bridge/bridge.zig",
+    "find": "    const holds_prompt = std.meta.activeTag(request.operation) == .ask;",
+    "replace": "    const holds_prompt = false;",
+    "expect": "NoCrash"
+  }
+]

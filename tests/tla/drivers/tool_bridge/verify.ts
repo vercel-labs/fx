@@ -26,6 +26,7 @@ import { MODEL_DIR, buildHarness, loadGraph, type Graph } from "./lib.ts";
 import { aloneConfig, codeToSpec, type CodeToSpecResult } from "./traces.ts";
 import { specToCode, type WalkResult } from "./walk.ts";
 import { runAgentGate } from "./agent-gate.ts";
+import { runAskGate } from "./ask-gate.ts";
 
 type Mutation = { id: string; breaks: string; file: string; find: string; replace: string; expect: string };
 type Stage = { name: string; ok: boolean; summary: string };
@@ -148,6 +149,11 @@ export async function runGate(options: { quick: boolean }): Promise<GateReport> 
   const agent = await runAgentGate({ quick, seed, out: join(out, "agent") });
   stages.push(...agent.stages);
   details.agent = agent.details;
+
+  // AskWait: `fx tool ask` on the real bridge, `runBridgeAsk`, worker question slot, and managed execution.
+  const ask = await runAskGate({ quick, seed, out: join(out, "ask") });
+  stages.push(...ask.stages);
+  details.ask = ask.details;
 
   const failures = stages.filter((s) => !s.ok).map((s) => s.name);
   details.durationMs = Math.round(performance.now() - started);

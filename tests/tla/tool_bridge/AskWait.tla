@@ -3,7 +3,9 @@
 (* `fx tool ask`, sent by a bash program through the tool bridge. This is  *)
 (* the design for slice 8, built in src/core/tool_bridge/bridge.zig (the   *)
 (* prompt lock) and src/core/tooling/tool_runtime.zig (runBridgeAsk and    *)
-(* QuestionWatch). Its Bun driver lands in block 8.2b.                     *)
+(* QuestionWatch). tests/tla/drivers/tool_bridge/ walks every distinct     *)
+(* step on the real code, checks recorded traces against TraceAskWait.tla, *)
+(* and catches both planted bugs in ask-mutations.json.                    *)
 (*                                                                         *)
 (* A question opens in the session's one question slot                     *)
 (* (`worker_runtime.zig` `requestQuestionBatchAnswerBlockingWithSource`,   *)
@@ -114,33 +116,49 @@ Gone ==
     /\ prog' = "gone"
     /\ UNCHANGED <<programs, ui, bash, req, lock, slot, crashed, asked, told>>
 
-\* Client r sends `fx tool ask`. After the first call yielded, no bridge is
-\* there (exit 3). A host with no question UI refuses at once (exit 6).
-\* Otherwise the request waits for the prompt lock.
-Send(r) ==
-    /\ prog = "running"
-    /\ req[r] = "none"
-    /\ IF bash # "first" THEN End(r, "unavailable")
-       ELSE IF ~ui THEN End(r, "no-ui")
-       ELSE /\ req' = [req EXCEPT ![r] = "queued"]
-            /\ UNCHANGED <<told, lock, slot>>
-    /\ UNCHANGED <<prog, programs, ui, bash, crashed, asked>>
-
-\* A queued request takes the free prompt lock and shows its question in the
-\* session's question slot. A full slot fires the assert. The planted bug
+\* The lock is free for a request when no question holds it. The planted bug
 \* admission-lock-only holds the lock only for the permission check, as the
-\* bridge does today, so a question opens without it.
-Show(r) ==
-    /\ req[r] = "queued"
-    /\ prog = "running"
-    /\ IF Mutation = "admission-lock-only"
-       THEN lock' = lock
-       ELSE lock = NoReq /\ lock' = r
+\* bridge did before slice 8, so a question never waits for it.
+LockFree == lock = NoReq \/ Mutation = "admission-lock-only"
+
+\* Request r takes the lock and shows its question in the session's question
+\* slot. A full slot fires the assert.
+ShowNow(r) ==
+    /\ lock' = IF Mutation = "admission-lock-only" THEN lock ELSE r
     /\ IF slot = NoReq
        THEN slot' = r /\ crashed' = crashed
        ELSE slot' = slot /\ crashed' = TRUE
     /\ req' = [req EXCEPT ![r] = "shown"]
     /\ asked' = asked + 1
+
+\* Client r sends `fx tool ask`. After the first call yielded, no bridge is
+\* there (exit 3). A host with no question UI refuses at once (exit 6). With
+\* the lock free, the request takes it and its question opens in this step:
+\* the bridge takes the lock right after it admits the request, with nothing
+\* between (`bridge.zig` `serve`). Else the request waits for the lock.
+Send(r) ==
+    /\ prog = "running"
+    /\ req[r] = "none"
+    /\ \/ /\ bash # "first"
+          /\ End(r, "unavailable")
+          /\ UNCHANGED <<crashed, asked>>
+       \/ /\ bash = "first" /\ ~ui
+          /\ End(r, "no-ui")
+          /\ UNCHANGED <<crashed, asked>>
+       \/ /\ bash = "first" /\ ui /\ LockFree
+          /\ ShowNow(r)
+          /\ UNCHANGED told
+       \/ /\ bash = "first" /\ ui /\ ~LockFree
+          /\ req' = [req EXCEPT ![r] = "queued"]
+          /\ UNCHANGED <<told, lock, slot, crashed, asked>>
+    /\ UNCHANGED <<prog, programs, ui, bash>>
+
+\* A queued request takes the lock once it is free, and its question opens.
+Show(r) ==
+    /\ req[r] = "queued"
+    /\ prog = "running"
+    /\ LockFree
+    /\ ShowNow(r)
     /\ UNCHANGED <<prog, programs, ui, bash, told>>
 
 \* A queued request whose program is gone gives up without a prompt. Its wait
