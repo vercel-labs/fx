@@ -852,11 +852,12 @@ pub fn executeCommandInEnvironment(
     );
 }
 
-/// The first line of a merged command's startup text. `command exec` keeps the
-/// redirect for the rest of the command, and `\` skips any alias. It is not in
-/// the bash session script, because the snapshot path runs the startup text
-/// inside a group, and bash 3.2 loses the output of an exec in such a group.
-const merge_stderr_startup = "\\command exec 2>&1\n";
+/// The first line of a merged command's startup text. `\exec` keeps the redirect
+/// for the rest of the command in bash 3.2, bash 5.3, and zsh, and `\` skips any
+/// alias. `builtin exec` drops the redirect in bash, and `command exec` fails in
+/// zsh. It is not in the bash session script, because the snapshot path runs the
+/// startup text inside a group, where an exec's redirect is lost.
+const merge_stderr_startup = "\\exec 2>&1\n";
 
 fn snapshotEligible(shell_path: []const u8, command: []const u8) bool {
     if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return false;
@@ -927,7 +928,7 @@ fn executeWithSnapshot(
         shell_resolver.snapshot_replay_failure_prefix,
         &nonce,
     });
-    const invocation = try shell_resolver.snapshotInvocation(scratch, generation.shell_path, failure_marker);
+    const invocation = try shell_resolver.snapshotInvocation(scratch, generation.shell_path, failure_marker, cfg.merge_stderr);
     const kind = shell_resolver.shellKind(generation.shell_path) orelse return error.UnsupportedShell;
     const script = try shell_resolver.snapshotScript(scratch, kind, generation.replay, cfg.after_startup, command, cfg.merge_stderr);
     debug_trace.logf(
@@ -2943,6 +2944,80 @@ test "a merged command writes its stderr into its stdout, in write order, on the
     shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
     const result = try executeCommandInEnvironment(config, arena, "printf a; printf B >&2; printf 'c\\n'", paths.workspace, .{ .user = paths.shell });
     try std.testing.expectEqualStrings("exit_code=0\n<stdout>\naBc\n</stdout>\n", result.output);
+}
+
+test "a merged command's EXIT trap writes into the one stream, in write order, on the snapshot path" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShellFor(arena, &tmp, "bash", ".bash_profile", "");
+    const config = Config{
+        .max_command_output_bytes = 16 * 1024,
+        .merge_stderr = true,
+    };
+
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const result = try executeCommandInEnvironment(config, arena, "trap 'echo trap_out; echo TRAP_ERR >&2' EXIT; printf body_out; printf 'BODY_ERR\\n' >&2", paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nbody_outBODY_ERR\ntrap_out\nTRAP_ERR\n</stdout>\n", result.output);
+}
+
+test "a merged command's EXIT trap writes into the one stream, in write order, on the full-startup path" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShellFor(arena, &tmp, "bash", ".bash_profile", "");
+    const config = Config{
+        .max_command_output_bytes = 16 * 1024,
+        .merge_stderr = true,
+    };
+
+    // A replay that cannot load sends the command down the full-startup path.
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    const result = try executeCommandInEnvironment(config, arena, "trap 'echo trap_out; echo TRAP_ERR >&2' EXIT; printf body_out; printf 'BODY_ERR\\n' >&2", paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nbody_outBODY_ERR\ntrap_out\nTRAP_ERR\n</stdout>\n", result.output);
+}
+
+test "a merged zsh command writes its stderr and EXIT trap into its stdout, on the snapshot and full-startup paths" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(arena, &tmp, "");
+    const config = Config{
+        .max_command_output_bytes = 16 * 1024,
+        .merge_stderr = true,
+    };
+    const command = "trap 'echo TRAP_ERR >&2; echo trap_out' EXIT; printf body_out; printf 'BODY_ERR\\n' >&2";
+    const want = "exit_code=0\n<stdout>\nbody_outBODY_ERR\nTRAP_ERR\ntrap_out\n</stdout>\n";
+
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const snapshot = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings(want, snapshot.output);
+
+    // A replay that cannot load sends the command down the full-startup path.
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    const full = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings(want, full.output);
 }
 
 test "a startup text with a syntax error sends the command to full startup, where the error shows" {
