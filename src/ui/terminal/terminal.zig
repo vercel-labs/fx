@@ -73,25 +73,38 @@ pub fn terminalGone(fd: std.posix.fd_t, err: anyerror) bool {
     const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
     // A descriptor that cannot be stat'ed is closed, so no terminal is left to hang up.
     const stat = file.stat(io_mod.getIo()) catch return true;
-    // Only a character device hangs up like a terminal. A pipe or a file never does, even after its writer closed.
-    if (stat.kind != .character_device) return false;
-    if (isNullDevice(fd)) return false;
     // macOS XNU poll with events=0 reports no flags on a closed pty; POLL.OUT surfaces POLLHUP and POLLNVAL.
     var fds = [_]std.posix.pollfd{.{
         .fd = fd,
         .events = std.posix.POLL.OUT,
         .revents = 0,
     }};
-    const gone_mask = std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL;
     _ = std.posix.poll(&fds, 0) catch return false;
-    if ((fds[0].revents & gone_mask) != 0) return true;
-    const fg_pgid = tcgetpgrp(fd);
-    if (fg_pgid > 0 and fg_pgid != getpgrp()) return true;
+    const hangup_at_first_poll = (fds[0].revents & gone_poll_flags) != 0;
+    const foreign_foreground = foreignForeground(fd);
+    // A call that fails, such as a revoked descriptor's, cannot prove the descriptor is still a terminal.
+    const still_terminal = file.isTty(io_mod.getIo()) catch true;
     // Error path only: teardown can raise EIO before POLLHUP/POLLNVAL appears (`tests/tla/terminal_hangup/TerminalHangup.tla` `GoneIsQuiet`).
     io_mod.sleep(@as(u64, @intCast(hangup_sign_wait_ms)) * std.time.ns_per_ms);
     fds[0].revents = 0;
     _ = std.posix.poll(&fds, 0) catch return false;
-    return (fds[0].revents & gone_mask) != 0;
+    return goneFromEvidence(.{
+        .character_device = stat.kind == .character_device,
+        .null_device = isNullDevice(fd),
+        .hangup_at_first_poll = hangup_at_first_poll,
+        .foreign_foreground = foreign_foreground,
+        .still_terminal = still_terminal,
+        .hangup_at_second_poll = (fds[0].revents & gone_poll_flags) != 0,
+    });
+}
+
+/// The poll flags that mean the terminal hung up, was revoked, or was invalidated.
+const gone_poll_flags = std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL;
+
+/// Whether another process group holds the terminal's foreground.
+fn foreignForeground(fd: std.posix.fd_t) bool {
+    const fg_pgid = tcgetpgrp(fd);
+    return fg_pgid > 0 and fg_pgid != getpgrp();
 }
 
 /// Whether terminal `fd` hung up when a read hit EOF (`0`) or `poll` reported
@@ -115,6 +128,8 @@ pub fn goneFromEvidence(evidence: GoneEvidence) bool {
     if (!evidence.character_device) return false;
     if (evidence.null_device) return false;
     if (evidence.hangup_at_first_poll or evidence.foreign_foreground) return true;
+    // macOS 15 polls a revoked terminal as readable only, so the poll flags miss it; a descriptor that is no longer a terminal is gone.
+    if (!evidence.still_terminal) return true;
     return evidence.hangup_at_second_poll;
 }
 

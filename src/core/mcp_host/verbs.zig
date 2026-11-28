@@ -1371,20 +1371,25 @@ fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
 
 /// Reads what waits on `fd` and takes a complete line from it. Test seam for the read and the hang-up check.
 fn readPastedFrom(arena: Allocator, line: *std.ArrayList(u8), fd: std.posix.fd_t, comptime readFn: anytype, comptime goneFn: anytype) !?[]const u8 {
-    _ = goneFn;
     var buffer: [1024]u8 = undefined;
-    const n = readFn(fd, &buffer) catch return null;
-    if (n == 0) {
-        // stdin closed: wait for the browser instead.
-        io_mod.sleep(100 * std.time.ns_per_ms);
-        return null;
-    }
+    const n = readFn(fd, &buffer) catch |err| {
+        if (goneFn(fd, err)) return error.TerminalHungUp;
+        return sleepPasteSlice();
+    };
+    // stdin closed: wait for the browser instead.
+    if (n == 0) return sleepPasteSlice();
     try line.appendSlice(arena, buffer[0..n]);
     const end = std.mem.findScalar(u8, line.items, '\n') orelse return null;
     const pasted = std.mem.trim(u8, line.items[0..end], " \t\r");
     const copy = try arena.dupe(u8, pasted);
     line.replaceRangeAssumeCapacity(0, end + 1, &.{});
     return if (copy.len == 0) null else copy;
+}
+
+/// Waits out one paste slice, so a stdin that keeps failing cannot spin the wait loop.
+fn sleepPasteSlice() ?[]const u8 {
+    io_mod.sleep(100 * std.time.ns_per_ms);
+    return null;
 }
 
 const testing = std.testing;
