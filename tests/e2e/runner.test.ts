@@ -323,9 +323,10 @@ async function withSandboxFixture(
   git(repo, ["add", "a.txt"]);
   git(repo, ["commit", "-q", "-m", "initial"]);
   writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ experimental: { sandbox_execution: sandboxOn } }));
+  const defaultRemote = active.remoteFor(fakeTeam, { id: fakeTeam.projects[0]!.id, name: "fx-sandbox" });
   const configBody = {
     rules: [],
-    remote: active.remote,
+    remote: defaultRemote,
     ...config(repo),
   } as Record<string, unknown>;
   writeFileSync(join(home, ".fx", "sandbox", "config.json"), JSON.stringify(configBody));
@@ -1438,6 +1439,84 @@ describe("remote setup over ACP: destination defaults, copy question, and consen
         setup,
       );
     });
+  }, TIMEOUT * 4);
+
+  test("fx config set sandbox_project then unset returns to fx-sandbox and asks again", async () => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam)] }, async (setup) => {
+      await withSandboxFixture(
+        [
+          fakeGatewayToolCall("call-1", "shell", { command: "echo custom-proj", runner: "remote" }),
+          fakeGatewayFinalText("custom done\n"),
+          fakeGatewayToolCall("call-2", "shell", { command: "echo default-proj", runner: "remote" }),
+          fakeGatewayFinalText("default done\n"),
+        ],
+        async (fixture) => {
+          const setRes = await runFx(["config", "set", "sandbox_project", fakeTeam.projects[0]!.name], {
+            cwd: fixture.workspace,
+            timeoutMs: TIMEOUT,
+            env: { HOME: fixture.home },
+          });
+          expect(setRes.code).toBe(0);
+
+          const run1 = await acpRun(fixture, ["Run with custom project."], answerCopy("Yes"));
+          expect(run1.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeTeam.name, fakeTeam.projects[0]!.name)]);
+          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
+
+          const unsetRes = await runFx(["config", "unset", "sandbox_project"], {
+            cwd: fixture.workspace,
+            timeoutMs: TIMEOUT,
+            env: { HOME: fixture.home },
+          });
+          expect(unsetRes.code).toBe(0);
+
+          const run2 = await acpRun(fixture, ["Run after unset."], answerCopy("Yes"));
+          expect(run2.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeTeam.name, "fx-sandbox")]);
+          expectRemoteWritten(fixture, fakeTeam, { id: `prj_sandbox_${fakeTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
+          expect(toolTexts(fixture.gateway)).toContain("default-proj");
+        },
+        NO_REMOTE,
+        true,
+        setup,
+      );
+    });
+  }, TIMEOUT * 4);
+
+  test("switching Vercel CLI config.json currentTeam asks again for the second team", async () => {
+    await withSetup(
+      {
+        teams: [teamWithSandbox(fakeTeam), teamWithSandbox(fakeSecondTeam)],
+        user: { ...fakeUser, defaultTeamId: null },
+      },
+      async (setup) => {
+        await withSandboxFixture(
+          [
+            fakeGatewayToolCall("call-1", "shell", { command: "echo team-1", runner: "remote" }),
+            fakeGatewayFinalText("one done\n"),
+            fakeGatewayToolCall("call-2", "shell", { command: "echo team-2", runner: "remote" }),
+            fakeGatewayFinalText("two done\n"),
+          ],
+          async (fixture) => {
+            writeCliLoginAndTeam(fixture.home, { currentTeam: fakeTeam.id });
+            const run1 = await acpRun(fixture, ["First team."], answerCopy("Yes"), {
+              env: { VERCEL_TOKEN: undefined, XDG_DATA_HOME: undefined },
+            });
+            expect(run1.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeTeam.name, "fx-sandbox")]);
+            expectRemoteWritten(fixture, fakeTeam, { id: `prj_sandbox_${fakeTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
+
+            writeCliLoginAndTeam(fixture.home, { currentTeam: fakeSecondTeam.id });
+            const run2 = await acpRun(fixture, ["Second team."], answerCopy("Yes"), {
+              env: { VERCEL_TOKEN: undefined, XDG_DATA_HOME: undefined },
+            });
+            expect(run2.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeSecondTeam.name, "fx-sandbox")]);
+            expectRemoteWritten(fixture, fakeSecondTeam, { id: `prj_sandbox_${fakeSecondTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
+            expect(toolTexts(fixture.gateway)).toContain("team-2");
+          },
+          NO_REMOTE,
+          true,
+          setup,
+        );
+      },
+    );
   }, TIMEOUT * 4);
 });
 

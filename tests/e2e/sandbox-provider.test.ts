@@ -62,7 +62,15 @@ async function withFixture(
     git(repo, ["init", "-q"]);
     git(repo, ["add", "a.txt"]);
     git(repo, ["commit", "-q", "-m", "initial"]);
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ experimental: { sandbox_execution: true } }));
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({
+        experimental: { sandbox_execution: true },
+        ...(options.configText === undefined && !options.config?.provider
+          ? { sandbox_project: remoteSetup.remote.project_name }
+          : {}),
+      }),
+    );
     const config = {
       rules: options.rules ?? [],
       remote: remoteSetup.remote,

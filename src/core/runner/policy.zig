@@ -1164,12 +1164,13 @@ test "ensureRemote is ready from the config's remote with no request, and then p
 
     const policy = try load(alloc, fx_home, "/Users/example", "/usr/bin:/bin");
     defer policy.destroy();
-    try writeConfigFile(tmp.dir, remote_config_text);
+    const sandbox_config_text = "{\"grace_ms\":2000,\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"fx-sandbox\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
+    try writeConfigFile(tmp.dir, sandbox_config_text);
     try policy.remote.setDestination(.{
         .team_id = "team_1",
         .team_slug = "acme",
         .project_id = "prj_1",
-        .project_name = "repo",
+        .project_name = "fx-sandbox",
         .user_id = "usr_1",
     });
     // The login's user is already cached for this token, so no request is made.
@@ -1177,7 +1178,7 @@ test "ensureRemote is ready from the config's remote with no request, and then p
     policy.remote_host.env = .{ .vercel_token = token, .home = policy.remote_host.home };
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
-    try policy.remote_host.user_check.store(alloc, digest, "usr_1");
+    try policy.remote_host.user_check.storeWithTeam(alloc, digest, "usr_1", "team_1");
 
     const repo = try makeRepo(alloc, tmp.dir);
     defer alloc.free(repo);
@@ -1203,7 +1204,7 @@ test "ensureRemote refuses headless without consent, and accepts isolated once r
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const isolated_config_text = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"isolated\"}],\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"repo\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
+    const isolated_config_text = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"isolated\"}],\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"fx-sandbox\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
     const policy = try load(alloc, fx_home, "/Users/example", "/usr/bin:/bin");
     defer policy.destroy();
     try writeConfigFile(tmp.dir, isolated_config_text);
@@ -1211,14 +1212,14 @@ test "ensureRemote refuses headless without consent, and accepts isolated once r
         .team_id = "team_1",
         .team_slug = "acme",
         .project_id = "prj_1",
-        .project_name = "repo",
+        .project_name = "fx-sandbox",
         .user_id = "usr_1",
     });
     const token = "fx-policy-token";
     policy.remote_host.env = .{ .vercel_token = token, .home = policy.remote_host.home };
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
-    try policy.remote_host.user_check.store(alloc, digest, "usr_1");
+    try policy.remote_host.user_check.storeWithTeam(alloc, digest, "usr_1", "team_1");
 
     const repo = try makeRepo(alloc, tmp.dir);
     defer alloc.free(repo);

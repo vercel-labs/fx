@@ -84,6 +84,17 @@ pub const UserCheck = struct {
         _ = alloc;
         return self.slot.storeChecked(hash, user_id);
     }
+
+    pub fn storeWithTeam(
+        self: *UserCheck,
+        alloc: std.mem.Allocator,
+        hash: TokenHash,
+        user_id: []const u8,
+        default_team_id: ?[]const u8,
+    ) std.mem.Allocator.Error!void {
+        _ = alloc;
+        return self.slot.storeCheckedUser(hash, user_id, default_team_id);
+    }
 };
 
 pub const Host = struct {
@@ -235,7 +246,7 @@ fn resolveUser(host: *Host, call: Call, token: vercel.Token) std.mem.Allocator.E
 }
 
 fn arriveResolved(host: *Host, call: Call, login: *HostLogin) std.mem.Allocator.Error!Arrived {
-    const first = switch (try arrive(host, call, login.state)) {
+    const first = switch (try arrive(host, call, login.*)) {
         .transition => |found| found,
         .done => |result| return .{ .done = result },
     };
@@ -244,7 +255,7 @@ fn arriveResolved(host: *Host, call: Call, login: *HostLogin) std.mem.Allocator.
         .login => |state| login.state = state,
         .done => |result| return .{ .done = result },
     }
-    return arrive(host, call, login.state);
+    return arrive(host, call, login.*);
 }
 
 const unused_token: vercel.Token = .{ .value = "" };
@@ -259,7 +270,7 @@ fn linkFor(host: *const Host, call: Call, token: vercel.Token) vercel.Link {
     return .{ .base = host.base, .token = token, .cancel_flag = call.cancel, .trace = host.trace };
 }
 
-fn arrive(host: *Host, call: Call, login: setup.Login) std.mem.Allocator.Error!Arrived {
+fn arrive(host: *Host, call: Call, login: HostLogin) std.mem.Allocator.Error!Arrived {
     const cfg = switch (try configOf(host, call, login)) {
         .config => |value| value,
         .done => |result| return .{ .done = result },
@@ -268,17 +279,61 @@ fn arrive(host: *Host, call: Call, login: setup.Login) std.mem.Allocator.Error!A
     return .{ .transition = setup.step(.{ .idle = mark }, .{ .arrival = .{
         .caller = if (call.setup_allowed) .main else .sub_agent,
         .channel = channelOf(call),
-        .login = login,
+        .login = login.state,
         .config = cfg,
     } }) };
 }
 
-fn configOf(host: *Host, call: Call, login: setup.Login) std.mem.Allocator.Error!ConfigRead {
+const EffectiveDestination = struct {
+    team_ref: ?[]const u8,
+    team_from_setting: bool,
+    project_name: []const u8,
+};
+
+/// Resolves the effective destination inputs in one place (R1.8) with no REST calls:
+/// team = `sandbox_team`, else Vercel CLI `currentTeam`, else cached `defaultTeamId`;
+/// project = `sandbox_project`, else `fx-sandbox`.
+fn effectiveDestination(
+    host: *const Host,
+    arena: std.mem.Allocator,
+    intent: SetupIntent,
+    token_hash: ?TokenHash,
+) std.mem.Allocator.Error!EffectiveDestination {
+    const team_ref: ?[]const u8 = if (intent.team) |slug|
+        slug
+    else if (try vercel.loadCliTeamId(arena, host.env, host.os, host.files, host.trace)) |cli_id|
+        cli_id
+    else if (token_hash) |hash|
+        try host.slot.checkedDefaultTeam(hash, arena)
+    else
+        null;
+
+    return .{
+        .team_ref = team_ref,
+        .team_from_setting = intent.team != null,
+        .project_name = intent.project orelse vercel.sandbox_project_name,
+    };
+}
+
+fn destinationMatchesEffective(destination: remote_slot.Destination, effective: EffectiveDestination) bool {
+    const team_ref = effective.team_ref orelse return false;
+    if (!std.mem.eql(u8, destination.team_id, team_ref) and !std.mem.eql(u8, destination.team_slug, team_ref)) {
+        return false;
+    }
+    return std.mem.eql(u8, destination.project_name, effective.project_name);
+}
+
+fn configOf(host: *Host, call: Call, login: HostLogin) std.mem.Allocator.Error!ConfigRead {
     const destination = (try host.slot.currentDestination(call.arena)) orelse return .{ .config = .absent };
-    const matches_intent = intentMatches(destination, call.intent);
-    const consent_state: setup.Consent = switch (login) {
+    const hash: ?TokenHash = switch (login.state) {
+        .user => tokenHash(login.token),
+        else => null,
+    };
+    const effective = try effectiveDestination(host, call.arena, call.intent, hash);
+    const matches_effective = destinationMatchesEffective(destination, effective);
+    const consent_state: setup.Consent = switch (login.state) {
         .user => |user_id| blk: {
-            if (!std.mem.eql(u8, destination.user_id, user_id) or !matches_intent) break :blk .missing;
+            if (!std.mem.eql(u8, destination.user_id, user_id) or !matches_effective) break :blk .missing;
             const root = io_mod.realpathAlloc(call.arena, call.workspace_root) catch |err| {
                 return .{ .done = .{ .refused = try workspaceRefusalText(call.arena, call.workspace_root, err) } };
             };
@@ -290,19 +345,9 @@ fn configOf(host: *Host, call: Call, login: setup.Login) std.mem.Allocator.Error
     };
     return .{ .config = .{ .remote = .{
         .user_id = destination.user_id,
-        .matches_intent = matches_intent,
+        .matches_intent = matches_effective,
         .consent = consent_state,
     } } };
-}
-
-fn intentMatches(destination: remote_slot.Destination, intent: SetupIntent) bool {
-    if (intent.team) |team_slug| {
-        if (!std.mem.eql(u8, destination.team_slug, team_slug)) return false;
-    }
-    if (intent.project) |project_name| {
-        if (!std.mem.eql(u8, destination.project_name, project_name)) return false;
-    }
-    return true;
 }
 
 fn channelOf(call: Call) setup.Channel {
@@ -366,13 +411,14 @@ fn discoverEvent(host: *Host, call: Call, token: vercel.Token, owner: setup.Owne
         return .{ .discover_refused = .{ .workspace_unresolved = message } };
     };
 
+    const effective = try effectiveDestination(host, call.arena, call.intent, tokenHash(token));
     const existing = try host.slot.currentDestination(call.arena);
     if (existing) |dest| {
-        if (std.mem.eql(u8, dest.user_id, owner.user_id) and intentMatches(dest, call.intent)) {
-            return discoverExistingDestination(host, call, link, dest);
+        if (std.mem.eql(u8, dest.user_id, owner.user_id) and destinationMatchesEffective(dest, effective)) {
+            return discoverExistingDestination(host, call, link, dest, effective);
         }
     }
-    return discoverFreshDestination(host, call, token, link);
+    return discoverFreshDestination(host, call, link, effective);
 }
 
 fn discoverExistingDestination(
@@ -380,10 +426,12 @@ fn discoverExistingDestination(
     call: Call,
     link: vercel.Link,
     dest: remote_slot.Destination,
+    effective: EffectiveDestination,
 ) std.mem.Allocator.Error!setup.Event {
+    const setting_slug = if (effective.team_from_setting) effective.team_ref else null;
     const team = switch (try vercel.getTeam(call.arena, link, dest.team_id)) {
         .ok => |found| found,
-        .not_found => return refuseTeamMissing(call.arena, link, call.intent.team),
+        .not_found => return refuseTeamMissing(call.arena, link, setting_slug),
         .rejected => return .rest_rejected,
         .canceled => return .owner_canceled,
         .failed => |failure| return .{ .rest_failed = failure },
@@ -404,30 +452,23 @@ fn discoverExistingDestination(
 fn discoverFreshDestination(
     host: *Host,
     call: Call,
-    token: vercel.Token,
     link: vercel.Link,
+    effective: EffectiveDestination,
 ) std.mem.Allocator.Error!setup.Event {
-    const team_ref = if (call.intent.team) |slug|
-        slug
-    else if (try vercel.loadCliTeamId(call.arena, host.env, host.os, host.files, host.trace)) |cli_id|
-        cli_id
-    else
-        try host.slot.checkedDefaultTeam(tokenHash(token), call.arena);
-
-    const lookup = team_ref orelse return refuseTeamMissing(call.arena, link, null);
+    const setting_slug = if (effective.team_from_setting) effective.team_ref else null;
+    const lookup = effective.team_ref orelse return refuseTeamMissing(call.arena, link, null);
     const team = switch (try vercel.getTeam(call.arena, link, lookup)) {
         .ok => |found| found,
-        .not_found => return refuseTeamMissing(call.arena, link, call.intent.team),
+        .not_found => return refuseTeamMissing(call.arena, link, setting_slug),
         .rejected => return .rest_rejected,
         .canceled => return .owner_canceled,
         .failed => |failure| return .{ .rest_failed = failure },
     };
 
-    const project_name = call.intent.project orelse vercel.sandbox_project_name;
-    const project: ?vercel.Project = switch (try vercel.getProjectByName(call.arena, link, team.id, project_name)) {
+    const project: ?vercel.Project = switch (try vercel.getProjectByName(call.arena, link, team.id, effective.project_name)) {
         .ok => |found| found,
         .not_found => if (call.intent.project != null)
-            return .{ .discover_refused = .{ .project_not_found = .{ .team = team, .name = project_name } } }
+            return .{ .discover_refused = .{ .project_not_found = .{ .team = team, .name = effective.project_name } } }
         else
             null,
         .rejected => return .rest_rejected,
@@ -1339,4 +1380,71 @@ test "E5, E6, E14, E15, and terminal-safe outside text hold" {
     try testing.expect(env_evil.scripted.saw_evil);
     try testing.expect(!env_evil.scripted.saw_token);
     try testing.expect(std.mem.find(u8, env_evil.capture.captured(), leak_token) == null);
+}
+
+test "unset project goes back to fx-sandbox and asks again, and same effective values make no REST call" {
+    const alloc = testing.allocator;
+    const steps = [_]Step{
+        .{ .answer = .{ .json = accept_yes } },
+        .{ .answer = .{ .json = accept_yes } },
+    };
+    const env = try TestEnv.create(alloc, &.{
+        user_default_team_reply,
+        team_def_reply,
+        project_custom_reply,
+        // After unsetting sandbox_project, fresh discovery checks team_def and fx-sandbox:
+        team_def_reply,
+        project_sandbox_reply,
+    }, &steps);
+    defer env.destroy();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 1. Setup with explicit project "my-proj".
+    try expectReady(try env.runWithIntent(a, env.repo_a, .{ .project = "my-proj" }, "session-a", 5), "team_def", "prj_custom");
+    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
+
+    // 2. Same effective values ask nothing and make no extra REST call.
+    const before_repeat = env.server.servedCount();
+    try expectReady(try env.runWithIntent(a, env.repo_a, .{ .project = "my-proj" }, "session-a", 6), "team_def", "prj_custom");
+    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
+    try testing.expectEqual(before_repeat, env.server.servedCount());
+
+    // 3. Unsetting project falls back to fx-sandbox and asks again.
+    try expectReady(try env.run(a, env.repo_a, "session-a", 7), "team_def", "prj_sandbox");
+    try testing.expectEqual(@as(usize, 2), env.scripted.prompts);
+    try testing.expect(std.mem.find(u8, env.scripted.lastMessage(), "project fx-sandbox?") != null);
+}
+
+test "a Vercel CLI currentTeam change asks again for the new team" {
+    const alloc = testing.allocator;
+    const steps = [_]Step{
+        .{ .answer = .{ .json = accept_yes } },
+        .{ .answer = .{ .json = accept_yes } },
+    };
+    const env = try TestEnv.create(alloc, &.{
+        user_plain_reply,
+        team_acme_reply,
+        project_sandbox_reply,
+        // After switching CLI currentTeam to team_exp:
+        team_explicit_reply,
+        project_sandbox_reply,
+    }, &steps);
+    defer env.destroy();
+    try env.writeCliLogin("team_1");
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try expectReady(try env.run(a, env.repo_a, "session-a", 5), "team_1", "prj_sandbox");
+    try testing.expectEqual(@as(usize, 1), env.scripted.prompts);
+
+    // Switch CLI currentTeam to team_exp; next run must ask for team_exp.
+    try env.writeCliLogin("team_exp");
+    try expectReady(try env.run(a, env.repo_a, "session-a", 6), "team_exp", "prj_sandbox");
+    try testing.expectEqual(@as(usize, 2), env.scripted.prompts);
+    try testing.expect(std.mem.find(u8, env.scripted.lastMessage(), "Vercel team Explicit Team, project fx-sandbox?") != null);
 }

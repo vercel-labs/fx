@@ -3312,7 +3312,7 @@ fn decodeFailureText(alloc: Allocator, ctx: tool_dispatch.DispatchContext, args:
 
 const remote_test_token = "fx-shell-token";
 const remote_rule_config = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"remote\"}]}";
-const remote_ready_config = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"remote\"}],\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"repo\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
+const remote_ready_config = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"remote\"}],\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"fx-sandbox\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
 const remote_e5_text = sandbox_runner.login_missing_text;
 const remote_e6_text = sandbox_runner.login_expired_text;
 const remote_e7_text = sandbox_runner.no_channel_text;
@@ -3354,11 +3354,11 @@ fn loadRemoteSetupPolicy(alloc: std.mem.Allocator, dir: std.Io.Dir, config: ?[]c
     return policy;
 }
 
-/// Caches `usr_1` as the user of the test token, so the login needs no request.
+/// Caches `usr_1` and default team `team_1` for the test token, so the login needs no request.
 fn primeRemoteLoginUser(policy: *sandbox_runner.Policy) !void {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(remote_test_token, &digest, .{});
-    try policy.remote_host.user_check.store(policy.gpa, digest, "usr_1");
+    try policy.remote_host.user_check.storeWithTeam(policy.gpa, digest, "usr_1", "team_1");
 }
 
 test "a default DispatchContext gives E10 for a remote run that needs setup" {
@@ -3602,7 +3602,7 @@ test "placeRunStart refuses an unconsented repo without channel and allows isola
     try self_exe.requireInstalledForTest();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const isolated_ready_config = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"isolated\"}],\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"repo\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
+    const isolated_ready_config = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"isolated\"}],\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"fx-sandbox\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
     const policy = try loadRemoteSetupPolicy(std.testing.allocator, tmp.dir, isolated_ready_config);
     defer policy.destroy();
     try primeRemoteLoginUser(policy);
@@ -3663,14 +3663,14 @@ test "remoteSetupRefusal reads live sandbox_team and sandbox_project settings an
 
     try tmp.dir.writeFile(io_mod.getIo(), .{
         .sub_path = "fxhome/settings.json",
-        .data = "{\"sandbox_team\":\"acme\",\"sandbox_project\":\"repo\"}",
+        .data = "{\"sandbox_team\":\"acme\",\"sandbox_project\":\"fx-sandbox\"}",
     });
     try std.testing.expectEqual(@as(?[]const u8, null), try remoteSetupRefusal(ctx, arena, "zig build test", .remote));
 
     // Updating settings.json without reloading Policy takes effect on the next call.
     try tmp.dir.writeFile(io_mod.getIo(), .{
         .sub_path = "fxhome/settings.json",
-        .data = "{\"sandbox_team\":\"other-team\",\"sandbox_project\":\"repo\"}",
+        .data = "{\"sandbox_team\":\"other-team\",\"sandbox_project\":\"fx-sandbox\"}",
     });
     const changed = (try remoteSetupRefusal(ctx, arena, "zig build test", .remote)) orelse return error.TestExpectedRefusal;
     try std.testing.expectEqualStrings(remote_e7_text, changed);
