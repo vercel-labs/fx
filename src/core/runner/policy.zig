@@ -1247,9 +1247,10 @@ test "ensureRemote refuses headless without consent, and accepts isolated once r
     const arena = arena_state.allocator();
 
     const isolated_config_text = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"isolated\"}],\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"fx-sandbox\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
+    // The isolated rule must be in the config that load reads.
+    try writeConfigFile(tmp.dir, isolated_config_text);
     const policy = try load(alloc, fx_home, "/Users/example", "/usr/bin:/bin");
     defer policy.destroy();
-    try writeConfigFile(tmp.dir, isolated_config_text);
     try policy.remote.setDestination(.{
         .team_id = "team_1",
         .team_slug = "acme",
