@@ -17,6 +17,8 @@ export class Acp {
   private readonly waiters = new Map<number, (message: any) => void>();
   private closed = false;
   stderr = "";
+  /// Every notification fx sent, in order.
+  readonly notifications: Array<{ method: string; params: any }> = [];
   readonly exited: Promise<number>;
 
   constructor(readonly proc: ReturnType<typeof Bun.spawn>, private readonly log: (entry: object) => void) {
@@ -46,6 +48,11 @@ export class Acp {
     if ("method" in message && "id" in message) {
       this.log({ dir: "in-request", method: message.method });
       this.write({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } });
+      return;
+    }
+    if ("method" in message && !("id" in message)) {
+      this.log({ dir: "in-notification", method: message.method });
+      this.notifications.push({ method: message.method, params: message.params });
       return;
     }
     if ("id" in message && typeof message.id === "number") {
@@ -123,6 +130,8 @@ export class Fixture {
   readonly holds: Hold[] = [];
   readonly processes: Array<{ exit: number; stderr: string }> = [];
   acp: Acp | null = null;
+  /// Other fx processes on this home, started by startPeer.
+  readonly peers: Acp[] = [];
   private gateway: any = null;
   private tools = 0;
 
@@ -189,7 +198,20 @@ export class Fixture {
     return readFileSync(this.traceLog, "utf8").split("\n").filter((line) => line.includes("queued steering prompt")).length;
   }
 
-  async start(): Promise<Acp> {
+  async start(init: Record<string, unknown> = { protocolVersion: 1 }): Promise<Acp> {
+    this.acp = await this.spawnAcp(init);
+    return this.acp;
+  }
+
+  /// Starts another `fx acp` on this home. It reads the session index that the
+  /// first process writes, as a second window does.
+  async startPeer(init: Record<string, unknown> = { protocolVersion: 1 }): Promise<Acp> {
+    const peer = await this.spawnAcp(init);
+    this.peers.push(peer);
+    return peer;
+  }
+
+  private async spawnAcp(init: Record<string, unknown>): Promise<Acp> {
     const env = testEnvironment({
       NO_COLOR: "1",
       HOME: this.home,
@@ -202,13 +224,13 @@ export class Fixture {
       FX_TRACE_LOG: this.traceLog,
       FX_TRACE_SCOPES: "acp",
     });
-    this.acp = new Acp(
+    const acp = new Acp(
       Bun.spawn([this.fxBin, "acp"], { cwd: this.workspace, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" }),
       (entry) => this.acpLog.push(entry),
     );
-    const init = await this.acp.request("initialize", { protocolVersion: 1 });
-    if (init.error) throw new Error(`initialize failed: ${JSON.stringify(init.error)}`);
-    return this.acp;
+    const initialized = await acp.request("initialize", init);
+    if (initialized.error) throw new Error(`initialize failed: ${JSON.stringify(initialized.error)}`);
+    return acp;
   }
 
   async dispose() {
@@ -216,6 +238,7 @@ export class Fixture {
     for (let n = 1; n <= this.tools; n += 1) writeFileSync(this.toolFiles(n).go, "");
     for (const hold of this.holds) hold.end("final");
     if (this.acp) this.processes.push(await this.acp.close());
+    for (const peer of this.peers) this.processes.push(await peer.close());
     this.acp = null;
     this.gateway?.stop();
     rmSync(this.root, { recursive: true, force: true });
