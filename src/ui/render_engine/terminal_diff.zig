@@ -2720,11 +2720,14 @@ test "flushFrame uses RIS before a terminal history reset" {
         sink.bytes.items,
         ui_terminal.interactive_mode_enable_sequence,
     ) orelse return error.TestExpectedInteractiveModes;
+    const paste_events_on = std.mem.find(u8, sink.bytes.items, "\x1b[?5522h") orelse return error.TestExpectedPasteEventsOn;
     const sync_begin = std.mem.find(u8, sink.bytes.items, "\x1b[?2026h") orelse return error.TestExpectedSyncBegin;
     const cursor_hide = std.mem.find(u8, sink.bytes.items, "\x1b[?25l") orelse return error.TestExpectedCursorHide;
     const clear_scrollback = std.mem.find(u8, sink.bytes.items, "\x1b[3J") orelse return error.TestExpectedScrollbackClear;
     try std.testing.expect(ris < sync_begin);
     try std.testing.expect(ris < interactive_modes);
+    try std.testing.expect(ris < paste_events_on);
+    try std.testing.expect(paste_events_on < sync_begin);
     try std.testing.expect(interactive_modes < sync_begin);
     try std.testing.expect(sync_begin < cursor_hide);
     try std.testing.expect(cursor_hide < clear_scrollback);
