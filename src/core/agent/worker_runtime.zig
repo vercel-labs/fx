@@ -11,6 +11,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const permission_request = @import("../permissions/permission_request.zig");
+const permissions = @import("../permissions/permissions.zig");
 const notification_contract = @import("../notifications/notification_contract.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -22,6 +23,7 @@ const types = @import("../shared/types.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
 const model_provider = @import("../config/model_provider.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
+const host_target = @import("../hosts/target.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -2396,6 +2398,14 @@ pub const WorkerRuntime = struct {
         debug_trace.logf("worker", "event=yield_requested processing={} queued={d}", .{ self.worker_processing, self.queuedWorkCountLocked() });
     }
 
+    /// Whether this agent's turn is asked to stop for an upgrade's restart
+    /// (`requestYield`). A wasm host never restarts itself, so its turns
+    /// never are.
+    pub fn stopsForRestart(self: *const WorkerRuntime) bool {
+        if (comptime host_target.is_wasm) return false;
+        return self.yield_requested.load(.seq_cst);
+    }
+
     /// Lets a turn held for the restart return, so fx can exit for it.
     pub fn releaseYield(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
@@ -3765,10 +3775,10 @@ pub const WorkerRuntime = struct {
         return preserved;
     }
 
-    pub fn propagateGrant(self: *WorkerRuntime, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
+    pub fn propagateGrant(self: *WorkerRuntime, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        for (self.queued_prompts.items) |*prompt| try appendGrantToQueuedPrompt(alloc, prompt, tool_name, target_path);
+        for (self.queued_prompts.items) |*prompt| try appendGrantToQueuedPrompt(alloc, prompt, tool_name, target_path, shell_epoch);
     }
 
     pub fn requestPermissionBlocking(
@@ -4277,9 +4287,11 @@ fn dupePendingBatchSnapshot(alloc: std.mem.Allocator, pending: OwnedQuestionBatc
     return .{ .entries = entries_dup, .source = pending.source };
 }
 
-fn appendGrantToQueuedPrompt(alloc: std.mem.Allocator, prompt: *QueuedPrompt, tool_name: []const u8, target_path: []const u8) !void {
-    for (prompt.grants) |grant| {
-        if (std.mem.eql(u8, grant.tool_name, tool_name) and std.mem.eql(u8, grant.target_path, target_path)) return;
+fn appendGrantToQueuedPrompt(alloc: std.mem.Allocator, prompt: *QueuedPrompt, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
+    for (prompt.grants) |*grant| {
+        if (!std.mem.eql(u8, grant.tool_name, tool_name) or !std.mem.eql(u8, grant.target_path, target_path)) continue;
+        if (!permissions.grantAppliesInShellEpoch(grant.*, shell_epoch)) grant.shell_epoch = shell_epoch;
+        return;
     }
     const tool_name_dup = try alloc.dupe(u8, tool_name);
     errdefer alloc.free(tool_name_dup);
@@ -4289,7 +4301,7 @@ fn appendGrantToQueuedPrompt(alloc: std.mem.Allocator, prompt: *QueuedPrompt, to
     const next = try alloc.alloc(types.PermissionGrant, current.len + 1);
     errdefer alloc.free(next);
     if (current.len > 0) @memmove(next[0..current.len], current);
-    next[current.len] = .{ .tool_name = tool_name_dup, .target_path = target_path_dup };
+    next[current.len] = .{ .tool_name = tool_name_dup, .target_path = target_path_dup, .shell_epoch = shell_epoch };
     alloc.free(current);
     prompt.grants = next;
 }
@@ -5677,6 +5689,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
             break :blk .{ .session_grant = .{
                 .tool_name = tool_name,
                 .target_path = target_path,
+                .shell_epoch = grant.shell_epoch,
             } };
         },
         .error_text => |notice| .{ .error_text = try types.dupeSemanticNotice(alloc, notice) },
@@ -5779,6 +5792,7 @@ pub fn dupeToolLifecycleEvent(
                 .arguments_json = arguments_json,
                 .place_after_current_transcript = started.place_after_current_transcript,
                 .mcp_tool = try dupeMcpToolName(alloc, started.mcp_tool),
+                .command_placement = started.command_placement,
             } };
         },
         .progress => |progress| blk: {
@@ -5877,6 +5891,25 @@ fn freeMcpToolName(alloc: std.mem.Allocator, name: ?types.McpToolName) void {
     alloc.free(@constCast(value.tool));
 }
 
+test "a copied terminal event keeps the notice of its shell result, and a failed copy frees it" {
+    const alloc = std.testing.allocator;
+    const event: types.ToolLifecycleEvent = .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "shell-1" },
+        .outcome = .{ .kind = .completed, .summary = "Ran uname -s" },
+        .result = "{\"output_delta\":\"Darwin\\n\"}",
+        .result_memory = .{ .notice = "fx: ran on local because of your rule for uname -s*", .command_placement = .remote },
+    } };
+    const copy = try dupeToolLifecycleEvent(alloc, event);
+    defer freeToolLifecycleEvent(alloc, copy);
+    try std.testing.expectEqualStrings("fx: ran on local because of your rule for uname -s*", copy.terminal.result_memory.?.notice.?);
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .remote), copy.terminal.result_memory.?.command_placement);
+    try std.testing.checkAllAllocationFailures(@import("../shared/testing_allocator.zig").no_resize, struct {
+        fn run(a: std.mem.Allocator, value: types.ToolLifecycleEvent) !void {
+            freeToolLifecycleEvent(a, try dupeToolLifecycleEvent(a, value));
+        }
+    }.run, .{event});
+}
+
 test "a copied start event keeps the MCP tool core named for the call" {
     const alloc = std.testing.allocator;
     var server = "my_srv".*;
@@ -5930,6 +5963,11 @@ fn dupeToolResultMemory(
     else
         null;
     errdefer if (preview) |value| alloc.free(value);
+    const notice = if (memory.notice) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (notice) |value| alloc.free(value);
     const command_output_replay = if (memory.command_output_replay) |replay|
         try types.dupeCommandOutputReplay(alloc, replay)
     else
@@ -5942,6 +5980,7 @@ fn dupeToolResultMemory(
     return .{
         .output_handle = output_handle,
         .preview = preview,
+        .notice = notice,
         .output_bytes = memory.output_bytes,
         .stored_output_bytes = memory.stored_output_bytes,
         .truncated = memory.truncated,
@@ -5951,6 +5990,7 @@ fn dupeToolResultMemory(
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
         .subagent_started = memory.subagent_started,
+        .command_placement = memory.command_placement,
     };
 }
 
@@ -5961,6 +6001,7 @@ fn freeToolResultMemory(
     const value = memory orelse return;
     if (value.output_handle) |handle| alloc.free(@constCast(handle));
     if (value.preview) |preview| alloc.free(@constCast(preview));
+    if (value.notice) |notice| alloc.free(@constCast(notice));
     if (value.command_output_replay) |replay| {
         types.freeCommandOutputReplay(alloc, replay);
     }
@@ -5993,8 +6034,8 @@ fn makeImagePrompt(alloc: std.mem.Allocator, text: []const u8, model: []const u8
     return prompt;
 }
 
-fn makeGrant(alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !types.PermissionGrant {
-    return .{ .tool_name = try alloc.dupe(u8, tool_name), .target_path = try alloc.dupe(u8, target_path) };
+fn makeGrant(alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !types.PermissionGrant {
+    return .{ .tool_name = try alloc.dupe(u8, tool_name), .target_path = try alloc.dupe(u8, target_path), .shell_epoch = shell_epoch };
 }
 
 test "direct steering applies at the boundary without cancellation and seals before teardown" {
@@ -6079,7 +6120,7 @@ fn makePromptWithGrant(alloc: std.mem.Allocator, text: []const u8, model: []cons
     var prompt = try makePrompt(alloc, text, model);
     errdefer freeQueuedPrompt(alloc, prompt);
     const grants = try alloc.alloc(types.PermissionGrant, 1);
-    grants[0] = try makeGrant(alloc, tool_name, target_path);
+    grants[0] = try makeGrant(alloc, tool_name, target_path, 0);
     alloc.free(prompt.grants);
     prompt.grants = grants;
     return prompt;
@@ -8148,7 +8189,7 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
 
     const grant_source = try alloc.alloc(types.PermissionGrant, 1);
     defer types.freePermissionGrantSlice(alloc, grant_source);
-    grant_source[0] = try makeGrant(alloc, "read_file", "/tmp/a");
+    grant_source[0] = try makeGrant(alloc, "read_file", "/tmp/a", 0);
     try runtime.syncQueuedPromptPermissionState(alloc, grant_source, .{
         .mode = .auto,
     });
@@ -8183,9 +8224,9 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     try std.testing.expectEqualStrings("summary", runtime.queued_history[1].compacted_summary.summary);
     try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items[0].unversioned_history_count);
 
-    try runtime.propagateGrant(alloc, "read_file", "/tmp/a");
+    try runtime.propagateGrant(alloc, "read_file", "/tmp/a", 0);
     try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].grants.len);
-    try runtime.propagateGrant(alloc, "read_file", "/tmp/b");
+    try runtime.propagateGrant(alloc, "read_file", "/tmp/b", 0);
     try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items[0].grants.len);
 
     runtime.worker_processing = true;
@@ -8946,12 +8987,12 @@ test "prompt take and grant append allocation failures preserve state" {
 
     const original = runtime.queued_prompts.items[0].grants.ptr;
     var failing_grant = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
-    try std.testing.expectError(error.OutOfMemory, runtime.propagateGrant(failing_grant.allocator(), "write_file", "/tmp/b"));
+    try std.testing.expectError(error.OutOfMemory, runtime.propagateGrant(failing_grant.allocator(), "write_file", "/tmp/b", 0));
     try std.testing.expectEqual(original, runtime.queued_prompts.items[0].grants.ptr);
     try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].grants.len);
 
     var failing_slice = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
-    try std.testing.expectError(error.OutOfMemory, runtime.propagateGrant(failing_slice.allocator(), "write_file", "/tmp/c"));
+    try std.testing.expectError(error.OutOfMemory, runtime.propagateGrant(failing_slice.allocator(), "write_file", "/tmp/c", 0));
     try std.testing.expectEqual(original, runtime.queued_prompts.items[0].grants.ptr);
     try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].grants.len);
 }
@@ -9022,7 +9063,7 @@ test "clear queued prompts preserves events and discard frees event payloads" {
         .removed_turn_count = 1,
         .compaction_count = 1,
     } } } });
-    freeWorkerEvent(alloc, .{ .session_grant = try makeGrant(alloc, "read_file", "/tmp/a") });
+    freeWorkerEvent(alloc, .{ .session_grant = try makeGrant(alloc, "read_file", "/tmp/a", 0) });
     freeWorkerEvent(alloc, try dupeWorkerEvent(alloc, .{ .error_text = .{
         .topic = "system",
         .tone = .@"error",
@@ -9117,7 +9158,7 @@ test "pushEvent copies session grants into queue allocator" {
     var runtime = WorkerRuntime{};
     defer runtime.deinit(queue_alloc);
 
-    const grant = try makeGrant(source_alloc, "read_file", "/tmp/source.zig");
+    const grant = try makeGrant(source_alloc, "read_file", "/tmp/source.zig", 0);
     const tool_ptr = grant.tool_name.ptr;
     const target_ptr = grant.target_path.ptr;
 
@@ -11849,6 +11890,29 @@ test "the commit gate logs a finish the app dropped, with its reason" {
     try std.testing.expect(std.mem.find(u8, trace, "event=commit_gate_finish_dropped") != null);
     try std.testing.expect(std.mem.find(u8, trace, "reason=cancel") != null);
     try std.testing.expect(std.mem.find(u8, trace, "reason=events_discarded") != null);
+}
+
+test "a non-bash approval made again after a shell refresh adds no second queued grant" {
+    const alloc = std.testing.allocator;
+    var prompt = try makePrompt(alloc, "grant", "model");
+    defer freeQueuedPrompt(alloc, prompt);
+
+    try appendGrantToQueuedPrompt(alloc, &prompt, "edit", "/tmp/workspace/a.zig", 0);
+    try appendGrantToQueuedPrompt(alloc, &prompt, "edit", "/tmp/workspace/a.zig", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), prompt.grants.len);
+}
+
+test "a bash approval made again after a shell refresh keeps one queued grant at the new epoch" {
+    const alloc = std.testing.allocator;
+    var prompt = try makePrompt(alloc, "grant", "model");
+    defer freeQueuedPrompt(alloc, prompt);
+
+    try appendGrantToQueuedPrompt(alloc, &prompt, "bash", "git status", 0);
+    try appendGrantToQueuedPrompt(alloc, &prompt, "bash", "git status", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), prompt.grants.len);
+    try std.testing.expectEqual(@as(u64, 1), prompt.grants[0].shell_epoch);
 }
 
 test "eb03: record_accepted runs unlocked before prompt enters queue snapshot and carries input_id" {

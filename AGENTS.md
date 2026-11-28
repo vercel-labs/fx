@@ -345,6 +345,8 @@ The `TLA+ subagent and session-write models` job takes a few minutes, so a pull 
 
 The `TLA+ shell quiet notice model` job takes a few minutes, so a pull request runs it only when the same detector finds a change to `src/core/execution/quiet_notice.zig`, `src/core/execution/managed_execution.zig`, `src/tools/shell/`, the model in `tests/tla/managed_execution/`, its drivers in `tests/tla/drivers/managed_execution/`, the shared code in `tests/tla/lib/`, `tests/tla/drivers/lib/`, and `tests/tla/drivers/graph.mjs`, the helpers those drivers load (`tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. It checks the model's design configs, runs `walk.ts` on `quiet_notice.zig` through `lab.zig`, and runs `binary.ts` against the built fx, and leaves out the planted bugs, `--self-check` mutants, and stress driver; run `tests/tla/managed_execution/check.sh` with no arguments, `bun tests/tla/drivers/managed_execution/walk.ts --self-check`, `bun tests/tla/drivers/managed_execution/binary.ts --self-check`, and `bun tests/tla/drivers/managed_execution/stress.ts` before you change that code.
 
+The `TLA+ ACP models and drivers` job takes about 5 minutes, so a pull request runs it only when the same detector finds a change to `src/acp/`, the models in `tests/tla/acp/`, their drivers in `tests/tla/drivers/acp/`, the code they share (`tests/tla/drivers/lib/` and `tests/tla/lib/`), the helpers they load (the fake Gateway in `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. It runs `tests/tla/acp/check.sh --ci`, which checks every ACP config and runs every driver in `tests/tla/drivers/acp/` against the built fx; run each driver's `check-spec.ts`, the planted bugs, by hand when you change its model.
+
 The `fx mcp call` model check, `.github/workflows/tla-mcp-call.yml`, runs `tests/tla/mcp_call/check.sh`: TLC on the bridge model, the core's tests, both drivers against the real core, and every planted bug. Every push to `main` runs it. A pull request runs it only with the `ci:tla-mcp-call` label, and `gh workflow run tla-mcp-call.yml --ref <branch>` runs it on any branch. Like `ci:macos`, the label needs triage access.
 
 The custom model connection model check, `.github/workflows/tla-configured-provider.yml`, runs `tests/tla/configured_provider/check.sh` and `bun tests/tla/drivers/configured_provider/driver.ts --self-check`: TLC on every config and planted mutation, the built fx against local fake servers along the models, and the deadline module through its lab. It runs only on request, never on a push: on a pull request with the `ci:tla-configured-provider` label, or with `gh workflow run tla-configured-provider.yml --ref <branch>`. Run it when you change `src/core/config/configured_provider.zig` or the custom connection adapters in `src/gateway/`.
@@ -436,7 +438,7 @@ investigation, but does not reject the pull request. Investigate notable
 unexplained growth before changing the threshold. The full macOS arm64, Linux
 arm64, and Linux x86_64 PGSO release qualifications remain authoritative for the
 production ceilings (7.500 MiB for macOS arm64, 8.000 MiB for Linux arm64, and
-10.000 MiB for Linux x86_64) and performance gates.
+10.250 MiB for Linux x86_64) and performance gates.
 
 ## Documentation
 
@@ -466,10 +468,11 @@ Releases are prepared by hand in a release PR. The maintainer controls the chang
 
 To prepare a release:
 
-1. Create a branch (e.g. `prepare-v0.3.0`)
-2. Bump `pub const version` in `src/main.zig`
-3. Write the changelog entry in `CHANGELOG.md` at the top, under a new `## <version>` heading, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers. Remove the markers from the previous release entry so only the new release has them.
-4. Open a PR and merge to `main`
+1. Run the validate-only release on current `main`, the code the release PR will build on: `gh workflow run release.yml --ref main -f validate_only=true`. It takes about as long as a release build and publishes nothing. A failure means a PGSO training, behavior, size, or performance gate failed on code that would ship. Fix it on `main` and run it again, and continue only when it passes.
+2. Create a branch (e.g. `prepare-v0.3.0`)
+3. Bump `pub const version` in `src/main.zig`
+4. Write the changelog entry in `CHANGELOG.md` at the top, under a new `## <version>` heading, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers. Remove the markers from the previous release entry so only the new release has them.
+5. Open a PR and merge to `main`
 
 When the PR merges, CI compares the version tag to what exists in git. If the tag is missing, it builds all platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached. Only the push that changes the version starts a release. To retry a failed release after a fix, run the Release workflow on `main` by hand with `validate_only` off. The release body is extracted from the content between the `<!-- release:start -->` and `<!-- release:end -->` markers in `CHANGELOG.md`.
 

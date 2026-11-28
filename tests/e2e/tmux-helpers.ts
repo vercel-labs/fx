@@ -1535,6 +1535,14 @@ export class TmuxSession {
     );
   }
 
+  /** Waits for a reply's text and its turn's end together. The text can show before the turn ends, so a test that reads saved state or sends the next prompt waits here, not on the text alone. */
+  async waitForReplyAndTurnEnd(text: string, timeoutMs: number): Promise<string> {
+    return this.waitForPane(
+      (pane) => pane.includes(text) && turnSettled(pane),
+      timeoutMs,
+    );
+  }
+
   async waitForComposer(timeoutMs = 15_000): Promise<string> {
     return this.waitForPane(hasEmptyComposer, timeoutMs);
   }
@@ -1644,6 +1652,12 @@ export class TmuxSession {
       }
     }
     rmSync(this.exitStatusPath, { force: true });
+  }
+
+  /// Closes the session's pane, as a closed terminal window does: tmux hangs
+  /// up the pane's program.
+  killPane(): void {
+    execFileSync("tmux", this.tmuxArgs(["kill-pane", "-t", this.name]), { stdio: "pipe" });
   }
 
   /// The fx process's exit status once the pane has ended, or null.

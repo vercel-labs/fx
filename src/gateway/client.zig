@@ -267,6 +267,9 @@ var resolved_model_trace_emitted = std.atomic.Value(bool).init(false);
 var test_cancel_watcher_spawn_error: ?anyerror = null;
 var test_cancel_watcher_poll_ms: ?i64 = null;
 var test_cancel_watcher_waiting: ?*std.Io.Event = null;
+var test_open_poll_ms: ?i64 = null;
+/// Waits `waitForOpen` began while its open still ran.
+var test_open_waits_while_running: std.atomic.Value(u32) = .init(0);
 
 pub const StreamResult = struct {
     status: std.http.Status,
@@ -1441,6 +1444,8 @@ const OpenJob = struct {
     pool: ?*http_pool.HttpPool,
     operation: RequestOpenOperation,
     handoff: open_job.Handoff = .{},
+    /// Set by `run` before its publish, to wake `waitForOpen`.
+    finished: std.Io.Event = .unset,
     result: anyerror!std.http.Client.Request = error.ConnectionSetupTimedOut,
 
     fn start(
@@ -1484,6 +1489,8 @@ const OpenJob = struct {
     fn run(self: *OpenJob) void {
         const pool = self.pool;
         self.result = self.openUnlessAbandoned();
+        // Set before publish: after `.hand_over` the request may already have freed the job.
+        self.finished.set(io_mod.getIo());
         switch (self.handoff.publish()) {
             // The request may free the job from here on.
             .hand_over => {},
@@ -1574,7 +1581,11 @@ const OpenJob = struct {
                 null;
             const stopped = stop_reason orelse switch (self.handoff.poll()) {
                 .wait => {
-                    zio.sleep(.fromMilliseconds(open_poll_ms), .awake) catch |err| switch (err) {
+                    if (builtin.is_test and !self.finished.isSet()) _ = test_open_waits_while_running.fetchAdd(1, .monotonic);
+                    // Once `run` set the event, this wait returns at once until
+                    // publish lands: a short spin.
+                    self.finished.waitTimeout(zio, .{ .duration = .{ .raw = .fromMilliseconds(openPollMs()), .clock = .awake } }) catch |err| switch (err) {
+                        error.Timeout => {},
                         error.Canceled => task_cancelled = true,
                     };
                     continue;
@@ -1639,8 +1650,16 @@ const OpenJob = struct {
     }
 };
 
-/// How often a request checks on its open job.
+/// How often a request checks cancel and its deadline while it waits for its
+/// open job. A finished open wakes the wait at once.
 const open_poll_ms = 2;
+
+fn openPollMs() i64 {
+    if (builtin.is_test) {
+        if (test_open_poll_ms) |ms| return ms;
+    }
+    return open_poll_ms;
+}
 
 /// Fires once the request walked away from its open job.
 const RequestGone = struct {
@@ -3341,6 +3360,8 @@ test "a request whose local address leaves the machine fails at once as a lost c
 /// thinking model alone and turn a dead connection into a failed read: a reset
 /// at the first probe after the network returns, or `ConnectionTimedOut` once
 /// every probe goes unanswered. Both are retried like any dropped stream.
+/// Keepalive runs only while no sent data waits for an acknowledgment, so the
+/// same budget also caps how long sent data may go unacknowledged.
 const dead_peer_probe = struct {
     /// Silence before the first probe.
     const idle_s: c_int = 15;
@@ -3349,6 +3370,9 @@ const dead_peer_probe = struct {
     const interval_s: c_int = 5;
     /// Unanswered probes before the read fails: 15 s + 6 x 5 s = 45 s.
     const count: c_int = 6;
+    /// Sent data unacknowledged this long drops the connection. Linux also
+    /// counts data that a peer's full receive window holds back.
+    const unacked_s: c_int = idle_s + interval_s * count;
 };
 
 const SocketOption = struct { level: i32, name: u32, value: c_int };
@@ -3361,12 +3385,14 @@ const dead_peer_probe_options: []const SocketOption = switch (builtin.target.os.
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPALIVE, .value = dead_peer_probe.idle_s },
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPINTVL, .value = dead_peer_probe.interval_s },
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPCNT, .value = dead_peer_probe.count },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.RXT_CONNDROPTIME, .value = dead_peer_probe.unacked_s },
     },
     .linux => &.{
         .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.KEEPALIVE, .value = 1 },
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPIDLE, .value = dead_peer_probe.idle_s },
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPINTVL, .value = dead_peer_probe.interval_s },
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPCNT, .value = dead_peer_probe.count },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.USER_TIMEOUT, .value = dead_peer_probe.unacked_s * std.time.ms_per_s },
     },
     else => &.{},
 };
@@ -3428,6 +3454,18 @@ test "a watched model connection probes for a dead peer" {
         // BSD reports a set flag as its bit, not as 1.
         if (option.value == 1) try std.testing.expect(value != 0) else try std.testing.expectEqual(option.value, value);
     }
+}
+
+test "dead-peer probes also drop data the peer never acknowledges" {
+    const expected: SocketOption = switch (builtin.target.os.tag) {
+        .macos => .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.RXT_CONNDROPTIME, .value = dead_peer_probe.unacked_s },
+        .linux => .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.USER_TIMEOUT, .value = dead_peer_probe.unacked_s * std.time.ms_per_s },
+        else => return error.SkipZigTest,
+    };
+    for (dead_peer_probe_options) |option| {
+        if (option.level == expected.level and option.name == expected.name) return std.testing.expectEqual(expected.value, option.value);
+    }
+    return error.TestExpectedUnackedDataLimit;
 }
 
 test "a refused probe option is reported instead of failing the request" {
@@ -12907,6 +12945,42 @@ test "a pooled open hands over a request that carries the caller's URI and heade
     try std.testing.expectEqual(text(uri.host.?).ptr, text(request.uri.host.?).ptr);
     try std.testing.expectEqual(@as([*]const std.http.Header, &extra), request.extra_headers.ptr);
     try std.testing.expectEqualStrings("Bearer test", request.headers.authorization.override);
+    try waitForOpenJobs(pool);
+}
+
+test "waitForOpen returns when the open finishes, not at the next poll" {
+    const zio = io_mod.getIo();
+    test_open_poll_ms = 60_000;
+    defer test_open_poll_ms = null;
+    test_open_waits_while_running.store(0, .monotonic);
+    var fixture: PooledOpenFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const pool = &fixture.pool;
+
+    var stuck: StuckLookupOpen = .{};
+    const Release = struct {
+        fn run(lookup: *StuckLookupOpen) void {
+            lookup.waitEntered();
+            // Holds the open 50 ms. A loop that sleeps the old fixed 2 ms wakes about
+            // 25 times in it; a wait the finished open wakes begins once.
+            io_mod.sleep(50 * std.time.ns_per_ms);
+            lookup.release.store(true, .seq_cst);
+        }
+    };
+    const release = try std.Thread.spawn(.{}, Release.run, .{&stuck});
+    defer release.join();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+    var reused = false;
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    var opened = try openGatewayRequestBounded(pool, try std.Uri.parse(fixture.url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    defer opened.deinit();
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+    // Fails a wait that sleeps out the whole 60 s poll.
+    try std.testing.expect(elapsed_ms < 5_000);
+    // Fails the old loop, which slept a fixed 2 ms and never read the poll hook.
+    try std.testing.expect(test_open_waits_while_running.load(.monotonic) <= 3);
     try waitForOpenJobs(pool);
 }
 
