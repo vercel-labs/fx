@@ -141,13 +141,13 @@ class BudgetComparisonTests(unittest.TestCase):
         self.assertEqual(1, result.returncode, result.stdout + result.stderr)
         self.assertIn("no base result for fx sessions --json", result.stdout)
 
-    def test_zero_base_mean_fails_with_named_cause(self) -> None:
+    def test_zero_base_median_fails_with_named_cause(self) -> None:
         result = self.run_checker(
             pr={SESSIONS: [2.0] * 5},
             base={SESSIONS: [0.0] * 5},
         )
         self.assertEqual(1, result.returncode, result.stdout + result.stderr)
-        self.assertIn("base mean is not positive", result.stdout)
+        self.assertIn("base median is not positive", result.stdout)
         self.assertNotIn("Traceback", result.stderr)
 
     def test_command_missing_from_pr_fails(self) -> None:
@@ -195,9 +195,9 @@ class BudgetComparisonTests(unittest.TestCase):
         self.assertEqual(1, result.returncode, result.stdout + result.stderr)
         self.assertIn("No benchmark result files found", result.stdout)
 
-    def test_margin_boundary_is_inclusive(self) -> None:
+    def test_fifteen_percent_median_boundary_is_inclusive(self) -> None:
         base = 0.002
-        at_margin = base * (1 + check_budgets.MAX_REGRESSION)
+        at_margin = base * 1.15
         just_over = at_margin * (1 + 1e-9)
         guard = 1.0
         self.assertIsNone(check_budgets.failure_reason(at_margin, base, guard))
@@ -214,23 +214,36 @@ class BudgetComparisonTests(unittest.TestCase):
         self.assertTrue(passed)
         self.assertIn("not evaluated on Darwin", output.getvalue())
 
-    def test_outlier_fails_the_mean_rule_but_not_the_median(self) -> None:
+    def test_outlier_moves_the_mean_but_passes_on_the_median(self) -> None:
         # Nine runs at 1 ms and one at 10 ms: the mean is 1.9 ms, the median 1 ms.
         result = self.run_checker(
             pr_raw={SESSIONS: [[1.0] * 9 + [10.0]]},
             base_raw={SESSIONS: [[1.0] * 10]},
         )
-        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
-        self.assertIn("FAIL  fx sessions --json", result.stdout)
-        median_line = next(
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        decision_line = next(
+            line for line in result.stdout.splitlines() if "PASS  fx sessions --json" in line
+        )
+        self.assertIn("median", decision_line)
+        self.assertIn("change=+0.0%", decision_line)
+        mean_line = next(
             line
             for line in result.stdout.splitlines()
-            if "median" in line and SESSIONS in line
+            if "mean" in line and SESSIONS in line
         )
-        self.assertIn("change=+0.0%", median_line)
+        self.assertIn("change=+90.0%", mean_line)
 
-    def test_margin_is_twenty_percent(self) -> None:
-        self.assertEqual(0.20, check_budgets.MAX_REGRESSION)
+    def test_real_median_regression_fails(self) -> None:
+        result = self.run_checker(
+            pr_raw={SESSIONS: [[1.2] * 10]},
+            base_raw={SESSIONS: [[1.0] * 10]},
+        )
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("FAIL  fx sessions --json", result.stdout)
+        self.assertIn("median more than 15% above the base median", result.stdout)
+
+    def test_margin_is_fifteen_percent(self) -> None:
+        self.assertEqual(0.15, check_budgets.MAX_REGRESSION)
 
     def test_raw_guard_is_three_milliseconds(self) -> None:
         self.assertEqual(0.003, check_budgets.RAW_GUARD_SECONDS)

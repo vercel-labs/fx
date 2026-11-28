@@ -139,7 +139,7 @@ Without those options, the sanitizer aborts a test binary once it has reported a
 
 ### Check startup performance
 
-The `Startup Latency` check fails a pull request when any benchmarked command on the Linux CI runner is more than 20% slower than the same command on the base commit, both measured on that runner, or when its mean passes a 3 ms guard. To measure before you push, build the base commit's `fx` in another folder, then run:
+The `Startup Latency` check fails a pull request when any benchmarked command on the Linux CI runner has a median more than 15% slower than the same command's median on the base commit, both measured on that runner, or when its PR median passes a 3 ms guard. To measure before you push, build the base commit's `fx` in another folder, then run:
 
 ```bash
 ./benchmarks/startup.sh --quick --base-binary /tmp/fx-base
@@ -217,7 +217,7 @@ These five checks must pass before a pull request merges:
 | `Build & Test` | Formatting, the PGSO corpus, the public-surface, compactor-boundary, and indexer-boundary checks, the ReleaseSafe unit tests, and the SDK package jobs, including the libfx durable-session model check when the change needs it |
 | `E2E (deterministic)` | Every end-to-end file, split across four weighted shards, plus the MCP conformance baseline |
 | `Shellcheck` | `bash -n` and `shellcheck` on the scripts listed in the job, such as `benchmarks/startup.sh` and `scripts/detect-macos-need.sh` |
-| `Startup Latency` | The benchmarked CLI commands on a ReleaseSafe build, each within 20% of the base commit and under a 3 ms guard, plus the interactive performance test in `tests/e2e/tui-performance.test.ts` |
+| `Startup Latency` | The benchmarked CLI commands on a ReleaseSafe build, each with a median within 15% of the base commit and under a 3 ms guard, plus the interactive performance test in `tests/e2e/tui-performance.test.ts` |
 | `macOS arm64` | The macOS checks when the change needs them, and otherwise a pass without starting a macOS runner |
 
 CI retries a failed end-to-end file once. A file that passes only on the retry gets a warning annotation, and you should investigate it as a possible race.

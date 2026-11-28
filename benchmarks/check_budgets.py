@@ -3,11 +3,11 @@
 
 Each round file is a hyperfine export. startup.sh measures the base and the PR
 binary in alternating rounds on one runner, so a slow host slows both. A command
-fails when its PR mean is more than MAX_REGRESSION above the base mean, or when
-its PR mean is above RAW_GUARD_SECONDS. The raw guard bounds slow creep across
-many changes: each change may not slow fx by the margin, and fx may not drift
-past the guard in total. The median and min of each side are printed for
-comparison only; the mean decides.
+fails when its PR median, pooled over every round, is more than MAX_REGRESSION
+above the base median, or when that PR median is above RAW_GUARD_SECONDS. The
+raw guard bounds slow creep across many changes: each change may not slow fx by
+the margin, and fx may not drift past the guard in total. The mean and min of
+each side are printed for comparison only.
 """
 
 import glob
@@ -17,7 +17,7 @@ import platform
 import sys
 
 
-MAX_REGRESSION = 0.20
+MAX_REGRESSION = 0.15
 RAW_GUARD_SECONDS = 0.003
 PROCESS_BASELINE = "process baseline"
 ROUNDS_DIR_ENV = "FX_BENCH_ROUNDS_DIR"
@@ -69,17 +69,6 @@ def summarize(samples):
     return {"mean": mean(samples), "median": median(samples), "min": min(samples)}
 
 
-def print_statistic(name, statistic, pr_value, base_value):
-    if base_value <= 0:
-        change = "n/a"
-    else:
-        change = f"{pr_value / base_value - 1:+.1%}"
-    print(
-        f"  INFO  {name:<25} {statistic:<6}  pr={pr_value * 1000:>5.2f}ms  "
-        f"base={base_value * 1000:>5.2f}ms  change={change}  (not compared)"
-    )
-
-
 def print_baseline(pr, base):
     if PROCESS_BASELINE not in pr or PROCESS_BASELINE not in base:
         return
@@ -89,35 +78,43 @@ def print_baseline(pr, base):
     )
 
 
-def failure_reason(pr_mean, base_mean, guard):
-    if pr_mean > guard:
+def failure_reason(pr_median, base_median, guard):
+    if pr_median > guard:
         return f"over the raw guard of {guard * 1000:.0f}ms"
-    if pr_mean > base_mean * (1 + MAX_REGRESSION):
-        return f"more than {MAX_REGRESSION:.0%} above the base"
+    if pr_median > base_median * (1 + MAX_REGRESSION):
+        return f"median more than {MAX_REGRESSION:.0%} above the base median"
     return None
+
+
+def describe(label, pr_value, base_value):
+    if base_value <= 0:
+        change = "n/a"
+    else:
+        change = f"{pr_value / base_value - 1:+.1%}"
+    return (
+        f"{label:<6} pr={pr_value * 1000:>5.2f}ms  base={base_value * 1000:>5.2f}ms  "
+        f"change={change}"
+    )
 
 
 def check_command(name, pr_times, base_times, guard):
     if not base_times:
         print(f"  FAIL  {name:<25} no base result for {name}, so the margin cannot be checked")
         return False
-    base_mean = mean(base_times)
-    if base_mean <= 0:
-        print(f"  FAIL  {name:<25} base mean is not positive, so the margin cannot be checked")
+    pr_stats = summarize(pr_times)
+    base_stats = summarize(base_times)
+    if base_stats["median"] <= 0:
+        print(f"  FAIL  {name:<25} base median is not positive, so the margin cannot be checked")
         return False
-    pr_mean = mean(pr_times)
-    reason = failure_reason(pr_mean, base_mean, guard)
+    reason = failure_reason(pr_stats["median"], base_stats["median"], guard)
     tag = "FAIL" if reason else "PASS"
     suffix = f"  ({reason})" if reason else ""
     print(
-        f"  {tag}  {name:<25} pr={pr_mean * 1000:>5.2f}ms  base={base_mean * 1000:>5.2f}ms  "
-        f"change={pr_mean / base_mean - 1:+.1%}  "
+        f"  {tag}  {name:<25} {describe('median', pr_stats['median'], base_stats['median'])}  "
         f"(margin {MAX_REGRESSION:.0%}, raw guard {guard * 1000:.0f}ms){suffix}"
     )
-    pr_stats = summarize(pr_times)
-    base_stats = summarize(base_times)
-    for statistic in ("median", "min"):
-        print_statistic(name, statistic, pr_stats[statistic], base_stats[statistic])
+    print(f"  INFO  {name:<25} {describe('mean', pr_stats['mean'], base_stats['mean'])}  (not compared)")
+    print(f"  INFO  {name:<25} {describe('min', pr_stats['min'], base_stats['min'])}  (not compared)")
     return reason is None
 
 
