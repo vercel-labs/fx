@@ -49,7 +49,6 @@ pub const Finished = struct {
     at_ms: i64,
     days_7: []const report.ModelRow,
     month: []const report.ModelRow,
-    complete: bool = true,
 };
 
 pub const Budget = struct {
@@ -107,21 +106,11 @@ pub fn merge(stored: Entry, fetched: Entry, now_ms: i64) Entry {
     };
     return .{
         .today = newer(Today, s.today, fetched.today, todayKey),
-        .finished = mergeFinished(s.finished, finishedBy(fetched.finished, now_ms)),
+        .finished = newer(Finished, s.finished, finishedBy(fetched.finished, now_ms), finishedKey),
         .budget = newer(Budget, s.budget, fetched.budget, budgetKey),
         .codex = mergeCodex(s.codex, fetched.codex),
         .grok = mergeGrok(s.grok, fetched.grok),
     };
-}
-
-fn mergeFinished(stored: ?Finished, fetched: ?Finished) ?Finished {
-    const s = stored orelse return fetched;
-    const f = fetched orelse return s;
-    if (f.day > s.day) return f;
-    if (f.day < s.day) return s;
-    if (f.complete) return f;
-    if (s.complete) return s;
-    return if (f.at_ms >= s.at_ms) f else s;
 }
 
 fn finishedBy(part: ?Finished, now_ms: i64) ?Finished {
@@ -165,6 +154,10 @@ fn codexKey(c: Codex) i64 {
 
 fn todayKey(t: Today) i64 {
     return t.at_ms;
+}
+
+fn finishedKey(f: Finished) i64 {
+    return f.day;
 }
 
 fn budgetKey(b: Budget) i64 {
@@ -350,22 +343,6 @@ test "the cache file round-trips and rejects other identities" {
     try testing.expect(decode(testing.allocator, b, bytes) == null);
     try testing.expect(decode(testing.allocator, a, "{\"schema_version\":2}") == null);
     try testing.expect(decode(testing.allocator, a, "garbage") == null);
-}
-
-test "mergeFinished prefers complete finished days over partial ones on the same day" {
-    const partial: Entry = .{
-        .today = .{ .day = 10, .at_ms = 200, .models = oneRow(2) },
-        .finished = .{ .day = 10, .at_ms = 200, .days_7 = oneRow(7), .month = &.{}, .complete = false },
-    };
-    const complete: Entry = .{
-        .finished = .{ .day = 10, .at_ms = 200, .days_7 = oneRow(7), .month = oneRow(30), .complete = true },
-    };
-    const merged = merge(complete, partial, 11 * std.time.ms_per_day);
-    try testing.expect(merged.finished.?.complete);
-    try testing.expectEqual(@as(usize, 1), merged.finished.?.month.len);
-    const completed = merge(partial, complete, 11 * std.time.ms_per_day);
-    try testing.expect(completed.finished.?.complete);
-    try testing.expectEqual(@as(f64, 30), completed.finished.?.month[0].totals.total_cost);
 }
 
 test "a decoded entry outlives the bytes it came from" {

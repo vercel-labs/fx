@@ -100,7 +100,7 @@ pub fn build(gpa: Allocator, entry: ?cache.Entry, period: Period, now_ms: i64) A
         .models = merged.items,
         .totals = totals,
         .today_current = today != null,
-        .finished_current = if (e.finished) |f| f.day == day and (period == .days_7 or f.complete) else false,
+        .finished_current = if (e.finished) |f| f.day == day else false,
         .fetched_at_ms = if (today) |t| t.at_ms else null,
         .budget = if (e.budget) |b| b.value else null,
     };

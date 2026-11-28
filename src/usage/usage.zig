@@ -255,6 +255,9 @@ pub const Dashboard = struct {
     session: ?Session = null,
     unavailable: ?Unavailable = null,
     entry: ?cache.Owned = null,
+    /// In-memory partial result for the fetch in flight (or retained after a
+    /// later request fails); never written to the shared cache file.
+    partial: ?Partial = null,
     failure: ?Failure = null,
     /// Bumps on every change the UI should redraw for. `usize` keeps it
     /// atomic on wasm32; readers only compare it, so wrapping is harmless.
@@ -288,6 +291,8 @@ pub const Dashboard = struct {
         self.queued_job = null;
         if (self.session) |*s| s.deinit(self.gpa);
         self.session = null;
+        if (self.partial) |*p| p.owned.deinit();
+        self.partial = null;
         if (self.entry) |*e| e.deinit();
         self.entry = null;
         self.is_open = false;
@@ -357,7 +362,23 @@ pub const Dashboard = struct {
         defer self.mutex.unlock(self.io());
         self.reloadEntryLocked();
         const now = self.host.now_fn(self.host.ctx);
-        const entry: ?cache.Entry = if (self.entry) |e| e.entry else null;
+        var merged_partial: ?cache.Owned = null;
+        defer if (merged_partial) |*m| m.deinit();
+        var finished_complete = true;
+        const entry: ?cache.Entry = blk: {
+            const base: ?cache.Entry = if (self.entry) |e| e.entry else null;
+            const s = self.session orelse break :blk base;
+            const p = self.partial orelse break :blk base;
+            if (!std.mem.eql(u8, &s.identity, &p.identity)) break :blk base;
+            const today = report.utcDay(now);
+            const base_finished_today = if (base) |b| (if (b.finished) |f| f.day == today else false) else false;
+            var incoming = p.owned.entry;
+            if (base_finished_today and !p.finished_complete) incoming.finished = null;
+            finished_complete = base_finished_today or p.finished_complete;
+            const combined = if (base) |b| cache.merge(b, incoming, now) else incoming;
+            merged_partial = cache.own(gpa, p.identity, combined) catch break :blk base;
+            break :blk merged_partial.?.entry;
+        };
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const label = try arena.allocator().dupe(u8, if (self.session) |s| s.label else "");
@@ -366,6 +387,7 @@ pub const Dashboard = struct {
         errdefer for (views[0..built]) |*v| v.deinit();
         for (Period.all, 0..) |period, i| {
             views[i] = try view.build(gpa, entry, period, now);
+            if (period == .month and !finished_complete) views[i].finished_current = false;
             built += 1;
         }
         const status: Status = if (self.unavailable) |u|
@@ -485,6 +507,8 @@ pub const Dashboard = struct {
         self.fetch_state.failed_at_ms = null;
         self.fetch_owed = true;
         // Another identity's numbers never stay on screen (ShowsOwnIdentity).
+        if (self.partial) |*p| p.owned.deinit();
+        self.partial = null;
         if (self.entry) |*e| e.deinit();
         self.entry = self.readCache(identity);
     }
@@ -492,6 +516,8 @@ pub const Dashboard = struct {
     fn dropSessionLocked(self: *Dashboard, reason: Unavailable) void {
         if (self.session) |*s| s.deinit(self.gpa);
         self.session = null;
+        if (self.partial) |*p| p.owned.deinit();
+        self.partial = null;
         if (self.entry) |*e| e.deinit();
         self.entry = null;
         self.unavailable = reason;
@@ -568,7 +594,7 @@ pub const Dashboard = struct {
         if (!policy.due(trigger, self.is_open, self.fetch_state, now)) return false;
         // Another process may already hold today's finished days.
         self.reloadEntryLocked();
-        const finished_day: ?i64 = if (self.entry) |e| (if (e.entry.finished) |f| (if (f.complete) f.day else null) else null) else null;
+        const finished_day: ?i64 = if (self.entry) |e| (if (e.entry.finished) |f| f.day else null) else null;
         const job = Job.init(self.gpa, s, policy.plan(s.scope, finished_day, now), now) catch return false;
         if (builtin.single_threaded or self.inline_fetches) {
             // `open` and `refresh` only queue it, because a key read during
@@ -624,6 +650,8 @@ pub const Dashboard = struct {
             // This sign-in has had its fetch.
             self.fetch_owed = false;
             self.failure = null;
+            if (self.partial) |*p| p.owned.deinit();
+            self.partial = null;
             if (self.entry) |*e| e.deinit();
             self.entry = owned;
             self.adoptRenewedBearerLocked(job);
@@ -635,10 +663,29 @@ pub const Dashboard = struct {
         }
     }
 
-    fn publishPartial(self: *Dashboard, job: *const Job, owned: cache.Owned) void {
+    fn publishPartial(self: *Dashboard, job: *const Job, fetched: cache.Entry, finished_complete: bool) void {
         self.mutex.lockUncancelable(self.io());
         defer self.mutex.unlock(self.io());
-        self.installOwnedLocked(job, owned);
+        const s = self.session orelse return;
+        if (!std.mem.eql(u8, &s.identity, &job.identity)) return;
+        const now = self.host.now_fn(self.host.ctx);
+        const today = report.utcDay(now);
+        const existing: ?Partial = if (self.partial) |p| (if (std.mem.eql(u8, &p.identity, &job.identity)) p else null) else null;
+        const base: ?cache.Entry = if (existing) |p| p.owned.entry else if (self.entry) |e| e.entry else null;
+        const base_complete = if (existing) |p| p.finished_complete else if (self.entry) |e| (if (e.entry.finished) |f| f.day == today else false) else false;
+        var incoming = fetched;
+        const incoming_day_matches = if (incoming.finished) |f| f.day == today else false;
+        const base_day_matches = if (base) |b| (if (b.finished) |f| f.day == today else false) else false;
+        if (base_complete and base_day_matches and incoming_day_matches and !finished_complete) {
+            incoming.finished = null;
+        }
+        const merged = if (base) |b| cache.merge(b, incoming, now) else incoming;
+        const owned = cache.own(self.gpa, job.identity, merged) catch return;
+        const next_complete = (base_complete and base_day_matches) or (finished_complete and incoming_day_matches);
+        if (self.partial) |*p| p.owned.deinit();
+        self.partial = .{ .identity = job.identity, .owned = owned, .finished_complete = next_complete };
+        self.failure = null;
+        self.adoptRenewedBearerLocked(job);
         self.bump();
     }
 
@@ -653,6 +700,12 @@ pub const Dashboard = struct {
         self.gpa.free(s.bearer);
         s.bearer = bearer;
     }
+};
+
+const Partial = struct {
+    identity: cache.Identity,
+    owned: cache.Owned,
+    finished_complete: bool,
 };
 
 const Outcome = union(enum) {
@@ -761,10 +814,7 @@ fn fetchAll(dashboard: *Dashboard, job: *const Job) Outcome {
     var run: Run = .{ .dashboard = dashboard, .job = job };
     defer run.deinit();
     const fetched = collect(&run) catch return run.stop;
-    return storeEntry(dashboard, job, fetched);
-}
 
-fn storeEntry(dashboard: *Dashboard, job: *const Job, fetched: cache.Entry) Outcome {
     const now = dashboard.host.now_fn(dashboard.host.ctx);
     // What the dashboard holds now counts too: the plan may have skipped
     // parts it already had, and the file may hold less after it was unreadable.
@@ -781,11 +831,8 @@ fn storeEntry(dashboard: *Dashboard, job: *const Job, fetched: cache.Entry) Outc
     return .{ .stored = stored };
 }
 
-fn publishProgress(run: *Run, fetched: cache.Entry) void {
-    switch (storeEntry(run.dashboard, run.job, fetched)) {
-        .stored => |owned| run.dashboard.publishPartial(run.job, owned),
-        .failed, .cancelled => {},
-    }
+fn publishProgress(run: *Run, fetched: cache.Entry, finished_complete: bool) void {
+    run.dashboard.publishPartial(run.job, fetched, finished_complete);
 }
 
 /// What a fetch shows when the cache cannot be written (a read-only or
@@ -807,7 +854,7 @@ fn collect(run: *Run) error{Stop}!cache.Entry {
     var fetched: cache.Entry = .{
         .today = .{ .day = job.plan.day, .at_ms = job.started_ms, .models = try fetchRows(run, job.plan.todayRange()) },
     };
-    if (job.plan.finished or job.plan.budget) publishProgress(run, fetched);
+    if (job.plan.finished or job.plan.budget) publishProgress(run, fetched, false);
     if (job.plan.finished) {
         const week_rows = try fetchRows(run, job.plan.weekRange());
         const month_range = job.plan.monthRange();
@@ -816,18 +863,16 @@ fn collect(run: *Run) error{Stop}!cache.Entry {
             .at_ms = job.started_ms,
             .days_7 = week_rows,
             .month = &.{},
-            .complete = month_range == null,
         };
-        if (month_range != null or job.plan.budget) publishProgress(run, fetched);
+        if (month_range != null or job.plan.budget) publishProgress(run, fetched, month_range == null);
         if (month_range) |range| {
             fetched.finished = .{
                 .day = job.plan.day,
                 .at_ms = job.started_ms,
                 .days_7 = week_rows,
                 .month = try fetchRows(run, range),
-                .complete = true,
             };
-            if (job.plan.budget) publishProgress(run, fetched);
+            if (job.plan.budget) publishProgress(run, fetched, true);
         }
     }
     if (job.plan.budget) {
@@ -875,12 +920,12 @@ fn fetchCodex(run: *Run) error{Stop}!codex.Usage {
     const owned = codex.parse(dashboard.gpa, body, dashboard.host.now_fn(dashboard.host.ctx)) catch return run.fail(.{ .failed = .bad_response });
     run.codex_part = owned;
     var value = owned.usage;
-    publishProgress(run, .{ .codex = .{ .at_ms = job.started_ms, .value = value } });
+    publishProgress(run, .{ .codex = .{ .at_ms = job.started_ms, .value = value } }, false);
     // The activity and breakdown are extra: a failure keeps the limits, and
     // the cache keeps what it already has.
     if (fetchProfile(run)) |profile| {
         value.profile = profile;
-        publishProgress(run, .{ .codex = .{ .at_ms = job.started_ms, .value = value } });
+        publishProgress(run, .{ .codex = .{ .at_ms = job.started_ms, .value = value } }, false);
     } else |_| {}
     if (fetchBreakdown(run)) |breakdown| value.breakdown = breakdown else |_| {}
     return value;
@@ -939,7 +984,7 @@ fn fetchGrok(run: *Run) error{Stop}!grok.Usage {
     const owned = grok.parseBilling(gpa, body) catch return run.fail(.{ .failed = .bad_response });
     run.grok_part = owned;
     var value = owned.usage;
-    publishProgress(run, .{ .grok = .{ .at_ms = job.started_ms, .value = value } });
+    publishProgress(run, .{ .grok = .{ .at_ms = job.started_ms, .value = value } }, false);
     // The plan's name is extra: a failure keeps the billing, and the cache
     // keeps the name it already has.
     if (fetchGrokSettings(run)) |settings| value.settings = settings else |_| {}
@@ -1851,6 +1896,53 @@ test "today's numbers show while 7d is slow, and a later month failure keeps tod
     try testing.expectEqual(Status{ .failed = .server }, after_fail.status);
     try testing.expect(after_fail.of(.today).today_current);
     try testing.expectApproxEqAbs(@as(f64, 2.5), after_fail.of(.today).totals.total_cost, 1e-9);
+    try testing.expect(after_fail.of(.days_7).finished_current);
+    try testing.expect(!after_fail.of(.month).finished_current);
     try testing.expectApproxEqAbs(@as(f64, 43), after_fail.of(.days_7).totals.total_cost, 1e-9);
     try testing.expectEqual(@as(usize, 2), after_fail.of(.days_7).models.len);
+}
+
+test "a partial result stays in memory only and is not written to the cache file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{
+        .slow_match = "start_date=2026-10-05",
+        .slow_release = .init(false),
+        .fail_match = "start_date=2026-10-01",
+        .fail_status = 500,
+    };
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer {
+        gateway.slow_release.store(true, .release);
+        dashboard.deinit();
+    }
+
+    dashboard.open(api_key);
+    while (!gateway.slow_entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    const identity = cache.identityOf(.api_key, api_key.subject, "");
+    // While 7d is pending, today is in memory only: nothing is stored on disk yet.
+    if (cache.read(testing.allocator, testing.io, tmp.dir, identity)) |*on_disk| {
+        var owned = on_disk.*;
+        owned.deinit();
+        return error.UnexpectedPartialCacheWrite;
+    }
+    var fx_dir = try tmp.dir.openDir(testing.io, ".fx", .{});
+    defer fx_dir.close(testing.io);
+    if (cache.read(testing.allocator, testing.io, fx_dir, identity)) |*on_disk| {
+        var owned = on_disk.*;
+        owned.deinit();
+        return error.UnexpectedPartialCacheWrite;
+    }
+
+    gateway.slow_release.store(true, .release);
+    dashboard.waitForFetch();
+    // Month failed: still no partial cache file written on disk.
+    if (cache.read(testing.allocator, testing.io, fx_dir, identity)) |*on_disk| {
+        var owned = on_disk.*;
+        owned.deinit();
+        return error.UnexpectedPartialCacheWrite;
+    }
 }
