@@ -505,6 +505,8 @@ interface Run {
   /// Every request the fake gateway answered, in order, with its headers: the
   /// model rides `ai-language-model-id`, not the body.
   requests: Array<{ body: string; headers: Headers }>;
+  /// The file the first fx writes its stderr to, when `withFx` keeps it.
+  stderrPath?: string;
 }
 
 async function withFx(
@@ -515,10 +517,12 @@ async function withFx(
   env: Record<string, string | undefined> = {},
   gatewayOptions: Parameters<typeof startDynamicFakeGateway>[1] = {},
   launchArgs = "",
+  keepStderr = false,
 ) {
   const gateway = startDynamicFakeGateway(respond, gatewayOptions);
   const home = createIsolatedTestHome();
   const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-switch-")));
+  const stderrPath = keepStderr ? join(home, "fx-stderr.log") : undefined;
   mkdirSync(join(home, ".fx"), { recursive: true });
   writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none" }));
   setupHome(home);
@@ -531,6 +535,7 @@ async function withFx(
     const session = await TmuxSession.create({
       cmd: args ? `${JSON.stringify(FX_BIN)} ${args}` : FX_BIN,
       cwd: workspace,
+      stderrPath,
       env: {
         HOME: home,
         AI_GATEWAY_API_KEY: "fake-switch-key",
@@ -556,7 +561,7 @@ async function withFx(
     return session;
   };
   try {
-    await run(await launch(launchArgs), { workspace, home, launch, tape, requests: gateway.requests });
+    await run(await launch(launchArgs), { workspace, home, launch, tape, requests: gateway.requests, stderrPath });
     return gateway.requests.map((request) => request.body);
   } finally {
     gateway.stop();
@@ -5692,6 +5697,74 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
         await until("the write", () => existsSync(join(workspace, "spike-e4.txt")));
         expect(mainSawNote).toBe(false);
       }, writeSpikeWriter);
+    },
+    TIMEOUT,
+  );
+
+  // The approval screen for a lent copy can fail before it opens. The deny
+  // still has to reach the subagent whose request waits, not main's worker,
+  // which usually has nothing to take it (`.no_pending`) and, with a request
+  // of its own numbered the same, would deny that one instead.
+  test(
+    "a failed approval screen on the lent copy denies the subagent, not main",
+    async () => {
+      const arrival = held();
+      let childCalls = 0;
+      let childSawReason = false;
+      await withFx(
+        (body) => {
+          if (!SPIKE_MAIN(body)) {
+            childCalls += 1;
+            if (childCalls === 1) return text("child_e6_ready", "SPIKE_E6_READY");
+            if (childCalls === 2) {
+              return arrival.promise.then(() =>
+                toolCall("child_e6_write", "write_file", { path: "spike-e6.txt", content: "SPIKE_WROTE\n" })
+              );
+            }
+            childSawReason = body.includes("could not show this request, so it was refused");
+            return text("child_e6_denied", "SPIKE_E6_DENIED");
+          }
+          if (!body.includes('"main_e6_start"')) {
+            return toolCall("main_e6_start", "subagent", {
+              request: { action: "message", agent: "writer", message: "SPIKE_E6_FIRST", profile: "writer" },
+            });
+          }
+          return text("main_e6_tail", "SPIKE_E6_MAIN_DONE");
+        },
+        async (session, { workspace, stderrPath }) => {
+          await session.sendText("SPIKE_USER_e6");
+          await session.waitForText("SPIKE_E6_MAIN_DONE", 30_000);
+          await showAgent(session, "writer");
+          await session.waitForPane((pane) => pane.includes("SPIKE_E6_FIRST"), 20_000);
+          // A turn the person types on the subagent's own screen. Its write
+          // arrives once the person is back on main, so the only screen that
+          // could show it is main's, holding the lent copy.
+          await session.sendText("SPIKE_E6_TYPED");
+          await session.waitForPane((pane) => pane.includes("SPIKE_E6_READY"), 20_000);
+          await showAgent(session, "main");
+          arrival.release();
+          await session.waitForText("The approval screen could not open", 30_000);
+          // A screen that keeps failing does not print the notice again.
+          const scrollback = await session.captureFullScrollback();
+          expect(scrollback.split("The approval screen could not open").length - 1).toBe(1);
+          // The subagent reads the reason and goes on; the refused write never
+          // touched the file, and its row no longer says it needs permission.
+          await showAgent(session, "writer");
+          await session.waitForText("SPIKE_E6_DENIED", 30_000);
+          expect(childSawReason).toBe(true);
+          await showAgent(session, "main");
+          expect(await session.capturePane()).not.toContain("needs permission");
+          expect(existsSync(join(workspace, "spike-e6.txt"))).toBe(false);
+          expect(stderrPath).toBeDefined();
+          expect(readFileSync(stderrPath!, "utf8")).toBe("");
+        },
+        writeSpikeWriter,
+        false,
+        { FX_TEST_APPROVAL_SCREEN_FAIL: "1" },
+        {},
+        "",
+        true,
+      );
     },
     TIMEOUT,
   );

@@ -141,6 +141,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_APPROVAL_SCREEN_FAIL": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_AUTH_LOCK_CONTENTION": {
       "job": "test",
       "stability": "internal"

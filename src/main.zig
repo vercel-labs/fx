@@ -3864,6 +3864,12 @@ const App = struct {
         return .{ .worker = &child.agent.worker, .id = child.id };
     }
 
+    /// The worker that owns the approval on screen: the subagent's while its
+    /// request is lent to that screen, else the screen agent's own.
+    pub fn approvalWorker(self: *App, agent: *agents.Agent) *WorkerRuntime {
+        return AgentsAppRuntime.approvalWorker(self, agent);
+    }
+
     /// Runs a cancel of the approval on main's screen in the context of the
     /// subagent it came from. False for main's own approval.
     pub fn answerLentApproval(self: *App, agent: *agents.Agent, comptime body: fn (*App, *agents.Agent) anyerror!void) !bool {
