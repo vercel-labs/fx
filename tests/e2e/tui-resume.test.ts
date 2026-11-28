@@ -19,6 +19,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -399,7 +400,7 @@ test.skipIf(!tmuxAvailable())(
     const tapePath = join(root, "resume.fxtape");
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ startup_scrollback: false }));
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
     const labels = Array.from({ length: 67 }, (_, i) => `RESUME_ROW_${String(i).padStart(3, "0")}`);
     const gateway = startFakeGateway([
       fakeGatewayFinalText(labels.join("\n\n")),
@@ -1213,6 +1214,91 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 2,
+);
+
+// How a toolbox change note opens (src/core/tooling/toolbox.zig renderChangeNote).
+const TOOLBOX_CHANGE_NOTE = "The toolbox now holds something other than the toolbox menu above lists.";
+
+function writeProfileSkill(home: string, name: string): void {
+  const dir = join(home, ".fx", "skills", name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: The ${name} steps.\n---\n\n# ${name}\n`);
+}
+
+// Cache markers move to the newest message on purpose; everything else a
+// request sent must start the next one.
+function withoutProviderOptions(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutProviderOptions);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "providerOptions").map(([key, item]) => [key, withoutProviderOptions(item)]));
+  }
+  return value;
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a TUI resume sends the toolbox menu the session sent first and notes a skill added since",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-toolbox-menu-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }));
+    writeProfileSkill(home, "menu-first");
+    const answers = ["TUI_MENU_FIRST", "TUI_MENU_SECOND", "TUI_MENU_THIRD"];
+    let turn = 0;
+    const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText(answers[turn]!));
+    let active: TmuxSession | null = null;
+    try {
+      let sessionId = "";
+      for (const [index, prompt] of ["First question.", "Second question.", "Third question."].entries()) {
+        turn = index;
+        if (index === 1) {
+          sessionId = sessionIdFromHome(home);
+          writeProfileSkill(home, "menu-added");
+        }
+        const stderrPath = join(root, `turn-${turn}.stderr`);
+        writeFileSync(stderrPath, "");
+        active = await TmuxSession.create({
+          cmd: index === 0 ? FX_BIN : `${FX_BIN} --resume ${sessionId}`,
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, gateway),
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+        await active.waitForComposer(TIMEOUT);
+        await active.sendText(prompt);
+        await active.waitForText(answers[turn]!, TIMEOUT);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+        await active.kill();
+        active = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      }
+
+      const requests = gateway.requests
+        .map((request) => JSON.parse(request.body))
+        .filter((request) => (request.tools ?? []).length > 0);
+      expect(requests.length).toBe(3);
+      for (let i = 1; i < requests.length; i++) {
+        expect(JSON.stringify(requests[i].tools)).toBe(JSON.stringify(requests[i - 1].tools));
+        const earlier = requests[i - 1].prompt.map((message: unknown) => JSON.stringify(withoutProviderOptions(message)));
+        const later = requests[i].prompt.slice(0, earlier.length).map((message: unknown) => JSON.stringify(withoutProviderOptions(message)));
+        expect(later).toEqual(earlier);
+      }
+      expect(JSON.stringify(requests[0].prompt)).not.toContain("menu-added");
+      const noted = JSON.stringify(requests[1].prompt.at(-1));
+      expect(noted).toContain(TOOLBOX_CHANGE_NOTE);
+      expect(noted).toContain("menu-added");
+      expect(JSON.stringify(requests[2].prompt).split(TOOLBOX_CHANGE_NOTE).length - 1).toBe(1);
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
 );
 
 function expectAltExitToPreserveNormalViewport(tapePath: string): void {
@@ -7542,7 +7628,6 @@ type CtrlGScreens = {
 async function captureCtrlGRelaunch(options: {
   label: string;
   reply: string | null;
-  startupScrollback?: boolean;
   prefillShellLines?: number;
   cols?: number;
   rows?: number;
@@ -7559,14 +7644,6 @@ async function captureCtrlGRelaunch(options: {
   mkdirSync(home);
   mkdirSync(workspace);
   mkdirSync(installDir);
-  if (options.startupScrollback !== undefined) {
-    mkdirSync(join(home, ".fx"), { mode: 0o700 });
-    writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ startup_scrollback: options.startupScrollback }) + "\n",
-      { mode: 0o600 },
-    );
-  }
   const workspaceRoot = realpathSync(workspace);
   const installedFx = join(installDir, "fx");
   copyFileSync(FX_BIN, installedFx);
@@ -7680,44 +7757,36 @@ const CTRL_G_SCREEN_REPLY = [
   "CTRL_G_SCREEN_LAST_LINE",
 ].join("\n\n");
 
-for (const startupScrollback of [undefined, false] as const) {
-  const setting = startupScrollback === undefined ? "startup_scrollback on by default" : "startup_scrollback off";
-  test.skipIf(!tmuxAvailable())(
-    `upgrade ctrl-g keeps the old screen in place until the new build redraws it (${setting})`,
-    async () => {
-      const screens = await captureCtrlGRelaunch({
-        label: startupScrollback === undefined ? "default" : "no-scrollback",
-        reply: CTRL_G_SCREEN_REPLY,
-        startupScrollback,
-      });
-      expectGapKeepsScreen(screens, "CTRL_G_SCREEN_LAST_LINE");
-      expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_FIRST_LINE")).toBe(1);
-      expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_LAST_LINE")).toBe(1);
-    },
-    UPGRADE_TIMEOUT * 2,
-  );
-}
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g keeps the old screen in place until the new build redraws it",
+  async () => {
+    const screens = await captureCtrlGRelaunch({
+      label: "default",
+      reply: CTRL_G_SCREEN_REPLY,
+    });
+    expectGapKeepsScreen(screens, "CTRL_G_SCREEN_LAST_LINE");
+    expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_FIRST_LINE")).toBe(1);
+    expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_LAST_LINE")).toBe(1);
+  },
+  UPGRADE_TIMEOUT * 2,
+);
 
-for (const startupScrollback of [undefined, false] as const) {
-  const setting = startupScrollback === undefined ? "startup_scrollback on by default" : "startup_scrollback off";
-  test.skipIf(!tmuxAvailable())(
-    `upgrade ctrl-g without a saved turn keeps the old screen in place until the new build redraws it (${setting})`,
-    async () => {
-      // The session saved nothing, so the new build starts twice: once for
-      // the session it cannot find and once for a fresh one (D81). With
-      // startup scrollback off, the short screen leaves the cursor above the
-      // rows a launch keeps free, so no launch moves it.
-      const screens = await captureCtrlGRelaunch({
-        label: startupScrollback === undefined ? "fresh-default" : "fresh-no-scrollback",
-        reply: null,
-        startupScrollback,
-      });
-      expectGapKeepsScreen(screens, "Run /help for commands");
-      expect(countOccurrences(screens.redrawn, "Run /help for commands")).toBe(1);
-    },
-    UPGRADE_TIMEOUT * 2,
-  );
-}
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g without a saved turn keeps the old screen in place until the new build redraws it",
+  async () => {
+    // The session saved nothing, so the new build starts twice: once for
+    // the session it cannot find and once for a fresh one (D81). The short
+    // screen leaves the cursor above the rows a launch keeps free, so no
+    // launch moves it.
+    const screens = await captureCtrlGRelaunch({
+      label: "fresh",
+      reply: null,
+    });
+    expectGapKeepsScreen(screens, "Run /help for commands");
+    expect(countOccurrences(screens.redrawn, "Run /help for commands")).toBe(1);
+  },
+  UPGRADE_TIMEOUT * 2,
+);
 
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g without a saved turn on a filled screen keeps the old screen in place until the new build redraws it",
@@ -7726,9 +7795,8 @@ test.skipIf(!tmuxAvailable())(
     // SessionNotFound teardown (D81) must not wipe rows above the footer
     // before the retry clears and redraws the screen.
     const screens = await captureCtrlGRelaunch({
-      label: "fresh-filled-no-scrollback",
+      label: "fresh-filled",
       reply: null,
-      startupScrollback: false,
       prefillShellLines: 25,
     });
     expectGapKeepsScreen(screens, "Run /help for commands");
@@ -7738,7 +7806,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "startup_scrollback off does not push ten blank lines when resuming at the bottom of the terminal",
+  "resuming at the bottom of the terminal does not push ten blank lines",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-no-blank-block-")));
     const home = join(root, "home");
@@ -7748,12 +7816,6 @@ test.skipIf(!tmuxAvailable())(
     const launchGate = join(root, "launch-gate");
     mkdirSync(home);
     mkdirSync(workspace);
-    mkdirSync(join(home, ".fx"), { mode: 0o700 });
-    writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ startup_scrollback: false }) + "\n",
-      { mode: 0o600 },
-    );
     const workspaceRoot = realpathSync(workspace);
     const gateway = startFakeGateway([fakeGatewayFinalText("RESUME_NO_BLANK_REPLY")]);
     let first: TmuxSession | null = null;
@@ -11625,11 +11687,17 @@ async function launchFxRecordingTty(
   fixture: ReturnType<typeof resumeFixture>,
   gateway: ReturnType<typeof startFakeGateway>,
   name: string,
+  opts: {
+    extraEnv?: Record<string, string | undefined>;
+    waitForComposer?: boolean;
+  } = {},
 ) {
   const stderrPath = join(fixture.root, `${name}-stderr.log`);
   const ttyAfterPath = join(fixture.root, `${name}-tty-after.txt`);
+  const statusPath = join(fixture.root, `${name}-status.txt`);
   const wrapperPath = join(fixture.root, `${name}-wrapper.sh`);
   const tmpPath = `${ttyAfterPath}.tmp`;
+  const statusTmpPath = `${statusPath}.tmp`;
   writeFileSync(stderrPath, "");
   writeFileSync(
     wrapperPath,
@@ -11639,6 +11707,8 @@ async function launchFxRecordingTty(
       "status=$?",
       `/bin/stty -a > ${shellQuote(tmpPath)}`,
       `/bin/mv ${shellQuote(tmpPath)} ${shellQuote(ttyAfterPath)}`,
+      `printf '%s\\n' "$status" > ${shellQuote(statusTmpPath)}`,
+      `/bin/mv ${shellQuote(statusTmpPath)} ${shellQuote(statusPath)}`,
       `echo ${CLOSE_RECORDED_MARK}`,
       'exit "$status"',
       "",
@@ -11647,14 +11717,45 @@ async function launchFxRecordingTty(
   const session = await TmuxSession.create({
     cmd: `/bin/sh ${shellQuote(wrapperPath)}`,
     cwd: fixture.workspace,
-    env: gatewayEnv(fixture.home, gateway),
+    env: { ...gatewayEnv(fixture.home, gateway), ...opts.extraEnv },
     stderrPath,
     width: 100,
     height: 32,
     remainOnExit: true,
   });
-  await session.waitForComposer(TIMEOUT);
-  return { session, stderrPath, ttyAfterPath };
+  if (opts.waitForComposer ?? true) await session.waitForComposer(TIMEOUT);
+  return { session, stderrPath, ttyAfterPath, statusPath };
+}
+
+function waitForMarkerFile(path: string, timeoutMs = TIMEOUT): Promise<void> {
+  if (existsSync(path)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const dir = join(path, "..");
+    const signal = AbortSignal.timeout(timeoutMs);
+    const watcher = watch(dir, () => {
+      if (existsSync(path)) {
+        watcher.close();
+        resolve();
+      }
+    });
+    signal.addEventListener("abort", () => {
+      watcher.close();
+      reject(new Error(`timed out waiting for ${path}`));
+    });
+    if (existsSync(path)) {
+      watcher.close();
+      resolve();
+    }
+  });
+}
+
+function singleWrapperChildPid(session: TmuxSession): number {
+  const wrapper = session.processPid();
+  const children = execFileSync("pgrep", ["-P", String(wrapper)], { encoding: "utf8" })
+    .trim()
+    .split("\n");
+  if (children.length !== 1) throw new Error(`expected one child of wrapper ${wrapper}, saw ${children.length}`);
+  return Number(children[0]);
 }
 
 /// Sends `signal` to fx, the wrapper's one child, and waits for the wrapper
@@ -11663,12 +11764,7 @@ async function signalFxRecordingTty(
   launch: Awaited<ReturnType<typeof launchFxRecordingTty>>,
   signal: NodeJS.Signals,
 ) {
-  const wrapper = launch.session.processPid();
-  const children = execFileSync("pgrep", ["-P", String(wrapper)], { encoding: "utf8" })
-    .trim()
-    .split("\n");
-  if (children.length !== 1) throw new Error(`expected one child of wrapper ${wrapper}, saw ${children.length}`);
-  process.kill(Number(children[0]), signal);
+  process.kill(singleWrapperChildPid(launch.session), signal);
   await launch.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
 }
 
@@ -11709,6 +11805,190 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
     TIMEOUT * 3,
   );
 }
+
+for (const [signal, expectedStatus] of [
+  ["SIGTERM", 143],
+  ["SIGHUP", 129],
+] as const) {
+  test.skipIf(!tmuxAvailable())(
+    `${signal} during normal /exit shutdown leaves the terminal in normal mode and off the alternate screen`,
+    async () => {
+      const fixture = resumeFixture(`fx-shutdown-${signal.toLowerCase()}-`);
+      const { gateway } = holdingGateway("Unused.");
+      const heldPath = join(fixture.root, "shutdown.held");
+      const releasePath = join(fixture.root, "shutdown.release");
+      let active: TmuxSession | null = null;
+      try {
+        const run = await launchFxRecordingTty(fixture, gateway, "exit", {
+          extraEnv: {
+            FX_TEST_SHUTDOWN_RELEASE_HELD: heldPath,
+            FX_TEST_SHUTDOWN_RELEASE_RELEASE: releasePath,
+          },
+        });
+        active = run.session;
+        await active.sendText("/exit");
+        await waitForMarkerFile(heldPath, TIMEOUT);
+        process.kill(singleWrapperChildPid(active), signal);
+        await run.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
+        expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(expectedStatus);
+        expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
+        expect(alternateScreenOn(active)).toBe(false);
+      } finally {
+        await active?.kill();
+        gateway.stop();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+}
+
+test.skipIf(!tmuxAvailable())(
+  "SIGTERM during active-turn /exit shutdown restores the terminal and saves the request to resume",
+  async () => {
+    const fixture = resumeFixture("fx-shutdown-turn-term-");
+    const prompt = "Save this turn on SIGTERM in shutdown.";
+    const { gateway, heldAtLeast } = holdingGateway(prompt);
+    const heldPath = join(fixture.root, "shutdown.held");
+    const releasePath = join(fixture.root, "shutdown.release");
+    const sessions: TmuxSession[] = [];
+    try {
+      const first = await launchFxRecordingTty(fixture, gateway, "first", {
+        extraEnv: {
+          FX_TEST_SHUTDOWN_RELEASE_HELD: heldPath,
+          FX_TEST_SHUTDOWN_RELEASE_RELEASE: releasePath,
+        },
+      });
+      sessions.push(first.session);
+      await first.session.sendText(prompt);
+      await heldAtLeast(1);
+      await first.session.sendText("/exit");
+      await waitForMarkerFile(heldPath, TIMEOUT);
+      process.kill(singleWrapperChildPid(first.session), "SIGTERM");
+      await first.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
+      expect(Number(readFileSync(first.statusPath, "utf8").trim())).toBe(143);
+      expect(enabledTtyFlags(readFileSync(first.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
+      expect(alternateScreenOn(first.session)).toBe(false);
+
+      const id = onlySessionId(fixture.home);
+      const lastRecord = savedRecords(fixture.home, id).filter((r) => r !== null).at(-1);
+      expect(lastRecord?.clean).toBe(true);
+
+      const before = gateway.requests.length;
+      const second = await launchFx(fixture, gateway, "-c", "second");
+      sessions.push(second.session);
+      await heldAtLeast(2);
+      const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
+      expect(resumed?.body).toContain(prompt);
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      for (const session of sessions) await session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "SIGTERM during error shutdown leaves the terminal in normal mode",
+  async () => {
+    const fixture = resumeFixture("fx-shutdown-err-term-");
+    const { gateway } = holdingGateway("Unused.");
+    const heldPath = join(fixture.root, "shutdown.held");
+    const releasePath = join(fixture.root, "shutdown.release");
+    mkdirSync(join(fixture.home, ".fx"), { recursive: true });
+    writeFileSync(join(fixture.home, ".fx", "recordings"), "not-a-directory");
+    let active: TmuxSession | null = null;
+    try {
+      const run = await launchFxRecordingTty(fixture, gateway, "err", {
+        waitForComposer: false,
+        extraEnv: {
+          FX_DEBUG_RECORD: "1",
+          FX_TEST_SHUTDOWN_RELEASE_HELD: heldPath,
+          FX_TEST_SHUTDOWN_RELEASE_RELEASE: releasePath,
+        },
+      });
+      active = run.session;
+      await waitForMarkerFile(heldPath, TIMEOUT);
+      process.kill(singleWrapperChildPid(active), "SIGTERM");
+      await run.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
+      expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(143);
+      expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
+      expect(alternateScreenOn(active)).toBe(false);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "/exit with no signal during shutdown exits 0 and restores normal mode",
+  async () => {
+    const fixture = resumeFixture("fx-shutdown-clean-");
+    const { gateway } = holdingGateway("Unused.");
+    const heldPath = join(fixture.root, "shutdown.held");
+    const releasePath = join(fixture.root, "shutdown.release");
+    let active: TmuxSession | null = null;
+    try {
+      const run = await launchFxRecordingTty(fixture, gateway, "clean", {
+        extraEnv: {
+          FX_TEST_SHUTDOWN_RELEASE_HELD: heldPath,
+          FX_TEST_SHUTDOWN_RELEASE_RELEASE: releasePath,
+        },
+      });
+      active = run.session;
+      await active.sendText("/exit");
+      await waitForMarkerFile(heldPath, TIMEOUT);
+      writeFileSync(releasePath, "go");
+      await run.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
+      expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(0);
+      expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
+      expect(alternateScreenOn(active)).toBe(false);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "SIGINT during normal /exit shutdown stays ignored and exits 0 with normal mode",
+  async () => {
+    const fixture = resumeFixture("fx-shutdown-int-guard-");
+    const { gateway } = holdingGateway("Unused.");
+    const heldPath = join(fixture.root, "shutdown.held");
+    const releasePath = join(fixture.root, "shutdown.release");
+    let active: TmuxSession | null = null;
+    try {
+      const run = await launchFxRecordingTty(fixture, gateway, "int", {
+        extraEnv: {
+          FX_TEST_SHUTDOWN_RELEASE_HELD: heldPath,
+          FX_TEST_SHUTDOWN_RELEASE_RELEASE: releasePath,
+        },
+      });
+      active = run.session;
+      await active.sendText("/exit");
+      await waitForMarkerFile(heldPath, TIMEOUT);
+      process.kill(singleWrapperChildPid(active), "SIGINT");
+      writeFileSync(releasePath, "go");
+      await run.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
+      expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(0);
+      expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
+      expect(alternateScreenOn(active)).toBe(false);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
 
 test.skipIf(!tmuxAvailable())(
   "an outside SIGINT is a closed window too: two closes in flight still resume without asking",
@@ -12860,7 +13140,7 @@ async function resumeLongHistory(options: DrainCase) {
   mkdirSync(workspace);
   writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
   writeFileSync(join(workspace, "a.txt"), "alpha\n");
-  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false }));
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false }));
   const history = Array.from({ length: options.lines }, (_, i) => `history line ${String(i + 1).padStart(5, "0")} alpha beta gamma`);
   const hold = heldFakeGatewayFinalText();
   let seeding = true;
@@ -13054,7 +13334,7 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
-    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false }));
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false }));
     const mcpFixture = startModernMcpHttpFixture("stall_call");
     writeStalledMcpConfig(home, mcpFixture.url);
     const history = Array.from({ length: lines }, (_, i) => `history line ${String(i + 1).padStart(5, "0")} alpha beta gamma`);
