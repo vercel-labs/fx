@@ -2178,6 +2178,17 @@ test "compose model picker status row aligns to active token" {
     try std.testing.expect(std.mem.find(u8, row.items, "no matching mode") != null);
 }
 
+test "model picker status row says loading over a failure while a retry runs" {
+    var loading = try composePickerStatusRow(std.testing.allocator, .model_stage, .model, true, true, 1, 60);
+    defer loading.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, loading.items, "loading models...") != null);
+    try std.testing.expect(std.mem.find(u8, loading.items, "unable to load models") == null);
+
+    var failed = try composePickerStatusRow(std.testing.allocator, .model_stage, .model, false, true, 1, 60);
+    defer failed.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, failed.items, "unable to load models") != null);
+}
+
 test "auth onboarding composes the welcome copy and setup choices" {
     const alloc = std.testing.allocator;
     const view = auth_runtime.PickerView{
