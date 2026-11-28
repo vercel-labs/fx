@@ -1816,6 +1816,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
                 cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
                 .{ .credential = ctx.api_key, .credential_source = source, .tenant = ctx.gateway_team },
             );
+            startModelCatalog(&ctx, token_pass_run.?.home, named.saved_as);
             token_pass_run.?.awaitAnswer(alloc, null);
             const nothing_chose_model = startup.model_source == .compiled_default and
                 options.model_override == null and
@@ -2374,6 +2375,21 @@ fn adoptRefreshedAskCredential(
 fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null or right == null) return left == null and right == null;
     return std.mem.eql(u8, left.?, right.?);
+}
+
+/// Starts from the catalog fx saved for the team (`saved_catalog.zig`) and
+/// starts the catalog's load in the background, so the turn's first
+/// capability lookup waits for none while a saved catalog answers. A due
+/// load saves what it fetches for the next run, and this run keeps the
+/// catalog it started with.
+fn startModelCatalog(ctx: *AskContext, home: ?[]const u8, team: ?[token_pass.identity_len]u8) void {
+    const catalog = ctx.cfg.provider_set.select(ctx.provider).model_catalog orelse return;
+    const input: model_catalog.FetchInput = .{
+        .access = ctx.model_catalog_access,
+        .endpoint = ctx.cfg.gateway_models_path,
+    };
+    if (home) |dir| if (team) |id| ctx.capability_resolver.useSavedCatalog(ctx.alloc, catalog, input, dir, id);
+    ctx.capability_resolver.startLoad(ctx.alloc, catalog, input);
 }
 
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {

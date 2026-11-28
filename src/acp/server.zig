@@ -2769,6 +2769,7 @@ fn startPromptWithInputId(
         }
     };
     if (!try requireActiveSessionTarget(state, alloc, msg)) return;
+    takeLandedModelCatalog(state);
     const session = if (state.active_session) |*active| active else unreachable;
     const active = try alloc.create(ActivePrompt);
     errdefer alloc.destroy(active);
@@ -3803,9 +3804,15 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
                 .message = "Selected provider is unavailable in this host",
             });
         // Nothing in the reply needs the catalog, so its first load runs
-        // while the client goes on (`awaitFirstCatalogLoad`).
+        // while the client goes on (`awaitFirstCatalogLoad`). The catalog fx
+        // saved for the team answers until that load lands, and a young one
+        // needs no load (`saved_catalog_plan.start`).
         var no_cancel = std.atomic.Value(bool).init(false);
-        state.capability_resolver.startLoad(state.alloc, startup_catalog, serverCatalogInput(state, &no_cancel));
+        const catalog_input = serverCatalogInput(state, &no_cancel);
+        if (state.token_pass_run) |*check| if (check.named.saved_as) |team| if (check.home) |home| {
+            state.capability_resolver.useSavedCatalog(state.alloc, startup_catalog, catalog_input, home, team);
+        };
+        state.capability_resolver.startLoad(state.alloc, startup_catalog, catalog_input);
     }
 
     if (state.cfg.effort_override) |raw| {
@@ -4723,18 +4730,36 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     // Restoring the same session can leave its previous cancellation flag set.
     var cancel_flag = std.atomic.Value(bool).init(false);
     try state.capability_resolver.refreshWithin(state.alloc, provider, .{
-        .access = if (state.cfg.auth_mode == .host_managed)
-            .host_managed
-        else
-            credentials.catalogAccessForCredentialAndAccount(
-                active.credential_source,
-                active.api_key,
-                state.gateway_team,
-                active.account_id,
-            ),
+        .access = activeCatalogAccess(state, active),
         .endpoint = state.cfg.gateway_models_path,
         .cancel_flag = &cancel_flag,
     }, gateway_provider.catalog_connect_wait_ms);
+}
+
+/// Takes a fresh catalog that landed since the last request, so the prompt
+/// about to start reads it. It never waits for a load or starts one. Like
+/// `refreshModelCatalogForOptions`, it leaves the catalog as it is while a
+/// subagent works.
+fn takeLandedModelCatalog(state: *ServerState) void {
+    if (comptime host_target.is_wasm) return;
+    if (state.cfg.minimal_kernel) return;
+    const active = if (state.active_session) |*session| session else return;
+    const provider = catalogProviderFor(state, active.provider) orelse return;
+    std.debug.assert(state.active_prompt == null);
+    if (state.subagent_host) |subagents| if (!subagents.quiet()) return;
+    state.capability_resolver.takeLanded(state.alloc, provider, activeCatalogAccess(state, active)) catch |err| {
+        debug_trace.logf("acp", "event=model_catalog_take_failed session={s} err={s}", .{ active.session_id, @errorName(err) });
+    };
+}
+
+fn activeCatalogAccess(state: *const ServerState, active: *const ActiveSessionState) credentials.CatalogAccess {
+    if (state.cfg.auth_mode == .host_managed) return .host_managed;
+    return credentials.catalogAccessForCredentialAndAccount(
+        active.credential_source,
+        active.api_key,
+        state.gateway_team,
+        active.account_id,
+    );
 }
 
 fn commitActiveSessionProvider(

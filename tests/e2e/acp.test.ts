@@ -214,6 +214,37 @@ function tokenPassCreditsReply(hasPass: boolean) {
     : null;
 }
 
+// The model catalog fx saved for the profile at `home`: a one-line header,
+// then AI Gateway's response body.
+function savedCatalogPath(home: string) {
+  return join(home, ".fx", "cache", "model-catalog-v1.json");
+}
+
+// Moves the saved catalog's time `ageMs` into the past.
+function ageSavedCatalog(home: string, ageMs: number) {
+  const path = savedCatalogPath(home);
+  const text = readFileSync(path, "utf8");
+  const newline = text.indexOf("\n");
+  const header = JSON.parse(text.slice(0, newline));
+  header.saved_ms = Date.now() - ageMs;
+  writeFileSync(path, JSON.stringify(header) + text.slice(newline));
+}
+
+function effortCatalogModel(efforts: string[]) {
+  return {
+    id: FAKE_GATEWAY_MODEL,
+    type: "language",
+    tags: ["tool-use"],
+    context_window: 128_000,
+    reasoning_options: [{ type: "effort", values: efforts }],
+  };
+}
+
+function effortValues(reply: any): string[] {
+  const effort = reply.result.configOptions.find((option: any) => option.id === "effort");
+  return effort.options.map((option: any) => option.value);
+}
+
 function fakeGatewayEnv(
   root: ReturnType<typeof createIsolatedRoot>,
   gateway: ReturnType<typeof startFakeGateway>,
@@ -2253,6 +2284,264 @@ describe("acp: model-independent", () => {
         const reply = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
         expect(reply.error.message).toBe(`Reasoning effort "xhigh" is not available for model "${FAKE_GATEWAY_MODEL}" (available: low, high)`);
         expect(gateway.modelRequests.length).toBe(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP answers session/new from the model catalog it saved while a fresh one loads, and the next reply takes the fresh one",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-saved-catalog-");
+      let efforts = ["low", "high"];
+      let held: Promise<void> | undefined;
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_SAVED_CATALOG_OK"), {
+        models: async () => {
+          if (held) await held;
+          return [effortCatalogModel(efforts)];
+        },
+      });
+      const path = savedCatalogPath(root.home);
+      try {
+        // A first start fetches the catalog and saves it.
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await waitForCondition("the saved catalog", () => existsSync(path));
+        await client.close();
+        client = undefined;
+        expect(statSync(path).mode & 0o777).toBe(0o600);
+        expect(readFileSync(path, "utf8")).not.toContain("fake-acp-file-key");
+
+        // Ten minutes later AI Gateway is slow, and it lists one more effort.
+        ageSavedCatalog(root.home, 10 * 60_000);
+        let release = () => {};
+        held = new Promise<void>((resolve) => { release = resolve; });
+        efforts = ["low", "medium", "high"];
+        const tracePath = join(root.root, "trace.log");
+        const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "gateway" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1, 1_000);
+        await waitForCondition("the fresh catalog request", () => gateway.modelRequests.length === 2);
+        // The fetch is held, so a reply that waited for it would time out.
+        const first = await client.request("session/new", { mcpServers: [] }, 2, 1_000) as any;
+        expect(effortValues(first)).toEqual(["auto", "low", "high"]);
+        release();
+        await waitForCondition("the fresh catalog load's end", () => trace().includes("model catalog load ended loaded=true"));
+        // The load saved the fresh catalog before it ended.
+        expect(readFileSync(path, "utf8")).toContain("medium");
+        const next = await client.request("session/new", { mcpServers: [] }, 3, 1_000) as any;
+        expect(effortValues(next)).toEqual(["auto", "low", "medium", "high"]);
+        expect(gateway.modelRequests.length).toBe(2);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP's next prompt takes the fresh model catalog that landed after the reply that opened the chat",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-saved-catalog-prompt-");
+      let maxTokens = 32_000;
+      let held: Promise<void> | undefined;
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_SAVED_PROMPT_OK"), {
+        models: async () => {
+          if (held) await held;
+          return [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128_000, max_tokens: maxTokens }];
+        },
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await waitForCondition("the saved catalog", () => existsSync(savedCatalogPath(root.home)));
+        await client.close();
+        client = undefined;
+
+        ageSavedCatalog(root.home, 10 * 60_000);
+        let release = () => {};
+        held = new Promise<void>((resolve) => { release = resolve; });
+        maxTokens = 48_000;
+        const tracePath = join(root.root, "trace.log");
+        const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "gateway" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1, 1_000);
+        await client.request("session/new", { mcpServers: [] }, 2, 1_000);
+        await client.readLine();
+        release();
+        await waitForCondition("the fresh catalog load's end", () => trace().includes("model catalog load ended loaded=true"));
+        const result = await runPrompt(client, "Which limit?", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.parse(gateway.requests[0]!.body).maxOutputTokens).toBe(48_000);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP starts from a saved model catalog younger than five minutes without fetching one",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-saved-catalog-young-");
+      const tracePath = join(root.root, "trace.log");
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_SAVED_YOUNG_OK"), {
+        models: () => [effortCatalogModel(["low", "high"])],
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await waitForCondition("the saved catalog", () => existsSync(savedCatalogPath(root.home)));
+        await client.close();
+        client = undefined;
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "gateway" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const reply = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        expect(effortValues(reply)).toEqual(["auto", "low", "high"]);
+        await client.readLine();
+        const result = await runPrompt(client, "Which catalog?", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        // Only the first start asked AI Gateway for the catalog.
+        expect(gateway.modelRequests.length).toBe(1);
+        expect(readFileSync(tracePath, "utf8")).toContain("model catalog saved copy used fetch=false");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP waits for the fresh model catalog when the saved one is older than a day, for another team, or unreadable",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-saved-catalog-cold-");
+      let held: Promise<void> | undefined;
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_SAVED_COLD_OK"), {
+        models: async () => {
+          if (held) await held;
+          return [effortCatalogModel(["low", "high"])];
+        },
+      });
+      const path = savedCatalogPath(root.home);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await waitForCondition("the saved catalog", () => existsSync(path));
+        await client.close();
+        client = undefined;
+        const saved = readFileSync(path, "utf8");
+
+        const cases: Array<{ name: string; prepare: () => void; env?: Record<string, string> }> = [
+          { name: "older than a day", prepare: () => { writeFileSync(path, saved); ageSavedCatalog(root.home, 25 * 60 * 60_000); } },
+          { name: "another team", prepare: () => writeFileSync(path, saved), env: { AI_GATEWAY_API_KEY: "fake-acp-other-team-key" } },
+          { name: "cut short", prepare: () => writeFileSync(path, saved.slice(0, saved.length - 40)) },
+        ];
+        for (const each of cases) {
+          each.prepare();
+          let release = () => {};
+          held = new Promise<void>((resolve) => { release = resolve; });
+          const requestsBefore = gateway.modelRequests.length;
+          client = await AcpClient.create({ cwd: root.workspace, env: { ...fakeGatewayEnv(root, gateway), ...each.env } });
+          await client.request("initialize", { protocolVersion: 1 }, 1, 1_000);
+          await waitForCondition(`the catalog request (${each.name})`, () => gateway.modelRequests.length === requestsBefore + 1);
+          let repliedAt = 0;
+          const created = (client.request("session/new", { mcpServers: [] }, 2) as Promise<any>)
+            .then((reply) => { repliedAt = Date.now(); return reply; });
+          // Paces the release: a reply that does not wait comes well within it.
+          await Bun.sleep(200);
+          const releasedAt = Date.now();
+          release();
+          const reply = await created;
+          expect({ case: each.name, waited: repliedAt >= releasedAt }).toEqual({ case: each.name, waited: true });
+          expect(effortValues(reply)).toEqual(["auto", "low", "high"]);
+          expect(client.stderr).toBe("");
+          await client.close();
+          client = undefined;
+        }
+        // The broken file was replaced by the fresh catalog.
+        expect(readFileSync(path, "utf8").length).toBeGreaterThanOrEqual(saved.length - 40);
+        expect(readFileSync(path, "utf8").split("\n", 1)[0]).toContain("\"format\":1");
+      } finally {
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP never takes a saved model catalog's Token Pass marks as the team's answer",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-saved-catalog-marks-");
+      const tracePath = join(root.root, "trace.log");
+      const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+      let creditsHeld: Promise<void> | undefined;
+      let hasPass = true;
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_SAVED_MARKS_OK"), {
+        models: () => tokenPassCatalog(true),
+        usage: (url) => url.pathname === "/coding-agent/v1/credits"
+          ? (creditsHeld ?? Promise.resolve()).then(() => Response.json({ balance: "5.00", token_pass: hasPass ? { remaining: "79.92906" } : null }))
+          : null,
+      });
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: undefined } });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await waitForCondition("the saved catalog", () => existsSync(savedCatalogPath(root.home)));
+        await client.close();
+        client = undefined;
+
+        // The team has lost its pass, and fx has no saved answer: only the
+        // saved catalog still marks Token Pass models.
+        rmSync(join(root.home, ".fx", "token-pass.json"), { force: true });
+        hasPass = false;
+        let releaseCredits = () => {};
+        creditsHeld = new Promise<void>((resolve) => { releaseCredits = resolve; });
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: undefined, FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "token_pass" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = client.request("session/new", { mcpServers: [] }, 2) as Promise<any>;
+        await waitForCondition("the credits check wait", () => trace().includes("check wait started"));
+        releaseCredits();
+        const model = (await created).result.configOptions.find((option: any) => option.id === "model");
+        expect(model.currentValue).toBe("spacexai/grok-4.7");
+        expect(trace()).not.toContain("source=catalog");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

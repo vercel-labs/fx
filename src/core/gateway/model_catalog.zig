@@ -27,6 +27,9 @@ pub const FetchInput = struct {
     /// Asked once when the provider rejects the authenticated request with
     /// 401, before the public fallback (`fetchWithPublicFallback`).
     renew_after_rejection: ?RenewAfterRejection = null,
+    /// A provider with `saved` sets this to the response body it parsed into
+    /// a catalog, for fx to save. The caller owns the body.
+    body_out: ?*?[]u8 = null,
 };
 
 /// Gives another token for a sign-in whose token the catalog rejected, such
@@ -176,6 +179,9 @@ pub const Provider = struct {
     refresh_interval_ms: ?i64 = null,
     /// The fetch sets `FetchInput.connected` once its request has a connection.
     reports_connection: bool = false,
+    /// Set when fx may save this provider's catalog and read it back at the
+    /// next start (`saved_catalog.zig`).
+    saved: ?SavedFormat = null,
 
     /// Returns owned catalog entries; the caller frees them with `freeModelCatalog`.
     pub fn fetch(self: Provider, alloc: Allocator, input: FetchInput) Allocator.Error!ProviderResult {
@@ -187,6 +193,15 @@ pub const Provider = struct {
         const lookup = self.lookup_capabilities_fn orelse return null;
         return lookup(self.context, model);
     }
+};
+
+/// How a provider's saved catalog is named and read.
+pub const SavedFormat = struct {
+    /// The URL a fetch of `endpoint` asks, which a saved catalog must match,
+    /// or null when fx cannot name it. Caller owns it.
+    url_fn: *const fn (Allocator, endpoint: []const u8) ?[]u8,
+    /// Parses a saved response body as a fetch parses one.
+    parse_fn: *const fn (Allocator, body: []const u8) Allocator.Error!ProviderResult,
 };
 
 test "catalog capability lookup distinguishes unsupported and unknown without fetching" {
