@@ -371,7 +371,7 @@ test "chat completions review request sends only the instruction and the user co
         .{ .role = .user, .content = "review_context_kind: normal\n" },
         .{ .role = .assistant, .tool_calls = &.{.{ .id = "call_ds_1", .name = "shell", .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"rm victim.txt\"}}" }} },
     };
-    const body = try build_review(&state, alloc, "model", "", &instructions, &messages, "call_ds_1", deadline, &cancel);
+    const body = try build_review(&state, alloc, "model", "", &instructions, &messages, &.{}, "call_ds_1", deadline, &cancel);
     defer alloc.free(body);
     try std.testing.expect(std.mem.find(u8, body, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"role\":\"user\"") != null);
