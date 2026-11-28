@@ -316,6 +316,7 @@ fn runAskChild(
 pub const PromptRunResult = struct {
     exit_code: u8,
     assistant_output: []u8,
+    has_model_output: bool = false,
     final_output: []u8 = &.{},
     /// Owned raw text of the completed final response as saved to history,
     /// with its Markdown intact; empty when absent. Unlike `final_output`, it
@@ -343,7 +344,7 @@ pub const PromptRunResult = struct {
     subagents: []subagent_usage.Entry = &.{},
 
     fn isPartial(self: PromptRunResult) bool {
-        return self.exit_code != 0 and self.assistant_output.len > 0 and self.final_output.len == 0;
+        return self.exit_code != 0 and self.has_model_output and self.final_output.len == 0;
     }
 
     pub fn deinit(self: PromptRunResult, alloc: Allocator) void {
@@ -705,9 +706,11 @@ const AskContext = struct {
     pending_tool_progress_mutex: std.Io.Mutex = .init,
     raw_boundary_pending: bool = false,
     response_output_start: usize = 0,
+    response_has_model_output_start: bool = false,
     response_restart_pending: bool = false,
     raw_trailing_newlines: u8 = 0,
     raw_has_output: bool = false,
+    has_model_output: bool = false,
     command_output_line_open: bool = false,
     assistant_output: std.ArrayList(u8) = .empty,
     final_output: std.ArrayList(u8) = .empty,
@@ -2069,6 +2072,7 @@ fn runAskTurn(
             return .{
                 .exit_code = 1,
                 .assistant_output = assistant_output,
+                .has_model_output = ctx.has_model_output,
                 .interrupted = ctx.processInterruptRequested(),
                 .tool_calls = tool_calls,
                 .error_code = "NonInteractivePermissionRequired",
@@ -2208,6 +2212,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     return .{
         .exit_code = if (ctx.failed) 1 else 0,
         .assistant_output = assistant_output,
+        .has_model_output = ctx.has_model_output,
         .final_output = final_output,
         .final_source = final_source,
         .interrupted = ctx.processInterruptRequested(),
@@ -3370,6 +3375,7 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
         .assistant_started => {
             discard_restarted_json_preview(ctx);
             ctx.response_output_start = ctx.assistant_output.items.len;
+            ctx.response_has_model_output_start = ctx.has_model_output;
         },
         .assistant_restarted => |text| switch (ctx.output_mode) {
             .raw => try writeRawAssistantBytes(ctx, text),
@@ -3400,6 +3406,7 @@ fn discard_restarted_json_preview(ctx: *AskContext) void {
     debug_trace.logf("agent", "discarding interrupted JSON preview bytes={d}", .{ctx.assistant_output.items.len - ctx.response_output_start});
     ctx.assistant_output.shrinkRetainingCapacity(ctx.response_output_start);
     ctx.response_restart_pending = false;
+    ctx.has_model_output = ctx.response_has_model_output_start;
     ctx.raw_has_output = ctx.assistant_output.items.len > 0;
     ctx.raw_boundary_pending = ctx.raw_has_output;
     ctx.raw_trailing_newlines = if (std.mem.endsWith(u8, ctx.assistant_output.items, "\n\n"))
@@ -3425,8 +3432,18 @@ fn pushRawAssistantText(ctx: *AskContext, text: []const u8) !void {
     try writeRawAssistantBytes(ctx, text);
 }
 
+fn hasNonWhitespaceByte(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (!std.ascii.isWhitespace(byte)) return true;
+    }
+    return false;
+}
+
 fn writeRawAssistantBytes(ctx: *AskContext, text: []const u8) !void {
-    if (ctx.output_mode == .json) try ctx.assistant_output.appendSlice(ctx.alloc, text);
+    if (ctx.output_mode == .json) {
+        try ctx.assistant_output.appendSlice(ctx.alloc, text);
+        if (hasNonWhitespaceByte(text)) ctx.has_model_output = true;
+    }
     if (ctx.output_mode == .raw) try ctx.writeStdout(text);
     if (text.len == 0) return;
     ctx.raw_has_output = true;
@@ -9899,6 +9916,7 @@ test "renderFinalJsonResult sets partial true only when failed with output and e
     const partial_fail = PromptRunResult{
         .exit_code = 1,
         .assistant_output = try alloc.dupe(u8, "partial reply"),
+        .has_model_output = true,
         .final_output = &.{},
         .error_code = "ModelError",
     };
@@ -9922,7 +9940,7 @@ test "renderFinalJsonResult sets partial true only when failed with output and e
     defer alloc.free(empty_json);
     try std.testing.expect(std.mem.find(u8, empty_json, "\"partial\"") == null);
 
-    // Success with empty final_output (e.g. legacy test case) or non-empty final_output: partial omitted.
+    // Success with non-empty final_output: partial omitted.
     const ok_res = PromptRunResult{
         .exit_code = 0,
         .assistant_output = try alloc.dupe(u8, "full reply"),
@@ -9932,4 +9950,63 @@ test "renderFinalJsonResult sets partial true only when failed with output and e
     const ok_json = try renderFinalJsonResult(alloc, ok_res);
     defer alloc.free(ok_json);
     try std.testing.expect(std.mem.find(u8, ok_json, "\"partial\"") == null);
+}
+
+test "isPartial ignores whitespace-only model text, HTTP errors, and discarded previews" {
+    const alloc = std.testing.allocator;
+    const renderModeJson = struct {
+        fn run(a: Allocator, setup: *const fn (*AskContext) anyerror!void) ![]u8 {
+            var stdout_capture: TestCapture = .{};
+            defer stdout_capture.deinit(a);
+            var stderr_capture: TestCapture = .{};
+            defer stderr_capture.deinit(a);
+            var ctx = AskContext.init(
+                a,
+                testConfig(),
+                testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+                "/tmp/workspace",
+            );
+            defer ctx.deinit();
+            ctx.output_mode = .json;
+            try setup(&ctx);
+            const result = try takePromptRunResult(&ctx, a);
+            defer result.deinit(a);
+            return try renderFinalJsonResult(a, result);
+        }
+    }.run;
+
+    // 1. Whitespace-only model text on a failed run must not emit "partial".
+    const ws_json = try renderModeJson(alloc, &struct {
+        fn f(ctx: *AskContext) !void {
+            const deps = agentRuntimeDeps(ctx);
+            try deps.push_text(deps.ctx, .assistant_started);
+            try deps.push_text(deps.ctx, .{ .assistant_source = "  \n\t " });
+            ctx.failed = true;
+        }
+    }.f);
+    defer alloc.free(ws_json);
+    try std.testing.expect(std.mem.find(u8, ws_json, "\"partial\"") == null);
+
+    // 2. HTTP error with no model text must not emit "partial".
+    const http_json = try renderModeJson(alloc, &struct {
+        fn f(ctx: *AskContext) !void {
+            try pushHttpError(@ptrCast(ctx), .bad_request, "bad request fixture", null);
+        }
+    }.f);
+    defer alloc.free(http_json);
+    try std.testing.expect(std.mem.find(u8, http_json, "\"partial\"") == null);
+
+    // 3. Discarded preview followed by failure with no new model text must not emit "partial".
+    const discarded_json = try renderModeJson(alloc, &struct {
+        fn f(ctx: *AskContext) !void {
+            const deps = agentRuntimeDeps(ctx);
+            try deps.push_text(deps.ctx, .assistant_started);
+            try deps.push_text(deps.ctx, .{ .assistant_source = "DISCARDED partial" });
+            try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart\n" });
+            try deps.push_text(deps.ctx, .assistant_started);
+            ctx.failed = true;
+        }
+    }.f);
+    defer alloc.free(discarded_json);
+    try std.testing.expect(std.mem.find(u8, discarded_json, "\"partial\"") == null);
 }

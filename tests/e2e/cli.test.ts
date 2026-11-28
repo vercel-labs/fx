@@ -8222,7 +8222,9 @@ describe("fx login Token Pass status", () => {
     },
     TIMEOUT,
   );
+});
 
+describe("fx ask --json recovery", () => {
   test(
     "fx ask --json reports recovery.attempt and partial across content-filter outcomes",
     async () => {
@@ -8376,7 +8378,9 @@ describe("fx login Token Pass status", () => {
           FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         };
         const res = await runFx(["ask", "--json", "--no-save", "unsafe reconciliation"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(res.code).toBe(1);
         const json = JSON.parse(res.stdout);
+        expect(json.exit_code).toBe(1);
         expect(json.recovery).toMatchObject({
           state: "failed",
           attempt: 2,
@@ -8384,6 +8388,53 @@ describe("fx login Token Pass status", () => {
           message: "⚠ Tool state needs review · malformed tool call during reconciliation · context preserved",
         });
         expect("partial" in json).toBe(false);
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --json after HTTP 400 with no model text has no partial field",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      const gateway = startFakeGateway([
+        new Response(
+          JSON.stringify({
+            error: {
+              type: "invalid_request_error",
+              message: "bad request fixture",
+            },
+          }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      ]);
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-http-400-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const res = await runFx(["ask", "--json", "--no-save", "http 400"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(res.code).toBe(1);
+        const json = JSON.parse(res.stdout);
+        expect(json.exit_code).toBe(1);
+        expect(json.output).toContain("HTTP 400");
+        expect(json.final_output).toBe("");
+        expect("partial" in json).toBe(false);
+        expect(gateway.requests).toHaveLength(1);
       } finally {
         gateway.stop();
         cleanupIsolatedTestHome(home);
