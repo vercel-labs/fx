@@ -10384,6 +10384,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         });
       });
 
+      let bodyPassed = false;
       try {
         await new Promise<void>((resolve, reject) => {
           server.once("error", reject);
@@ -10428,6 +10429,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(requests).toBe(2);
         expect(requestSockets.size).toBe(2);
         expect(trace).toContain("socket_err=ConnectionTimedOut");
+        bodyPassed = true;
       } finally {
         const ruleRemoval = iptablesRuleArgs
           ? spawnSync("sudo", ["-n", "iptables", "-D", ...iptablesRuleArgs], { encoding: "utf8" })
@@ -10438,7 +10440,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         }
         rmSync(root.root, { recursive: true, force: true });
         if (ruleRemoval && ruleRemoval.status !== 0) {
-          throw new Error(`could not remove the loopback DROP rule: ${ruleRemoval.stderr || ruleRemoval.error}`);
+          const message = `could not remove the loopback DROP rule: ${ruleRemoval.stderr || ruleRemoval.error}`;
+          // A throw here would replace the body's own failure, so only report it then.
+          if (bodyPassed) throw new Error(message);
+          console.error(message);
         }
       }
     },
