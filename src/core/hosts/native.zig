@@ -16,6 +16,19 @@ pub const secret_store = native_secret_store.provider;
 
 fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
     const argv = clipboardCommand(builtin.target.os.tag) orelse return false;
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromSeconds(clipboard_child_timeout_seconds),
+    });
+    try runClipboardCopy(argv, deadline, text);
+    return true;
+}
+
+fn runClipboardCopy(
+    argv: []const []const u8,
+    deadline: std.Io.Clock.Timestamp,
+    text: []const u8,
+) host.ClipboardError!void {
     const io = io_mod.getIo();
     var child = std.process.spawn(io, .{
         .argv = argv,
@@ -26,7 +39,7 @@ fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
         debug_trace.logf("host", "clipboard copy spawn failed err={s}", .{@errorName(err)});
         return error.CopyFailed;
     };
-    defer child.kill(io);
+    defer child_wait.killAndReap(&child, "clipboard copy");
 
     if (child.stdin) |*stdin| {
         stdin.writeStreamingAll(io, text) catch |err| {
@@ -42,7 +55,7 @@ fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
         return error.CopyFailed;
     }
 
-    const term = child.wait(io) catch |err| {
+    const term = child_wait.waitWithDeadline(&child, deadline) catch |err| {
         debug_trace.logf("host", "clipboard copy wait failed err={s}", .{@errorName(err)});
         return error.CopyFailed;
     };
@@ -50,7 +63,6 @@ fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
         logUnsuccessfulTerm("copy", term);
         return error.CopyFailed;
     }
-    return true;
 }
 
 const ClipboardProcessResult = struct {
@@ -175,7 +187,7 @@ fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []cons
 const max_clipboard_text_bytes: usize = 16 * 1024 * 1024;
 /// stderr is read only to recognize xclip's "no text" message, which is short.
 const max_clipboard_read_stderr_bytes: usize = 1024;
-const clipboard_read_timeout_seconds = 2;
+const clipboard_child_timeout_seconds = 2;
 /// Free buffer bytes the reader keeps for each read, in bytes.
 const clipboard_read_spare_capacity_bytes: usize = 64;
 /// Exit status xclip uses when the selection has no text target.
@@ -296,7 +308,7 @@ fn read_clipboard_text(_: ?*anyopaque, alloc: std.mem.Allocator) host.ClipboardE
     const argv = clipboardReadCommand(builtin.target.os.tag) orelse return null;
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
-        .raw = .fromSeconds(clipboard_read_timeout_seconds),
+        .raw = .fromSeconds(clipboard_child_timeout_seconds),
     });
     return runClipboardTextRead(alloc, argv, deadline, max_clipboard_text_bytes);
 }
@@ -433,4 +445,32 @@ test "native clipboard accepts only a successful exit" {
     try std.testing.expect(!copySucceeded(.{ .signal = .TERM }));
     try std.testing.expect(!copySucceeded(.{ .stopped = .STOP }));
     try std.testing.expect(!copySucceeded(.{ .unknown = 1 }));
+}
+
+test "native clipboard copy kills a command that outlives its deadline" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ root, "child.pid" });
+    defer alloc.free(pid_path);
+    const script = try alloc.print("echo $$ > '{s}'; exec sleep 5", .{pid_path});
+    defer alloc.free(script);
+
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(error.CopyFailed, runClipboardCopy(
+        &.{ "sh", "-c", script },
+        testReadDeadline(1000),
+        "text",
+    ));
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expect(elapsed_ms < 5000);
+
+    const pid_text = try tmp.dir.readFileAlloc(io, "child.pid", alloc, .limited(32));
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, pid_text, " \r\n"), 10);
+    var status: c_int = undefined;
+    try std.testing.expectEqual(std.posix.E.CHILD, std.posix.errno(std.c.waitpid(pid, &status, std.c.W.NOHANG)));
 }
