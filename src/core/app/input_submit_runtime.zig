@@ -688,10 +688,11 @@ pub fn SubmitRuntime(comptime App: type) type {
                     {
                         if (comptime @hasDecl(App, "retryPendingPromptCredential")) {
                             switch (try App.retryPendingPromptCredential(app, agents.screenAgentOf(app))) {
+                                // The prompt waits for a new refresh again, and
+                                // its `/trace` record says it went on.
                                 .pending => {
-                                    agents.screenAgentOf(app).submission.retry_after_auth = false;
-                                    agents.screenAgentOf(app).submission.pending.?.phase = .adopted;
-                                    app.shell.render_requests.request(.footer);
+                                    const resumed = resumePendingPromptAfterAuth(app, agents.screenAgentOf(app), "retry");
+                                    std.debug.assert(resumed);
                                 },
                                 .current => {
                                     const resumed = resumePendingPromptAfterAuth(app, agents.screenAgentOf(app), "submit");
