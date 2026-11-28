@@ -484,7 +484,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         } else {
             writeStderr(
                 deps,
-                "fx: upgrade installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
+                "fx: update installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
             );
         }
         return .{ .exit = 1 };
@@ -556,9 +556,9 @@ fn writeUpgradeRelaunchFailure(
     var words: [128]u8 = undefined;
     const message = std.mem.print(
         &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nResume this session with:\nfx --resume {s}\n",
+        "fx: update installed, but relaunch failed: {s}\nResume this session with:\nfx --resume {s}\n",
         .{ types.plainErrorText(@errorName(err), &words), session_id },
-    ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
+    ) catch "fx: update installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
 }
 
@@ -1434,6 +1434,10 @@ test "app entry relaunches only after teardown with the validated handoff" {
         capture.stderr.written(),
         "relaunch failed: invalid exe\nResume this session with:\nfx --resume session-123\n",
     ) != null);
+    try std.testing.expectEqualStrings(
+        "fx: update installed, but relaunch failed: invalid exe\nResume this session with:\nfx --resume session-123\n",
+        capture.stderr.written(),
+    );
     try expectEvents(&.{
         "init:none",
         "rebind-after-init",
@@ -1446,6 +1450,19 @@ test "app entry relaunches only after teardown with the validated handoff" {
         "deinit",
         "stderr-attempt",
     });
+}
+
+test "app entry falls back to doctor hint when relaunch failure message overflows" {
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    const long_id: [768]u8 = @splat('s');
+
+    writeUpgradeRelaunchFailure(capture.deps(), error.InvalidExe, &long_id);
+
+    try std.testing.expectEqualStrings(
+        "fx: update installed, but relaunch failed; run `fx doctor`.\n",
+        capture.stderr.written(),
+    );
 }
 
 test "app entry carries the previous revision through upgrade relaunch" {
@@ -1548,6 +1565,10 @@ test "app entry never relaunches without a validated handoff" {
         capture.stderr.written(),
         "no validated resume handoff",
     ) != null);
+    try std.testing.expectEqualStrings(
+        "fx: update installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
+        capture.stderr.written(),
+    );
 }
 
 test "app entry ignores resume handoff stdout failures" {
