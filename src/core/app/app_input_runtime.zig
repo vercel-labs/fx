@@ -13787,7 +13787,12 @@ test "app_input_runtime submit holds a prompt while the upgrade restart waits, a
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expect(app.agent().submission.pending == null);
     try std.testing.expectEqualStrings("after the restart", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, "; send this after the restart, or press Ctrl+G to cancel it"));
+    try std.testing.expectEqualStrings("update", app.notice_topic.items);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone);
+    try std.testing.expectEqualStrings(
+        "fx restarts for the update once the running turns stop and the prompt is empty; send this after the restart, or press Ctrl+G to cancel it",
+        app.notice_body.items,
+    );
 
     // Once the held turns are let go, Ctrl+G no longer cancels the restart.
     app.upgrader.restart = .releasing;
@@ -13795,8 +13800,12 @@ test "app_input_runtime submit holds a prompt while the upgrade restart waits, a
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expect(app.agent().submission.pending == null);
     try std.testing.expectEqualStrings("after the restart", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, "; send this after the restart"));
-    try std.testing.expect(std.mem.find(u8, app.notice_body.items, "Ctrl+G") == null);
+    try std.testing.expectEqualStrings("update", app.notice_topic.items);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone);
+    try std.testing.expectEqualStrings(
+        "fx restarts for the update once the running turns stop and the prompt is empty; send this after the restart",
+        app.notice_body.items,
+    );
     try std.testing.expectEqual(@as(usize, 2), app.notice_count);
 }
 

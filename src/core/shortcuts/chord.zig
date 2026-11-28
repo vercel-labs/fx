@@ -139,7 +139,7 @@ pub const Reserved = struct {
 pub const reserved = [_]Reserved{
     .{ .chord = .{ .key = .{ .char = 'c' }, .ctrl = true }, .why = "interrupts a running turn and exits" },
     .{ .chord = .{ .key = .{ .char = 'd' }, .ctrl = true }, .why = "exits fx" },
-    .{ .chord = .{ .key = .{ .char = 'g' }, .ctrl = true }, .why = "restarts for an upgrade, or cancels the waiting restart" },
+    .{ .chord = .{ .key = .{ .char = 'g' }, .ctrl = true }, .why = "restarts for an update, or cancels the waiting restart" },
     .{ .chord = .{ .key = .{ .char = 'o' }, .ctrl = true }, .why = "opens the full transcript" },
     .{ .chord = .{ .key = .{ .char = 'p' }, .ctrl = true }, .why = "opens the model catalog" },
     .{ .chord = .{ .key = .{ .char = 't' }, .ctrl = true }, .why = "cycles the reasoning effort" },
@@ -357,6 +357,11 @@ test "reservedMessage names the chord and why fx keeps it" {
     try std.testing.expectEqualStrings(
         "ctrl+c is reserved for fx: interrupts a running turn and exits",
         ctrl_c.reservedMessage(&buf).?,
+    );
+    const ctrl_g: Chord = .{ .key = .{ .char = 'g' }, .ctrl = true };
+    try std.testing.expectEqualStrings(
+        "ctrl+g is reserved for fx: restarts for an update, or cancels the waiting restart",
+        ctrl_g.reservedMessage(&buf).?,
     );
     const ctrl_f: Chord = .{ .key = .{ .char = 'f' }, .ctrl = true };
     try std.testing.expect(ctrl_f.reservedMessage(&buf) == null);
