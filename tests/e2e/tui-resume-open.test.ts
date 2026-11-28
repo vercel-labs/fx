@@ -18,7 +18,9 @@ const TIMEOUT = 30_000;
 // first and is selected when the picker opens.
 const NEWER = "CONV_FIRST 2";
 const OLDER = "CONV_FIRST 1";
-const OPENING = "• Opening…";
+const OPENING = "Opening…";
+// fx's loading marker, the `•` of `• Thinking`, blinks before the label.
+const MARKER_ON = "• Opening…";
 
 function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
@@ -48,6 +50,7 @@ function setup() {
   const release = join(root, "release");
   const stderrPath = join(root, "stderr.log");
   writeFileSync(stderrPath, "");
+  const tracePath = join(root, "trace.log");
   const gateway = startFakeGateway([]);
   const env = {
     HOME: home,
@@ -59,8 +62,10 @@ function setup() {
     FX_AUTO_UPGRADE: "0",
     FX_TEST_SESSION_OPEN_HELD: held,
     FX_TEST_SESSION_OPEN_RELEASE: release,
+    FX_TRACE_LOG: tracePath,
+    FX_TRACE_SCOPES: "frame_commit,session",
   };
-  return { root, home, workspace, held, release, stderrPath, gateway, env };
+  return { root, home, workspace, held, release, stderrPath, tracePath, gateway, env };
 }
 
 async function openPicker(fixture: ReturnType<typeof setup>): Promise<TmuxSession> {
@@ -74,6 +79,31 @@ async function openPicker(fixture: ReturnType<typeof setup>): Promise<TmuxSessio
   });
   await active.waitForPane((pane) => pane.includes("Sessions 2") && pane.includes(NEWER) && pane.includes(OLDER), TIMEOUT);
   return active;
+}
+
+function framesWritten(tracePath: string): number {
+  if (!existsSync(tracePath)) return 0;
+  return readFileSync(tracePath, "utf8").split("\n").filter((line) => line.includes("[frame_commit] wire_frame")).length;
+}
+
+/// The frames fx writes over one second once nothing on screen changes: none,
+/// since the opening row's marker stopped with its open.
+async function framesWhileIdle(tracePath: string): Promise<number> {
+  // The screen's last change, such as the switch's second frame, lands first.
+  const settleBy = Date.now() + TIMEOUT;
+  let seen = framesWritten(tracePath);
+  let quietSince = Date.now();
+  while (Date.now() - quietSince < 500 && Date.now() < settleBy) {
+    await Bun.sleep(50);
+    const now = framesWritten(tracePath);
+    if (now !== seen) {
+      seen = now;
+      quietSince = Date.now();
+    }
+  }
+  // An observation window, not a wait for state: no signal marks "no frame".
+  await Bun.sleep(1_000);
+  return framesWritten(tracePath) - seen;
 }
 
 async function waitForResumed(active: TmuxSession, title: string): Promise<string> {
@@ -94,9 +124,19 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Enter");
       // The worker holds the session open; the UI thread is free.
       await waitForFile(`${fixture.held}.1`);
-      const opening = await active.waitForPane((pane) => rowOf(pane, NEWER).includes(OPENING), TIMEOUT);
+      const opening = await active.waitForPane((pane) => rowOf(pane, NEWER).includes(MARKER_ON), TIMEOUT);
       expect(rowOf(opening, OLDER)).not.toContain("Opening");
       expect(rowOf(opening, OLDER)).toMatch(/\bturns?\b/);
+      // The marker blinks: its off half leaves the label where it was.
+      const dark = await active.waitForPane((pane) => {
+        const row = rowOf(pane, NEWER);
+        return row.includes(OPENING) && !row.includes("•");
+      }, TIMEOUT);
+      expect(rowOf(dark, NEWER).indexOf(OPENING)).toBe(rowOf(opening, NEWER).indexOf(OPENING));
+      // The blink is frames: they keep coming while the row opens.
+      const blinking = framesWritten(fixture.tracePath);
+      await Bun.sleep(1_000);
+      expect(framesWritten(fixture.tracePath) - blinking).toBeGreaterThan(0);
 
       await active.sendKeys("Enter");
       // Keys still reach the picker: the search filters the rows at once,
@@ -108,6 +148,7 @@ test.skipIf(!tmuxAvailable())(
 
       writeFileSync(fixture.release, "");
       await waitForResumed(active, NEWER);
+      expect(await framesWhileIdle(fixture.tracePath)).toBe(0);
       // The second Enter started no second open.
       expect(existsSync(`${fixture.held}.2`)).toBe(false);
       expect(rootSessionIds(fixture.home)).toHaveLength(1);
@@ -146,6 +187,7 @@ test.skipIf(!tmuxAvailable())(
         return text.includes("enter resume") && !text.includes("Opening") && rowOf(pane, NEWER).length > 0;
       }, TIMEOUT);
       expect(rowOf(kept, NEWER)).toMatch(/\bturns?\b/);
+      expect(await framesWhileIdle(fixture.tracePath)).toBe(0);
 
       // The dropped open let the session's writer lock go: a new open
       // takes it and reaches the hold again.

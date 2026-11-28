@@ -123,8 +123,8 @@ pub const SessionMenuProjection = struct {
     rest_loading: bool = false,
     /// The session the picker opens, whose row shows it opening.
     opening_id: ?[]const u8 = null,
-    /// The opening row's bullet, which blinks while the open runs.
-    opening_bullet_visible: bool = true,
+    /// Animation phase of the opening row's loading marker.
+    marker_phase: i16 = 0,
 
     pub fn filteredItemCount(self: SessionMenuProjection) usize {
         return session_catalog.filteredCount(self.summaries, self.query);
@@ -145,6 +145,17 @@ pub const SessionMenuProjection = struct {
     pub fn isOpening(self: SessionMenuProjection, summary: session_store.SessionSummary) bool {
         const id = self.opening_id orelse return false;
         return std.mem.eql(u8, id, summary.id);
+    }
+
+    /// Whether a listed row shows its session opening, so the frame keeps
+    /// its loading marker blinking.
+    pub fn showsOpening(self: SessionMenuProjection) bool {
+        if (self.opening_id == null or self.load_state != .ready) return false;
+        var index: usize = 0;
+        while (self.itemAt(index)) |summary| : (index += 1) {
+            if (self.isOpening(summary.*)) return true;
+        }
+        return false;
     }
 };
 

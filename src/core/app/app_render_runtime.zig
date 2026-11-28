@@ -873,6 +873,7 @@ pub fn Runtime(comptime App: type) type {
                     .selection_failure = agent.session_persistence.session_picker.selection_failure,
                     .opening_id = agent.session_persistence.session_picker_open.openingId(),
                     .rest_loading = agent.session_persistence.pickerListingRest(),
+                    .marker_phase = shimmer_pos,
                 } else .{},
                 .fork_menu = if (comptime agents.hasAgentField(App, "session_persistence"))
                     app_session_runtime.forkMenuProjection(&agent.session_persistence.fork_menu)

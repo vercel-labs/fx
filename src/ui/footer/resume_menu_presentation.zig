@@ -8,6 +8,7 @@ const ui_render = @import("../render.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
+const render_request = @import("../render_request.zig");
 
 const Allocator = std.mem.Allocator;
 const SessionMenuProjection = render_input.SessionMenuProjection;
@@ -250,20 +251,21 @@ pub fn composeSessionMenuRow(
             width,
         );
     }
-    const opening: ?OpeningMark = if (projection.isOpening(summary.*)) .{ .bullet_visible = projection.opening_bullet_visible } else null;
+    const opening: ?OpeningMark = if (projection.isOpening(summary.*)) .{ .marker_phase = projection.marker_phase } else null;
     return composeTitleRowOpening(alloc, summary.*, display_index == layout.selected, projection.now_ms, columns, width, opening);
 }
 
-/// A row whose session opens: its right cluster says so, with a bullet
-/// that blinks while the open runs.
+/// A row whose session opens: its right cluster says so, after fx's
+/// loading marker, which blinks while the open runs.
 const OpeningMark = struct {
-    bullet_visible: bool,
+    marker_phase: i16,
 
     const label = "Opening…";
-    const bullet = "• ";
+    /// `row_text.appendLoadingMarker`'s two columns.
+    const marker_width: usize = 2;
 
     fn width() usize {
-        return display_width.visibleWidth(bullet) + display_width.visibleWidth(label);
+        return marker_width + display_width.visibleWidth(label);
     }
 };
 
@@ -431,8 +433,8 @@ fn composeTitleRowOpening(
     if (opening) |mark| {
         if (!show_metadata and !mark_fits) return row;
         if (show_metadata) try row_text.appendSpacesToColumn(alloc, &row, metadata_start) else try row.append(alloc, ' ');
+        _ = try row_text.appendLoadingMarker(alloc, &row, mark.marker_phase, OpeningMark.width());
         try row.appendSlice(alloc, ui_render.selected_completion_style);
-        if (mark.bullet_visible) try row.appendSlice(alloc, OpeningMark.bullet) else try row.appendNTimes(alloc, ' ', display_width.visibleWidth(OpeningMark.bullet));
         try row.appendSlice(alloc, OpeningMark.label);
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
@@ -1089,43 +1091,56 @@ test "resume menu shows the opening session's row as opening, in the column the 
         .now_ms = 1_000 + 8 * std.time.ms_per_min,
         .opening_id = "two",
     };
+    try std.testing.expect(projection.showsOpening());
 
-    var plain = try composeSessionMenuRow(alloc, projection, 2, 100, 5);
-    defer plain.deinit(alloc);
+    const plain_text = try menuRowText(alloc, projection, 2, 100);
+    defer alloc.free(plain_text);
+    const opening_text = try menuRowText(alloc, projection, 3, 100);
+    defer alloc.free(opening_text);
+    try std.testing.expect(std.mem.find(u8, plain_text, "app · 8m · 3 turns") != null);
+    try std.testing.expect(std.mem.find(u8, plain_text, "Opening") == null);
+    try std.testing.expect(std.mem.find(u8, opening_text, "Second session") != null);
+    try std.testing.expect(std.mem.find(u8, opening_text, "5 turns") == null);
+    // fx's loading marker, the `•` of `• Thinking`, where the cluster starts.
+    try std.testing.expectEqual(std.mem.find(u8, plain_text, "app ·").?, std.mem.find(u8, opening_text, "• Opening…").?);
     var opening = try composeSessionMenuRow(alloc, projection, 3, 100, 5);
     defer opening.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, plain.items, "app · 8m · 3 turns") != null);
-    try std.testing.expect(std.mem.find(u8, plain.items, "Opening") == null);
-    try std.testing.expect(std.mem.find(u8, opening.items, "Second session") != null);
-    try std.testing.expect(std.mem.find(u8, opening.items, "• Opening…") != null);
-    try std.testing.expect(std.mem.find(u8, opening.items, "5 turns") == null);
-
-    var plain_grid = try vt_emulator.Grid.init(alloc, 100, 1);
-    defer plain_grid.deinit();
-    try plain_grid.feed(plain.items);
-    var opening_grid = try vt_emulator.Grid.init(alloc, 100, 1);
-    defer opening_grid.deinit();
-    try opening_grid.feed(opening.items);
-    var plain_text: std.ArrayList(u8) = .empty;
-    defer plain_text.deinit(alloc);
-    try plain_grid.rowTextTrimmed(1, &plain_text);
-    var opening_text: std.ArrayList(u8) = .empty;
-    defer opening_text.deinit(alloc);
-    try opening_grid.rowTextTrimmed(1, &opening_text);
-    try std.testing.expectEqual(std.mem.find(u8, plain_text.items, "app ·").?, std.mem.find(u8, opening_text.items, "• Opening").?);
+    try std.testing.expect(std.mem.find(u8, opening.items, ui_render.permission_auto_style) != null);
 
     // The blink's off phase keeps the label where it was.
-    projection.opening_bullet_visible = false;
-    var dark = try composeSessionMenuRow(alloc, projection, 3, 100, 5);
-    defer dark.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, dark.items, "•") == null);
-    try std.testing.expect(std.mem.find(u8, dark.items, "  Opening…") != null);
+    projection.marker_phase = render_request.blink_half_period_frames - render_request.animation_padding;
+    const dark_text = try menuRowText(alloc, projection, 3, 100);
+    defer alloc.free(dark_text);
+    try std.testing.expect(std.mem.find(u8, dark_text, "•") == null);
+    const lit_column = display_width.visibleWidth(opening_text[0..std.mem.find(u8, opening_text, "Opening…").?]);
+    const dark_column = display_width.visibleWidth(dark_text[0..std.mem.find(u8, dark_text, "Opening…").?]);
+    try std.testing.expectEqual(lit_column, dark_column);
 
     // Too narrow for the cluster: the mark still follows the title.
-    var narrow = try composeSessionMenuRow(alloc, projection, 3, 24, 5);
-    defer narrow.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "Opening…") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow.items) <= 24);
+    projection.marker_phase = 0;
+    const narrow_text = try menuRowText(alloc, projection, 3, 24);
+    defer alloc.free(narrow_text);
+    try std.testing.expect(std.mem.find(u8, narrow_text, "• Opening…") != null);
+
+    // Once the row is filtered out, or nothing opens, no row shows it.
+    projection.opening_id = "three";
+    try std.testing.expect(!projection.showsOpening());
+    projection.opening_id = null;
+    try std.testing.expect(!projection.showsOpening());
+}
+
+/// Row `row_index` of the session menu as a terminal shows it. Caller owns.
+fn menuRowText(alloc: Allocator, projection: SessionMenuProjection, row_index: u16, width: u16) ![]u8 {
+    var row = try composeSessionMenuRow(alloc, projection, row_index, width, 5);
+    defer row.deinit(alloc);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
+    var grid = try vt_emulator.Grid.init(alloc, width, 1);
+    defer grid.deinit();
+    try grid.feed(row.items);
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(alloc);
+    try grid.rowTextTrimmed(1, &text);
+    return text.toOwnedSlice(alloc);
 }
 
 test "resume menu says sessions still load when a search has no match in the first part of a listing" {
