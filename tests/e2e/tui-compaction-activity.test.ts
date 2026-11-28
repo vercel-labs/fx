@@ -315,6 +315,16 @@ async function assertLive(terminal: InstanceType<typeof TmuxSession>) {
 /// saves the first read (D87), so a reopened transcript and Ctrl+O show the
 /// turn as it ran, while the model never gets a.txt back: not on the next
 /// turn, and not after the reopen.
+// fx measures a request as a whole, tool catalog included, and compacts when
+// that estimate reaches 10% of the usable input: the window less the 8192
+// tokens kept for output. The turn must compact once, after a.txt's preview
+// and before the calls that follow. Measured: a point below about 6.6k
+// compacts on the turn's first request, and a point up to about 8.9k gives
+// exactly one compaction. The point, 7.8k, sits about 1.1k from either side,
+// so a tool catalog that grows by less than that keeps one compaction.
+const FOLDED_AUTO_COMPACT_AT_TOKENS = 7_800;
+const FOLDED_AUTO_CONTEXT_WINDOW = FOLDED_AUTO_COMPACT_AT_TOKENS * 10 + 8192;
+
 async function foldedReadAfterReopen(trigger: "auto" | "overflow") {
   const root = mkdtempSync(join(tmpdir(), `fx-folded-read-${trigger}-`));
   const home = join(root, "home");
@@ -368,7 +378,7 @@ async function foldedReadAfterReopen(trigger: "auto" | "overflow") {
       () => fakeGatewayToolCall("read_c", "read_file", { path: "c.txt" }),
     ];
     return steps[turnSteps - 1]?.() ?? fakeGatewayFinalText(DONE);
-  }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 67_000 + 8192, max_tokens: 8192 }] });
+  }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: FOLDED_AUTO_CONTEXT_WINDOW, max_tokens: 8192 }] });
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-compaction-key",
