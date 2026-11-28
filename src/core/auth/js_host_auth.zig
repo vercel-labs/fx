@@ -110,7 +110,8 @@ fn executeRequest(
     headers: anytype,
     body: []const u8,
 ) !oauth_transport.Response {
-    var headers_json: std.Io.Writer.Allocating = .init(alloc);
+    var wiping: secret.Wiping = .init(alloc);
+    var headers_json: std.Io.Writer.Allocating = .init(wiping.allocator());
     defer headers_json.deinit();
     try std.json.Stringify.value(headers, .{}, &headers_json.writer);
 
