@@ -635,16 +635,50 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         self,
     ) -> None:
         publish_libfx = PUBLISH_LIBFX_WORKFLOW_PATH.read_text(encoding="utf-8")
-        publish_step = publish_libfx.split(
+        publish_job = re.split(
+            r"\n  [A-Za-z0-9_-]+:\n", publish_libfx.split("\n  publish:\n", 1)[1], maxsplit=1
+        )[0]
+        publish_step = publish_job.split(
             "      - name: Publish the verified archive with npm trusted publishing\n", 1
         )[1].split("\n      - name: ", 1)[0]
+        step_header, step_script = publish_step.split("        run: |\n", 1)
 
-        self.assertIn("NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}", publish_step)
-        self.assertIn("CHANNEL: ${{ needs.metadata.outputs.channel }}", publish_step)
-
-        script_lines = [
-            line.strip() for line in publish_step.split("        run: |\n", 1)[1].splitlines()
+        header_lines = step_header.splitlines()
+        key_pattern = re.compile(r"""^( *)(["']?)([A-Za-z_][A-Za-z0-9_]*)\2\s*:\s*(.*?)\s*$""")
+        step_keys = [
+            match.group(3)
+            for match in map(key_pattern.match, header_lines)
+            if match and len(match.group(1)) == 8
         ]
+        self.assertEqual(1, step_keys.count("env"), step_keys)
+        env_start = next(
+            i
+            for i, line in enumerate(header_lines)
+            if (match := key_pattern.match(line)) and len(match.group(1)) == 8 and match.group(3) == "env"
+        )
+        env_block = []
+        for line in header_lines[env_start + 1 :]:
+            if not line.strip() or line.strip().startswith("#"):
+                continue
+            if len(line) - len(line.lstrip()) <= 8:
+                break
+            env_block.append(line)
+        env_keys = []
+        for line in env_block:
+            match = key_pattern.match(line)
+            self.assertTrue(
+                match and len(match.group(1)) == 10,
+                f"the publish step's env block has a line that is not one plain key: {line!r}",
+            )
+            env_keys.append((match.group(3), match.group(4)))
+        for name, value in (
+            ("NPM_TAG", "${{ needs.metadata.outputs.npm_tag }}"),
+            ("CHANNEL", "${{ needs.metadata.outputs.channel }}"),
+        ):
+            with self.subTest(env=name):
+                self.assertEqual([value], [v for key, v in env_keys if key == name], env_keys)
+
+        script_lines = [line.strip() for line in step_script.splitlines()]
         # The guard must run before anything else in the step, so nothing can
         # publish or change CHANNEL or NPM_TAG before it decides.
         self.assertEqual("set -euo pipefail", script_lines[0])
