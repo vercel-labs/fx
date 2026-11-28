@@ -12,6 +12,9 @@ export type ManyMcpOptions = {
   toolsPerServer: number;
   // The text every tools/call answers with.
   resultText?: string;
+  // Extra bytes added to each tool's description and schema description for size-cap tests.
+  toolDescriptionBytes?: number;
+  schemaDescriptionBytes?: number;
 };
 
 export type ManyMcpStats = {
@@ -28,15 +31,24 @@ export function manyMcpToolName(index: number): string {
   return `tool_${String(index).padStart(2, "0")}`;
 }
 
-function toolList(server: number, count: number) {
+function toolList(server: number, count: number, options: ManyMcpOptions) {
   const tools = [];
+  const baseDesc = (tool: number) => `Tool ${tool} of server ${server}: echoes its text with the server and tool number.`;
+  const argBase = "What to echo.";
+  const schemaDesc = options.schemaDescriptionBytes && options.schemaDescriptionBytes > argBase.length
+    ? `${argBase} ${"s".repeat(options.schemaDescriptionBytes - argBase.length - 1)}`
+    : argBase;
   for (let tool = 0; tool < count; tool++) {
+    const prefix = baseDesc(tool);
+    const description = options.toolDescriptionBytes && options.toolDescriptionBytes > prefix.length
+      ? `${prefix} ${"d".repeat(options.toolDescriptionBytes - prefix.length - 1)}`
+      : prefix;
     tools.push({
       name: manyMcpToolName(tool),
-      description: `Tool ${tool} of server ${server}: echoes its text with the server and tool number.`,
+      description,
       inputSchema: {
         type: "object",
-        properties: { text: { type: "string", description: "What to echo." } },
+        properties: { text: { type: "string", description: schemaDesc } },
         required: ["text"],
       },
     });
@@ -85,7 +97,7 @@ export function startManyMcpHttpServers(options: ManyMcpOptions) {
           stats.toolsList += 1;
           let tools = lists.get(index);
           if (!tools) {
-            tools = toolList(index, options.toolsPerServer);
+            tools = toolList(index, options.toolsPerServer, options);
             lists.set(index, tools);
           }
           return Response.json({ jsonrpc: "2.0", id: message.id, result: { tools } });

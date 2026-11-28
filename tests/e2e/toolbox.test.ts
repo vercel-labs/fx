@@ -802,6 +802,43 @@ describe("toolbox", () => {
     expect(resultValue(body(childBodies[1]!), "child_glob")).toContain("FINDER_NOTES.md");
   }, 60_000);
 
+  test("toolbox search on a 14-tool MCP server with limit 10 fits the combined result inside the tool result cap", async () => {
+    const root = createRoot();
+    const many = startManyMcpHttpServers({
+      servers: 1,
+      toolsPerServer: 14,
+      toolDescriptionBytes: 1024,
+      schemaDescriptionBytes: 448,
+    });
+    try {
+      const serverName = manyMcpServerName(0);
+      const config = JSON.parse(readFileSync(join(root.home, ".fx", "mcp.json"), "utf8")) as { mcp: Record<string, unknown> };
+      config.mcp[serverName] = { type: "http", url: many.url(0) };
+      writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify(config));
+      const active = start([
+        fakeGatewayToolCall("search_limit_10", "toolbox", { search: "echoes text", server: serverName, limit: 10 }),
+        fakeGatewayFinalText("TOOLBOX_LIMIT_10_DONE"),
+      ]);
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Search the MCP server."], {
+        cwd: root.workspace,
+        env: env(root, active),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("TOOLBOX_LIMIT_10_DONE");
+      const raws = modelRequests(active);
+      expect(raws.length).toBe(2);
+      const text = resultValue(body(raws[1]!), "search_limit_10");
+      expect(text, text).not.toContain("CapabilitySearchResultLimitTooSmall");
+      expect(Buffer.byteLength(text, "utf8"), text).toBeLessThanOrEqual(16_384);
+      const parsed = JSON.parse(text) as { mcp_tools?: SearchRow[] };
+      expect((parsed.mcp_tools ?? []).length, text).toBeGreaterThan(0);
+      expectEveryRequestExtendsThePrevious(raws);
+    } finally {
+      many.stop();
+    }
+  }, 40_000);
+
   // A resumed session sends the menu its first request sent, whatever the
   // config holds now, so each request still starts with the whole request
   // before it; a server added since arrives as a change note at the end of
