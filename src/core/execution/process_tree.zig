@@ -726,10 +726,12 @@ pub const Tracker = struct {
 
     /// Tracks each live process of `session` that this tracker does not track
     /// yet, except the session's leader and this process. Returns how many it
-    /// added.
+    /// added. A member whose identity cannot be read is never signalled, and
+    /// `summary` says it is incomplete.
     fn trackSessionWith(
         self: *Tracker,
         session: std.posix.pid_t,
+        summary: *DeliverySummary,
         comptime Effects: type,
     ) !usize {
         var pids: std.ArrayList(std.posix.pid_t) = .empty;
@@ -742,6 +744,7 @@ pub const Tracker = struct {
             if (!inSessionWith(pid, session, Effects)) continue;
             const snapshot = Effects.capture(self.alloc, pid) catch |err| {
                 if (err == error.OutOfMemory) return err;
+                if (err != error.ProcessNotFound) summary.incomplete = true;
                 continue;
             };
             // Read after the identity: a process that is alive from this read
@@ -824,7 +827,9 @@ const session_end_passes: usize = 16;
 /// The caller must own `session`: this process leads it, or holds its
 /// leader's identity, since the session id only names the session while a
 /// member lives, and a leader that is gone leaves nothing to check it by.
-/// A session this process belongs to without leading is refused.
+/// A session this process belongs to without leading is refused. A member
+/// whose identity cannot be read is not signalled, and the summary says it is
+/// incomplete.
 pub fn endSession(alloc: Allocator, session: std.posix.pid_t) !DeliverySummary {
     return endSessionWith(alloc, session, SystemSignalEffects);
 }
@@ -847,7 +852,7 @@ fn endSessionWith(
     var tracker = try Tracker.init(alloc);
     defer tracker.deinit();
     for (0..session_end_passes) |_| {
-        if (try tracker.trackSessionWith(session, Effects) == 0) return summary;
+        if (try tracker.trackSessionWith(session, &summary, Effects) == 0) return summary;
         const pass_summary = tracker.signalProcessesWith(std.posix.SIG.KILL, null, Effects);
         summary.delivered += pass_summary.delivered;
         summary.incomplete = summary.incomplete or pass_summary.incomplete;
@@ -1770,6 +1775,9 @@ const FakeSessionTable = struct {
     var swapped_reads: usize = 0;
     /// The session of this pid cannot be read.
     var unreadable_pid: ?std.posix.pid_t = null;
+    /// The identity of this pid cannot be read: `capture` fails with `capture_error`.
+    var unidentifiable_pid: ?std.posix.pid_t = null;
+    var capture_error: anyerror = error.AccessDenied;
     /// A process of `late_member_session` that exists only once the
     /// `late_member_after_list`th list has been returned, as one that starts
     /// while the list is read.
@@ -1791,6 +1799,8 @@ const FakeSessionTable = struct {
         swapped_pid = null;
         swapped_reads = 0;
         unreadable_pid = null;
+        unidentifiable_pid = null;
+        capture_error = error.AccessDenied;
         late_member_after_list = 0;
     }
 
@@ -1837,6 +1847,7 @@ const FakeSessionTable = struct {
 
     fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
         const index = find(pid) orelse return error.ProcessNotFound;
+        if (unidentifiable_pid == pid) return capture_error;
         var ticks: u64 = @intCast(pid);
         if (reused_pid == pid) {
             reused_reads += 1;
@@ -1925,6 +1936,46 @@ test "ending a session stops looking after a bounded number of passes" {
     try std.testing.expectEqual(session_end_passes, table.killed_count);
     // No pass found the session empty, so the result says it may not be.
     try std.testing.expect(summary.incomplete);
+}
+
+test "ending a session says incomplete for a member whose identity cannot be read" {
+    const table = FakeSessionTable;
+    table.reset();
+    table.add(200, 200, false);
+    table.add(201, 200, false);
+    table.add(202, 200, false);
+    table.unidentifiable_pid = 202;
+
+    // The readable member is killed. The other is never signalled, since its
+    // identity is unknown, and the result says that it may still run.
+    const with_sibling = try endSessionWith(std.testing.allocator, 200, table);
+    try table.expectKilled(&.{201});
+    try std.testing.expect(with_sibling.incomplete);
+
+    // The same when it is the only member left.
+    table.reset();
+    table.add(200, 200, false);
+    table.add(202, 200, false);
+    table.unidentifiable_pid = 202;
+    const alone = try endSessionWith(std.testing.allocator, 200, table);
+    try std.testing.expectEqual(@as(usize, 0), table.killed_count);
+    try std.testing.expectEqual(@as(usize, 0), alone.delivered);
+    try std.testing.expect(alone.incomplete);
+}
+
+test "ending a session does not say incomplete for a member that vanished" {
+    const table = FakeSessionTable;
+    table.reset();
+    table.add(200, 200, false);
+    table.add(201, 200, false);
+    table.add(202, 200, false);
+    // 202 ends between the list and the read of its identity.
+    table.unidentifiable_pid = 202;
+    table.capture_error = error.ProcessNotFound;
+
+    const summary = try endSessionWith(std.testing.allocator, 200, table);
+    try table.expectKilled(&.{201});
+    try std.testing.expect(!summary.incomplete);
 }
 
 test "ending a session refuses the session this process belongs to unless it leads it" {
