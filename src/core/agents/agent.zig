@@ -105,6 +105,11 @@ pub const Agent = struct {
     session_usage: SessionUsageTracker = .{},
     /// A top-level instance, every one alike, or a subagent.
     role: Role = .instance,
+    /// Names this agent's screen for the app's whole run. Unlike the agent's
+    /// address, which an agent created after this one closes can take, no
+    /// later agent gets it again. 0 for the first instance; the app gives
+    /// every other agent the next number when it creates it.
+    screen_id: u64 = 0,
     /// Whether one of its turns was going when the host last looked, so the
     /// host can tell when one ends. Main loop only.
     was_working: bool = false,

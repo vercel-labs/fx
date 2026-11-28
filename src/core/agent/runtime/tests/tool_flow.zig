@@ -35,6 +35,7 @@ const runtime_tool_presentation = @import("../tool_presentation.zig");
 const runtime_telemetry = @import("../telemetry.zig");
 const recovery = @import("../../../recovery/recovery.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
+const shell_snapshot = @import("../../../terminal/shell_snapshot.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const auto_classifier_context = @import("../../../permissions/auto_classifier_context.zig");
@@ -1778,7 +1779,7 @@ test "shell lifecycle resolves one display target before execution" {
             return .{
                 .decision = .once,
                 .execution_authority = .ordinary,
-                .human_approval = .once,
+                .human_approval = .{ .kind = .once, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() },
             };
         }
     };
@@ -4594,6 +4595,131 @@ test "modern mixed batch materializes unsupported terminal before admission" {
     try std.testing.expectEqual(types.PersistedToolStatus.failure, results[1].status);
 }
 
+test "unsupported bash call hints the registered shell tool when no bash tool is registered" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var renamed_shell = builtin_tools.shell;
+    renamed_shell.name = "terminal";
+    renamed_shell.model_schema.name = "terminal";
+    const renamed_tools = [_]tool_dispatch.Tool{ builtin_tools.read_file, renamed_shell };
+    const no_shell_tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
+
+    const cases = [_]struct {
+        tools: ?[]const tool_dispatch.Tool,
+        expected: []const u8,
+    }{
+        .{ .tools = null, .expected = "Unsupported tool: bash. Use shell instead." },
+        .{ .tools = &renamed_tools, .expected = "Unsupported tool: bash. Use terminal instead." },
+        .{ .tools = &no_shell_tools, .expected = "Unsupported tool: bash" },
+    };
+
+    for (cases) |case| {
+        const calls = [_]ToolCall{toolCall("bash_1", "bash", "{\"command\":\"true\"}")};
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &calls },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.context_enabled = true;
+        hooks.context_registry = EmptyApplicableContext.registry;
+        hooks.validation_not_registered_names = &.{"bash"};
+        if (case.tools) |tools| hooks.tool_registry = .{ .tools = tools };
+        var fixture = PromptFixture{ .workspace_root = workspace };
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+        const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings(case.expected, results[0].output);
+        try std.testing.expectEqual(types.PersistedToolStatus.failure, results[0].status);
+    }
+}
+
+test "unsupported bash_placeholder keeps the generic message" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    for ([_][]const u8{ "bash_placeholder", "bash_tool_placeholder" }) |name| {
+        const calls = [_]ToolCall{toolCall("bad_1", name, "{}")};
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &calls },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.context_enabled = true;
+        hooks.context_registry = EmptyApplicableContext.registry;
+        hooks.validation_not_registered_names = &.{name};
+        var fixture = PromptFixture{ .workspace_root = workspace };
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        const expected = try alloc.print("Unsupported tool: {s}", .{name});
+        defer alloc.free(expected);
+        const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings(expected, results[0].output);
+        try std.testing.expectEqual(types.PersistedToolStatus.failure, results[0].status);
+    }
+}
+
+test "registered bash tool dispatches directly without unsupported hint" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var bash_tool = builtin_tools.read_file;
+    bash_tool.name = "bash";
+    bash_tool.model_schema.name = "bash";
+    const tools = [_]tool_dispatch.Tool{ builtin_tools.shell, bash_tool };
+
+    const calls = [_]ToolCall{toolCall("bash_1", "bash", "{\"path\":\"notes.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.context_registry = EmptyApplicableContext.registry;
+    hooks.tool_registry = .{ .tools = &tools };
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "bash tool ran" } }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("bash", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
+    const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("bash tool ran", results[0].output);
+    try std.testing.expectEqual(types.PersistedToolStatus.success, results[0].status);
+}
+
 test "modern cancellation during later context selection stops before context or tool history commit" {
     const alloc = std.testing.allocator;
     defer ApplicableContextDelta.reset("", null);
@@ -6497,6 +6623,7 @@ test "initial session grants follow active registry metadata" {
         "/tmp/workspace",
         .{ .id = "provider-glob", .name = "provider_glob", .arguments_json = "{\"pattern\":\"*\"}" },
         "/tmp/workspace/src",
+        shell_snapshot.processOwner().approvalEpoch(),
     );
 
     try std.testing.expectEqual(@as(usize, 4), local_grants.items.len);
@@ -8158,6 +8285,7 @@ test "child live authority refresh denies the next tool action before execution"
         const allowed_tools = [_][]const u8{"read_file"};
         const integrations = [_][]const u8{"mcp_fixture"};
         var grants = [_]PermissionGrant{.{
+            .shell_epoch = 0,
             .tool_name = @constCast("read_file"),
             .target_path = @constCast("/tmp/workspace/first"),
         }};
@@ -8406,7 +8534,7 @@ test "child live authority allow to ask requires current approval before effect"
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     hooks.permission_decisions = &.{ .once, .once };
-    hooks.permission_human_approvals = &.{ .none, .once };
+    hooks.permission_human_approvals = &.{ command_admission.no_human_approval, .{ .kind = .once, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() } };
     hooks.permission_wait_index = 1;
     hooks.exec_plans = &.{.{ .result = .{ .model_output = "approved result" } }};
 
@@ -8602,6 +8730,34 @@ test "a subagent's always approval of a file change stores the session grant" {
 
 test "a subagent's always approval of a command stores the session grant" {
     try expectChildAlwaysStoresGrant(.command);
+}
+
+test "an always answer to a shell command stores the epoch it was answered in when a refresh lands first" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_always", "shell", "{\"command\":\"zig fmt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.always};
+    hooks.refresh_before_record = true;
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.propagated_grants.items.len);
+    const stored = hooks.propagated_grants.items[0];
+    try std.testing.expectEqual(@as(u64, 0), stored.shell_epoch);
+    try std.testing.expect(!permissions.sessionGrantAllowed(hooks.propagated_grants.items, "run_command", stored.target_path));
 }
 
 /// What a subagent's approval of a call that reads an image kept, as the turn

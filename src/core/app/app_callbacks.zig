@@ -1438,10 +1438,10 @@ pub fn Bindings(comptime App: type) type {
             app_session_runtime.Runtime(App).reachWorkspace(appOf(agent), agent, dir, tool_name);
         }
 
-        fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
+        fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            try app_worker_runtime.Runtime(App).propagateGrant(app, agent, tool_name, target_path);
+            try app_worker_runtime.Runtime(App).propagateGrant(app, agent, tool_name, target_path, shell_epoch);
         }
 
         fn agentPushEvent(ctx: *anyopaque, event: WorkerEvent) !void {
@@ -1812,7 +1812,12 @@ pub fn Bindings(comptime App: type) type {
                 }
                 // The picker borrows the composer as its query box; the
                 // person's draft goes back when the pick or the close is done.
-                if (comptime @hasField(App, "input_runtime")) app.input_runtime.stashModelPickerDraft();
+                // An open `/effort` menu closes first, so its query is not
+                // kept as the draft.
+                if (comptime @hasField(App, "input_runtime")) {
+                    if (comptime @hasDecl(InputRuntime, "cancelEffortMenu")) _ = app.input_runtime.cancelEffortMenu(app.alloc, "worker_model_picker");
+                    app.input_runtime.stashModelPickerDraft();
+                }
                 try input_completion_runtime.CompletionRuntime(App).openCurrentModelPicker(app);
             }
         }
@@ -1885,7 +1890,7 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeSessionGrant(ctx: *anyopaque, grant: types.PermissionGrant) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            try app.allowToolForSession(agent, grant.tool_name, grant.target_path);
+            try app.allowToolForSession(agent, grant.tool_name, grant.target_path, grant.shell_epoch);
         }
 
         fn workerBridgeErrorText(ctx: *anyopaque, notice: types.SemanticNotice) !void {
@@ -1973,7 +1978,7 @@ const FakeWorker = struct {
         self.propagated_history_turns += 1;
     }
 
-    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
+    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8, _: u64) !void {
         _ = alloc;
         _ = tool_name;
         _ = target_path;
@@ -2383,7 +2388,7 @@ const FakeApp = struct {
         }
     }
 
-    fn allowToolForSession(self: *FakeApp, _: anytype, tool_name: []const u8, target_path: []const u8) !void {
+    fn allowToolForSession(self: *FakeApp, _: anytype, tool_name: []const u8, target_path: []const u8, _: u64) !void {
         _ = tool_name;
         _ = target_path;
         self.grant_count += 1;
@@ -2488,7 +2493,7 @@ const NoOverridePersistentApp = struct {
         _ = record;
     }
 
-    fn allowToolForSession(self: *NoOverridePersistentApp, _: anytype, tool_name: []const u8, target_path: []const u8) !void {
+    fn allowToolForSession(self: *NoOverridePersistentApp, _: anytype, tool_name: []const u8, target_path: []const u8, _: u64) !void {
         _ = self;
         _ = tool_name;
         _ = target_path;
@@ -2590,7 +2595,7 @@ test "agent deps forward app callbacks through core types" {
         .removed_turn_count = 1,
         .compaction_count = 1,
     } });
-    try deps.propagate_grant(deps.ctx, "read_file", "/tmp/a");
+    try deps.propagate_grant(deps.ctx, "read_file", "/tmp/a", 0);
     const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{ .turn = .{
         .compacted_summary = .{
             .summary = @constCast("finished"),
@@ -3168,7 +3173,7 @@ test "worker bridge deps forward UI operations" {
         .turn_duration_ms = 130_000,
         .token_progress = .{ .input_tokens = 10_000, .output_tokens = 5_000 },
     } });
-    try deps.session_grant(deps.ctx, .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a") });
+    try deps.session_grant(deps.ctx, .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a"), .shell_epoch = 0 });
     try deps.error_text(deps.ctx, .{
         .topic = "system",
         .tone = .@"error",

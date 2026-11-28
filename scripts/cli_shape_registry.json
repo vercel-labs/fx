@@ -249,6 +249,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_RECOVERY_RETRY_BUDGET_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_REPORT_DELIVERY_HELD": {
       "job": "test",
       "stability": "internal"
@@ -507,6 +511,7 @@
     "--version": "Detects a version request before any command parser runs.",
     "-v": "Short form of --version.",
     "--json": "Picks the error format when a command's own parser has rejected its arguments.",
+    "--stream-events": "Picks the stream-events error format when fx ask's own parser has rejected its arguments.",
     "--resume": "The fixed resume grammar: --resume takes an optional last or ID operand.",
     "--continue": "The fixed resume grammar.",
     "-c": "The fixed resume grammar.",

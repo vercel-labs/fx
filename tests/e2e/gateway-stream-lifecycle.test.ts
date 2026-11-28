@@ -731,6 +731,7 @@ function parseAskJson(stdout: string): {
   recovery?: {
     state: string;
     attempt: number;
+    cause?: string;
     need?: string;
     message?: string;
   };
@@ -2533,6 +2534,77 @@ describe("gateway stream lifecycle", () => {
       expect(readFileSync(tracePath, "utf8")).toContain(
         `catalog omitted identical copy name="release-notes" path="${omitted}`,
       );
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("a workspace outside HOME lists no skills from folders above its repository or itself", async () => {
+    const root = createFixtureRoot("skill-walk-boundary");
+    const tracePath = join(root.root, "trace.log");
+    const writeSkill = (base: string, name: string) => {
+      const directory = join(base, ".agents", "skills", name);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        join(directory, "SKILL.md"),
+        `---\nname: ${name}\ndescription: ${name} fixture\n---\n\nbody\n`,
+      );
+    };
+    const gitInit = (directory: string) => {
+      mkdirSync(directory, { recursive: true });
+      const result = Bun.spawnSync(["git", "init", "-q", "--template=", directory], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          HOME: root.home,
+          GIT_CONFIG_NOSYSTEM: "1",
+          LC_ALL: "C",
+        },
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(`git init failed: ${result.stderr.toString()}`);
+      }
+    };
+    // The fixture's HOME is beside these two workspaces, not above them.
+    const repository = join(root.root, "top", "mid", "repo");
+    gitInit(repository);
+    writeSkill(join(root.root, "top"), "walk-above-repository");
+    writeSkill(repository, "walk-repository");
+    const plainParent = join(root.root, "plain");
+    const plainWorkspace = join(plainParent, "workspace");
+    writeSkill(plainParent, "walk-above-workspace");
+    writeSkill(plainWorkspace, "walk-workspace");
+    // A repository under HOME keeps loading the folders up to HOME.
+    const homeRepository = join(root.home, "projects", "repo");
+    gitInit(homeRepository);
+    writeSkill(join(root.home, "projects"), "walk-above-home-repository");
+
+    const gateway = startGateway(() => fakeGatewayFinalText("SKILL_WALK_DONE"));
+    const firstRequest = async (cwd: string) => {
+      const index = gateway.requestCount();
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Say done."],
+        {
+          cwd,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_SOUND: "0" },
+          timeoutMs: 30_000,
+        },
+      );
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("SKILL_WALK_DONE");
+      return gateway.requests[index]!.body;
+    };
+    try {
+      const inRepository = await firstRequest(repository);
+      expect(advertisedSkillOpenKeys(inRepository, "walk-repository")).toHaveLength(1);
+      expect(advertisedSkillOpenKeys(inRepository, "walk-above-repository")).toEqual([]);
+
+      const inPlainWorkspace = await firstRequest(plainWorkspace);
+      expect(advertisedSkillOpenKeys(inPlainWorkspace, "walk-workspace")).toHaveLength(1);
+      expect(advertisedSkillOpenKeys(inPlainWorkspace, "walk-above-workspace")).toEqual([]);
+
+      const inHomeRepository = await firstRequest(homeRepository);
+      expect(advertisedSkillOpenKeys(inHomeRepository, "walk-above-home-repository")).toHaveLength(1);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -14464,6 +14536,38 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
   }, 20_000);
 
 
+  test("fx ask --json hints the shell tool when a model calls bash", async () => {
+    const root = createFixtureRoot("bash-tool-hint");
+    const tracePath = join(root.root, "trace.log");
+    const responses = [
+      fakeGatewayToolCall("bash_1", "bash", { command: "printf ok" }),
+      fakeGatewayFinalText("Recovered after bash hint."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Run a command."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.final_output).toBe("Recovered after bash hint.");
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("Unsupported tool: bash. Use shell instead.");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("model response recovery keeps retrying status failures past ten real requests", async () => {
     const root = createFixtureRoot("provider-attempt-budget");
     const tracePath = join(root.root, "trace.log");
@@ -14499,6 +14603,196 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("fx ask --json stops retrying 503 responses once the retry budget passes", async () => {
+    const root = createFixtureRoot("ask-retry-budget-503");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => unavailableResponse("1"));
+    const started = Date.now();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Stop retrying after the budget."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+          timeoutMs: 8_000,
+        },
+      );
+      const elapsedMs = Date.now() - started;
+
+      expect(result.timedOut).toBe(false);
+      expect(result.code).toBe(1);
+      expect(elapsedMs).toBeLessThan(6_000);
+      const json = parseAskJson(result.stdout);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(json.recovery).toEqual({
+        state: "failed",
+        attempt: 2,
+        cause: "server",
+      });
+      expect(result.stderr).toContain("fx ask: API request failed · HTTP 503 · provider temporarily unavailable");
+      expect(gateway.requestCount()).toBe(2);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("fx ask --json stops retrying provider_error events once the retry budget passes", async () => {
+    const root = createFixtureRoot("ask-retry-budget-provider-error");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => providerErrorResponse("always broken provider"));
+    const started = Date.now();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Stop retrying provider errors after the budget."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+          timeoutMs: 8_000,
+        },
+      );
+      const elapsedMs = Date.now() - started;
+
+      expect(result.timedOut).toBe(false);
+      expect(result.code).toBe(1);
+      expect(elapsedMs).toBeLessThan(6_000);
+      const json = parseAskJson(result.stdout);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBe("ModelError");
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.cause).toBe("server");
+      expect(json.recovery?.attempt).toBe(2);
+      expect(result.stderr).toContain("[notice] ⚠ Provider unavailable · provider_error: always broken provider · stopped after 2 attempts");
+      expect(gateway.requestCount()).toBe(2);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("fx ask --json exits when its own 503 retry budget expires even with a subagent running", async () => {
+    const root = createFixtureRoot("ask-retry-budget-503-with-subagent");
+    const tracePath = join(root.root, "trace.log");
+    let sawParentStartCall = false;
+    let sawChildRequest = false;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"') && body.includes("Keep working while the gateway fails.")) {
+        sawChildRequest = true;
+      }
+      if (!sawParentStartCall && body.includes('"name":"subagent"') && !hasCurrentToolResult(body, "start_worker")) {
+        sawParentStartCall = true;
+        return fakeGatewayToolCall("start_worker", "subagent", {
+          request: {
+            action: "message",
+            agent: "worker",
+            message: "Keep working while the gateway fails.",
+          },
+        });
+      }
+      return unavailableResponse("1");
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const started = Date.now();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Start a subagent and stop if retries run out."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+          timeoutMs: 60_000,
+        },
+      );
+      const elapsedMs = Date.now() - started;
+
+      expect(result.timedOut).toBe(false);
+      expect(elapsedMs).toBeLessThan(15_000);
+      expect(sawChildRequest).toBe(true);
+      expect(result.code).toBe(1);
+      const json = parseAskJson(result.stdout);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.cause).toBe("server");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  test("fx ask --json still waits for its subagent when a retried turn fails for a non-budget reason", async () => {
+    const root = createFixtureRoot("ask-retry-then-non-budget-fail-waits-subagent");
+    const tracePath = join(root.root, "trace.log");
+    let sawParentStartCall = false;
+    let parentFailures = 0;
+    let sawParentReportTurn = false;
+    let releaseChild: () => void = () => {};
+    const childHeld = new Promise<void>((resolve) => { releaseChild = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"') && body.includes("CHILD_AFTER_PARENT_ERROR")) {
+        await childHeld;
+        return fakeGatewayFinalText("CHILD_FINISHES_TASK");
+      }
+      if (body.includes("CHILD_FINISHES_TASK")) {
+        sawParentReportTurn = true;
+        return fakeGatewayFinalText("MAIN_AFTER_CHILD_REPORT");
+      }
+      if (!sawParentStartCall && body.includes('"name":"subagent"') && !hasCurrentToolResult(body, "start_worker")) {
+        sawParentStartCall = true;
+        return fakeGatewayToolCall("start_worker", "subagent", {
+          request: {
+            action: "message",
+            agent: "worker",
+            message: "CHILD_AFTER_PARENT_ERROR",
+          },
+        });
+      }
+      parentFailures += 1;
+      if (parentFailures === 1) return unavailableResponse("0");
+      return new Response(JSON.stringify({ error: { message: "bad request after retry" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const released = (async () => {
+      if (await waitUntil(() => mainTurnsEnded(tracePath) >= 1, 20_000)) releaseChild();
+    })();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Start a subagent, retry once, then fail with 400."],
+        {
+          cwd: root.workspace,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "worker" },
+          timeoutMs: 30_000,
+        },
+      );
+      await released;
+
+      expect(result.timedOut).toBe(false);
+      expect(sawParentReportTurn).toBe(true);
+      const json = parseAskJson(result.stdout);
+      expect(json.final_output).toBe("MAIN_AFTER_CHILD_REPORT");
+    } finally {
+      releaseChild();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test("a retried model request leaves its recovery timeline in the session log", async () => {
     const root = createFixtureRoot("recovery-timeline");
@@ -17580,3 +17874,52 @@ test("a repeated subagent message with the same model and effort is delivered an
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 60_000);
+
+test("fx ask --json reports unsupported tty shell as a failed tool result and continues", async () => {
+  const root = createFixtureRoot("unsupported-shell-tool-result");
+  const tracePath = join(root.root, "trace.log");
+  writeFileSync(
+    join(root.home, ".fx", "settings.json"),
+    JSON.stringify({ permission_mode: "full-access" }),
+  );
+  const responses = [
+    fakeGatewayToolCall("bad_shell_1", "shell", {
+      request: {
+        action: "run",
+        command: "echo hi",
+        tty: true,
+        shell: { kind: "executable", path: "/nonexistent_eb47_shell" },
+      },
+    }),
+    fakeGatewayFinalText("Saw unsupported shell error."),
+  ];
+  const gateway = startGateway(() =>
+    responses.shift() ?? new Response("unexpected request", { status: 500 })
+  );
+  try {
+    const result = await runFx(
+      ["ask", "--json", "Run echo hi with the unsupported shell."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 15_000,
+      },
+    );
+    expect(result.code, `stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
+    const json = parseAskJson(result.stdout);
+    expect(json.exit_code).toBe(0);
+    expect(json.output).toBe("Saw unsupported shell error.");
+    expect(gateway.requestCount()).toBe(2);
+    const toolOutput = toolResultOutput(gateway.requests[1]!.body, "bad_shell_1");
+    expect(toolOutput).toContain("Unsupported shell");
+    expect(toolOutput).toContain("/nonexistent_eb47_shell");
+    expect(toolOutput).toContain("bash");
+    expect(toolOutput).toContain("zsh");
+    expect(json.tool_calls).toContainEqual(
+      expect.objectContaining({ name: "shell", status: "error" }),
+    );
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+});

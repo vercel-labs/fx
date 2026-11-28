@@ -1,7 +1,8 @@
 //! The `/effort` menu in the footer, laid out like the `/model` menu: an
 //! `Effort` title naming the model, then one row per reasoning effort level
-//! with the one in use marked `current`. When the levels do not all fit, the
-//! list scrolls with the highlight.
+//! with the one in use marked `current`. The composer text filters the
+//! levels, and one row says so when none matches. When the levels do not all
+//! fit, the list scrolls with the highlight.
 
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
@@ -17,6 +18,7 @@ const Projection = render_input.EffortMenuProjection;
 const header_rows: u16 = 1;
 const gap_rows: u16 = 1;
 const current_label = "current";
+const no_match_label = "No levels found.";
 pub const max_inline_rows: u16 = header_rows + gap_rows + effort_menu.max_options;
 
 const Layout = struct {
@@ -27,8 +29,9 @@ const Layout = struct {
     /// The title and the gap under it come first; a short footer drops the
     /// gap, then the title, before it drops a level.
     fn build(projection: Projection, row_budget: u16) Layout {
-        const count = projection.levels.len;
-        if (row_budget == 0 or count == 0) return .{};
+        // A query with no match keeps one row to say so.
+        const count = @max(projection.levels.len, 1);
+        if (row_budget == 0) return .{};
         if (row_budget == 1) return .{ .visible_items = 1 };
         const first_item_row: u16 = if (row_budget >= 3) header_rows + gap_rows else header_rows;
         return .{
@@ -72,6 +75,12 @@ pub fn composeEffortMenuRow(
     if (layout.show_header and row_index == 0) return composeHeaderRow(alloc, projection, width);
     if (row_index < layout.first_item_row) return row;
 
+    if (projection.levels.len == 0) {
+        try row.appendSlice(alloc, ui_render.dim_style);
+        try row_text.appendSingleLineEllipsized(alloc, &row, no_match_label, width);
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
+    }
     const index = windowStart(projection, row_budget) + (row_index - layout.first_item_row);
     if (index >= projection.levels.len) return row;
     const selected = index == projection.selected;
@@ -80,7 +89,7 @@ pub fn composeEffortMenuRow(
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
     const label = projection.levels[index].displayLabel();
     const marker_column = indent + labelColumnWidth(projection) + 2;
-    const show_marker = index == projection.current and marker_column + current_label.len <= width;
+    const show_marker = projection.current == index and marker_column + current_label.len <= width;
     try row_text.appendSingleLineEllipsized(alloc, &row, label, @as(usize, width) -| indent);
     try row.appendSlice(alloc, ui_render.reset_style);
     if (show_marker) {
