@@ -487,6 +487,9 @@ fn startV2Session(
     var session_host_owned = true;
     defer if (session_host_owned) if (session_host) |h| h.destroy();
     const workspace_root = if (start.workspace) |binding| binding.root else state.workspace_root;
+    // The new session replaces the active one, so its prompt ends first and
+    // the wait below holds no prompt's `session/cancel` or EOF.
+    server.cancelAndReapActivePrompt(state);
     server.awaitTokenPassForNewSession(state);
     const v2 = session_adapter.Session.create(alloc, v2_store, workspace_root, .acp, .{
         .preferences = .{
@@ -521,7 +524,6 @@ fn startV2Session(
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.childCapability(), v2.id());
-    server.cancelAndReapActivePrompt(state);
     activateSession(state, .{
         .session_id = session_id,
         .v2 = v2,
