@@ -47,11 +47,11 @@ fn parseObject(scratch: std.mem.Allocator, bytes: []const u8) ?std.json.ObjectMa
 
 const status_on =
     \\{"scope":"user","harnesses":[
-    \\{"id":"claude","detected":true,"session_naming":false,"items":[]},
+    \\{"id":"opencode","detected":true,"session_naming":false,"items":[]},
     \\{"id":"pi","detected":false,"session_naming":true,"items":[{"kind":"skill","state":"current"}]}]}
 ;
 const status_off =
-    \\{"scope":"user","harnesses":[{"id":"claude","detected":true,"session_naming":false},{"id":"codex","detected":true}]}
+    \\{"scope":"user","harnesses":[{"id":"opencode","detected":true,"session_naming":false},{"id":"codex","detected":true}]}
 ;
 
 test "the rename option is on when one agent in Rex's status names sessions" {
