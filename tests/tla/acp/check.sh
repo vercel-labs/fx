@@ -73,6 +73,7 @@ MCAcpSharedSession AcpSharedSessionToday-request RequestReachesAll
 MCAcpSharedSession AcpSharedSessionToday-prompts EchoComplete
 MCAcpSharedSession AcpSharedSessionToday-clients RosterCurrent
 MCAcpSharedSession AcpSharedSessionToday-cancel CancelStops
+MCAcpSharedSession AcpSharedSessionToday-stop StopEffect
 EOF
 
 if [ "$ci" = true ]; then

@@ -124,6 +124,12 @@ const MUTANTS: Mutant[] = [
     from: `       THEN /\\ turn' = None`,
     to: `       THEN /\\ turn' = turn`,
     expect: "StopEffect",
+  },  {
+    id: "roster-to-closed-client",
+    note: "fx sends the list of clients to a client that closed the session",
+    from: `RosterOut(c, now) == IF Rules /\\ now[c] THEN`,
+    to: `RosterOut(c, now) == IF Rules THEN`,
+    expect: "ClosedQuiet",
   },
 ];
 

@@ -222,6 +222,10 @@ CancelStops == ~cancelIgnored
 \* A request goes only to clients that have the session open.
 RequestOnlyOpen == \A d \in sentTo : open[d]
 
+\* A client that doesn't have the session open gets nothing more: no prompt,
+\* request, cancellation, or list of clients.
+ClosedQuiet == \A c \in Conns : ~open[c] => chan[c] = <<>>
+
 \* A session/cancel that comes from a client with the session open stops the turn.
 StopEffect == [][ (\E c \in Conns : open[c] /\ turn # None /\ Cancel(c)) => turn' = None ]_vars
 =============================================================================
