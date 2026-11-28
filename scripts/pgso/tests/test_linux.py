@@ -79,7 +79,7 @@ class LinuxPlatformTests(unittest.TestCase):
 
     def test_each_platform_has_its_own_size_ceiling(self) -> None:
         self.assertEqual(7.500, macos.SIZE_CEILING_MIB)
-        self.assertEqual(7.750, linux.ARM64.SIZE_CEILING_MIB)
+        self.assertEqual(8.000, linux.ARM64.SIZE_CEILING_MIB)
         self.assertEqual(10.000, linux.X86_64.SIZE_CEILING_MIB)
 
     def test_each_ceiling_leaves_the_preferred_headroom_over_main_s_measured_candidate(self) -> None:
