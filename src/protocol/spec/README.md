@@ -9,7 +9,7 @@ fx doesn't implement the specification yet. Its ACP server in `src/acp/` still n
 | `sh-fx.md` | The specification: naming rules, capabilities, and the messages and fields of each extension |
 | `sh-fx.schema.json` | The JSON Schema for the types that `sh-fx.md` defines |
 | `acp/v1/` | ACP's version 1 schema and method lists, copied unchanged from ACP's repository, and ACP's license |
-| `schemas.zig` | Tests that every schema file parses, that `acp/v1/` matches the pinned commit, and that `sh-fx.schema.json` uses the JSON Schema draft of ACP's schema |
+| `schemas.zig` | Tests that every schema file parses, that `acp/v1/` matches the pinned commit, that `sh-fx.schema.json` uses the JSON Schema draft of ACP's schema and states the naming rules, and that the names and JSON examples in `sh-fx.md` follow those rules and parse |
 
 `zig build test` runs the tests in `schemas.zig`.
 
