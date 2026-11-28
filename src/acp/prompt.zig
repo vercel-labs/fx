@@ -5726,34 +5726,57 @@ test "a refresh and a tool call share the server's sign-in" {
     var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
 
     const Caller = struct {
-        fn run(context: *AcpContext, a: Allocator, seen: *std.atomic.Value(usize)) void {
-            for (0..100) |_| {
+        const rounds: usize = 100;
+        /// Reads a key on every round and counts it: a call that fails is
+        /// counted too, so a thread that stopped early shows in the round
+        /// count instead of passing unseen.
+        fn run(context: *AcpContext, a: Allocator, calls: *std.atomic.Value(usize), failures: *std.atomic.Value(usize)) void {
+            for (0..rounds) |_| {
                 var arena = std.heap.ArenaAllocator.init(a);
                 defer arena.deinit();
-                const tool_ctx = context.toolContext(arena.allocator()) catch return;
-                _ = seen.fetchAdd(tool_ctx.api_key.len, .monotonic);
+                const tool_ctx = context.toolContext(arena.allocator()) catch {
+                    _ = failures.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                if (tool_ctx.api_key.len == 0) {
+                    _ = failures.fetchAdd(1, .monotonic);
+                    continue;
+                }
+                _ = calls.fetchAdd(1, .monotonic);
             }
         }
     };
     const Adopter = struct {
-        fn run(server_state: *server.ServerState, a: Allocator) void {
-            for (0..100) |_| {
+        const rounds: usize = 100;
+        fn run(server_state: *server.ServerState, a: Allocator, adopted: *std.atomic.Value(usize), failures: *std.atomic.Value(usize)) void {
+            for (0..rounds) |_| {
                 var credential: credentials.Credential = .{
-                    .token = a.dupe(u8, "rotating-token") catch return,
+                    .token = a.dupe(u8, "rotating-token") catch {
+                        _ = failures.fetchAdd(1, .monotonic);
+                        continue;
+                    },
                     .source = .ai_gateway_api_key,
                 };
                 server_state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
                 defer server_state.subagent_authority_mutex.unlock(io_mod.getIo());
                 server.adoptServerCredential(server_state, &credential);
+                _ = adopted.fetchAdd(1, .monotonic);
             }
         }
     };
-    var seen = std.atomic.Value(usize).init(0);
-    const caller = try std.Thread.spawn(.{}, Caller.run, .{ &ctx, alloc, &seen });
-    const adopter = try std.Thread.spawn(.{}, Adopter.run, .{ &state, alloc });
+    var calls = std.atomic.Value(usize).init(0);
+    var adopted = std.atomic.Value(usize).init(0);
+    var failures = std.atomic.Value(usize).init(0);
+    const caller = try std.Thread.spawn(.{}, Caller.run, .{ &ctx, alloc, &calls, &failures });
+    // A failed second spawn must not free the state the caller reads.
+    errdefer caller.join();
+    const adopter = try std.Thread.spawn(.{}, Adopter.run, .{ &state, alloc, &adopted, &failures });
     caller.join();
     adopter.join();
-    try std.testing.expect(seen.load(.monotonic) > 0);
+    // Both threads ran every round without a failure, so neither stopped early.
+    try std.testing.expectEqual(Caller.rounds, calls.load(.monotonic));
+    try std.testing.expectEqual(Adopter.rounds, adopted.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), failures.load(.monotonic));
 }
 
 test "a tool call keeps the sign-in a refresh replaces" {
@@ -6985,7 +7008,9 @@ test "ACP turn sign-in outlives a refreshed credential the server publishes" {
 const SignInRace = struct {
     state: *server.ServerState,
     publishes: u32,
+    rounds: u32,
     publisher_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    published: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     captures: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     torn: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
@@ -7006,12 +7031,20 @@ const SignInRace = struct {
     fn runPublisher(self: *SignInRace) void {
         defer self.publisher_done.store(true, .release);
         var number: u32 = 1;
-        while (number <= self.publishes) : (number += 1) publish(self.state, number) catch return;
+        while (number <= self.publishes) : (number += 1) {
+            publish(self.state, number) catch return;
+            _ = self.published.fetchAdd(1, .monotonic);
+        }
     }
 
+    /// Takes exactly `rounds` captures whatever order the threads run in: it
+    /// waits for the first credential beside a running publisher, and it never
+    /// stops because the publisher finished (RULES.md R7.3: a signal, no sleep).
     fn runCapturer(self: *SignInRace) void {
         const alloc = std.testing.allocator;
-        while (!self.publisher_done.load(.acquire)) {
+        while (self.published.load(.acquire) == 0 and
+            !self.publisher_done.load(.acquire)) std.atomic.spinLoopHint();
+        for (0..self.rounds) |_| {
             var sign_in = TurnSignIn.capture(alloc, self.state, &self.state.active_session.?) catch {
                 _ = self.torn.fetchAdd(1, .monotonic);
                 continue;
@@ -7046,13 +7079,18 @@ test "ACP turn sign-in is one whole credential while a refresh publishes beside 
     defer state.deinit();
     try SignInRace.publish(&state, 0);
 
-    var race: SignInRace = .{ .state = &state, .publishes = 4000 };
+    var race: SignInRace = .{ .state = &state, .publishes = 4000, .rounds = 4000 };
     const publisher = try std.Thread.spawn(.{}, SignInRace.runPublisher, .{&race});
+    // A failed second spawn must not free the state the publisher writes.
+    errdefer publisher.join();
     const capturer = try std.Thread.spawn(.{}, SignInRace.runCapturer, .{&race});
     publisher.join();
     capturer.join();
 
-    try std.testing.expect(race.captures.load(.monotonic) > 0);
+    // Both threads ran every round, so neither finished before it began, and no
+    // capture between two publishes was torn.
+    try std.testing.expectEqual(race.publishes, race.published.load(.monotonic));
+    try std.testing.expectEqual(race.rounds, race.captures.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), race.torn.load(.monotonic));
 }
 
