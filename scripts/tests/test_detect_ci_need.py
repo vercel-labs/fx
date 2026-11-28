@@ -144,6 +144,8 @@ class DetectCiNeedTests(unittest.TestCase):
             "tests/tla/sdk/DurableSession.tla",
             "tests/tla/drivers/drive.mjs",
             "tests/tla/drivers/session-process.mjs",
+            "tests/tla/drivers/sdk/ui-order.ts",
+            "tests/tla/drivers/sdk/recovery-process.mjs",
             "src/napi_core_main.zig",
             "src/napi_fetch_state.zig",
             "src/wasm_core_main.zig",
@@ -275,8 +277,8 @@ class DetectCiNeedTests(unittest.TestCase):
 
     def test_shared_driver_code_needs_each_check_that_loads_it(self) -> None:
         self.commit_each(
-            ("tests/tla/drivers/lib/context.ts",),
-            libfx=False,
+            ("tests/tla/drivers/lib/context.ts", "tests/tla/drivers/lib/tlc.ts"),
+            libfx=True,
             mcp=True,
             transcript_window=True,
             subagent=True,
