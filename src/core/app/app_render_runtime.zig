@@ -837,6 +837,7 @@ pub fn Runtime(comptime App: type) type {
                     .tools = app.mcp.host_menu_tools,
                     .notes = app.mcp.host_menu_notes,
                     .sign_in_url = app.mcp.hostMenuSignInUrl(),
+                    .marker_phase = shimmer_pos,
                 } else .{},
                 .help_menu = render_input.helpMenuProjection(
                     &app.input_runtime.help_menu,
@@ -1518,7 +1519,8 @@ pub fn Runtime(comptime App: type) type {
                     .attempt_invalidations = attempt_invalidations,
                     .pending_tail_rows = if (pending_card) |card| card.row_count else 0,
                 };
-                const fixed_point = try render_engine.frame_fixed_point.solve(
+                const fixed_point = try presentation_shell.solveFrameWithFooterCloseReset(
+                    &app.metrics,
                     FixedPointTranscriptContext(App),
                     &fixed_point_ctx,
                     .{
@@ -1533,6 +1535,8 @@ pub fn Runtime(comptime App: type) type {
                     },
                     FixedPointTranscriptContext(App).prepareCandidate,
                     FixedPointTranscriptContext(App).resolveCandidate,
+                    skillsMenuRefreshPending(app),
+                    &prepared_transcript,
                 );
                 const solved = fixed_point.layout;
                 solved_layout = solved;
@@ -1923,6 +1927,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 presentation_shell.shimmer_active = frame_ctx.activity_result.painted;
                 presentation_shell.shimmer_is_overlay = frame_ctx.activity_result.overlay;
+                presentation_shell.loading_marker_active = footer_frame.composed.loading_marker_visible;
                 if (scroll_plan.remaining_inline_advance_rows > 0) {
                     presentation_shell.markTranscriptDirty();
                 } else if (!render_requests.hasReason(.transcript)) {
@@ -1934,7 +1939,7 @@ pub fn Runtime(comptime App: type) type {
             }
             return .{
                 .shadow_state = result.state(),
-                .animation_visible = frame_ctx.activity_result.painted,
+                .animation_visible = frame_ctx.activity_result.painted or footer_frame.composed.loading_marker_visible,
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
                 // The committed pending UI permits adoption even when its preview
@@ -2141,6 +2146,17 @@ pub fn Runtime(comptime App: type) type {
         fn skillsMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "skills")) return app.skills.menuVisible();
             return false;
+        }
+
+        /// `/skills` and `/skills <name>` open the skills menu when the catalog
+        /// refresh they queued lands, so the frame before that shows the plain composer.
+        fn skillsMenuRefreshPending(app: *const App) bool {
+            if (comptime !@hasField(App, "skills")) return false;
+            const pending = app.skills.pending_refresh_action orelse return false;
+            return switch (pending.action) {
+                .list, .show => true,
+                .notice, .startup_notice => false,
+            };
         }
 
         fn modelMenuActive(app: *const App) bool {

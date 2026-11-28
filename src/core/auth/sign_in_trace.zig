@@ -218,6 +218,45 @@ test "a screen name says which view the prompt is on" {
     try std.testing.expectEqualStrings("main", screenName(&WithoutRole{}));
 }
 
+test "sign-in events from several threads at once are all counted, in order" {
+    reset();
+    defer reset();
+    const writers = 4;
+    const per_writer = 250;
+    const Worker = struct {
+        fn write(index: usize) void {
+            for (0..per_writer) |n| record(.lock_wait, n % 4 == 0, "writer={d} n={d}", .{ index, n });
+        }
+        fn read(done: *std.atomic.Value(bool), ordered: *std.atomic.Value(bool)) void {
+            var events: [ring_capacity]Event = undefined;
+            while (!done.load(.acquire)) {
+                const count = snapshot(&events);
+                if (count < 2) continue;
+                for (1..count) |i| {
+                    if (events[i].sequence <= events[i - 1].sequence) ordered.store(false, .release);
+                }
+            }
+        }
+    };
+    var done: std.atomic.Value(bool) = .init(false);
+    var ordered: std.atomic.Value(bool) = .init(true);
+    const reader = try std.Thread.spawn(.{}, Worker.read, .{ &done, &ordered });
+    var threads: [writers]std.Thread = undefined;
+    for (&threads, 0..) |*thread, index| thread.* = try std.Thread.spawn(.{}, Worker.write, .{index});
+    for (threads) |thread| thread.join();
+    done.store(true, .release);
+    reader.join();
+
+    try std.testing.expect(ordered.load(.acquire));
+    // The ring is the process's own, and a refresh thread that an earlier test
+    // left running can add its events, so the counts are lower bounds.
+    try std.testing.expect(total() >= writers * per_writer);
+    try std.testing.expect(failureCount() >= writers * per_writer / 4);
+    var events: [ring_capacity]Event = undefined;
+    try std.testing.expectEqual(@as(usize, ring_capacity), snapshot(&events));
+    try std.testing.expect(events[ring_capacity - 1].sequence >= writers * per_writer);
+}
+
 test "sign-in events cut a long detail on a character boundary" {
     reset();
     defer reset();

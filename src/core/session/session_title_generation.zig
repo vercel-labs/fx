@@ -430,8 +430,22 @@ pub const Task = struct {
 
     /// Joins like `join`, but cancels the call once `owner_cancel` is set or
     /// `grace_ms` has passed, so a finished or cancelled turn does not wait
-    /// out the title deadline. The session then keeps its derived title.
+    /// out the title deadline. With `grace_ms == 0` (`fx ask`), any call still
+    /// running at exit is cancelled at once with no wait. The session then
+    /// keeps its derived title.
     pub fn joinOrCancel(self: *Task, owner_cancel: *const std.atomic.Value(bool), grace_ms: u32) void {
+        if (grace_ms == 0) {
+            if (!self.isDone()) {
+                const why: []const u8 = if (owner_cancel.load(.seq_cst))
+                    "turn_cancelled"
+                else
+                    "exit_no_wait";
+                debug_trace.logf("session", "event=title_generation_dropped reason={s} session={s}", .{ why, self.session_id });
+                self.cancel();
+            }
+            self.join();
+            return;
+        }
         const zio = io_mod.getIo();
         const grace_end = std.Io.Clock.Timestamp.fromNow(zio, .{ .clock = .awake, .raw = .fromMilliseconds(grace_ms) });
         while (!self.isDone()) {
@@ -962,4 +976,66 @@ test "joinOrCancel keeps a title that answers within the grace" {
     const title = task.takeTitle().?;
     defer std.heap.c_allocator.free(title);
     try std.testing.expectEqualStrings("Fix the renderer", title);
+}
+
+test "joinOrCancel with zero grace drops a pending title without waiting and keeps one already done" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(tmp_root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "session");
+    defer debug_trace.resetForTest();
+
+    const pending = try Task.create(.{
+        .session_id = "session-zero-pending",
+        .model = "test/title",
+        .prompt_excerpt = "fix the renderer",
+        .api_key = "key",
+        .stream_provider = .{ .stream_fn = HeadWaitProvider.stream },
+    });
+    defer pending.destroy();
+    try pending.spawn();
+    var turn_cancel = std.atomic.Value(bool).init(false);
+    const started = io_mod.milliTimestamp();
+    pending.joinOrCancel(&turn_cancel, 0);
+    try std.testing.expect(io_mod.milliTimestamp() - started < 1_000);
+    try std.testing.expectEqual(Task.Status.unavailable, pending.status);
+    try std.testing.expectEqual(FailureReason.cancelled, pending.failure_reason.?);
+
+    const Fast = struct {
+        fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
+            try request.admission.admit();
+            return .{ .completed = .{ .completion = .{
+                .content = "Fast Ready Title",
+                .finish_reason = .stop,
+            }, .ownership = .borrowed } };
+        }
+    };
+    const ready = try Task.create(.{
+        .session_id = "session-zero-ready",
+        .model = "test/title",
+        .prompt_excerpt = "fix the renderer",
+        .api_key = "key",
+        .stream_provider = .{ .stream_fn = Fast.stream },
+    });
+    defer ready.destroy();
+    try ready.spawn();
+    ready.join();
+    ready.joinOrCancel(&turn_cancel, 0);
+    try std.testing.expectEqual(Task.Status.generated, ready.status);
+    const title = ready.takeTitle().?;
+    defer std.heap.c_allocator.free(title);
+    try std.testing.expectEqualStrings("Fast Ready Title", title);
+
+    debug_trace.resetForTest();
+    var trace_file = try tmp.dir.openFile(io_mod.getIo(), "trace.log", .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=title_generation_dropped reason=exit_no_wait session=session-zero-pending") != null);
 }
