@@ -113,11 +113,11 @@ fn connectWith(
     const socket = connectOpened(start, io, fd, address) catch |err| {
         // The line comes before the close: a closed descriptor's number can go to
         // another thread's connect, whose lines would then mix with these.
-        traceConnect(io, fd, "done", resultName(err));
+        traceConnect(fd, "done", resultName(err));
         Threaded.closeFd(fd);
         return err;
     };
-    traceConnect(io, fd, "done", "ok");
+    traceConnect(fd, "done", "ok");
     return socket;
 }
 
@@ -133,12 +133,12 @@ fn connectOpened(
     const length = Threaded.addressToPosix(address, &storage);
     // One `start` line for each call of the kernel's connect, so a second call on a socket
     // shows as a second line before its `done`, and everything that can fail after it ends in a `done`.
-    traceConnect(io, fd, "start", null);
+    traceConnect(fd, "start", null);
     switch (start(fd, &storage.any, length)) {
         .SUCCESS => {},
         // Interrupted or not, the connection goes on in the kernel.
         .INTR => {
-            traceConnect(io, fd, "intr", null);
+            traceConnect(fd, "intr", null);
             try awaitConnected(io, fd);
         },
         .INPROGRESS => try awaitConnected(io, fd),
@@ -151,14 +151,7 @@ fn connectOpened(
 /// One FX_TRACE line per event under the scope `net`: the descriptor and the
 /// outcome, never an address. tests/tla/drivers/mcp_host/connect.test.ts reads
 /// them and has TLC check each socket against tests/tla/mcp_host/Connect.tla.
-///
-/// `debug_trace` writes its file with an Io call that is a cancelation point,
-/// and drops the line when that call ends `error.Canceled`. That would take the
-/// cancel that this connect is waiting for, so the write runs with cancelation
-/// blocked and the cancel stays for the next `io.checkCancel`.
-fn traceConnect(io: std.Io, fd: posix.fd_t, comptime event: []const u8, result: ?[]const u8) void {
-    const before = io.swapCancelProtection(.blocked);
-    defer _ = io.swapCancelProtection(before);
+fn traceConnect(fd: posix.fd_t, comptime event: []const u8, result: ?[]const u8) void {
     if (result) |name| {
         debug_trace.logf("net", "connect fd={d} event=" ++ event ++ " result={s}", .{ fd, name });
     } else {
@@ -180,7 +173,7 @@ fn awaitConnected(io: std.Io, fd: posix.fd_t) net.IpAddress.ConnectError!void {
         const ready = posix.system.poll(&fds, fds.len, cancel_check_ms);
         switch (posix.errno(ready)) {
             .SUCCESS => if (ready > 0) return socketError(fd),
-            .INTR => traceConnect(io, fd, "intr", null),
+            .INTR => traceConnect(fd, "intr", null),
             .AGAIN, .NOMEM => return error.SystemResources,
             else => |err| return unexpected(err),
         }
@@ -660,7 +653,7 @@ fn traceWhileCancelRequested(io: std.Io) error{Canceled}!void {
     gate_ready.store(true, .release);
     // A failed yield only makes this spin tighter; the loop still ends when the gate opens.
     while (!gate_open.load(.acquire)) std.Thread.yield() catch {};
-    traceConnect(io, 3, "start", null);
+    traceConnect(3, "start", null);
     try io.checkCancel();
 }
 
