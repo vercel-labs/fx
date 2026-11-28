@@ -440,6 +440,7 @@ const PendingToolProgress = struct {
     tool_name: []u8,
     text: ?[]u8 = null,
     visible: bool = false,
+    stream_started: bool = false,
 
     fn deinit(self: PendingToolProgress, alloc: Allocator) void {
         alloc.free(self.call_id);
@@ -2211,6 +2212,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
     worker_events_drained = true;
     if (ctx.presenter) |value| try value.finish();
+    if (ctx.output_mode.streamsEvents() and !ctx.processInterruptRequested()) {
+        try flushUnclosedStreamToolEnds(&ctx, .failed, null);
+    }
 
     return takePromptRunResult(&ctx, alloc);
 }
@@ -2245,27 +2249,22 @@ fn runAskTurn(
     ctx.takeTurnUsage();
     processed catch |err| switch (err) {
         error.NonInteractivePermissionRequired => {
-            const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
-            errdefer alloc.free(assistant_output);
-            const subagents = try takeSubagentUsage(ctx, alloc);
-            errdefer subagent_usage.freeEntries(alloc, subagents);
-            const tool_calls = try takeToolCallRecords(ctx, alloc);
-            return .{
-                .exit_code = 1,
-                .assistant_output = assistant_output,
-                .interrupted = ctx.processInterruptRequested(),
-                .tool_calls = tool_calls,
-                .error_code = "NonInteractivePermissionRequired",
-                .usage = ctx.usage_total,
-                .subagents = subagents,
-            };
+            try flushUnclosedStreamToolEnds(ctx, .denied, "NonInteractivePermissionRequired");
+            var result = try takePromptRunResult(ctx, alloc);
+            result.exit_code = 1;
+            result.error_code = "NonInteractivePermissionRequired";
+            return result;
         },
         else => {
             if (err == error.TerminalHungUp or
                 err == error.TerminalInputClosed or
-                err == error.OutputReaderGone)
+                err == error.OutputReaderGone or
+                err == error.OutputWriteFailed)
             {
                 return err;
+            }
+            if (ctx.output_mode.streamsEvents() and !ctx.processInterruptRequested()) {
+                try flushUnclosedStreamToolEnds(ctx, .failed, @errorName(err));
             }
             if (!options.output_mode.capturesJson()) return err;
             var failed_result = try takePromptRunResult(ctx, alloc);
@@ -3692,7 +3691,12 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
         .progress => |progress| if (!ctx.output_mode.isTerminal()) {
             try publishPendingToolProgress(ctx, progress.id.call_id, progress.text);
         },
-        .turn_finished => if (!ctx.output_mode.isTerminal()) clearPendingToolProgress(ctx),
+        .turn_finished => {
+            if (ctx.output_mode.streamsEvents() and !ctx.processInterruptRequested()) {
+                try flushUnclosedStreamToolEnds(ctx, .cancelled, null);
+            }
+            if (!ctx.output_mode.isTerminal()) clearPendingToolProgress(ctx);
+        },
         .terminal => |value| {
             if (ctx.output_mode.streamsEvents()) {
                 try emitToolEndStreamEvent(ctx, value);
@@ -3708,20 +3712,105 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
     }
 }
 
+fn startsWithWorkspaceBoundary(path: []const u8, workspace_root_input: []const u8) bool {
+    var root_end = workspace_root_input.len;
+    while (root_end > 1 and workspace_root_input[root_end - 1] == '/') {
+        root_end -= 1;
+    }
+    const root = workspace_root_input[0..root_end];
+    if (root.len <= 1 or root[0] != '/') return false;
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    return path.len == root.len or path[root.len] == '/';
+}
+
+fn resolvePathOrParent(alloc: Allocator, path: []const u8) Allocator.Error!?[]u8 {
+    if (io_mod.realpathAlloc(alloc, path)) |resolved| {
+        return resolved;
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Unresolvable targets stay unchanged at their original path.
+        else => {},
+    }
+    const dir = std.Io.Dir.path.dirname(path) orelse return null;
+    const base = std.Io.Dir.path.basename(path);
+    if (base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) return null;
+    const resolved_parent = io_mod.realpathAlloc(alloc, dir) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Unresolvable parent folders keep the original model path.
+        else => return null,
+    };
+    return try std.Io.Dir.path.join(alloc, &.{ resolved_parent, base });
+}
+
+fn resolveStreamTargetInWorkspace(
+    alloc: Allocator,
+    tool_registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    call: ToolCall,
+    display_target: ?[]const u8,
+) Allocator.Error!?[]u8 {
+    const shown = (try toolbox.shownBuiltinRun(alloc, tool_registry, call)) orelse call;
+    const spec = tool_registry.lookup(shown.name) orelse return null;
+    if (spec.executor_kind == .web_search or spec.executor_kind == .subagent or spec.executor_kind == .run_command) return null;
+    const args = tool_args.parseToolArgsObject(alloc, shown.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
+    if (presentation.label_arg_kind != .path) return null;
+    const raw_target = display_target orelse
+        shown.resolved_display_target orelse
+        tool_dispatch.presentationLabelValue(presentation, args) orelse
+        return null;
+    if (raw_target.len <= 1 or raw_target[0] != '/') return null;
+    if (startsWithWorkspaceBoundary(raw_target, workspace_root)) return null;
+    const resolved = (try resolvePathOrParent(alloc, raw_target)) orelse return null;
+    if (!startsWithWorkspaceBoundary(resolved, workspace_root)) return null;
+    return resolved;
+}
+
+fn formatStreamStartTarget(
+    alloc: Allocator,
+    tool_registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    call: ToolCall,
+    display_target: ?[]const u8,
+) ![]const u8 {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const resolved = try resolveStreamTargetInWorkspace(
+        scratch_state.allocator(),
+        tool_registry,
+        workspace_root,
+        call,
+        display_target,
+    );
+    var resolved_call = call;
+    if (resolved) |path| resolved_call.resolved_display_target = path;
+    return tool_presentation.formatShortSafeTarget(alloc, .{
+        .tool_registry = tool_registry,
+        .call = resolved_call,
+        .workspace_root = workspace_root,
+        .display_target = resolved orelse display_target,
+    });
+}
+
 fn emitToolStartStreamEvent(ctx: *AskContext, started: anytype) !void {
+    if (!try markPendingToolStreamStarted(ctx, started.id.call_id)) return;
     var target_arena = std.heap.ArenaAllocator.init(ctx.alloc);
     defer target_arena.deinit();
-    const target = try tool_presentation.formatShortSafeTarget(target_arena.allocator(), .{
-        .tool_registry = ctx.toolRegistry(),
-        .call = .{
+    const target = try formatStreamStartTarget(
+        target_arena.allocator(),
+        ctx.toolRegistry(),
+        ctx.workspace_root,
+        .{
             .id = started.id.call_id,
             .name = started.tool_name,
             .arguments_json = started.arguments_json orelse "{}",
             .resolved_display_target = started.resolved_display_target,
         },
-        .workspace_root = ctx.workspace_root,
-        .display_target = started.resolved_display_target,
-    });
+        started.resolved_display_target,
+    );
     const line = try renderToolStartEventJson(
         ctx.alloc,
         started.id.call_id,
@@ -3733,33 +3822,113 @@ fn emitToolStartStreamEvent(ctx: *AskContext, started: anytype) !void {
 }
 
 fn emitToolEndStreamEvent(ctx: *AskContext, value: anytype) !void {
-    const tool_name = try pendingToolNameDup(ctx, value.id.call_id);
-    defer if (tool_name) |name| ctx.alloc.free(name);
+    const claimed = try claimPendingToolStreamEnd(ctx, value.id.call_id);
+    defer if (claimed.tool_name) |name| ctx.alloc.free(name);
+    const tool_name = claimed.tool_name orelse "";
     const err_text: ?[]const u8 = if (value.outcome.kind != .completed and value.outcome.summary.len > 0)
         value.outcome.summary
     else
         null;
-    const line = try renderToolEndEventJson(
+    const end_line = try renderToolEndEventJson(
         ctx.alloc,
         value.id.call_id,
-        tool_name orelse "",
+        tool_name,
         @tagName(value.outcome.kind),
         err_text,
     );
-    defer ctx.alloc.free(line);
-    try ctx.emitStreamEventLine(line);
+    defer ctx.alloc.free(end_line);
+    if (claimed.needs_start) {
+        const start_line = try renderToolStartEventJson(
+            ctx.alloc,
+            value.id.call_id,
+            tool_name,
+            "",
+        );
+        defer ctx.alloc.free(start_line);
+        const combined = try ctx.alloc.print("{s}{s}", .{ start_line, end_line });
+        defer ctx.alloc.free(combined);
+        try ctx.emitStreamEventLine(combined);
+        return;
+    }
+    try ctx.emitStreamEventLine(end_line);
 }
 
-fn pendingToolNameDup(ctx: *AskContext, call_id: []const u8) !?[]u8 {
+fn markPendingToolStreamStarted(ctx: *AskContext, call_id: []const u8) !bool {
     ctx.pending_tool_progress_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.pending_tool_progress_mutex.unlock(io_mod.getIo());
-    const pending = findPendingToolProgressLocked(ctx, call_id) orelse return null;
-    return try ctx.alloc.dupe(u8, pending.tool_name);
+    const pending = findPendingToolProgressLocked(ctx, call_id) orelse return true;
+    if (pending.stream_started) return false;
+    pending.stream_started = true;
+    return true;
+}
+
+const ClaimedToolStreamEnd = struct {
+    tool_name: ?[]u8,
+    needs_start: bool,
+};
+
+fn claimPendingToolStreamEnd(ctx: *AskContext, call_id: []const u8) !ClaimedToolStreamEnd {
+    ctx.pending_tool_progress_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.pending_tool_progress_mutex.unlock(io_mod.getIo());
+    const pending = findPendingToolProgressLocked(ctx, call_id) orelse return .{
+        .tool_name = null,
+        .needs_start = true,
+    };
+    const needs_start = !pending.stream_started;
+    pending.stream_started = true;
+    return .{
+        .tool_name = try ctx.alloc.dupe(u8, pending.tool_name),
+        .needs_start = needs_start,
+    };
+}
+
+fn flushUnclosedStreamToolEnds(
+    ctx: *AskContext,
+    outcome_kind: types.ToolOutcomeKind,
+    err_text: ?[]const u8,
+) !void {
+    if (!ctx.output_mode.streamsEvents()) return;
+    var open_calls: std.ArrayList(PendingToolProgress) = .empty;
+    defer {
+        for (open_calls.items) |entry| entry.deinit(ctx.alloc);
+        open_calls.deinit(ctx.alloc);
+    }
+    {
+        ctx.pending_tool_progress_mutex.lockUncancelable(io_mod.getIo());
+        defer ctx.pending_tool_progress_mutex.unlock(io_mod.getIo());
+        var idx: usize = 0;
+        while (idx < ctx.pending_tool_progress.items.len) {
+            if (!ctx.pending_tool_progress.items[idx].stream_started) {
+                idx += 1;
+                continue;
+            }
+            const removed = ctx.pending_tool_progress.swapRemove(idx);
+            open_calls.append(ctx.alloc, removed) catch |err| {
+                removed.deinit(ctx.alloc);
+                return err;
+            };
+        }
+    }
+    for (open_calls.items) |entry| {
+        const line = try renderToolEndEventJson(
+            ctx.alloc,
+            entry.call_id,
+            entry.tool_name,
+            @tagName(outcome_kind),
+            err_text,
+        );
+        defer ctx.alloc.free(line);
+        try ctx.emitStreamEventLine(line);
+    }
 }
 
 fn beginPendingToolProgress(ctx: *AskContext, call_id: []const u8, tool_name: []const u8) !void {
     ctx.pending_tool_progress_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.pending_tool_progress_mutex.unlock(io_mod.getIo());
+    const already_started = if (findPendingToolProgressLocked(ctx, call_id)) |existing|
+        existing.stream_started
+    else
+        false;
     discardPendingToolProgressLocked(ctx, call_id);
 
     const owned_id = try ctx.alloc.dupe(u8, call_id);
@@ -3769,6 +3938,7 @@ fn beginPendingToolProgress(ctx: *AskContext, call_id: []const u8, tool_name: []
     try ctx.pending_tool_progress.append(ctx.alloc, .{
         .call_id = owned_id,
         .tool_name = owned_name,
+        .stream_started = already_started,
     });
 }
 
@@ -3935,7 +4105,7 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
         .unsafe_assistant_output,
         .unsafe_tool_start,
         .content_filter,
-        => ctx.output_mode != .json and ctx.output_mode != .quiet,
+        => !ctx.output_mode.capturesJson() and ctx.output_mode != .quiet,
     };
     if (!notice) return;
     var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
@@ -4461,12 +4631,18 @@ const ParseErrorMode = enum { text, json, stream_events };
 
 fn parseErrorModeFromArgs(args: []const [:0]const u8) ParseErrorMode {
     var mode: ParseErrorMode = .text;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--")) break;
-        if (std.mem.eql(u8, arg, "--json")) {
-            mode = .json;
-        } else if (std.mem.eql(u8, arg, "--stream-events")) {
-            mode = .stream_events;
+    var parser = cli_flags.Parser.init(&builtin_commands.ask_options, args);
+    while (true) {
+        const item = (parser.next() catch continue) orelse break;
+        const match = switch (item) {
+            .positional => continue,
+            .option => |option| option,
+        };
+        const id = ask_flag_ids[match.index] orelse continue;
+        switch (id) {
+            .json => mode = .json,
+            .stream_events => mode = .stream_events,
+            else => {},
         }
     }
     return mode;
@@ -10711,4 +10887,277 @@ test "stream-events error exits emit result line on stdout with stderr diagnosti
         try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"turn_start\"") != null);
         try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"result\"") == null);
     }
+}
+
+test "parseErrorModeFromArgs skips values of value-taking flags via cli_flags" {
+    try std.testing.expectEqual(ParseErrorMode.text, parseErrorModeFromArgs(&.{ "--system", "--stream-events" }));
+    try std.testing.expectEqual(ParseErrorMode.text, parseErrorModeFromArgs(&.{ "--model", "--json" }));
+    try std.testing.expectEqual(ParseErrorMode.stream_events, parseErrorModeFromArgs(&.{ "--system", "be brief", "--stream-events" }));
+    try std.testing.expectEqual(ParseErrorMode.json, parseErrorModeFromArgs(&.{ "--system", "--stream-events", "--json" }));
+    try std.testing.expectEqual(ParseErrorMode.stream_events, parseErrorModeFromArgs(&.{ "--unknown-flag", "--stream-events" }));
+    try std.testing.expectEqual(ParseErrorMode.stream_events, parseErrorModeFromArgs(&.{ "--stream-events", "--", "--json" }));
+}
+
+test "pushToolLifecycle emits tool_start before tool_end when a provisional call fails without authoritative_started" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+
+    var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
+    defer ctx.deinit();
+    ctx.output_mode = .stream_events;
+
+    try pushToolLifecycle(&ctx, .{ .provisional = .{ .id = .{ .turn_id = 1, .call_id = "call_bad" }, .tool_name = "read_file", .activity_kind = .open } });
+    try pushToolLifecycle(&ctx, .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "call_bad" },
+        .outcome = .{ .kind = .failed, .summary = "malformed tool arguments" },
+    } });
+
+    const out = std.mem.trimEnd(u8, stdout_capture.bytes.items, "\n");
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    const first = lines.next() orelse return error.TestExpectedEqual;
+    const second = lines.next() orelse return error.TestExpectedEqual;
+    try std.testing.expect(lines.next() == null);
+
+    var p1 = try std.json.parseFromSlice(std.json.Value, alloc, first, .{});
+    defer p1.deinit();
+    try std.testing.expectEqualStrings("tool_start", p1.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("call_bad", p1.value.object.get("call_id").?.string);
+    try std.testing.expectEqualStrings("read_file", p1.value.object.get("name").?.string);
+    try std.testing.expectEqualStrings("", p1.value.object.get("target").?.string);
+
+    var p2 = try std.json.parseFromSlice(std.json.Value, alloc, second, .{});
+    defer p2.deinit();
+    try std.testing.expectEqualStrings("tool_end", p2.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("call_bad", p2.value.object.get("call_id").?.string);
+    try std.testing.expectEqualStrings("failed", p2.value.object.get("status").?.string);
+}
+
+fn testProcessQueuedPromptPermissionDenied(
+    agent: *agent_runtime.Agent,
+    deps: *const agent_runtime.AgentRuntimeDeps,
+    _: ?agent_runtime.SemanticPresentationSink,
+    _: agent_runtime.LifecycleContext,
+    _: agent_runtime.Config,
+    _: worker_runtime.QueuedPrompt,
+) !void {
+    agent.startTurn();
+    agent.observeUsage(.{ .input_tokens = 11, .output_tokens = 2 });
+    const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
+    try ctx.tool_call_records.append(ctx.alloc, .{
+        .name = try ctx.alloc.dupe(u8, "write_file"),
+        .status = try ctx.alloc.dupe(u8, "error"),
+    });
+    try pushToolLifecycle(deps.ctx, .{ .authoritative_started = .{
+        .id = .{ .turn_id = 1, .call_id = "call_perm_1" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "write_file",
+        .activity_kind = .write,
+        .arguments_json = "{\"path\":\"out.txt\",\"content\":\"hi\"}",
+    } });
+    return error.NonInteractivePermissionRequired;
+}
+
+test "NonInteractivePermissionRequired closes started stream tools and fills model, session_id, and steps" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+
+    const deps = testPromptRunDepsWithProcess(&stdout_capture, &stderr_capture, testProcessQueuedPromptPermissionDenied);
+    const exit_code = try runWithDeps(alloc, &.{ "--stream-events", "--no-save", "hello" }, testConfig(), deps);
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+
+    const out = std.mem.trimEnd(u8, stdout_capture.bytes.items, "\n");
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    const l1 = lines.next() orelse return error.TestExpectedEqual;
+    const l2 = lines.next() orelse return error.TestExpectedEqual;
+    const l3 = lines.next() orelse return error.TestExpectedEqual;
+    const l4 = lines.next() orelse return error.TestExpectedEqual;
+    try std.testing.expect(lines.next() == null);
+
+    var p1 = try std.json.parseFromSlice(std.json.Value, alloc, l1, .{});
+    defer p1.deinit();
+    try std.testing.expectEqualStrings("turn_start", p1.value.object.get("type").?.string);
+    const turn_model = p1.value.object.get("model").?.string;
+    try std.testing.expect(turn_model.len > 0);
+
+    var p2 = try std.json.parseFromSlice(std.json.Value, alloc, l2, .{});
+    defer p2.deinit();
+    try std.testing.expectEqualStrings("tool_start", p2.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("call_perm_1", p2.value.object.get("call_id").?.string);
+
+    var p3 = try std.json.parseFromSlice(std.json.Value, alloc, l3, .{});
+    defer p3.deinit();
+    try std.testing.expectEqualStrings("tool_end", p3.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("call_perm_1", p3.value.object.get("call_id").?.string);
+    try std.testing.expectEqualStrings("denied", p3.value.object.get("status").?.string);
+
+    var p4 = try std.json.parseFromSlice(std.json.Value, alloc, l4, .{});
+    defer p4.deinit();
+    try std.testing.expectEqualStrings("result", p4.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings(turn_model, p4.value.object.get("model").?.string);
+    try std.testing.expectEqual(@as(i64, 1), p4.value.object.get("steps").?.integer);
+    try std.testing.expectEqualStrings("NonInteractivePermissionRequired", p4.value.object.get("error").?.string);
+}
+
+test "pushRouteRecoveryStatus suppresses content_filter and safety notices in stream_events like json" {
+    const alloc = std.testing.allocator;
+    for ([_]OutputMode{ .json, .stream_events }) |mode| {
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+
+        var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
+        defer ctx.deinit();
+        ctx.output_mode = mode;
+
+        try pushRouteRecoveryStatus(&ctx, .{ .kind = .content_filter, .attempt = 1 });
+        try pushRouteRecoveryStatus(&ctx, .{ .kind = .unsafe_assistant_output, .attempt = 1 });
+        try pushRouteRecoveryStatus(&ctx, .{ .kind = .unsafe_tool_start, .attempt = 1 });
+        try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+    }
+}
+
+fn testProcessQueuedPromptMidTurnWriteFail(
+    agent: *agent_runtime.Agent,
+    deps: *const agent_runtime.AgentRuntimeDeps,
+    _: ?agent_runtime.SemanticPresentationSink,
+    _: agent_runtime.LifecycleContext,
+    _: agent_runtime.Config,
+    _: worker_runtime.QueuedPrompt,
+) !void {
+    agent.startTurn();
+    try pushToolLifecycle(deps.ctx, .{ .authoritative_started = .{
+        .id = .{ .turn_id = 1, .call_id = "call_write_fail_1" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .open,
+        .arguments_json = "{\"path\":\"q.txt\"}",
+    } });
+    return error.OutputWriteFailed;
+}
+
+test "runWithDeps stops on OutputWriteFailed without a second write try in flushUnclosedStreamToolEnds" {
+    const alloc = std.testing.allocator;
+    const WriteCountFail = struct {
+        writes: usize = 0,
+
+        fn write(ctx: ?*anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.writes += 1;
+            if (self.writes >= 2) return error.OutputWriteFailed;
+        }
+    };
+
+    var dummy_stdout: TestCapture = .{};
+    defer dummy_stdout.deinit(alloc);
+    var writer: WriteCountFail = .{};
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+
+    var deps = testPromptRunDepsWithProcess(&dummy_stdout, &stderr_capture, testProcessQueuedPromptMidTurnWriteFail);
+    deps.stdout_ctx = &writer;
+    deps.write_stdout = WriteCountFail.write;
+
+    try std.testing.expectError(
+        error.OutputWriteFailed,
+        runWithDeps(alloc, &.{ "--stream-events", "--no-save", "hello" }, testConfig(), deps),
+    );
+    try std.testing.expectEqual(@as(usize, 2), writer.writes);
+}
+
+test "formatStreamStartTarget resolves symlinked workspace paths and keeps outside or unresolvable paths full" {
+    const alloc = std.testing.allocator;
+    const registry = builtin_tools.advertisement_set.registry;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "real/sub");
+    try tmp.dir.createDirPath(io_mod.getIo(), "outside");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "real/sub/a.txt", .{});
+        file.close(io_mod.getIo());
+    }
+    {
+        var outside = try tmp.dir.createFile(io_mod.getIo(), "outside/ext.txt", .{});
+        outside.close(io_mod.getIo());
+    }
+    try tmp.dir.symLink(io_mod.getIo(), "real", "link", .{ .is_directory = true });
+
+    const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(tmp_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "real");
+    defer alloc.free(workspace_root);
+    const link_root = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "link" });
+    defer alloc.free(link_root);
+
+    const existing_path = try std.Io.Dir.path.join(alloc, &.{ link_root, "sub", "a.txt" });
+    defer alloc.free(existing_path);
+    const existing_args = try std.json.Stringify.valueAlloc(alloc, .{ .path = existing_path }, .{});
+    defer alloc.free(existing_args);
+    const existing_target = try formatStreamStartTarget(alloc, registry, workspace_root, .{
+        .id = "r1",
+        .name = "read_file",
+        .arguments_json = existing_args,
+    }, null);
+    defer alloc.free(existing_target);
+    try std.testing.expectEqualStrings("sub/a.txt", existing_target);
+
+    const new_path = try std.Io.Dir.path.join(alloc, &.{ link_root, "new.txt" });
+    defer alloc.free(new_path);
+    const new_args = try std.json.Stringify.valueAlloc(alloc, .{ .path = new_path, .content = "hi" }, .{});
+    defer alloc.free(new_args);
+    const new_target = try formatStreamStartTarget(alloc, registry, workspace_root, .{
+        .id = "w1",
+        .name = "write_file",
+        .arguments_json = new_args,
+    }, null);
+    defer alloc.free(new_target);
+    try std.testing.expectEqualStrings("new.txt", new_target);
+
+    const outside_path = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "outside", "ext.txt" });
+    defer alloc.free(outside_path);
+    const outside_args = try std.json.Stringify.valueAlloc(alloc, .{ .path = outside_path }, .{});
+    defer alloc.free(outside_args);
+    const expected_outside = try tool_presentation.formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{
+            .id = "r2",
+            .name = "read_file",
+            .arguments_json = outside_args,
+        },
+        .workspace_root = workspace_root,
+    });
+    defer alloc.free(expected_outside);
+    const outside_target = try formatStreamStartTarget(alloc, registry, workspace_root, .{
+        .id = "r2",
+        .name = "read_file",
+        .arguments_json = outside_args,
+    }, null);
+    defer alloc.free(outside_target);
+    try std.testing.expectEqualStrings(expected_outside, outside_target);
+
+    const short_outside_target = try formatStreamStartTarget(alloc, registry, workspace_root, .{
+        .id = "r3",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"/etc/hosts\"}",
+    }, null);
+    defer alloc.free(short_outside_target);
+    try std.testing.expectEqualStrings("/etc/hosts", short_outside_target);
+
+    const unresolvable_path = "/nonexistent-fx-stream-test-dir/missing/new.txt";
+    const unresolvable_args = try std.json.Stringify.valueAlloc(alloc, .{ .path = unresolvable_path }, .{});
+    defer alloc.free(unresolvable_args);
+    const unresolvable_target = try formatStreamStartTarget(alloc, registry, workspace_root, .{
+        .id = "w2",
+        .name = "write_file",
+        .arguments_json = unresolvable_args,
+    }, null);
+    defer alloc.free(unresolvable_target);
+    try std.testing.expectEqualStrings(unresolvable_path, unresolvable_target);
 }

@@ -1274,12 +1274,27 @@ pub fn formatShortSafeTarget(alloc: Allocator, input: ToolActionInput) ![]const 
         call.resolved_display_target orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         "";
+    const abbreviated = abbreviateWorkspacePath(input.workspace_root, value);
     const encoded = try text_utils.encodeTerminalSafe(
         alloc,
-        value,
+        abbreviated,
         max_run_command_activity_bytes,
     );
     return encoded.bytes;
+}
+
+fn abbreviateWorkspacePath(workspace_root_input: []const u8, value: []const u8) []const u8 {
+    var workspace_root_end = workspace_root_input.len;
+    while (workspace_root_end > 1 and workspace_root_input[workspace_root_end - 1] == '/') {
+        workspace_root_end -= 1;
+    }
+    const workspace_root = workspace_root_input[0..workspace_root_end];
+    if (workspace_root.len <= 1 or workspace_root[0] != '/') return value;
+    if (!std.mem.startsWith(u8, value, workspace_root)) return value;
+    if (value.len == workspace_root.len) return ".";
+    if (value[workspace_root.len] != '/') return value;
+    const rel = std.mem.trimStart(u8, value[workspace_root.len..], "/");
+    return if (rel.len > 0) rel else ".";
 }
 
 /// Names an earlier call in the row of a later call that reads its saved
@@ -2201,4 +2216,100 @@ test "saved output sources name commands, paths, URLs, and MCP tools" {
             try std.testing.expect(label == null);
         }
     }
+}
+
+test "formatShortSafeTarget abbreviates workspace paths for file tools and keeps outside paths" {
+    const alloc = std.testing.allocator;
+    const registry = test_builtin_tools.advertisement_set.registry;
+
+    const read_inside = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{ .id = "r1", .name = "read_file", .arguments_json = "{\"path\":\"/tmp/ws/sub/a.txt\"}" },
+        .workspace_root = "/tmp/ws",
+    });
+    defer alloc.free(read_inside);
+    try std.testing.expectEqualStrings("sub/a.txt", read_inside);
+
+    const write_inside = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{ .id = "w1", .name = "write_file", .arguments_json = "{\"path\":\"/tmp/ws/b.txt\",\"content\":\"hi\"}" },
+        .workspace_root = "/tmp/ws/",
+    });
+    defer alloc.free(write_inside);
+    try std.testing.expectEqualStrings("b.txt", write_inside);
+
+    const read_root = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{ .id = "g1", .name = "read_file", .arguments_json = "{\"path\":\"/tmp/ws\"}" },
+        .workspace_root = "/tmp/ws",
+    });
+    defer alloc.free(read_root);
+    try std.testing.expectEqualStrings(".", read_root);
+
+    const sibling = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{ .id = "r2", .name = "read_file", .arguments_json = "{\"path\":\"/tmp/ws-other/c.txt\"}" },
+        .workspace_root = "/tmp/ws",
+    });
+    defer alloc.free(sibling);
+    try std.testing.expectEqualStrings("/tmp/ws-other/c.txt", sibling);
+
+    const outside = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{ .id = "r3", .name = "read_file", .arguments_json = "{\"path\":\"/etc/hosts\"}" },
+        .workspace_root = "/tmp/ws",
+    });
+    defer alloc.free(outside);
+    try std.testing.expectEqualStrings("/etc/hosts", outside);
+
+    const safe_read = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{ .id = "r4", .name = "read_file", .arguments_json = "{\"path\":\"/tmp/ws/dir/\\u001b[2Jfile.txt\"}" },
+        .workspace_root = "/tmp/ws",
+    });
+    defer alloc.free(safe_read);
+    try std.testing.expectEqualStrings("dir/\\x1b[2Jfile.txt", safe_read);
+    try std.testing.expect(safe_read.len <= max_run_command_activity_bytes);
+}
+
+test "formatShortSafeTarget pins long UTF-8 clipping, web_search, and subagent targets" {
+    const alloc = std.testing.allocator;
+    const registry = test_builtin_tools.advertisement_set.registry;
+
+    // Place a 3-byte UTF-8 character across byte 117 (120 - "..." = 117) so
+    // clipping must fall back before that codepoint rather than splitting it.
+    const prefix: [115]u8 = @splat('a');
+    const long_path = prefix ++ "\u{2603}tail.txt".*;
+    const long_args = try alloc.print("{{\"path\":\"{s}\"}}", .{&long_path});
+    defer alloc.free(long_args);
+    const clipped = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{ .id = "long1", .name = "read_file", .arguments_json = long_args },
+        .workspace_root = "/tmp/ws",
+    });
+    defer alloc.free(clipped);
+    try std.testing.expect(clipped.len <= max_run_command_activity_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(clipped));
+    try std.testing.expect(std.mem.endsWith(u8, clipped, "..."));
+    try std.testing.expectEqualStrings(&(prefix ++ "...".*), clipped);
+
+    const search_target = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{ .id = "ws1", .name = "web_search", .arguments_json = "{\"query\":\"zig 0.17 release notes\"}" },
+        .workspace_root = "/tmp/ws",
+    });
+    defer alloc.free(search_target);
+    try std.testing.expectEqualStrings("zig 0.17 release notes", search_target);
+
+    const subagent_target = try formatShortSafeTarget(alloc, .{
+        .tool_registry = registry,
+        .call = .{
+            .id = "sa1",
+            .name = "subagent",
+            .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"helper\",\"message\":\"check tests\"}}",
+        },
+        .workspace_root = "/tmp/ws",
+    });
+    defer alloc.free(subagent_target);
+    try std.testing.expectEqualStrings("· check tests", subagent_target);
 }
