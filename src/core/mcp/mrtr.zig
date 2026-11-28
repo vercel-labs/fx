@@ -181,7 +181,7 @@ fn scanRequestBounds(alloc: Allocator, text: []const u8, limits: Limits) Error!b
                 try frames.append(a, .{ .object = token == .object_begin });
             },
             .object_end, .array_end => {
-                const frame = frames.pop().?;
+                const frame = frames.pop() orelse return error.InvalidInputRequired;
                 if (frame.members > limits.max_collection_items) exceeded = true;
                 endValue(frames.items);
             },
@@ -208,6 +208,7 @@ fn scanRequestBounds(alloc: Allocator, text: []const u8, limits: Limits) Error!b
             .string => |piece| {
                 scalar_bytes +|= piece.len;
                 if (naming) {
+                    if (frames.items.len == 0) return error.InvalidInputRequired;
                     try name.appendSlice(a, piece);
                     const frame = &frames.items[frames.items.len - 1];
                     if (name.items.len > limits.max_name_bytes) exceeded = true;
