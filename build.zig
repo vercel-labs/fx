@@ -47,17 +47,20 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     const git_commit = readGitCommit(b);
+    const build_number = readBuildNumber(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "git_commit", git_commit);
+    build_options.addOption(u32, "build_number", build_number);
     build_options.addOption([]const u8, "app_version", app_version);
     build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     build_options.addOption(WasmSurface, "wasm_surface", .none);
     // Whether this is a libfx artifact, which leaves out what only the fx
     // binary uses, such as its E2E test controls.
     build_options.addOption(bool, "libfx", false);
+    build_options.addOption(bool, "trace_log", true);
     build_options.addOption(bool, "builtin_tools", true);
 
     const fuzz_corpora = readFuzzCorpora(b);
@@ -202,6 +205,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    benchmark_exports_mod.addImport("build_options", build_options.createModule());
     const file_index_bench = b.addExecutable(.{
         .name = "file-index-bench",
         .root_module = b.createModule(.{
@@ -412,6 +416,10 @@ fn addWasmArtifact(
     wasm_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
+    // The core surface starts with `minimal_kernel`, which never reads
+    // `FX_TRACE*`; only the term surface runs the full app, and the SDK tests
+    // turn tracing on there through `env:`.
+    wasm_options.addOption(bool, "trace_log", surface == .term);
     wasm_options.addOption(bool, "builtin_tools", true);
 
     const wasm_root = switch (surface) {
@@ -459,6 +467,11 @@ fn addNapiArtifact(
     napi_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     napi_options.addOption(NapiSurface, "napi_surface", surface);
     napi_options.addOption(bool, "libfx", true);
+    // The addon starts with `minimal_kernel`, so startup never calls
+    // `configureFromEnv` and nothing sets a log file
+    // (`sdk/tests/test-native-core-misuse.mjs` holds that). The trace log
+    // would only add its formatting at every call site.
+    napi_options.addOption(bool, "trace_log", false);
     // libfx agents run only the host's tools, so the addon leaves fx's out.
     napi_options.addOption(bool, "builtin_tools", false);
 
@@ -535,6 +548,29 @@ fn readGitCommit(b: *std.Build) []const u8 {
     };
     const trimmed = std.mem.trim(u8, out, " \t\r\n");
     return b.allocator.dupe(u8, trimmed) catch "unknown";
+}
+
+/// The build's number: how many commits main's first-parent history holds up
+/// to HEAD, so a later commit on main always has a higher number. The dev
+/// channel installs only a higher one (`update_target.Target.shouldInstall`).
+/// 0 when unknown, such as in a shallow checkout, where the count is wrong.
+fn readBuildNumber(b: *std.Build) u32 {
+    const shallow = switch (b.runFallible(
+        &.{ "git", "rev-parse", "--is-shallow-repository" },
+        .{ .stderr_behavior = .ignore },
+    )) {
+        .success => |stdout| stdout,
+        .spawn_failed, .bad_exit_code, .crashed => return 0,
+    };
+    if (!std.mem.eql(u8, std.mem.trim(u8, shallow, " \t\r\n"), "false")) return 0;
+    const out = switch (b.runFallible(
+        &.{ "git", "rev-list", "--count", "--first-parent", "HEAD" },
+        .{ .stderr_behavior = .ignore },
+    )) {
+        .success => |stdout| stdout,
+        .spawn_failed, .bad_exit_code, .crashed => return 0,
+    };
+    return std.fmt.parseInt(u32, std.mem.trim(u8, out, " \t\r\n"), 10) catch 0;
 }
 
 /// The session manager as its own module, rooted at its API. It imports

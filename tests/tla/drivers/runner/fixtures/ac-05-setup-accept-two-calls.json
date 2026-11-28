@@ -1,0 +1,51 @@
+{
+  "covers": [
+    "AC-5"
+  ],
+  "title": "No destination, two teams: one team prompt and one project prompt for two remote calls; the second waits, then both run remote after the project accept.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false
+      },
+      "c2": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false
+      }
+    },
+    "teams": "many",
+    "surface": "interactive",
+    "login": "valid",
+    "configured": false,
+    "configValid": true,
+    "answers": [
+      "team_accept",
+      "accept"
+    ],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "remote"
+      ],
+      "c2": [
+        "remote"
+      ]
+    },
+    "prompts": 2,
+    "writes": 1
+  },
+  "tamper": {
+    "setup": "extra-prompt"
+  },
+  "drive": {
+    "teams": 2
+  }
+}

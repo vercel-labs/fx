@@ -16,6 +16,8 @@ pub const session_files_dir_name = "session-files";
 pub const terminal_dir_name = "terminal";
 pub const prompt_history_file_name = "history.jsonl";
 pub const backups_dir_name = "backups";
+/// Workspace file index snapshots, one `<sha256>.idx` per listing.
+pub const file_index_dir_name = "file-index";
 pub const mcp_credentials_dir_name = "mcp-credentials";
 pub const mcp_credentials_file_name = "credentials.json";
 
@@ -44,6 +46,11 @@ pub fn useFxHome(value: []const u8, home: ?[]const u8) FxHomeError!void {
     if (trimmed.len == 0) return error.FxHomeIsRoot;
     if (home) |path| if (std.mem.eql(u8, trimmed, std.mem.trimEnd(u8, path, "/"))) return error.FxHomeIsHome;
     fx_home = trimmed;
+}
+
+/// Clears the FX_HOME override for tests, which must restore the default.
+pub fn resetFxHomeForTest() void {
+    fx_home = null;
 }
 
 /// The folder that holds `$FX_HOME`, or null when it isn't set. fx uses it
@@ -198,6 +205,11 @@ pub fn backupsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{backups_dir_name});
 }
 
+/// Workspace file index snapshots. Follows `FX_HOME` like every fx folder.
+pub fn fileIndexDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return rootPath(alloc, home, &.{file_index_dir_name});
+}
+
 pub fn logsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{logs_dir_name});
 }
@@ -335,4 +347,19 @@ test "FX_HOME moves every profile path and how messages name it" {
     try useFxHome("/fx", null);
     try std.testing.expectEqualStrings("/", rootParent("/tmp/fake-home"));
     try std.testing.expectEqualStrings("fx", rootName());
+}
+
+test "file index folder follows FX_HOME" {
+    const alloc = std.testing.allocator;
+    defer resetFxHomeForTest();
+
+    resetFxHomeForTest();
+    const default_dir = try fileIndexDir(alloc, "/home/u");
+    defer alloc.free(default_dir);
+    try std.testing.expectEqualStrings("/home/u/.fx/file-index", default_dir);
+
+    try useFxHome("/tmp/fx-profile", "/home/u");
+    const moved_dir = try fileIndexDir(alloc, "/home/u");
+    defer alloc.free(moved_dir);
+    try std.testing.expectEqualStrings("/tmp/fx-profile/file-index", moved_dir);
 }

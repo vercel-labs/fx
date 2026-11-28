@@ -13,6 +13,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const env_settings = @import("../config/env_settings.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -23,6 +24,7 @@ const diff_mod = @import("../output/diff.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const permission_request = @import("../permissions/permission_request.zig");
+const subagent_execution = @import("../subagent/execution.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
 const file_index = @import("../workspace/file_index.zig");
@@ -418,6 +420,24 @@ noinline fn approvalScreenNeedsClear(
     return prior.request_id != request.id or
         prior.rows != layout.rows or
         prior.cols != layout.cols;
+}
+
+/// What the person reads when the approval screen fails and fx denies the
+/// request instead.
+const approval_screen_failure_notice = "The approval screen could not open, so fx denied this request.";
+
+/// `FX_TEST_APPROVAL_SCREEN_FAIL` makes the next approval screen fail, so a
+/// test can prove the deny reaches the request's owner
+/// (`tests/e2e/tui-host-switch.test.ts`). Like every test switch, only an on
+/// value such as `1` turns it on, so `0` opens the screen as usual.
+const approval_screen_fail_env = "FX_TEST_APPROVAL_SCREEN_FAIL";
+var approval_screen_fail_used = false;
+
+fn approvalScreenFailureForced(raw: ?[]const u8) bool {
+    if (approval_screen_fail_used) return false;
+    if (!env_settings.testSwitchOn(raw)) return false;
+    approval_screen_fail_used = true;
+    return true;
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -1496,7 +1516,8 @@ pub fn Runtime(comptime App: type) type {
                     .attempt_invalidations = attempt_invalidations,
                     .pending_tail_rows = if (pending_card) |card| card.row_count else 0,
                 };
-                const fixed_point = try render_engine.frame_fixed_point.solve(
+                const fixed_point = try presentation_shell.solveFrameWithFooterCloseReset(
+                    &app.metrics,
                     FixedPointTranscriptContext(App),
                     &fixed_point_ctx,
                     .{
@@ -1511,6 +1532,8 @@ pub fn Runtime(comptime App: type) type {
                     },
                     FixedPointTranscriptContext(App).prepareCandidate,
                     FixedPointTranscriptContext(App).resolveCandidate,
+                    skillsMenuRefreshPending(app),
+                    &prepared_transcript,
                 );
                 const solved = fixed_point.layout;
                 solved_layout = solved;
@@ -1930,6 +1953,9 @@ pub fn Runtime(comptime App: type) type {
         fn renderApprovalScreen(app: *App, agent: *AppAgent) !FrameAttemptResult {
             const approval = agent.approval_prompt.projection() orelse return error.MissingApprovalRequest;
             const request = approval.request;
+            if (approvalScreenFailureForced(io_mod.getenv(approval_screen_fail_env))) {
+                return failApprovalScreen(app, agent, request.id, error.ForcedApprovalScreenFailure);
+            }
             const clear_display = approvalScreenNeedsClear(
                 app.terminal.fileApprovalScreenActive(),
                 request,
@@ -2042,13 +2068,60 @@ pub fn Runtime(comptime App: type) type {
                     .{@errorName(leave_err)},
                 );
             };
-            switch (agent.worker.submitPermissionResponse(
+            // The screen can show a request a subagent lent it, and that
+            // request waits on the subagent's worker, so the deny goes to the
+            // worker that owns it (R1.8, `tests/tla/subagent/TuiParentApproval.tla`
+            // NoAnswerToNonOwner).
+            const worker = if (comptime @hasDecl(App, "approvalWorker"))
+                app.approvalWorker(agent)
+            else
+                &agent.worker;
+            const reason: ?[]u8 = app.alloc.dupe(u8, subagent_execution.unshown_approval_feedback) catch blk: {
+                // The deny still lands without its reason, so a copy that
+                // fails here is traced instead of ending the frame.
+                debug_trace.logf(
+                    "permission",
+                    "approval_screen_deny_reason_lost request_id={d}",
+                    .{request_id},
+                );
+                break :blk null;
+            };
+            const result = worker.submitPermissionResponse(
                 request_id,
-                permission_request.OwnedPermissionResponse.init(app.alloc, .deny, null),
-            )) {
+                permission_request.OwnedPermissionResponse.init(app.alloc, .deny, reason),
+            );
+            debug_trace.logf(
+                "permission",
+                "approval_screen_denied result={s} request_id={d}",
+                .{ @tagName(result), request_id },
+            );
+            switch (result) {
                 .accepted => {
                     agent.approval_prompt.clearWithReason(app.alloc, "screen_failure");
                     app.approval_screen.clear();
+                    // The answered request's registry binding goes with it, as
+                    // the key path's does (R1.8), so main's later answer reads
+                    // that it no longer waits instead of answering a binding
+                    // whose worker is gone (`tests/tla/subagent/TuiParentApproval.tla`
+                    // AnswerOnce).
+                    if (comptime @hasDecl(App, "withdrawAnsweredApproval")) {
+                        app.withdrawAnsweredApproval(agent);
+                    }
+                    // An accepted answer clears the prompt, so no frame retries
+                    // this screen and the notice shows once.
+                    if (comptime @hasDecl(App, "writeDomainNotice")) {
+                        app.writeDomainNotice(.{
+                            .topic = "permissions",
+                            .tone = .warning,
+                            .body = approval_screen_failure_notice,
+                        }, true) catch |notice_err| {
+                            debug_trace.logf(
+                                "permission",
+                                "approval_screen_failure_notice_failed request_id={d} err={s}",
+                                .{ request_id, @errorName(notice_err) },
+                            );
+                        };
+                    }
                 },
                 .stale, .no_pending => {},
             }
@@ -2069,6 +2142,17 @@ pub fn Runtime(comptime App: type) type {
         fn skillsMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "skills")) return app.skills.menuVisible();
             return false;
+        }
+
+        /// `/skills` and `/skills <name>` open the skills menu when the catalog
+        /// refresh they queued lands, so the frame before that shows the plain composer.
+        fn skillsMenuRefreshPending(app: *const App) bool {
+            if (comptime !@hasField(App, "skills")) return false;
+            const pending = app.skills.pending_refresh_action orelse return false;
+            return switch (pending.action) {
+                .list, .show => true,
+                .notice, .startup_notice => false,
+            };
         }
 
         fn modelMenuActive(app: *const App) bool {
@@ -4076,6 +4160,243 @@ const CoordinatorTestApp = struct {
         return &self.main_agent;
     }
 };
+
+// A worker that takes only the request it waits on, as `WorkerRuntime` does:
+// an answer for any other id is `.stale`, and one with nothing waiting is
+// `.no_pending` (`permissionSubmissionBlockedLocked` in
+// `src/core/agent/worker_runtime.zig`).
+const approval_screen_failure_feedback_capacity_bytes: usize = 128;
+
+const ApprovalScreenFailureWorker = struct {
+    waiting_id: ?u64 = null,
+    accepted: usize = 0,
+    request_id: ?u64 = null,
+    decision: ?types.ToolPermissionDecision = null,
+    feedback_buf: [approval_screen_failure_feedback_capacity_bytes]u8 = undefined,
+    feedback_len: usize = 0,
+
+    pub fn submitPermissionResponse(
+        self: *ApprovalScreenFailureWorker,
+        request_id: u64,
+        response: permission_request.OwnedPermissionResponse,
+    ) worker_runtime.PermissionSubmissionResult {
+        var owned = response;
+        defer owned.deinit();
+        const waiting = self.waiting_id orelse return .no_pending;
+        if (waiting != request_id) return .stale;
+        self.accepted += 1;
+        self.request_id = request_id;
+        self.decision = owned.decision;
+        if (owned.feedback) |text| {
+            self.feedback_len = @min(text.len, self.feedback_buf.len);
+            @memcpy(self.feedback_buf[0..self.feedback_len], text[0..self.feedback_len]);
+        }
+        return .accepted;
+    }
+
+    fn feedbackText(self: *const ApprovalScreenFailureWorker) []const u8 {
+        return self.feedback_buf[0..self.feedback_len];
+    }
+};
+
+const ApprovalScreenFailureAgent = struct {
+    approval_prompt: approval_prompt.ApprovalPrompt = .{},
+    worker: ApprovalScreenFailureWorker = .{},
+};
+
+// An app whose screen shows the approval `lender` holds a copy of, as
+// `lentApproval` reports for main's screen.
+const ApprovalScreenFailureTestApp = struct {
+    alloc: std.mem.Allocator,
+    metrics: types.Metrics = .{},
+    terminal: shell_runtime.TerminalState = .{},
+    shell: transcript_runtime.TranscriptRuntime = .{},
+    approval_screen: interaction_state.ApprovalScreenState = .{},
+    main_agent: ApprovalScreenFailureAgent = .{},
+    lender: ?*ApprovalScreenFailureAgent = null,
+    /// The hosted child this app answers for, as `child_agents` holds it:
+    /// production withdraws a binding only for an agent that is one, and main
+    /// is not.
+    hosted_child: ?*ApprovalScreenFailureAgent = null,
+    notice_count: usize = 0,
+    notice_buf: [128]u8 = undefined,
+    notice_len: usize = 0,
+    withdrawn: usize = 0,
+
+    pub fn approvalWorker(
+        self: *ApprovalScreenFailureTestApp,
+        agent: *ApprovalScreenFailureAgent,
+    ) *ApprovalScreenFailureWorker {
+        const lender = self.lender orelse return &agent.worker;
+        return &lender.worker;
+    }
+
+    pub fn withdrawAnsweredApproval(
+        self: *ApprovalScreenFailureTestApp,
+        agent: *ApprovalScreenFailureAgent,
+    ) void {
+        const child = self.hosted_child orelse return;
+        if (agent != child) return;
+        self.withdrawn += 1;
+    }
+
+    pub fn writeDomainNotice(
+        self: *ApprovalScreenFailureTestApp,
+        notice: types.SemanticNotice,
+        _: bool,
+    ) !void {
+        self.notice_count += 1;
+        self.notice_len = @min(notice.body.len, self.notice_buf.len);
+        @memcpy(self.notice_buf[0..self.notice_len], notice.body[0..self.notice_len]);
+    }
+
+    fn noticeBody(self: *const ApprovalScreenFailureTestApp) []const u8 {
+        return self.notice_buf[0..self.notice_len];
+    }
+};
+
+test "only an on value fails the next approval screen" {
+    approval_screen_fail_used = false;
+    defer approval_screen_fail_used = false;
+    try std.testing.expect(!approvalScreenFailureForced(null));
+    try std.testing.expect(!approvalScreenFailureForced("0"));
+    try std.testing.expect(!approvalScreenFailureForced(""));
+    try std.testing.expect(!approvalScreenFailureForced("false"));
+    try std.testing.expect(approvalScreenFailureForced("1"));
+    // One shot: an on value fails one screen, not every later one.
+    try std.testing.expect(!approvalScreenFailureForced("1"));
+}
+
+test "a failed approval screen denies the request on the worker that owns it" {
+    const alloc = std.testing.allocator;
+    var app: ApprovalScreenFailureTestApp = .{ .alloc = alloc };
+    defer app.main_agent.approval_prompt.deinit(alloc);
+    var child: ApprovalScreenFailureAgent = .{};
+    defer child.approval_prompt.deinit(alloc);
+    child.worker.waiting_id = 7;
+    app.lender = &child;
+    // Main's screen holds the copy of the subagent's request, as
+    // `lendApproval` leaves it.
+    _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{
+        .id = 7,
+        .label = "write_file note.txt",
+        .origin = .{ .subagent = "writer" },
+    });
+
+    _ = try Runtime(ApprovalScreenFailureTestApp).failApprovalScreen(
+        &app,
+        &app.main_agent,
+        7,
+        error.OutOfMemory,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), child.worker.accepted);
+    try std.testing.expectEqual(@as(?u64, 7), child.worker.request_id);
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), child.worker.decision);
+    try std.testing.expectEqualStrings(
+        subagent_execution.unshown_approval_feedback,
+        child.worker.feedbackText(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.accepted);
+    try std.testing.expect(!app.main_agent.approval_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqualStrings(approval_screen_failure_notice, app.noticeBody());
+    // The screen agent is main, which is not a hosted child, so production
+    // withdraws nothing: the key path passes main here too and the binding, if
+    // the request has one, is the subagent's own.
+    try std.testing.expectEqual(@as(usize, 0), app.withdrawn);
+}
+
+test "a failed approval screen never answers the screen's own request with the same id" {
+    const alloc = std.testing.allocator;
+    var app: ApprovalScreenFailureTestApp = .{ .alloc = alloc };
+    defer app.main_agent.approval_prompt.deinit(alloc);
+    var child: ApprovalScreenFailureAgent = .{};
+    defer child.approval_prompt.deinit(alloc);
+    // Every worker numbers its requests from 1, so main's own request can have
+    // the lent request's id (`allocatePermissionRequestIdLocked` in
+    // `src/core/agent/worker_runtime.zig`).
+    app.main_agent.worker.waiting_id = 7;
+    child.worker.waiting_id = 7;
+    app.lender = &child;
+    _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{
+        .id = 7,
+        .label = "shell ls",
+        .origin = .{ .subagent = "writer" },
+    });
+
+    _ = try Runtime(ApprovalScreenFailureTestApp).failApprovalScreen(
+        &app,
+        &app.main_agent,
+        7,
+        error.OutOfMemory,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.accepted);
+    try std.testing.expectEqual(@as(usize, 1), child.worker.accepted);
+    // Main's own screen answers through the subagent's worker and withdraws
+    // nothing for main.
+    try std.testing.expectEqual(@as(usize, 0), app.withdrawn);
+}
+
+test "a failed screen on the subagent's own screen withdraws its answered request" {
+    const alloc = std.testing.allocator;
+    var app: ApprovalScreenFailureTestApp = .{ .alloc = alloc };
+    var child: ApprovalScreenFailureAgent = .{};
+    defer child.approval_prompt.deinit(alloc);
+    child.worker.waiting_id = 7;
+    app.hosted_child = &child;
+    // The subagent's own screen shows its request, so the answer goes to its
+    // worker, and its binding goes with the answer
+    // (`withdrawAnsweredApproval` for a hosted child).
+    _ = try child.approval_prompt.syncRequest(alloc, .{
+        .id = 7,
+        .label = "write_file note.txt",
+        .origin = .{ .subagent = "writer" },
+    });
+
+    _ = try Runtime(ApprovalScreenFailureTestApp).failApprovalScreen(
+        &app,
+        &child,
+        7,
+        error.OutOfMemory,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), child.worker.accepted);
+    try std.testing.expect(!child.approval_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqual(@as(usize, 1), app.withdrawn);
+}
+
+test "a failed approval screen that no worker takes withdraws nothing" {
+    const alloc = std.testing.allocator;
+    var app: ApprovalScreenFailureTestApp = .{ .alloc = alloc };
+    var child: ApprovalScreenFailureAgent = .{};
+    defer child.approval_prompt.deinit(alloc);
+    // The request ended before the deny arrived: its own worker waits on
+    // nothing.
+    child.worker.waiting_id = null;
+    app.hosted_child = &child;
+    _ = try child.approval_prompt.syncRequest(alloc, .{
+        .id = 7,
+        .label = "write_file note.txt",
+        .origin = .{ .subagent = "writer" },
+    });
+
+    _ = try Runtime(ApprovalScreenFailureTestApp).failApprovalScreen(
+        &app,
+        &child,
+        7,
+        error.OutOfMemory,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), child.worker.accepted);
+    try std.testing.expectEqual(@as(usize, 0), app.main_agent.worker.accepted);
+    // A deny nobody took answers nothing, so no binding goes with it and no
+    // notice claims a request was denied.
+    try std.testing.expectEqual(@as(usize, 0), app.withdrawn);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+}
 
 fn initCoordinatorProjectionTestApp(
     alloc: std.mem.Allocator,

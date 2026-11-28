@@ -58,8 +58,8 @@ fn parseCheckIntervalMs(text: ?[]const u8) u64 {
 
 /// The build that an earlier check installed while this fx runs. Later checks
 /// compare a release with it, not with the running build, so the installed
-/// release is never installed again: a dev release replaces it when its commit
-/// differs, and a stable release when its version is higher
+/// release is never installed again: a dev release replaces it when it is
+/// newer, and a stable release when its version is higher
 /// (`update_target.Target.shouldInstall`). This tracks what fx installed, not
 /// the file itself, so a binary another process writes there is not noticed.
 const StagedBuild = struct {
@@ -69,6 +69,7 @@ const StagedBuild = struct {
     version_len: usize = 0,
     revision_buf: [update_target.max_revision_bytes]u8 = undefined,
     revision_len: usize = 0,
+    build: u32 = 0,
 
     /// Copies what `target` names. Its version and revision passed the
     /// target's own length checks, so they fit.
@@ -79,6 +80,7 @@ const StagedBuild = struct {
         @memcpy(self.revision_buf[0..revision.len], revision);
         self.version_len = version.len;
         self.revision_len = revision.len;
+        self.build = target.build();
         self.channel = target.channel();
         self.installed = true;
     }
@@ -91,6 +93,7 @@ const StagedBuild = struct {
             .channel = self.channel,
             .version = self.version_buf[0..self.version_len],
             .revision = self.revision_buf[0..self.revision_len],
+            .build = self.build,
         };
     }
 };
@@ -118,7 +121,7 @@ pub const RestartWait = enum {
     releasing,
 };
 
-const restart_wait_label = "restart waits: ctrl+g to cancel";
+const restart_wait_label = "restart pending · ctrl+g cancel";
 
 pub const AutoUpgrade = struct {
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(State.idle)),
@@ -562,6 +565,28 @@ test "a staged dev build is the baseline, so only a different revision replaces 
     try std.testing.expectEqual(update_target.Channel.dev, staged.baseline(current).channel);
 }
 
+test "a staged dev build keeps its build number, so a stale manifest cannot replace it" {
+    const alloc = std.testing.allocator;
+    const current: update_target.CurrentBuild = .{
+        .channel = .dev,
+        .version = "0.0.18",
+        .revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .build = 100,
+    };
+    var newer = try update_target.Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"2222222222222222222222222222222222222222\",\"build\":105}");
+    defer newer.deinit(alloc);
+    var stale = try update_target.Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"1111111111111111111111111111111111111111\",\"build\":103}");
+    defer stale.deinit(alloc);
+
+    var staged: StagedBuild = .{};
+    try std.testing.expect(newer.shouldInstall(staged.baseline(current)));
+    staged.record(newer);
+    try std.testing.expectEqual(@as(u32, 105), staged.baseline(current).build);
+    // Newer than the running build, but older than the one installed.
+    try std.testing.expect(stale.shouldInstall(current));
+    try std.testing.expect(!stale.shouldInstall(staged.baseline(current)));
+}
+
 test "a staged stable build is the baseline, so only a higher version replaces it" {
     const alloc = std.testing.allocator;
     const current: update_target.CurrentBuild = .{ .channel = .stable, .version = "0.0.18", .revision = "" };
@@ -710,9 +735,9 @@ test "a waiting restart says how to cancel it" {
     var au = AutoUpgrade{};
     var buf: [64]u8 = undefined;
     au.restart = .waiting;
-    try std.testing.expectEqualStrings("restart waits: ctrl+g to cancel", au.statusLabel(&buf));
+    try std.testing.expectEqualStrings("restart pending · ctrl+g cancel", au.statusLabel(&buf));
     au.restart = .none;
-    try std.testing.expect(!std.mem.eql(u8, "restart waits: ctrl+g to cancel", au.statusLabel(&buf)));
+    try std.testing.expect(!std.mem.eql(u8, "restart pending · ctrl+g cancel", au.statusLabel(&buf)));
 }
 
 test "statusLabel waiting returns empty" {

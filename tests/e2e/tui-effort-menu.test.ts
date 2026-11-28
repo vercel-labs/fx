@@ -5,7 +5,7 @@
 // `fx replay`, and the highlight from the bytes fx wrote for it, so these
 // tests check what the terminal showed, not the live pane alone.
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
@@ -18,7 +18,6 @@ import {
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 60_000;
@@ -72,6 +71,8 @@ async function launch(options: {
   width?: number;
   height?: number;
   respond?: (body: string) => Response;
+  /// Writes files into the workspace before fx starts, such as a skill.
+  prepare?: (workspace: string) => void;
 } = {}): Promise<Shell> {
   const root = mkdtempSync(join(tmpdir(), "fx-effort-menu-"));
   roots.push(root);
@@ -79,6 +80,7 @@ async function launch(options: {
   const workspace = join(root, "workspace");
   mkdirSync(home);
   mkdirSync(workspace);
+  options.prepare?.(workspace);
   let catalogServed = 0;
   const gateway = startDynamicFakeGateway(options.respond ?? (() => fakeGatewayFinalText("ANSWER")), {
     models: () => {
@@ -287,11 +289,14 @@ test.skipIf(!tmuxAvailable())("/effort lists the model's levels with the one in 
   await waitForEffortMenu(current, "high     current");
   await session.sendKeys("Escape");
   await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
-  // A typed character closes the menu and lands in the composer.
+  // A typed character stays in the composer as the menu's query, and Esc
+  // closes the menu.
   await session.sendText("/effort");
   await waitForEffortMenu(current);
   await session.sendLiteral("x");
-  await session.waitForPane((pane) => !pane.includes("Effort 5") && /^┃ x$/m.test(pane), 5_000);
+  await session.waitForPane((pane) => pane.includes("Effort 1") && /^┃ x$/m.test(pane), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort 1"), 5_000);
   await session.sendKeys("C-u");
   expect(savedEffort(current)).toBe("high");
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
@@ -320,7 +325,7 @@ test.skipIf(!tmuxAvailable())("/effort <level> applies the level directly, and t
   await session.waitForText("Reasoning effort set to xhigh for acme/thinker", 5_000);
   expect(savedEffort(current)).toBe("xhigh");
   await session.sendText("first question");
-  await session.waitForPane((pane) => pane.includes("ANSWER") && turnSettled(pane), 10_000);
+  await session.waitForReplyAndTurnEnd("ANSWER", 10_000);
   await session.waitForComposer(10_000);
 
   await session.sendText("/effort default");
@@ -339,6 +344,347 @@ test.skipIf(!tmuxAvailable())("/effort <level> applies the level directly, and t
   // The model's default sends no effort at all.
   expect(turn("second question")).not.toHaveProperty("reasoning");
   expect(menuViews(current, "direct")).toEqual([]);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("typing over the open /effort menu filters its levels, as typing over the /model menu filters its models", async () => {
+  const current = await launch();
+  const { session, gateway } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  // The typed text stays in the composer as the query, and the first match
+  // is highlighted.
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await press(session, "Down");
+  await session.sendKeys("Enter");
+  await session.waitForText("Reasoning effort set to xhigh for acme/thinker", 5_000);
+  expect(savedEffort(current)).toBe("xhigh");
+
+  // A query with no match lists no level, and Enter neither applies one nor
+  // sends the query as a prompt: Backspace still edits the menu's query, and
+  // an empty query lists every level again with the one in use highlighted.
+  await session.sendText("/effort");
+  await waitForEffortMenu(current, "xhigh    current");
+  await session.sendLiteral("zz");
+  await session.waitForPane((pane) => pane.includes("Effort 0") && pane.includes("No levels found.") && /^┃ zz$/m.test(pane), 5_000);
+  await session.sendKeys("Enter");
+  await session.sendKeys("BSpace");
+  await session.sendKeys("BSpace");
+  await session.waitForPane((pane) => pane.includes("Effort 5") && /^┃ *$/m.test(pane), 5_000);
+  await session.sendKeys("Enter");
+  await session.waitForPane((pane) => count(pane, "Reasoning effort set to xhigh for acme/thinker") === 2, 5_000);
+  expect(savedEffort(current)).toBe("xhigh");
+  expect(gateway.requests.some((request) => request.body.includes("zz"))).toBe(false);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+
+  const views = menuViews(current, "filter").map((view) => view.menu);
+  expect(views).toContainEqual({ count: 2, model: MODEL, levels: ["high", "xhigh"], current: null });
+  expect(views).toContainEqual({ count: 0, model: MODEL, levels: [], current: null });
+  expect(views.at(-1)).toEqual({ count: 5, model: MODEL, levels: LEVELS, current: "xhigh" });
+  expect(highlightsAfter(current, /^h$/)).toEqual(["high"]);
+  expect(highlightsAfter(current, ARROW)).toEqual(["xhigh"]);
+  expect(highlightsAfter(current, /^\x7f$/).at(-1)).toBe("xhigh");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("Ctrl+P over the open /effort menu closes it with its query, and the /model menu it opens takes the typing and Enter", async () => {
+  const current = await launch();
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await session.sendKeys("C-p");
+  await session.waitForPane((pane) => pane.includes("Models 2") && !pane.includes("Effort 2") && /^┃ *$/m.test(pane), 5_000);
+  await session.sendLiteral("plain");
+  await session.waitForPane((pane) => pane.includes("Models 1"), 5_000);
+  await session.sendKeys("Enter");
+  await session.waitForText(`* Switched to ${PLAIN_MODEL}`, 5_000);
+  // The effort query is not given back as a draft when the /model menu closes.
+  await session.waitForPane((pane) => /^┃ *$/m.test(pane) && !pane.includes("Models "), 5_000);
+  expect(savedEffort(current)).toBeUndefined();
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=model_menu_opened query_bytes=1");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("a typed $ over the open /effort menu is part of its query and opens no skill list", async () => {
+  const current = await launch();
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("$");
+  await session.waitForPane((pane) => pane.includes("Effort 0") && pane.includes("No levels found.") && /^┃ \$$/m.test(pane), 5_000);
+  // Enter applies nothing for a query with no match, even the level that
+  // was highlighted before the $.
+  await session.sendKeys("Enter");
+  await session.sendKeys("BSpace");
+  await session.sendLiteral("x");
+  await session.waitForPane((pane) => pane.includes("Effort 1") && /^┃ x$/m.test(pane), 5_000);
+  await session.sendKeys("Enter");
+  await session.waitForText("Reasoning effort set to xhigh for acme/thinker", 5_000);
+  expect(await session.capturePane()).not.toContain("Reasoning effort set to default");
+  expect(savedEffort(current)).toBe("xhigh");
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("Tab over the open /effort menu leaves its query as typed, even when the query reads like a command", async () => {
+  const current = await launch();
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  for (const query of ["/effort h", "/model", "/effort"]) {
+    await session.sendLiteral(query);
+    await session.waitForPane((pane) => pane.includes("Effort 0") && new RegExp(`^┃ ${query.replace("/", "\\/")}$`, "m").test(pane), 5_000);
+    await session.sendKeys("Tab");
+    await session.sendKeys("C-u");
+    await session.waitForPane((pane) => pane.includes("Effort 5") && /^┃ *$/m.test(pane), 5_000);
+  }
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  // No frame showed a completion that Tab wrote into the query.
+  const rows = [...replayGrids(FX_BIN, current.tape, join(current.root, "tab.frames")).values()]
+    .flatMap((grid) => grid.map((row) => row.trimEnd()));
+  expect(rows).not.toContain("┃ /effort high");
+  expect(rows.filter((row) => /^┃ \/model \S/.test(row))).toEqual([]);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("the /effort menu sets an image draft aside while its query filters, and gives it back on Esc", async () => {
+  const current = await launch();
+  const { session } = current;
+  const image = join(current.root, "workspace", "i.png");
+  writeFileSync(image, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64"));
+  await session.sendHexBytes([...Buffer.from(`\x1b[200~${image}\x1b[201~`)].map((byte) => byte.toString(16).padStart(2, "0")));
+  await session.waitForPane((pane) => /^┃ \[Image 1\]/m.test(pane), 5_000);
+  await session.sendLiteral("/effort");
+  await session.sendKeys("Enter");
+  await waitForEffortMenu(current);
+  // The query starts empty: the image waits outside the composer.
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ \[Image 1\]/m.test(pane), 5_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await session.sendKeys("C-u");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=escape query_bytes=1 pasted_blocks=0 image_tokens=0 skill_tokens=0 draft_restored=true");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("a failed prompt that fx gives back closes the open /effort menu and stays in the composer", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let attempts = 0;
+  const current = await launch({
+    respond: (body) => {
+      if (!body.includes("first question")) return fakeGatewayFinalText("ANSWER");
+      attempts += 1;
+      // A dropped stream, which fx resends, then a reply no retry can fix,
+      // so the turn stops and gives the prompt back.
+      if (attempts === 1) return held.then(() => new Response("", { headers: { "content-type": "text/event-stream" } }));
+      return new Response(`data: ${"[".repeat(300)}${"]".repeat(300)}\n\n`, { headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  const { session } = current;
+  await session.sendText("first question");
+  await session.waitForText("Thinking", 10_000);
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  release();
+  await session.waitForPane((pane) => /^┃ first question$/m.test(pane) && !pane.includes("Effort "), 20_000);
+  expect(attempts).toBe(2);
+  expect(savedEffort(current)).toBeUndefined();
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await session.sendKeys("C-u");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=failed_prompt_restored query_bytes=1");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("switching models from the out-of-credits card closes the open /effort menu, and the prompt, not its query, comes back as the draft", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const current = await launch({
+    respond: (body) => body.includes("first question")
+      ? held.then(() => new Response(
+        JSON.stringify({ error: { code: "credit_card_required", message: "Buy credits to use AI Gateway." } }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      ))
+      : fakeGatewayFinalText("ANSWER"),
+  });
+  const { session } = current;
+  await session.sendText("first question");
+  await session.waitForText("Thinking", 10_000);
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  release();
+  await session.waitForText("Switch to another model", 10_000);
+  await session.sendKeys("Down");
+  await session.sendKeys("Enter");
+  await session.waitForPane((pane) => /^┃ \/model *$/m.test(pane) && !pane.includes("Effort "), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => /^┃ first question$/m.test(pane), 5_000);
+  expect(savedEffort(current)).toBeUndefined();
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await session.sendKeys("C-u");
+  await quit(current);
+  // The card gives the prompt back before it opens the picker, and that
+  // closes the menu first.
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=failed_prompt_restored query_bytes=1");
+}, TIMEOUT);
+
+const ONE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+async function bracketPaste(session: TmuxSession, text: string): Promise<void> {
+  await session.sendHexBytes([...Buffer.from(`\x1b[200~${text}\x1b[201~`)].map((byte) => byte.toString(16).padStart(2, "0")));
+}
+
+/// The images the last user message in a request body carries. The test
+/// model has no vision, so fx lists each pending image by name in an
+/// `<available_images>` block instead of sending its bytes.
+function userImages(body: string): number {
+  const prompt = (JSON.parse(body) as { prompt: { role: string; content: { type: string; text?: string }[] | string }[] }).prompt;
+  const content = prompt.findLast((entry) => entry.role === "user")?.content;
+  const text = Array.isArray(content) ? content.map((part) => part.text ?? "").join("") : content ?? "";
+  const listed = /<available_images>([\s\S]*?)<\/available_images>/.exec(text)?.[1] ?? "";
+  return (listed.match(/\[Image #\d+\]/g) ?? []).length;
+}
+
+test.skipIf(!tmuxAvailable())("Ctrl+U, Ctrl+C, and Ctrl+D over the open /effort menu keep the image draft it set aside", async () => {
+  const current = await launch();
+  const { session, gateway } = current;
+  const image = join(current.root, "workspace", "i.png");
+  writeFileSync(image, Buffer.from(ONE_PIXEL_PNG, "base64"));
+  await bracketPaste(session, image);
+  await session.waitForPane((pane) => /^┃ \[Image 1\]/m.test(pane), 5_000);
+
+  // Ctrl+U clears only the query; the menu stays.
+  await session.sendLiteral("/effort");
+  await session.sendKeys("Enter");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await session.sendKeys("C-u");
+  await session.waitForPane((pane) => pane.includes("Effort 5") && /^┃ *$/m.test(pane), 5_000);
+  // Ctrl+C closes the menu and gives the draft back.
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2"), 5_000);
+  await session.sendKeys("C-c");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ \[Image 1\]/m.test(pane), 5_000);
+  // Ctrl+D on an empty query closes the menu too, and fx keeps running.
+  await session.sendLiteral("/effort");
+  await session.sendKeys("Enter");
+  await waitForEffortMenu(current);
+  await session.sendKeys("C-d");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ \[Image 1\]/m.test(pane), 5_000);
+
+  await session.sendLiteral(" describe this");
+  await session.sendKeys("Enter");
+  await session.waitForPane(() => gateway.requests.some((request) => request.body.includes("describe this")), 10_000);
+  const sent = gateway.requests.find((request) => request.body.includes("describe this"))!;
+  expect(userImages(sent.body)).toBe(1);
+  await session.waitForComposer(10_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  const trace = readFileSync(current.trace, "utf8");
+  expect(trace).not.toContain("draft cleared reason=");
+  expect(trace).toContain("effort menu closed and its query cleared reason=ctrl_c");
+  expect(trace).toContain("effort menu closed and its query cleared reason=ctrl_d");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("an image path pasted over the open /effort menu stays text in its query and attaches nothing", async () => {
+  const current = await launch();
+  const { session, gateway } = current;
+  const image = join(current.root, "workspace", "secret.png");
+  writeFileSync(image, Buffer.from(ONE_PIXEL_PNG, "base64"));
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await bracketPaste(session, image);
+  await session.waitForPane((pane) => pane.includes("Effort 0") && pane.includes("secret.png") && !pane.includes("[Image 1]"), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ *$/m.test(pane), 5_000);
+  // Enter on the empty composer starts nothing; the next prompt carries no image.
+  await session.sendKeys("Enter");
+  await session.sendText("hello");
+  await session.waitForText("ANSWER", 10_000);
+  await session.waitForComposer(10_000);
+  const chats = gateway.requests.filter((request) => request.body.includes("\"prompt\""));
+  expect(chats.some((request) => request.body.includes("hello"))).toBe(true);
+  expect(chats.every((request) => userImages(request.body) === 0)).toBe(true);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("Ctrl+Y over the open /effort menu yanks no killed image into its query", async () => {
+  const current = await launch();
+  const { session, gateway } = current;
+  const image = join(current.root, "workspace", "i.png");
+  writeFileSync(image, Buffer.from(ONE_PIXEL_PNG, "base64"));
+  await bracketPaste(session, image);
+  await session.waitForPane((pane) => /^┃ \[Image 1\]/m.test(pane), 5_000);
+  // Ctrl+U kills the image token, and its image, into the kill ring.
+  await session.sendKeys("C-u");
+  await session.waitForPane((pane) => /^┃ *$/m.test(pane), 5_000);
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendKeys("C-y");
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ *$/m.test(pane), 5_000);
+  // Enter on the empty composer starts nothing; the next prompt carries no image.
+  await session.sendKeys("Enter");
+  await session.sendText("hello");
+  await session.waitForText("ANSWER", 10_000);
+  await session.waitForComposer(10_000);
+  const chats = gateway.requests.filter((request) => request.body.includes("\"prompt\""));
+  expect(chats.some((request) => request.body.includes("hello"))).toBe(true);
+  expect(chats.every((request) => userImages(request.body) === 0)).toBe(true);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("yank skipped reason=menu_borrows_composer images=1");
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("Space after a model name in the /effort query switches no model", async () => {
+  const current = await launch();
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral(`/model ${PLAIN_MODEL}`);
+  await session.waitForPane((pane) => pane.includes("Effort 0") && pane.includes(`┃ /model ${PLAIN_MODEL}`), 5_000);
+  await session.sendLiteral(" x");
+  await session.waitForPane((pane) => pane.includes(`┃ /model ${PLAIN_MODEL} x`) && pane.includes("Effort 0"), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort "), 5_000);
+  const pane = await session.capturePane();
+  expect(pane).not.toContain("Switched to");
+  expect(pane).toMatch(/^auto · thinker/m);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("a $skill pasted over the open /effort menu opens no skill list, so one Esc closes the menu", async () => {
+  const current = await launch({
+    prepare: (workspace) => {
+      const dir = join(workspace, ".agents", "skills", "demo");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "SKILL.md"), "---\nname: demo\ndescription: A skill for the effort menu test\n---\n\nbody\n");
+    },
+  });
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await bracketPaste(session, "$demo");
+  await session.waitForPane((pane) => pane.includes("Effort 0") && /^┃ \$demo$/m.test(pane), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort ") && /^┃ *$/m.test(pane), 5_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
 }, TIMEOUT);
 
 test.skipIf(!tmuxAvailable())("a level the model does not offer, or a malformed one, changes nothing and names the levels", async () => {
@@ -383,10 +729,10 @@ test.skipIf(!tmuxAvailable())("a level chosen during a turn applies to the next 
   await session.sendKeys("Enter");
   await session.waitForText("Next turn will use reasoning effort xhigh for acme/thinker", 5_000);
   held.release("FIRST_ANSWER");
-  await session.waitForPane((pane) => pane.includes("FIRST_ANSWER") && turnSettled(pane), 10_000);
+  await session.waitForReplyAndTurnEnd("FIRST_ANSWER", 10_000);
   await session.waitForComposer(10_000);
   await session.sendText("second question");
-  await session.waitForPane((pane) => pane.includes("SECOND_ANSWER") && turnSettled(pane), 10_000);
+  await session.waitForReplyAndTurnEnd("SECOND_ANSWER", 10_000);
   await session.waitForComposer(10_000);
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
   await quit(current);
@@ -523,7 +869,7 @@ test.skipIf(!tmuxAvailable())("Ctrl+T steps from default through the model's lev
   expect(pane).not.toContain("Reasoning effort");
 
   await session.sendKeys("Enter");
-  await session.waitForPane((pane) => pane.includes("ANSWER") && turnSettled(pane), 10_000);
+  await session.waitForReplyAndTurnEnd("ANSWER", 10_000);
   await session.waitForComposer(10_000);
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
   await quit(current);
