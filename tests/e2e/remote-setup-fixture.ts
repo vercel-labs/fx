@@ -1,10 +1,11 @@
 import { expect } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type FakeVercelApi, type FakeVercelUser, startFakeVercelApi } from "./fixtures/fake-vercel-api";
 
-// The built-in remote runner's login and in-chat setup, for the sandbox tests.
+// The built-in runner's login and in-chat setup, for the sandbox tests.
 // fx reads `fakeLoginToken` as VERCEL_TOKEN. While FX_TEST_VERCEL_API_URL is
 // honored, fx sends `fakeApiToken` instead of the login (spec AC-30), so the fake
 // answers the user check with 200, and any other token with 403.
@@ -14,9 +15,6 @@ export const fakeLoginToken = "fx-test-login";
 
 /** The token the fake API signs in. fx sends it while its test override is honored. */
 export const fakeApiToken = "fx-test-token";
-
-export const fakeUser: FakeVercelUser = { id: "user_fx_test", username: "fx-test", email: "fx-test@example.com" };
-export const fakeOtherUser: FakeVercelUser = { id: "user_fx_other", username: "fx-other", email: "fx-other@example.com" };
 
 export type SetupProject = { id: string; name: string };
 export type SetupTeam = { id: string; slug: string; name: string; projects: SetupProject[] };
@@ -35,6 +33,19 @@ export const fakeSecondTeam: SetupTeam = {
   projects: [{ id: "prj_fx_second", name: "fx-second-project" }],
 };
 
+export const fakeUser: FakeVercelUser = {
+  id: "user_fx_test",
+  username: "fx-test",
+  email: "fx-test@example.com",
+  defaultTeamId: fakeTeam.id,
+};
+export const fakeOtherUser: FakeVercelUser = {
+  id: "user_fx_other",
+  username: "fx-other",
+  email: "fx-other@example.com",
+  defaultTeamId: fakeTeam.id,
+};
+
 export type RemoteSetupFixture = {
   api: FakeVercelApi;
   /** The environment of an fx process: its login, and the fake's loopback URL. */
@@ -45,6 +56,53 @@ export type RemoteSetupFixture = {
   remote: Record<string, string>;
   stop(): void;
 };
+
+/** Computes `{fx_home}/sandbox/state/{repoKey}` matching `consent.repoKey`. */
+export function repoKeyFor(userId: string, repoRoot: string): string {
+  const canonical = realpathSync(repoRoot);
+  return createHash("sha256").update(`${userId}\n${canonical}`).digest("hex").slice(0, 16);
+}
+
+/** Writes `{home}/.fx/sandbox/state/{repoKey}/consent.json` for a repository and destination. */
+export function seedConsent(
+  home: string,
+  userId: string,
+  repoRoot: string,
+  teamId: string,
+  projectId: string,
+): void {
+  const key = repoKeyFor(userId, repoRoot);
+  const stateDir = join(realpathSync(home), ".fx", "sandbox", "state", key);
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    join(stateDir, "consent.json"),
+    `${JSON.stringify({
+      version: 1,
+      team_id: teamId,
+      project_id: projectId,
+      confirmed_at: "2026-11-22T10:00:00Z",
+    })}\n`,
+    { mode: 0o600 },
+  );
+}
+
+/** Writes Vercel CLI `auth.json` and optional `config.json` (`currentTeam`) in `home`. */
+export function writeCliLoginAndTeam(
+  home: string,
+  options: { token?: string; currentTeam?: string } = {},
+): void {
+  const token = options.token ?? fakeLoginToken;
+  for (const dir of [
+    join(home, ".local", "share", "com.vercel.cli"),
+    join(home, "Library", "Application Support", "com.vercel.cli"),
+  ]) {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "auth.json"), JSON.stringify({ token }));
+    if (options.currentTeam !== undefined) {
+      writeFileSync(join(dir, "config.json"), JSON.stringify({ currentTeam: options.currentTeam }));
+    }
+  }
+}
 
 /** Starts a fake Vercel API. Stop it with `stop` when the test ends. */
 export function startRemoteSetupFixture(

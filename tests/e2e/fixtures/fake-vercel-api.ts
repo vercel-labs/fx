@@ -83,7 +83,7 @@ function requireSandboxTools(): void {
   sandboxToolsChecked = true;
 }
 
-export type FakeVercelUser = { id: string; username: string; email: string };
+export type FakeVercelUser = { id: string; username: string; email: string; defaultTeamId?: string | null };
 export type FakeVercelTeam = { id: string; slug: string; name: string };
 export type FakeVercelProject = { id: string; name: string; createdAt: number };
 
@@ -712,7 +712,7 @@ export function startFakeVercelApi(options: FakeVercelOptions): FakeVercelApi {
         return Response.json({ teams: page.map((team) => padded(team, options.padding?.team)), pagination: { count: page.length, next } });
       }
       case "teamBySlug": {
-        const team = options.teams.find((item) => item.slug === params[0]);
+        const team = options.teams.find((item) => item.slug === params[0] || item.id === params[0]);
         return team ? Response.json(team) : errorAnswer(404, "not_found", "team not found");
       }
       case "projects": {

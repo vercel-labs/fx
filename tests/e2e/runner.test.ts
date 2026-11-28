@@ -25,9 +25,12 @@ import {
   fakeTeam,
   fakeUser,
   type RemoteSetupFixture,
+  repoKeyFor,
+  seedConsent,
   type SetupProject,
   type SetupTeam,
   startRemoteSetupFixture,
+  writeCliLoginAndTeam,
 } from "./remote-setup-fixture";
 
 // The `runner` field of `shell`. With the sandbox policy on, the shell schema
@@ -320,14 +323,16 @@ async function withSandboxFixture(
   git(repo, ["add", "a.txt"]);
   git(repo, ["commit", "-q", "-m", "initial"]);
   writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ experimental: { sandbox_execution: sandboxOn } }));
-  writeFileSync(
-    join(home, ".fx", "sandbox", "config.json"),
-    JSON.stringify({
-      rules: [],
-      remote: active.remote,
-      ...config(repo),
-    }),
-  );
+  const configBody = {
+    rules: [],
+    remote: active.remote,
+    ...config(repo),
+  } as Record<string, unknown>;
+  writeFileSync(join(home, ".fx", "sandbox", "config.json"), JSON.stringify(configBody));
+  const remoteSection = configBody.remote as Record<string, string> | undefined;
+  if (remoteSection?.user_id && remoteSection.team_id && remoteSection.project_id) {
+    seedConsent(home, remoteSection.user_id, repo, remoteSection.team_id, remoteSection.project_id);
+  }
   const gateway = Array.isArray(responses) ? startFakeGateway(responses) : startDynamicFakeGateway(responses);
   gateways.push(gateway);
   try {
@@ -829,15 +834,16 @@ describe("a run that goes somewhere other than the request says why (D2, D3, D7)
 // ---- remote setup: the prompts, the refusals and the first run (spec AC-5 to AC-7, AC-18, AC-20, AC-25, AC-30) ----
 
 // The setup refusals, word for word from src/core/runner/setup_host.zig.
-const E5_NO_LOGIN = "fx did not run this command: no Vercel login. Run `vercel login`, then try again.";
+const E5_NO_LOGIN = "fx did not run this command: no Vercel login. Ask the person to run `vercel login` or set VERCEL_TOKEN.";
 const E6_LOGIN_REJECTED =
-  "fx did not run this command: the Vercel login has expired or was rejected. Run `vercel whoami` to refresh it, or `vercel login`, then try again.";
+  "fx did not run this command: the Vercel login has expired or was rejected. Ask the person to run `vercel whoami` to refresh it, or run `vercel login`.";
 const E7_NO_CHANNEL =
-  "fx did not run this command: remote is not set up, and fx cannot ask the user here. Ask again in an interactive fx session.";
-const E8_DECLINED = "fx did not run this command: the user did not set up remote.";
-const E10_SUB_AGENT = "fx did not run this command: remote is not set up. Set it up from the main conversation first.";
+  "fx did not run this command: this repository needs remote consent, and fx cannot ask here. Run the first remote command in the fx TUI or `fx ask` in a terminal.";
+const E8_DECLINED =
+  "fx did not run this command: the person declined copying this repository to Vercel. Do not retry in this turn.";
+const E10_SUB_AGENT =
+  "fx did not run this command: this repository is not set up for remote commands. Set it up from the main conversation first.";
 const INTERIM_TEXT = "the sandbox provider cannot be used: ";
-const P1_MESSAGE = "fx asks: Which Vercel team should remote commands use?";
 const NO_REMOTE = (): object => ({ remote: undefined });
 // The setup lists, which no model request may carry (AC-5, spec line 370): the ids of
 // every team and project the fake sets up, and the names of the team and project that
@@ -848,8 +854,12 @@ const SETUP_NAMES = [
   "fx-second-team", "fx second team", "fx-second-project",
 ];
 
-function p2Message(slug: string): string {
-  return `fx asks: Pick a project in ${slug}. fx will copy this repository's files to a sandbox in the project you pick, for remote commands.`;
+function copyMessage(teamName: string, projectName: string): string {
+  return `fx asks: Copy this repository to Vercel team ${teamName}, project ${projectName}? fx copies its tracked and unignored files to a sandbox there for remote commands.`;
+}
+
+function teamWithSandbox(team: SetupTeam, sandboxId = `prj_sandbox_${team.id}`): SetupTeam {
+  return { ...team, projects: [...team.projects, { id: sandboxId, name: "fx-sandbox" }] };
 }
 
 async function withSetup(
@@ -869,6 +879,10 @@ function sandboxConfigText(fixture: Fixture): string {
   return readFileSync(join(fixture.home, ".fx", "sandbox", "config.json"), "utf8");
 }
 
+function consentFilePath(home: string, userId: string, repoRoot: string): string {
+  return join(realpathSync(home), ".fx", "sandbox", "state", repoKeyFor(userId, repoRoot), "consent.json");
+}
+
 function expectRemoteWritten(fixture: Fixture, team: SetupTeam, project: SetupProject, userId: string) {
   const remote = JSON.parse(sandboxConfigText(fixture)).remote;
   expect(remote).toMatchObject({
@@ -879,6 +893,15 @@ function expectRemoteWritten(fixture: Fixture, team: SetupTeam, project: SetupPr
     user_id: userId,
   });
   expect(typeof remote.confirmed_at).toBe("string");
+  const consentPath = consentFilePath(fixture.home, userId, fixture.workspace);
+  expect(existsSync(consentPath)).toBe(true);
+  const consent = JSON.parse(readFileSync(consentPath, "utf8"));
+  expect(consent).toMatchObject({
+    version: 1,
+    team_id: team.id,
+    project_id: project.id,
+  });
+  expect(typeof consent.confirmed_at).toBe("string");
 }
 
 function expectNoInterimText(...texts: string[]) {
@@ -893,13 +916,9 @@ function expectNoSetupNames(gateway: Gateway) {
 type AcpElicitation = { turn: number; message: string; params: Record<string, any> };
 type AcpAnswer = (params: Record<string, any>) => { action: "accept" | "decline" | "cancel"; content?: Record<string, unknown> };
 
-/// The client's answers to the setup prompts: the named team, then the named
-/// project. A team prompt is the one with a `team` property.
-function answerSetup(team: string, project: string): AcpAnswer {
-  return (params) =>
-    "team" in (params.requestedSchema?.properties ?? {})
-      ? { action: "accept", content: { team } }
-      : { action: "accept", content: { project } };
+/// Answers the copy question (`Yes` or `No`).
+function answerCopy(choice: "Yes" | "No" = "Yes"): AcpAnswer {
+  return () => ({ action: "accept", content: { copy: choice } });
 }
 
 /// One `fx acp` process with one session. Each prompt is one turn, and the
@@ -913,6 +932,7 @@ async function acpRun(
     permissionMode?: string;
     // The option id to choose for each permission request, given its params. Default: allow once.
     permissionOption?: (params: Record<string, any>) => string;
+    env?: Record<string, string | undefined>;
   } = {},
 ): Promise<{ elicitations: AcpElicitation[]; stopReasons: string[]; permissions: Array<Record<string, any>> }> {
   const env: Record<string, string> = {};
@@ -921,6 +941,7 @@ async function acpRun(
     ...fixture.setup.env,
     FX_PERMISSION_MODE: options.permissionMode ?? "full-access",
     PATH: process.env.PATH,
+    ...options.env,
   };
   for (const [key, value] of Object.entries(merged)) if (value !== undefined) env[key] = value;
   const proc = spawn(FX_BIN, ["acp"], { cwd: fixture.workspace, env, stdio: ["pipe", "pipe", "pipe"] });
@@ -1009,17 +1030,22 @@ describe("a command grant names its placement and project (A1, AC-13)", () => {
 });
 
 describe("an isolated folder with nothing set up, and a missing login (A1, E5)", () => {
-  test("an isolated folder with nothing set up asks the setup question, then runs isolated", async () => {
+  test("an isolated folder with nothing set up asks the copy question, creates fx-sandbox after Yes, then runs isolated", async () => {
     await withSetup({}, async (setup) => {
       await withSandboxFixture(
         shellCall({ command: "echo isolated-one" }),
         async (fixture) => {
-          const run = await acpRun(fixture, ["Run it."], answerSetup(fakeTeam.id, fakeTeam.projects[0]!.id));
-          expect(run.elicitations.map((e) => e.message)).toEqual([p2Message(fakeTeam.slug)]);
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
+          const run = await acpRun(fixture, ["Run it."], answerCopy("Yes"));
+          expect(run.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeTeam.name, "fx-sandbox")]);
+          const created = setup.api.log.filter((entry) => entry.route === "createProject");
+          expect(created).toHaveLength(1);
+          const remote = JSON.parse(sandboxConfigText(fixture)).remote;
+          expect(remote.team_id).toBe(fakeTeam.id);
+          expect(remote.project_name).toBe("fx-sandbox");
+          expectRemoteWritten(fixture, fakeTeam, { id: remote.project_id, name: "fx-sandbox" }, fakeUser.id);
           const texts = toolTexts(fixture.gateway);
           expect(texts).toContain("isolated-one");
-          expect(texts).toContain(`fx: ran isolated on vercel:${fakeTeam.slug}/${fakeTeam.projects[0]!.name}`);
+          expect(texts).toContain(`fx: ran isolated on vercel:${fakeTeam.slug}/fx-sandbox`);
           expectNoSetupNames(fixture.gateway);
         },
         () => ({ remote: undefined, rules: [{ command: "echo isolated-one", runner: "isolated" }] }),
@@ -1053,8 +1079,7 @@ describe("an isolated folder with nothing set up, and a missing login (A1, E5)",
   }, TIMEOUT);
 });
 
-// The sizes of a real account (U5, U6): thirty teams, and a team whose 25 projects put
-// `fx-sandbox` past the first page of 20. Entries are padded to the real entry sizes.
+// The sizes of a real account (U5, U6): padded team and project replies.
 describe("remote setup with the sizes of a real account (U5, U6)", () => {
   const bigTeam: SetupTeam = {
     ...fakeTeam,
@@ -1063,22 +1088,16 @@ describe("remote setup with the sizes of a real account (U5, U6)", () => {
       { id: "prj_sandbox", name: "fx-sandbox" },
     ],
   };
-  const otherTeams: SetupTeam[] = Array.from({ length: 29 }, (_, index) => ({
-    id: `team_big_${index}`,
-    slug: `big-${index}`,
-    name: `Big ${index}`,
-    projects: [],
-  }));
 
-  test("setup lists the teams and projects, offers fx-sandbox as existing, and the run goes on", async () => {
-    await withSetup({ teams: [bigTeam, ...otherTeams], padding: { team: 40 * 1024, project: 200 * 1024 } }, async (setup) => {
+  test("setup reads padded team and fx-sandbox replies, asks one copy question, and runs", async () => {
+    await withSetup({ teams: [bigTeam], padding: { team: 40 * 1024, project: 200 * 1024 } }, async (setup) => {
       await withSandboxFixture(
         [fakeGatewayToolCall("call-1", "shell", { command: "echo sized", runner: "remote" }), fakeGatewayFinalText("done\n")],
         async (fixture) => {
-          const run = await acpRun(fixture, ["Run it."], answerSetup(bigTeam.id, "prj_sandbox"));
+          const run = await acpRun(fixture, ["Run it."], answerCopy("Yes"));
           const texts = toolTexts(fixture.gateway);
           expect(texts).not.toContain("too large");
-          expect(run.elicitations.map((e) => e.message)).toEqual([P1_MESSAGE, p2Message(bigTeam.slug)]);
+          expect(run.elicitations.map((e) => e.message)).toEqual([copyMessage(bigTeam.name, "fx-sandbox")]);
           expectRemoteWritten(fixture, bigTeam, { id: "prj_sandbox", name: "fx-sandbox" }, fakeUser.id);
           expect(texts).toContain("sized");
         },
@@ -1090,9 +1109,9 @@ describe("remote setup with the sizes of a real account (U5, U6)", () => {
   }, TIMEOUT * 3);
 });
 
-describe("remote setup over ACP: the prompts and the first run (AC-5, AC-6)", () => {
-  test("AC-5: two teams: a team prompt, then a project prompt, one write, the command runs remote, and a second remote call asks nothing", async () => {
-    await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
+describe("remote setup over ACP: destination defaults, copy question, and consent (AC-5, AC-6)", () => {
+  test("AC-5: no team or project prompt, one copy question, one write, runs remote, and second call in same repo asks nothing", async () => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam), fakeSecondTeam] }, async (setup) => {
       await withSandboxFixture(
         [
           fakeGatewayToolCall("call-1", "shell", { command: "echo first", runner: "remote" }),
@@ -1100,9 +1119,9 @@ describe("remote setup over ACP: the prompts and the first run (AC-5, AC-6)", ()
           fakeGatewayFinalText("done\n"),
         ],
         async (fixture) => {
-          const run = await acpRun(fixture, ["Run two commands."], answerSetup(fakeTeam.id, fakeTeam.projects[0]!.id));
-          expect(run.elicitations.map((e) => e.message)).toEqual([P1_MESSAGE, p2Message(fakeTeam.slug)]);
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
+          const run = await acpRun(fixture, ["Run two commands."], answerCopy("Yes"));
+          expect(run.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeTeam.name, "fx-sandbox")]);
+          expectRemoteWritten(fixture, fakeTeam, { id: `prj_sandbox_${fakeTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
           const texts = toolTexts(fixture.gateway);
           expect(texts).toContain("first");
           expect(texts).toContain("second");
@@ -1117,28 +1136,7 @@ describe("remote setup over ACP: the prompts and the first run (AC-5, AC-6)", ()
     });
   }, TIMEOUT * 3);
 
-  test("ACP, one team: one project prompt with the exact message, one write, and the command runs remote", async () => {
-    await withSetup({}, async (setup) => {
-      await withSandboxFixture(
-        shellCall({ command: "echo one", runner: "remote" }),
-        async (fixture) => {
-          const run = await acpRun(fixture, ["Run it."], answerSetup(fakeTeam.id, fakeTeam.projects[0]!.id));
-          expect(run.elicitations.map((e) => e.message)).toEqual([p2Message(fakeTeam.slug)]);
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
-          expect(sandboxConfigText(fixture).split('"remote"').length - 1).toBe(1);
-          const texts = toolTexts(fixture.gateway);
-          expect(texts).toContain("one");
-          expect(execEvents(fixture).length).toBeGreaterThan(0);
-          expectNoInterimText(texts, JSON.stringify(run.elicitations));
-        },
-        NO_REMOTE,
-        true,
-        setup,
-      );
-    });
-  }, TIMEOUT * 3);
-
-  test("AC-6: the client declines the project prompt, so both calls are E8 in the turn, with one prompt and the config unchanged", async () => {
+  test("AC-6: answering No to the copy question gives E8 for the turn, nothing written, and nothing created on Vercel", async () => {
     await withSetup({}, async (setup) => {
       await withSandboxFixture(
         [
@@ -1148,11 +1146,13 @@ describe("remote setup over ACP: the prompts and the first run (AC-5, AC-6)", ()
         ],
         async (fixture) => {
           const before = sandboxConfigText(fixture);
-          const run = await acpRun(fixture, ["Run two commands."], () => ({ action: "decline" }));
+          const run = await acpRun(fixture, ["Run two commands."], answerCopy("No"));
           expect(run.elicitations.length).toBe(1);
           const texts = toolTexts(fixture.gateway);
           expect(callsWithResult(fixture.gateway, E8_DECLINED)).toBe(2);
           expect(sandboxConfigText(fixture)).toBe(before);
+          expect(existsSync(consentFilePath(fixture.home, fakeUser.id, fixture.workspace))).toBe(false);
+          expect(setup.api.log.filter((entry) => entry.route === "createProject")).toEqual([]);
           expect(execEvents(fixture)).toEqual([]);
           expectNoInterimText(texts, JSON.stringify(run.elicitations));
         },
@@ -1163,8 +1163,8 @@ describe("remote setup over ACP: the prompts and the first run (AC-5, AC-6)", ()
     });
   }, TIMEOUT * 3);
 
-  test("a decline on the team prompt is E8 for the rest of the turn with no prompt, and a new prompt asks again", async () => {
-    await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
+  test("dismissing the copy question is E8 for the rest of the turn, and a new turn asks again", async () => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam)] }, async (setup) => {
       await withSandboxFixture(
         [
           fakeGatewayToolCall("call-1", "shell", { command: "echo one", runner: "remote" }),
@@ -1174,25 +1174,19 @@ describe("remote setup over ACP: the prompts and the first run (AC-5, AC-6)", ()
           fakeGatewayFinalText("second turn done\n"),
         ],
         async (fixture) => {
-          let teamPrompts = 0;
-          const run = await acpRun(fixture, ["First turn.", "Second turn."], (params) => {
-            if ("team" in (params.requestedSchema?.properties ?? {})) {
-              teamPrompts += 1;
-              return teamPrompts === 1
-                ? { action: "decline" }
-                : { action: "accept", content: { team: fakeTeam.id } };
-            }
-            return { action: "accept", content: { project: fakeTeam.projects[0]!.id } };
+          let prompts = 0;
+          const run = await acpRun(fixture, ["First turn.", "Second turn."], () => {
+            prompts += 1;
+            return prompts === 1 ? { action: "decline" } : { action: "accept", content: { copy: "Yes" } };
           });
           expect(run.elicitations.map((e) => [e.turn, e.message])).toEqual([
-            [1, P1_MESSAGE],
-            [2, P1_MESSAGE],
-            [2, p2Message(fakeTeam.slug)],
+            [1, copyMessage(fakeTeam.name, "fx-sandbox")],
+            [2, copyMessage(fakeTeam.name, "fx-sandbox")],
           ]);
           const texts = toolTexts(fixture.gateway);
           expect(callsWithResult(fixture.gateway, E8_DECLINED)).toBe(2);
           expect(texts).toContain("three");
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
+          expectRemoteWritten(fixture, fakeTeam, { id: `prj_sandbox_${fakeTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
           expectNoInterimText(texts, JSON.stringify(run.elicitations));
         },
         NO_REMOTE,
@@ -1202,42 +1196,43 @@ describe("remote setup over ACP: the prompts and the first run (AC-5, AC-6)", ()
     });
   }, TIMEOUT * 4);
 
-  test("a team name with an escape sequence shows with no ESC byte in the ACP prompt, and the step gets the team's id", async () => {
-    const escaped: SetupTeam = {
+  test("a team name with an escape sequence shows with no ESC byte in the ACP copy question", async () => {
+    const escaped: SetupTeam = teamWithSandbox({
       id: "team_fx_esc",
       slug: "evil-team",
       name: "evil\x1b[2Jteam",
       projects: [{ id: "prj_fx_esc", name: "esc-project" }],
-    };
-    await withSetup({ teams: [escaped, fakeSecondTeam] }, async (setup) => {
-      await withSandboxFixture(
-        shellCall({ command: "echo esc", runner: "remote" }),
-        async (fixture) => {
-          const run = await acpRun(fixture, ["Run it."], answerSetup(escaped.id, escaped.projects[0]!.id));
-          const titles = (run.elicitations[0]!.params.requestedSchema.properties.team.oneOf as Array<{ title: string }>).map(
-            (option) => option.title,
-          );
-          expect(titles.some((title) => title.includes("evil"))).toBe(true);
-          for (const title of titles) expect(title).not.toContain("\x1b");
-          expect(JSON.stringify(run.elicitations)).not.toContain("\\u001b");
-          expectRemoteWritten(fixture, escaped, escaped.projects[0]!, fakeUser.id);
-        },
-        NO_REMOTE,
-        true,
-        setup,
-      );
     });
+    await withSetup(
+      { teams: [escaped], user: { ...fakeUser, defaultTeamId: escaped.id } },
+      async (setup) => {
+        await withSandboxFixture(
+          shellCall({ command: "echo esc", runner: "remote" }),
+          async (fixture) => {
+            const run = await acpRun(fixture, ["Run it."], answerCopy("Yes"));
+            expect(run.elicitations[0]!.message).toContain("evil\\x1b[2Jteam");
+            expect(run.elicitations[0]!.message).not.toContain("\x1b");
+            expect(JSON.stringify(run.elicitations)).not.toContain("\\u001b");
+            expectRemoteWritten(fixture, escaped, { id: `prj_sandbox_${escaped.id}`, name: "fx-sandbox" }, fakeUser.id);
+          },
+          NO_REMOTE,
+          true,
+          setup,
+        );
+      },
+    );
   }, TIMEOUT * 3);
 
   test("AC-20: a config file that cannot be read is refused on the write, and its bytes are unchanged", async () => {
-    await withSetup({}, async (setup) => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam)] }, async (setup) => {
       await withSandboxFixture(
         shellCall({ command: "echo cfg", runner: "remote" }),
         async (fixture) => {
           const broken = '{"provider_args": [';
           writeFileSync(join(fixture.home, ".fx", "sandbox", "config.json"), broken);
-          const run = await acpRun(fixture, ["Run it."], answerSetup(fakeTeam.id, fakeTeam.projects[0]!.id));
+          const run = await acpRun(fixture, ["Run it."], answerCopy("Yes"));
           expect(sandboxConfigText(fixture)).toBe(broken);
+          expect(existsSync(consentFilePath(fixture.home, fakeUser.id, fixture.workspace))).toBe(false);
           expect(execEvents(fixture)).toEqual([]);
           const texts = toolTexts(fixture.gateway);
           expect(texts).toContain("fx did not run this command: ");
@@ -1250,55 +1245,234 @@ describe("remote setup over ACP: the prompts and the first run (AC-5, AC-6)", ()
     });
   }, TIMEOUT * 3);
 
-  test("AC-18: a token for another user: the config's remote names the other user, so the project prompt appears again", async () => {
-    await withSetup({ user: fakeOtherUser }, async (setup) => {
+  test("AC-18: a token for another user: the config's remote names the other user, so the copy question appears again", async () => {
+    await withSetup({ user: fakeOtherUser, teams: [teamWithSandbox(fakeTeam)] }, async (setup) => {
       await withSandboxFixture(
         shellCall({ command: "echo again", runner: "remote" }),
         async (fixture) => {
-          const run = await acpRun(fixture, ["Run it."], answerSetup(fakeTeam.id, fakeTeam.projects[0]!.id));
-          expect(run.elicitations.map((e) => e.message)).toEqual([p2Message(fakeTeam.slug)]);
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeOtherUser.id);
+          const run = await acpRun(fixture, ["Run it."], answerCopy("Yes"));
+          expect(run.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeTeam.name, "fx-sandbox")]);
+          expectRemoteWritten(fixture, fakeTeam, { id: `prj_sandbox_${fakeTeam.id}`, name: "fx-sandbox" }, fakeOtherUser.id);
           const texts = toolTexts(fixture.gateway);
           expect(texts).toContain("again");
           expectNoInterimText(texts, JSON.stringify(run.elicitations));
         },
-        (repo) => ({ remote: setup.remoteFor(fakeTeam, fakeTeam.projects[0]!, fakeUser.id) }),
+        () => ({ remote: setup.remoteFor(fakeTeam, fakeTeam.projects[0]!, fakeUser.id) }),
         true,
         setup,
       );
     });
   }, TIMEOUT * 3);
-});
 
-describe("remote setup without a channel, and the login refusals (AC-7, AC-18, AC-30, E10)", () => {
-  test("AC-7: fx ask --json with no remote and no channel gives E7 within 5 s, asks nothing, and writes no config", async () => {
-    await withSetup({}, async (setup) => {
+  test("team resolution: CLI currentTeam, user defaultTeamId, and sandbox_team setting override", async () => {
+    // 1. CLI currentTeam when user has no defaultTeamId.
+    await withSetup(
+      {
+        teams: [teamWithSandbox(fakeTeam), teamWithSandbox(fakeSecondTeam)],
+        user: { ...fakeUser, defaultTeamId: null },
+      },
+      async (setup) => {
+        await withSandboxFixture(
+          shellCall({ command: "echo cli-team", runner: "remote" }),
+          async (fixture) => {
+            writeCliLoginAndTeam(fixture.home, { currentTeam: fakeSecondTeam.id });
+            const run = await acpRun(fixture, ["Run it."], answerCopy("Yes"), {
+              env: { VERCEL_TOKEN: undefined, XDG_DATA_HOME: undefined },
+            });
+            expect(run.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeSecondTeam.name, "fx-sandbox")]);
+            expectRemoteWritten(fixture, fakeSecondTeam, { id: `prj_sandbox_${fakeSecondTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
+            expect(toolTexts(fixture.gateway)).toContain("cli-team");
+          },
+          NO_REMOTE,
+          true,
+          setup,
+        );
+      },
+    );
+
+    // 2. user.defaultTeamId when no CLI config.json exists.
+    await withSetup(
+      {
+        teams: [teamWithSandbox(fakeTeam), teamWithSandbox(fakeSecondTeam)],
+        user: { ...fakeUser, defaultTeamId: fakeSecondTeam.id },
+      },
+      async (setup) => {
+        await withSandboxFixture(
+          shellCall({ command: "echo default-team", runner: "remote" }),
+          async (fixture) => {
+            const run = await acpRun(fixture, ["Run it."], answerCopy("Yes"));
+            expect(run.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeSecondTeam.name, "fx-sandbox")]);
+            expectRemoteWritten(fixture, fakeSecondTeam, { id: `prj_sandbox_${fakeSecondTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
+            expect(toolTexts(fixture.gateway)).toContain("default-team");
+          },
+          NO_REMOTE,
+          true,
+          setup,
+        );
+      },
+    );
+
+    // 3. sandbox_team setting overrides both CLI currentTeam and defaultTeamId.
+    await withSetup(
+      { teams: [teamWithSandbox(fakeTeam), teamWithSandbox(fakeSecondTeam)] },
+      async (setup) => {
+        await withSandboxFixture(
+          shellCall({ command: "echo setting-team", runner: "remote" }),
+          async (fixture) => {
+            writeCliLoginAndTeam(fixture.home, { currentTeam: fakeTeam.id });
+            writeFileSync(
+              join(fixture.home, ".fx", "settings.json"),
+              JSON.stringify({ experimental: { sandbox_execution: true }, sandbox_team: fakeSecondTeam.slug }),
+            );
+            const run = await acpRun(fixture, ["Run it."], answerCopy("Yes"));
+            expect(run.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeSecondTeam.name, "fx-sandbox")]);
+            expectRemoteWritten(fixture, fakeSecondTeam, { id: `prj_sandbox_${fakeSecondTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
+            expect(toolTexts(fixture.gateway)).toContain("setting-team");
+          },
+          NO_REMOTE,
+          true,
+          setup,
+        );
+      },
+    );
+  }, TIMEOUT * 6);
+
+  test("missing sandbox_project setting refuses with fix text, asks nothing, and creates nothing", async () => {
+    await withSetup({ teams: [fakeTeam] }, async (setup) => {
       await withSandboxFixture(
-        shellCall({ command: "echo headless", runner: "remote" }),
+        shellCall({ command: "echo missing-proj", runner: "remote" }),
         async (fixture) => {
-          const before = sandboxConfigText(fixture);
-          const started = Date.now();
-          const result = await runFx(["ask", "--json", "--permission-mode", "full-access", "Run it."], {
-            cwd: fixture.workspace,
-            timeoutMs: TIMEOUT,
-            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
-          });
-          const elapsed = Date.now() - started;
-          expect(result.code).toBe(0);
-          expect(elapsed).toBeLessThan(5000);
+          writeFileSync(
+            join(fixture.home, ".fx", "settings.json"),
+            JSON.stringify({ experimental: { sandbox_execution: true }, sandbox_project: "does-not-exist" }),
+          );
+          const run = await acpRun(fixture, ["Run it."], answerCopy("Yes"));
+          expect(run.elicitations).toEqual([]);
           const texts = toolTexts(fixture.gateway);
-          expect(texts).toContain(E7_NO_CHANNEL);
-          expect(sandboxConfigText(fixture)).toBe(before);
+          expect(texts).toContain("does-not-exist");
+          expect(texts).toContain("fx config set sandbox_project <name>");
+          expect(setup.api.log.filter((entry) => entry.route === "createProject")).toEqual([]);
           expect(execEvents(fixture)).toEqual([]);
-          expect(setup.api.log).toEqual([]);
-          expectNoInterimText(texts);
         },
         NO_REMOTE,
         true,
         setup,
       );
     });
-  }, TIMEOUT);
+  }, TIMEOUT * 3);
+
+  test("fx-sandbox is created only after Yes, never before", async () => {
+    await withSetup({ teams: [fakeTeam] }, async (setup) => {
+      await withSandboxFixture(
+        [
+          fakeGatewayToolCall("call-1", "shell", { command: "echo first", runner: "remote" }),
+          fakeGatewayFinalText("declined\n"),
+          fakeGatewayToolCall("call-2", "shell", { command: "echo second", runner: "remote" }),
+          fakeGatewayFinalText("accepted\n"),
+        ],
+        async (fixture) => {
+          let turn = 0;
+          const run = await acpRun(fixture, ["Turn 1.", "Turn 2."], () => {
+            turn += 1;
+            if (turn === 1) {
+              expect(setup.api.log.filter((entry) => entry.route === "createProject")).toEqual([]);
+              return { action: "accept", content: { copy: "No" } };
+            }
+            return { action: "accept", content: { copy: "Yes" } };
+          });
+          expect(run.elicitations).toHaveLength(2);
+          expect(setup.api.log.filter((entry) => entry.route === "createProject")).toHaveLength(1);
+          expect(toolTexts(fixture.gateway)).toContain("second");
+        },
+        NO_REMOTE,
+        true,
+        setup,
+      );
+    });
+  }, TIMEOUT * 3);
+
+  test("consent in repo A asks again in repo B, and a destination change asks again", async () => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam), teamWithSandbox(fakeSecondTeam)] }, async (setup) => {
+      await withSandboxFixture(
+        [
+          fakeGatewayToolCall("call-1", "shell", { command: "echo repo-a", runner: "remote" }),
+          fakeGatewayFinalText("repo a\n"),
+          fakeGatewayToolCall("call-2", "shell", { command: "echo repo-a-dest2", runner: "remote" }),
+          fakeGatewayFinalText("repo a dest2\n"),
+        ],
+        async (fixture) => {
+          const runA = await acpRun(fixture, ["Run in A."], answerCopy("Yes"));
+          expect(runA.elicitations).toHaveLength(1);
+
+          // Second repository with the same fx_home must ask again.
+          const repoB = join(createDir(), "repo-b");
+          mkdirSync(repoB);
+          writeFileSync(join(repoB, "b.txt"), "b\n");
+          git(repoB, ["init", "-q"]);
+          git(repoB, ["add", "b.txt"]);
+          git(repoB, ["commit", "-q", "-m", "initial"]);
+          const gatewayB = startFakeGateway([
+            fakeGatewayToolCall("call-b", "shell", { command: "echo repo-b", runner: "remote" }),
+            fakeGatewayFinalText("repo b\n"),
+          ]);
+          gateways.push(gatewayB);
+          const runB = await acpRun(
+            { home: fixture.home, workspace: realpathSync(repoB), gateway: gatewayB, setup, logStart: setup.api.log.length },
+            ["Run in B."],
+            answerCopy("Yes"),
+          );
+          expect(runB.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeTeam.name, "fx-sandbox")]);
+          expect(toolTexts(gatewayB)).toContain("repo-b");
+
+          // Destination change in repo A asks again.
+          writeFileSync(
+            join(fixture.home, ".fx", "settings.json"),
+            JSON.stringify({ experimental: { sandbox_execution: true }, sandbox_team: fakeSecondTeam.slug }),
+          );
+          const runA2 = await acpRun(fixture, ["Run in A again."], answerCopy("Yes"));
+          expect(runA2.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeSecondTeam.name, "fx-sandbox")]);
+          expectRemoteWritten(fixture, fakeSecondTeam, { id: `prj_sandbox_${fakeSecondTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
+        },
+        NO_REMOTE,
+        true,
+        setup,
+      );
+    });
+  }, TIMEOUT * 4);
+});
+
+describe("remote setup without a channel, and the login refusals (AC-7, AC-18, AC-30, E10)", () => {
+  test("AC-7: plain fx ask and fx ask --json with no consent and no channel refuse with E7 within 5 s, ask nothing, and write no config", async () => {
+    await withSetup({}, async (setup) => {
+      for (const extraArgs of [["--json"], []] as const) {
+        await withSandboxFixture(
+          shellCall({ command: "echo headless", runner: "remote" }),
+          async (fixture) => {
+            const before = sandboxConfigText(fixture);
+            const started = Date.now();
+            const result = await runFx(["ask", ...extraArgs, "--permission-mode", "full-access", "Run it."], {
+              cwd: fixture.workspace,
+              timeoutMs: TIMEOUT,
+              env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
+            });
+            const elapsed = Date.now() - started;
+            expect(result.code).toBe(0);
+            expect(elapsed).toBeLessThan(5000);
+            const texts = toolTexts(fixture.gateway);
+            expect(texts).toContain(E7_NO_CHANNEL);
+            expect(sandboxConfigText(fixture)).toBe(before);
+            expect(existsSync(consentFilePath(fixture.home, fakeUser.id, fixture.workspace))).toBe(false);
+            expect(execEvents(fixture)).toEqual([]);
+            expect(setup.api.log).toEqual([]);
+            expectNoInterimText(texts);
+          },
+          NO_REMOTE,
+          true,
+          setup,
+        );
+      }
+    });
+  }, TIMEOUT * 2);
 
   test("AC-18: no token and no auth file gives E5, with no request to the fake", async () => {
     await withSetup({}, async (setup) => {
@@ -1440,7 +1614,7 @@ describe("a sub-agent's remote call over ACP, which has a channel (U2, E10)", ()
           return fakeGatewayToolCall("call-child", "shell", { command: "echo child", runner: "remote" });
         },
         async (fixture) => {
-          const run = await acpRun(fixture, ["Delegate a remote command."], answerSetup(fakeTeam.id, fakeTeam.projects[0]!.id));
+          const run = await acpRun(fixture, ["Delegate a remote command."], answerCopy("Yes"));
           expect(run.elicitations).toEqual([]);
           expect(toolTexts(fixture.gateway)).toContain(E10_SUB_AGENT);
           expect(setup.api.log).toEqual([]);
@@ -1488,15 +1662,15 @@ describe("login changes, first use, the model's view and include (V1, R5, AC-5, 
     });
   }, TIMEOUT * 3);
 
-  test("a fresh profile with no sandbox folder: the first remote setup writes the config, and the command runs", async () => {
-    await withSetup({}, async (setup) => {
+  test("a fresh profile with no sandbox folder: the first remote setup writes the config and consent, and the command runs", async () => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam)] }, async (setup) => {
       await withSandboxFixture(
         [fakeGatewayToolCall("call-1", "shell", { command: "echo fresh-profile", runner: "remote" }), fakeGatewayFinalText("done\n")],
         async (fixture) => {
           rmSync(join(fixture.home, ".fx", "sandbox"), { recursive: true, force: true });
-          const run = await acpRun(fixture, ["Run it."], answerSetup(fakeTeam.id, fakeTeam.projects[0]!.id));
-          expect(run.elicitations.map((e) => e.message)).toEqual([p2Message(fakeTeam.slug)]);
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
+          const run = await acpRun(fixture, ["Run it."], answerCopy("Yes"));
+          expect(run.elicitations.map((e) => e.message)).toEqual([copyMessage(fakeTeam.name, "fx-sandbox")]);
+          expectRemoteWritten(fixture, fakeTeam, { id: `prj_sandbox_${fakeTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
           expect(toolResults(fixture.gateway).some((text) => text.includes("fresh-profile"))).toBe(true);
         },
         NO_REMOTE,
@@ -1507,11 +1681,11 @@ describe("login changes, first use, the model's view and include (V1, R5, AC-5, 
   }, TIMEOUT * 3);
 
   test("AC-5: no fake-gateway request body carries a setup list's team or project id or name", async () => {
-    await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam), fakeSecondTeam] }, async (setup) => {
       await withSandboxFixture(
         [fakeGatewayToolCall("call-1", "shell", { command: "echo listed", runner: "remote" }), fakeGatewayFinalText("done\n")],
         async (fixture) => {
-          const run = await acpRun(fixture, ["Run it."], answerSetup(fakeTeam.id, fakeTeam.projects[0]!.id));
+          const run = await acpRun(fixture, ["Run it."], answerCopy("Yes"));
           expect(run.elicitations.length).toBeGreaterThan(0);
           // The run's own destination is named in its N14 line (the model may see it, R270), so only the lists are checked.
           const listed = [fakeSecondTeam.id, fakeSecondTeam.slug, fakeSecondTeam.name, fakeSecondTeam.projects[0]!.id, fakeSecondTeam.projects[0]!.name, fakeTeam.id, fakeTeam.name, fakeTeam.projects[0]!.id];
@@ -1573,8 +1747,8 @@ describe("login changes, first use, the model's view and include (V1, R5, AC-5, 
     });
   }, TIMEOUT * 2);
 
-  test.skipIf(!tmuxAvailable())("fx ask in a terminal with a fresh profile: the first setup writes the config, and the command runs", async () => {
-    await withSetup({}, async (setup) => {
+  test.skipIf(!tmuxAvailable())("fx ask in a terminal with a fresh profile: the compact copy form writes the config and consent, and the command runs", async () => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam)] }, async (setup) => {
       await withSandboxFixture(
         shellCall({ command: "printf 'fresh-tmux\\n'", runner: "remote" }),
         async (fixture) => {
@@ -1586,14 +1760,12 @@ describe("login changes, first use, the model's view and include (V1, R5, AC-5, 
             env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
           });
           sessions.push(session);
-          expect(await session.waitForText("fx asks", TIMEOUT)).toContain("fx asks");
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          expect(await session.waitForText("Choose an option to submit.", TIMEOUT)).toContain("fx asks");
+          expect(await session.captureFullScrollback()).not.toContain("Submit, Edit, Decline, or Cancel");
           await session.sendLiteral("1");
           await session.sendKeys("Enter");
           expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
+          expectRemoteWritten(fixture, fakeTeam, { id: `prj_sandbox_${fakeTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
           expect(toolResults(fixture.gateway).some((text) => text.includes("fresh-tmux"))).toBe(true);
         },
         NO_REMOTE,
@@ -1603,8 +1775,8 @@ describe("login changes, first use, the model's view and include (V1, R5, AC-5, 
     });
   }, TIMEOUT * 3);
 
-  test.skipIf(!tmuxAvailable())("the TUI with a fresh profile: the first remote call sets up, and the second runs with no question", async () => {
-    await withSetup({}, async (setup) => {
+  test.skipIf(!tmuxAvailable())("the TUI with a fresh profile: the first remote call asks compact copy once, and the second runs with no question", async () => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam)] }, async (setup) => {
       await withSandboxFixture(
         [
           fakeGatewayToolCall("tui-call-1", "shell", { command: "printf 'tui-1\\n'", runner: "remote" }),
@@ -1623,15 +1795,14 @@ describe("login changes, first use, the model's view and include (V1, R5, AC-5, 
           sessions.push(session);
           await session.waitForComposer(TIMEOUT);
           await session.sendText("Run it.");
-          expect(await session.waitForText("fx asks", TIMEOUT)).toContain("fx asks");
-          // A digit answers its question at once, so no Enter follows it.
-          await session.sendLiteral("1");
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          expect(await session.waitForText("Copy this repository to Vercel team", TIMEOUT)).toContain("fx-sandbox");
+          expect(await session.captureFullScrollback()).not.toContain("Submit, Edit, Decline, or Cancel");
+          // A digit answers the compact host form at once, with no Enter or review step.
           await session.sendLiteral("1");
           await session.waitForText("First done.", TIMEOUT);
           await session.waitForStableComposer(TIMEOUT);
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
-          const setupRequests = (): number => setup.api.log.filter((entry) => entry.route === "teams" || entry.route === "write").length;
+          expectRemoteWritten(fixture, fakeTeam, { id: `prj_sandbox_${fakeTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
+          const setupRequests = (): number => setup.api.log.filter((entry) => entry.route === "teamBySlug" || entry.route === "project").length;
           const afterFirst = setupRequests();
           await session.sendText("Run again.");
           await session.waitForText("Second done.", TIMEOUT);
@@ -1644,16 +1815,52 @@ describe("login changes, first use, the model's view and include (V1, R5, AC-5, 
       );
     });
   }, TIMEOUT * 3);
+
+  test.skipIf(!tmuxAvailable())("/sandbox setup followed by fx config set sandbox_team makes the next remote call use the new team without restart", async () => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam), teamWithSandbox(fakeSecondTeam)] }, async (setup) => {
+      await withSandboxFixture(
+        (body) => {
+          if (body.includes("tui-switched-call")) return fakeGatewayFinalText("Switched remote done.\n");
+          if (body.includes("Run on new team.")) {
+            return fakeGatewayToolCall("tui-switched-call", "shell", { command: "printf 'tui-switched\\n'", runner: "remote" });
+          }
+          if (body.includes("config-set-call")) return fakeGatewayFinalText("Team set to fx-second-team.\n");
+          return fakeGatewayToolCall("config-set-call", "shell", {
+            command: `${FX_BIN} config set sandbox_team ${fakeSecondTeam.slug}`,
+          });
+        },
+        async (fixture) => {
+          rmSync(join(fixture.home, ".fx", "sandbox"), { recursive: true, force: true });
+          const session = await TmuxSession.create({
+            cmd: FX_BIN,
+            cwd: fixture.workspace,
+            width: 200,
+            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env, FX_PERMISSION_MODE: "full-access" },
+          });
+          sessions.push(session);
+          await session.waitForComposer(TIMEOUT);
+          await session.sendText("/sandbox setup");
+          await session.waitForText("Team set to fx-second-team.", TIMEOUT);
+          await session.waitForStableComposer(TIMEOUT);
+
+          await session.sendText("Run on new team.");
+          await session.waitForText(`Copy this repository to Vercel team ${fakeSecondTeam.name}, project fx-sandbox?`, TIMEOUT);
+          await session.sendLiteral("1");
+          await session.waitForText("Switched remote done.", TIMEOUT);
+          expectRemoteWritten(fixture, fakeSecondTeam, { id: `prj_sandbox_${fakeSecondTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
+          expect(toolResults(fixture.gateway).some((text) => text.includes("tui-switched"))).toBe(true);
+        },
+        NO_REMOTE,
+        true,
+        setup,
+      );
+    });
+  }, TIMEOUT * 3);
 });
 
-// The optional name question that the form shows only for "Another project" (x-fx-shown-when).
-const OTHER_NAME_TEXT = "Project name, for Another project";
-const typedProject: SetupProject = { id: "prj_fx_typed", name: "fx-typed-project" };
-const typedNameTeam = { ...fakeTeam, projects: [fakeTeam.projects[0]!, typedProject] };
-
 describe("remote setup in a terminal (AC-25)", () => {
-  test.skipIf(!tmuxAvailable())("AC-25: fx ask in a terminal shows the fx asks header, and the command runs after the accept", async () => {
-    await withSetup({}, async (setup) => {
+  test.skipIf(!tmuxAvailable())("AC-25: fx ask in a terminal shows fx asks with no review screen, and the command runs after Yes", async () => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam)] }, async (setup) => {
       await withSandboxFixture(
         shellCall({ command: "printf 'tui%s\\n' ok-42", runner: "remote" }),
         async (fixture) => {
@@ -1664,23 +1871,15 @@ describe("remote setup in a terminal (AC-25)", () => {
             env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
           });
           sessions.push(session);
-          const header = await session.waitForText("fx asks", TIMEOUT);
+          const header = await session.waitForText("Choose an option to submit.", TIMEOUT);
           expect(header).toContain("fx asks");
-          // The form lists the projects as numbers: "1. [1] fx-test-project" is the first.
+          expect(header).toContain("1. Yes");
+          expect(header).toContain("2. No");
+          expect(header).not.toContain("Submit, Edit, Decline, or Cancel");
           await session.sendLiteral("1");
           await session.sendKeys("Enter");
-          // The completed form is reviewed before it is sent. Submit: option 1.
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          // Known gap, older code (not fixed here): after a prompt, fx ask's live tool group
-          // and its final reply write over the prompt's lines (ask_presentation.zig; the prompt
-          // writer in cli_ask.zig), so the reply is not reliably on screen. The sandbox log is
-          // the evidence until that is fixed. The width is 200: at 120 columns the reason line
-          // loses its end, because fx ask turns autowrap off (ask_presentation.zig).
           expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
-          // The sandbox started the command and it exited 0.
+          expectRemoteWritten(fixture, fakeTeam, { id: `prj_sandbox_${fakeTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
           const started = events(fixture).find((event) => event.ev === "start" && JSON.stringify(event.argv).includes("ok-42"));
           expect(started).toBeDefined();
           expect(events(fixture).some((event) => event.ev === "exit" && event.id === started!.id && event.code === 0)).toBe(true);
@@ -1692,46 +1891,9 @@ describe("remote setup in a terminal (AC-25)", () => {
     });
   }, TIMEOUT * 3);
 
-  test.skipIf(!tmuxAvailable())("AC-25: the team and project menus list one number per option, and the review names the team", async () => {
-    await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
-      await withSandboxFixture(
-        shellCall({ command: "printf 'tui%s\\n' ok-42", runner: "remote" }),
-        async (fixture) => {
-          const session = await TmuxSession.create({
-            cmd: `${FX_BIN} ask --permission-mode full-access "Run it."`,
-            cwd: fixture.workspace,
-            width: 200,
-            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
-          });
-          sessions.push(session);
-          await session.waitForText("Which Vercel team should remote commands use?", TIMEOUT);
-          const teamMenu = await session.captureFullScrollback();
-          expect(teamMenu).toMatch(/^ {2}1\. fx test team/m);
-          expect(teamMenu).not.toContain("[1]");
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          // The team is reviewed before it is sent. Submit: option 1.
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
-          const review = await session.captureFullScrollback();
-          expect(review).toContain("- team: fx test team (fx-test-team)");
-          expect(review).not.toContain(fakeTeam.id);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Pick a project in fx-test-team", TIMEOUT);
-          const projectMenu = await session.captureFullScrollback();
-          expect(projectMenu).toMatch(/^ {2}1\. fx-test-project$/m);
-          expect(projectMenu).not.toContain("[1]");
-        },
-        NO_REMOTE,
-        true,
-        setup,
-      );
-    });
-  }, TIMEOUT * 3);
-
-  test.skipIf(!tmuxAvailable())("AC-25: width 120 keeps both Reason lines and the remote command output intact without garbling", async () => {
+  test.skipIf(!tmuxAvailable())("AC-25: width 120 keeps the copy Reason line and the remote command output intact without garbling", async () => {
     const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
-    await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam)] }, async (setup) => {
       await withSandboxFixture(
         [
           fakeGatewayToolCall("call-1", "shell", { command: "printf 'remote-out-%s\\n' ok-42" }),
@@ -1752,45 +1914,35 @@ describe("remote setup in a terminal (AC-25)", () => {
             env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
           });
           sessions.push(session);
-          await session.waitForText("Which Vercel team should remote commands use?", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Pick a project in fx-test-team", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          await session.waitForText("Choose an option to submit.", TIMEOUT);
           await session.sendLiteral("1");
           await session.sendKeys("Enter");
           await session.waitForText("__FX_EXIT_0__", TIMEOUT);
 
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
+          expectRemoteWritten(fixture, fakeTeam, { id: `prj_sandbox_${fakeTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
           const started = events(fixture).find((event) => event.ev === "start" && JSON.stringify(event.argv).includes("ok-42"));
           expect(started).toBeDefined();
           expect(events(fixture).some((event) => event.ev === "exit" && event.id === started!.id && event.code === 0)).toBe(true);
 
           const scrollback = await session.captureFullScrollback();
           const lines = scrollback.split("\n").map((line) => line.trimEnd());
-          const teamReason = "Reason: Which Vercel team should remote commands use?";
-          const projectReason = `Reason: Pick a project in ${fakeTeam.slug}. fx will copy this repository's files to a sandbox in the project you pick, for remote commands.`;
+          const copyReason = `Reason: Copy this repository to Vercel team ${fakeTeam.name}, project fx-sandbox? fx copies its tracked and unignored files to a sandbox there for remote commands.`;
           const outputText = "remote-out-ok-42";
 
-          expect(lines).toContain(teamReason);
-
-          const projectReasonStart = lines.findIndex((line) => line.startsWith("Reason: Pick a project in "));
-          expect(projectReasonStart).toBeGreaterThanOrEqual(0);
-          const firstLine = lines[projectReasonStart] ?? "";
-          const secondLine = lines[projectReasonStart + 1] ?? "";
-          const joinedProjectReason = firstLine.length === 120 || `${firstLine}${secondLine}` === projectReason
-            ? `${firstLine}${secondLine}`
-            : `${firstLine} ${secondLine}`;
-          expect(joinedProjectReason).toBe(projectReason);
+          const reasonStart = lines.findIndex((line) => line.startsWith("Reason: Copy this repository to Vercel team "));
+          expect(reasonStart).toBeGreaterThanOrEqual(0);
+          let joinedReason = lines[reasonStart] ?? "";
+          let previousRow = joinedReason;
+          for (let row = reasonStart + 1; !joinedReason.endsWith("remote commands.") && row < lines.length; row += 1) {
+            const line = lines[row] ?? "";
+            joinedReason += previousRow.length === 120 ? line : ` ${line}`;
+            previousRow = line;
+          }
+          expect(joinedReason).toBe(copyReason);
 
           expect(lines.some((line) => line.trim() === outputText)).toBe(true);
 
-          const formPattern = /fx asks|Reason:|Which Vercel team|Pick a project|Another project|Choose a number|Submit, Edit, Decline|Current values/;
+          const formPattern = /fx asks|Reason:|Copy this repository|Choose an option|Submit, Edit, Decline/;
           const commandOutputPattern = /remote-out-ok-42|Running printf/;
           for (const line of lines) {
             expect(formPattern.test(line) && commandOutputPattern.test(line)).toBe(false);
@@ -1803,9 +1955,9 @@ describe("remote setup in a terminal (AC-25)", () => {
     });
   }, TIMEOUT * 3);
 
-  test.skipIf(!tmuxAvailable())("AC-25: width 80 keeps both Reason lines and the remote command output intact without garbling", async () => {
+  test.skipIf(!tmuxAvailable())("AC-25: width 80 keeps the copy Reason line and the remote command output intact without garbling", async () => {
     const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
-    await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam)] }, async (setup) => {
       await withSandboxFixture(
         [
           fakeGatewayToolCall("call-1", "shell", { command: "printf 'remote-out-%s\\n' ok-42" }),
@@ -1827,49 +1979,35 @@ describe("remote setup in a terminal (AC-25)", () => {
             env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
           });
           sessions.push(session);
-          await session.waitForText("Which Vercel team should remote commands use?", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Pick a project in fx-test-team", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          await session.waitForText("Choose an option to submit.", TIMEOUT);
           await session.sendLiteral("1");
           await session.sendKeys("Enter");
           await session.waitForText("__FX_EXIT_0__", TIMEOUT);
 
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
+          expectRemoteWritten(fixture, fakeTeam, { id: `prj_sandbox_${fakeTeam.id}`, name: "fx-sandbox" }, fakeUser.id);
           const started = events(fixture).find((event) => event.ev === "start" && JSON.stringify(event.argv).includes("ok-42"));
           expect(started).toBeDefined();
           expect(events(fixture).some((event) => event.ev === "exit" && event.id === started!.id && event.code === 0)).toBe(true);
 
           const scrollback = await session.captureFullScrollback();
           const lines = scrollback.split("\n").map((line) => line.trimEnd());
-          const teamReason = "Reason: Which Vercel team should remote commands use?";
-          const projectReason = `Reason: Pick a project in ${fakeTeam.slug}. fx will copy this repository's files to a sandbox in the project you pick, for remote commands.`;
+          const copyReason = `Reason: Copy this repository to Vercel team ${fakeTeam.name}, project fx-sandbox? fx copies its tracked and unignored files to a sandbox there for remote commands.`;
           const outputText = "remote-out-ok-42";
 
-          expect(lines).toContain(teamReason);
-
-          // At 80 columns the project Reason line can wrap over several rows. A row that fills the
-          // width was cut inside a word, so the next row joins it with no space; any other break fell on a space.
-          const projectReasonStart = lines.findIndex((line) => line.startsWith("Reason: Pick a project in "));
-          expect(projectReasonStart).toBeGreaterThanOrEqual(0);
-          let joinedProjectReason = lines[projectReasonStart] ?? "";
-          let previousRow = joinedProjectReason;
-          for (let row = projectReasonStart + 1; !joinedProjectReason.endsWith("remote commands.") && row < lines.length; row += 1) {
+          const reasonStart = lines.findIndex((line) => line.startsWith("Reason: Copy this repository to Vercel team "));
+          expect(reasonStart).toBeGreaterThanOrEqual(0);
+          let joinedReason = lines[reasonStart] ?? "";
+          let previousRow = joinedReason;
+          for (let row = reasonStart + 1; !joinedReason.endsWith("remote commands.") && row < lines.length; row += 1) {
             const line = lines[row] ?? "";
-            joinedProjectReason += previousRow.length === width ? line : ` ${line}`;
+            joinedReason += previousRow.length === width ? line : ` ${line}`;
             previousRow = line;
           }
-          expect(joinedProjectReason).toBe(projectReason);
+          expect(joinedReason).toBe(copyReason);
 
           expect(lines.some((line) => line.trim() === outputText)).toBe(true);
 
-          const formPattern = /fx asks|Reason:|Which Vercel team|Pick a project|Another project|Choose a number|Submit, Edit, Decline|Current values/;
+          const formPattern = /fx asks|Reason:|Copy this repository|Choose an option|Submit, Edit, Decline/;
           const commandOutputPattern = /remote-out-ok-42|Running printf/;
           for (const line of lines) {
             expect(formPattern.test(line) && commandOutputPattern.test(line)).toBe(false);
@@ -1882,87 +2020,8 @@ describe("remote setup in a terminal (AC-25)", () => {
     });
   }, TIMEOUT * 3);
 
-  test.skipIf(!tmuxAvailable())("AC-25: a fresh profile with a remote rule, and a listed project picked: the other-name question never appears", async () => {
-    await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
-      await withSandboxFixture(
-        shellCall({ command: "printf 'listed%s\\n' ok-7", runner: "remote" }),
-        async (fixture) => {
-          const session = await TmuxSession.create({
-            cmd: `${FX_BIN} ask --permission-mode full-access "Run it."`,
-            cwd: fixture.workspace,
-            width: 200,
-            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
-          });
-          sessions.push(session);
-          await session.waitForText("Which Vercel team should remote commands use?", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          // The team is reviewed before the project prompt. Submit: option 1.
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Pick a project in fx-test-team", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
-          expect(await session.captureFullScrollback()).not.toContain(OTHER_NAME_TEXT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-          expect(await session.captureFullScrollback()).not.toContain(OTHER_NAME_TEXT);
-          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
-          const started = events(fixture).find((event) => event.ev === "start" && JSON.stringify(event.argv).includes("ok-7"));
-          expect(started).toBeDefined();
-          expect(events(fixture).some((event) => event.ev === "exit" && event.id === started!.id && event.code === 0)).toBe(true);
-        },
-        () => ({ remote: undefined, rules: [{ command: "printf*", runner: "remote" }] }),
-        true,
-        setup,
-      );
-    });
-  }, TIMEOUT * 3);
-
-  test.skipIf(!tmuxAvailable())("AC-25: picking Another project asks for the name with no Skip, and the run uses that name", async () => {
-    await withSetup({ teams: [typedNameTeam] }, async (setup) => {
-      await withSandboxFixture(
-        shellCall({ command: "printf 'typed%s\\n' ok-8", runner: "remote" }),
-        async (fixture) => {
-          const session = await TmuxSession.create({
-            cmd: `${FX_BIN} ask --permission-mode full-access "Run it."`,
-            cwd: fixture.workspace,
-            width: 200,
-            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
-          });
-          sessions.push(session);
-          await session.waitForText("Pick a project in fx-test-team", TIMEOUT);
-          // The menu numbers "Another project" after the listed projects and the create choice.
-          const another = (await session.captureFullScrollback()).match(/^ {2}(\d+)\. Another project \(type its name below\)$/m);
-          expect(another).not.toBeNull();
-          await session.sendLiteral(another![1]!);
-          await session.sendKeys("Enter");
-          await session.waitForText(`${OTHER_NAME_TEXT} (required)`, TIMEOUT);
-          const asked = await session.captureFullScrollback();
-          expect(asked).not.toContain("choose how to fill");
-          expect(asked).not.toContain("Skip");
-          await session.sendText(typedProject.name);
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-          expectRemoteWritten(fixture, typedNameTeam, typedProject, fakeUser.id);
-          const started = events(fixture).find((event) => event.ev === "start" && JSON.stringify(event.argv).includes("ok-8"));
-          expect(started).toBeDefined();
-          expect(events(fixture).some((event) => event.ev === "exit" && event.id === started!.id && event.code === 0)).toBe(true);
-        },
-        () => ({ remote: undefined, rules: [{ command: "printf*", runner: "remote" }] }),
-        true,
-        setup,
-      );
-    });
-  }, TIMEOUT * 3);
-
   test.skipIf(!tmuxAvailable())("fx ask --no-save: a decline holds for the second remote call in the same process (U4)", async () => {
-    await withSetup({}, async (setup) => {
+    await withSetup({ teams: [teamWithSandbox(fakeTeam)] }, async (setup) => {
       await withSandboxFixture(
         [
           fakeGatewayToolCall("call-1", "shell", { command: "echo one", runner: "remote" }),
@@ -1976,11 +2035,8 @@ describe("remote setup in a terminal (AC-25)", () => {
             env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
           });
           sessions.push(session);
-          await session.waitForText("fx asks project", TIMEOUT);
-          await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
-          await session.sendLiteral("3");
+          await session.waitForText("Choose an option to submit.", TIMEOUT);
+          await session.sendLiteral("2");
           await session.sendKeys("Enter");
           // A second form would wait for input, the gateway would get no reply, and this wait would time out.
           expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);

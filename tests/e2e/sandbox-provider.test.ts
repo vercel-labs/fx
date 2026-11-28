@@ -11,7 +11,7 @@ import {
   fakeShellRun,
   startFakeGateway,
 } from "./tmux-helpers";
-import { expectRemoteLoginNeverSent, type RemoteSetupFixture, startRemoteSetupFixture } from "./remote-setup-fixture";
+import { expectRemoteLoginNeverSent, fakeUser, type RemoteSetupFixture, seedConsent, startRemoteSetupFixture } from "./remote-setup-fixture";
 
 // fx runs the built binary against a fake model gateway. A rule in the private sandbox
 // config places a shell call, and fx starts the built-in runner (`fx __fx_runner__`),
@@ -69,6 +69,9 @@ async function withFixture(
       ...options.config,
     };
     writeFileSync(join(home, ".fx", "sandbox", "config.json"), options.configText ?? JSON.stringify(config));
+    if (options.configText === undefined && !options.config?.provider) {
+      seedConsent(home, fakeUser.id, repo, remoteSetup.remote.team_id!, remoteSetup.remote.project_id!);
+    }
     const responses = typeof options.responses === "function" ? options.responses({ root, home, repo }) : options.responses;
     gateway = startFakeGateway(responses);
     await body({ root, home, repo, gateway, logStart: remoteSetup.api.log.length });
