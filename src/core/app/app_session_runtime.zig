@@ -2211,7 +2211,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Notes the request the newest turn left unfinished, if a crash or a
         /// close ended it (`tests/tla/recovery/Resume.tla` AutoResumes).
-        fn noteInterruptedRequest(agent: *AppAgent, v2: *session_adapter.Session) void {
+        pub fn noteInterruptedRequest(agent: *AppAgent, v2: *session_adapter.Session) void {
             agent.session_persistence.pending_request_resume = null;
             agent.session_persistence.pending_resume_yielded = false;
             const found = (v2.interruptedRequest() catch |err| {
@@ -2271,7 +2271,7 @@ pub fn Runtime(comptime App: type) type {
         /// history and queues a turn that goes on from its pieces. The
         /// session's next turn then says it continues the yielded one, so a
         /// later replay drops that one (`session_adapter.Session.setContinuesYielded`).
-        fn continueYieldedTurn(app: *App, agent: *AppAgent, resumed: types.RecoveryResume) !void {
+        pub fn continueYieldedTurn(app: *App, agent: *AppAgent, resumed: types.RecoveryResume) !void {
             if (comptime !@hasDecl(App, "queueYieldedTurn")) return error.YieldedTurnUnsupported;
             const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
             const taken = agent.session.takeNewestTurn() orelse return error.YieldedTurnMissing;
@@ -3234,6 +3234,12 @@ pub fn Runtime(comptime App: type) type {
             try v2.savePromptImages(alloc, images);
         }
 
+        /// Writes `patch` to `agent`'s own session, and for main to the
+        /// person's settings as well. A subagent's model choice is kept in its
+        /// own session alone, so a choice made for it from any view, with the
+        /// card, the picker or `/model` on its screen, never changes the
+        /// person's settings (`src/core/app/provider_runtime.zig`
+        /// `subagentPreferences`).
         pub fn commitRuntimePreferences(
             app: *App,
             agent: *AppAgent,
@@ -3247,25 +3253,27 @@ pub fn Runtime(comptime App: type) type {
                 agent.session_persistence.fast_mode_model_bound =
                     patch.model != null and patch.fast_mode != null;
             }
-
-            var settings_attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
-                patch.userSettingsPatch(),
-            );
-            switch (settings_attempt) {
-                .outcome => |outcome| {
-                    result.settings_outcome = outcome;
-                    settings_attempt = undefined;
-                },
-                .failure => |failure| {
-                    result.settings_error = failure.err;
-                    result.settings_failure_cleanup = failure.cleanup;
-                    settings_attempt = undefined;
-                },
-            }
-            // A subagent keeps no workspace seed for new sessions: its
+            // A subagent keeps no workspace seed for new sessions either: its
             // preferences live in its own session alone.
             const subagent = if (comptime @hasField(App, "screen_owner")) agent.role == .subagent else false;
+
+            if (!subagent) {
+                var settings_attempt = config_runtime.attemptUserPreferences(
+                    app.alloc,
+                    patch.userSettingsPatch(),
+                );
+                switch (settings_attempt) {
+                    .outcome => |outcome| {
+                        result.settings_outcome = outcome;
+                        settings_attempt = undefined;
+                    },
+                    .failure => |failure| {
+                        result.settings_error = failure.err;
+                        result.settings_failure_cleanup = failure.cleanup;
+                        settings_attempt = undefined;
+                    },
+                }
+            }
             if (result.settings_error == null and !subagent) {
                 applyPreferencePatch(
                     app.alloc,
@@ -5941,7 +5949,12 @@ pub fn Runtime(comptime App: type) type {
                 children,
                 subagentAuthorityResolver(app),
                 if (comptime @hasDecl(App, "runSubagentChild"))
-                    .{ .context = app, .bind_fn = App.bindSubagentWorker, .run_fn = App.runSubagentChild }
+                    .{
+                        .context = app,
+                        .bind_fn = App.bindSubagentWorker,
+                        .run_fn = App.runSubagentChild,
+                        .restarting_fn = if (comptime runtime_profile.allows(App, .auto_upgrade) and @hasDecl(App, "subagentRestarting")) App.subagentRestarting else null,
+                    }
                 else
                     .{},
             ) catch |err| {
@@ -5960,6 +5973,13 @@ pub fn Runtime(comptime App: type) type {
                 // and its children are as deep as fx nests.
                 host.owner_has_parent = agent.role == .subagent;
                 host.authority_resolver.children_nest = agent.role != .subagent;
+                if (comptime runtime_profile.allows(App, .auto_upgrade)) {
+                    // Saves the continuations before the reports below, so
+                    // the fold skips the works they replace. Their slots start
+                    // from the main loop (`takePosts`): this can run inside
+                    // `App.init`, before the app moves.
+                    host.continueYieldedWorks();
+                }
                 // What a restart left owed reaches this agent now.
                 host.resumeReports(v2);
             }
@@ -10728,7 +10748,7 @@ test "resumeRequestedSession preserves failed partial terminal reason" {
 
     try std.testing.expect(std.mem.find(u8, app.assistant_text.items, "partial response") != null);
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expectEqualStrings("✗ system: failed", app.notices.items[1]);
+    try std.testing.expectEqualStrings("✗ Failed", app.notices.items[1]);
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "cancelled") == null);
 }
 

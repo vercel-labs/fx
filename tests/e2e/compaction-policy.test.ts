@@ -130,7 +130,7 @@ const BIG_REPLY = Array.from({ length: 14_000 }, (_, n) => `Reference line ${n}:
 
 type Script = (request: any, raw: string, phase: string) => Response;
 
-async function toolboxRun(model: string, label: string, phases: { phase: string; prompt: string; resume: boolean; env?: Record<string, string> }[], script: Script, exitCode = 0) {
+async function toolboxRun(model: string, label: string, phases: { phase: string; prompt: string; resume: boolean; env?: Record<string, string>; before?: (home: string) => void }[], script: Script, exitCode = 0) {
   const root = mkdtempSync(join(tmpdir(), "fx-toolbox-menu-")), home = join(root, "home"), cwd = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(cwd, { mode: 0o700 });
@@ -157,6 +157,7 @@ async function toolboxRun(model: string, label: string, phases: { phase: string;
   let passed = false;
   try {
     for (const step of phases) {
+      step.before?.(home);
       phase = step.phase;
       const out = join(root, `${step.phase}.stdout`), err = join(root, `${step.phase}.stderr`);
       const args = ["ask", "--json", "--full-access", ...(step.resume ? ["--resume", sessionId] : []), step.prompt];
@@ -223,6 +224,38 @@ test("two automatic compactions in one session keep the toolbox menu the convers
   });
   expect(run.compactions).toBe(2);
   expectMenuKept(run);
+}, 120_000);
+
+// How a toolbox change note opens (src/core/tooling/toolbox.zig renderChangeNote).
+const TOOLBOX_CHANGE_NOTE = "The toolbox now holds something other than the toolbox menu above lists.";
+
+function writeProfileSkill(home: string, name: string) {
+  const dir = join(home, ".fx", "skills", name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: The ${name} steps.\n---\n\n# ${name}\n`);
+}
+
+// The compaction saves the menu with its summary, so a resume after it sends
+// that menu and notes a skill added since, as one process would
+// (tests/tla/toolbox/Toolbox.tla MenuFixed and Informed).
+test("a resume after a compaction sends the toolbox menu the conversation sent first and notes a skill added since", async () => {
+  const run = await toolboxRun("fixture/compaction", "resume after compaction", [
+    { phase: "seed", prompt: "Start the work.", resume: false },
+    { phase: "continue", prompt: "Continue the work.", resume: true },
+    { phase: "after", prompt: "One more turn.", resume: true, before: (home) => writeProfileSkill(home, "menu-added") },
+    { phase: "last", prompt: "Last turn.", resume: true },
+  ], (_request, _raw, phase) => {
+    if (phase === "summary") return fakeGatewayFinalText("Turn 1\nIn between: none");
+    return fakeGatewayFinalText(phase === "seed" ? `SEED_DONE\n${BIG_REPLY}` : `${phase.toUpperCase()}_DONE`);
+  });
+  expect(run.compactions).toBe(1);
+  expect(run.bodies.length).toBe(4);
+  expectMenuKept(run);
+  expect(run.bodies[0]).not.toContain("menu-added");
+  const noted = JSON.stringify(JSON.parse(run.bodies[2]!).prompt.at(-1));
+  expect(noted).toContain(TOOLBOX_CHANGE_NOTE);
+  expect(noted).toContain("menu-added");
+  expect(run.bodies[3]!.split(TOOLBOX_CHANGE_NOTE).length - 1).toBe(1);
 }, 120_000);
 
 test("overflow recovery in the middle of a turn keeps the toolbox menu the conversation sent first", async () => {

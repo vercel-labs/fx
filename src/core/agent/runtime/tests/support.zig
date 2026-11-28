@@ -1204,7 +1204,7 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.log.append(self.alloc, try self.alloc.print(fmt, args));
     }
 
-    fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+    fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, _: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         if (self.runtime_context_error) |err| return err;
         if (self.runtime_context_texts.len > 0) {

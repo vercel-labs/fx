@@ -9701,7 +9701,14 @@ pub const TranscriptRuntime = struct {
             target_total_visual_rows > anchor.total_visual_rows;
         const width_stable = self.committed_frame_layout.terminal_cols == 0 or
             self.committed_frame_layout.terminal_cols == self.layout.cols;
-        const geometry_rebase = footer_reservation_changed and
+        // A pending resume can change the transcript area without changing the
+        // footer, so its own area change also rebases the geometry.
+        const pending_resume_geometry_rebase = self.notebook.pending_resume_source != null and
+            !std.meta.eql(
+                self.committed_frame_layout.transcript_area,
+                prepared.projectionArea(),
+            );
+        const geometry_rebase = (footer_reservation_changed or pending_resume_geometry_rebase) and
             width_stable and
             self.resize_history_row_delta == null;
         const displaced_history_replay = if (geometry_rebase and
@@ -14843,6 +14850,165 @@ test "stable resume publication starts a fresh retained source epoch" {
     try std.testing.expect(facts.recovery_rebase);
 }
 
+const ResumeHandoffPlan = struct {
+    start_line: usize,
+    line_count: usize,
+    facts: TranscriptScrollFacts,
+};
+
+fn resumeHandoffTestRuntime(
+    alloc: Allocator,
+    pending_flow: []const u8,
+    transcript: []const u8,
+) !TranscriptRuntime {
+    const layout: Layout = .{
+        .rows = 8,
+        .cols = 40,
+        .content_bottom = 4,
+        .divider_top_row = 5,
+        .input_row = 6,
+        .divider_bottom_row = 7,
+        .hint_row = 8,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+    };
+    errdefer runtime.deinit(alloc);
+    try runtime.enableShadowVt(alloc);
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, pending_flow),
+    );
+    try runtime.notebook.transcript.appendSlice(alloc, transcript);
+    return runtime;
+}
+
+fn commitResumeHandoff(
+    alloc: Allocator,
+    runtime: *TranscriptRuntime,
+    start_line: usize,
+    line_count: usize,
+    visual_offset: u32,
+    cursor_col: u16,
+) void {
+    var transition = TranscriptTransition{
+        .scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(
+            runtime.layout.rows,
+            runtime.owned_top_row,
+        ),
+        .document_append = .{},
+        .materialized_without_append = .{},
+        .target_flow = runtime.notebook.pending_resume_source.?.bytes,
+        .target_flow_owned = false,
+        .target_cache = .empty,
+        .target_cache_unchanged = true,
+        .folded_summary_indices = &.{},
+        .target_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 4,
+            .start_line = start_line,
+            .partial_skip_rows = 0,
+            .line_count = line_count,
+            .last_visible_row = 4,
+        },
+        .visual_offset = visual_offset,
+        .history_visual_offset = visual_offset,
+        .total_visual_rows = @intCast(line_count),
+        .cursor_row = 4,
+        .cursor_col = cursor_col,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 4,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 4,
+    };
+    defer transition.deinit(alloc);
+    runtime.consumeTranscriptTransition(
+        alloc,
+        &transition,
+        testFrameCommitResult(0, .committed),
+    );
+}
+
+fn planAfterResumeHandoff(
+    alloc: Allocator,
+    runtime: *TranscriptRuntime,
+) !ResumeHandoffPlan {
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer prepared.deinit(alloc);
+    return .{
+        .start_line = prepared.selection.start_line,
+        .line_count = prepared.selection.line_count,
+        .facts = runtime.planTranscriptScroll(&prepared),
+    };
+}
+
+test "a resume that grows before its repaint scrolls the rows it pushes off" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "line-1\n" ++
+        "line-2\n" ++
+        "line-3\n" ++
+        "line-4\n" ++
+        "line-5\n" ++
+        "line-6";
+    var runtime = try resumeHandoffTestRuntime(alloc, flow, flow);
+    defer runtime.deinit(alloc);
+
+    commitResumeHandoff(alloc, &runtime, 2, 6, 2, 7);
+    try runtime.notebook.transcript.appendSlice(alloc, "\nline-7\nline-8\nline-9\nline-10");
+
+    const result = try planAfterResumeHandoff(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 6), result.start_line);
+    try std.testing.expectEqual(@as(usize, 10), result.line_count);
+    try std.testing.expectEqual(@as(u32, 6), result.facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 4), result.facts.planned_rows);
+}
+
+test "a resume that grew before its handoff commits scrolls the rows it pushes off" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "line-1\n" ++
+        "line-2\n" ++
+        "line-3\n" ++
+        "line-4\n" ++
+        "line-5\n" ++
+        "line-6";
+    var runtime = try resumeHandoffTestRuntime(alloc, flow, flow);
+    defer runtime.deinit(alloc);
+
+    try runtime.notebook.transcript.appendSlice(alloc, "\nline-7\nline-8\nline-9\nline-10");
+    commitResumeHandoff(alloc, &runtime, 2, 6, 2, 7);
+
+    const result = try planAfterResumeHandoff(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 6), result.start_line);
+    try std.testing.expectEqual(@as(usize, 10), result.line_count);
+    try std.testing.expectEqual(@as(u32, 6), result.facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 4), result.facts.planned_rows);
+}
+
 test "oversized resume publication starts without a prior committed frame" {
     const alloc = std.testing.allocator;
     const layout = invalidationTestLayout();
@@ -15268,6 +15434,116 @@ test "a line fx wrote marks the text entry that shows it, and nothing else" {
     var copy = try transcript_store.cloneEntryForSnapshot(alloc, runtime.notebook.entries.items[1]);
     defer copy.deinit(alloc);
     try std.testing.expect(copy.assistant_turn.operational);
+}
+
+test "pending resume publication rebases when the candidate gains one transcript row" {
+    const alloc = std.testing.allocator;
+    const layout: Layout = .{
+        .rows = 73,
+        .cols = 80,
+        .content_bottom = 69,
+        .divider_top_row = 70,
+        .input_row = 71,
+        .divider_bottom_row = 72,
+        .hint_row = 73,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .has_painted_transcript = true,
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 73 },
+            .body_area = .{ .top = 1, .bottom = 68 },
+            .transcript_area = .{ .top = 1, .bottom = 68 },
+            .footer_area = .{ .top = 69, .bottom = 73 },
+            .solved_frame_height = 73,
+            .terminal_rows = 73,
+            .terminal_cols = 80,
+        },
+    };
+    defer runtime.deinit(alloc);
+
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+    for (0..980) |_| try flow.appendSlice(alloc, "row\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try flow.toOwnedSlice(alloc),
+    );
+    const source = &runtime.notebook.pending_resume_source.?;
+
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        source,
+        .{ .top = 1, .bottom = 69 },
+    );
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 980), prepared.sourceTotalVisualRows());
+    try std.testing.expectEqual(@as(u32, 911), prepared.sourceVisualOffset());
+
+    runtime.transcript_commit_state = .{ .stable = .{
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 68,
+            .start_line = 912,
+            .partial_skip_rows = 0,
+            .line_count = 980,
+            .last_visible_row = 68,
+        },
+        .visual_offset = 912,
+        .history_visual_offset = 0,
+        .total_visual_rows = 980,
+        .flow = try alloc.dupe(u8, source.bytes),
+        .cursor_row = 68,
+        .cursor_col = 1,
+        .occupied_last_row = 68,
+        .occupied_last_row_blank = false,
+        .layout_id = 17,
+    } };
+
+    const facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        source,
+        &prepared,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(@as(u32, 911), facts.target_visual_offset);
+
+    const target_layout: render_engine.frame_layout.CommittedLayoutSnapshot = .{
+        .layout_id = 18,
+        .owned_top = 1,
+        .owned_band = .{ .top = 1, .bottom = 73 },
+        .body_area = .{ .top = 1, .bottom = 69 },
+        .transcript_area = .{ .top = 1, .bottom = 69 },
+        .footer_area = .{ .top = 70, .bottom = 73 },
+        .solved_frame_height = 73,
+        .terminal_rows = 73,
+        .terminal_cols = 80,
+    };
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    _ = try runtime.resolveTranscriptTransitionTargetForFrame(
+        alloc,
+        source,
+        &prepared,
+        target_layout,
+        scroll_plan,
+        facts,
+        false,
+        false,
+    );
+    try std.testing.expect(facts.geometry_rebase);
 }
 
 test "pending resume publication yields after a bounded row batch" {

@@ -5,6 +5,7 @@
     {"name": "vision_json", "module": "fx", "test": "Vision JSON parsers tolerate arbitrary bounded bytes", "iterations": 1200000},
     {"name": "doctor_child_status", "module": "fx", "test": "doctor child status parser tolerates arbitrary bytes", "iterations": 1500000},
     {"name": "token_pass_memory", "module": "fx", "test": "token pass memory: a saved-answers file reads and rewrites on fuzzed bytes", "iterations": 1000000},
+    {"name": "worktree_links", "module": "fx", "test": "a worktree link's commondir and gitdir files never break the main root lookup on fuzzed bytes", "iterations": 20000},
     {"name": "host_record_decode", "module": "fx", "test": "a host record file decodes or is refused on fuzzed bytes", "iterations": 1500000},
     {"name": "mcp_add_reader_agree", "module": "fx", "test": "an add the reader's check accepts is loaded by the reader's own entry points, for fuzzed entries and files", "iterations": 300000},
     {"name": "fx_login_replace_rejected", "module": "fx", "test": "a forced fx login refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines", "iterations": 20000},
@@ -71,6 +72,7 @@
     {"name": "trace_record_text", "module": "fx", "test": "trace records stay one valid JSON line for fuzzed text", "iterations": 12000},
     {"name": "mcp_object_fields", "module": "fx", "test": "the engine reads an object's field names as std.json decodes them", "iterations": 1000000},
     {"name": "mcp_wire", "module": "fx", "test": "MCP wire decoding returns only whole JSON values from valid input", "iterations": 900000},
+    {"name": "mcp_input_round", "module": "fx", "test": "a round the engine read gets the answer the text form gets, with its keys and state as written", "iterations": 300000},
     {"name": "mcp_elicitation_escapes", "module": "fx", "test": "the engine's equality and length limits of a form's strings and an answer's match std.json's decoded strings", "iterations": 150000},
     {"name": "mcp_challenge", "module": "fx", "test": "a WWW-Authenticate challenge is read within its bounds on fuzzed bytes", "iterations": 1500000},
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
@@ -79,6 +81,7 @@
     {"name": "cli_flags", "module": "fx", "test": "the flag parser keeps its laws on fuzzed command lines", "iterations": 1200000},
     {"name": "ask_questions_text", "module": "fx", "test": "ask_user_question questions sent as JSON text decode or refuse arbitrary bytes", "iterations": 250000},
     {"name": "read_tool_result_request_text", "module": "fx", "test": "read_tool_result requests sent as JSON text decode and label alike", "iterations": 250000},
+    {"name": "stored_answer_reads", "module": "fx", "test": "stored answer reads stay inside their limits and their text on fuzzed reviewer calls", "iterations": 250000},
     {"name": "request_wrapper_text", "module": "fx", "test": "request wrappers sent as JSON text unwrap as tool_args reads them", "iterations": 250000},
     {"name": "transcript_window", "module": "fx", "test": "the transcript window keeps the model's laws on arbitrary event sequences", "iterations": 2000000},
     {"name": "tool_story_rows", "module": "fx", "test": "story rows fit the width and stay plain text for fuzzed arguments and output", "iterations": 12000},
@@ -105,6 +108,8 @@
     {"name": "turn_clock", "module": "fx", "test": "the turn clock keeps its laws on fuzzed event sequences", "iterations": 2000000},
     {"name": "compaction_progress", "module": "fx", "test": "the notes count keeps its laws on fuzzed replies", "iterations": 2000000},
     {"name": "secret_pieces", "module": "fx", "test": "maskSecretPieces masks every piece of a wrapped value and keeps other bytes on fuzzed rows", "iterations": 400000},
-    {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000}
+    {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000},
+    {"name": "file_index_snapshot", "module": "fx", "test": "a saved file-index snapshot loads or is refused on fuzzed bytes", "iterations": 3000},
+    {"name": "shortcut_map", "module": "fx", "test": "shortcut map parses or is refused on fuzzed bytes", "iterations": 400000}
   ]
 }

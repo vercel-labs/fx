@@ -9,6 +9,7 @@ const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const shared_theme = @import("../shared/theme.zig");
 const ui_render = @import("../../ui/render.zig");
+const ui_terminal = @import("../../ui/terminal/terminal.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -293,10 +294,24 @@ fn runAskChild(
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
+    // The child copies the sign-in its run owns, and web search is configured
+    // from that copy, in one section: the parent's next refresh frees the
+    // token `ctx.api_key` points at (`src/core/cli/cli_ask.zig` "an ask
+    // subagent keeps the sign-in a refresh replaces").
+    const child_setup = blk: {
+        ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+        defer ctx.credential_mutex.unlock(io_mod.getIo());
+        const captured = ChildSignIn.captureLocked(ctx.alloc, ctx) catch return error.OutOfMemory;
+        break :blk .{ .sign_in = captured, .tool_context = ctx.toolContext() };
+    };
+    var sign_in = child_setup.sign_in;
+    defer sign_in.deinit(ctx.alloc);
+    var tool_context = child_setup.tool_context;
+    sign_in.apply(&tool_context);
     return subagent_agent_adapter.run(.{
         .toolbox_behind = ctx.toolbox_behind.slice(),
         .host = ctx.subagent_host orelse return error.ProviderFailed,
-        .tool_context = ctx.toolContext(),
+        .tool_context = tool_context,
         .provider_set = ctx.cfg.provider_set,
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
@@ -614,12 +629,65 @@ const StdinSource = union(enum) {
 
 const stdin_prompt_resource_byte_limit: usize = 8 * 1024 * 1024;
 
+/// The sign-in one ask subagent run owns. A parent refresh replaces the key
+/// `AskContext` points at and frees the one it held, while the child still
+/// runs, so the child copies the three values under `credential_mutex`, which
+/// `adoptRefreshedAskCredential` holds while it replaces and frees them
+/// (`src/core/cli/cli_ask.zig` "an ask subagent keeps the sign-in a refresh
+/// replaces").
+const ChildSignIn = struct {
+    api_key: []u8,
+    credential_source: ?types.CredentialSource,
+    account_id: ?[]u8,
+    gateway_team: ?[]u8,
+
+    fn capture(alloc: Allocator, ctx: *AskContext) !ChildSignIn {
+        ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+        defer ctx.credential_mutex.unlock(io_mod.getIo());
+        return captureLocked(alloc, ctx);
+    }
+
+    /// The same copy with `credential_mutex` already held, for `runAskChild`,
+    /// which configures web search from the copy in the same section: a
+    /// refresh would otherwise free the bytes `OwnedText.set` reads.
+    fn captureLocked(alloc: Allocator, ctx: *AskContext) !ChildSignIn {
+        const api_key = try alloc.dupe(u8, ctx.api_key);
+        errdefer secret.zeroAndFree(alloc, api_key);
+        const account_id = if (ctx.account_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (account_id) |value| alloc.free(value);
+        const gateway_team = if (ctx.gateway_team) |value| try alloc.dupe(u8, value) else null;
+        return .{
+            .api_key = api_key,
+            .credential_source = ctx.credential_source,
+            .account_id = account_id,
+            .gateway_team = gateway_team,
+        };
+    }
+
+    /// The child's context sends and reports these copies.
+    fn apply(self: ChildSignIn, tool_ctx: *tool_runtime.Context) void {
+        tool_ctx.api_key = self.api_key;
+        tool_ctx.credential_source = self.credential_source;
+        tool_ctx.account_id = self.account_id;
+        tool_ctx.gateway_team = self.gateway_team;
+    }
+
+    fn deinit(self: *ChildSignIn, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.api_key);
+        if (self.account_id) |value| alloc.free(value);
+        if (self.gateway_team) |value| alloc.free(value);
+    }
+};
+
 const AskContext = struct {
     alloc: Allocator,
     cfg: Config,
     deps: RunDeps,
     workspace_root: []const u8,
     workspace_access: workspace_access.WorkspaceAccess = .{},
+    /// Guards the fields below against a refresh on the turn's thread while a
+    /// subagent's slot thread copies them (`ChildSignIn.capture`).
+    credential_mutex: std.Io.Mutex = .init,
     api_key: []const u8 = "",
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
@@ -1370,7 +1438,13 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .deps = deps,
     }) catch |err| {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-        if (err == error.OutOfMemory) return err;
+        if (err == error.OutOfMemory or
+            err == error.TerminalHungUp or
+            err == error.TerminalInputClosed or
+            err == error.OutputReaderGone)
+        {
+            return err;
+        }
         // The reason is on stderr already; JSON keeps the code it always had.
         if (err == error.SessionConversionRefused) {
             if (!options.json_output) return 1;
@@ -1973,9 +2047,23 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     // The ask ends once its whole tree is quiet: mail that waits when a turn
     // ends runs as the ask's next turn, as one wakes an idle main.
     while (ctx.subagent_host) |tree| {
-        switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag())) {
+        switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag(), true)) {
             .quiet, .stopped => break,
             .mail => {},
+            // fx ask cannot show an approval, and main had its turn: refuse
+            // what it left unanswered, so the subagents resume, report, and
+            // their reports wake main again (`ParentApproval.tla` `Fallback`).
+            .approvals_unanswered => {
+                const refused = tree.refuseUnansweredApprovals();
+                if (refused == 0) {
+                    // Nothing could be refused, so the next check would see the
+                    // same state at once: wait one poll first (RULES.md R3.8).
+                    debug_trace.eventf("mailbox", "approvals_refusal_empty", .{}, "reason=nothing_refused", .{});
+                    if (ctx.cancelFlag().load(.seq_cst)) break;
+                    _ = ctx.worker.waitForPostOrNudgeTimeout(subagent_tool_host.Runtime.cancel_poll);
+                }
+                continue;
+            },
         }
         // The take marks the turn, so mail posted from then on joins it.
         const turn_id = debug_trace.nextTurnId();
@@ -2052,6 +2140,12 @@ fn runAskTurn(
             };
         },
         else => {
+            if (err == error.TerminalHungUp or
+                err == error.TerminalInputClosed or
+                err == error.OutputReaderGone)
+            {
+                return err;
+            }
             if (!options.output_mode.capturesJson()) return err;
             var failed_result = try takePromptRunResult(ctx, alloc);
             failed_result.exit_code = 1;
@@ -2314,6 +2408,8 @@ fn adoptRefreshedAskCredential(
     worker_alloc: Allocator,
     refreshed: *credentials.Credential,
 ) ![]u8 {
+    ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.credential_mutex.unlock(io_mod.getIo());
     if (ctx.credential_source != refreshed.source) return error.CredentialAuthorityChanged;
     if (!optionalCredentialFieldEqual(ctx.account_id, refreshed.accountId()) or
         !optionalCredentialFieldEqual(ctx.gateway_team, refreshed.gatewayTeam()))
@@ -2427,13 +2523,14 @@ fn takeSteeringBoundary(
     return ctx.worker.takeSteeringBoundaryInto(std.heap.c_allocator, arena, turn_id, kind);
 }
 
-fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.deps.context_registry.appendDefaultTransient(.{
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
+        .model = model,
         .subagents = if (ctx.subagent_host) |team_host| try team_host.teamNote(arena, ctx.active_turn_id) else null,
     }, arena, messages);
 }
@@ -3559,7 +3656,7 @@ fn onWebFetchProgress(raw_ctx: *anyopaque, _: []const u8, progress: types.WebFet
 fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.presenter) |presenter| return presenter.pushNotice(.{
-        .topic = "system",
+        .topic = "",
         .tone = .neutral,
         .body = text,
     });
@@ -4188,7 +4285,10 @@ fn readPromptFromReader(
     const input = reader.allocRemaining(alloc, .limited(detection_limit)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.StreamTooLong => return error.PromptResourceLimitExceeded,
-        else => return error.PromptInputReadFailed,
+        else => {
+            if (ui_terminal.terminalInputGone(std.posix.STDIN_FILENO)) return error.TerminalHungUp;
+            return error.PromptInputReadFailed;
+        },
     };
     if (input.len > resource_byte_limit) {
         alloc.free(input);
@@ -4416,7 +4516,11 @@ fn promptRealPermissionApproval(
 
     var read_buf: [256]u8 = undefined;
     var reader = std.Io.File.stdin().reader(zio, &read_buf);
-    const line = reader.interface.takeDelimiter('\n') catch return .deny;
+    const line = reader.interface.takeDelimiter('\n') catch |err| {
+        if (ui_terminal.terminalGone(std.posix.STDIN_FILENO, err)) return error.TerminalHungUp;
+        return .deny;
+    };
+    if (line == null and ui_terminal.terminalInputGone(std.posix.STDIN_FILENO)) return error.TerminalHungUp;
     const answer = std.mem.trim(u8, line orelse "", " \t\r\n");
     if (answer.len == 1 and (answer[0] == 'y' or answer[0] == 'Y')) return .approve;
     return .deny;
@@ -4434,20 +4538,27 @@ fn realStdoutIsTty(_: ?*anyopaque) bool {
     return std.Io.File.stdout().isTty(io_mod.getIo()) catch false;
 }
 
+fn classifyRealOutputError(fd: std.posix.fd_t, err: anyerror, fallback: anyerror) anyerror {
+    if (err == error.BrokenPipe) return error.OutputReaderGone;
+    if (ui_terminal.terminalGone(fd, err)) return error.TerminalHungUp;
+    return fallback;
+}
+
 /// A failed write to stdout reads "couldn't write the output"
 /// (`error.OutputWriteFailed`), and its cause goes to the trace. A reader that
 /// went away, as `head` does, gives `error.OutputReaderGone`, which ends the
-/// run quietly.
+/// run quietly; a hung-up terminal gives `error.TerminalHungUp`.
 fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
     std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text) catch |err| {
         debug_trace.logf("core", "ask output write failed err={s}", .{@errorName(err)});
-        if (err == error.BrokenPipe) return error.OutputReaderGone;
-        return error.OutputWriteFailed;
+        return classifyRealOutputError(std.posix.STDOUT_FILENO, err, error.OutputWriteFailed);
     };
 }
 
 fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {
-    try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+    std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text) catch |err| {
+        return classifyRealOutputError(std.posix.STDERR_FILENO, err, err);
+    };
 }
 
 const TestCapture = struct {
@@ -4722,9 +4833,13 @@ fn testProcessQueuedPromptChecksTimeout(_: *agent_runtime.Agent, deps: *const ag
     try std.testing.expect(tool_ctx.web_fetch_runtime.? == &ctx.web_fetch_runtime);
     try std.testing.expect(tool_ctx.web_fetch_progress_ctx != null);
     try std.testing.expect(tool_ctx.on_web_fetch_progress != null);
-    try std.testing.expectEqualStrings(ctx.model, ctx.web_search_runtime.worker_model);
-    try std.testing.expectEqual(ctx.cfg.gateway_retry_count, ctx.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gateway_chat_url);
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(std.testing.allocator);
+        defer live.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(ctx.model, live.worker_model);
+        try std.testing.expectEqual(ctx.cfg.gateway_retry_count, live.gateway_retry_count);
+        try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, live.gateway_chat_url);
+    }
     try std.testing.expect(ctx.web_search_runtime.provider.?.execute_fn == ctx.cfg.provider_set.gateway.fx_search.?.execute_fn);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try testPushAssistantText(deps, "assistant text");
@@ -5065,7 +5180,7 @@ const TestContextRegistryFixture = struct {
 
         const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
         try append_static(deps.ctx, arena, &messages);
-        try deps.append_runtime_context(deps.ctx, arena, &messages);
+        try deps.append_runtime_context(deps.ctx, arena, ctx.model, &messages);
         try std.testing.expectEqual(
             ctx.permission_mode,
             transient_permission_mode orelse return error.TestExpectedEqual,
@@ -5261,9 +5376,13 @@ test "CLI prompt projection configures web search then blocks native execution" 
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
     try append_static(deps.ctx, arena, &messages);
-    try deps.append_runtime_context(deps.ctx, arena, &messages);
+    try deps.append_runtime_context(deps.ctx, arena, ctx.model, &messages);
 
-    try std.testing.expectEqualStrings("stale-key", ctx.web_search_runtime.api_key);
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("stale-key", live.api_key);
+    }
 
     const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
     const validation = try validate(deps.ctx, arena, .{
@@ -5272,10 +5391,14 @@ test "CLI prompt projection configures web search then blocks native execution" 
         .arguments_json = "{\"query\":\"x\"}",
     });
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
-    try std.testing.expectEqualStrings(ctx.api_key, ctx.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(ctx.model, ctx.web_search_runtime.worker_model);
-    try std.testing.expectEqual(ctx.cfg.gateway_retry_count, ctx.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gateway_chat_url);
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings(ctx.api_key, live.api_key);
+        try std.testing.expectEqualStrings(ctx.model, live.worker_model);
+        try std.testing.expectEqual(ctx.cfg.gateway_retry_count, live.gateway_retry_count);
+        try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, live.gateway_chat_url);
+    }
 
     const execute = deps.execute_tool_call;
     const execution = try execute(deps.ctx, .{
@@ -5291,10 +5414,14 @@ test "CLI prompt projection configures web search then blocks native execution" 
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = ctx.max_tool_result_bytes,
     });
-    try std.testing.expectEqualStrings(ctx.api_key, ctx.web_search_runtime.api_key);
-    try std.testing.expectEqualStrings(ctx.model, ctx.web_search_runtime.worker_model);
-    try std.testing.expectEqual(ctx.cfg.gateway_retry_count, ctx.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gateway_chat_url);
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings(ctx.api_key, live.api_key);
+        try std.testing.expectEqualStrings(ctx.model, live.worker_model);
+        try std.testing.expectEqual(ctx.cfg.gateway_retry_count, live.gateway_retry_count);
+        try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, live.gateway_chat_url);
+    }
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }
@@ -5334,6 +5461,61 @@ test "fx ask publishes a complete refreshed credential before later consumers" {
         "fresh-token",
         ctx.model_catalog_access.authorizationCredential().?,
     );
+}
+
+test "an ask subagent keeps the sign-in a refresh replaces" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.api_key = "first-token";
+    ctx.credential_source = .fx_login;
+    ctx.gateway_team = "team_123";
+
+    // What `runAskChild` does, unchanged: one locked section copies the
+    // sign-in and configures web search from it.
+    const child_setup = blk: {
+        ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+        defer ctx.credential_mutex.unlock(io_mod.getIo());
+        break :blk .{
+            .sign_in = try ChildSignIn.captureLocked(alloc, &ctx),
+            .tool_context = ctx.toolContext(),
+        };
+    };
+    var sign_in = child_setup.sign_in;
+    defer sign_in.deinit(alloc);
+    var child_ctx = child_setup.tool_context;
+    sign_in.apply(&child_ctx);
+
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "second-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+    };
+    defer refreshed.deinit(alloc);
+    const worker_token = try adoptRefreshedAskCredential(&ctx, alloc, &refreshed);
+    defer secret.zeroAndFree(alloc, worker_token);
+
+    // The refresh replaced the parent's key and freed the one it held; the
+    // child and the runtime it configured still hold their own copies.
+    try std.testing.expectEqualStrings("second-token", ctx.api_key);
+    try std.testing.expectEqualStrings("first-token", child_ctx.api_key);
+    try std.testing.expect(child_ctx.api_key.ptr != ctx.api_key.ptr);
+    try std.testing.expectEqualStrings("team_123", child_ctx.gateway_team.?);
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("first-token", live.api_key);
+        try std.testing.expect(live.api_key.ptr != ctx.api_key.ptr);
+    }
 }
 
 test "fx ask refuses a refreshed login on another team" {
@@ -9821,4 +10003,25 @@ test "fx ask persists recovery checkpoints via save_recovery_record and append_t
     defer reopened.close();
     const interrupted = (try reopened.interruptedRequest()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, &rec2, &(interrupted.record orelse return error.TestUnexpectedResult));
+}
+
+test "cli ask output classifier maps closed TestPty EIO to TerminalHungUp and preserves open-file write errors" {
+    const shell_runtime = @import("../../ui/shell_runtime.zig");
+    try std.testing.expectEqual(@as(anyerror, error.OutputReaderGone), classifyRealOutputError(-1, error.BrokenPipe, error.OutputWriteFailed));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "out.txt", .{ .read = true });
+    defer file.close(io_mod.getIo());
+    try std.testing.expectEqual(@as(anyerror, error.OutputWriteFailed), classifyRealOutputError(file.handle, error.InputOutput, error.OutputWriteFailed));
+
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |f| f.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+    master.?.close(io_mod.getIo());
+    master = null;
+    try std.testing.expectEqual(@as(anyerror, error.TerminalHungUp), classifyRealOutputError(slave.handle, error.InputOutput, error.OutputWriteFailed));
 }

@@ -16,10 +16,13 @@ const storage = @import("storage.zig");
 const log_mod = @import("log.zig");
 const session_mod = @import("session.zig");
 const diag = @import("diag.zig");
+const lock_wait = @import("lock_wait.zig");
 
 const index_name = "index.jsonl";
 const index_tmp_name = "index.jsonl.tmp";
 const lock_name = "index.lock";
+/// How long an index write sleeps between tries of a held `index.lock`.
+const index_lock_retry_ms: u64 = 5;
 
 /// A `.tmp` entry younger than this may be a publish in progress.
 const sweep_after_ms: i64 = 60 * 60 * 1000;
@@ -563,11 +566,16 @@ pub const Catalog = struct {
             cat.lock.file = opened_file;
             break :blk opened_file;
         };
-        var waited: u64 = 0;
-        while (!(s.tryLock(file) catch |io_err| return storage.ioFault(io_err))) {
-            if (waited >= env.options.lock_wait_ms) return error.Busy;
-            s.io.sleep(.fromMilliseconds(5), .awake) catch return error.Busy;
-            waited += 5;
+        const wait: lock_wait.Wait = .{ .budget_ms = env.options.lock_wait_ms, .retry_ms = index_lock_retry_ms };
+        const started = std.Io.Timestamp.now(s.io, .awake);
+        var sleeps: u64 = 0;
+        // flock has no timed wait, so the wait polls a non-blocking try between short sleeps.
+        while (!(s.tryLock(file) catch |io_err| return storage.ioFault(io_err))) : (sleeps += 1) {
+            const elapsed_ms = lock_wait.elapsedMs(started, std.Io.Timestamp.now(s.io, .awake));
+            switch (lock_wait.afterFailedTry(wait, elapsed_ms, sleeps)) {
+                .give_up => return error.Busy,
+                .sleep_ms => |ms| s.io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch return error.Busy,
+            }
         }
         return file;
     }

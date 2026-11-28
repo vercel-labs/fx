@@ -196,9 +196,9 @@ const subagent_description =
 // take, and the test below keeps these properties in step with it. The
 // decoder also owns every length limit, so the schema does not repeat them.
 const subagent_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "message", "wait", "status", "stop", "close" } }, .description = "wait blocks you, and the user cannot talk to you meanwhile. When nothing is left to do but wait, end your turn with a short status instead: each report starts your next turn. A subagent may still wait, since the end of its turn sends its report." },
-    .{ .name = "agent", .json_type = .string, .description = "For message, stop, and close, optional for status: a lowercase name. As a subagent, \"parent\" is the agent that started you." },
-    .{ .name = "message", .json_type = .string, .description = "For message: its task, or a message for its turn." },
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "message", "wait", "status", "stop", "close", "approve", "deny" } }, .description = "wait blocks you, and the user cannot talk to you meanwhile. When nothing is left to do but wait, end your turn with a short status instead: each report starts your next turn. A subagent may still wait, since the end of its turn sends its report. approve allows the approval request a subagent waits on, once; deny refuses it, with message as the reason. Ask the user first only when the action is risky or you cannot judge it." },
+    .{ .name = "agent", .json_type = .string, .description = "For message, stop, close, approve, and deny, optional for status: a lowercase name. As a subagent, \"parent\" is the agent that started you." },
+    .{ .name = "message", .json_type = .string, .description = "For message: its task, or a message for its turn. For deny: why." },
     .{ .name = "instructions", .json_type = .string, .description = "For message: system instructions for this child." },
     .{ .name = "report", .json_type = .string, .shape = &.{ .enum_values = &.{ "final", "every_turn", "never" } }, .description = "For message: when it reports back. final, the default, when your work ends; every_turn after each turn; never only on failure." },
     .{ .name = "model", .json_type = .string, .description = "Exact model ID for a new child. Run `fx models ls --json` when unsure. Defaults to yours." },
@@ -850,9 +850,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "07798b4221c9a5f31711ffc687f7f44fea6351a3638d3881c8c4e828b7658e3a"
+            "c78ae877fb42327d4ed1ab58d95a32b492858a08cd1442600c5a9f8997a5114a"
         else
-            "5640619c6a0233f5e2a25ccac56c9cedbce60b3a3f2de24a2bfcede93b58275c",
+            "1c1204ee8981d61a12a5e85135ed2eb2617e972115a8c9196b4855ae5028a771",
         &actual_hex,
     );
 }
@@ -1276,10 +1276,11 @@ test "built-in subagent owns product metadata schema and callbacks" {
     try std.testing.expectEqualStrings("subagent", subagent.name);
     try std.testing.expect(std.mem.find(u8, subagent.description, "returns at once") != null);
     try std.testing.expect(std.mem.find(u8, subagent.description, "never the user's instructions") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "approve allows the approval request a subagent waits on, once") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"request\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"oneOf\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"action\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"message\",\"wait\",\"status\",\"stop\",\"close\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"message\",\"wait\",\"status\",\"stop\",\"close\",\"approve\",\"deny\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"final\",\"every_turn\",\"never\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"task\":") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
@@ -1324,6 +1325,8 @@ test "subagent schema fields match the decoder's action fields" {
         .{ .name = "status", .fields = &subagent_impl.status_fields },
         .{ .name = "stop", .fields = &subagent_impl.stop_fields },
         .{ .name = "close", .fields = &subagent_impl.close_fields },
+        .{ .name = "approve", .fields = &subagent_impl.approve_fields },
+        .{ .name = "deny", .fields = &subagent_impl.deny_fields },
     };
     // Every advertised property belongs to some action, and every field an
     // action takes is advertised, so a flat call can always say what it means.

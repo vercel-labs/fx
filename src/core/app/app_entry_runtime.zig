@@ -798,10 +798,21 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
 /// The status a shell reports for a process SIGPIPE ended: 128 + 13.
 const output_reader_gone_exit_code: u8 = 141;
 
+/// The status a shell reports for a process SIGHUP ended: 128 + 1.
+const terminal_hung_up_exit_code: u8 = if (host_target.is_wasm)
+    1
+else
+    128 + @as(u8, @intCast(@backingInt(std.posix.SIG.HUP)));
+
 /// How a command that ended on `err` exits. One whose output reader went
 /// away, as `head` does, ends quietly with SIGPIPE's status, as the commands
-/// that finish before fx's I/O starts do when SIGPIPE ends them.
+/// that finish before fx's I/O starts do when SIGPIPE ends them. A command whose
+/// terminal hung up ends quietly with SIGHUP's status (`tests/tla/cli_hangup/CliHangup.tla`).
 fn commandFailure(deps: RunDeps, err: anyerror) BeforeInteractiveResult {
+    if (isTerminalHangUp(err)) {
+        debug_trace.logf("core", "command ended after its terminal hung up err={s}", .{@errorName(err)});
+        return .{ .exit = terminal_hung_up_exit_code };
+    }
     if (err == error.OutputReaderGone) {
         debug_trace.logf("core", "command ended after its output reader went away", .{});
         return .{ .exit = output_reader_gone_exit_code };
@@ -1581,6 +1592,19 @@ test "a command whose output reader went away ends quietly with SIGPIPE's status
     const outcome = try runWithDeps(TestApp, alloc, &.{"ask"}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunOutcome{ .exit = 141 }, outcome);
     try std.testing.expectEqualStrings("", capture.stderr.written());
+}
+
+test "a command whose terminal hung up ends quietly with SIGHUP's status" {
+    const alloc = std.testing.allocator;
+    for ([_]anyerror{ error.TerminalHungUp, error.TerminalInputClosed }) |err| {
+        var capture = TestCapture.init(.{ .interactive = .{} });
+        defer capture.deinit();
+        capture.cli_error = err;
+
+        const outcome = try runWithDeps(TestApp, alloc, &.{"status"}, testConfig(), capture.deps());
+        try std.testing.expectEqual(RunOutcome{ .exit = 129 }, outcome);
+        try std.testing.expectEqualStrings("", capture.stderr.written());
+    }
 }
 
 test "app entry reports unexpected init errors once and preserves identity" {
