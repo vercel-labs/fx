@@ -348,7 +348,7 @@ fx answers `session/list` at once, also while a turn runs on the connection. For
 A client that lists `sh.fx/listChanges` receives `_sh.fx/session/list_changed`, the draft's hint that a list changed. The hint names the folder of the session that changed, as `cwd`, and holds no rows:
 
 - fx sends the hint to a connection that has called `session/list` with that `cwd`, or with no `cwd`, which lists every folder.
-- A list changes when a session in the folder is saved for the first time, saves a turn, gets a new title, or is deleted. A change of state isn't a list change, because the state notification reports it.
+- A list changes when a session in the folder is saved for the first time, saves a turn, gets a new title, or is deleted. fx saves a session for the first time when its first prompt starts, as fx does today. A change of state isn't a list change, because the state notification reports it.
 - fx sends the hint after it saves the change, so a `session/list` that the client sends after the hint returns the change.
 - One hint can stand for several changes. The client reads the first page again and drops the pages after it, as the draft says.
 
@@ -361,6 +361,8 @@ A client that lists `sh.fx/listChanges` receives `_sh.fx/session/list_changed`, 
 ```
 
 `tests/tla/acp/AcpSessionState.tla` models these rules, and TLC checks that a connection's view of a session's state is current whenever no state update is on its way, and that a list a connection holds is out of date only while a hint is on its way or after one arrived. Its `Today` configs show where fx breaks them now, and `tests/tla/drivers/acp/session_state/driver.ts` runs `fx acp` along the model.
+
+The model leaves out these parts of this section: steers and queued prompts that move a session from idle to running; capability gating; `sessionCapabilities.status`; the order of a `session/new` response against a load's; the `sessionId` in `-32002`'s data; the client's rule for an unknown state; and the row state, which only the trace checks.
 
 ## Names in use today
 
