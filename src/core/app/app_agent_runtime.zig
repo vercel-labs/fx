@@ -1421,6 +1421,7 @@ pub fn Runtime(comptime App: type) type {
                     .records = if (app_session_runtime.Runtime(App).childCapability(agent)) |capability| result_store.compactorStore(capability) else null,
                     .cancel_flag = &agent.worker.worker_cancel_requested,
                     .trace_ctx = .{ .turn_id = job.turn_id },
+                    .toolbox_menu = try agent.session.agent.compactionToolboxMenu(arena, job.history),
                 },
             }) catch |err| {
                 if (err == error.Cancelled and agent.worker.worker_cancel_requested.load(.seq_cst)) return;
@@ -1488,7 +1489,12 @@ pub fn Runtime(comptime App: type) type {
             var run = try prepareChildRun(app, turn, message, admission);
             var completion: agents.ChildRunCompletion = .{};
             run.completion = &completion;
-            var post = app_agents_runtime.Post{ .turn = turn, .run = run, .message = message.content };
+            var post = app_agents_runtime.Post{
+                .turn = turn,
+                .run = run,
+                .message = message.content,
+                .continues_yielded = if (comptime runtime_profile.allows(App, .auto_upgrade)) message.continues_yielded else false,
+            };
             defer if (post.run) |*unsent| {
                 unsent.completion = null;
                 unsent.turn = null;

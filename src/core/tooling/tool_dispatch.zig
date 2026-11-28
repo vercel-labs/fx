@@ -318,7 +318,6 @@ pub const DispatchContext = struct {
     mcp_access_changed: ?tool_mcp_runtime.AccessChangedFn = null,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     mcp_call_options: tool_mcp_runtime.CallOptions = .{},
-    mcp_call_status_sink: ?*?tool_mcp_runtime.CallStatus = null,
     mcp_execution_error_sink: ?*?anyerror = null,
     /// Lent to `fx mcp call` while this tool call runs; see
     /// `mcp_call_capability.zig`. Only the shell tool uses it.
