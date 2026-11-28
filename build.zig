@@ -47,11 +47,13 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     const git_commit = readGitCommit(b);
+    const build_number = readBuildNumber(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "git_commit", git_commit);
+    build_options.addOption(u32, "build_number", build_number);
     build_options.addOption([]const u8, "app_version", app_version);
     build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     build_options.addOption(WasmSurface, "wasm_surface", .none);
@@ -546,6 +548,29 @@ fn readGitCommit(b: *std.Build) []const u8 {
     };
     const trimmed = std.mem.trim(u8, out, " \t\r\n");
     return b.allocator.dupe(u8, trimmed) catch "unknown";
+}
+
+/// The build's number: how many commits main's first-parent history holds up
+/// to HEAD, so a later commit on main always has a higher number. The dev
+/// channel installs only a higher one (`update_target.Target.shouldInstall`).
+/// 0 when unknown, such as in a shallow checkout, where the count is wrong.
+fn readBuildNumber(b: *std.Build) u32 {
+    const shallow = switch (b.runFallible(
+        &.{ "git", "rev-parse", "--is-shallow-repository" },
+        .{ .stderr_behavior = .ignore },
+    )) {
+        .success => |stdout| stdout,
+        .spawn_failed, .bad_exit_code, .crashed => return 0,
+    };
+    if (!std.mem.eql(u8, std.mem.trim(u8, shallow, " \t\r\n"), "false")) return 0;
+    const out = switch (b.runFallible(
+        &.{ "git", "rev-list", "--count", "--first-parent", "HEAD" },
+        .{ .stderr_behavior = .ignore },
+    )) {
+        .success => |stdout| stdout,
+        .spawn_failed, .bad_exit_code, .crashed => return 0,
+    };
+    return std.fmt.parseInt(u32, std.mem.trim(u8, out, " \t\r\n"), 10) catch 0;
 }
 
 /// The session manager as its own module, rooted at its API. It imports
