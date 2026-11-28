@@ -2616,6 +2616,28 @@ describe("fx tool and fx mcp call without MCP servers", () => {
 describe("slice 4 break-it: results as files", () => {
   const BASH_SETTING = ["--config", "experimental.bash_tool=true"];
 
+  test("alternating stdout and stderr lines of one bash program are saved in write order", async () => {
+    const root = createRoot();
+    const command = 'i=1; while [ $i -le 2000 ]; do echo "out $i"; echo "err $i" >&2; i=$((i+1)); done';
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("alt", "bash", { command }),
+      fakeGatewayToolCall("altw", "bash", { command: "wait_more" }),
+      fakeGatewayFinalText("Alternating done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Alternate."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const saved = readFileSync(join(sessionResults(root.home), "1.txt"), "utf8");
+    const expected = Array.from({ length: 2000 }, (_, index) => `out ${index + 1}\nerr ${index + 1}\n`).join("");
+    expect(saved).toBe(expected);
+  }, TIMEOUT);
+
   test("4a: 50 MB output cuts file to first and last 8 MiB with one cut line, bounded preview, and header", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([
