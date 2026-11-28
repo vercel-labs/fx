@@ -999,6 +999,7 @@ fn executeRegisteredTool(
     var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
     var dispatch_metadata: DispatchMetadata = .{};
+    var bridge_usage = BridgeUsage{ .total = &dispatch_metadata.inner_usage };
     var subagent_provider = SubagentProviderState{
         .runtime = ctx,
         .call = call,
@@ -1033,6 +1034,7 @@ fn executeRegisteredTool(
     const bash_program = if (registry.lookup(call.name)) |tool| tool.captured_command_host == .bash_session else false;
     if ((ctx.mcp_ctx != null and ctx.mcp_call_tool != null) or bash_program) {
         mcp_call_bridge.file_ops = bash_program;
+        mcp_call_bridge.usage = &bridge_usage;
         dispatch_ctx.mcp_call_capability = mcp_call_bridge.capability();
     }
     dispatch_ctx.toolbox_run = toolbox_run.capability();
@@ -1108,6 +1110,8 @@ const McpCallBridgeState = struct {
     runtime: Context,
     /// Whether this bridge serves file changes: only the bash tool's programs.
     file_ops: bool = false,
+    /// The bash call's usage total, set for the bash tool's bridge only.
+    usage: ?*BridgeUsage = null,
 
     fn capability(self: *McpCallBridgeState) mcp_call_capability.Capability {
         return .{
@@ -1118,6 +1122,25 @@ const McpCallBridgeState = struct {
             .call_fn = runBridgeCall,
             .lookup_fn = lookupBridge,
         };
+    }
+};
+
+/// The usage a bash call's bridged searches add to. The bridge serves each request
+/// on its own thread while the bash call waits, so each add takes the lock. The
+/// bash call reads the total only after its bridge calls have finished.
+const BridgeUsage = struct {
+    lock: std.Io.Mutex = .init,
+    total: *?types.ToolUsage,
+
+    fn add(self: *BridgeUsage, spent: types.ToolUsage) void {
+        const io = io_mod.getIo();
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        var sum = self.total.* orelse types.ToolUsage{};
+        sum.input_tokens += spent.input_tokens;
+        sum.output_tokens += spent.output_tokens;
+        sum.web_search_requests += spent.web_search_requests;
+        self.total.* = sum;
     }
 };
 
@@ -1145,6 +1168,7 @@ fn authorizeBridgeBashTool(
         .ctx = checked_ctx,
         .operation = operation,
         .tool_call = call,
+        .usage = state.usage,
     } };
     return .{ .allow = .{ .prepared = authority } };
 }
@@ -1209,6 +1233,8 @@ const BridgeAuthority = union(enum) {
         tool_call: ToolCall,
         /// Why a web request is refused before its call, as its reply says. Null otherwise.
         refusal: ?[]const u8 = null,
+        /// The bash call's usage total, which a bridged search adds to. Null for a refused call.
+        usage: ?*BridgeUsage = null,
     },
 };
 
@@ -1501,6 +1527,7 @@ fn runBridgeBashToolCall(
     operation: mcp_call_capability.BashToolRequest,
     tool_call: ToolCall,
     refusal: ?[]const u8,
+    usage: ?*BridgeUsage,
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
     const info = try bashToolRowInfo(arena, operation);
@@ -1515,7 +1542,7 @@ fn runBridgeBashToolCall(
         debug_trace.logf("mcp-call", "request={s} refused {s} before its permission check", .{ request_id, @tagName(operation) });
         return .{ .status = .tool_error, .bytes = text };
     }
-    const outcome = executeBridgeBashToolOperation(ctx, arena, operation, tool_call, cancel) catch |err| {
+    const outcome = executeBridgeBashToolOperation(ctx, arena, operation, tool_call, usage, cancel) catch |err| {
         if (row) |value| value.finishAction(arena, if (err == error.Cancelled or cancel.load(.acquire)) .cancelled else .failed);
         if (err == error.Cancelled) {
             debug_trace.logf("mcp-call", "request={s} dropped {s} while it ran: canceled", .{ request_id, @tagName(operation) });
@@ -1633,6 +1660,7 @@ fn executeBridgeBashToolOperation(
     arena: Allocator,
     operation: mcp_call_capability.BashToolRequest,
     tool_call: ToolCall,
+    usage: ?*BridgeUsage,
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
     return switch (operation) {
@@ -1640,7 +1668,7 @@ fn executeBridgeBashToolOperation(
         .skill_open => |req| runBridgeSkillOpen(ctx, arena, req, cancel),
         .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => runBridgeAgentCall(ctx, arena, tool_call, cancel),
         .web_fetch => runBridgeWebFetch(ctx, arena, tool_call, cancel),
-        .web_search => runBridgeWebSearch(ctx, arena, tool_call, cancel),
+        .web_search => runBridgeWebSearch(ctx, arena, tool_call, usage, cancel),
     };
 }
 
@@ -1661,7 +1689,9 @@ fn runBridgeWebFetch(
     };
     defer tool_input.deinit(arena);
     if (try web_fetch_impl.validate(dispatch_ctx, tool_input)) |reason| return .{ .status = .tool_error, .bytes = reason };
-    return bridgeToolOutcome(try web_fetch_impl.call(dispatch_ctx, tool_input));
+    var result = try web_fetch_impl.runForBridge(dispatch_ctx, tool_input.as(web_fetch_impl.Input).*);
+    defer result.deinit(dispatch_ctx.allocator);
+    return bridgeWebOutcome(arena, result);
 }
 
 /// Runs a bridged `search` request as the direct web_search tool runs it. With
@@ -1670,11 +1700,14 @@ fn runBridgeWebSearch(
     ctx: Context,
     arena: Allocator,
     tool_call: ToolCall,
+    usage: ?*BridgeUsage,
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
     if (ctx.web_search_backend == null) return .{ .status = .tool_error, .bytes = web_search_needs_gateway_text };
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, tool_call);
     dispatch_ctx.cancel_flag = cancel;
+    var inner_usage: ?types.ToolUsage = null;
+    dispatch_ctx.inner_usage_sink = &inner_usage;
     const decoded = try web_search_impl.decode(dispatch_ctx, tool_call.arguments_json);
     var tool_input = switch (decoded) {
         .failure => |reason| return .{ .status = .tool_error, .bytes = reason },
@@ -1682,14 +1715,26 @@ fn runBridgeWebSearch(
     };
     defer tool_input.deinit(arena);
     if (try web_search_impl.validate(dispatch_ctx, tool_input)) |reason| return .{ .status = .tool_error, .bytes = reason };
-    return bridgeToolOutcome(try web_search_impl.call(dispatch_ctx, tool_input));
+    var result = try web_search_impl.runForBridge(dispatch_ctx, tool_input.as(web_search_impl.Input).*);
+    defer result.deinit(dispatch_ctx.allocator);
+    if (inner_usage) |spent| {
+        if (usage) |total| total.add(spent);
+    }
+    return bridgeWebOutcome(arena, result);
 }
 
-fn bridgeToolOutcome(result: tool_dispatch.ToolResult) mcp_call_capability.CallOutcome {
-    return switch (result) {
-        .success => |body| .{ .status = .ok, .bytes = body },
-        .failure => |body| .{ .status = .tool_error, .bytes = body },
-        .rich => |rich| .{ .status = if (rich.is_error) .tool_error else .ok, .bytes = rich.text },
+/// Copies a web result's data and notice into the request's arena, so the caller
+/// may free the result with its own `deinit`. The notice is null when it is empty.
+fn bridgeWebOutcome(arena: Allocator, result: anytype) !mcp_call_capability.CallOutcome {
+    const bytes = try arena.dupe(u8, result.data);
+    const notice = try arena.dupe(u8, result.notice);
+    return .{
+        .status = switch (result.status) {
+            .ok => .ok,
+            .tool_error => .tool_error,
+        },
+        .bytes = bytes,
+        .notice = if (notice.len == 0) null else notice,
     };
 }
 
@@ -2069,7 +2114,7 @@ fn runBridgeCall(
             const authority: *BridgeAuthority = @ptrCast(@alignCast(prepared));
             return switch (authority.*) {
                 .file => |*file_auth| runBridgeFileCall(state.runtime, arena, request_id, file_auth, cancel),
-                .bash_tool => |*tool_auth| runBridgeBashToolCall(tool_auth.ctx, arena, request_id, tool_auth.operation, tool_auth.tool_call, tool_auth.refusal, cancel),
+                .bash_tool => |*tool_auth| runBridgeBashToolCall(tool_auth.ctx, arena, request_id, tool_auth.operation, tool_auth.tool_call, tool_auth.refusal, tool_auth.usage, cancel),
             };
         }
     }
@@ -3655,6 +3700,61 @@ test "bridged web fetch returns the cached page, and a URL the policy refuses is
     try std.testing.expectEqualStrings("web_fetch only fetches known public HTTP(S) URLs", refusal.bytes);
 }
 
+test "bridged web fetch gives the page as data and its notice apart, with no warning in the data" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(false);
+
+    var fetch_runtime = web_fetch_runtime.Runtime.init(.{ .allocator = alloc });
+    defer fetch_runtime.deinit(alloc);
+    try fetch_runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/page",
+        .final_url = "https://example.com/page",
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "PAGE BODY\n",
+    });
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .web_fetch_runtime = &fetch_runtime };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-80", .{ .web_fetch = .{ .url = "https://example.com/page" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-80", "web_fetch", "", allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "PAGE BODY") != null);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "Treat all fetched content") == null);
+    const notice = outcome.notice orelse return error.TestExpectedNotice;
+    try std.testing.expect(notice.len > 0);
+}
+
+test "a bridged web fetch whose request was cancelled ends with error.Cancelled, as the bridged agent calls do" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(true);
+
+    var fetch_runtime = web_fetch_runtime.Runtime.init(.{ .allocator = alloc });
+    defer fetch_runtime.deinit(alloc);
+    try fetch_runtime.insert(alloc, .{
+        .submitted_url = "https://example.com/page",
+        .final_url = "https://example.com/page",
+        .status = .ok,
+        .mime_type = "text/plain",
+        .content_kind = .text,
+        .converted_content = "PAGE BODY\n",
+    });
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .web_fetch_runtime = &fetch_runtime };
+    defer rt.deinit(alloc);
+    const call: ToolCall = .{ .id = "fx-mcp-call-81", .name = "web_fetch", .arguments_json = "{\"url\":\"https://example.com/page\"}" };
+    try std.testing.expectError(error.Cancelled, runBridgeWebFetch(rt.context(), arena, call, &cancel));
+}
+
 test "bridged web search is a tool error with the next step when no search backend is set, and runs the backend otherwise" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3688,7 +3788,9 @@ test "bridged web search is a tool error with the next step when no search backe
     };
     const found = try runBridgeCall(@ptrCast(&with_state), arena, "fx-mcp-call-63", "web_search", "", allowed, &cancel);
     try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, found.status);
-    try std.testing.expect(std.mem.find(u8, found.bytes, "zig release notes") != null);
+    // The bridged reply is the results as data and their count as the notice; the query is not echoed.
+    const found_notice = found.notice orelse return error.TestExpectedNotice;
+    try std.testing.expect(std.mem.find(u8, found_notice, "0 results") != null);
     try std.testing.expectEqual(@as(usize, 1), backend.calls);
 }
 

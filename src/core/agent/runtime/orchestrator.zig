@@ -3460,6 +3460,59 @@ fn providerExecutedResult(call: ToolCall) ?ToolExecutionResult {
     };
 }
 
+/// The usage a bash session's tool result adds to the turn's totals. Its bridged
+/// searches spent it in their own model requests, which no model completion
+/// carries. Only a tool the registry marks as a bash session qualifies. Bash never
+/// runs in a parallel batch (its read-only set is empty), so the serial tool result
+/// is the one place that sees it.
+fn bashSessionUsage(registry: tool_dispatch.Registry, tool_name: []const u8, execution: ToolExecutionResult) ?types.Usage {
+    const tool = registry.lookup(tool_name) orelse return null;
+    if (tool.captured_command_host != .bash_session) return null;
+    const spent = execution.inner_usage orelse return null;
+    return .{ .input_tokens = spent.input_tokens, .output_tokens = spent.output_tokens };
+}
+
+test "a bash session's usage counts toward the turn under any name, and any other tool's adds nothing" {
+    const bash_named_tool = tool_dispatch.Tool{
+        .name = "bash",
+        .description = "bash",
+        .model_schema = .{ .name = "bash", .description = "bash" },
+        .captured_command_host = .bash_session,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    var renamed_bash_tool = bash_named_tool;
+    renamed_bash_tool.name = "shell_session";
+    var native_bash_named_tool = bash_named_tool;
+    native_bash_named_tool.captured_command_host = .native;
+    var search_tool = bash_named_tool;
+    search_tool.name = "web_search";
+    search_tool.captured_command_host = .native;
+
+    const spent: ToolExecutionResult = .{
+        .status = .success,
+        .model_output = "",
+        .inner_usage = .{ .input_tokens = 5, .output_tokens = 7, .web_search_requests = 1 },
+    };
+
+    const session_tools = [_]tool_dispatch.Tool{bash_named_tool};
+    const counted = bashSessionUsage(.{ .tools = &session_tools }, "bash", spent) orelse return error.TestExpectedUsage;
+    try std.testing.expectEqual(@as(?u64, 5), counted.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 7), counted.output_tokens);
+
+    const renamed_tools = [_]tool_dispatch.Tool{renamed_bash_tool};
+    try std.testing.expect(bashSessionUsage(.{ .tools = &renamed_tools }, "shell_session", spent) != null);
+
+    const native_tools = [_]tool_dispatch.Tool{native_bash_named_tool};
+    try std.testing.expect(bashSessionUsage(.{ .tools = &native_tools }, "bash", spent) == null);
+
+    const search_tools = [_]tool_dispatch.Tool{search_tool};
+    try std.testing.expect(bashSessionUsage(.{ .tools = &search_tools }, "web_search", spent) == null);
+    try std.testing.expect(bashSessionUsage(.{ .tools = &session_tools }, "web_search", spent) == null);
+}
+
 fn reportProviderExecutedUsage(
     deps: *const AgentRuntimeDeps,
     calls: []const ToolCall,
@@ -13143,6 +13196,7 @@ fn processQueuedPromptLoop(
             }
 
             runtime_parallel_execution.reportInnerToolUsage(deps, tool_call.name, execution);
+            if (bashSessionUsage(deps.tool_registry, tool_call.name, execution)) |spent| agent.observeUsage(spent);
             if (execution.diff_entry) |payload| {
                 try deps.push_diff_block(deps.ctx, payload);
             }
