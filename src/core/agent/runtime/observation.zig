@@ -9,6 +9,7 @@ pub const ModelPurpose = enum { agent, compaction, vision, title, permission_rev
 pub const TurnOutcome = enum { completed, interrupted, failed, paused, yielded, cancelled, fenced };
 pub const WaitKind = enum { approval, question, mcp_form, mcp_url };
 pub const WaitOutcome = enum { accepted, denied, cancelled, failed, timed_out };
+// The published SDK type still lists `input_required`; fx no longer sends it.
 pub const McpStatus = enum { success, failure, cancelled, input_required, unavailable, unknown };
 pub const WaitRequest = struct {
     kind: WaitKind,

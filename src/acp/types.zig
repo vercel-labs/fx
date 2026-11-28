@@ -263,6 +263,15 @@ pub fn writeToolCallUpdateWithCommandResult(
     try w.writeAll("}");
 }
 
+/// Content only: the client keeps the status it already has for the call.
+pub fn writeToolCallContentUpdate(w: *std.Io.Writer, tool_call_id: []const u8, content_text: []const u8) !void {
+    try w.writeAll("{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":");
+    try writeJsonStr(tool_call_id, w);
+    try w.writeAll(",\"content\":[{\"type\":\"content\",\"content\":{\"type\":\"text\",\"text\":");
+    try writeJsonStr(content_text, w);
+    try w.writeAll("}}]}");
+}
+
 pub const AgentCapabilities = struct {
     image_prompts: bool,
     /// Accepts client `mcpServers` on session setup.
@@ -519,6 +528,23 @@ test "writeToolCallUpdate without content" {
     try writeToolCallUpdate(&out.writer, "call_003", .in_progress, null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"in_progress\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "content") == null);
+}
+
+test "writeToolCallContentUpdate omits the status and keeps the content" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallContentUpdate(&out.writer, "call_004", "LATE_STDOUT");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+
+    const update = parsed.value.object;
+    try std.testing.expectEqualStrings("tool_call_update", update.get("sessionUpdate").?.string);
+    try std.testing.expectEqualStrings("call_004", update.get("toolCallId").?.string);
+    try std.testing.expect(update.get("status") == null);
+    const block = update.get("content").?.array.items[0].object.get("content").?.object;
+    try std.testing.expectEqualStrings("text", block.get("type").?.string);
+    try std.testing.expectEqualStrings("LATE_STDOUT", block.get("text").?.string);
 }
 
 test "writeInitializeResponse contains required fields" {

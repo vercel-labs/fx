@@ -307,7 +307,8 @@ manager:
   `data` comes from v1's piece codec (`encodeConversationFrame`,
   `src/core/session/session_event.zig` lines 439 to 482). The types are
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
-  `context_note` (D93), `runtime_context` (D94), `model_call` (D96),
+  `context_note` (D93), `runtime_context` (D94), `toolbox_menu` and
+  `toolbox_noted` (D103), `model_call` (D96),
   `mcp_bridge_call` (D99), `cancelled_command` (D100), `subagent_started`
   (D101), `cancelled_wait` (D102), `turn_end` (files
   and turn summary), `interruption` (reason detail, partial text, command
@@ -1732,10 +1733,26 @@ permission mode does not rewrite a cached prompt prefix):
     The system prompt says what the block is and that its values replace
     the runtime context from then on (`src/builtins/system_prompt.md`);
     without that line, GPT-6.1 kept the instructions' permission mode.
-  - **Compaction:** a compaction summary ends the search, so the next turn
-    captures the current runtime context. An update kept after the summary
-    still counts as what the model last saw, so a turn whose new copy
-    differs from it adds one more update.
+  - **Compaction:** fx's own summary starts a new prefix, so the first
+    request after it captures the current runtime context, including the
+    rest of the turn that wrote it. A turn that sent an earlier turn's copy
+    captures it there and saves it in the summary record, the checkpoint's
+    `runtime_context` (`src/core/compactor/checkpoint.zig`), not on the
+    turn, so nothing the turn already saved is written again (D87). The
+    summary record is one write, with its copy in it. Later turns and
+    resumes read the copy from the summary and send the same bytes after it
+    (`src/core/agent/runtime/runtime_context.zig` restartAfterSummary,
+    `tests/tla/prompt_context/PromptCache.tla` "summary"). A turn that
+    captured its own copy keeps it, and so does a turn the summary kept:
+    the requests after the summary then send the kept turn's copy, not the
+    summary's. A summary that saved no copy, such as a manual `/compact`
+    between turns or one an older fx wrote, ends the search, so the next
+    turn captures one; nothing was sent after it before then. An update the
+    cut removed no longer counts. An update kept after the summary, in a
+    kept turn or in the running turn's kept messages, still counts as what
+    the model last saw, so a turn whose new copy differs from it adds one
+    more update, and only one. A provider's compaction block keeps the copy
+    the turns after it were sent with.
   - **Older fx:** an fx from before D94 leaves the item out (D17) and
     rebuilds the runtime context for every request, as it did.
 
@@ -2228,6 +2245,51 @@ as it was sent):
   fx's strict reader rejects with the whole session; or the names of the
   turn's last completed wait, which miss a subagent that started or ended
   after it.
+
+Settled for the toolbox menu (2026-11-27, so a resume does not rewrite a
+cached prompt prefix):
+- **D103 Decision:** a conversation sends one toolbox menu on every request,
+  resumed ones included (`tests/tla/toolbox/Toolbox.tla` MenuFixed). The
+  turn that renders it saves it, and a turn whose change note tells the
+  conversation the toolbox changed saves what the note told.
+  - **Save:** the turn that kept the menu saves its bytes, the lead and the
+    menu as sent, with the hash of the entries it lists, as a
+    `toolbox_menu` item. A turn that adds a toolbox change note saves a
+    `toolbox_noted` item with the hash of what the toolbox held and the
+    conversation's compaction count then. Both come right after the user
+    item, before `runtime_context` (D94): the turn has them before its
+    first step captures the runtime context, and every save of the turn
+    carries them, so a streamed turn keeps its prefix. In the execution JSON
+    they need schema version 13, written only for that turn, which names
+    `runtime_context` too, null when the turn captured none; libfx versions
+    the journal, checkpoint, and snapshot that hold it as D93 does. A v1 log
+    never holds them.
+  - **Compaction:** a compaction checkpoint keeps the menu in its payload's
+    `toolbox_menu`, for fx's own summary and a provider's block alike, so a
+    resume of a compacted session, which reads no turn before the
+    checkpoint, still has it.
+  - **Restore:** before a resumed conversation's first request, fx reads its
+    history oldest to newest: a checkpoint sets the menu it kept, or none,
+    and counts the conversation as told only what the menu lists, since the
+    notes before it went with its summary, as one process does after a
+    compaction; a turn that saved a menu sets it when none is set; and a
+    turn's `toolbox_noted` sets what the conversation was told, unless its
+    compaction count is older than the newest checkpoint's, as for a turn
+    the compaction kept or cut. A recovered turn's first attempt counts as
+    the newest turn. Without a saved menu, as in a session from before
+    D103 or after a checkpoint without the field, the next request renders
+    a menu and saves it. Clearing the conversation renders a new one, and
+    a fork copies the turns with their items.
+  - **Older fx:** an fx from before D103 leaves the items out (D17), ignores
+    the payload field, and renders the menu again on resume, as it did.
+
+  **Why:** the menu sits in the instructions, so a resume that rendered it
+  from the skills and MCP servers configured then rewrote the cached prefix
+  of every request after it, and providers that bind reasoning to what came
+  before it dropped the conversation's reasoning.
+  **Alternative:** keep the menu only in memory, which every resume, `fx ask
+  --resume` and ACP `session/load` rebuild; or derive what a change note told
+  from its text, which the note does not hold in full.
 
 ## Design Risks And Failure Behavior
 

@@ -1,0 +1,53 @@
+{
+  "covers": [
+    "AC-3"
+  ],
+  "title": "A ready remote run: output, its own exit code, and a new file brought back.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false
+      }
+    },
+    "teams": "one",
+    "surface": "interactive",
+    "login": "valid",
+    "configured": true,
+    "configValid": true,
+    "answers": [],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "remote"
+      ]
+    },
+    "prompts": 0,
+    "writes": 0
+  },
+  "run": {
+    "events": [
+      "push_ok",
+      "send_ran",
+      "id_arrives",
+      "cmd_edits",
+      "cmd_exits",
+      "stream_end",
+      "bring_back_written",
+      "exit_cmd"
+    ]
+  },
+  "tamper": {
+    "setup": "outcome-as-local",
+    "run": "early-bring-back"
+  },
+  "drive": {
+    "command": "echo hi; echo err >&2; echo changed > made.txt; exit 7",
+    "file": "made.txt"
+  }
+}
