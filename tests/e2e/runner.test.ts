@@ -2468,6 +2468,30 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
     expect(later[extend]?.body).toEqual({ duration: 1800000 });
   }, TIMEOUT * 2);
 
+  test("with sandbox.json gone, a create that answers 400 for the taken name resumes that sandbox and creates none (V3)", async () => {
+    const repo = makeRepo("lost-state");
+    expect((await runRemote(repo, "true")).code).toBe(0);
+    const file = join(stateOf(repo), "sandbox.json");
+    const name = (JSON.parse(readFileSync(file, "utf8")) as { name: string }).name;
+    rmSync(file);
+    runner.api.faults.takenNameAs400 = true;
+    try {
+      const before = runner.api.log.length;
+      const result = await runRemote(repo, "echo again");
+      expect(result.code).toBe(0);
+      expect(result.stdout).toBe("again\n");
+      const later = runner.api.log.slice(before);
+      const creates = later.filter((entry) => entry.route === "createSandbox");
+      expect(creates.map((entry) => entry.status)).toEqual([400]);
+      const create = later.findIndex((entry) => entry.route === "createSandbox");
+      const resume = later.findIndex((entry) => entry.route === "getSandbox" && entry.query.resume === "true");
+      expect(resume).toBeGreaterThan(create);
+      expect((JSON.parse(readFileSync(file, "utf8")) as { name: string }).name).toBe(name);
+    } finally {
+      runner.api.faults.takenNameAs400 = false;
+    }
+  }, TIMEOUT * 2);
+
   test("a file the command writes comes back to the repository, and N14 counts it (V9)", async () => {
     const repo = makeRepo("writes-back");
     const result = await runRemote(repo, "echo made > made.txt");

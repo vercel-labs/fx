@@ -21,6 +21,8 @@
 //
 // Fault knobs (`api.faults`, each used once unless noted):
 //   createStatus        POST /v3/sandboxes answers this status
+//   takenNameAs400      every create of a taken name answers 400 with the real
+//                       API's body, not 409 (not once)
 //   dropAfterExecBody   the next exec: the body is read, then the connection
 //                       drops before any line; "ran" starts the command first
 //   delayCommandLineMs  the next exec stream holds its first line, the one
@@ -146,6 +148,8 @@ function endTracked(answer: Response, onEnd: () => void): Response {
 
 export type FakeVercelFaults = {
   createStatus?: number;
+  // Every create of a taken name answers 400 `bad_request` with the real API's body, not 409.
+  takenNameAs400?: boolean;
   // The next create answers 200 with this raw body, once: a body fx cannot read.
   createBody?: string;
   // The next command whose arguments contain `contains` answers `status` with an error body, once, before any command line.
@@ -751,6 +755,9 @@ export function startFakeVercelApi(options: FakeVercelOptions): FakeVercelApi {
         const vcpus = body.resources?.vcpus ?? DEFAULT_VCPUS;
         const badVcpus = vcpusError(vcpus);
         if (badVcpus) return badVcpus;
+        if (byName.has(body.name) && faults.takenNameAs400) {
+          return measuredError(400, `A sandbox with the name '${body.name}' already exists for this project. Use GET /sandboxes/:name to resume it or delete it first.`);
+        }
         if (byName.has(body.name)) return errorAnswer(409, "conflict", "a sandbox with this name exists");
         const memory = vcpus * MEMORY_MB_PER_VCPU;
         const timeout = faults.nextSessionMs ?? (typeof body.timeout === "number" ? body.timeout : DEFAULT_SESSION_TIMEOUT_MS);
@@ -1193,6 +1200,13 @@ async function selfTest(): Promise<number> {
     check("create without resources is 2 vcpus and 4096 MB",
       madeBody.sandbox.vcpus === 2 && madeBody.sandbox.memory === 4096 && madeBody.session.vcpus === 2 && madeBody.session.memory === 4096, madeBody);
     check("a second create of the same name is 409 again", (await post("/v3/sandboxes?teamId=team_1", sandboxBody)).status === 409);
+    api.faults.takenNameAs400 = true;
+    const takenAs400 = await post("/v3/sandboxes?teamId=team_1", sandboxBody);
+    const takenBody = await takenAs400.json() as any;
+    api.faults.takenNameAs400 = false;
+    check("a create of a taken name is 400 bad_request with the real body when takenNameAs400 is set",
+      takenAs400.status === 400 && takenBody.error?.code === "bad_request" &&
+      takenBody.error?.message === "A sandbox with the name 'fx-0123456789abcdef' already exists for this project. Use GET /sandboxes/:name to resume it or delete it first.", takenBody);
     const odd = await post("/v3/sandboxes?teamId=team_1", { name: "fx-odd", projectId: "prj_1", resources: { vcpus: 3 } });
     const oddBody = await odd.json();
     check("an odd vcpus above 1 is 400 with the real error", odd.status === 400 &&

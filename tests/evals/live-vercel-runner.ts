@@ -324,6 +324,22 @@ try {
     `exits ${first.code} and ${second.code}; brought back ${brought === "second\n" ? "the second run's file" : "a different file or none"}; sandbox.json vcpus ${String(size)}`,
     `${first.stderr}${second.stderr}`,
   );
+
+  // Item 9: with sandbox.json gone, the run finds the sandbox by its name and resumes it, and creates none (V3).
+  const seeded = await runOnce(runnerArgs("remote", 4, [], "echo lost-seed"));
+  const seededName = sandboxInfo().name;
+  const seededNames = await sandboxNames();
+  rmSync(join(stateDir, "sandbox.json"), { force: true });
+  const rerun = await runOnce(runnerArgs("remote", 4, [], "echo lost-again"));
+  const rerunName = sandboxInfo().name;
+  const afterRerun = await sandboxNames();
+  const created = afterRerun && seededNames ? [...afterRerun].filter((name) => !seededNames.has(name)) : null;
+  record(
+    "9 a lost state file resumes the same sandbox",
+    seeded.code === 0 && rerun.code === 0 && rerun.stdout.includes("lost-again") && typeof seededName === "string" && rerunName === seededName && created?.length === 0,
+    `seed exit ${seeded.code}; rerun exit ${rerun.code}; output ${rerun.stdout.includes("lost-again") ? "arrived" : "is missing"}; new sandbox.json name ${rerunName === seededName ? "is the same" : "differs"}; new sandboxes in the project after the rerun: ${created === null ? "listing failed" : created.length}`,
+    rerun.stderr,
+  );
 } finally {
   const now = await sandboxNames();
   if (initial === null || now === null) {

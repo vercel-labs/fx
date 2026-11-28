@@ -217,13 +217,35 @@ const Obtained = struct {
     created: bool,
 };
 
-/// V3 with no state file: create. A 409 means the sandbox exists, so one resume GET.
+/// V3 with no state file: create. A 409 means the sandbox exists, so one resume GET. A 400 counts too:
+/// the real API answers a taken name with 400 `bad_request`, not 409. A 400 that names the size is a bad
+/// size, not a taken name, so it is refused as it is (`refuseStatus` marks it with a `vcpus: ` detail).
 fn createFirst(ctx: *Context) Error!Obtained {
     const created = createSandbox(ctx) catch |err| {
-        if (err != error.Refused or ctx.failure.status != 409) return err;
-        return resumeOrCreate(ctx);
+        if (err != error.Refused) return err;
+        return switch (ctx.failure.status) {
+            409 => resumeOrCreate(ctx),
+            400 => if (namesSize(ctx.failure)) err else resumeTakenName(ctx),
+            else => err,
+        };
     };
     return .{ .state = created, .created = true };
+}
+
+fn namesSize(failure: Failure) bool {
+    return std.mem.startsWith(u8, failure.detail, "vcpus: ");
+}
+
+/// One resume GET for a name the create refused with 400. A 404 from that GET gives back the create's own
+/// failure, so the person sees its status and message, and no second create runs.
+fn resumeTakenName(ctx: *Context) Error!Obtained {
+    const create_failure = ctx.failure;
+    const resumed = resumeSandbox(ctx) catch |err| {
+        if (err != error.Refused or ctx.failure.status != 404) return err;
+        ctx.failure = create_failure;
+        return error.Refused;
+    };
+    return .{ .state = resumed, .created = false };
 }
 
 /// One resume GET. A 404 means the sandbox was deleted, so it is created once.
@@ -1488,6 +1510,8 @@ const resume_answer = "{\"sandbox\":{\"name\":\"fx-test\",\"vcpus\":4,\"expiresA
 const gone_body = "{\"error\":{\"code\":\"not_found\",\"message\":\"sandbox not found\"}}";
 const forbidden_body = "{\"error\":{\"code\":\"forbidden\",\"message\":\"Not authorized\"}}";
 const conflict_body = "{\"error\":{\"code\":\"conflict\",\"message\":\"a sandbox with this name exists\"}}";
+const taken_name = "fx-0123456789abcdef";
+const taken_body = "{\"error\":{\"code\":\"bad_request\",\"message\":\"A sandbox with the name 'fx-0123456789abcdef' already exists for this project. Use GET /sandboxes/:name to resume it or delete it first.\"}}";
 const user_out = "{\"stream\":\"stdout\",\"data\":\"fx\\n\"}\n{\"command\":{\"id\":\"cmd_1\",\"exitCode\":0}}\n";
 const exit_zero = "{\"command\":{\"id\":\"cmd_2\",\"exitCode\":0}}\n";
 const exit_one = "{\"command\":{\"id\":\"cmd_3\",\"exitCode\":1}}\n";
@@ -1966,6 +1990,77 @@ test "a create that answers 409, a resume that answers 404, and a second create 
     try std.testing.expectEqual(@as(u16, 409), failure.status);
     server.close();
     try std.testing.expectEqual(@as(usize, 3), server.servedCount());
+}
+
+test "a create that answers 400 for a taken name resumes that sandbox, with no first-use setup (V3)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    try seedManifest(arena, &state_dir, generation_fresh);
+
+    var server: test_server.Server = .{ .replies = &.{
+        .{ .status = "400 Bad Request", .body = taken_body },
+        .{ .body = resume_answer },
+        .{ .mode = .lines_then_close, .body = marker_fresh },
+    } };
+    try server.listen();
+    try server.start();
+    defer server.close();
+    var buffer: [64]u8 = undefined;
+    const base = try baseFor(&buffer, server.port());
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var ctx = contextFor(arena, &cancel, base, &capture, &state_dir);
+    ctx.name = taken_name;
+
+    const session = try expectOk(Session, ensure(&ctx));
+    try std.testing.expectEqualStrings("sess_2", session.state.session_id);
+    try std.testing.expectEqual(Generation.kept, session.generation);
+    server.close();
+    try std.testing.expectEqual(@as(usize, 3), server.servedCount());
+    try std.testing.expect(std.mem.startsWith(u8, server.head(0), "POST /v3/sandboxes?teamId=team_fake HTTP/1.1"));
+    try std.testing.expect(std.mem.find(u8, server.head(1), "GET /v2/sandboxes/fx-0123456789abcdef?projectId=prj_fake&resume=true") != null);
+    try std.testing.expect(std.mem.find(u8, server.head(2), "/v2/sandboxes/sessions/sess_2/cmd") != null);
+}
+
+test "a create that answers 400 for a taken name, and a resume that answers 404, gives the create's failure with no second create (V3)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+
+    var server: test_server.Server = .{ .replies = &.{
+        .{ .status = "400 Bad Request", .body = taken_body },
+        .{ .status = "404 Not Found", .body = gone_body },
+    } };
+    try server.listen();
+    try server.start();
+    defer server.close();
+    var buffer: [64]u8 = undefined;
+    const base = try baseFor(&buffer, server.port());
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var ctx = contextFor(arena, &cancel, base, &capture, &state_dir);
+    ctx.name = taken_name;
+
+    const failure = try expectFailed(Session, ensure(&ctx));
+    try std.testing.expectEqual(@as(u16, 400), failure.status);
+    try std.testing.expectEqualStrings("create", failure.step);
+    try std.testing.expectEqualStrings(
+        "A sandbox with the name 'fx-0123456789abcdef' already exists for this project. Use GET /sandboxes/:name to resume it or delete it first.",
+        failure.detail,
+    );
+    server.close();
+    try std.testing.expectEqual(@as(usize, 2), server.servedCount());
+    try std.testing.expect(std.mem.startsWith(u8, server.head(0), "POST /v3/sandboxes?teamId=team_fake HTTP/1.1"));
+    try std.testing.expect(std.mem.find(u8, server.head(1), "GET /v2/sandboxes/fx-0123456789abcdef?projectId=prj_fake&resume=true") != null);
 }
 
 test "an exec command that answers 404 resumes once and runs once more, and a second 404 is refused and marks the record (V3)" {
