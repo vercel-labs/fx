@@ -64,6 +64,7 @@ Observable(o) ==
                     refusedOpen, coverBroken, lateStart>>
      /\ UNCHANGED heldVars
      /\ UNCHANGED idleVars
+     /\ UNCHANGED turnVars
   \/ /\ o.op \in {"send", "stop", "close"}
      /\ Exec
      /\ last'.op = o.op

@@ -150,6 +150,8 @@ pub const Request = struct {
     cancel_flag: *std.atomic.Value(bool),
     trace_ctx: debug_trace.TraceContext,
     progress: ?Progress = null,
+    /// Extra instructions for the summary, such as the user's PreCompact hooks gave; null for none.
+    instructions: ?[]const u8 = null,
     /// The runtime context the conversation was sent with, one system
     /// message text each. A provider block keeps it, so the turns after the
     /// block go on after the same instructions.
@@ -272,6 +274,7 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .conversation_room = if (caller.sends_after_conversation) request.size.roomAfterConversation() else null,
         .max_text_tokens = request.size.compactedTokens(chosen_fx.kept_used),
         .counter = if (counts) &counter else null,
+        .instructions = request.instructions,
     }, summarizer.model(), request.records);
     defer summary.deinit();
     trace.info(trace_ctx, .provider_completed, "model={s} summaries={d} shown_turns={d} turns={d} tools={d} entries={d} used={d} text_bytes={d} fallback={s}", .{ caller.model, summarizer.summaries, summary.compacted.turns.len, summary.compacted.turn_count, summary.compacted.tool_count, summary.compacted.entries.len, summary.compacted.used.len, summary.text.len, summarizer.fallback_used orelse "none" });

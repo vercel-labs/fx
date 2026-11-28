@@ -77,6 +77,7 @@ pub const Settings = struct {
     update_channel: ?update_target.Channel = null,
     theme: ?[]const u8 = null,
     prompt_history_enabled: ?bool = null,
+    experimental_hooks: ?bool = null,
     effort: ?types.ReasoningEffort = null,
     /// Optional review-model override for automatic permission review. Owned by
     /// this Settings; freed in deinit. Null keeps the provider's default.
@@ -173,6 +174,7 @@ pub const ConfigSources = struct {
     slash_menu_categories: ConfigSource = .compiled_default,
     collapse_tool_calls: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
+    experimental_hooks: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
     statusline_session: ConfigSource = .compiled_default,
     session_titles: ConfigSource = .compiled_default,
@@ -1053,6 +1055,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.session_titles != null) sources.session_titles = source;
     if (settings.cache_warming != null) sources.cache_warming = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
+    if (settings.experimental_hooks != null) sources.experimental_hooks = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
     if (settings.statusline_session != null) sources.statusline_session = source;
     if (settings.notification_turn_end != null) sources.notification_turn_end = source;
@@ -2029,6 +2032,14 @@ fn parseProfileOnlyFields(
         }
     }
 
+    if (root.object.get("experimental")) |experimental_value| {
+        if (experimental_value != .object) return error.InvalidExperimentalType;
+        if (experimental_value.object.get("hooks")) |hooks_value| {
+            if (hooks_value != .bool) return error.InvalidExperimentalHooksType;
+            settings.experimental_hooks = hooks_value.bool;
+        }
+    }
+
     if (root.object.get("effort")) |effort_value| {
         const value = effort_value;
         switch (value) {
@@ -2290,6 +2301,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
         incoming.skill_symlink_authorities = null;
     }
     if (incoming.prompt_history_enabled) |value| target.prompt_history_enabled = value;
+    if (incoming.experimental_hooks) |value| target.experimental_hooks = value;
     if (incoming.effort) |value| target.effort = value;
     if (incoming.review_model) |value| {
         if (target.review_model) |old| alloc.free(old);
@@ -4052,6 +4064,65 @@ test "project profile-only settings are ignored and diagnosed by key" {
     }
 }
 
+test "a project file cannot turn on an experiment" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{}\n");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"experimental\":{\"hooks\":true}}\n");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.settings.experimental_hooks == null);
+    try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.experimental_hooks);
+    try expectIgnoredProjectKey(result.diagnostics, "experimental");
+}
+
+test "a bad experimental setting fails the profile layer" {
+    const alloc = std.testing.allocator;
+
+    var wrong_switch = try std.json.parseFromSlice(std.json.Value, alloc, "{\"experimental\":{\"hooks\":\"yes\"}}", .{});
+    defer wrong_switch.deinit();
+    try std.testing.expectError(
+        error.InvalidExperimentalHooksType,
+        parseSettingsValueForLayer(alloc, wrong_switch.value, .profile, false),
+    );
+
+    var wrong_group = try std.json.parseFromSlice(std.json.Value, alloc, "{\"experimental\":true}", .{});
+    defer wrong_group.deinit();
+    try std.testing.expectError(
+        error.InvalidExperimentalType,
+        parseSettingsValueForLayer(alloc, wrong_group.value, .profile, false),
+    );
+
+    // The layer load reports it the way it reports any malformed field.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"experimental\":{\"hooks\":\"yes\"}}\n");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    var result = try loadMergedSettingsDetailedFromHome(alloc, home_root, workspace_root);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.settings.experimental_hooks == null);
+    var saw_user_diagnostic = false;
+    for (result.diagnostics) |diagnostic| {
+        if (diagnostic.layer == .user and diagnostic.cause == .malformed_settings) saw_user_diagnostic = true;
+    }
+    try std.testing.expect(saw_user_diagnostic);
+}
+
 test "project auto_compact_percent is ignored with a diagnostic" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4389,7 +4460,7 @@ test "detailed settings expose target sources and permission views" {
 
     const user_settings = try std.testing.allocator.print(
         "{{\"model\":\"user/model\",\"permission_mode\":\"ask\",\"fast_mode\":true,\"input_appearance\":\"tint\"," ++
-            "\"prompt_history\":{{\"enabled\":false}},\"status_line\":{{\"sandbox\":true,\"context\":false,\"session\":true}}," ++
+            "\"prompt_history\":{{\"enabled\":false}},\"experimental\":{{\"hooks\":true}},\"status_line\":{{\"sandbox\":true,\"context\":false,\"session\":true}}," ++
             "\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{" ++
             "\"model\":\"workspace/model\",\"permission_mode\":\"auto\",\"input_appearance\":\"lines\",\"sandbox\":\"none\",\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}" ++
             "}}}}}}\n",
@@ -4411,6 +4482,8 @@ test "detailed settings expose target sources and permission views" {
     try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.effort);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.fast_mode);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.prompt_history_enabled);
+    try std.testing.expectEqual(ConfigSource.user_global, result.sources.experimental_hooks);
+    try std.testing.expectEqual(true, result.settings.experimental_hooks.?);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.statusline_context);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.statusline_session);
     try std.testing.expectEqual(true, result.settings.statusline_session.?);

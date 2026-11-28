@@ -36,6 +36,7 @@ export type {
   FxGrokProvider,
   FxHostTool,
   FxHooks,
+  FxObserve,
   FxHookEvent,
   FxHookMessage,
   FxHookToolCall,

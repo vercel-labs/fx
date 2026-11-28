@@ -5,6 +5,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const runtime_user_hooks = @import("../agent/runtime/user_hooks.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const shared_theme = @import("../shared/theme.zig");
@@ -35,6 +36,7 @@ const gateway_client = @import("../../gateway/client.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
+const hooks_host = @import("../hooks_host/hooks_host.zig");
 const select_watch = @import("../shared/select_watch.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
@@ -153,6 +155,8 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
         if (std_builtin.is_test) null else {};
 
     fn handle(signal: std.posix.SIG) callconv(.c) void {
+        // Stops the hook groups too, so a hook that runs after the cancel (SessionEnd) ends with the turn (R3.9).
+        hooks_host.killLiveGroups();
         _ = requested_signal.cmpxchgStrong(
             0,
             @intCast(@backingInt(signal)),
@@ -193,6 +197,8 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
             }
             std.posix.sigaction(std.posix.SIG.INT, &action, &scope.old_sigint_action);
             std.posix.sigaction(std.posix.SIG.TERM, &action, &scope.old_sigterm_action);
+            // A hang-up has no turn to cancel: it stops the hook groups and ends the process (R3.9).
+            hooks_host.installExitSignals(&hooks_host.hangup_exit_signals);
             coordinator_active = true;
             scope.installed = true;
             return scope;
@@ -205,6 +211,7 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
             std.debug.assert(coordinator_active);
             std.posix.sigaction(std.posix.SIG.INT, &self.old_sigint_action, null);
             std.posix.sigaction(std.posix.SIG.TERM, &self.old_sigterm_action, null);
+            hooks_host.restoreExitSignals(&hooks_host.hangup_exit_signals);
             if (std_builtin.is_test) {
                 if (test_after_restore) |hook| hook();
             }
@@ -330,7 +337,75 @@ fn runAskChild(
         .project_context = ctx.modelVisibleProjectContext(),
         .lifecycle_view = ctx.lifecycle_view,
         .workspace_capture = if (ctx.workspaceCaptureContext()) |context| .{ .home = context.home, .path = context.path } else null,
+        .user_hooks = if (ctx.user_hooks) |*rt| rt else null,
+        .hooks_trust_required = true,
     }, turn, message, admission, cancel);
+}
+
+/// One notice a run showed on stderr, kept for `fx ask --json`. `topic` and
+/// `tone` are static strings; `text` is owned.
+const JsonNotice = struct {
+    topic: []const u8,
+    tone: []const u8,
+    text: []u8,
+};
+
+/// The notices a run showed, kept for `fx ask --json`. Each text is cut to
+/// `max_text_bytes` on a UTF-8 boundary. Past `max_count`, a notice is only
+/// counted in `dropped`.
+const JsonNoticeLog = struct {
+    const max_count = 100;
+    const max_text_bytes = 2000;
+
+    items: std.ArrayList(JsonNotice) = .empty,
+    dropped: usize = 0,
+
+    pub fn record(self: *JsonNoticeLog, alloc: Allocator, topic: []const u8, tone: []const u8, text: []const u8) void {
+        if (self.items.items.len >= max_count) {
+            self.dropped += 1;
+            debug_trace.logf("ask", "dropped {s} notice from fx ask --json: the {d}-notice limit is full", .{ topic, max_count });
+            return;
+        }
+        const kept = text_utils.utf8PrefixByBytes(text, max_text_bytes);
+        if (kept.len < text.len) {
+            debug_trace.logf("ask", "cut {s} notice for fx ask --json from {d} to {d} bytes", .{ topic, text.len, kept.len });
+        }
+        const owned = alloc.dupe(u8, kept) catch {
+            self.dropped += 1;
+            debug_trace.logf("ask", "dropped {s} notice from fx ask --json: its copy could not be made", .{topic});
+            return;
+        };
+        self.items.append(alloc, .{ .topic = topic, .tone = tone, .text = owned }) catch {
+            alloc.free(owned);
+            self.dropped += 1;
+            debug_trace.logf("ask", "dropped {s} notice from fx ask --json: its list could not grow", .{topic});
+        };
+    }
+
+    pub fn deinit(self: *JsonNoticeLog, alloc: Allocator) void {
+        freeJsonNoticeTexts(alloc, self.items.items);
+        self.items.deinit(alloc);
+    }
+};
+
+fn freeJsonNoticeTexts(alloc: Allocator, notices: []const JsonNotice) void {
+    for (notices) |notice| alloc.free(notice.text);
+}
+
+/// Copies notices into a result, which then owns the copies.
+fn dupeJsonNotices(alloc: Allocator, notices: []const JsonNotice) ![]JsonNotice {
+    if (notices.len == 0) return @constCast(&.{});
+    const out = try alloc.alloc(JsonNotice, notices.len);
+    var copied: usize = 0;
+    errdefer {
+        freeJsonNoticeTexts(alloc, out[0..copied]);
+        alloc.free(out);
+    }
+    for (notices, 0..) |notice, i| {
+        out[i] = .{ .topic = notice.topic, .tone = notice.tone, .text = try alloc.dupe(u8, notice.text) };
+        copied += 1;
+    }
+    return out;
 }
 
 pub const PromptRunResult = struct {
@@ -361,6 +436,10 @@ pub const PromptRunResult = struct {
     /// each first ran; empty when none did. Not part of `usage`, which is
     /// main's alone.
     subagents: []subagent_usage.Entry = &.{},
+    /// Owned. The notices the run showed, for `fx ask --json`; empty when none.
+    notices: []JsonNotice = &.{},
+    /// Notices the run showed but did not keep: past the limit, or a copy failed.
+    notices_dropped: usize = 0,
 
     pub fn deinit(self: PromptRunResult, alloc: Allocator) void {
         subagent_usage.freeEntries(alloc, self.subagents);
@@ -370,6 +449,8 @@ pub const PromptRunResult = struct {
         if (self.model.len > 0) alloc.free(self.model);
         if (self.resolved_provider.len > 0) alloc.free(self.resolved_provider);
         if (self.session_id.len > 0) alloc.free(self.session_id);
+        freeJsonNoticeTexts(alloc, self.notices);
+        if (self.notices.len > 0) alloc.free(self.notices);
         freeToolCallRecords(alloc, self.tool_calls);
     }
 };
@@ -754,6 +835,8 @@ const AskContext = struct {
     assistant_output: std.ArrayList(u8) = .empty,
     final_output: std.ArrayList(u8) = .empty,
     final_source: std.ArrayList(u8) = .empty,
+    /// Copies of the notices the run showed, kept only in `--json` mode.
+    notice_log: JsonNoticeLog = .{},
     tool_call_records: std.ArrayList(ToolCallRecord) = .empty,
     tool_call_records_mutex: std.Io.Mutex = .init,
     stream_events_mutex: std.Io.Mutex = .init,
@@ -768,6 +851,8 @@ const AskContext = struct {
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
+    /// The user's hooks runtime for this run, or null when hooks are off.
+    user_hooks: ?hooks_host.Runtime = null,
     active_turn_id: u64 = 0,
     /// The turn of this `fx ask` process, set once at its start. Mail turns that
     /// follow run under it too (the known U4 gap).
@@ -839,6 +924,7 @@ const AskContext = struct {
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
         self.capability_resolver.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
+        if (self.user_hooks) |*rt| rt.deinit();
         if (self.v2) |v2| v2.close();
         self.v2 = null;
         if (self.v2_store) |*store| store.deinit(self.alloc);
@@ -859,6 +945,7 @@ const AskContext = struct {
         self.assistant_output.deinit(self.alloc);
         self.final_output.deinit(self.alloc);
         self.final_source.deinit(self.alloc);
+        self.notice_log.deinit(self.alloc);
         for (self.pending_tool_progress.items) |progress| progress.deinit(self.alloc);
         self.pending_tool_progress.deinit(self.alloc);
         for (self.deferred_tool_progress.items) |progress| self.alloc.free(progress);
@@ -880,6 +967,8 @@ const AskContext = struct {
                 .session_id = self.activeSessionId(),
             },
             .outcome_allocator = self.alloc,
+            .user_hooks = if (self.user_hooks) |*rt| rt else null,
+            .trust_required = true,
         };
     }
 
@@ -1849,6 +1938,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
     ctx.context_enabled = startup.context_enabled;
     ctx.workspace_capture = startup.workspace_capture;
+    ctx.user_hooks = hooks_host.Runtime.init(std.heap.c_allocator, .{
+        .enabled = startup.experimental_hooks,
+        .home = io_mod.homeDir(),
+        .workspace_root = ctx.workspace_root,
+    }) catch |err| blk: {
+        debug_trace.logf("hooks", "could not start hooks: {s}", .{@errorName(err)});
+        break :blk null;
+    };
     if (comptime !host_target.is_wasm) {
         if (startup.sandbox_execution) ctx.sandbox_policy = sandbox_policy.loadForProcess(alloc);
     }
@@ -2044,10 +2141,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     loaded_skills.dir = &.{};
     if (startup.context_enabled) {
         try ctx.checkCancellation();
+        var instructions: runtime_user_hooks.InstructionFilterState = .{ .lifecycle = ctx.lifecycleContext() };
         ctx.context_snapshot = try ctx.deps.context_registry.gatherDefaultSnapshot(alloc, .{
             .workspace_root = startup.workspace_root,
             .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
             .context_limits = ctx.context_limits,
+            .instruction_filter = instructions.filter(),
         });
         try ctx.checkCancellation();
         for (ctx.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
@@ -2410,6 +2509,12 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     const subagents = try takeSubagentUsage(ctx, alloc);
     errdefer subagent_usage.freeEntries(alloc, subagents);
 
+    const notices = try dupeJsonNotices(alloc, ctx.notice_log.items.items);
+    errdefer {
+        freeJsonNoticeTexts(alloc, notices);
+        if (notices.len > 0) alloc.free(notices);
+    }
+
     const tool_calls = try takeToolCallRecords(ctx, alloc);
 
     return .{
@@ -2417,6 +2522,8 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .assistant_output = assistant_output,
         .final_output = final_output,
         .final_source = final_source,
+        .notices = notices,
+        .notices_dropped = ctx.notice_log.dropped,
         .interrupted = ctx.processInterruptRequested(),
         .output_write_failed = ctx.output_write_failed,
         .output_reader_gone = ctx.output_reader_gone,
@@ -2496,6 +2603,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .push_tool_lifecycle = pushToolLifecycle,
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
+        .push_hook_notice = pushHookNotice,
         .push_context_notice = pushContextNotice,
         .push_session_notice = pushSessionNotice,
         .push_route_recovery_status = pushRouteRecoveryStatus,
@@ -3876,11 +3984,40 @@ fn onWebFetchProgress(raw_ctx: *anyopaque, _: []const u8, progress: types.WebFet
 
 fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    recordNotice(ctx, "system", "neutral", text);
     if (ctx.presenter) |presenter| return presenter.pushNotice(.{
         .topic = "",
         .tone = .neutral,
         .body = text,
     });
+    try writeNoticeLine(ctx, text);
+}
+
+fn pushHookNotice(raw_ctx: *anyopaque, tone: agent_runtime.HookNoticeTone, text: []const u8) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    recordNotice(ctx, "hooks", switch (tone) {
+        .neutral => "neutral",
+        .warning => "warning",
+    }, text);
+    if (ctx.presenter) |presenter| return presenter.pushNotice(.{
+        .topic = "hooks",
+        .tone = switch (tone) {
+            .neutral => .neutral,
+            .warning => .warning,
+        },
+        .body = text,
+    });
+    // fx's text output has no warning prefix, so both tones print `[notice]`.
+    try writeNoticeLine(ctx, text);
+}
+
+/// Keeps a copy of a notice for `fx ask --json`. The notice still prints on stderr either way.
+fn recordNotice(ctx: *AskContext, topic: []const u8, tone: []const u8, text: []const u8) void {
+    if (!ctx.output_mode.capturesJson()) return;
+    ctx.notice_log.record(ctx.alloc, topic, tone, text);
+}
+
+fn writeNoticeLine(ctx: *AskContext, text: []const u8) !void {
     try ctx.writeStderr("[notice] ");
     try ctx.writeStderr(text);
     try ctx.writeStderr("\n");
@@ -4719,6 +4856,22 @@ fn writeFinalJsonFields(writer: *std.Io.Writer, result: PromptRunResult) !void {
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
         try writer.writeAll(",\"recovery\":");
         try recovery.report(&label_buf).writeJson(writer);
+    }
+    // `notices` is always present, so a script reads what a person saw on stderr.
+    try writer.writeAll(",\"notices\":[");
+    for (result.notices, 0..) |notice, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"topic\":");
+        try std.json.Stringify.value(notice.topic, .{}, writer);
+        try writer.writeAll(",\"tone\":");
+        try std.json.Stringify.value(notice.tone, .{}, writer);
+        try writer.writeAll(",\"text\":");
+        try std.json.Stringify.value(notice.text, .{}, writer);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+    if (result.notices_dropped > 0) {
+        try writer.print(",\"notices_dropped\":{d}", .{result.notices_dropped});
     }
 }
 
@@ -6515,19 +6668,65 @@ test "stdin prompt reader propagates allocation failure" {
     );
 }
 
+test "json notices keep at most 100 copies, each cut to 2000 bytes on a character boundary" {
+    const alloc = std.testing.allocator;
+    var log: JsonNoticeLog = .{};
+    defer log.deinit(alloc);
+    const long = try alloc.alloc(u8, 2001);
+    defer alloc.free(long);
+    @memset(long, 'a');
+    long[1999] = 0xC3; // the first byte of a two-byte character that starts before the cut
+    long[2000] = 0xA9; // its second byte, which the cut must not keep
+    log.record(alloc, "hooks", "neutral", long);
+    try std.testing.expectEqual(@as(usize, 1), log.items.items.len);
+    const kept = log.items.items[0].text;
+    try std.testing.expectEqual(@as(usize, 1999), kept.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(kept));
+    for (0..101) |_| log.record(alloc, "system", "neutral", "again");
+    try std.testing.expectEqual(@as(usize, 100), log.items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), log.dropped);
+}
+
+test "final ask json lists the notices the run showed, in order, and counts the ones it did not keep" {
+    const alloc = std.testing.allocator;
+    var log: JsonNoticeLog = .{};
+    defer log.deinit(alloc);
+    log.record(alloc, "hooks", "warning", "Hook guard failed: exited with code 1");
+    log.record(alloc, "system", "neutral", "A hook blocked this prompt: blocked by policy");
+    log.dropped = 3;
+    const result = PromptRunResult{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, "ok"),
+        .notices = try dupeJsonNotices(alloc, log.items.items),
+        .notices_dropped = log.dropped,
+    };
+    defer result.deinit(alloc);
+    const rendered = try renderFinalJsonResult(alloc, result);
+    defer alloc.free(rendered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rendered, .{});
+    defer parsed.deinit();
+    const items = parsed.value.object.get("notices").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("hooks", items[0].object.get("topic").?.string);
+    try std.testing.expectEqualStrings("warning", items[0].object.get("tone").?.string);
+    try std.testing.expectEqualStrings("Hook guard failed: exited with code 1", items[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("system", items[1].object.get("topic").?.string);
+    try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("notices_dropped").?.integer);
+}
+
 test "stdin prompt errors keep exact structured names" {
     const alloc = std.testing.allocator;
     const overflow = try renderResultObject(alloc, .{ .exit_code = 1, .assistant_output = &.{}, .error_code = "PromptResourceLimitExceeded" }, false);
     defer alloc.free(overflow);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptResourceLimitExceeded\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptResourceLimitExceeded\",\"notices\":[]}\n",
         overflow,
     );
 
     const read_failure = try renderResultObject(alloc, .{ .exit_code = 1, .assistant_output = &.{}, .error_code = "PromptInputReadFailed" }, false);
     defer alloc.free(read_failure);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\",\"notices\":[]}\n",
         read_failure,
     );
 }
@@ -6544,7 +6743,7 @@ test "image preparation failure has stable text and JSON contracts" {
     const json = try renderResultObject(alloc, .{ .exit_code = 1, .assistant_output = &.{}, .error_code = @errorName(error.ImagePreparationFailed) }, false);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\",\"notices\":[]}\n",
         json,
     );
 }
@@ -6573,7 +6772,7 @@ test "unresolved image capability has actionable text and stable JSON code" {
     }, false);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ModelImageCapabilityUnavailable\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ModelImageCapabilityUnavailable\",\"notices\":[]}\n",
         json,
     );
 }
@@ -6604,7 +6803,7 @@ test "stdin read failure has distinct text and JSON output contracts" {
         try runWithDeps(alloc, &.{"--json"}, testConfig(), deps),
     );
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\",\"notices\":[]}\n",
         stdout_capture.bytes.items,
     );
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
@@ -8664,7 +8863,7 @@ test "ask JSON lists each subagent with its own usage in the shape of the result
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]," ++
             "\"usage\":{\"input_tokens\":1,\"output_tokens\":2}," ++
             "\"subagents\":[{\"name\":\"alpha\",\"id\":\"child_a\",\"usage\":{\"input_tokens\":7000,\"output_tokens\":70,\"cache_read_tokens\":700,\"cache_write_tokens\":0}}," ++
-            "{\"name\":null,\"id\":\"child_b\",\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}]}\n",
+            "{\"name\":null,\"id\":\"child_b\",\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}],\"notices\":[]}\n",
         json,
     );
 }
@@ -8679,7 +8878,7 @@ test "ask JSON has no subagents field when no subagent worked" {
     defer alloc.free(json);
     try std.testing.expect(std.mem.find(u8, json, "subagents") == null);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2},\"notices\":[]}\n",
         json,
     );
 }
@@ -8705,7 +8904,7 @@ test "render final JSON preserves shape escaping order and newline" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"resolved_provider\":null,\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
+        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"resolved_provider\":null,\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"notices\":[]}\n",
         json,
     );
 }
@@ -8722,7 +8921,7 @@ test "render final JSON emits empty tool call array" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"notices\":[]}\n",
         json,
     );
 }
@@ -8744,7 +8943,7 @@ test "render final JSON reports the successful recovery attempt" {
     // The module shape (decision 38): `recovered` carries the attempt and,
     // when a send failed, the cause. This status has no failure, so it
     // carries only the attempt, with no message, budget, or delay fields.
-    try std.testing.expect(std.mem.find(u8, json, ",\"recovery\":{\"state\":\"recovered\",\"attempt\":3}}") != null);
+    try std.testing.expect(std.mem.find(u8, json, ",\"recovery\":{\"state\":\"recovered\",\"attempt\":3},\"notices\":[]}") != null);
 }
 
 test "render final JSON names what a needs-you status needs" {
@@ -9468,7 +9667,7 @@ test "json run with missing API key prints diagnostic then final object" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings("fx ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"MissingCredentials\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"MissingCredentials\",\"notices\":[]}\n",
         stdout_capture.bytes.items,
     );
 }
@@ -9627,8 +9826,8 @@ test "default fx ask preserves project context gathering error mappings" {
         json: ?[]const u8,
     }{
         .{ .err = error.OutOfMemory, .json = null },
-        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"NoSpaceLeft\"}\n" },
-        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"WriteFailed\"}\n" },
+        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"NoSpaceLeft\",\"notices\":[]}\n" },
+        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"WriteFailed\",\"notices\":[]}\n" },
     };
 
     for (cases) |case| {
@@ -9682,7 +9881,7 @@ test "quiet suppresses streaming while quiet json captures final output" {
     const json_exit = try runWithDeps(alloc, &.{ "--quiet", "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup));
     try std.testing.expectEqual(@as(u8, 0), json_exit);
     try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model\",\"resolved_provider\":null,\"session_id\":\""));
-    try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n"));
+    try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"notices\":[]}\n"));
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 

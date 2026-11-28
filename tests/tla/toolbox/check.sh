@@ -13,6 +13,7 @@
 #   skip-admission     a run goes ahead when permission was denied          RunNeedsAdmission
 #   rerun-after-crash  a resume runs an interrupted call again              AtMostOnce
 #   run-needs-open     a run fails unless its entry was opened first        RunWorksWhenAllowed
+#   hook-overrides-deny a hook's allow runs a call a configured deny covers ConfiguredDenyWins
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -35,4 +36,5 @@ Toolbox toolbox-mutation-compact-forgets-notes Informed
 Toolbox toolbox-mutation-skip-admission RunNeedsAdmission
 Toolbox toolbox-mutation-rerun-after-crash AtMostOnce
 Toolbox toolbox-mutation-run-needs-open RunWorksWhenAllowed
+Toolbox toolbox-mutation-hook-overrides-deny ConfiguredDenyWins
 VERDICTS

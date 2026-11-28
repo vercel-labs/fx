@@ -53,6 +53,14 @@ pub fn InterruptRuntime(comptime App: type) type {
                     if (app.auth.providerPreparationPending()) return true;
                 }
             }
+            // A setting change that waits for its hooks is active work too (R2.4).
+            if (comptime @hasField(App, "hook_gate")) {
+                if (app.hook_gate.isPending()) return true;
+            }
+            // A `/hook test` counts as active work, so Esc and Ctrl-C reach it. Other `/hook` verbs do not.
+            if (comptime @hasField(App, "hook_job")) {
+                if (app.hook_job.cancelable()) return true;
+            }
             return activeCancellationTarget(agent) != .none;
         }
 
@@ -74,6 +82,18 @@ pub fn InterruptRuntime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return;
                     }
+                }
+            }
+            if (comptime @hasField(App, "hook_gate")) {
+                if (app.hook_gate.cancel()) {
+                    app.shell.render_requests.request(.footer);
+                    return;
+                }
+            }
+            if (comptime @hasField(App, "hook_job")) {
+                if (app.hook_job.cancel()) {
+                    app.shell.render_requests.request(.footer);
+                    return;
                 }
             }
             if (activeCancellationTarget(agent) == .context_compaction) {

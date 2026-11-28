@@ -27,9 +27,11 @@
 (*        prefill recovery prompt                                          *)
 (*   "H"  a Stop hook's message to continue                               *)
 (*   "V"  review mode's message                                           *)
+(*   "S"  fx's turn-start steering: a UserPromptSubmit hook's context and  *)
+(*        PostModelSwitch notes, saved as steering at boundary 0           *)
 (*   "Q"  a tool's notice to the model, such as Vision's                   *)
 (*   "X"  a user message fx sent with no marker, which the save drops      *)
-(* The steering kinds are T, K, H, V and Q: the save keeps each in the     *)
+(* The steering kinds are T, K, H, V, Q and S: the save keeps each in the  *)
 (* turn's steering list, anchored at the number of steps before it. fx     *)
 (* marks every one but T, which is the user's own, as its own message      *)
 (* (`recovery_prompt`). X is a message fx does not send: only a planted    *)
@@ -60,12 +62,13 @@
 (*     hook_plain       a Stop hook's message has no marker                *)
 (*     steering_first   Restore puts a boundary's steering before its notes *)
 (*     prefix_dropped   Save forgets the assistant message before steering *)
+(*     ctx_joined       the turn-start context joins the prompt, no marker *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS MaxAtoms, MaxRequests, Notices, Review, Hook, DoubleTrail, Bug
 
-Steer == {"T", "K", "H", "V", "Q"}
+Steer == {"T", "K", "H", "V", "Q", "S"}
 Atoms == {"C", "R", "F", "A", "P", "N", "X"} \cup Steer
 StepStart == {"C", "A"}
 
@@ -148,8 +151,17 @@ VARIABLES
 
 vars == <<live, sent, pend, ctx, wrote, phase, requests, how>>
 
+\* The turn's messages before its first request: the cancel steering the user
+\* typed, if any, then fx's turn-start steering, if any: a UserPromptSubmit
+\* hook's context and PostModelSwitch notes (orchestrator.zig:6857-6860, after
+\* the stale-shell note and the cancel steering). Bug = "ctx_joined" is fx
+\* before H2b: the context joined the prompt with no marker, so the save drops it.
+TurnStartAtom == IF Bug = "ctx_joined" THEN "X" ELSE "S"
+
 Init ==
-    /\ live = <<>> /\ sent = <<>> /\ pend = 0 /\ ctx = FALSE
+    /\ \E cancel \in BOOLEAN, startCtx \in BOOLEAN :
+         live = (IF cancel THEN <<"T">> ELSE <<>>) \o (IF startCtx THEN <<TurnStartAtom>> ELSE <<>>)
+    /\ sent = <<>> /\ pend = 0 /\ ctx = FALSE
     /\ wrote = FALSE /\ phase = "top" /\ requests = 0 /\ how = "none"
 
 \* Another process changes the git branch or the date.

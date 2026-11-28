@@ -52,6 +52,16 @@ export function toolObservation(scope, callId, hooks, emit, signal) {
     if (signal.aborted) abort();
     return finish;
   }
+  // The same observer for a host-created child engine, which keeps the parent tool relationship.
+  const childObserve = () => ({
+    ...hooks,
+    parent: {
+      rootSessionId: scope.rootSessionId,
+      sessionId: scope.sessionId,
+      turnId: scope.turnId,
+      callId,
+    },
+  });
   return {
     async wait(request, run) {
       if (
@@ -170,16 +180,8 @@ export function toolObservation(scope, callId, hooks, emit, signal) {
         throw error;
       }
     },
-    childHooks() {
-      return {
-        ...hooks,
-        parent: {
-          rootSessionId: scope.rootSessionId,
-          sessionId: scope.sessionId,
-          turnId: scope.turnId,
-          callId,
-        },
-      };
-    },
+    childObserve,
+    /** @deprecated Use `childObserve()`. */
+    childHooks: childObserve,
   };
 }

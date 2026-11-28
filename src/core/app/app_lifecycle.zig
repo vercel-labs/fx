@@ -15,6 +15,7 @@ const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const request_recovery = @import("../agent/runtime/request_recovery.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const hooks_host = @import("../hooks_host/hooks_host.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const shared_theme = @import("../shared/theme.zig");
 const record_tape = @import("../workspace/record_tape.zig");
@@ -71,9 +72,9 @@ fn restoreFoundTty(fd: std.posix.fd_t) void {
     _ = std.c.tcsetattr(fd, .NOW, &found);
 }
 
-/// Restores terminal state, installs the default disposition, and re-raises.
-/// Must remain async-signal-safe: only `tcsetattr(3)`, `write(2)`,
-/// `sigaction(2)`, and `raise(3)`.
+/// Restores terminal state, stops the hook groups, installs the default disposition, and re-raises. `closerMain`
+/// reaches this too, so the TUI's close path stops hook groups as well (R3.9).
+/// Must remain async-signal-safe: only `tcsetattr(3)`, `write(2)`, `kill(2)` (through `killLiveGroups`), `sigaction(2)`, and `raise(3)`.
 fn abnormalExitHandlerWithRestore(comptime restore: []const u8, sig: std.posix.SIG) void {
     restoreFoundTty(std.posix.STDIN_FILENO);
     // Signal context cannot recover from a failed async-signal-safe write.
@@ -88,6 +89,7 @@ fn abnormalExitHandlerWithRestore(comptime restore: []const u8, sig: std.posix.S
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
+    hooks_host.killLiveGroups();
     std.posix.sigaction(sig, &default_action, null);
     _ = std.c.raise(sig);
 }
@@ -295,6 +297,7 @@ pub const StartupState = struct {
     sandbox_execution: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
+    experimental_hooks: bool = false,
     theme_monitor_enabled: bool = false,
     theme: ?[]const u8 = null,
     /// `shortcuts` from the profile, read by the same settings load as the rest.
@@ -470,6 +473,8 @@ pub const StartupStatus = struct {
     agent_step_limit: usize,
     update_channel: update_target.Channel = .stable,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
+    /// Resolved `experimental.hooks`; `fx status` and `fx doctor` report the hooks state with it.
+    experimental_hooks: bool = false,
 
     pub fn deinit(self: *StartupStatus, alloc: Allocator) void {
         alloc.free(self.workspace_root);
@@ -724,6 +729,7 @@ pub fn loadStartupStatusWithAuthMode(
         .agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps),
         .update_channel = settings.update_channel orelse .stable,
         .config_diagnostics = detailed.diagnostics,
+        .experimental_hooks = settings.experimental_hooks orelse false,
     };
     auth_status.owned_team = null;
     detailed.diagnostics = &.{};
@@ -981,6 +987,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.sandbox_execution = settings.experimental_sandbox_execution orelse false;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
+    state.experimental_hooks = settings.experimental_hooks orelse false;
 }
 
 /// `FX_THEME`, which beats the `theme` setting. An empty value counts as unset.

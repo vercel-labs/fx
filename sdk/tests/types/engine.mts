@@ -17,6 +17,7 @@ import {
   type FxEngineTurnResult,
   type FxHostTool,
   type FxHooks,
+  type FxObserve,
   type FxHookEvent,
   type FxToolResult,
   type JournalRecord,
@@ -30,7 +31,7 @@ function assertType<T extends true>(): void {}
 declare const process: { env: Record<string, string | undefined> };
 declare const apiKey: string;
 
-const hooks: FxHooks = {
+const observe: FxObserve = {
   captureContent: true,
   onEvent(event: FxHookEvent) {
     if (event.type === "model.start") {
@@ -45,8 +46,11 @@ const hooks: FxHooks = {
   },
   async onError(_error: unknown) {},
 };
-void createFxEngine({ apiKey, hooks });
-void createFxAgent({ apiKey, hooks });
+void createFxEngine({ apiKey, observe });
+void createFxAgent({ apiKey, observe });
+// The deprecated name still type-checks.
+const legacy: FxHooks = observe;
+void createFxEngine({ apiKey, hooks: legacy });
 const interactiveTool: FxHostTool = {
   name: "confirm",
   description: "Ask the host",
@@ -58,6 +62,8 @@ const interactiveTool: FxHostTool = {
     const childHooks: import("libfx/browser").FxHooks = context.observation.childHooks();
     const wasmObserver: import("libfx/wasm").FxToolObservation = context.observation;
     void childHooks;
+    const childObserve: import("libfx/browser").FxObserve = context.observation.childObserve();
+    void childObserve;
     void wasmObserver;
     return response.outcome;
   },

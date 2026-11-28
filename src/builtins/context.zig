@@ -157,6 +157,8 @@ const SelectionOptions = struct {
     home: ?[]const u8 = null,
     initial: bool,
     instruction_files: context_contract.InstructionFiles = .filesystem,
+    /// Asked before each instruction file loads. Null loads every file.
+    instruction_filter: ?context_contract.InstructionFilter = null,
     context_limits: context_limits.Values = .{},
 };
 
@@ -248,6 +250,7 @@ fn gatherProjectContextWithHome(
         .home = home,
         .initial = true,
         .instruction_files = input.instruction_files,
+        .instruction_filter = input.instruction_filter,
         .context_limits = input.context_limits,
     });
 }
@@ -263,6 +266,7 @@ fn selectApplicableProjectContext(alloc: Allocator, input: LaterContextInput) co
         .attached_omission_summary = input.omission_summary,
         .initial = false,
         .instruction_files = input.instruction_files,
+        .instruction_filter = input.instruction_filter,
         .context_limits = input.context_limits,
     });
 }
@@ -322,7 +326,9 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                 if (canonical_home) |home_root| {
                     global_source_path = try profile_paths.rootPath(arena, home_root, &.{"AGENTS.md"});
                     // The profile rule may link to instructions shared elsewhere in home.
-                    global_rule = try loadRuleForSelection(arena, &scratch, files, global_source_path.?, options.context_limits.project_instruction_file_bytes, home_root);
+                    if (try mayLoadInstruction(arena, &scratch, options, global_source_path.?, .session_start)) {
+                        global_rule = try loadRuleForSelection(arena, &scratch, files, global_source_path.?, options.context_limits.project_instruction_file_bytes, home_root);
+                    }
                     if (pathing.pathInside(home_root, options.workspace_root)) {
                         try collectLaunchAncestorCandidates(arena, &scratch, home_root, options.workspace_root, options.delivered_sources);
                     } else {
@@ -338,7 +344,9 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                 if (global_source_path == null or
                     !std.mem.eql(u8, global_source_path.?, project_source))
                 {
-                    project_rule = try loadRuleForSelection(arena, &scratch, files, project_source, options.context_limits.project_instruction_file_bytes, null);
+                    if (try mayLoadInstruction(arena, &scratch, options, project_source, .session_start)) {
+                        project_rule = try loadRuleForSelection(arena, &scratch, files, project_source, options.context_limits.project_instruction_file_bytes, null);
+                    }
                 }
             } else {
                 try scratch.addOmission(options.workspace_root, .unsafe_target);
@@ -350,6 +358,9 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
         }
 
         for (scratch.candidates.items) |*candidate| {
+            // Launch ancestors are found only at the initial gather, so they load at session start.
+            const load_reason: context_contract.InstructionLoadReason = if (candidate.class == .ancestor) .session_start else .nested_traversal;
+            if (!try mayLoadInstruction(arena, &scratch, options, candidate.source, load_reason)) continue;
             switch (try loadRuleFrom(arena, files, candidate.source, options.context_limits.project_instruction_file_bytes, null)) {
                 .body => |body| {
                     candidate.body = body.text;
@@ -472,6 +483,22 @@ fn renderRuleReminders(alloc: Allocator, root: []const u8, sources: []const []co
         try out.writer.writeAll("\">" ++ rule_reminder_text ++ "</" ++ scoped_rules_tag ++ "-reminder>");
     }
     return out.toOwnedSlice();
+}
+
+/// Asks the caller's instruction filter whether `path` may load. A "no" records a `hook_denied`
+/// omission for it and returns false. With no filter every file may load, and nothing is read.
+fn mayLoadInstruction(
+    arena: Allocator,
+    scratch: *SelectionScratch,
+    options: SelectionOptions,
+    path: []const u8,
+    reason: context_contract.InstructionLoadReason,
+) !bool {
+    const filter = options.instruction_filter orelse return true;
+    const stamp = options.instruction_files.sourceStamp(arena, path);
+    if (filter.allow(filter.context, path, reason, stamp)) return true;
+    try scratch.addOmission(path, .hook_denied);
+    return false;
 }
 
 fn loadRuleForSelection(
@@ -950,6 +977,7 @@ fn writeOmissionRepair(writer: *std.Io.Writer, reason: context_contract.Omission
         .symlink => try writer.writeAll("replace the symlink with a regular file"),
         .selection_cap => try writer.writeAll("reduce applicable AGENTS.md files"),
         .host_unreadable => try writer.writeAll("add readFile to the host workspace adapter"),
+        .hook_denied => try writer.writeAll("check the hook that left it out"),
     }
 }
 
@@ -2029,6 +2057,99 @@ test "host instruction files deliver global and project rules from host paths" {
     try std.testing.expectEqualStrings("/workspace/AGENTS.md", context.delivered_sources[1]);
     try std.testing.expectEqual(@as(usize, 0), context.notices.len);
     try std.testing.expectEqual(ruleReadLength((context_limits.Values{}).project_instruction_file_bytes), FakeInstructionHost.last_max_bytes);
+}
+
+/// Records each question an instruction filter is asked, and denies the one path `deny` names.
+const RecordingInstructionFilter = struct {
+    const Call = struct {
+        path: [256]u8 = undefined,
+        path_len: usize = 0,
+        reason: context_contract.InstructionLoadReason = .session_start,
+
+        fn pathText(self: *const Call) []const u8 {
+            return self.path[0..self.path_len];
+        }
+    };
+
+    calls: [8]Call = undefined,
+    count: usize = 0,
+    deny: ?[]const u8 = null,
+
+    fn allow(context: *anyopaque, path: []const u8, reason: context_contract.InstructionLoadReason, stamp: u64) bool {
+        _ = stamp;
+        const self: *RecordingInstructionFilter = @ptrCast(@alignCast(context));
+        var call: Call = .{ .reason = reason };
+        @memcpy(call.path[0..path.len], path);
+        call.path_len = path.len;
+        self.calls[self.count] = call;
+        self.count += 1;
+        return if (self.deny) |denied| !std.mem.eql(u8, denied, path) else true;
+    }
+
+    fn filter(self: *RecordingInstructionFilter) context_contract.InstructionFilter {
+        return .{ .context = self, .allow = allow };
+    }
+};
+
+test "an instruction filter leaves a denied file out" {
+    const alloc = std.testing.allocator;
+    FakeInstructionHost.reset(&.{
+        .{ .path = "/home/visitor/.fx/AGENTS.md", .content = "PROFILE_RULE\n" },
+        .{ .path = "/workspace/AGENTS.md", .content = "PROJECT_RULE\n" },
+    });
+    defer FakeInstructionHost.reset(&.{});
+    var recorder: RecordingInstructionFilter = .{ .deny = "/workspace/AGENTS.md" };
+
+    var context = try gatherProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .instruction_files = FakeInstructionHost.instruction_files,
+        .instruction_filter = recorder.filter(),
+    });
+    defer context.deinit(alloc);
+
+    const visible = context.modelVisibleBytes();
+    try std.testing.expect(std.mem.find(u8, visible, "PROFILE_RULE") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "PROJECT_RULE") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "<project-rules-omitted from=\"AGENTS.md\" reason=\"a hook left it out\" />") != null);
+    try std.testing.expectEqual(@as(usize, 1), context.delivered_sources.len);
+    try std.testing.expectEqualStrings("/home/visitor/.fx/AGENTS.md", context.delivered_sources[0]);
+}
+
+test "an instruction filter gets the load reason" {
+    const alloc = std.testing.allocator;
+    FakeInstructionHost.reset(&.{
+        .{ .path = "/home/visitor/.fx/AGENTS.md", .content = "PROFILE_RULE\n" },
+        .{ .path = "/workspace/AGENTS.md", .content = "PROJECT_RULE\n" },
+        .{ .path = "/workspace/sub/AGENTS.md", .content = "FOLDER_RULE\n" },
+    });
+    defer FakeInstructionHost.reset(&.{});
+    var recorder: RecordingInstructionFilter = .{};
+
+    var initial = try gatherProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .instruction_files = FakeInstructionHost.instruction_files,
+        .instruction_filter = recorder.filter(),
+    });
+    defer initial.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), recorder.count);
+    try std.testing.expectEqualStrings("/home/visitor/.fx/AGENTS.md", recorder.calls[0].pathText());
+    try std.testing.expectEqual(context_contract.InstructionLoadReason.session_start, recorder.calls[0].reason);
+    try std.testing.expectEqualStrings("/workspace/AGENTS.md", recorder.calls[1].pathText());
+    try std.testing.expectEqual(context_contract.InstructionLoadReason.session_start, recorder.calls[1].reason);
+
+    var folder = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .instruction_files = FakeInstructionHost.instruction_files,
+        .targets = &.{.{ .path = "/workspace/sub/file.zig", .kind = .file }},
+        .delivered_sources = &.{},
+        .evaluated_endpoints = &.{},
+        .instruction_filter = recorder.filter(),
+    });
+    defer folder.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), recorder.count);
+    try std.testing.expectEqualStrings("/workspace/sub/AGENTS.md", recorder.calls[2].pathText());
+    try std.testing.expectEqual(context_contract.InstructionLoadReason.nested_traversal, recorder.calls[2].reason);
+    try std.testing.expect(std.mem.find(u8, folder.modelVisibleBytes(), "FOLDER_RULE") != null);
 }
 
 test "host instruction files give only the delivery guidance when no rule exists (D93)" {

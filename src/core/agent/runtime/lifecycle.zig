@@ -3,6 +3,9 @@ const testing_allocator = @import("../../shared/testing_allocator.zig");
 const hooks = @import("../../hooks/hooks.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+const host_target = @import("../../hosts/target.zig");
+const hooks_host = @import("../../hooks_host/hooks_host.zig");
+const runtime_user_hooks = @import("user_hooks.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -12,10 +15,19 @@ const PreToolUseDispatchError = Allocator.Error || error{
     LifecycleFailedClosed,
 };
 
+pub const UserHooksRuntime = if (host_target.is_wasm) opaque {} else hooks_host.Runtime;
+
 pub const LifecycleContext = struct {
     view: hooks.RuntimeView,
     scope: hooks.Scope,
     outcome_allocator: Allocator,
+    /// The user's hooks runtime, or null when this surface runs none.
+    user_hooks: ?*UserHooksRuntime = null,
+    /// Whether only hooks a person trusted may run. Every surface keeps it on: a waiting hook never
+    /// runs, and the default is the safe value.
+    trust_required: bool = true,
+    /// The turn runs inside the libfx SDK (reported as surface "libfx").
+    libfx: bool = false,
 };
 
 pub const StopCheckpoint = struct {
@@ -374,6 +386,12 @@ pub fn dispatchAttentionRequiredCheckpoint(
         },
         .kind = checkpoint.kind,
     });
+    // The person's Notification hooks run in the background; the view above is unchanged.
+    switch (checkpoint.kind) {
+        .permission => runtime_user_hooks.notification(lifecycle, "permission_prompt", "fx needs your permission to continue"),
+        .question => runtime_user_hooks.notification(lifecycle, "question", "fx has a question for you"),
+        .route_recovery => runtime_user_hooks.notification(lifecycle, "route_recovery", "fx needs you to choose how to continue the request"),
+    }
 }
 
 fn dispatchPreToolUseCheckpoint(
@@ -447,7 +465,8 @@ pub fn dupeBlockedToolCall(alloc: Allocator, call: ToolCall) !ToolCall {
     return types.dupeToolCall(alloc, replay);
 }
 
-fn makePreparedBlocked(
+/// Blocks one call with the model-facing output `kind` names.
+pub fn makePreparedBlocked(
     alloc: Allocator,
     call: ToolCall,
     kind: PreparedToolBlockKind,
