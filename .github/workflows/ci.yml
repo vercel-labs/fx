@@ -1023,8 +1023,10 @@ jobs:
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
   # The ACP models, and the drivers that run the built fx acp along them. Their
-  # planted bugs stay local (tests/tla/acp/check.sh without --ci): they
-  # measure the checks, not the code.
+  # planted bugs stay local: they measure the checks, not the code. Run each
+  # drivers/acp/<area>/check-spec.ts by hand, for example
+  # `bun tests/tla/drivers/acp/speed/check-spec.ts`. tests/tla/acp/check.sh runs
+  # the TLC configs, and with --ci the driver.ts files, but no check-spec.ts.
   tla-acp:
     name: TLA+ ACP models and drivers
     needs: [build, ci-need]
