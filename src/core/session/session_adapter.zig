@@ -3226,6 +3226,65 @@ pub const Session = struct {
         if (comptime !durable_sessions_enabled) return 0;
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
+        return self.recordInputAcceptedLocked(text, images, null);
+    }
+
+    pub const KeyedInputReceipt = union(enum) {
+        inserted: u64,
+        existing: u64,
+    };
+
+    /// Assigns the same input ID to repeated submissions in a saved session.
+    /// The caller must validate the prompt before invoking this method. A
+    /// still-held session has no readable log and needs a separate admission
+    /// path; refusing here prevents a false durable receipt.
+    pub fn recordInputWithRetryKey(
+        self: *Session,
+        text: []const u8,
+        images: []const types.ImageAttachment,
+        retry_key: []const u8,
+    ) !KeyedInputReceipt {
+        if (comptime !durable_sessions_enabled) return error.SessionNotOnDisk;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.saved()) return error.SessionNotOnDisk;
+
+        // The opaque key does not need to appear in the log, traces or replay.
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        // A fork copies records, but a key belongs to the original session.
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(self.id());
+        hasher.update(&.{0});
+        hasher.update(retry_key);
+        hasher.final(&digest);
+        const hash = std.fmt.bytesToHex(digest, .lower);
+        if (try findInputReceipt(self.source(), self.alloc, &hash)) |receipt_id|
+            return .{ .existing = receipt_id };
+        return .{ .inserted = try self.recordInputAcceptedLocked(text, images, &hash) };
+    }
+
+    fn findInputReceipt(src: Source, alloc: Allocator, hash: []const u8) !?u64 {
+        var from: sm.From = .start;
+        while (true) {
+            var page = try src.readTo(alloc, from, .forward, replay_page_lines);
+            defer page.deinit();
+            if (page.damaged) return error.Corrupt;
+            for (page.entries) |entry| {
+                if (entry.kind != .input_accepted) continue;
+                const body = entry.body orelse return error.Corrupt;
+                const seen_hash = body.input_accepted.retry_key_hash orelse continue;
+                if (std.mem.eql(u8, seen_hash, hash)) return body.input_accepted.id;
+            }
+            from = .{ .at = page.next orelse return null };
+        }
+    }
+
+    fn recordInputAcceptedLocked(
+        self: *Session,
+        text: []const u8,
+        images: []const types.ImageAttachment,
+        retry_key_hash: ?[]const u8,
+    ) !u64 {
         const known_last_seq = blk: {
             self.host.write_lock.lockUncancelable(io_mod.getIo());
             defer self.host.write_lock.unlock(io_mod.getIo());
@@ -3251,6 +3310,7 @@ pub const Session = struct {
                     .text = w.buffered(),
                     .blobs = &refs,
                     .images = image_refs,
+                    .retry_key_hash = retry_key_hash,
                 } }});
                 self.next_input_id = input_id +| 1;
                 return input_id;
@@ -3264,6 +3324,7 @@ pub const Session = struct {
             .id = input_id,
             .text = text,
             .images = image_refs,
+            .retry_key_hash = retry_key_hash,
         } }});
         self.next_input_id = input_id +| 1;
         return input_id;
@@ -8183,6 +8244,40 @@ test "a new session commits turns, and resume gives them back with its settings"
     var st = try r.handle.state(testing.allocator);
     defer st.deinit(testing.allocator);
     try testing.expectEqualStrings("\"first question\"", st.title.?);
+}
+
+test "a keyed ACP input keeps its receipt across session reopen" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const alloc = testing.allocator;
+    var model = "test-model".*;
+    const s = try Session.create(alloc, &t.store, "/w", .acp, testSeed(&model));
+    var active: ?*Session = s;
+    defer if (active) |session| session.close();
+    try testing.expectError(error.SessionNotOnDisk, s.recordInputWithRetryKey("not published", &.{}, "a"));
+    try s.commitTurn(assistantTurn("first question", "first answer"), types.ConversationLanguage.default());
+    const first = try s.recordInputWithRetryKey("next question", &.{}, "a");
+    try testing.expect(first == .inserted);
+    const again = try s.recordInputWithRetryKey("next question", &.{}, "a");
+    try testing.expectEqual(@as(Session.KeyedInputReceipt, .{ .existing = first.inserted }), again);
+    _ = try s.write(&.{.{ .input_delivered = .{ .id = first.inserted } }});
+    const id = try alloc.dupe(u8, s.id());
+    defer alloc.free(id);
+    s.close();
+    active = null;
+
+    const resumed = try Session.resumeSession(alloc, &t.store, .{ .id = id }, "/w", .acp);
+    active = resumed;
+    const retry = try resumed.recordInputWithRetryKey("different payload", &.{}, "a");
+    try testing.expectEqual(@as(Session.KeyedInputReceipt, .{ .existing = first.inserted }), retry);
+    const other = try resumed.recordInputWithRetryKey("other question", &.{}, "A");
+    try testing.expect(other == .inserted);
+    try testing.expect(first.inserted != other.inserted);
+
+    var pending = try resumed.pendingAcceptedInputs(alloc);
+    defer pending.deinit(alloc);
+    try testing.expectEqualSlices(u64, &.{other.inserted}, pending.ids);
 }
 
 test "a result the model saw whole comes back whole after a resume, or says its body is unavailable" {
